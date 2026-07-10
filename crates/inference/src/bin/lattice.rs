@@ -2336,6 +2336,12 @@ mod serve {
         messages: Vec<ChatMessage>,
         gen_cfg: GenerateConfig,
         on_token: Box<dyn FnMut(&str) -> bool + Send>,
+        /// Disconnect-cancellation signal (ADR-080 C2, #744): starts `false`,
+        /// flips to `true` the moment the request's
+        /// `lattice_inference::serve::CancelOnDrop` guard is dropped. Checked
+        /// by the worker independently of `on_token`, mirroring
+        /// `lattice_serve.rs`'s existing `Job::cancel` contract exactly.
+        cancel: tokio::sync::watch::Receiver<bool>,
         /// `Err` when the worker's `generate_streaming` call fails closed
         /// (#611: e.g. a grammar mask that blocks every token). Carries the
         /// same `InferenceError` the CPU path already returns from `generate`.
@@ -2394,7 +2400,24 @@ mod serve {
                 let _ = ready_tx.send(Ok(()));
 
                 while let Some(job) = job_rx.blocking_recv() {
+                    // Dequeue-time cancel check (#744): a client that
+                    // disconnected while this job was still queued behind an
+                    // earlier one must not pay for prefill at all. Mirrors
+                    // `lattice_serve.rs`'s `run_worker_loop` dequeue check.
+                    if *job.cancel.borrow() {
+                        let _ = job.reply.send(Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: 0,
+                            generated_tokens: 0,
+                            stopped: false,
+                            stop_reason: Some(lattice_inference::StopReason::Interrupt),
+                            token_logprobs: vec![],
+                        }));
+                        continue;
+                    }
                     let mut on_token = job.on_token;
+                    let cancel = job.cancel;
                     // Render via the engine's canonical ChatML template
                     // (#661) rather than a second, hand-rolled builder local
                     // to this file — see the `MetalJob::messages` doc.
@@ -2410,12 +2433,19 @@ mod serve {
                     // whenever they diverge, so correctness never depends on
                     // distinguishing clients. Mirrors the wiring already
                     // shipped in `lattice_serve.rs`.
-                    let cached = state.generate_streaming_with_prefix_cache(
+                    //
+                    // Cancellation-aware (#744): `should_cancel` is checked
+                    // before prefill, immediately after prefill, and at the
+                    // top of every decode iteration, independent of
+                    // `on_token` -- see
+                    // `generate_streaming_with_prefix_cache_and_cancel`'s doc.
+                    let cached = state.generate_streaming_with_prefix_cache_and_cancel(
                         lattice_inference::kv_cache::CrossTurnSlotId::DEFAULT,
                         &prompt,
                         &tokenizer,
                         &job.gen_cfg,
                         |delta, _token_id| on_token(delta),
+                        move || *cancel.borrow(),
                     );
                     if let Ok(c) = &cached {
                         eprintln!(
@@ -2455,11 +2485,37 @@ mod serve {
             gen_cfg: GenerateConfig,
             on_token: impl FnMut(&str) -> bool + Send + 'static,
         ) -> Result<GenerateOutput, ApiError> {
+            // `cancel = never-fires` convenience form of
+            // `generate_streaming_with_cancel`, for callers that do not wire
+            // up disconnect cancellation.
+            let (_never_cancels, cancel_rx) = tokio::sync::watch::channel(false);
+            self.generate_streaming_with_cancel(messages, gen_cfg, on_token, cancel_rx)
+                .await
+        }
+
+        /// Cancellation-aware sibling of [`Self::generate_streaming`]
+        /// (ADR-080 C2, #744): `cancel` starts `false` and flips to `true`
+        /// the moment the caller's paired
+        /// `lattice_inference::serve::CancelOnDrop` guard is dropped (client
+        /// disconnect). The worker checks it once at dequeue (before paying
+        /// for prefill on an already-abandoned job) and independently of
+        /// `on_token` via `generate_streaming_with_prefix_cache_and_cancel`'s
+        /// `should_cancel` predicate — before prefill, immediately after
+        /// prefill, and at the top of every decode iteration. Mirrors
+        /// `lattice_serve.rs`'s `Job::cancel` contract exactly.
+        async fn generate_streaming_with_cancel(
+            &self,
+            messages: Vec<ChatMessage>,
+            gen_cfg: GenerateConfig,
+            on_token: impl FnMut(&str) -> bool + Send + 'static,
+            cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<GenerateOutput, ApiError> {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             let job = MetalJob {
                 messages,
                 gen_cfg,
                 on_token: Box::new(on_token),
+                cancel,
                 reply: reply_tx,
             };
             self.jobs.send(job).map_err(|_| ApiError::Internal {
@@ -2577,73 +2633,16 @@ mod serve {
     }
 
     // -----------------------------------------------------------------------
-    // Error type
+    // Error type (ADR-080 C2, #782): shared verbatim with `lattice_serve.rs`
+    // via `lattice_inference::serve::ApiError` -- this binary's local
+    // `ApiError`/`ErrorBody`/`ErrorDetail`/`IntoResponse` were byte-identical
+    // to the shared definition, so they are gone; every existing
+    // `ApiError::BadRequest { message, code }` / `PayloadTooLarge` /
+    // `Internal` construction site below is unaffected (same variant names
+    // and fields).
     // -----------------------------------------------------------------------
 
-    /// Structured HTTP error that serialises to the OpenAI error envelope so
-    /// that clients can parse failure responses uniformly.
-    #[derive(Debug)]
-    pub enum ApiError {
-        /// Caller mistake — HTTP 400.
-        BadRequest { message: String, code: &'static str },
-        /// Request body exceeds size limit — HTTP 413.
-        PayloadTooLarge { message: String },
-        /// Server-side failure — HTTP 500.
-        Internal { message: String },
-    }
-
-    #[derive(Serialize)]
-    struct ErrorBody {
-        error: ErrorDetail,
-    }
-
-    #[derive(Serialize)]
-    struct ErrorDetail {
-        message: String,
-        r#type: &'static str,
-        code: String,
-        param: Option<String>,
-    }
-
-    impl IntoResponse for ApiError {
-        fn into_response(self) -> Response {
-            match self {
-                ApiError::BadRequest { message, code } => {
-                    let body = Json(ErrorBody {
-                        error: ErrorDetail {
-                            message,
-                            r#type: "invalid_request_error",
-                            code: code.to_string(),
-                            param: None,
-                        },
-                    });
-                    (StatusCode::BAD_REQUEST, body).into_response()
-                }
-                ApiError::PayloadTooLarge { message } => {
-                    let body = Json(ErrorBody {
-                        error: ErrorDetail {
-                            message,
-                            r#type: "invalid_request_error",
-                            code: "request_body_too_large".to_string(),
-                            param: None,
-                        },
-                    });
-                    (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
-                }
-                ApiError::Internal { message } => {
-                    let body = Json(ErrorBody {
-                        error: ErrorDetail {
-                            message,
-                            r#type: "server_error",
-                            code: "internal_error".to_string(),
-                            param: None,
-                        },
-                    });
-                    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
-                }
-            }
-        }
-    }
+    use lattice_inference::serve::ApiError;
 
     // -----------------------------------------------------------------------
     // Request / response types
@@ -2866,12 +2865,13 @@ mod serve {
                 });
             }
         };
-        if effective == 0 {
-            return Err(ApiError::BadRequest {
-                message: "max_tokens must be at least 1".to_string(),
-                code: "invalid_max_tokens",
-            });
-        }
+        // ADR-080 C2, #745: the zero-rejection itself is the shared contract
+        // (`lattice_serve.rs`'s `build_cfg` silently clamped a
+        // client-supplied `max_tokens: 0` through instead of rejecting it);
+        // the cap-reject below stays local since the two binaries'
+        // over-cap policies deliberately differ (this one rejects, the
+        // daemon clamps to the model's context window).
+        lattice_inference::serve::reject_zero_max_tokens(effective)?;
         if effective > max_tokens_cap {
             return Err(ApiError::BadRequest {
                 message: format!("max_tokens {effective} exceeds server limit {max_tokens_cap}"),
@@ -3191,15 +3191,16 @@ mod serve {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Maps a `GenerateOutput` to the OpenAI `finish_reason` string.
-    ///
-    /// Returns `"stop"` when the library explicitly ended generation via a stop
-    /// condition (EOS token, stop-token-id, or stop-string match); `"length"` when
-    /// the token budget was exhausted without a stop condition.
+    /// Maps a `GenerateOutput` to the OpenAI `finish_reason` string (ADR-080
+    /// C2, #746): delegates to the shared `lattice_inference::serve::
+    /// finish_reason`, which both binaries now use so the mapping cannot
+    /// drift between them again -- `lattice_serve.rs`'s worker previously
+    /// hardcoded `"stop"` unconditionally instead of carrying the engine's
+    /// `stopped` flag through.
     pub(super) fn finish_reason_for(
         output: &lattice_inference::model::qwen35_config::GenerateOutput,
     ) -> &'static str {
-        if output.stopped { "stop" } else { "length" }
+        lattice_inference::serve::finish_reason(output.stopped)
     }
 
     /// Resolve a token id back to its OpenAI `logprobs` text/bytes representation (#585).
@@ -3269,6 +3270,21 @@ mod serve {
 
     pub async fn health() -> Json<HealthResponse> {
         Json(HealthResponse { status: "ok" })
+    }
+
+    /// `GET /v1/models` (ADR-080 C2, #746's sibling gap): advertises the
+    /// single loaded model, in the same shape `lattice_serve.rs` already
+    /// served on its own daemon -- this binary had no equivalent route at
+    /// all before this change.
+    pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Json(lattice_inference::serve::models_list_body(
+            &state.model_id,
+            created,
+        ))
     }
 
     /// Everything `chat_completions` must check about a request *before* it
@@ -3516,11 +3532,18 @@ mod serve {
             // sends at most one `Delta` per generated token and generation halts at
             // the cap, so the worst-case buffer is a few thousand short strings —
             // the same order the non-streaming path already holds as one buffered
-            // string. There is no true backpressure (an unbounded send never
-            // blocks); if the client disconnects mid-stream the producer keeps
-            // generating to the cap and the ignored send errors drain harmlessly.
-            // Per-token backpressure / disconnect-cancellation is a future refinement.
+            // string.
+            //
+            // Disconnect cancellation (ADR-080 C2, #744): `cancel_guard` is
+            // moved into the `body_stream` closure below, so it drops the
+            // instant axum drops this response's stream (client disconnect).
+            // Dropping it flips `cancel_rx` to `true`, which both backends
+            // poll independently of `on_token` (before prefill, immediately
+            // after prefill, and at the top of every decode iteration) —
+            // closing the gap the old comment here used to document as "a
+            // future refinement".
             let (tx, rx) = futures::channel::mpsc::unbounded::<StreamMsg>();
+            let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
 
             let stream_id = response_id.clone();
             let stream_model = state.model_id.clone();
@@ -3548,11 +3571,21 @@ mod serve {
                 ModelBackend::Cpu(cpu_model) => {
                     tokio::task::spawn_blocking(move || {
                         let tx_delta = tx.clone();
-                        let result = cpu_model.generate_streaming(&prompt, &gen_cfg, |delta| {
-                            // Send each incremental text delta; ignore if the receiver
-                            // dropped (client disconnected).
-                            let _ = tx_delta.unbounded_send(StreamMsg::Delta(delta.to_string()));
-                        });
+                        let result = cpu_model.generate_streaming_with_cancel(
+                            &prompt,
+                            &gen_cfg,
+                            move |delta| {
+                                // Send each incremental text delta; a `false`
+                                // return (send failed, receiver dropped) also
+                                // signals disconnect directly to `on_token`,
+                                // on top of the independent `should_cancel`
+                                // check below.
+                                tx_delta
+                                    .unbounded_send(StreamMsg::Delta(delta.to_string()))
+                                    .is_ok()
+                            },
+                            move || *cancel_rx.borrow(),
+                        );
                         match result {
                             Ok(output) => finish_streaming(output),
                             Err(e) => {
@@ -3567,11 +3600,16 @@ mod serve {
                     tokio::spawn(async move {
                         let tx_delta = tx.clone();
                         let result = handle
-                            .generate_streaming(chat_messages, gen_cfg, move |delta| {
-                                tx_delta
-                                    .unbounded_send(StreamMsg::Delta(delta.to_string()))
-                                    .is_ok()
-                            })
+                            .generate_streaming_with_cancel(
+                                chat_messages,
+                                gen_cfg,
+                                move |delta| {
+                                    tx_delta
+                                        .unbounded_send(StreamMsg::Delta(delta.to_string()))
+                                        .is_ok()
+                                },
+                                cancel_rx,
+                            )
                             .await;
                         match result {
                             Ok(output) => finish_streaming(output),
@@ -3612,6 +3650,11 @@ mod serve {
 
             // Map each StreamMsg from the channel into one or two SSE events.
             let body_stream = rx.flat_map(move |msg| {
+                // Keeps `cancel_guard` alive for exactly as long as this
+                // stream is: the moment axum drops the whole SSE response
+                // (client disconnect), this closure -- and the guard moved
+                // into it -- drops too, flipping `cancel_rx` to `true`.
+                let _cancel_guard_tied_to_stream_lifetime = &cancel_guard;
                 let id = stream_id.clone();
                 let mdl = stream_model.clone();
                 match msg {
@@ -3775,6 +3818,7 @@ mod serve {
     pub fn router(state: AppState) -> Router {
         Router::new()
             .route("/health", get(health))
+            .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
             .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
             .with_state(state)
@@ -4682,31 +4726,22 @@ mod serve {
         // Error envelope JSON shape
         // -----------------------------------------------------------------------
 
-        #[test]
-        fn error_envelope_bad_request_shape() {
+        /// Drains an `axum::response::Response` body into a parsed `Value`,
+        /// for asserting on the shared `lattice_inference::serve::ApiError`
+        /// envelope shape (ADR-080 C2, #782) from this binary's own tests.
+        async fn response_json(response: axum::response::Response) -> serde_json::Value {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body reads");
+            serde_json::from_slice(&body).expect("response body is valid JSON")
+        }
+
+        #[tokio::test]
+        async fn error_envelope_bad_request_shape() {
             let err = ApiError::BadRequest {
                 message: "test error".to_string(),
                 code: "invalid_request",
             };
-            // Verify the error serialises to the OpenAI envelope shape:
-            // {"error":{"message":"...","type":"invalid_request_error","code":"...","param":null}}
-            let body = ErrorBody {
-                error: ErrorDetail {
-                    message: "test error".to_string(),
-                    r#type: "invalid_request_error",
-                    code: "invalid_request".to_string(),
-                    param: None,
-                },
-            };
-            let json = serde_json::to_string(&body).unwrap();
-            assert!(json.contains("\"error\""));
-            assert!(json.contains("\"message\":\"test error\""));
-            assert!(json.contains("\"type\":\"invalid_request_error\""));
-            assert!(json.contains("\"code\":\"invalid_request\""));
-            assert!(json.contains("\"param\":null"));
-            // Ensure it is NOT a bare message — must be nested under "error".
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert!(v["error"].is_object(), "top-level key must be 'error'");
             // Variant check kept separate so we know err itself was constructed correctly.
             assert!(matches!(
                 err,
@@ -4715,35 +4750,41 @@ mod serve {
                     ..
                 }
             ));
+            // Verify the shared ApiError serialises to the OpenAI envelope shape:
+            // {"error":{"message":"...","type":"invalid_request_error","code":"...","param":null}}
+            let response = ApiError::BadRequest {
+                message: "test error".to_string(),
+                code: "invalid_request",
+            }
+            .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let v = response_json(response).await;
+            assert!(v["error"].is_object(), "top-level key must be 'error'");
+            assert_eq!(v["error"]["message"], "test error");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            assert_eq!(v["error"]["code"], "invalid_request");
+            assert!(v["error"]["param"].is_null());
         }
 
-        #[test]
-        fn error_envelope_payload_too_large_shape() {
-            let body = ErrorBody {
-                error: ErrorDetail {
-                    message: "request body exceeds 1 MiB limit".to_string(),
-                    r#type: "invalid_request_error",
-                    code: "request_body_too_large".to_string(),
-                    param: None,
-                },
-            };
-            let json = serde_json::to_string(&body).unwrap();
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        #[tokio::test]
+        async fn error_envelope_payload_too_large_shape() {
+            let response = ApiError::PayloadTooLarge {
+                message: "request body exceeds 1 MiB limit".to_string(),
+            }
+            .into_response();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let v = response_json(response).await;
             assert_eq!(v["error"]["code"], "request_body_too_large");
         }
 
-        #[test]
-        fn error_envelope_internal_shape() {
-            let body = ErrorBody {
-                error: ErrorDetail {
-                    message: "inference failed".to_string(),
-                    r#type: "server_error",
-                    code: "internal_error".to_string(),
-                    param: None,
-                },
-            };
-            let json = serde_json::to_string(&body).unwrap();
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        #[tokio::test]
+        async fn error_envelope_internal_shape() {
+            let response = ApiError::Internal {
+                message: "inference failed".to_string(),
+            }
+            .into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let v = response_json(response).await;
             assert_eq!(v["error"]["type"], "server_error");
             assert_eq!(v["error"]["code"], "internal_error");
         }

@@ -21,6 +21,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::watch;
 
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries
 /// already enforced this exact limit independently (`lattice.rs` via
@@ -156,6 +157,34 @@ pub fn models_list_body(model_id: &str, created: u64) -> Value {
     })
 }
 
+/// Disconnect-cancellation contract shared by both HTTP servers (#744):
+/// flips the paired [`watch::Receiver<bool>`] to `true` the moment this guard
+/// is dropped. Held inside the per-request SSE stream state (streaming) or
+/// the handler's local scope (non-streaming) so it drops exactly when axum
+/// stops caring about the response -- on client disconnect, or harmlessly
+/// after the request already finished normally. `lattice_serve.rs` already
+/// had this exact type as a private struct; `lattice.rs`'s CPU streaming
+/// path had no equivalent at all and kept generating to the token cap after
+/// a client left (its own comment documented this as "a future
+/// refinement") -- this hoists the ONE contract both binaries now share.
+pub struct CancelOnDrop(pub watch::Sender<bool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
+}
+
+/// Fresh cancel-on-drop guard/receiver pair for one request. The receiver is
+/// threaded into the engine's `should_cancel` predicate (checked before
+/// prefill, immediately after prefill, and at the top of every decode
+/// iteration); the guard is held for the lifetime of the response so it
+/// fires the moment axum drops it.
+pub fn cancel_pair() -> (CancelOnDrop, watch::Receiver<bool>) {
+    let (tx, rx) = watch::channel(false);
+    (CancelOnDrop(tx), rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +254,28 @@ mod tests {
             message: "too big".to_string(),
         };
         assert_eq!(err.message(), "too big");
+    }
+
+    #[test]
+    fn cancel_pair_receiver_starts_false() {
+        let (_guard, rx) = cancel_pair();
+        assert!(!*rx.borrow());
+    }
+
+    #[test]
+    fn cancel_on_drop_flips_receiver_true_on_drop() {
+        let (guard, rx) = cancel_pair();
+        assert!(!*rx.borrow());
+        drop(guard);
+        assert!(*rx.borrow());
+    }
+
+    #[test]
+    fn cancel_on_drop_leaves_receiver_false_while_alive() {
+        let (guard, rx) = cancel_pair();
+        assert!(!*rx.borrow());
+        // Guard still in scope -- receiver must not have flipped yet.
+        assert!(!*rx.borrow());
+        drop(guard);
     }
 }
