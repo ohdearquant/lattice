@@ -157,7 +157,29 @@ pub struct GdnLoraParams {
 }
 
 impl GdnLoraParams {
-    pub fn zeros(rank: usize, hidden: usize, gd: &GdnDims) -> Result<Self> {
+    /// Shape-aware constructor: the single source of truth for every GDN LoRA
+    /// array's length (mirrors the `d_out`/`d_in` table in the struct's doc
+    /// comment above). `fill_a`/`fill_b` receive the exact element count and
+    /// return the initialised vec, so callers that need randomized or
+    /// zero-B initialization go through the SAME shape derivation as `zeros`
+    /// instead of re-deriving `d_out` per array per call site.
+    ///
+    /// This exists because of a real drift: #792 codex round-2 found that
+    /// `train_grad_full.rs` had two independent call sites (gradcheck-mode
+    /// and training-mode initialization) that re-derived `b_b`/`b_a` as
+    /// `num_kh * rank` instead of `value_heads * rank` — the exact blocker
+    /// round-1 fixed in `zeros`, but round-1's fix never touched those two
+    /// inline constructors because they didn't call `zeros` at all. Routing
+    /// both through `shaped` (and `zeros` through `shaped`) makes that class
+    /// of drift a compile-time-shared-code property instead of a
+    /// grep-and-hope one.
+    pub fn shaped(
+        rank: usize,
+        hidden: usize,
+        gd: &GdnDims,
+        mut fill_a: impl FnMut(usize) -> Vec<f32>,
+        mut fill_b: impl FnMut(usize) -> Vec<f32>,
+    ) -> Result<Self> {
         let checked = |a: usize, b: usize, label: &str| -> Result<usize> {
             a.checked_mul(b).ok_or_else(|| {
                 TuneError::Validation(format!(
@@ -166,21 +188,25 @@ impl GdnLoraParams {
             })
         };
         Ok(Self {
-            a_qkv: vec![0.0; checked(rank, hidden, "rank*hidden (a_qkv)")?],
-            b_qkv: vec![0.0; checked(gd.qkv_dim, rank, "qkv_dim*rank (b_qkv)")?],
-            a_z: vec![0.0; checked(rank, hidden, "rank*hidden (a_z)")?],
-            b_z: vec![0.0; checked(gd.output_dim, rank, "output_dim*rank (b_z)")?],
-            a_b: vec![0.0; checked(rank, hidden, "rank*hidden (a_b)")?],
+            a_qkv: fill_a(checked(rank, hidden, "rank*hidden (a_qkv)")?),
+            b_qkv: fill_b(checked(gd.qkv_dim, rank, "qkv_dim*rank (b_qkv)")?),
+            a_z: fill_a(checked(rank, hidden, "rank*hidden (a_z)")?),
+            b_z: fill_b(checked(gd.output_dim, rank, "output_dim*rank (b_z)")?),
+            a_b: fill_a(checked(rank, hidden, "rank*hidden (a_b)")?),
             // beta (in_proj_b) is projected per VALUE head, matching the
             // shipping gdn_fused forward and the f16 weight loader — NOT
             // per key head (#792 codex round-1 blocker fix).
-            b_b: vec![0.0; checked(gd.value_heads, rank, "value_heads*rank (b_b)")?],
-            a_a: vec![0.0; checked(rank, hidden, "rank*hidden (a_a)")?],
+            b_b: fill_b(checked(gd.value_heads, rank, "value_heads*rank (b_b)")?),
+            a_a: fill_a(checked(rank, hidden, "rank*hidden (a_a)")?),
             // alpha (in_proj_a) is likewise per VALUE head.
-            b_a: vec![0.0; checked(gd.value_heads, rank, "value_heads*rank (b_a)")?],
-            a_out: vec![0.0; checked(rank, gd.output_dim, "rank*output_dim (a_out)")?],
-            b_out: vec![0.0; checked(hidden, rank, "hidden*rank (b_out)")?],
+            b_a: fill_b(checked(gd.value_heads, rank, "value_heads*rank (b_a)")?),
+            a_out: fill_a(checked(rank, gd.output_dim, "rank*output_dim (a_out)")?),
+            b_out: fill_b(checked(hidden, rank, "hidden*rank (b_out)")?),
         })
+    }
+
+    pub fn zeros(rank: usize, hidden: usize, gd: &GdnDims) -> Result<Self> {
+        Self::shaped(rank, hidden, gd, |n| vec![0.0; n], |n| vec![0.0; n])
     }
 }
 

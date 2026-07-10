@@ -195,6 +195,81 @@ fn strided_probes(len: usize, count: usize, seed: u64) -> Vec<usize> {
     out
 }
 
+/// Gradcheck-mode GDN LoRA initialization: every array (A and B) filled with
+/// small non-zero random noise, so both `grad_A` and the gate path are
+/// non-vacuous for the finite-difference probe.
+///
+/// Extracted into a standalone, testable function per #792 codex round-2:
+/// this is the exact constructor that had drifted to `gdn_dims.num_kh` for
+/// `b_b`/`b_a` while `GdnLoraParams::zeros` (fixed in round-1) used the
+/// correct `value_heads`. Now routes through `GdnLoraParams::shaped`, the
+/// single shape source of truth.
+fn gradcheck_gdn_loras(
+    num_gdn_slots: usize,
+    rank: usize,
+    hidden: usize,
+    gdn_dims: &GdnDims,
+    seed: u64,
+) -> Vec<GdnLoraParams> {
+    // rand_fill takes `&mut u64`; two closures can't each hold that mutable
+    // borrow as separate `shaped` arguments, so thread it through a `Cell`
+    // (each closure captures `&rng_cell`, a shared reference, so both can
+    // coexist as separate arguments).
+    let rng_cell = std::cell::Cell::new(seed);
+    (0..num_gdn_slots)
+        .map(|_| {
+            GdnLoraParams::shaped(
+                rank,
+                hidden,
+                gdn_dims,
+                |n| {
+                    let mut r = rng_cell.get();
+                    let v = rand_fill(&mut r, n, 0.05);
+                    rng_cell.set(r);
+                    v
+                },
+                |n| {
+                    let mut r = rng_cell.get();
+                    let v = rand_fill(&mut r, n, 0.05);
+                    rng_cell.set(r);
+                    v
+                },
+            )
+            .expect("gdn lora gradcheck-mode shapes should not overflow")
+        })
+        .collect()
+}
+
+/// Training-mode GDN LoRA initialization: A ~ U(-init_amp, +init_amp), B
+/// zero (delta=0 at init reproduces the base; grad_B != 0 so B moves first).
+///
+/// Extracted into a standalone, testable function per #792 codex round-2:
+/// see [`gradcheck_gdn_loras`] for why this must route through
+/// `GdnLoraParams::shaped` rather than re-deriving `b_b`/`b_a`'s length
+/// inline (the same drift existed at this call site independently).
+fn zero_b_gdn_loras(
+    num_gdn_slots: usize,
+    rank: usize,
+    hidden: usize,
+    gdn_dims: &GdnDims,
+    seed: u64,
+    init_amp: f32,
+) -> Vec<GdnLoraParams> {
+    let mut rng = seed;
+    (0..num_gdn_slots)
+        .map(|_| {
+            GdnLoraParams::shaped(
+                rank,
+                hidden,
+                gdn_dims,
+                |n| rand_fill(&mut rng, n, init_amp),
+                |n| vec![0.0; n],
+            )
+            .expect("gdn lora training-mode shapes should not overflow")
+        })
+        .collect()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if parse_flag(&args, "-h") || parse_flag(&args, "--help") {
@@ -495,20 +570,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b_v: rand_fill(&mut rng, dims.kv_dim * rank, 0.05),
             })
             .collect();
-        let mut gdn_loras: Vec<GdnLoraParams> = (0..num_gdn_slots)
-            .map(|_| GdnLoraParams {
-                a_qkv: rand_fill(&mut rng, rank * dims.hidden, 0.05),
-                b_qkv: rand_fill(&mut rng, gdn_dims.qkv_dim * rank, 0.05),
-                a_z: rand_fill(&mut rng, rank * dims.hidden, 0.05),
-                b_z: rand_fill(&mut rng, gdn_dims.output_dim * rank, 0.05),
-                a_b: rand_fill(&mut rng, rank * dims.hidden, 0.05),
-                b_b: rand_fill(&mut rng, gdn_dims.num_kh * rank, 0.05),
-                a_a: rand_fill(&mut rng, rank * dims.hidden, 0.05),
-                b_a: rand_fill(&mut rng, gdn_dims.num_kh * rank, 0.05),
-                a_out: rand_fill(&mut rng, rank * gdn_dims.output_dim, 0.05),
-                b_out: rand_fill(&mut rng, dims.hidden * rank, 0.05),
-            })
-            .collect();
+        let mut gdn_loras: Vec<GdnLoraParams> =
+            gradcheck_gdn_loras(num_gdn_slots, rank, dims.hidden, &gdn_dims, rng);
 
         let fwd = forward_full(
             &caches[0], &layers, &loras, &gdn_loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
@@ -780,20 +843,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             b_v: vec![0.0; dims.kv_dim * rank],
         })
         .collect();
-    let mut gdn_loras: Vec<GdnLoraParams> = (0..num_gdn_slots)
-        .map(|_| GdnLoraParams {
-            a_qkv: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_qkv: vec![0.0; gdn_dims.qkv_dim * rank],
-            a_z: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_z: vec![0.0; gdn_dims.output_dim * rank],
-            a_b: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_b: vec![0.0; gdn_dims.num_kh * rank],
-            a_a: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_a: vec![0.0; gdn_dims.num_kh * rank],
-            a_out: rand_fill(&mut rng, rank * gdn_dims.output_dim, init_amp),
-            b_out: vec![0.0; dims.hidden * rank],
-        })
-        .collect();
+    // Reuses `rng`'s current stream position as the seed (matches the prior
+    // inline behavior of drawing from the same generator as `loras` above).
+    let mut gdn_loras: Vec<GdnLoraParams> =
+        zero_b_gdn_loras(num_gdn_slots, rank, dims.hidden, &gdn_dims, rng, init_amp);
 
     let mut adam = AdamState::new();
     let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
@@ -1019,4 +1072,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod gdn_lora_ctor_tests {
+    use super::*;
+
+    /// Asymmetric fixture (num_kh=2, value_heads=4) — the only shape that can
+    /// distinguish "sized by key heads" from "sized by value heads"; a
+    /// symmetric config (e.g. num_kh == value_heads) would pass either way.
+    /// #792 codex round-2 blocker: `gradcheck_gdn_loras`/`zero_b_gdn_loras`
+    /// (this binary's two GDN LoRA initializers) had independently
+    /// re-derived `b_b`/`b_a` as `num_kh * rank` instead of
+    /// `value_heads * rank`, breaking on exactly this shape class.
+    fn asymmetric_gdn_dims() -> GdnDims {
+        let key_dim = 8;
+        let value_dim = 8;
+        let num_kh = 2;
+        let value_heads = 4;
+        GdnDims {
+            num_kh,
+            value_heads,
+            key_dim,
+            value_dim,
+            qkv_dim: 2 * key_dim * num_kh + value_heads * value_dim,
+            output_dim: value_heads * value_dim,
+            kernel_size: 3,
+            scale: 1.0 / (key_dim as f32).sqrt(),
+        }
+    }
+
+    #[test]
+    fn gradcheck_gdn_loras_sizes_b_b_and_b_a_by_value_heads() {
+        let gd = asymmetric_gdn_dims();
+        let hidden = 16;
+        let rank = 3;
+        let loras = gradcheck_gdn_loras(2, rank, hidden, &gd, 0x1234_5678);
+        assert_eq!(loras.len(), 2);
+        for lora in &loras {
+            assert_eq!(
+                lora.b_b.len(),
+                gd.value_heads * rank,
+                "b_b must be sized by value_heads ({}), not num_kh ({})",
+                gd.value_heads,
+                gd.num_kh
+            );
+            assert_eq!(
+                lora.b_a.len(),
+                gd.value_heads * rank,
+                "b_a must be sized by value_heads ({}), not num_kh ({})",
+                gd.value_heads,
+                gd.num_kh
+            );
+            // Non-zero: gradcheck mode fills both A and B with random noise.
+            assert!(lora.b_b.iter().any(|&v| v != 0.0));
+            assert!(lora.b_a.iter().any(|&v| v != 0.0));
+        }
+    }
+
+    #[test]
+    fn zero_b_gdn_loras_sizes_b_b_and_b_a_by_value_heads() {
+        let gd = asymmetric_gdn_dims();
+        let hidden = 16;
+        let rank = 3;
+        let init_amp = 1.0 / (hidden as f32).sqrt();
+        let loras = zero_b_gdn_loras(2, rank, hidden, &gd, 0xFEED_FACE, init_amp);
+        assert_eq!(loras.len(), 2);
+        for lora in &loras {
+            assert_eq!(
+                lora.b_b.len(),
+                gd.value_heads * rank,
+                "b_b must be sized by value_heads ({}), not num_kh ({})",
+                gd.value_heads,
+                gd.num_kh
+            );
+            assert_eq!(
+                lora.b_a.len(),
+                gd.value_heads * rank,
+                "b_a must be sized by value_heads ({}), not num_kh ({})",
+                gd.value_heads,
+                gd.num_kh
+            );
+            // Training-mode: B is zero at init (delta=0 reproduces the base).
+            assert!(lora.b_b.iter().all(|&v| v == 0.0));
+            assert!(lora.b_a.iter().all(|&v| v == 0.0));
+            // A is non-zero random.
+            assert!(lora.a_b.iter().any(|&v| v != 0.0));
+            assert!(lora.a_a.iter().any(|&v| v != 0.0));
+        }
+    }
 }
