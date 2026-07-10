@@ -209,14 +209,23 @@ fn softmax_decode_scores(
             l = l * alpha + (s - m_new).exp();
             m = m_new;
         }
-        if l > 0.0 {
-            let inv_l = 1.0 / l;
-            for s in row.iter_mut() {
-                *s = (*s - m).exp() * inv_l;
-            }
-        } else {
-            row.fill(0.0);
+        // ADR-080 C1: route the fail-closed final decision through the
+        // shared row-finalizer (#780). Behavior-preserving: the online
+        // (Welford-style) running normalizer `l` here is arithmetically
+        // independent of this split — `l` and `m` are already fully
+        // resolved from the read-only pass above. Splitting the fused
+        // `exp(*s - m) * inv_l` into a separate exp pass then
+        // `finalize_row`'s multiply-by-`inv` is the same floating-point
+        // operations in the same order (no added/removed rounding step).
+        // The added `l.is_finite()` guard (vs. the prior bare `l > 0.0`)
+        // does not change reachable behavior: in every non-finite-score
+        // scenario reachable here, `l` becomes NaN (not a finite-but-huge
+        // or `+inf` value) before this point, so `l > 0.0` and
+        // `l.is_finite() && l > 0.0` already agree on every reachable input.
+        for s in row.iter_mut() {
+            *s = (*s - m).exp();
         }
+        crate::attention::softmax_row::finalize_row(row, l);
     }
 }
 
@@ -813,6 +822,38 @@ mod tests {
             out.iter().all(|&x| x == 0.0),
             "expected fail-closed zero row, got {out:?}"
         );
+    }
+
+    /// ADR-080 C1: `softmax_decode_scores` (the scalar/portable path, called
+    /// directly here rather than through `decode_attention` which always
+    /// dispatches to NEON on aarch64) must fail closed on a lone NaN score,
+    /// not leave it corrupting the row. A second, unpoisoned head in the
+    /// same batched buffer must stay unaffected.
+    #[test]
+    fn test_decode_softmax_scalar_nan_score_fails_closed() {
+        let kv_seq_len = 4;
+        let num_heads = 2;
+        let score_stride = kv_seq_len;
+        let mut scores = vec![0.0f32; num_heads * score_stride];
+        // head 0: poisoned with a NaN score.
+        scores[0..kv_seq_len].copy_from_slice(&[1.0, f32::NAN, 0.5, -0.2]);
+        // head 1: well-formed, must be unaffected.
+        scores[score_stride..score_stride + kv_seq_len].copy_from_slice(&[0.1, 0.2, 0.3, 0.05]);
+
+        softmax_decode_scores(&mut scores, num_heads, kv_seq_len, score_stride);
+
+        let head0 = &scores[0..kv_seq_len];
+        assert!(
+            head0.iter().all(|&v| v == 0.0),
+            "NaN-poisoned head must zero out: {head0:?}"
+        );
+        let head1 = &scores[score_stride..score_stride + kv_seq_len];
+        assert!(
+            head1.iter().all(|v| v.is_finite()),
+            "sibling head must be unaffected: {head1:?}"
+        );
+        let sum: f32 = head1.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-4, "head1 must sum to ~1: {head1:?}");
     }
 
     /// A `NaN` score in the scalar tail (`kv_seq_len % 16 != 0`) must fail closed

@@ -248,14 +248,16 @@ fn test_softmax_simd_matches_scalar() {
     }
 }
 
-// A NaN in an attention-score row must not make the NEON fast path diverge from the
-// scalar reference. seq_len must be >= CHUNK (16) so the row actually enters the NEON
-// vector max loop; a shorter row falls to the scalar tail and matches trivially. With
-// FMAX (the pre-fix reduction) the NaN propagates -> max = NaN -> every exp underflows
-// to 0 -> the row is all zeros. With FMAXNM (maxNum) the NaN is dropped, matching the
-// scalar path which normalizes the finite logits and gives the NaN lane zero weight.
-// aarch64-only: the AVX2 path uses a different (position-dependent) NaN reduction and
-// its maxNum/NaN-delta parity is a deliberate, separately-tracked follow-up.
+// ADR-080 C1 (#780): a NaN anywhere in an attention-score row must fail-close
+// the WHOLE row, not just leave that lane at zero weight while the rest of
+// the row silently renormalizes around the other (finite) scores. This test
+// previously locked the pre-C1 behavior (NaN lane -> 0.0, row still sums to
+// 1.0), which is exactly the "silently drop a single lane" pattern #740/C1
+// forbids; it now asserts the fail-closed contract instead. seq_len must be
+// >= CHUNK (16) so the row actually enters the NEON vector max/NaN-scan loop;
+// a shorter row falls to the scalar tail and matches trivially.
+// aarch64-only: the AVX2 path uses a separate SIMD implementation with its
+// own dedicated NaN-lane tests in `forward/cpu/softmax.rs`.
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn test_softmax_neon_nan_row_matches_scalar() {
@@ -266,25 +268,28 @@ fn test_softmax_neon_nan_row_matches_scalar() {
     for (i, v) in x_simd.iter_mut().enumerate() {
         *v = (i % seq_len) as f32;
     }
-    // Poison the first lane of row 0 with NaN (the lane FMAX would propagate from).
+    // Poison the first lane of row 0 with NaN.
     x_simd[0] = f32::NAN;
     let mut x_scalar = x_simd.clone();
 
     softmax_attention(&mut x_simd, seq_len, num_heads);
     softmax_attention_scalar(&mut x_scalar, seq_len, num_heads);
 
-    // The NaN lane gets zero weight in both paths (fast_exp(NaN) -> 0.0).
-    assert_eq!(x_simd[0], 0.0, "NEON NaN lane must be 0.0, not propagated");
-    assert_eq!(x_scalar[0], 0.0);
-
-    // Row 0 must be a real distribution (sums to 1), NOT the pre-fix all-zeros.
-    let row0_sum: f32 = x_simd[0..seq_len].iter().sum();
-    assert_relative_eq!(row0_sum, 1.0, epsilon = 1e-3);
-
-    // NEON and scalar agree element-wise across every lane of the NaN row.
+    // ADR-080 C1: the NaN poisons the WHOLE row, not just its own lane.
     for i in 0..seq_len {
-        assert_relative_eq!(x_simd[i], x_scalar[i], epsilon = 1e-3);
+        assert_eq!(
+            x_simd[i], 0.0,
+            "NEON row must fail-close to all-zero: lane {i}"
+        );
+        assert_eq!(
+            x_scalar[i], 0.0,
+            "scalar row must fail-close to all-zero: lane {i}"
+        );
     }
+
+    // A sibling (non-poisoned) row is unaffected and still normalizes to 1.0.
+    let row1_sum: f32 = x_simd[seq_len..2 * seq_len].iter().sum();
+    assert_relative_eq!(row1_sum, 1.0, epsilon = 1e-3);
 }
 
 // An all-masked attention row (every score -inf, the structural mask used by
@@ -332,19 +337,15 @@ fn test_softmax_all_masked_row_is_zero_across_backends() {
     assert_relative_eq!(row1_sum, 1.0, epsilon = 1e-3);
 }
 
-// Contract for a row with at least one finite valid score and a -inf-masked key
-// (the common #361 case, distinct from the all-masked row above). The masked
-// weight is NOT mathematically exact zero: `softmax_attention` routes through
-// `fast_exp`, which clamps its input to the [-87, 88] floor, so `fast_exp(-inf)`
-// is `fast_exp(-87)` ~= 1.746e-38, not 0.0. This is deliberate and byte-identical
-// to the prior `-10_000.0` sentinel for valid-keys-present rows (both clamp to the
-// same floor), which is why e2e-parity greedy generation is unaffected. The
-// guarantee #361 needs is weaker than exact zero: the masked weight is negligible
-// and never the row max / never dominant. Asserting the clamped magnitude (rather
-// than 0.0) locks that contract so a future `-inf`->0.0 special-case can't silently
-// change parity/perf behaviour without updating this expectation.
+// ADR-080 C1 (#740): a row with at least one finite valid score and a
+// -inf-masked key (the common #361 case, distinct from the all-masked row
+// above) must give the masked key EXACT zero weight, not a tiny nonzero
+// `fast_exp` clamp floor. This test previously locked the pre-#740 behavior
+// (masked weight ~= fast_exp(-87) ~= 1.7e-38, deliberately nonzero); C1's
+// exact-zero-masking fix (`is_masked_neg_inf`) closed that leak, so this now
+// asserts the masked lane is precisely `0.0`.
 #[test]
-fn test_softmax_finite_valid_row_masked_weight_is_clamped_nonzero_not_dominant() {
+fn test_softmax_finite_valid_row_masked_weight_is_exact_zero() {
     let num_heads = 1;
     let seq_len = 2;
     // Row 0: valid key 0 scores 0.0, masked key 1 is -inf.
@@ -357,19 +358,11 @@ fn test_softmax_finite_valid_row_masked_weight_is_clamped_nonzero_not_dominant()
         valid.is_finite() && masked.is_finite(),
         "row must be finite"
     );
-    // The masked weight is a tiny clamped nonzero, not exact zero.
+    assert_eq!(masked, 0.0, "masked lane must be exact zero, got {masked}");
+    // The valid key carries all the probability mass.
     assert!(
-        masked > 0.0,
-        "fast_exp clamp makes the masked weight strictly > 0"
-    );
-    assert!(
-        masked < 1e-30,
-        "masked weight {masked} must be negligible (clamped fast_exp(-87) ~= 1.7e-38)"
-    );
-    // The valid key carries essentially all the probability mass: never dominated.
-    assert!(
-        valid > 1.0 - 1e-6,
-        "valid key weight {valid} must dominate (~1.0)"
+        (valid - 1.0).abs() < 1e-6,
+        "valid key weight {valid} must be ~1.0"
     );
 }
 

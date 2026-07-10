@@ -1111,14 +1111,14 @@ fn compute_attention(
                 l = l * alpha + (s - m_new).exp();
                 m = m_new;
             }
-            if l > 0.0 {
-                let inv_l = 1.0 / l;
-                for s in scores.iter_mut() {
-                    *s = (*s - m).exp() * inv_l;
-                }
-            } else {
-                scores.fill(0.0);
+            // ADR-080 C1 (#785 round-1 medium 1): route the final decision
+            // through the shared row-finalizer. Behavior-preserving -- `l`
+            // reaches the same `<= 0.0`/non-finite outcomes as the manual
+            // `if l > 0.0 { .. } else { scores.fill(0.0) }` this replaces.
+            for s in scores.iter_mut() {
+                *s = (*s - m).exp();
             }
+            crate::attention::softmax_row::finalize_row(scores, l);
         }
 
         // Phase 3: V accumulation — per-head, NEON-accelerated on aarch64 for head_dim=128.
@@ -1167,27 +1167,18 @@ fn compute_attention(
                 }
             }
 
-            // Softmax
+            // Softmax. ADR-080 C1 (#785 round-1 medium 1): route the final
+            // decision through the shared row-finalizer -- behavior-preserving,
+            // real (unclamped) `.exp()` already reaches the same full-row-zero
+            // outcome via NaN-into-`sum` propagation that the manual
+            // `if sum > 0.0 { .. } else { scores.fill(0.0) }` this replaces did.
             let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0f32;
             for s in scores.iter_mut() {
                 *s = (*s - max_score).exp();
                 sum += *s;
             }
-            if sum > 0.0 {
-                let inv = 1.0 / sum;
-                for s in scores.iter_mut() {
-                    *s *= inv;
-                }
-            } else {
-                // Fail closed, mirroring the q_seq_len==1 online fast path (l > 0.0
-                // guard above). A non-finite score (e.g. a NaN Q/K activation) makes
-                // `sum` NaN; `NaN > 0.0` is false, so without this branch the
-                // unnormalized NaN weights would flow into the V accumulation and
-                // poison the attention output. Zeroing the row drops this query's
-                // contribution instead of propagating garbage into the logits.
-                scores.fill(0.0);
-            }
+            crate::attention::softmax_row::finalize_row(scores, sum);
 
             // Weighted sum of V
             let out_off = qi * (num_heads * head_dim) + h * head_dim;
@@ -1557,10 +1548,14 @@ mod tests {
             output[0]
         );
         assert_eq!(output[0], 0.0, "failed-closed row must be zeroed");
-        // Query 1 has a finite score and must still produce a finite result.
+        // ADR-080 C1 (#785 round-1 medium 1) clean-row parity check: query 1's
+        // clean row must still normalize through `finalize_row` to the exact
+        // weighted average, not merely stay finite. Both keys score equally
+        // (q[1] == 0.0 dotted with either k), so softmax is a uniform 0.5/0.5
+        // and output[1] == 0.5*7.0 + 0.5*11.0 == 9.0.
         assert!(
-            output[1].is_finite(),
-            "finite query must be unaffected, got {}",
+            (output[1] - 9.0).abs() < 1e-5,
+            "clean sibling query must normalize to the exact weighted average, got {}",
             output[1]
         );
     }

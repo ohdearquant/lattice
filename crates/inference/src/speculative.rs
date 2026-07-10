@@ -934,30 +934,30 @@ impl<'a> MtpVerifier<'a> {
 
             // Compute scores
             let scores_start = qh * cur_seq_len;
-            let mut max_score = f32::NEG_INFINITY;
             for t in 0..cur_seq_len {
                 let k_off = t * kv_dim + kvh * head_dim;
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
                     dot += self.scratch.q[q_off + d] * k_all[k_off + d];
                 }
-                let s = dot * scale;
-                self.scratch.scores[scores_start + t] = s;
-                if s > max_score {
-                    max_score = s;
-                }
+                self.scratch.scores[scores_start + t] = dot * scale;
             }
 
-            // Softmax
-            let mut sum_exp = 0.0f32;
-            for t in 0..cur_seq_len {
-                let e = (self.scratch.scores[scores_start + t] - max_score).exp();
-                self.scratch.scores[scores_start + t] = e;
-                sum_exp += e;
-            }
-            let inv_sum = 1.0 / sum_exp;
-            for t in 0..cur_seq_len {
-                self.scratch.scores[scores_start + t] *= inv_sum;
+            // ADR-080 C1: fail-closed softmax row contract (#785 round-1 blocker 1).
+            // This is MtpVerifier's own GQA attention over its KV cache, not a
+            // vocabulary/logit softmax -- a NaN/`+inf` cached score must zero the
+            // whole row, not silently poison every weight via `1.0 / sum_exp`.
+            let row = &mut self.scratch.scores[scores_start..scores_start + cur_seq_len];
+            let (max_score, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(row);
+            if crate::attention::softmax_row::row_fails_closed_pre_exp(max_score, any_nan) {
+                row.fill(0.0);
+            } else {
+                let mut sum_exp = 0.0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - max_score).exp();
+                    sum_exp += *v;
+                }
+                crate::attention::softmax_row::finalize_row(row, sum_exp);
             }
 
             // Weighted sum of V
@@ -4513,5 +4513,73 @@ mod tests {
         // `all_tokens.last()` in the first decode step.
         let out = generate_with_speculation(&[], 8, 999, |_tok, _pos| vec![0.0; 4], 3, 4);
         assert!(out.is_empty());
+    }
+
+    /// ADR-080 C1 (#785 round-1 blocker 1): `MtpVerifier::forward_one`'s own GQA
+    /// attention over its KV cache is a production attention row, not a
+    /// vocabulary/logit softmax (the PR body's original classification was wrong).
+    /// A NaN cached K row must zero the whole attention-context row for every
+    /// query head that attends through that KV head, while a sibling query head
+    /// attending through an unpoisoned KV head stays finite/normalized.
+    ///
+    /// Uses `num_key_value_heads == num_attention_heads == 2` (MHA, `groups == 1`)
+    /// so each query head has its own independent KV head slice: poisoning KV
+    /// head 0 cannot leak into query head 1's row through GQA sharing.
+    #[test]
+    fn mtp_forward_one_nan_cached_k_row_fails_closed_sibling_head_stays_finite() {
+        let mut cfg = tiny_mtp_config();
+        cfg.num_key_value_heads = 2; // MHA: qh 0 -> kvh 0, qh 1 -> kvh 1, independent caches
+        let weights = tiny_mtp_weights(&cfg);
+        let h = cfg.hidden_size;
+        let head_dim = cfg.head_dim;
+        let max_seq = 8usize;
+
+        let embed: Vec<f32> = (0..cfg.vocab_size * h)
+            .map(|i| ((i as f32 + 1.0) * 0.01).sin())
+            .collect();
+        let lm_head: Vec<f32> = (0..cfg.vocab_size * h)
+            .map(|i| ((i as f32 + 2.0) * 0.01).cos())
+            .collect();
+        let prev_hidden: Vec<f32> = (0..h).map(|i| 0.1 * (i as f32 + 1.0)).collect();
+
+        let mut verifier = MtpVerifier::new(cfg, &weights, &embed, &lm_head, max_seq).unwrap();
+
+        // Step 0: append a real (unpoisoned) K/V pair at cache position 0.
+        verifier.forward_one(1, 0, &prev_hidden).unwrap();
+        assert_eq!(verifier.cache.seq_len(), 1);
+
+        // Directly poison KV head 0's cached K vector at position 0 -- a NaN
+        // score that must be caught by `row_max_and_any_nan`, not silently
+        // dropped by the old `if s > max_score` fold.
+        {
+            let k_buf = verifier.cache.k_buffer_mut(0);
+            // Position 0, KV head 0 occupies the first `head_dim` lanes of the
+            // per-position `kv_dim`-wide slice.
+            k_buf[0] = half::f16::NAN;
+        }
+
+        // Step 1: a second forward_one attends over cache positions {0, 1}.
+        // qh=0 (kvh=0) sees the poisoned position-0 score; qh=1 (kvh=1) does not.
+        verifier.forward_one(2, 1, &prev_hidden).unwrap();
+
+        let ctx = &verifier.scratch.context;
+        let poisoned_head = &ctx[0..head_dim];
+        let clean_head = &ctx[head_dim..2 * head_dim];
+
+        assert!(
+            poisoned_head.iter().all(|&v| v == 0.0),
+            "query head attending through the poisoned KV head must be exactly \
+             all-zero (fail-closed), got {poisoned_head:?}"
+        );
+        assert!(
+            clean_head.iter().all(|v| v.is_finite()),
+            "sibling query head attending through an unpoisoned KV head must \
+             stay finite, got {clean_head:?}"
+        );
+        assert!(
+            clean_head.iter().any(|&v| v != 0.0),
+            "sibling query head's context must be a real (non-degenerate) \
+             normalized result, not incidentally all-zero, got {clean_head:?}"
+        );
     }
 }

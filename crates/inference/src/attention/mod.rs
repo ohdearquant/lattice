@@ -10,6 +10,7 @@ pub mod gdn_backward;
 pub mod gdn_fused;
 pub mod gqa;
 pub mod native_sparse;
+pub mod softmax_row;
 pub mod standard;
 
 // Re-export from standard for backward compat

@@ -637,6 +637,37 @@ impl Drop for QwenModel {
     }
 }
 
+/// ADR-080 cluster C1: apply the causal mask then the fail-closed softmax
+/// normalization to a single `[seq_len]` attention-score row in place, where
+/// `qi` is this row's query position and `scale` is the pre-softmax score
+/// scale (`1 / sqrt(head_dim)`).
+///
+/// This is the shared body of what used to be two byte-identical inline
+/// softmax duplicates in `forward_all_layers` and `forward_profiled` (#780);
+/// extracting it here both routes the fail-closed decision through the
+/// shared `attention::softmax_row` contract and removes the duplication
+/// between the two call sites in this file.
+fn causal_softmax_row(row: &mut [f32], qi: usize, scale: f32) {
+    for (ki, v) in row.iter_mut().enumerate() {
+        if ki > qi {
+            *v = f32::NEG_INFINITY;
+        } else {
+            *v *= scale;
+        }
+    }
+    let (max_val, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(row);
+    if crate::attention::softmax_row::row_fails_closed_pre_exp(max_val, any_nan) {
+        row.fill(0.0);
+        return;
+    }
+    let mut sum = 0.0f32;
+    for v in row.iter_mut() {
+        *v = (*v - max_val).exp();
+        sum += *v;
+    }
+    crate::attention::softmax_row::finalize_row(row, sum);
+}
+
 impl QwenModel {
     /// **Unstable**: load Qwen3 model from a local directory; path convention may change.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
@@ -1126,27 +1157,14 @@ impl QwenModel {
                     head_dim,
                     seq_len,
                 );
+                // ADR-080 C1: shared `causal_softmax_row` helper (defined above
+                // `impl QwenModel`) replaces the bare `sum > 0.0` check (which
+                // had no `else` and left a NaN/+inf-poisoned row un-zeroed,
+                // #780) and deduplicates what used to be two byte-identical
+                // secondary-prefill softmax copies in this file.
                 for qi in 0..seq_len {
                     let row = &mut scores_head[qi * seq_len..(qi + 1) * seq_len];
-                    for ki in 0..seq_len {
-                        if ki > qi {
-                            row[ki] = f32::NEG_INFINITY;
-                        } else {
-                            row[ki] *= scale;
-                        }
-                    }
-                    let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0f32;
-                    for v in row.iter_mut() {
-                        *v = (*v - max_val).exp();
-                        sum += *v;
-                    }
-                    if sum > 0.0 {
-                        let inv = 1.0 / sum;
-                        for v in row.iter_mut() {
-                            *v *= inv;
-                        }
-                    }
+                    causal_softmax_row(row, qi, scale);
                 }
                 for i in 0..seq_len {
                     let v_off = i * kv_dim + kv_h * head_dim;
@@ -1449,27 +1467,14 @@ impl QwenModel {
                 );
 
                 // Scale + causal mask + softmax.
+                // ADR-080 C1: shared `causal_softmax_row` helper (defined above
+                // `impl QwenModel`) replaces the bare `sum > 0.0` check (which
+                // had no `else` and left a NaN/+inf-poisoned row un-zeroed,
+                // #780) and deduplicates what used to be two byte-identical
+                // secondary-prefill softmax copies in this file.
                 for qi in 0..seq_len {
                     let row = &mut scores_head[qi * seq_len..(qi + 1) * seq_len];
-                    for ki in 0..seq_len {
-                        if ki > qi {
-                            row[ki] = f32::NEG_INFINITY;
-                        } else {
-                            row[ki] *= scale;
-                        }
-                    }
-                    let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0f32;
-                    for v in row.iter_mut() {
-                        *v = (*v - max_val).exp();
-                        sum += *v;
-                    }
-                    if sum > 0.0 {
-                        let inv = 1.0 / sum;
-                        for v in row.iter_mut() {
-                            *v *= inv;
-                        }
-                    }
+                    causal_softmax_row(row, qi, scale);
                 }
 
                 // Transpose V_head for matmul_bt trick: V_T[head_dim, seq_len]
@@ -3456,5 +3461,94 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ---------------------------------------------------------------
+    // ADR-080 C1: `causal_softmax_row` (shared by the `forward_all_layers` /
+    // `forward_profiled` secondary-prefill duplicates, #780) must fail
+    // closed on a NaN score, a `+inf` max, or a fully-masked row, not
+    // propagate garbage.
+    //
+    // Note on scope: an earlier version of this test built a full
+    // `QwenModel` fixture and poisoned a token's *embedding* to check that
+    // the NaN didn't leak into sibling positions' hidden states end to end.
+    // That test was infeasible and was removed: poisoning a token's
+    // embedding poisons Q, K, *and* V for that position (all three are
+    // linear projections of the same hidden row), and `0.0 * NaN == NaN` in
+    // IEEE 754 — so even a *correctly* fail-closed softmax weight of exactly
+    // `0.0` for the poisoned position still yields NaN once multiplied
+    // against that position's NaN V-vector in the context matmul
+    // (`scores @ V`). That is a property of plain matmul shared by the
+    // canonical `gqa.rs`/`decode.rs` implementations too (neither guards
+    // exact-zero-weight multiplication against a NaN operand); it is a
+    // separate, out-of-scope concern from the softmax row-finalizer contract
+    // this cluster fixes. `gqa.rs`'s own existing NaN tests
+    // (`fused_softmax_all_neg_inf_row_is_zero_not_nan`,
+    // `fused_softmax_pos_inf_row_is_zero_not_nan`) test at the same level as
+    // here: the softmax row function directly, not through a full
+    // model forward pass.
+    // ---------------------------------------------------------------
+
+    /// A NaN score anywhere in the visible (non-causally-masked) range must
+    /// zero the whole row. RED before the fix: `if sum > 0.0` with no `else`
+    /// left a NaN-poisoned row's NaN/garbage exponentials un-zeroed.
+    #[test]
+    fn causal_softmax_row_nan_score_fails_closed() {
+        let mut row = vec![1.0f32, f32::NAN, 2.0];
+        causal_softmax_row(&mut row, 2, 1.0);
+        assert!(
+            row.iter().all(|&v| v == 0.0),
+            "expected all-zero row: {row:?}"
+        );
+    }
+
+    /// A `+inf` score must zero the whole row (fail-closed on non-finite max).
+    #[test]
+    fn causal_softmax_row_pos_inf_score_fails_closed() {
+        let mut row = vec![1.0f32, f32::INFINITY, 2.0];
+        causal_softmax_row(&mut row, 2, 1.0);
+        assert!(
+            row.iter().all(|&v| v == 0.0),
+            "expected all-zero row: {row:?}"
+        );
+    }
+
+    /// The causal mask sets every `ki > qi` lane to `-inf` before the
+    /// fail-closed decision; a query that only sees itself (`qi == 0`) must
+    /// still normalize correctly (this is not a poisoned-row case).
+    #[test]
+    fn causal_softmax_row_masks_future_positions() {
+        let mut row = vec![1.0f32, 2.0, 3.0];
+        causal_softmax_row(&mut row, 0, 1.0);
+        assert_eq!(
+            row,
+            vec![1.0, 0.0, 0.0],
+            "query 0 must attend only to itself: {row:?}"
+        );
+    }
+
+    /// A row that is fully masked to `-inf` (degenerate `qi` with no visible
+    /// keys) must zero out rather than compute `exp(NaN)` from a `-inf - -inf`
+    /// subtraction.
+    #[test]
+    fn causal_softmax_row_all_masked_zeros_row() {
+        let mut row = vec![f32::NEG_INFINITY; 3];
+        causal_softmax_row(&mut row, 0, 1.0);
+        assert!(
+            row.iter().all(|&v| v == 0.0),
+            "expected all-zero row: {row:?}"
+        );
+    }
+
+    /// A well-formed row still normalizes to a valid probability
+    /// distribution over the visible (non-masked) positions (guards against
+    /// the fixture trivially zeroing everything regardless of the fix).
+    #[test]
+    fn causal_softmax_row_normal_row_sums_to_one() {
+        let mut row = vec![1.0f32, 2.0, 3.0, 4.0];
+        causal_softmax_row(&mut row, 3, 1.0);
+        assert!(row.iter().all(|v| v.is_finite() && *v >= 0.0));
+        let sum: f32 = row.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "expected sum ~1.0, got {sum}");
     }
 }

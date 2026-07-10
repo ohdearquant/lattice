@@ -375,7 +375,6 @@ impl Qwen35Model {
             let q = &scratch.q_buf[q_off..q_off + head_dim];
 
             let scores_start = qh * cur_seq_len;
-            let mut max_score = f32::NEG_INFINITY;
 
             for t in 0..cur_seq_len {
                 let k_off = t * kv_dim + kvh * head_dim;
@@ -383,23 +382,12 @@ impl Qwen35Model {
                 for d in 0..head_dim {
                     dot += q[d] * k_cache[k_off + d];
                 }
-                let s = dot * scale;
-                scratch.scores[scores_start + t] = s;
-                if s > max_score {
-                    max_score = s;
-                }
+                scratch.scores[scores_start + t] = dot * scale;
             }
 
-            let mut sum_exp = 0.0f32;
-            for t in 0..cur_seq_len {
-                let e = (scratch.scores[scores_start + t] - max_score).exp();
-                scratch.scores[scores_start + t] = e;
-                sum_exp += e;
-            }
-            let inv_sum = 1.0 / sum_exp;
-            for t in 0..cur_seq_len {
-                scratch.scores[scores_start + t] *= inv_sum;
-            }
+            decode_context_softmax_row(
+                &mut scratch.scores[scores_start..scores_start + cur_seq_len],
+            );
 
             let ctx_off = qh * head_dim;
             for d in 0..head_dim {
@@ -502,5 +490,61 @@ impl Qwen35Model {
             down_input,
             &mut scratch.ffn_out[..hidden],
         );
+    }
+}
+
+/// ADR-080 cluster C1: fail-closed softmax normalize for one decode-step
+/// attention-score row (`compute_attention_context`'s per-head row over the
+/// KV cache, #780). No causal masking here — decode attends to every cached
+/// position for the current token, so unlike the prefill row-finalizers this
+/// is a plain full-row two-pass softmax with no masked tail.
+fn decode_context_softmax_row(row: &mut [f32]) {
+    let (max_score, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(row);
+    if crate::attention::softmax_row::row_fails_closed_pre_exp(max_score, any_nan) {
+        row.fill(0.0);
+        return;
+    }
+    let mut sum_exp = 0.0f32;
+    for v in row.iter_mut() {
+        *v = (*v - max_score).exp();
+        sum_exp += *v;
+    }
+    crate::attention::softmax_row::finalize_row(row, sum_exp);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RED before the fix: the bare `1.0 / sum_exp` had no guard, so a
+    /// NaN-poisoned cached score propagated NaN into every lane instead of
+    /// failing the row closed.
+    #[test]
+    fn decode_context_softmax_row_nan_score_fails_closed() {
+        let mut row = vec![1.0f32, f32::NAN, 0.5];
+        decode_context_softmax_row(&mut row);
+        assert!(
+            row.iter().all(|&v| v == 0.0),
+            "expected all-zero row: {row:?}"
+        );
+    }
+
+    #[test]
+    fn decode_context_softmax_row_pos_inf_score_fails_closed() {
+        let mut row = vec![1.0f32, f32::INFINITY, 0.5];
+        decode_context_softmax_row(&mut row);
+        assert!(
+            row.iter().all(|&v| v == 0.0),
+            "expected all-zero row: {row:?}"
+        );
+    }
+
+    #[test]
+    fn decode_context_softmax_row_normal_row_sums_to_one() {
+        let mut row = vec![1.0f32, 2.0, 3.0, 0.5];
+        decode_context_softmax_row(&mut row);
+        assert!(row.iter().all(|v| v.is_finite() && *v >= 0.0));
+        let sum: f32 = row.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "expected sum ~1.0, got {sum}");
     }
 }

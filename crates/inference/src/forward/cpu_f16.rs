@@ -350,7 +350,6 @@ fn full_attention_step_f16(
 
         // Compute scores against all cached K vectors
         let scores_start = qh * cur_seq_len;
-        let mut max_score = f32::NEG_INFINITY;
 
         for t in 0..cur_seq_len {
             let k_off = t * kv_dim + kvh * head_dim;
@@ -358,23 +357,26 @@ fn full_attention_step_f16(
             for d in 0..head_dim {
                 dot += q[d] * k_cache[k_off + d];
             }
-            let s = dot * scale;
-            scratch.scores[scores_start + t] = s;
-            if s > max_score {
-                max_score = s;
-            }
+            scratch.scores[scores_start + t] = dot * scale;
         }
 
-        // Softmax
-        let mut sum_exp = 0.0f32;
-        for t in 0..cur_seq_len {
-            let e = (scratch.scores[scores_start + t] - max_score).exp();
-            scratch.scores[scores_start + t] = e;
-            sum_exp += e;
-        }
-        let inv_sum = 1.0 / sum_exp;
-        for t in 0..cur_seq_len {
-            scratch.scores[scores_start + t] *= inv_sum;
+        // ADR-080 C1: route the fail-closed final decision through the
+        // shared row-finalizer contract (#780). RED before the fix: the
+        // bare `1.0 / sum_exp` had no guard, so a NaN/`+inf` cached score
+        // propagated NaN into the context output instead of failing the
+        // row closed. Mirrors the byte-identical duplicate in
+        // `model::qwen35::forward::compute_attention_context`.
+        let row = &mut scratch.scores[scores_start..scores_start + cur_seq_len];
+        let (max_score, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(row);
+        if crate::attention::softmax_row::row_fails_closed_pre_exp(max_score, any_nan) {
+            row.fill(0.0);
+        } else {
+            let mut sum_exp = 0.0f32;
+            for v in row.iter_mut() {
+                *v = (*v - max_score).exp();
+                sum_exp += *v;
+            }
+            crate::attention::softmax_row::finalize_row(row, sum_exp);
         }
 
         // Weighted sum of V
@@ -1242,6 +1244,125 @@ mod tests {
             max_q_diff < 1e-4,
             "cpu F16 Q-loop stride-half RoPE diverges from reference: max_q_diff = {max_q_diff:.6}. \
              With interleaved pairing the diff is O(0.1-1). Bug: #392."
+        );
+    }
+
+    /// ADR-080 C1 (#780): `full_attention_step_f16`'s decode-attention row
+    /// finalizer must fail closed on a NaN score, not propagate the bare
+    /// `1.0 / sum_exp` into the context output. A prior cached position is
+    /// poisoned (NaN K); the current position's own K/V stay finite. RED
+    /// before the fix: the poisoned row's NaN leaked into every context lane.
+    #[test]
+    fn test_full_attn_step_f16_nan_cached_score_fails_closed() {
+        use crate::model::qwen35_config::LayerType;
+        use crate::weights::f16_weights::f32_to_f16_slice;
+
+        let head_dim: usize = 32;
+        let num_q_heads: usize = 1;
+        let num_kv_heads: usize = 1;
+        let hidden: usize = 64;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let position: usize = 1;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 2,
+            vocab_size: 128,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: num_q_heads,
+            num_key_value_heads: num_kv_heads,
+            head_dim,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: Some(2),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+            layer_mask: vec![true; 2],
+            eos_token_id: 127,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+        };
+
+        let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
+
+        let to_f16 = |src: &[f32]| -> Vec<u16> {
+            let mut dst = vec![0u16; src.len()];
+            f32_to_f16_slice(src, &mut dst);
+            dst
+        };
+
+        // W_k = identity, W_q = identity for the Q half (gate half zero), W_v
+        // = identity too (so the CURRENT token's V is a distinct, finite,
+        // predictable vector rather than zero -- confirms the fail-closed
+        // path isn't trivially passing because every V is zero anyway).
+        let mut k_proj_f32 = vec![0.0f32; kv_dim * hidden];
+        for j in 0..kv_dim {
+            k_proj_f32[j * hidden + j] = 1.0;
+        }
+        let mut v_proj_f32 = vec![0.0f32; kv_dim * hidden];
+        for j in 0..kv_dim {
+            v_proj_f32[j * hidden + j] = 1.0;
+        }
+        let mut q_proj_f32 = vec![0.0f32; 2 * q_dim * hidden];
+        for j in 0..q_dim {
+            q_proj_f32[j * hidden + j] = 1.0;
+        }
+
+        let weights = F16FullAttentionLayerWeights {
+            q_proj: to_f16(&q_proj_f32),
+            k_proj: to_f16(&k_proj_f32),
+            v_proj: to_f16(&v_proj_f32),
+            o_proj: to_f16(&vec![0.0f32; hidden * q_dim]),
+            q_norm: vec![0.0f32; head_dim],
+            k_norm: vec![0.0f32; head_dim],
+        };
+
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.07).collect();
+
+        let mut scratch = ForwardScratch::new();
+        scratch.ensure_capacity(&cfg, 2);
+        scratch.attn_out[..hidden].copy_from_slice(&input);
+
+        // Pre-load one poisoned cached position (position 0): NaN K, finite V.
+        let mut kv_cache = KvCache::new(1);
+        let mut poisoned_k = vec![0.0f32; kv_dim];
+        poisoned_k[0] = f32::NAN;
+        let finite_v = vec![5.0f32; kv_dim];
+        kv_cache.append_kv(0, &poisoned_k, &finite_v);
+        kv_cache.seq_len = 1;
+
+        full_attention_step_f16(
+            &weights,
+            0,
+            position,
+            &mut kv_cache,
+            &mut scratch,
+            &cfg,
+            &rope,
+            hidden,
+        );
+
+        assert!(
+            scratch.context[..head_dim].iter().all(|&v| v == 0.0),
+            "expected exact-zero context for a NaN-poisoned cached score, \
+             got {:?}",
+            &scratch.context[..head_dim]
         );
     }
 
