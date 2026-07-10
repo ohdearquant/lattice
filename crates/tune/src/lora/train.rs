@@ -10,8 +10,8 @@ use lattice_inference::model::qwen35::Qwen35Model;
 
 use crate::error::{Result, TuneError};
 use crate::lora::train_core::{
-    Dims, GdnDims, Head, LayerW, LoraParams, MixerKind, SeqCtx, TOP_LAYER, apply_adam_updates,
-    forward_full, nll_and_grads, rand_fill, shifted,
+    Dims, GdnDims, GdnLoraParams, Head, LayerW, LoraParams, MixerKind, SeqCtx, TOP_LAYER,
+    apply_adam_updates, forward_full, nll_and_grads, rand_fill, shifted,
 };
 use crate::lora::{AdamState, LoraAdapter, LoraConfig, LoraLayer};
 
@@ -370,13 +370,18 @@ pub fn train_micro_lora(
     let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
     let lr = config.learning_rate;
 
+    // This library entry point trains GQA q_proj/v_proj slots only (no GDN
+    // LoRA request surface yet), so the GDN slot arrays stay empty — forward_full
+    // and nll_and_grads fall back to the byte-identical no-LoRA GDN path.
+    let gdn_loras: Vec<GdnLoraParams> = Vec::new();
     for step in 1..=config.steps {
         let ctx = &caches[(step - 1) % caches.len()];
         let fwd = forward_full(
-            ctx, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
+            ctx, &layers, &loras, &gdn_loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
         )?;
-        let (_nll, _n, grads) =
-            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale)?;
+        let (_nll, _n, grads, _gdn_grads) = nll_and_grads(
+            &fwd, &layers, &loras, &head, &dims, &gdn_dims, num_slots, 0, rank, scale,
+        )?;
 
         apply_adam_updates(
             &mut adam,

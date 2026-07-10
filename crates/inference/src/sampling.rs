@@ -3,7 +3,103 @@
 //! Supports temperature scaling, top-k filtering, top-p (nucleus) sampling,
 //! and repetition penalty.
 
-use crate::model::qwen35_config::{GenerateConfig, TokenLogprob, TopLogprob};
+use crate::model::qwen35_config::{GenerateConfig, TopLogprob};
+
+/// Greedy argmax over a dense `f32` logit slice, with **first-wins** tie-break
+/// (ADR-080 C3, #783; held finding from the ADR-080 duplication audit).
+///
+/// `Iterator::max_by` keeps the *last* element on `Ordering::Equal`, so tied
+/// maximum logits (e.g. `[0.0, 1.0, 1.0]`) return the higher token id — the
+/// opposite of the engine-wide greedy contract. [`CandidateSet::argmax`],
+/// `attention` decode paths, and `torch.argmax` all return the *first*
+/// occurrence on a tie; this is the canonical shared implementation every
+/// dense-logit-slice greedy call site should use instead of hand-rolling its
+/// own `max_by` closure (the duplication this ADR-080 cluster closes).
+///
+/// Strict `>` from `NEG_INFINITY` skips `NaN` (a `NaN` comparison is always
+/// false) and returns `0` on empty / all-`NaN` / fully-masked (all
+/// `NEG_INFINITY`) input — the dense-array form of the engine-wide
+/// fail-closed-to-first-in-set contract, never a panic.
+///
+/// Its only production callers today (`generate_greedy_mtp`,
+/// `generate_greedy_self_spec` in `forward/metal_qwen35.rs`) live behind the
+/// `metal-gpu` feature, so a default-feature build never calls it outside
+/// this module's own tests.
+#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+pub(crate) fn argmax_f32_first_wins(logits: &[f32]) -> u32 {
+    let mut best_idx = 0u32;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
+}
+
+#[cfg(test)]
+mod argmax_f32_first_wins_tests {
+    use super::argmax_f32_first_wins;
+
+    /// Mutation sensitivity: replacing the strict `>` comparison with `>=`
+    /// (or switching to `Iterator::max_by`, which keeps the LAST tied
+    /// element) flips this to return index 2 instead of 1.
+    #[test]
+    fn tie_break_is_first_wins() {
+        let logits = [0.0_f32, 1.0, 1.0, 0.5];
+        assert_eq!(
+            argmax_f32_first_wins(&logits),
+            1,
+            "tied maximum logits must resolve to the FIRST index, not the last"
+        );
+    }
+
+    #[test]
+    fn no_tie_returns_true_max() {
+        let logits = [0.1_f32, -2.0, 5.5, -0.001];
+        assert_eq!(argmax_f32_first_wins(&logits), 2);
+    }
+
+    /// Mutation sensitivity: initializing `best_val` to `0.0` instead of
+    /// `NEG_INFINITY` would make this return 0 (all-negative logits never
+    /// beat a 0.0 floor) instead of the true argmax at index 1.
+    #[test]
+    fn all_negative_logits_still_find_true_max() {
+        let logits = [-5.0_f32, -1.0, -3.0];
+        assert_eq!(argmax_f32_first_wins(&logits), 1);
+    }
+
+    /// A NaN in a non-max position must never win: `NaN > best_val` is
+    /// always false, so the comparison silently skips it.
+    #[test]
+    fn nan_in_nonmax_position_is_skipped() {
+        let logits = [1.0_f32, f32::NAN, 2.0];
+        assert_eq!(argmax_f32_first_wins(&logits), 2);
+    }
+
+    /// All-NaN input must fail closed to index 0, never panic.
+    #[test]
+    fn all_nan_fails_closed_to_zero() {
+        let logits = [f32::NAN, f32::NAN, f32::NAN];
+        assert_eq!(argmax_f32_first_wins(&logits), 0);
+    }
+
+    /// Empty input must fail closed to index 0, never panic.
+    #[test]
+    fn empty_slice_fails_closed_to_zero() {
+        let logits: [f32; 0] = [];
+        assert_eq!(argmax_f32_first_wins(&logits), 0);
+    }
+
+    /// All-`NEG_INFINITY` (a fully-masked grammar/top-k step) must fail
+    /// closed to index 0.
+    #[test]
+    fn all_neg_infinity_fails_closed_to_zero() {
+        let logits = [f32::NEG_INFINITY; 4];
+        assert_eq!(argmax_f32_first_wins(&logits), 0);
+    }
+}
 
 /// **Unstable**: sampling configuration for decoder-only generation; fields
 /// and defaults may change as the generation API evolves.
@@ -654,7 +750,17 @@ const LOGPROB_NEG_SENTINEL: f32 = -1.0e9;
 /// Falls back to [`LOGPROB_NEG_SENTINEL`] wherever a value would otherwise be
 /// non-finite (e.g. every logit non-finite) or `token_id` is outside the
 /// vocabulary covered by `logits`.
-fn compute_step_logprobs(
+///
+/// `pub(crate)` (codex round-3 medium #2, PR #787 / Leo's ruling): this is
+/// the pure-computation half of what `record_logprob` used to expose as one
+/// combined `pub(crate)` function. `DecodePolicy::record_logprob`
+/// (`model::qwen35::generation`) is the only place that pushes the result
+/// into a `token_logprobs: &mut Vec<TokenLogprob>` -- a decode call site can
+/// read a logprob distribution for its own purposes, but it can no longer
+/// independently append to a `token_logprobs` accumulator without going
+/// through `DecodePolicy`, since no freestanding "record" function exists to
+/// call anymore.
+pub(crate) fn compute_step_logprobs(
     logits: &[f32],
     token_id: u32,
     temperature: f32,
@@ -736,31 +842,6 @@ fn compute_step_logprobs(
     };
 
     (token_logprob, top)
-}
-
-/// Appends one decode step's logprob data to `token_logprobs` when requested.
-///
-/// `logprobs_requested` is the caller's `top_logprobs` count (`Some(0)` when
-/// `logprobs` was requested without a `top_logprobs` count); `None` disables
-/// capture entirely and this is a no-op, so callers can invoke it
-/// unconditionally on every decode step -- the cost of the softmax pass over
-/// the full vocabulary is paid only when logprobs were actually requested.
-pub(crate) fn record_logprob(
-    token_logprobs: &mut Vec<TokenLogprob>,
-    logits: &[f32],
-    token_id: u32,
-    temperature: f32,
-    logprobs_requested: Option<usize>,
-) {
-    let Some(top_n) = logprobs_requested else {
-        return;
-    };
-    let (logprob, top) = compute_step_logprobs(logits, token_id, temperature, top_n);
-    token_logprobs.push(TokenLogprob {
-        token_id,
-        logprob,
-        top,
-    });
 }
 
 /// Fail-closed pre-scan for `sample_full_logits`: detects whether `logits`
@@ -2296,32 +2377,14 @@ mod tests {
         assert!((top[0].logprob - reference[2]).abs() < 1e-4);
     }
 
-    #[test]
-    fn test_record_logprob_noop_when_not_requested() {
-        let mut token_logprobs = Vec::new();
-        record_logprob(&mut token_logprobs, &[1.0, 2.0, 3.0], 2, 1.0, None);
-        assert!(
-            token_logprobs.is_empty(),
-            "record_logprob must not allocate/push anything when logprobs \
-             were not requested -- this is the zero-cost default path"
-        );
-    }
-
-    #[test]
-    fn test_record_logprob_appends_entry_when_requested() {
-        let mut token_logprobs = Vec::new();
-        record_logprob(&mut token_logprobs, &[1.0, 2.0, 3.0], 2, 1.0, Some(2));
-        assert_eq!(token_logprobs.len(), 1);
-        assert_eq!(token_logprobs[0].token_id, 2);
-        assert_eq!(token_logprobs[0].top.len(), 2);
-
-        // A second call appends rather than overwrites, matching per-step
-        // accumulation across a whole generation.
-        record_logprob(&mut token_logprobs, &[3.0, 2.0, 1.0], 0, 1.0, Some(0));
-        assert_eq!(token_logprobs.len(), 2);
-        assert_eq!(token_logprobs[1].token_id, 0);
-        assert!(token_logprobs[1].top.is_empty());
-    }
+    // `record_logprob`'s noop/appends behavior moved to
+    // `model::qwen35::generation`'s `DecodePolicy::record_logprob` tests
+    // (codex round-3 medium #2, PR #787 / Leo's ruling) -- see
+    // `decode_policy_record_logprob_noop_when_not_requested` and
+    // `transition_records_one_logprob_per_generated_token` there. The
+    // freestanding `pub(crate) record_logprob` this module used to export no
+    // longer exists: only `compute_step_logprobs` (pure computation) remains
+    // shared, and mutating `token_logprobs` is exclusively `DecodePolicy`'s.
 
     // -------------------------------------------------------------------
     // CPU-side microbench (issue #650): before/after `sample_full_logits`.
