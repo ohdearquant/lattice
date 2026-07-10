@@ -26,7 +26,8 @@ use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, ForwardScratch,
     FullAttentionLayerWeights, KvCache, Qwen35Model, check_grammar_not_set, check_logprobs_not_set,
-    decode_tokens, qwen35_rms_norm, resize, sample_token, should_stop_token,
+    check_reasoning_budget_not_set, check_stop_strings_not_set, decode_tokens, qwen35_rms_norm,
+    resize, sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::stop_reason::StopReason;
@@ -432,6 +433,10 @@ impl Qwen35Model {
         // Same rationale for logprobs capture, which is also not wired into this
         // generate loop (#585).
         check_logprobs_not_set(gen_cfg)?;
+        // Same rationale for stop_strings matching and reasoning-budget forcing,
+        // neither of which is wired into this generate loop (ADR-080 C3, #783).
+        check_stop_strings_not_set(gen_cfg)?;
+        check_reasoning_budget_not_set(gen_cfg)?;
         // Context preflight. apply_partial_rope indexes the precomputed cos/sin table
         // without bounds checks, so a position at or past max_context() is an out-of-bounds
         // slice access — a release panic, not a clean error. Mirror the same total-token
@@ -2072,6 +2077,60 @@ mod tests {
             matches!(result, Err(InferenceError::InvalidInput(_))),
             "generate_with_batch_prefill must fail closed with InvalidInput when grammar is \
              set (#397/#398); got {result:?}"
+        );
+    }
+
+    /// `generate_with_batch_prefill` must reject a `GenerateConfig` that sets
+    /// `stop_strings` with a typed `InvalidInput` error before sampling any token
+    /// (ADR-080 C3, #783).
+    ///
+    /// Mutation sensitivity: removing `check_stop_strings_not_set` causes the
+    /// function to proceed through the full prefill + decode path with the tiny
+    /// weights, returning `Ok(...)`. The `matches!` assert then fails.
+    #[test]
+    fn generate_with_batch_prefill_rejects_stop_strings_config_before_sampling() {
+        use crate::error::InferenceError;
+
+        let cfg = tiny_test_config();
+        let model = build_random_model(cfg, 0x1234_5678_abcd_ef01);
+
+        let gen_cfg = GenerateConfig {
+            stop_strings: vec!["</s>".to_string()],
+            ..Default::default()
+        };
+
+        let result = model.generate_with_batch_prefill("a b c", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generate_with_batch_prefill must fail closed with InvalidInput when \
+             stop_strings is set (ADR-080 C3, #783); got {result:?}"
+        );
+    }
+
+    /// `generate_with_batch_prefill` must reject a `GenerateConfig` that sets
+    /// `reasoning_budget` with a typed `InvalidInput` error before sampling any
+    /// token (ADR-080 C3, #783).
+    ///
+    /// Mutation sensitivity: removing `check_reasoning_budget_not_set` causes the
+    /// function to proceed through the full prefill + decode path with the tiny
+    /// weights, returning `Ok(...)`. The `matches!` assert then fails.
+    #[test]
+    fn generate_with_batch_prefill_rejects_reasoning_budget_config_before_sampling() {
+        use crate::error::InferenceError;
+
+        let cfg = tiny_test_config();
+        let model = build_random_model(cfg, 0x1234_5678_abcd_ef01);
+
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(16),
+            ..Default::default()
+        };
+
+        let result = model.generate_with_batch_prefill("a b c", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generate_with_batch_prefill must fail closed with InvalidInput when \
+             reasoning_budget is set (ADR-080 C3, #783); got {result:?}"
         );
     }
 

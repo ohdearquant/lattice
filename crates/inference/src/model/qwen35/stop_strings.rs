@@ -115,22 +115,28 @@ pub(crate) fn stop_scan_search_start(haystack: &str, prev_len: usize, max_stop: 
 /// `finish` is called once after the decode loop ends (natural stop / EOS / token cap).
 /// If `stopped` is already true it is a no-op; otherwise it appends the `detok.finish()` tail,
 /// checks for a stop in the result, and emits whatever is safe.
-pub(crate) struct StopStringMatcher<'a> {
+pub(crate) struct StopStringMatcher {
     full: String,
     emitted: usize,
     max_stop: usize,
-    stops: &'a [String],
+    stops: Vec<String>,
     stopped: bool,
 }
 
-impl<'a> StopStringMatcher<'a> {
-    pub(crate) fn new(stops: &'a [String]) -> Self {
+impl StopStringMatcher {
+    /// `stops` is cloned into an owned `Vec<String>` (codex round-3 major #1,
+    /// PR #787): a `DecodePolicy`-owned `StopMode::Streaming(StopStringMatcher)`
+    /// variant cannot borrow `gen_cfg.stop_strings`'s lifetime without
+    /// infecting `DecodePolicy` itself with a lifetime parameter threaded
+    /// through every call site; the stop-string list is tiny and constructed
+    /// once per generation, so cloning it is free relative to the decode loop.
+    pub(crate) fn new(stops: &[String]) -> Self {
         let max_stop = stops.iter().map(String::len).max().unwrap_or(1);
         Self {
             full: String::new(),
             emitted: 0,
             max_stop,
-            stops,
+            stops: stops.to_vec(),
             stopped: false,
         }
     }
@@ -163,7 +169,7 @@ impl<'a> StopStringMatcher<'a> {
         }
         let search_start = stop_scan_search_start(&self.full, prev_len, self.max_stop);
 
-        if let Some(hit) = earliest_stop_match_from(&self.full, self.stops, search_start) {
+        if let Some(hit) = earliest_stop_match_from(&self.full, &self.stops, search_start) {
             let slice = &self.full[self.emitted..hit];
             if !slice.is_empty() {
                 sink(slice);
@@ -204,7 +210,7 @@ impl<'a> StopStringMatcher<'a> {
             self.full.push_str(tail);
         }
         // A stop string could complete inside the tail bytes.
-        if let Some(hit) = earliest_stop_match(&self.full, self.stops) {
+        if let Some(hit) = earliest_stop_match(&self.full, &self.stops) {
             let slice = &self.full[self.emitted..hit];
             if !slice.is_empty() {
                 sink(slice);
@@ -227,6 +233,15 @@ impl<'a> StopStringMatcher<'a> {
     }
 
     /// Consume the streamer and return the final (possibly truncated) text.
+    ///
+    /// Only reachable from Metal's non-streaming `generate()` fast/self-spec
+    /// paths (which construct and drive their own local `StopStringMatcher`
+    /// directly, outside `DecodePolicy` -- out of ADR-080 C3's scope) and
+    /// this module's own tests; every `DecodePolicy`-driven call site
+    /// (CPU and Metal streaming) accumulates into a caller-owned
+    /// `text: &mut String` via `stop_check`/`finish_stop` instead (codex
+    /// round-3 major #1, PR #787).
+    #[cfg(any(test, feature = "metal-gpu"))]
     pub(crate) fn into_text(self) -> String {
         self.full
     }
