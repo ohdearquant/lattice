@@ -3504,6 +3504,55 @@ mod serve {
         })
     }
 
+    /// The `on_token`/`should_cancel` composition for CPU-style streaming
+    /// generation, constructed in exactly ONE place and shared by the real
+    /// `ModelBackend::Cpu` arm and the test-only `CpuFakeGenerate` arm below
+    /// (ADR-080 C2 round 3, codex round-3 medium finding #1). Before this,
+    /// each arm rebuilt `move || *cancel_rx.borrow()` independently, so a
+    /// disposable-worktree mutation that broke ONLY the real `Cpu` arm's
+    /// predicate left the `CpuFakeGenerate`-only post-drop oracle green --
+    /// it was pinning a copy, not the production call site. Both arms now
+    /// funnel through this one function, so mutating the shared predicate
+    /// here is observed by the fake-arm-driven test too: there is no
+    /// separate copy left unmutated.
+    #[allow(clippy::type_complexity)]
+    fn spawn_cpu_style_streaming_generation(
+        tx: futures::channel::mpsc::UnboundedSender<StreamMsg>,
+        cancel_rx: tokio::sync::watch::Receiver<bool>,
+        prompt: String,
+        gen_cfg: lattice_inference::model::qwen35_config::GenerateConfig,
+        generate: Arc<
+            dyn Fn(
+                    &str,
+                    &lattice_inference::model::qwen35_config::GenerateConfig,
+                    &mut dyn FnMut(&str) -> bool,
+                    &mut dyn FnMut() -> bool,
+                )
+                    -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                + Send
+                + Sync,
+        >,
+        finish_streaming: impl FnOnce(GenerateOutput) + Send + 'static,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            let tx_delta = tx.clone();
+            let mut on_token = move |delta: &str| {
+                tx_delta
+                    .unbounded_send(StreamMsg::Delta(delta.to_string()))
+                    .is_ok()
+            };
+            let mut should_cancel = move || *cancel_rx.borrow();
+            let result = generate(&prompt, &gen_cfg, &mut on_token, &mut should_cancel);
+            match result {
+                Ok(output) => finish_streaming(output),
+                Err(e) => {
+                    eprintln!("generation error (streaming): {e}");
+                    let _ = tx.unbounded_send(StreamMsg::Failed);
+                }
+            }
+        });
+    }
+
     pub async fn chat_completions(
         State(state): State<AppState>,
         result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
@@ -3619,31 +3668,34 @@ mod serve {
 
             match model {
                 ModelBackend::Cpu(cpu_model) => {
-                    tokio::task::spawn_blocking(move || {
-                        let tx_delta = tx.clone();
-                        let result = cpu_model.generate_streaming_with_cancel(
-                            &prompt,
-                            &gen_cfg,
-                            move |delta| {
-                                // Send each incremental text delta; a `false`
-                                // return (send failed, receiver dropped) also
-                                // signals disconnect directly to `on_token`,
-                                // on top of the independent `should_cancel`
-                                // check below.
-                                tx_delta
-                                    .unbounded_send(StreamMsg::Delta(delta.to_string()))
-                                    .is_ok()
-                            },
-                            move || *cancel_rx.borrow(),
-                        );
-                        match result {
-                            Ok(output) => finish_streaming(output),
-                            Err(e) => {
-                                eprintln!("generation error (streaming): {e}");
-                                let _ = tx.unbounded_send(StreamMsg::Failed);
-                            }
-                        }
+                    // Delegates through the SAME shared helper the test-only
+                    // `CpuFakeGenerate` arm below uses (codex round-3 medium
+                    // finding #1) -- only the generation call itself
+                    // (`cpu_model.generate_streaming_with_cancel` here, an
+                    // injected closure there) differs; the `should_cancel`
+                    // predicate is constructed once, by the helper, for both.
+                    #[allow(clippy::type_complexity)]
+                    let generate: Arc<
+                        dyn Fn(
+                                &str,
+                                &lattice_inference::model::qwen35_config::GenerateConfig,
+                                &mut dyn FnMut(&str) -> bool,
+                                &mut dyn FnMut() -> bool,
+                            )
+                                -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                            + Send
+                            + Sync,
+                    > = Arc::new(move |p, c, on_token, should_cancel| {
+                        cpu_model.generate_streaming_with_cancel(p, c, on_token, should_cancel)
                     });
+                    spawn_cpu_style_streaming_generation(
+                        tx,
+                        cancel_rx,
+                        prompt,
+                        gen_cfg,
+                        generate,
+                        finish_streaming,
+                    );
                 }
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { handle, .. } => {
@@ -3670,30 +3722,22 @@ mod serve {
                         }
                     });
                 }
-                // ADR-080 C2 round 2, codex round-2 medium finding #3: same
-                // `on_token`/`should_cancel`/`cancel_rx` composition as the
-                // real `Cpu` arm above, byte-for-byte, with only the
-                // generation call itself substituted -- this is the seam a
-                // post-drop cancellation probe test injects into.
+                // ADR-080 C2 round 2/3, codex round-3 medium finding #1: goes
+                // through the exact same `spawn_cpu_style_streaming_generation`
+                // helper as the real `Cpu` arm above -- there is no separate
+                // `should_cancel` construction here to leave un-mutated. Only
+                // the injected `generate` closure differs; this is the seam a
+                // post-drop cancellation probe test substitutes.
                 #[cfg(all(feature = "test-utils", test))]
                 ModelBackend::CpuFakeGenerate { generate, .. } => {
-                    tokio::task::spawn_blocking(move || {
-                        let tx_delta = tx.clone();
-                        let mut on_token = move |delta: &str| {
-                            tx_delta
-                                .unbounded_send(StreamMsg::Delta(delta.to_string()))
-                                .is_ok()
-                        };
-                        let mut should_cancel = move || *cancel_rx.borrow();
-                        let result = generate(&prompt, &gen_cfg, &mut on_token, &mut should_cancel);
-                        match result {
-                            Ok(output) => finish_streaming(output),
-                            Err(e) => {
-                                eprintln!("generation error (streaming, fake): {e}");
-                                let _ = tx.unbounded_send(StreamMsg::Failed);
-                            }
-                        }
-                    });
+                    spawn_cpu_style_streaming_generation(
+                        tx,
+                        cancel_rx,
+                        prompt,
+                        gen_cfg,
+                        generate,
+                        finish_streaming,
+                    );
                 }
             }
 
@@ -5784,40 +5828,40 @@ mod serve {
         // HTTP 400 `context_length_exceeded` before any SSE stream is ever
         // built. `cm_serve_context_window_checked_before_stop_parsing` above
         // already pins the underlying cascade ordering as a pure function;
-        // this drives the SAME contract through the real `Router` (matching
-        // `lattice_serve.rs`'s sibling test for the daemon side of the same
-        // finding), so a future regression at the HTTP-composition layer --
-        // not just inside `prepare_chat_request` itself -- is also caught.
+        // this drives the SAME contract through the real `Router`.
+        //
+        // ADR-080 C2 round 3, codex round-3 medium finding #2: this now
+        // builds its request from `lattice_inference::serve`'s shared
+        // `OVERFLOW_PARITY_*` constants -- the SAME body/limits
+        // `lattice_serve.rs`'s `real_router_overflow_parity` module drives
+        // through its own real router and real worker -- so the two really
+        // are the identical request the old doc comment here merely
+        // claimed. The tiny test model's context window
+        // (`test_support::tiny_zero_model`'s `max_position_embeddings`) is
+        // fixed at `OVERFLOW_PARITY_CONTEXT_WINDOW` (1024) precisely so this
+        // side's "effective context limit" matches the daemon side's
+        // explicitly-configured `AppState.model_max_context` of the same
+        // value, per codex's finding.
         // -----------------------------------------------------------------------
         #[cfg(feature = "test-utils")]
         mod streaming_context_overflow {
             use super::*;
+            use lattice_inference::serve::{
+                OVERFLOW_PARITY_MAX_TOKENS_CAP, OVERFLOW_PARITY_REQUEST_BODY,
+            };
             use tower::ServiceExt as _;
-
-            /// The tiny test model's context window is a fixed 1024 tokens
-            /// (`test_support::tiny_zero_model`'s `max_position_embeddings`,
-            /// see `disconnect_cancellation`'s comment). `max_tokens` here
-            /// equals that whole window, so any non-empty prompt pushes
-            /// `prompt_token_count + max_tokens` past it; `max_tokens_cap` is
-            /// kept well above 1024 so `validate_max_tokens`'s cap-reject
-            /// (`max_tokens_exceeds_limit`) never fires first -- this test
-            /// must isolate the context-window check, not the cap check.
-            const MAX_TOKENS_AT_WINDOW: usize = 1024;
-            const CAP: usize = 4096;
 
             #[tokio::test]
             async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse()
             {
-                let body = axum::body::Body::from(format!(
-                    r#"{{"model":"test-model","messages":[{{"role":"user","content":"hi"}}],"max_tokens":{MAX_TOKENS_AT_WINDOW},"stream":true}}"#
-                ));
+                let body = axum::body::Body::from(OVERFLOW_PARITY_REQUEST_BODY.to_string());
                 let request = axum::http::Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
                     .body(body)
                     .expect("fixture request must build");
-                let response = router(tiny_state(CAP))
+                let response = router(tiny_state(OVERFLOW_PARITY_MAX_TOKENS_CAP))
                     .oneshot(request)
                     .await
                     .expect("router must produce a response, not a transport error");
@@ -5827,7 +5871,7 @@ mod serve {
                     "an over-context stream:true request must be rejected with HTTP \
                      400 before any SSE stream is committed, matching \
                      lattice_serve.rs's equivalent preflight for the identical \
-                     request body"
+                     shared-fixture request body"
                 );
                 let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
