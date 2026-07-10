@@ -210,16 +210,54 @@ pub enum Binary {
     LatticeServe,
 }
 
-/// One row of the cross-binary `/v1/chat/completions` parity table (ADR-080
-/// C2 round 2, codex finding #1): a single request body, and the expected
-/// `(status, error_code)` for each binary. Use [`ParityCase::same`] when both
-/// binaries must produce an identical outcome for this body (the common
-/// case, post-alignment); use [`ParityCase::diverging`] only for a
-/// documented, intentional per-binary difference -- an undocumented
-/// divergence is exactly the drift this table exists to catch.
+/// A parity case's request body. Most cases pin a small literal fixture;
+/// [`CaseBody::Oversized`] generates a body larger than
+/// [`REQUEST_BODY_LIMIT_BYTES`] at test time instead of embedding a >1MiB
+/// string literal in source (ADR-080 C2 round 2, codex round-2 medium
+/// finding #2: neither binary's parity table exercised the oversized-body
+/// case at all, so restoring the daemon's old 400/`invalid_request` mapping
+/// left its parity test green).
+pub enum CaseBody {
+    Fixed(&'static str),
+    /// A `messages` array whose `content` field alone exceeds
+    /// `REQUEST_BODY_LIMIT_BYTES`, forcing both binaries' body-limit
+    /// enforcement (`DefaultBodyLimit` on `lattice.rs`, manual
+    /// `to_bytes(.., LIMIT)` on `lattice_serve.rs`) to trip.
+    Oversized,
+}
+
+impl CaseBody {
+    pub fn build(&self) -> Vec<u8> {
+        match self {
+            CaseBody::Fixed(s) => s.as_bytes().to_vec(),
+            CaseBody::Oversized => {
+                let filler = "x".repeat(REQUEST_BODY_LIMIT_BYTES + 1);
+                format!(
+                    r#"{{"model":"test-model","messages":[{{"role":"user","content":"{filler}"}}]}}"#
+                )
+                .into_bytes()
+            }
+        }
+    }
+}
+
+/// One row of the cross-binary HTTP parity table (ADR-080 C2 round 2, codex
+/// finding #1): a request `method`/`path`/`body`, and the expected
+/// `(status, error_code)` for each binary. A case whose `divergence_reason`
+/// is `None` means both binaries must produce an identical outcome for this
+/// request (the common case, post-alignment); `Some` documents an
+/// intentional, reviewed per-binary difference -- an undocumented
+/// divergence is exactly the drift this table exists to catch. `method`/
+/// `path` were added in round 2 (codex medium finding #2) after an
+/// unguarded `GET /` route removal on `lattice.rs` left the round-1 table
+/// green: every case before that was implicitly `POST
+/// /v1/chat/completions`, so route exposure itself was never actually
+/// checked.
 pub struct ParityCase {
     pub name: &'static str,
-    pub body: &'static str,
+    pub method: &'static str,
+    pub path: &'static str,
+    pub body: CaseBody,
     lattice: (u16, &'static str),
     lattice_serve: (u16, &'static str),
     /// `Some` only for a documented intentional divergence; explains WHY the
@@ -249,62 +287,88 @@ impl ParityCase {
 pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
     ParityCase {
         name: "unknown_role_not_openai",
+        method: "POST",
+        path: "/v1/chat/completions",
         // A trailing valid `user` turn keeps this isolated to the role
         // check: `lattice.rs` separately requires the conversation's LAST
         // message to have role `user` (a Qwen ChatML constraint, unrelated
         // to and checked before role-validity), so a single-message
         // `moderator` body would fail on THAT check first with
         // `invalid_messages` instead of exercising role validation at all.
-        body: r#"{"model":"test-model","messages":[{"role":"moderator","content":"hi"},{"role":"user","content":"hi"}]}"#,
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"moderator","content":"hi"},{"role":"user","content":"hi"}]}"#,
+        ),
         lattice: (400, "invalid_role"),
         lattice_serve: (400, "invalid_role"),
         divergence_reason: None,
     },
     ParityCase {
         name: "developer_role_unsupported_feature",
+        method: "POST",
+        path: "/v1/chat/completions",
         // See `unknown_role_not_openai`'s comment on the trailing `user` turn.
-        body: r#"{"model":"test-model","messages":[{"role":"developer","content":"hi"},{"role":"user","content":"hi"}]}"#,
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"developer","content":"hi"},{"role":"user","content":"hi"}]}"#,
+        ),
         lattice: (400, "unsupported_feature"),
         lattice_serve: (400, "unsupported_feature"),
         divergence_reason: None,
     },
     ParityCase {
         name: "empty_messages",
-        body: r#"{"model":"test-model","messages":[]}"#,
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(r#"{"model":"test-model","messages":[]}"#),
         lattice: (400, "invalid_messages"),
         lattice_serve: (400, "invalid_messages"),
         divergence_reason: None,
     },
     ParityCase {
         name: "max_tokens_zero",
-        body: r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#,
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#,
+        ),
         lattice: (400, "invalid_max_tokens"),
         lattice_serve: (400, "invalid_max_tokens"),
         divergence_reason: None,
     },
     ParityCase {
         name: "max_tokens_and_max_completion_tokens_conflict",
-        body: r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":20}"#,
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":20}"#,
+        ),
         lattice: (400, "invalid_request"),
         lattice_serve: (400, "invalid_request"),
         divergence_reason: None,
     },
     ParityCase {
         name: "tools_unsupported",
-        body: r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#,
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#,
+        ),
         lattice: (400, "unsupported_feature"),
         lattice_serve: (400, "unsupported_feature"),
         divergence_reason: None,
     },
     ParityCase {
         name: "malformed_json_body",
-        body: r#"{"model":"test-model","messages":"#,
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(r#"{"model":"test-model","messages":"#),
         lattice: (400, "invalid_request_body"),
         lattice_serve: (400, "invalid_request_body"),
         divergence_reason: None,
     },
     ParityCase {
         name: "max_tokens_over_cap_reject_vs_clamp",
+        method: "POST",
+        path: "/v1/chat/completions",
         // Both servers are configured (in each binary's own oneshot test
         // harness) with a small cap/context window; this body's max_tokens
         // exceeds it. `lattice.rs` rejects before ever touching the
@@ -321,7 +385,9 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         // proves is "not a 400 at the validation cascade" -- clamp-not-reject
         // -- which the diverging (500 vs 400) outcome demonstrates without
         // needing a real model.
-        body: r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":999999}"#,
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":999999}"#,
+        ),
         lattice: (400, "max_tokens_exceeds_limit"),
         lattice_serve: (500, "internal_error"),
         divergence_reason: Some(
@@ -333,6 +399,39 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
              this router-level fixture's no-live-worker harness artifact once past \
              validation, not the divergence itself.",
         ),
+    },
+    ParityCase {
+        name: "get_root_route_exposed",
+        // ADR-080 C2 round 2, codex round-2 medium finding #2, mutation-
+        // proven: every case above targets only `POST
+        // /v1/chat/completions`, so removing `lattice.rs`'s `.route("/",
+        // get(root))` entirely left the parity test green -- route exposure
+        // itself was never actually checked. Both binaries must expose
+        // `GET /` and return the shared `root_body()` shape (200; no error
+        // envelope to check, so no error `code` is meaningful here).
+        method: "GET",
+        path: "/",
+        body: CaseBody::Fixed(""),
+        lattice: (200, ""),
+        lattice_serve: (200, ""),
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "oversized_body_over_limit",
+        // ADR-080 C2 round 2, codex round-2 medium finding #2, mutation-
+        // proven: no case above sent a body over
+        // `REQUEST_BODY_LIMIT_BYTES`, so restoring `lattice_serve.rs`'s old
+        // 400/`invalid_request` oversized-body mapping (instead of the
+        // current 413/`request_body_too_large`) also left the parity test
+        // green. Both binaries enforce the same 1 MiB cap today (`lattice.rs`
+        // via `DefaultBodyLimit`, `lattice_serve.rs` via a manual
+        // `to_bytes(.., LIMIT)` check) and must report it identically.
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Oversized,
+        lattice: (413, "request_body_too_large"),
+        lattice_serve: (413, "request_body_too_large"),
+        divergence_reason: None,
     },
 ];
 
