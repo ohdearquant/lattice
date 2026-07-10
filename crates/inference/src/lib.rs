@@ -80,6 +80,12 @@ pub mod quant;
 pub mod rope;
 /// Sampling configuration and token selection helpers. See [`generate`] and [`speculative`].
 pub mod sampling;
+/// Shared HTTP serving contract (error envelope, `finish_reason`, `max_tokens`
+/// zero-rejection, `/v1/models` body) consumed by both the `lattice` unified
+/// server and the `lattice_serve` daemon binaries (ADR-080 cluster C2).
+/// Requires the `serve` feature (axum/tokio/futures).
+#[cfg(feature = "serve")]
+pub mod serve;
 /// N-gram prompt lookup speculative decoding. See [`sampling`] and [`generate`].
 pub mod speculative;
 /// Generation stop reason taxonomy; see [`StopReason`] and [`generate`].
