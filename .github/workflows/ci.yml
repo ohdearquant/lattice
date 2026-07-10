@@ -343,6 +343,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
+    # RUSTUP_TOOLCHAIN pins every rustup-mediated invocation in this job to 1.93.1.
+    # Without it, rustup's checked-in rust-toolchain.toml (1.94.1, repo dev/CI pin)
+    # outranks the action's `rustup default 1.93.1`, so `rustup which cargo` and
+    # `cargo check` below would silently resolve to 1.94.1 and this gate would stop
+    # proving anything about the declared MSRV (see rust-toolchain.toml precedence:
+    # https://rust-lang.github.io/rustup/overrides.html).
+    env:
+      RUSTUP_TOOLCHAIN: "1.93.1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.1
@@ -352,6 +360,8 @@ jobs:
         with:
           shared-key: msrv
           cache-on-failure: true
+      - name: assert selected compiler is 1.93.1
+        run: rustc --version | grep -F 1.93.1
       - name: workspace — check at MSRV (f16,metal-gpu, all targets)
         run: cargo check --workspace --features f16,metal-gpu --all-targets
 
