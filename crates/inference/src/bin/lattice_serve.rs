@@ -1015,6 +1015,32 @@ mod imp {
         Ok(())
     }
 
+    /// Tokenizes `messages` and enforces the full KV-window invariant
+    /// (`check_prompt_fits_window`) before any generation work starts.
+    ///
+    /// ADR-080 C2 round 3 (codex round-3 medium finding #2): `spawn_worker`'s
+    /// real Metal closure below and the real-router streaming
+    /// context-overflow parity test in this module's test suite both call
+    /// this EXACT function -- not two independently-written copies of the
+    /// same check -- so a mutation that guts the window enforcement here is
+    /// observed by production's own worker closure AND by the test's worker
+    /// seam identically. There is no separate test-only reimplementation of
+    /// `check_prompt_fits_window` for such a mutation to leave unmutated.
+    fn enforce_prompt_window(
+        tokenizer: &BpeTokenizer,
+        model_max_context: usize,
+        messages: &[ChatMessage],
+        cfg: &GenerateConfig,
+    ) -> Result<usize, String> {
+        let prompt_len = tokenizer
+            .tokenize(&format_chat_template(messages))
+            .real_length;
+        if let Err(msg) = check_prompt_fits_window(model_max_context, prompt_len, cfg) {
+            return Err(format!("{PROMPT_EXCEEDS_WINDOW_PREFIX}{msg}"));
+        }
+        Ok(prompt_len)
+    }
+
     // ─── GPU worker thread ───────────────────────────────────────────────────
 
     /// Spawn the dedicated thread that owns the `!Send` Metal state. Loads the
@@ -1059,12 +1085,7 @@ mod imp {
                 // before doing any GPU work -- `cfg` alone was already
                 // clamped by `build_cfg`, but only against the window in
                 // isolation, not against this specific prompt's length.
-                let prompt_len = tokenizer
-                    .tokenize(&format_chat_template(messages))
-                    .real_length;
-                if let Err(msg) = check_prompt_fits_window(model_max_context, prompt_len, cfg) {
-                    return Err(format!("{PROMPT_EXCEEDS_WINDOW_PREFIX}{msg}"));
-                }
+                enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
                 // Cache-aware + cancellation-aware call (#462): reuses the
                 // previous turn's shared token prefix instead of the old
                 // unconditional `reset_state()` + full re-prefill on every
@@ -3049,17 +3070,27 @@ mod imp {
         /// stream is committed -- not silently commit to a 200 SSE response
         /// that only discovers the overflow later via `Ev::Rejected`
         /// mid-stream and terminates with `finish_reason: "length"` (the
-        /// exact drift this finding named; `lattice.rs`'s equivalent
-        /// `stream: true` request already returned 400 via
-        /// `check_context_window`, run unconditionally before its `stream`
-        /// branch). This fakes the worker side of the `Ev::Rejected`
-        /// contract (production code sends it from
-        /// `check_prompt_fits_window` inside `run_worker_loop`, prefixed
-        /// with `PROMPT_EXCEEDS_WINDOW_PREFIX`) so the composition under
-        /// test is purely `chat_completions`'s streaming branch: does it
-        /// await the worker's first event and inspect it for
-        /// `Ev::Rejected` BEFORE calling `Sse::new(..).into_response()`, or
-        /// does it commit unconditionally?
+        /// exact drift this finding named). This fakes the worker side of
+        /// the `Ev::Rejected` contract (production code sends it from
+        /// `enforce_prompt_window` inside `run_worker_loop`, prefixed with
+        /// `PROMPT_EXCEEDS_WINDOW_PREFIX`) so the composition under test is
+        /// purely `chat_completions`'s streaming branch: does it await the
+        /// worker's first event and inspect it for `Ev::Rejected` BEFORE
+        /// calling `Sse::new(..).into_response()`, or does it commit
+        /// unconditionally?
+        ///
+        /// ADR-080 C2 round 3, codex round-3 medium finding #2: this test
+        /// pins ONLY that response-mapping contract with a request that
+        /// would NOT genuinely overflow in production (`max_tokens`
+        /// defaults to 100 against a 4096-token `model_max_context`) and a
+        /// fake task that manufactures `Ev::Rejected` directly -- it does
+        /// NOT exercise the real worker's `enforce_prompt_window` call, so
+        /// it is not, by itself, same-input real-router parity with
+        /// `lattice.rs`'s equivalent test (an earlier version of this
+        /// comment incorrectly claimed "identical request body"; it is not
+        /// -- `real_router_overflow_parity` below is the test that actually
+        /// is). Kept because it is still the cheapest, fastest pin of the
+        /// response-mapping contract in isolation.
         ///
         /// Mutation-sensitive: reverting the pre-`Sse::new()` `first_ev`
         /// preflight (going back to building `stream::unfold` and
@@ -3091,8 +3122,7 @@ mod imp {
                 response.status(),
                 StatusCode::BAD_REQUEST,
                 "an Ev::Rejected worker reply for a stream:true request must surface \
-                 as a pre-commit HTTP 400, matching lattice.rs's behavior for the \
-                 identical request body, not a committed 200 SSE stream"
+                 as a pre-commit HTTP 400, not a committed 200 SSE stream"
             );
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -3108,6 +3138,111 @@ mod imp {
                 "error message must carry the worker's actual overflow explanation, \
                  got: {value}"
             );
+        }
+
+        /// ADR-080 C2 round 3 (codex round-3 medium finding #2): the
+        /// same-input real-router parity the test above does NOT provide.
+        /// Drives `lattice_inference::serve::OVERFLOW_PARITY_REQUEST_BODY`
+        /// -- the SAME fixture `lattice.rs`'s `streaming_context_overflow`
+        /// module drives through its own real `Router` -- through THIS
+        /// binary's real `router()`, backed by a REAL worker thread running
+        /// the actual `run_worker_loop` + `enforce_prompt_window` production
+        /// code (a real `BpeTokenizer` from
+        /// `test_support::tiny_zero_model`, no Metal engine involved since
+        /// the request is expected to be rejected before any generation
+        /// call). `AppState.model_max_context` is set to
+        /// `OVERFLOW_PARITY_CONTEXT_WINDOW` (1024) -- the same effective
+        /// limit `lattice.rs`'s tiny test model's fixed context window uses
+        /// -- so both sides genuinely share the same input AND the same
+        /// effective context limit, not just the same JSON body.
+        ///
+        /// Mutation-sensitive: removing `enforce_prompt_window`'s call to
+        /// `check_prompt_fits_window` (i.e. having it unconditionally
+        /// return `Ok(prompt_len)`) makes this fail -- the real worker
+        /// would accept the request, `chat_completions` would commit a 200
+        /// SSE response, and this test's `StatusCode::BAD_REQUEST`
+        /// assertion would fail. This is the exact production worker-side
+        /// check codex named ("removing the production worker closure's
+        /// check_prompt_fits_window call ... would leave both the direct
+        /// handler test and the pure helper test green") -- `spawn_worker`'s
+        /// real Metal closure and this test's worker seam both call
+        /// `enforce_prompt_window`, not two independent copies of the
+        /// check, so a mutation to the shared function is observed here too.
+        ///
+        /// Gated behind `test-utils` (see
+        /// `lattice_inference::model::qwen35::test_support`) for the same
+        /// reason as `lattice.rs`'s equivalent test modules: this needs a
+        /// real (tiny) `BpeTokenizer`, which is only constructible outside
+        /// this crate's own `#[cfg(test)]` build via that feature.
+        #[cfg(feature = "test-utils")]
+        mod real_router_overflow_parity {
+            use super::*;
+            use lattice_inference::serve::{
+                OVERFLOW_PARITY_CONTEXT_WINDOW, OVERFLOW_PARITY_REQUEST_BODY,
+            };
+            use tower::ServiceExt as _;
+
+            /// A real worker thread running the actual `run_worker_loop` +
+            /// `enforce_prompt_window` production code, with a real (tiny)
+            /// tokenizer and NO Metal engine -- the generate closure is
+            /// never reached by an overflowing request, so it only needs a
+            /// trivial success stand-in for a non-overflowing one.
+            fn real_worker_state(model_max_context: usize) -> AppState {
+                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone();
+                let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
+                std::thread::spawn(move || {
+                    run_worker_loop(jobs_rx, move |messages, cfg, _on_token, _should_cancel| {
+                        let prompt_len =
+                            enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
+                        Ok((prompt_len, 0, true))
+                    });
+                });
+                AppState {
+                    jobs,
+                    model_id: Arc::from("test-model"),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
+                    model_max_context,
+                }
+            }
+
+            #[tokio::test]
+            async fn chat_completions_streaming_context_overflow_matches_lattice_real_router() {
+                let body = Body::from(OVERFLOW_PARITY_REQUEST_BODY.to_string());
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .expect("fixture request must build");
+                let response = router(real_worker_state(OVERFLOW_PARITY_CONTEXT_WINDOW))
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "the shared overflow-parity request, driven through the real \
+                     worker's production enforce_prompt_window check, must be \
+                     rejected with HTTP 400 before any SSE stream is committed -- \
+                     matching lattice.rs's real-router result for the identical \
+                     request body and effective context limit"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("error response body must be readable");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("error response must be JSON");
+                assert_eq!(value["error"]["code"], "context_length_exceeded");
+            }
         }
 
         #[test]
