@@ -11,7 +11,12 @@
 // This is a zero-dependency approach: Accelerate.framework is a system
 // framework available on all macOS installations.
 
-use super::gemm_validate::{validate_gemm_bt, validate_gemm_nn, validate_gemm_strided_shape};
+// `validate_gemm_bt` is only used by the macOS `accelerate_matmul_bt` FFI wrapper below; the
+// non-macOS fallback path in this file only uses `validate_gemm_nn`/`validate_gemm_strided_shape`,
+// so an unconditional import trips `-D warnings` unused-import on non-macOS CI legs (#796 round 1).
+#[cfg(target_os = "macos")]
+use super::gemm_validate::validate_gemm_bt;
+use super::gemm_validate::{validate_gemm_nn, validate_gemm_strided_shape};
 #[cfg(not(target_os = "macos"))]
 use super::matmul::{matmul_bt, matmul_into};
 
@@ -43,6 +48,24 @@ mod accelerate {
     pub const CBLAS_ROW_MAJOR: i32 = 101;
     pub const CBLAS_NO_TRANS: i32 = 111;
     pub const CBLAS_TRANS: i32 = 112;
+}
+
+/// Convert a GEMM dimension or leading dimension to CBLAS's `i32` ABI type, failing closed
+/// (release-active) instead of silently wrapping via an unchecked `as i32` cast.
+///
+/// `validate_gemm_nn`/`validate_gemm_bt`/`validate_gemm_strided_shape` check `usize` shape-
+/// product overflow and buffer-length bounds, but a non-overflowing `usize` value above
+/// `i32::MAX` still passes those checks (e.g. `m=0, k=0, n=i32::MAX as usize + 1`: every
+/// canonical product is zero, so every length check is trivially satisfied) and would
+/// otherwise reach `cblas_sgemm` as a negative parameter (#796 round 1 finding 2). Every
+/// Accelerate call site converts each `m`/`n`/`k`/`lda`/`ldb`/`ldc` through this helper
+/// immediately before the FFI call, so the checked contract covers the full path to CBLAS,
+/// not just the `usize`-level shape check.
+#[cfg(target_os = "macos")]
+#[inline]
+fn cblas_dim(value: usize, param: &'static str, op: &'static str) -> i32 {
+    i32::try_from(value)
+        .unwrap_or_else(|_| panic!("{op}: {param}={value} exceeds i32::MAX (CBLAS ABI limit)"))
 }
 
 /// Accelerate-backed C = A @ B^T.
@@ -89,17 +112,17 @@ pub(super) fn accelerate_matmul_bt(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
+            cblas_dim(m, "m", "accelerate_matmul_bt"),
+            cblas_dim(n, "n", "accelerate_matmul_bt"),
+            cblas_dim(k, "k", "accelerate_matmul_bt"),
             1.0,
             a.as_ptr(),
-            k as i32,
+            cblas_dim(k, "lda", "accelerate_matmul_bt"),
             b.as_ptr(),
-            k as i32,
+            cblas_dim(k, "ldb", "accelerate_matmul_bt"),
             0.0,
             output.as_mut_ptr(),
-            n as i32,
+            cblas_dim(n, "ldc", "accelerate_matmul_bt"),
         );
     }
 }
@@ -132,17 +155,17 @@ pub(super) fn accelerate_matmul(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
+            cblas_dim(m, "m", "accelerate_matmul"),
+            cblas_dim(n, "n", "accelerate_matmul"),
+            cblas_dim(k, "k", "accelerate_matmul"),
             1.0,
             a.as_ptr(),
-            k as i32,
+            cblas_dim(k, "lda", "accelerate_matmul"),
             b.as_ptr(),
-            n as i32,
+            cblas_dim(n, "ldb", "accelerate_matmul"),
             0.0,
             output.as_mut_ptr(),
-            n as i32,
+            cblas_dim(n, "ldc", "accelerate_matmul"),
         );
     }
 }
@@ -196,17 +219,17 @@ pub unsafe fn sgemm_bt_strided(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
+            cblas_dim(m, "m", "sgemm_bt_strided"),
+            cblas_dim(n, "n", "sgemm_bt_strided"),
+            cblas_dim(k, "k", "sgemm_bt_strided"),
             1.0,
             a,
-            lda as i32,
+            cblas_dim(lda, "lda", "sgemm_bt_strided"),
             b,
-            ldb as i32,
+            cblas_dim(ldb, "ldb", "sgemm_bt_strided"),
             0.0,
             c,
-            ldc as i32,
+            cblas_dim(ldc, "ldc", "sgemm_bt_strided"),
         );
     }
 }
@@ -245,17 +268,17 @@ pub unsafe fn sgemm_nn_strided(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
+            cblas_dim(m, "m", "sgemm_nn_strided"),
+            cblas_dim(n, "n", "sgemm_nn_strided"),
+            cblas_dim(k, "k", "sgemm_nn_strided"),
             1.0,
             a,
-            lda as i32,
+            cblas_dim(lda, "lda", "sgemm_nn_strided"),
             b,
-            ldb as i32,
+            cblas_dim(ldb, "ldb", "sgemm_nn_strided"),
             0.0,
             c,
-            ldc as i32,
+            cblas_dim(ldc, "ldc", "sgemm_nn_strided"),
         );
     }
 }
@@ -291,17 +314,17 @@ pub fn sgemm_nn_ab(
             accelerate::CBLAS_ROW_MAJOR,
             accelerate::CBLAS_NO_TRANS,
             accelerate::CBLAS_NO_TRANS,
-            m as i32,
-            n as i32,
-            k as i32,
+            cblas_dim(m, "m", "sgemm_nn_ab"),
+            cblas_dim(n, "n", "sgemm_nn_ab"),
+            cblas_dim(k, "k", "sgemm_nn_ab"),
             alpha,
             a.as_ptr(),
-            k as i32,
+            cblas_dim(k, "lda", "sgemm_nn_ab"),
             b.as_ptr(),
-            n as i32,
+            cblas_dim(n, "ldb", "sgemm_nn_ab"),
             beta,
             c.as_mut_ptr(),
-            n as i32,
+            cblas_dim(n, "ldc", "sgemm_nn_ab"),
         );
     }
 }
@@ -527,5 +550,73 @@ mod tests {
         unsafe {
             sgemm_bt_strided(a.as_ptr(), 2, b.as_ptr(), 1, c.as_mut_ptr(), 2, 1, 2, 2);
         }
+    }
+
+    // --- CBLAS i32 ABI guard (ADR-080 C4, #796 round 1 finding 2): a non-overflowing usize
+    // above i32::MAX passes every usize-level shape/length check (zero-extent shapes make
+    // every canonical product zero), so it must be caught by cblas_dim's i32::try_from
+    // conversion before reaching the FFI call, not the shape validator.
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "n=2147483648 exceeds i32::MAX")]
+    fn accelerate_matmul_rejects_n_above_i32_max() {
+        let huge_n = i32::MAX as usize + 1;
+        let a: [f32; 0] = [];
+        let b: [f32; 0] = [];
+        let mut c: [f32; 0] = [];
+        // m=0, k=0: every canonical product (m*k, k*n, m*n) is zero, so validate_gemm_nn's
+        // usize-level checks all pass trivially. Only cblas_dim's i32 conversion should reject.
+        accelerate_matmul(&a, &b, &mut c, 0, huge_n, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "n=2147483648 exceeds i32::MAX")]
+    fn accelerate_matmul_bt_rejects_n_above_i32_max() {
+        let huge_n = i32::MAX as usize + 1;
+        let a: [f32; 0] = [];
+        let b: [f32; 0] = [];
+        let mut c: [f32; 0] = [];
+        accelerate_matmul_bt(&a, &b, &mut c, 0, huge_n, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "ldb=2147483648 exceeds i32::MAX")]
+    fn sgemm_nn_strided_rejects_ldb_above_i32_max() {
+        let huge_ldb = i32::MAX as usize + 1;
+        let a: [f32; 0] = [];
+        let b: [f32; 0] = [];
+        let mut c: [f32; 0] = [];
+        // m=0, k=0, n=0: validate_gemm_strided_shape's product-overflow checks pass trivially,
+        // and lda/ldb/ldc >= their row extents (0) also pass; only cblas_dim should reject.
+        // SAFETY: never reached — cblas_dim panics before any pointer is dereferenced.
+        unsafe {
+            sgemm_nn_strided(
+                a.as_ptr(),
+                0,
+                b.as_ptr(),
+                huge_ldb,
+                c.as_mut_ptr(),
+                0,
+                0,
+                0,
+                0,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[should_panic(expected = "m=2147483648 exceeds i32::MAX")]
+    fn sgemm_nn_ab_rejects_m_above_i32_max() {
+        let huge_m = i32::MAX as usize + 1;
+        let a: [f32; 0] = [];
+        let b: [f32; 0] = [];
+        let mut c: [f32; 0] = [];
+        // n=0, k=0: every canonical product is zero, so validate_gemm_nn's usize-level checks
+        // all pass trivially; only cblas_dim's i32 conversion of m should reject.
+        sgemm_nn_ab(&a, &b, &mut c, huge_m, 0, 0, 1.0, 0.0);
     }
 }

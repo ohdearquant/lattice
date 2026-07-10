@@ -281,8 +281,9 @@ pub fn matvec_ternary_scalar(
 ///
 /// Caller must ensure this runs only on a target with NEON enabled. `x_q`,
 /// `alphas`, `packed_w`, and `output` must satisfy the dimensions described
-/// by `n` and `k`; the function checks those invariants in debug builds before
-/// using unchecked indexing in the SIMD loop.
+/// by `n` and `k`; the function validates those invariants in all builds
+/// (release-active, via `validate_ternary_matvec_args`) before using unchecked
+/// indexing in the SIMD loop.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub unsafe fn matvec_ternary_neon(
@@ -1098,6 +1099,25 @@ mod tests {
         let weights = vec![1.0f32; n * k];
         let (packed, alphas) = pack_ternary(&weights, n, k);
         let x_q = vec![1i8; k - 1]; // too short
+        let mut output = vec![0.0f32; n];
+        matvec_ternary_scalar(&x_q, 1.0, &packed, &alphas, n, k, &mut output);
+    }
+
+    #[test]
+    #[should_panic(expected = "x_q too short for k")]
+    fn matvec_ternary_scalar_rejects_short_x_q_remainder_path() {
+        // #796 round 1 finding 4: k=32/len=31 above triggers an incidental native
+        // out-of-bounds panic from the full-byte loop (`x_q[31]`) rather than exercising the
+        // silent-truncation remainder path (k % 4 != 0, lines ~253-261 above), which only
+        // runs for `rem_start < k`. Use k=5 (rem_start=4, one remainder weight) with
+        // x_q.len()=4 so, with the validator reverse-mutated out, the remainder loop's
+        // `.take(k).skip(rem_start)` would silently iterate zero elements and the function
+        // would return normally instead of panicking — the guard is what makes this red.
+        let n = 2;
+        let k = 5;
+        let weights = vec![1.0f32; n * k];
+        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let x_q = vec![1i8; k - 1]; // too short, ends inside the remainder range
         let mut output = vec![0.0f32; n];
         matvec_ternary_scalar(&x_q, 1.0, &packed, &alphas, n, k, &mut output);
     }

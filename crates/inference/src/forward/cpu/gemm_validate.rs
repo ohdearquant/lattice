@@ -97,11 +97,11 @@ pub(crate) fn validate_gemm_strided_shape(
 /// (`packed_row_bytes(k)` bytes per row), and the activation/alpha/output vectors are addressed
 /// densely by `k`/`n` rather than a 2-D stride.
 ///
-/// `x_q_len`/`alphas_len`/`output_len` follow the oversized-allowed `>=` contract; `packed_w`
-/// is checked against the exact packed footprint `n * packed_row_bytes(k)` since the packed
-/// layout has no meaningful "oversized prefix" semantics for the caller to exploit (any row
-/// beyond the ones read is unreachable, and unpacked-row overrun both under- and over-sized
-/// buffers indicate a genuine caller shape mismatch).
+/// `x_q_len`/`alphas_len`/`packed_w_len`/`output_len` all follow the same oversized-allowed
+/// `>=` contract as the GEMM validators above: each is checked against its minimum required
+/// footprint (`packed_w` against `n * packed_row_bytes(k)`), and a caller-supplied buffer
+/// longer than that minimum is accepted — only rows/elements within the required footprint
+/// are ever read (see `validate_ternary_matvec_args_accepts_oversized` below).
 #[inline]
 pub(crate) fn validate_ternary_matvec_args(
     x_q_len: usize,
