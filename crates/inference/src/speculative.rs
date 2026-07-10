@@ -3078,9 +3078,8 @@ mod tests {
             l
         };
         let mut ref_tokens = prompt.clone();
-        let mut ref_pos = prompt.len();
         let mut greedy_out = Vec::with_capacity(max_new);
-        for _ in 0..max_new {
+        for ref_pos in (prompt.len()..).take(max_new) {
             let logits = greedy_fwd(*ref_tokens.last().unwrap(), ref_pos);
             let t = argmax(&logits) as u32;
             if t == eos {
@@ -3088,7 +3087,6 @@ mod tests {
             }
             greedy_out.push(t);
             ref_tokens.push(t);
-            ref_pos += 1;
         }
 
         // Speculative path — identical forward logic, independent closure.
@@ -3138,9 +3136,8 @@ mod tests {
             l
         };
         let mut ref_tokens = prompt.clone();
-        let mut ref_pos = prompt.len();
         let mut greedy_out = Vec::with_capacity(max_new);
-        for _ in 0..max_new {
+        for ref_pos in (prompt.len()..).take(max_new) {
             let logits = greedy_fwd(*ref_tokens.last().unwrap(), ref_pos);
             let t = argmax(&logits) as u32;
             if t == eos {
@@ -3148,7 +3145,6 @@ mod tests {
             }
             greedy_out.push(t);
             ref_tokens.push(t);
-            ref_pos += 1;
         }
 
         let spec_out = generate_with_speculation(&prompt, max_new, eos, tied_fwd, 5, 4);

@@ -184,7 +184,9 @@ E5 models need `"query: "` / `"passage: "` prefixes. Qwen3 needs instruction pre
 
 ## Rust Conventions
 
-**Toolchain**: Edition 2024, no MSRV declared; CI pins Rust 1.94.1, resolver 2.
+**Toolchain**: Edition 2024, resolver 2. MSRV is 1.93 (`Cargo.toml` `rust-version`, CI-gated
+at 1.93.1 in the `msrv` job). Repository development/CI toolchain is pinned to 1.94.1 via
+`rust-toolchain.toml`.
 
 **Lints**: Zero clippy warnings. All crates inherit `[lints] workspace = true`. Correctness lints are `deny`. `unsafe_op_in_unsafe_fn = "allow"` for SIMD. `inference` allows `too_many_arguments` and `needless_range_loop` crate-wide. AVX-512 code gets `#[allow(clippy::incompatible_msrv)]`.
 
