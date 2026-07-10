@@ -46,7 +46,7 @@ const DEFAULT_TINY_TOK_JSON: &str = r#"{
 
 /// An all-zero-weight, 4-layer, 64-hidden-dim `Qwen35Model` with a 7-token
 /// vocab. All-zero weights make every forward pass emit all-zero logits, so
-/// greedy sampling deterministically always picks token 0 ("<unk>") --
+/// greedy sampling deterministically always picks token 0 (`"<unk>"`) --
 /// useful for tests that need *some* real, non-empty, deterministic
 /// generation output without loading real model weights.
 pub fn tiny_zero_model() -> Qwen35Model {
