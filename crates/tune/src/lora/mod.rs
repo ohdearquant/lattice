@@ -239,8 +239,12 @@ impl LoraAdapter {
                 ("o_proj", true) => (config.full_q_dim(), config.hidden_size),
                 ("in_proj_qkv", false) => (config.hidden_size, config.linear_qkv_dim()),
                 ("in_proj_z", false) => (config.hidden_size, config.linear_output_dim()),
-                ("in_proj_b", false) => (config.hidden_size, config.linear_num_key_heads),
-                ("in_proj_a", false) => (config.hidden_size, config.linear_num_key_heads),
+                // beta/alpha are projected per VALUE head (matches the shipping
+                // gdn_fused forward and the f16 weight loader), not per key head
+                // (#792 codex round-1 blocker: this was linear_num_key_heads,
+                // wrong for asymmetric 4B/27B shapes where value_heads != key_heads).
+                ("in_proj_b", false) => (config.hidden_size, config.linear_num_value_heads()),
+                ("in_proj_a", false) => (config.hidden_size, config.linear_num_value_heads()),
                 ("out_proj", false) => (config.linear_output_dim(), config.hidden_size),
                 ("gate_proj", _) => (config.hidden_size, config.intermediate_size),
                 ("up_proj", _) => (config.hidden_size, config.intermediate_size),
@@ -526,8 +530,8 @@ mod tests {
             let cases = [
                 ("in_proj_qkv", h, cfg.linear_qkv_dim()),
                 ("in_proj_z", h, cfg.linear_output_dim()),
-                ("in_proj_b", h, cfg.linear_num_key_heads),
-                ("in_proj_a", h, cfg.linear_num_key_heads),
+                ("in_proj_b", h, cfg.linear_num_value_heads()),
+                ("in_proj_a", h, cfg.linear_num_value_heads()),
                 ("out_proj", cfg.linear_output_dim(), h),
             ];
             for (module, d_in, d_out) in cases {
@@ -537,6 +541,70 @@ mod tests {
                     "GDN LoRA module {module} should validate (d_in={d_in}, d_out={d_out})"
                 );
             }
+        }
+
+        /// Regression for #792 codex round-1 blocker: in_proj_b/in_proj_a
+        /// dims must be keyed by `linear_num_value_heads()`, not
+        /// `linear_num_key_heads`. Asymmetric-head configs (key_heads !=
+        /// value_heads) are the only ones that can tell these apart —
+        /// `qwen35_0_8b` has key_heads == value_heads == 16 and would pass
+        /// either way.
+        #[test]
+        fn test_validate_against_gdn_asymmetric_value_heads_35b_a3b() {
+            let cfg = Qwen35Config::qwen36_35b_a3b();
+            assert_eq!(cfg.linear_num_key_heads, 16);
+            assert_eq!(cfg.linear_num_value_heads(), 32);
+            let gdn_layer = (0..cfg.num_hidden_layers)
+                .find(|&i| !cfg.is_full_attention(i))
+                .expect("config has linear-attention layers");
+            let h = cfg.hidden_size;
+
+            // Correct dims (value_heads=32) must validate.
+            let ok_b = make_adapter_for_layer(gdn_layer, "in_proj_b", h, 32);
+            assert!(ok_b.validate_against(&cfg).is_ok());
+            let ok_a = make_adapter_for_layer(gdn_layer, "in_proj_a", h, 32);
+            assert!(ok_a.validate_against(&cfg).is_ok());
+
+            // The old (wrong) key-head dim (16) must be rejected.
+            let bad_b = make_adapter_for_layer(gdn_layer, "in_proj_b", h, 16);
+            assert!(
+                bad_b.validate_against(&cfg).is_err(),
+                "in_proj_b with key-head dim (16) must fail on a 16-key/32-value config"
+            );
+            let bad_a = make_adapter_for_layer(gdn_layer, "in_proj_a", h, 16);
+            assert!(
+                bad_a.validate_against(&cfg).is_err(),
+                "in_proj_a with key-head dim (16) must fail on a 16-key/32-value config"
+            );
+        }
+
+        #[test]
+        fn test_validate_against_gdn_asymmetric_value_heads_27b() {
+            let cfg = Qwen35Config::qwen36_27b();
+            assert_eq!(cfg.linear_num_key_heads, 16);
+            assert_eq!(cfg.linear_num_value_heads(), 48);
+            let gdn_layer = (0..cfg.num_hidden_layers)
+                .find(|&i| !cfg.is_full_attention(i))
+                .expect("config has linear-attention layers");
+            let h = cfg.hidden_size;
+
+            // Correct dims (value_heads=48) must validate.
+            let ok_b = make_adapter_for_layer(gdn_layer, "in_proj_b", h, 48);
+            assert!(ok_b.validate_against(&cfg).is_ok());
+            let ok_a = make_adapter_for_layer(gdn_layer, "in_proj_a", h, 48);
+            assert!(ok_a.validate_against(&cfg).is_ok());
+
+            // The old (wrong) key-head dim (16) must be rejected.
+            let bad_b = make_adapter_for_layer(gdn_layer, "in_proj_b", h, 16);
+            assert!(
+                bad_b.validate_against(&cfg).is_err(),
+                "in_proj_b with key-head dim (16) must fail on a 16-key/48-value config"
+            );
+            let bad_a = make_adapter_for_layer(gdn_layer, "in_proj_a", h, 16);
+            assert!(
+                bad_a.validate_against(&cfg).is_err(),
+                "in_proj_a with key-head dim (16) must fail on a 16-key/48-value config"
+            );
         }
     }
 }

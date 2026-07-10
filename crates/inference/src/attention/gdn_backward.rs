@@ -18,12 +18,15 @@
 //!
 //! c_t     = conv1d_silu(qkv_t)        (causal depthwise conv, then SiLU)
 //!
-//! For each value-head h  (key-head k_head = h / ratio):
-//!   q_hat = L2norm( c_t[q_start..] )
-//!   k_hat = L2norm( c_t[k_start..] )
+//! For each value-head h  (key-head k_head = h / ratio, used only for Q/K sharing):
+//!   q_hat = L2norm( c_t[q_start..] )   (q_start from k_head)
+//!   k_hat = L2norm( c_t[k_start..] )   (k_start from k_head)
 //!   v     = c_t[v_start..]
 //!
-//!   g   = exp(-exp(a_log) * softplus(alpha_t[k_head] + dt_bias[k_head]))
+//!   beta_t, alpha_t, a_log, dt_bias are all indexed by h directly — GDN's
+//!   decay gate and update rate are per VALUE head, not per key head. Only
+//!   Q/K projections are shared across a key-head's group of value-heads.
+//!   g   = exp(-exp(a_log[h]) * softplus(alpha_t[h] + dt_bias[h]))
 //!
 //!   kv_mem_t = S_{t-1}^T @ k_hat      (retrieval from *pre-decayed* state)
 //!   delta_t  = (v - kv_mem_t * g) * beta_t
@@ -81,10 +84,10 @@ pub struct GdnGrads {
     /// in_proj_z LoRA: d_in=hidden, d_out=output_dim
     pub grad_a_z: Vec<f32>,
     pub grad_b_z: Vec<f32>,
-    /// in_proj_b (beta sigmoid) LoRA: d_in=hidden, d_out=num_kh
+    /// in_proj_b (beta sigmoid) LoRA: d_in=hidden, d_out=value_heads
     pub grad_a_b: Vec<f32>,
     pub grad_b_b: Vec<f32>,
-    /// in_proj_a (alpha decay) LoRA: d_in=hidden, d_out=num_kh
+    /// in_proj_a (alpha decay) LoRA: d_in=hidden, d_out=value_heads
     pub grad_a_a: Vec<f32>,
     pub grad_b_a: Vec<f32>,
     /// out_proj LoRA: d_in=output_dim, d_out=hidden
@@ -119,13 +122,13 @@ pub struct GdnSaved {
     pub qkv_proj: Vec<f32>,
     /// z projection: [seq_len, output_dim]
     pub z_proj: Vec<f32>,
-    /// raw beta pre-sigmoid: [seq_len, num_key_heads]
+    /// raw beta pre-sigmoid: [seq_len, value_heads] (per VALUE head, not key head)
     pub beta_raw: Vec<f32>,
-    /// alpha projection: [seq_len, num_key_heads]
+    /// alpha projection: [seq_len, value_heads] (per VALUE head, not key head)
     pub alpha_proj: Vec<f32>,
-    /// beta = sigmoid(beta_raw): [seq_len, num_key_heads]
+    /// beta = sigmoid(beta_raw): [seq_len, value_heads]
     pub beta: Vec<f32>,
-    /// decay gate g per key-head: [seq_len, num_key_heads]
+    /// decay gate g per value-head: [seq_len, value_heads]
     pub g: Vec<f32>,
 
     /// Conv1d SiLU output: [seq_len, qkv_dim]
@@ -203,11 +206,11 @@ pub struct GdnSaved {
     pub lora_b_z: Vec<f32>,
     /// A_b: [rank, hidden]
     pub lora_a_b: Vec<f32>,
-    /// B_b: [num_kh, rank]
+    /// B_b: [value_heads, rank]
     pub lora_b_b: Vec<f32>,
     /// A_a: [rank, hidden]
     pub lora_a_a: Vec<f32>,
-    /// B_a: [num_kh, rank]
+    /// B_a: [value_heads, rank]
     pub lora_b_a: Vec<f32>,
     /// A_out: [rank, output_dim]
     pub lora_a_out: Vec<f32>,
@@ -252,10 +255,10 @@ impl GdnSaved {
             inputs: vec![0.0; seq_len * hidden_size],
             qkv_proj: vec![0.0; seq_len * qkv_dim],
             z_proj: vec![0.0; seq_len * output_dim],
-            beta_raw: vec![0.0; seq_len * num_key_heads],
-            alpha_proj: vec![0.0; seq_len * num_key_heads],
-            beta: vec![0.0; seq_len * num_key_heads],
-            g: vec![0.0; seq_len * num_key_heads],
+            beta_raw: vec![0.0; seq_len * value_heads],
+            alpha_proj: vec![0.0; seq_len * value_heads],
+            beta: vec![0.0; seq_len * value_heads],
+            g: vec![0.0; seq_len * value_heads],
             conv_out: vec![0.0; seq_len * qkv_dim],
             conv_buffers: vec![0.0; seq_len * qkv_dim * buf_len],
             q_hat: vec![0.0; seq_len * value_heads * key_dim],
@@ -341,10 +344,10 @@ pub fn gdn_forward_save(
     // LoRA params for in_proj_z: a=[rank,hidden], b=[output_dim,rank]
     lora_a_z: Option<&[f32]>,
     lora_b_z: Option<&[f32]>,
-    // LoRA params for in_proj_b (beta): a=[rank,hidden], b=[num_kh,rank]
+    // LoRA params for in_proj_b (beta): a=[rank,hidden], b=[value_heads,rank]
     lora_a_b: Option<&[f32]>,
     lora_b_b: Option<&[f32]>,
-    // LoRA params for in_proj_a (alpha): a=[rank,hidden], b=[num_kh,rank]
+    // LoRA params for in_proj_a (alpha): a=[rank,hidden], b=[value_heads,rank]
     lora_a_a: Option<&[f32]>,
     lora_b_a: Option<&[f32]>,
     // LoRA params for out_proj: a=[rank,output_dim], b=[hidden,rank]
@@ -506,8 +509,12 @@ pub fn gdn_forward_save(
             }
         }
 
-        let beta_out = &mut saved.beta_raw[t * num_kh..(t + 1) * num_kh];
-        matmul_bt(x, &weights.in_proj_b, beta_out, 1, hidden, num_kh);
+        // beta/alpha are projected per VALUE head (in_proj_b/in_proj_a have
+        // value_heads rows, matching the shipping gdn_fused forward and the
+        // f16 weight loader) — NOT per key head. Only Q/K share a key-head's
+        // projection; beta/alpha/a_log/dt_bias never do.
+        let beta_out = &mut saved.beta_raw[t * value_heads..(t + 1) * value_heads];
+        matmul_bt(x, &weights.in_proj_b, beta_out, 1, hidden, value_heads);
 
         // LoRA for in_proj_b (beta, pre-sigmoid linear output)
         if let Some((_, _, _, _, a_b, b_b, _, _, _, _)) = lora_bound {
@@ -519,8 +526,8 @@ pub fn gdn_forward_save(
                     .map(|(a, xi)| a * xi)
                     .sum();
             }
-            let beta_out = &mut saved.beta_raw[t * num_kh..(t + 1) * num_kh];
-            for i in 0..num_kh {
+            let beta_out = &mut saved.beta_raw[t * value_heads..(t + 1) * value_heads];
+            for i in 0..value_heads {
                 let acc: f32 = lora_scale
                     * b_b[i * lora_rank..(i + 1) * lora_rank]
                         .iter()
@@ -531,8 +538,8 @@ pub fn gdn_forward_save(
             }
         }
 
-        let alpha_out = &mut saved.alpha_proj[t * num_kh..(t + 1) * num_kh];
-        matmul_bt(x, &weights.in_proj_a, alpha_out, 1, hidden, num_kh);
+        let alpha_out = &mut saved.alpha_proj[t * value_heads..(t + 1) * value_heads];
+        matmul_bt(x, &weights.in_proj_a, alpha_out, 1, hidden, value_heads);
 
         // LoRA for in_proj_a (alpha, pre-softplus linear output)
         if let Some((_, _, _, _, _, _, a_a, b_a, _, _)) = lora_bound {
@@ -544,8 +551,8 @@ pub fn gdn_forward_save(
                     .map(|(a, xi)| a * xi)
                     .sum();
             }
-            let alpha_out = &mut saved.alpha_proj[t * num_kh..(t + 1) * num_kh];
-            for i in 0..num_kh {
+            let alpha_out = &mut saved.alpha_proj[t * value_heads..(t + 1) * value_heads];
+            for i in 0..value_heads {
                 let acc: f32 = lora_scale
                     * b_a[i * lora_rank..(i + 1) * lora_rank]
                         .iter()
@@ -556,18 +563,18 @@ pub fn gdn_forward_save(
             }
         }
 
-        // sigmoid(beta)
-        for kh in 0..num_kh {
-            let raw = saved.beta_raw[t * num_kh + kh];
-            saved.beta[t * num_kh + kh] = sigmoid(raw);
+        // sigmoid(beta), indexed per value-head
+        for vh in 0..value_heads {
+            let raw = saved.beta_raw[t * value_heads + vh];
+            saved.beta[t * value_heads + vh] = sigmoid(raw);
         }
 
-        // decay gate g per key-head
-        for kh in 0..num_kh {
-            let alpha_h = saved.alpha_proj[t * num_kh + kh];
-            let a = weights.a_log[kh].exp();
-            let sp = softplus(alpha_h + weights.dt_bias[kh]);
-            saved.g[t * num_kh + kh] = (-a * sp).exp();
+        // decay gate g per value-head
+        for vh in 0..value_heads {
+            let alpha_h = saved.alpha_proj[t * value_heads + vh];
+            let a = weights.a_log[vh].exp();
+            let sp = softplus(alpha_h + weights.dt_bias[vh]);
+            saved.g[t * value_heads + vh] = (-a * sp).exp();
         }
 
         // --- Causal conv1d + SiLU ---
@@ -629,8 +636,8 @@ pub fn gdn_forward_save(
             saved.q_hat[q_off..q_off + key_dim].copy_from_slice(&q_raw);
             saved.k_hat[k_off..k_off + key_dim].copy_from_slice(&k_raw);
 
-            let g_h = saved.g[t * num_kh + kh];
-            let beta_h = saved.beta[t * num_kh + kh];
+            let g_h = saved.g[t * value_heads + h];
+            let beta_h = saved.beta[t * value_heads + h];
 
             // S_{t-1} for this head
             let s_off = h * key_dim * value_dim;
@@ -804,7 +811,7 @@ pub fn gdn_backward(
         Vec::new()
     };
     let mut grad_b_b = if have_lora {
-        vec![0.0f32; num_kh * lora_rank]
+        vec![0.0f32; value_heads * lora_rank]
     } else {
         Vec::new()
     };
@@ -814,7 +821,7 @@ pub fn gdn_backward(
         Vec::new()
     };
     let mut grad_b_a = if have_lora {
-        vec![0.0f32; num_kh * lora_rank]
+        vec![0.0f32; value_heads * lora_rank]
     } else {
         Vec::new()
     };
@@ -993,11 +1000,12 @@ pub fn gdn_backward(
         // We work with the per-head adjoint dS[h] which carries across time.
 
         let mut d_conv_out = vec![0.0f32; qkv_dim];
-        // Per key-head accumulators for alpha and beta scalar grads (multiple
-        // value-heads share one key-head, so we must sum across value-heads first
-        // before applying lora_vjp to avoid double-counting the d_in/d_out shape).
-        let mut d_alpha_kh = vec![0.0f32; num_kh]; // d_loss / d(alpha_proj[t, kh])
-        let mut d_beta_raw_kh = vec![0.0f32; num_kh]; // d_loss / d(beta_raw[t, kh])
+        // Per value-head accumulators for alpha and beta scalar grads. Unlike
+        // Q/K (shared across a key-head's group of value-heads), alpha/beta/
+        // a_log/dt_bias are genuinely one-per-value-head — no reduction across
+        // heads is needed or correct here.
+        let mut d_alpha_vh = vec![0.0f32; value_heads]; // d_loss / d(alpha_proj[t, h])
+        let mut d_beta_raw_vh = vec![0.0f32; value_heads]; // d_loss / d(beta_raw[t, h])
 
         for h in 0..value_heads {
             let kh = h / ratio;
@@ -1005,8 +1013,8 @@ pub fn gdn_backward(
             let k_start = q_total + kh * key_dim;
             let v_start = q_total * 2 + h * value_dim;
 
-            let g_h = saved.g[t * num_kh + kh];
-            let beta_h = saved.beta[t * num_kh + kh];
+            let g_h = saved.g[t * value_heads + h];
+            let beta_h = saved.beta[t * value_heads + h];
 
             let q_off = (t * value_heads + h) * key_dim;
             let k_off = (t * value_heads + h) * key_dim;
@@ -1123,9 +1131,9 @@ pub fn gdn_backward(
             // dg/d_alpha = g * (-exp(a_log)) * sigmoid(alpha + dt_bias)
             //            = g * (-exp(a_log)) * softplus'(alpha + dt_bias)
             // where softplus'(x) = sigmoid(x)
-            let alpha_h = saved.alpha_proj[t * num_kh + kh];
-            let a_val = weights.a_log[kh].exp();
-            let sp_arg = alpha_h + weights.dt_bias[kh];
+            let alpha_h = saved.alpha_proj[t * value_heads + h];
+            let a_val = weights.a_log[h].exp();
+            let sp_arg = alpha_h + weights.dt_bias[h];
             let sp_deriv = sigmoid(sp_arg); // d/dx softplus(x) = sigmoid(x)
             // dg/d_alpha = g * (-a_val) * sp_deriv
             let d_alpha_from_g = d_g_h * g_h * (-a_val) * sp_deriv;
@@ -1160,48 +1168,48 @@ pub fn gdn_backward(
             // ---- 4h. Backward through sigmoid(beta_raw) → d_beta_raw ----
             // beta = sigmoid(beta_raw)
             // d_beta_raw = d_beta * beta * (1 - beta)
-            let beta_raw_h = saved.beta_raw[t * num_kh + kh];
+            let beta_raw_h = saved.beta_raw[t * value_heads + h];
             let sig = sigmoid(beta_raw_h);
             let d_beta_raw_h = d_beta_h * sig * (1.0 - sig);
 
-            // ---- 4i. Accumulate per key-head scalar grads ----
-            // Multiple value-heads share the same key-head; accumulate into kh slots.
+            // ---- 4i. Store per value-head scalar grads ----
+            // No reduction across heads: alpha/beta are one-per-value-head.
             // These will be fed to W_a^T/W_b^T and lora_vjp after this loop.
-            d_alpha_kh[kh] += d_alpha_from_g;
-            d_beta_raw_kh[kh] += d_beta_raw_h;
+            d_alpha_vh[h] += d_alpha_from_g;
+            d_beta_raw_vh[h] += d_beta_raw_h;
         } // end per-head loop
 
-        // ---- Apply per key-head alpha/beta grads → d_x and LoRA weight grads ----
-        // d_alpha_proj[t, kh] = d_alpha_kh[kh]  (scalar per head)
-        // d_beta_raw[t, kh]   = d_beta_raw_kh[kh]
+        // ---- Apply per value-head alpha/beta grads → d_x and LoRA weight grads ----
+        // d_alpha_proj[t, h] = d_alpha_vh[h]  (scalar per value-head)
+        // d_beta_raw[t, h]   = d_beta_raw_vh[h]
         //
         // For lora_vjp on the beta and alpha projections, we need the full
-        // d_proj_output vector of shape [num_kh].  We built those above.
+        // d_proj_output vector of shape [value_heads]. We built those above.
         //
-        // g for in_proj_b  = d_beta_raw_kh   (pre-sigmoid linear-output gradient)
-        // g for in_proj_a  = d_alpha_kh      (pre-softplus linear-output gradient)
+        // g for in_proj_b  = d_beta_raw_vh   (pre-sigmoid linear-output gradient)
+        // g for in_proj_a  = d_alpha_vh      (pre-softplus linear-output gradient)
         let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
-        for kh in 0..num_kh {
-            let d_a = d_alpha_kh[kh];
-            let d_b = d_beta_raw_kh[kh];
+        for vh in 0..value_heads {
+            let d_a = d_alpha_vh[vh];
+            let d_b = d_beta_raw_vh[vh];
             for i in 0..hidden {
-                dx_t[i] += weights.in_proj_a[kh * hidden + i] * d_a;
-                dx_t[i] += weights.in_proj_b[kh * hidden + i] * d_b;
+                dx_t[i] += weights.in_proj_a[vh * hidden + i] * d_a;
+                dx_t[i] += weights.in_proj_b[vh * hidden + i] * d_b;
             }
         }
         // LoRA weight grads for in_proj_a and in_proj_b.
-        // g = d_alpha_kh (full [num_kh] vector), x = x_t, h_a_t, d_in=hidden, d_out=num_kh
+        // g = d_alpha_vh (full [value_heads] vector), x = x_t, h_a_t, d_in=hidden, d_out=value_heads
         if have_lora {
             let h_b_t = &saved.h_b[t * lora_rank..(t + 1) * lora_rank];
             let (gb, ga, dx_lora) = lora_vjp(
-                &d_beta_raw_kh,
+                &d_beta_raw_vh,
                 x_t,
                 h_b_t,
                 &saved.lora_a_b,
                 &saved.lora_b_b,
                 lora_rank,
                 hidden,
-                num_kh,
+                value_heads,
                 lora_scale,
             );
             for k in 0..ga.len() {
@@ -1216,14 +1224,14 @@ pub fn gdn_backward(
 
             let h_a_t = &saved.h_a[t * lora_rank..(t + 1) * lora_rank];
             let (gb, ga, dx_lora) = lora_vjp(
-                &d_alpha_kh,
+                &d_alpha_vh,
                 x_t,
                 h_a_t,
                 &saved.lora_a_a,
                 &saved.lora_b_a,
                 lora_rank,
                 hidden,
-                num_kh,
+                value_heads,
                 lora_scale,
             );
             for k in 0..ga.len() {
@@ -1459,13 +1467,16 @@ mod tests {
 
         let mut in_proj_qkv = vec![0.0f32; qkv_dim * hidden];
         let mut in_proj_z = vec![0.0f32; output_dim * hidden];
-        let mut in_proj_b = vec![0.0f32; num_kh * hidden];
-        let mut in_proj_a = vec![0.0f32; num_kh * hidden];
+        // in_proj_b/in_proj_a/a_log/dt_bias are dimensioned by VALUE heads
+        // (num_vh), matching the shipping f16 weight loader and gdn_fused —
+        // not by key heads. Only Q/K share a key-head's projection.
+        let mut in_proj_b = vec![0.0f32; num_vh * hidden];
+        let mut in_proj_a = vec![0.0f32; num_vh * hidden];
         let mut conv1d_weight = vec![0.0f32; qkv_dim * kernel_size];
         let mut out_proj = vec![0.0f32; hidden * output_dim];
         let mut norm_weight = vec![0.0f32; value_dim];
-        let mut a_log = vec![0.0f32; num_kh];
-        let mut dt_bias = vec![0.0f32; num_kh];
+        let mut a_log = vec![0.0f32; num_vh];
+        let mut dt_bias = vec![0.0f32; num_vh];
 
         rng.fill(&mut in_proj_qkv, -scale, scale);
         rng.fill(&mut in_proj_z, -scale, scale);
@@ -1476,8 +1487,13 @@ mod tests {
         for g in &mut norm_weight {
             *g = rng.f32_range(0.9, 1.1);
         }
+        // Wider than the original (-2.0, -0.5): a steeper a_log range makes
+        // the decay gate g more sensitive to alpha (dg/d_alpha scales with
+        // exp(a_log)), which is one of the two levers (with lora_scale/seq_len
+        // in the gradcheck fixtures below) needed to lift the alpha/beta LoRA
+        // gradient signal above the finite-difference noise floor.
         for a in &mut a_log {
-            *a = rng.f32_range(-2.0, -0.5);
+            *a = rng.f32_range(-0.3, 2.0);
         }
         for dt in &mut dt_bias {
             *dt = rng.f32_range(-0.1, 0.1);
@@ -1491,10 +1507,10 @@ mod tests {
             in_proj_z_rows: output_dim,
             in_proj_z_cols: hidden,
             in_proj_b,
-            in_proj_b_rows: num_kh,
+            in_proj_b_rows: num_vh,
             in_proj_b_cols: hidden,
             in_proj_a,
-            in_proj_a_rows: num_kh,
+            in_proj_a_rows: num_vh,
             in_proj_a_cols: hidden,
             a_log,
             dt_bias,
@@ -1965,7 +1981,11 @@ mod tests {
         eps: f32,
     ) -> f32 {
         // Helper: clone an array, perturb entry [idx] by delta, re-run, return loss.
-        let perturbed_loss = |delta: f32| -> f32 {
+        // Loss accumulates in f64 (forward stays f32, matching production) to avoid
+        // catastrophic cancellation in (lp - lm) when lora_scale/seq_len are large
+        // enough to push output magnitudes up — the same precision discipline as
+        // fd_grad_inputs_linear's f64 accumulation above.
+        let perturbed_loss = |delta: f32| -> f64 {
             let mut aq = a_qkv.to_vec();
             let mut bq = b_qkv.to_vec();
             let mut az = a_z.to_vec();
@@ -2034,16 +2054,40 @@ mod tests {
             outputs
                 .iter()
                 .zip(coeffs.iter())
-                .map(|(&y, &c)| y * c)
+                .map(|(&y, &c)| (y as f64) * (c as f64))
                 .sum()
         };
         let lp = perturbed_loss(eps);
         let lm = perturbed_loss(-eps);
-        (lp - lm) / (2.0 * eps)
+        ((lp - lm) / (2.0 * eps as f64)) as f32
+    }
+
+    /// Names of the 10 GDN LoRA weight-gradient arrays, in `which` order.
+    const LORA_ARRAY_NAMES: [&str; 10] = [
+        "grad_a_qkv",
+        "grad_b_qkv",
+        "grad_a_z",
+        "grad_b_z",
+        "grad_a_b",
+        "grad_b_b",
+        "grad_a_a",
+        "grad_b_a",
+        "grad_a_out",
+        "grad_b_out",
+    ];
+
+    /// Per-array gradcheck coverage: (n_tested, max_rel) for each of the 10 arrays.
+    struct PerArrayCoverage {
+        /// (n_tested, max_rel) per array, in `LORA_ARRAY_NAMES` order.
+        per_array: [(usize, f32); 10],
+        overall_max_rel: f32,
+        overall_n_tested: usize,
     }
 
     // Core helper that exercises weight-grad gradcheck for any fixture.
-    // Returns (max_rel_err, n_tested).
+    // Returns per-array AND aggregate coverage — the aggregate alone hid the
+    // fact that whole arrays (alpha/beta) went completely untested (codex
+    // review round 1, PR #792).
     #[allow(clippy::too_many_arguments)]
     fn run_lora_weight_gradcheck(
         hidden: usize,
@@ -2060,7 +2104,7 @@ mod tests {
         lora_seed: u64,
         coeff_seed: u64,
         eps: f32,
-    ) -> (f32, usize) {
+    ) -> PerArrayCoverage {
         let cfg = tiny_cfg(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size);
         let weights = make_tiny_weights(
             hidden,
@@ -2092,9 +2136,9 @@ mod tests {
         let mut a_z = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
         let mut b_z = vec![0.0f32; output_dim * lora_rank]; // [output_dim, rank]
         let mut a_b = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
-        let mut b_b = vec![0.0f32; num_kh * lora_rank]; // [num_kh, rank]
+        let mut b_b = vec![0.0f32; num_vh * lora_rank]; // [value_heads, rank]
         let mut a_a = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
-        let mut b_a = vec![0.0f32; num_kh * lora_rank]; // [num_kh, rank]
+        let mut b_a = vec![0.0f32; num_vh * lora_rank]; // [value_heads, rank]
         let mut a_out = vec![0.0f32; lora_rank * output_dim]; // [rank, output_dim]
         let mut b_out = vec![0.0f32; hidden * lora_rank]; // [hidden, rank]
         for arr in [
@@ -2111,7 +2155,6 @@ mod tests {
             &inputs, &weights, &cfg, seq_len, &coeffs, lora_rank, lora_scale, &a_qkv, &b_qkv, &a_z,
             &b_z, &a_b, &b_b, &a_a, &b_a, &a_out, &b_out,
         );
-
         // Collect (which_array, analytic_grad_slice, array_len) triples.
         let analytic_arrays: [(&[f32], usize); 10] = [
             (&grads.grad_a_qkv, a_qkv.len()),
@@ -2126,13 +2169,16 @@ mod tests {
             (&grads.grad_b_out, b_out.len()),
         ];
 
-        let mut max_rel = 0.0f32;
-        let mut n_tested = 0usize;
+        let mut overall_max_rel = 0.0f32;
+        let mut overall_n_tested = 0usize;
+        let mut per_array = [(0usize, 0.0f32); 10];
 
         for (which, (analytic_slice, arr_len)) in analytic_arrays.iter().enumerate() {
             // Sample up to 6 entries spread across each array.
             let step = (arr_len / 6).max(1);
             let mut idx = 0usize;
+            let mut arr_n_tested = 0usize;
+            let mut arr_max_rel = 0.0f32;
             while idx < *arr_len {
                 let analytic_v = analytic_slice[idx];
                 let fd_v = fd_lora_weight_entry(
@@ -2141,76 +2187,238 @@ mod tests {
                 );
                 let mag = fd_v.abs().max(analytic_v.abs());
                 if mag >= 1e-4 {
-                    n_tested += 1;
+                    arr_n_tested += 1;
+                    overall_n_tested += 1;
                     let rel = (fd_v - analytic_v).abs() / mag;
-                    if rel > max_rel {
-                        max_rel = rel;
+                    if rel > arr_max_rel {
+                        arr_max_rel = rel;
+                    }
+                    if rel > overall_max_rel {
+                        overall_max_rel = rel;
                     }
                 }
                 idx += step;
             }
+            per_array[which] = (arr_n_tested, arr_max_rel);
         }
 
-        (max_rel, n_tested)
+        PerArrayCoverage {
+            per_array,
+            overall_max_rel,
+            overall_n_tested,
+        }
     }
 
     #[test]
     fn gradcheck_gdn_lora_weight_grads() {
         // Tiny GDN: hidden=32, num_kh=1, value_heads=1, key_dim=8, value_dim=8,
-        // kernel_size=3, seq=6; rank=2; scale=2.0.
+        // kernel_size=3, seq=14; rank=2; lora_scale=16.0.
         //
-        // lora_scale bumped 0.5->2.0 vs the original draft: with num_kh=1 the
-        // beta/alpha LoRA arrays (b_b/b_a) are only [1, rank] = 2 entries each,
-        // and at scale=0.5 too many sampled entries across all 10 arrays fell
-        // under the 1e-4 magnitude floor (only 6 testable, below the >=10
-        // gate) — the LoRA delta was too small relative to the GDN's internal
-        // L2-normalization to leave a measurable footprint on a 4-step
-        // sequence. scale=2.0 + seq=6 amplifies the signal without changing
-        // what is being verified (the same 10 weight-gradient arrays).
-        let (max_rel, n_tested) = run_lora_weight_gradcheck(
-            32, 1, 1, 8, 8, 3, 6,    // hidden, num_kh, num_vh, key_dim, value_dim, kernel, seq
+        // Per-array coverage (codex review round 1, PR #792): the PREVIOUS
+        // fixture (seq=6, scale=2.0) hit the overall n_tested>=10 aggregate
+        // gate while grad_a_b/grad_b_b/grad_a_a/grad_b_a (the alpha/beta
+        // arrays) had ZERO entries above the 1e-4 floor in EITHER fixture —
+        // the aggregate threshold hid four completely unverified arrays.
+        // alpha/beta only reach the output through a SCALAR decay gate/update
+        // rate feeding a recurrent state (an indirect path), unlike
+        // qkv/z/out which sit directly in the per-token output computation —
+        // their gradient magnitude is intrinsically much smaller for the same
+        // input/weight scale. Fix: seq_len 6->14 (more recurrent steps to
+        // accumulate signal) + lora_scale 2.0->16.0 (amplifies the LoRA
+        // delta feeding alpha/beta) lifts all 10 arrays' gradients above the
+        // floor; run_lora_weight_gradcheck now tracks and gates per-array
+        // coverage (below), not just an aggregate count, so this can't
+        // silently regress. fd_lora_weight_entry's loss also switched to f64
+        // accumulation (was f32) to keep the larger scale's finite-difference
+        // estimate accurate rather than just louder.
+        let cov = run_lora_weight_gradcheck(
+            32, 1, 1, 8, 8, 3, 14,   // hidden, num_kh, num_vh, key_dim, value_dim, kernel, seq
             2,    // lora_rank
-            2.0,  // lora_scale
+            16.0, // lora_scale
             42,   // weight_seed
             1337, // input_seed
             777,  // lora_seed
             999,  // coeff_seed
             1e-3, // eps
         );
+        for (name, (n, rel)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
+            println!("  {name:<12}: n_tested={n}  max_rel={rel:.3e}");
+        }
+        for (name, (n, _)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
+            assert!(
+                *n >= 1,
+                "lora weight gradcheck: array {name} has ZERO testable entries \
+                 above the 1e-4 floor — this array is not actually being verified"
+            );
+        }
         assert!(
-            n_tested >= 10,
-            "lora weight gradcheck: too few testable entries ({n_tested}); \
-             increase array sizes or tighten threshold"
+            cov.overall_n_tested >= 10,
+            "lora weight gradcheck: too few testable entries ({}); \
+             increase array sizes or tighten threshold",
+            cov.overall_n_tested
         );
         assert!(
-            max_rel < 1e-2,
-            "gdn lora weight gradcheck failed: max_rel={max_rel:.3e} \
-             (n_tested={n_tested})"
+            cov.overall_max_rel < 1e-2,
+            "gdn lora weight gradcheck failed: max_rel={:.3e} (n_tested={})",
+            cov.overall_max_rel,
+            cov.overall_n_tested
         );
     }
 
     #[test]
     fn gradcheck_gdn_lora_weight_grads_multi_head() {
-        // Multi-head variant: num_kh=2, value_heads=4 exercises alpha/beta head-sharing reduction.
-        let (max_rel, n_tested) = run_lora_weight_gradcheck(
+        // Asymmetric-head variant: num_kh=2, value_heads=4 — exercises the
+        // real value-head-scoped alpha/beta projection (in_proj_a/in_proj_b
+        // have 4 rows, not 2; Q/K still share via kh=h/ratio=h/2).
+        let cov = run_lora_weight_gradcheck(
             32, 2, 4, 8, 8, 3,
-            4,    // hidden, num_kh=2, num_vh=4, key_dim=8, value_dim=8, kernel, seq
+            20,   // hidden, num_kh=2, num_vh=4, key_dim=8, value_dim=8, kernel, seq
             2,    // lora_rank
-            0.5,  // lora_scale
+            12.0, // lora_scale
             99,   // weight_seed
             2024, // input_seed
             555,  // lora_seed
             111,  // coeff_seed
             1e-3, // eps
         );
+        for (name, (n, rel)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
+            println!("  {name:<12}: n_tested={n}  max_rel={rel:.3e}");
+        }
+        for (name, (n, _)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
+            assert!(
+                *n >= 1,
+                "lora weight gradcheck (multi-head): array {name} has ZERO testable \
+                 entries above the 1e-4 floor — this array is not actually being verified"
+            );
+        }
         assert!(
-            n_tested >= 10,
-            "lora weight gradcheck (multi-head): too few testable entries ({n_tested})"
+            cov.overall_n_tested >= 10,
+            "lora weight gradcheck (multi-head): too few testable entries ({})",
+            cov.overall_n_tested
         );
         assert!(
-            max_rel < 1e-2,
-            "gdn lora weight gradcheck (multi-head) failed: max_rel={max_rel:.3e} \
-             (n_tested={n_tested})"
+            cov.overall_max_rel < 1e-2,
+            "gdn lora weight gradcheck (multi-head) failed: max_rel={:.3e} (n_tested={})",
+            cov.overall_max_rel,
+            cov.overall_n_tested
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Source-parity: gdn_forward_save (training path) vs gdn_fused (shipping
+    // inference path), LoRA off, on an ASYMMETRIC-head fixture.
+    // ---------------------------------------------------------------------------
+    //
+    // Codex review round 1 (PR #792) blocker: gdn_forward_save/gdn_backward
+    // originally sized in_proj_a/in_proj_b/a_log/dt_bias (and everything
+    // downstream: gates, LoRA B factors, PEFT export, validate_against) by
+    // KEY heads instead of VALUE heads. Every prior gradcheck used a fixture
+    // where the weights fed to BOTH the analytic and finite-difference paths
+    // shared the same (buggy) shape, so the two sides agreed with each other
+    // on the wrong graph — self-consistency, not correctness. The only way
+    // to catch this class of bug is to compare against an INDEPENDENT
+    // implementation that has the right shape baked in: the shipping
+    // `gated_delta_net_step_fused` path, which the f16 weight loader and
+    // production inference actually use. This test builds a fixture where
+    // num_key_heads (2) != num_value_heads (4) and asserts the two forwards
+    // agree, LoRA off.
+    #[test]
+    fn source_parity_forward_save_vs_fused_asymmetric_heads() {
+        use crate::attention::gdn::GatedDeltaNetState;
+        use crate::attention::gdn_fused::{GatedDeltaNetFusedScratch, gated_delta_net_step_fused};
+        use crate::lora_hook::NoopLoraHook;
+
+        let hidden = 32;
+        let num_kh = 2;
+        let num_vh = 4; // asymmetric: ratio = 2, matches the 4B/27B shape class
+        let key_dim = 8;
+        let value_dim = 8;
+        let kernel_size = 3;
+        let seq_len = 6;
+
+        let cfg = tiny_cfg(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size);
+        let weights =
+            make_tiny_weights(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size, 321);
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let scale = 1.0 / (key_dim as f32).sqrt();
+
+        let mut rng = Rng::new(654);
+        let mut inputs = vec![0.0f32; seq_len * hidden];
+        rng.fill(&mut inputs, -0.5, 0.5);
+
+        // --- Path A: gdn_forward_save (training path), LoRA off ---
+        let mut saved = GdnSaved::new(
+            seq_len,
+            num_kh,
+            num_vh,
+            key_dim,
+            value_dim,
+            hidden,
+            qkv_dim,
+            output_dim,
+            kernel_size,
+            scale,
+            cfg.rms_norm_eps,
+        );
+        let mut outputs_a = vec![0.0f32; seq_len * hidden];
+        gdn_forward_save(
+            &inputs,
+            &weights,
+            &cfg,
+            &mut saved,
+            &mut outputs_a,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0.0,
+        );
+
+        // --- Path B: gated_delta_net_step_fused (shipping inference path), per token ---
+        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut scratch = GatedDeltaNetFusedScratch::default();
+        let hook = NoopLoraHook;
+        let mut outputs_b = vec![0.0f32; seq_len * hidden];
+        for t in 0..seq_len {
+            let x_t = &inputs[t * hidden..(t + 1) * hidden];
+            let y_t = &mut outputs_b[t * hidden..(t + 1) * hidden];
+            gated_delta_net_step_fused(
+                x_t,
+                &mut state,
+                &weights,
+                &cfg,
+                &mut scratch,
+                y_t,
+                &hook,
+                0,
+            );
+        }
+
+        let mut max_abs_diff = 0.0f32;
+        let mut worst = 0;
+        for i in 0..outputs_a.len() {
+            let d = (outputs_a[i] - outputs_b[i]).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+                worst = i;
+            }
+        }
+        assert!(
+            max_abs_diff < 1e-4,
+            "gdn_forward_save diverges from the shipping gated_delta_net_step_fused \
+             on an asymmetric-head fixture (num_kh={num_kh}, num_vh={num_vh}): \
+             max_abs_diff={max_abs_diff:.3e} at flat index {worst} \
+             (a={}, b={})",
+            outputs_a[worst],
+            outputs_b[worst],
         );
     }
 }

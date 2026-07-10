@@ -139,8 +139,8 @@ pub type Grads = LoraParams;
 /// Shapes (rank = LoRA rank, dims from `GdnDims`):
 ///   a_qkv: [rank, hidden]        b_qkv: [qkv_dim, rank]
 ///   a_z:   [rank, hidden]        b_z:   [output_dim, rank]
-///   a_b:   [rank, hidden]        b_b:   [num_kh, rank]
-///   a_a:   [rank, hidden]        b_a:   [num_kh, rank]
+///   a_b:   [rank, hidden]        b_b:   [value_heads, rank]
+///   a_a:   [rank, hidden]        b_a:   [value_heads, rank]
 ///   a_out: [rank, output_dim]    b_out: [hidden, rank]
 #[derive(Clone)]
 pub struct GdnLoraParams {
@@ -171,9 +171,13 @@ impl GdnLoraParams {
             a_z: vec![0.0; checked(rank, hidden, "rank*hidden (a_z)")?],
             b_z: vec![0.0; checked(gd.output_dim, rank, "output_dim*rank (b_z)")?],
             a_b: vec![0.0; checked(rank, hidden, "rank*hidden (a_b)")?],
-            b_b: vec![0.0; checked(gd.num_kh, rank, "num_kh*rank (b_b)")?],
+            // beta (in_proj_b) is projected per VALUE head, matching the
+            // shipping gdn_fused forward and the f16 weight loader — NOT
+            // per key head (#792 codex round-1 blocker fix).
+            b_b: vec![0.0; checked(gd.value_heads, rank, "value_heads*rank (b_b)")?],
             a_a: vec![0.0; checked(rank, hidden, "rank*hidden (a_a)")?],
-            b_a: vec![0.0; checked(gd.num_kh, rank, "num_kh*rank (b_a)")?],
+            // alpha (in_proj_a) is likewise per VALUE head.
+            b_a: vec![0.0; checked(gd.value_heads, rank, "value_heads*rank (b_a)")?],
             a_out: vec![0.0; checked(rank, gd.output_dim, "rank*output_dim (a_out)")?],
             b_out: vec![0.0; checked(hidden, rank, "hidden*rank (b_out)")?],
         })
@@ -763,9 +767,9 @@ mod gdn_lora_tests {
         assert_eq!(p.a_z.len(), rank * hidden);
         assert_eq!(p.b_z.len(), gd.output_dim * rank);
         assert_eq!(p.a_b.len(), rank * hidden);
-        assert_eq!(p.b_b.len(), gd.num_kh * rank);
+        assert_eq!(p.b_b.len(), gd.value_heads * rank);
         assert_eq!(p.a_a.len(), rank * hidden);
-        assert_eq!(p.b_a.len(), gd.num_kh * rank);
+        assert_eq!(p.b_a.len(), gd.value_heads * rank);
         assert_eq!(p.a_out.len(), rank * gd.output_dim);
         assert_eq!(p.b_out.len(), hidden * rank);
         // Zero-initialised.

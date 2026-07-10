@@ -968,7 +968,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             a: g.a_b.clone(),
                             b: g.b_b.clone(),
                             d_in: dims.hidden,
-                            d_out: gdn_dims.num_kh,
+                            // beta is projected per VALUE head (matches the
+                            // shipping gdn_fused forward and the f16 weight
+                            // loader), not per key head (#792 codex blocker).
+                            d_out: gdn_dims.value_heads,
                             rank,
                         },
                     );
@@ -978,7 +981,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             a: g.a_a.clone(),
                             b: g.b_a.clone(),
                             d_in: dims.hidden,
-                            d_out: gdn_dims.num_kh,
+                            // alpha is likewise projected per VALUE head.
+                            d_out: gdn_dims.value_heads,
                             rank,
                         },
                     );
