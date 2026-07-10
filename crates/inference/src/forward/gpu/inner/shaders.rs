@@ -280,11 +280,12 @@ fn attention_scores(
 // before the `* scale` multiply (below) narrows the window but cannot close
 // it for backends whose compiler chooses to optimize on the assumption
 // upstream of that read. The claim this kernel makes is therefore: "fails
-// closed on the tested native backend"; the CPU parity / differential
+// closed on the tested native backend". The CPU parity / differential
 // (`e2e-parity.yml`, HF-vs-lattice greedy-token) and CPU-side
-// `attention::softmax_row` gates remain the cross-backend correctness
-// detection surface for any backend where this best-effort guard is
-// silently defeated by the finite math assumption.
+// `attention::softmax_row` gates define the reference semantics for future
+// backend-specific differential coverage; detecting a defeated guard on an
+// untested WGPU backend requires adding that backend to a differential run —
+// those gates do not execute this shader on Vulkan/DX12/browser WebGPU today.
 pub(super) const ATTENTION_SOFTMAX_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read_write> SCORES: array<f32>;
 @group(0) @binding(1) var<storage, read> params: array<u32>;
