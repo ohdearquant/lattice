@@ -116,7 +116,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [078](ADR-078-multimodal-serving-deferral-priority.md) | Multimodal / Vision Serving Priority (Deferral)             | Proposed     | ADR-049, 069, 071 |
 | [079](ADR-079-adaptive-micro-lora-brain.md)        | Adaptive Micro-LoRA Brain — Composed Train→Govern→Compose→Route→Consume Loop | Proposed | ADR-008/031/043/045/054/056/057 |
 | [080](ADR-080-consolidation-duplicated-contracts.md) | Consolidation of Duplicated Numeric-Contract Helpers (Softmax, HTTP Serving, Decode Policy, GEMM Validation) | Proposed | ADR-058, ADR-064, ADR-066 |
-| [081](ADR-081-prefill-gemm-optimization-priority.md) | Prefill GEMM Optimization Priority (Metal) — renumbered from ADR-070 on 2026-07-10 | Proposed | none |
+| [081](ADR-081-prefill-gemm-optimization-priority.md) | Prefill GEMM Optimization Priority (Metal) | Proposed | none |
 
 ## informational
 
