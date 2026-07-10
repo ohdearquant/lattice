@@ -9,7 +9,7 @@
 //! Both modules coexist — callers choose which to use.
 
 use crate::attention::gdn::{GatedDeltaNetState, GatedDeltaNetWeights, sigmoid, softplus};
-use crate::forward::cpu::matmul_bt;
+use crate::forward::cpu::{matmul_bt, validate_gemm_nn};
 use crate::model::qwen35_config::Qwen35Config;
 
 /// **Unstable**: scratch buffers for the SIMD-fused GatedDeltaNet step; buffer layout evolving.
@@ -228,14 +228,20 @@ pub fn simd_matvec_transpose(
     key_dim: usize,
     value_dim: usize,
 ) {
-    // Release-active: these are the soundness preconditions for the unsafe SIMD
-    // kernels below (which load `key_dim`/`value_dim` lanes via raw pointers).
-    // `debug_assert!` is compiled out in release, so a malformed-slice call from
-    // this safe `pub fn` would reach an out-of-bounds SIMD load (UB). Promote to
-    // real checks so the contract violation panics deterministically instead.
-    assert!(s.len() >= key_dim * value_dim);
-    assert!(k.len() >= key_dim);
-    assert!(kv_mem.len() >= value_dim);
+    // Release-active, overflow-first: `kv_mem = k @ s` (m=1, k=key_dim, n=value_dim) —
+    // these are the soundness preconditions for the unsafe SIMD kernels below (which load
+    // `key_dim`/`value_dim` lanes via raw pointers). A plain `key_dim * value_dim` multiply
+    // (as this used before ADR-080 C4) can wrap in release and make the length check pass
+    // spuriously on a malformed shape; `validate_gemm_nn` checks overflow first.
+    validate_gemm_nn(
+        k.len(),
+        s.len(),
+        kv_mem.len(),
+        1,
+        key_dim,
+        value_dim,
+        "gdn_matvec_transpose",
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
@@ -272,12 +278,24 @@ pub fn simd_decay_and_rank1_update(
     key_dim: usize,
     value_dim: usize,
 ) {
-    // Release-active: soundness preconditions for the unsafe SIMD kernels below.
-    // See `simd_matvec_transpose` for the rationale (debug_assert is removed in
-    // release, leaving the safe wrapper able to drive an OOB SIMD load).
-    assert!(s.len() >= key_dim * value_dim);
-    assert!(k.len() >= key_dim);
-    assert!(delta.len() >= value_dim);
+    // Release-active, overflow-first: `s` is mutated in place at the same [key_dim,
+    // value_dim] footprint as an `A(1,key_dim) @ B(key_dim,value_dim)` operand pair (`k`
+    // plays the role of A, `delta` the per-column update); reuse `validate_gemm_nn`'s
+    // overflow-first `key_dim*value_dim` check rather than the raw multiply this used
+    // before ADR-080 C4 (see `simd_matvec_transpose` for the overflow rationale).
+    validate_gemm_nn(
+        k.len(),
+        s.len(),
+        s.len(),
+        1,
+        key_dim,
+        value_dim,
+        "gdn_decay_and_rank1_update",
+    );
+    assert!(
+        delta.len() >= value_dim,
+        "gdn_decay_and_rank1_update: delta too short for value_dim"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
@@ -1694,12 +1712,40 @@ mod tests {
         simd_matvec_transpose(&s, &k, &mut kv_mem, 2, 4);
     }
 
+    // ADR-080 C4: `s` is read through a raw pointer (`row_ptr.add(j)` /
+    // `s.as_ptr().wrapping_add(...)`) in the AVX2/NEON kernels with no per-element bounds
+    // check, unlike `k` (indexed via safe `k[i]`, which Rust already bounds-checks on its
+    // own). A short `k` test above is not mutation-sensitive to this guard specifically —
+    // it's caught by the incidental `k[i]` panic even with the validator removed. This test
+    // exercises the case the validator uniquely guards: a too-short `s`.
+    #[test]
+    #[should_panic(expected = "gdn_matvec_transpose")]
+    fn simd_matvec_transpose_rejects_short_s() {
+        let s = [0.0f32; 7]; // key_dim*value_dim = 8, one short
+        let k = [0.0f32; 2];
+        let mut kv_mem = [0.0f32; 4];
+        simd_matvec_transpose(&s, &k, &mut kv_mem, 2, 4);
+    }
+
     #[test]
     #[should_panic]
     fn simd_decay_and_rank1_update_rejects_short_delta() {
         let mut s = [0.0f32; 8];
         let k = [0.0f32; 2];
         let delta = [0.0f32; 1]; // value_dim = 4 but only 1 element
+        simd_decay_and_rank1_update(&mut s, &k, &delta, 0.5, 2, 4);
+    }
+
+    // ADR-080 C4: same rationale as `simd_matvec_transpose_rejects_short_s` above — `s` is
+    // read/written through a raw pointer in the AVX2/NEON kernels with no bounds check, and a
+    // short `k`/`delta` test doesn't exercise that guard since `k[i]`/`delta[j]` are indexed
+    // via safe indexing that panics on its own even with the validator removed.
+    #[test]
+    #[should_panic(expected = "gdn_decay_and_rank1_update")]
+    fn simd_decay_and_rank1_update_rejects_short_s() {
+        let mut s = [0.0f32; 7]; // key_dim*value_dim = 8, one short
+        let k = [0.0f32; 2];
+        let delta = [0.0f32; 4];
         simd_decay_and_rank1_update(&mut s, &k, &delta, 0.5, 2, 4);
     }
 
