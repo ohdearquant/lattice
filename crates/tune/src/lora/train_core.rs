@@ -28,14 +28,14 @@ pub struct Dims {
 
 #[derive(Clone, Copy)]
 pub struct GdnDims {
-    num_kh: usize,
-    value_heads: usize,
-    key_dim: usize,
-    value_dim: usize,
-    qkv_dim: usize,
-    output_dim: usize,
-    kernel_size: usize,
-    scale: f32,
+    pub num_kh: usize,
+    pub value_heads: usize,
+    pub key_dim: usize,
+    pub value_dim: usize,
+    pub qkv_dim: usize,
+    pub output_dim: usize,
+    pub kernel_size: usize,
+    pub scale: f32,
 }
 
 impl GdnDims {
@@ -130,6 +130,86 @@ impl LoraParams {
 
 pub type Grads = LoraParams;
 
+/// LoRA parameters (and, doubling as the gradient container, LoRA gradients)
+/// for the 5 GDN projections: in_proj_qkv, in_proj_z, in_proj_b (beta),
+/// in_proj_a (alpha), out_proj. Mirrors `GdnGrads` in
+/// `lattice_inference::attention::gdn_backward` field-for-field so a
+/// `GdnGrads` can be converted straight into a `GdnLoraParams` gradient slot.
+///
+/// Shapes (rank = LoRA rank, dims from `GdnDims`):
+///   a_qkv: [rank, hidden]        b_qkv: [qkv_dim, rank]
+///   a_z:   [rank, hidden]        b_z:   [output_dim, rank]
+///   a_b:   [rank, hidden]        b_b:   [value_heads, rank]
+///   a_a:   [rank, hidden]        b_a:   [value_heads, rank]
+///   a_out: [rank, output_dim]    b_out: [hidden, rank]
+#[derive(Clone)]
+pub struct GdnLoraParams {
+    pub a_qkv: Vec<f32>,
+    pub b_qkv: Vec<f32>,
+    pub a_z: Vec<f32>,
+    pub b_z: Vec<f32>,
+    pub a_b: Vec<f32>,
+    pub b_b: Vec<f32>,
+    pub a_a: Vec<f32>,
+    pub b_a: Vec<f32>,
+    pub a_out: Vec<f32>,
+    pub b_out: Vec<f32>,
+}
+
+impl GdnLoraParams {
+    /// Shape-aware constructor: the single source of truth for every GDN LoRA
+    /// array's length (mirrors the `d_out`/`d_in` table in the struct's doc
+    /// comment above). `fill_a`/`fill_b` receive the exact element count and
+    /// return the initialised vec, so callers that need randomized or
+    /// zero-B initialization go through the SAME shape derivation as `zeros`
+    /// instead of re-deriving `d_out` per array per call site.
+    ///
+    /// This exists because of a real drift: #792 codex round-2 found that
+    /// `train_grad_full.rs` had two independent call sites (gradcheck-mode
+    /// and training-mode initialization) that re-derived `b_b`/`b_a` as
+    /// `num_kh * rank` instead of `value_heads * rank` — the exact blocker
+    /// round-1 fixed in `zeros`, but round-1's fix never touched those two
+    /// inline constructors because they didn't call `zeros` at all. Routing
+    /// both through `shaped` (and `zeros` through `shaped`) makes that class
+    /// of drift a compile-time-shared-code property instead of a
+    /// grep-and-hope one.
+    pub fn shaped(
+        rank: usize,
+        hidden: usize,
+        gd: &GdnDims,
+        mut fill_a: impl FnMut(usize) -> Vec<f32>,
+        mut fill_b: impl FnMut(usize) -> Vec<f32>,
+    ) -> Result<Self> {
+        let checked = |a: usize, b: usize, label: &str| -> Result<usize> {
+            a.checked_mul(b).ok_or_else(|| {
+                TuneError::Validation(format!(
+                    "{label} overflows GDN LoRA gradient buffer size ({a} * {b})"
+                ))
+            })
+        };
+        Ok(Self {
+            a_qkv: fill_a(checked(rank, hidden, "rank*hidden (a_qkv)")?),
+            b_qkv: fill_b(checked(gd.qkv_dim, rank, "qkv_dim*rank (b_qkv)")?),
+            a_z: fill_a(checked(rank, hidden, "rank*hidden (a_z)")?),
+            b_z: fill_b(checked(gd.output_dim, rank, "output_dim*rank (b_z)")?),
+            a_b: fill_a(checked(rank, hidden, "rank*hidden (a_b)")?),
+            // beta (in_proj_b) is projected per VALUE head, matching the
+            // shipping gdn_fused forward and the f16 weight loader — NOT
+            // per key head (#792 codex round-1 blocker fix).
+            b_b: fill_b(checked(gd.value_heads, rank, "value_heads*rank (b_b)")?),
+            a_a: fill_a(checked(rank, hidden, "rank*hidden (a_a)")?),
+            // alpha (in_proj_a) is likewise per VALUE head.
+            b_a: fill_b(checked(gd.value_heads, rank, "value_heads*rank (b_a)")?),
+            a_out: fill_a(checked(rank, gd.output_dim, "rank*output_dim (a_out)")?),
+            b_out: fill_b(checked(hidden, rank, "hidden*rank (b_out)")?),
+        })
+    }
+
+    pub fn zeros(rank: usize, hidden: usize, gd: &GdnDims) -> Result<Self> {
+        Self::shaped(rank, hidden, gd, |n| vec![0.0; n], |n| vec![0.0; n])
+    }
+}
+
 pub struct SeqCtx {
     pub h_in: Vec<f32>,
     pub cos: Vec<f32>,
@@ -208,6 +288,7 @@ pub fn forward_full(
     ctx: &SeqCtx,
     layers: &[LayerW<'_>],
     loras: &[LoraParams],
+    gdn_loras: &[GdnLoraParams],
     head: &Head<'_>,
     d: &Dims,
     gdn_dims: &GdnDims,
@@ -274,7 +355,51 @@ pub fn forward_full(
                     d.eps,
                 );
                 let mut out = vec![0.0f32; seq * hidden];
-                gdn_forward_save(&normed_pre, gdn_w, cfg, &mut saved, &mut out);
+                match lw.lora_slot {
+                    Some(slot) => {
+                        let l = &gdn_loras[slot];
+                        gdn_forward_save(
+                            &normed_pre,
+                            gdn_w,
+                            cfg,
+                            &mut saved,
+                            &mut out,
+                            Some(&l.a_qkv),
+                            Some(&l.b_qkv),
+                            Some(&l.a_z),
+                            Some(&l.b_z),
+                            Some(&l.a_b),
+                            Some(&l.b_b),
+                            Some(&l.a_a),
+                            Some(&l.b_a),
+                            Some(&l.a_out),
+                            Some(&l.b_out),
+                            rank,
+                            scale,
+                        );
+                    }
+                    None => {
+                        gdn_forward_save(
+                            &normed_pre,
+                            gdn_w,
+                            cfg,
+                            &mut saved,
+                            &mut out,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            0,
+                            0.0,
+                        );
+                    }
+                }
                 (out, MixerCache::Gdn(Box::new(saved)))
             }
         };
@@ -344,6 +469,7 @@ pub fn eval_chain_nll(
     caches: &[SeqCtx],
     layers: &[LayerW<'_>],
     loras: &[LoraParams],
+    gdn_loras: &[GdnLoraParams],
     head: &Head<'_>,
     d: &Dims,
     gdn_dims: &GdnDims,
@@ -354,7 +480,9 @@ pub fn eval_chain_nll(
     let mut nll_sum = 0.0f64;
     let mut n = 0usize;
     for ctx in caches {
-        let fwd = forward_full(ctx, layers, loras, head, d, gdn_dims, cfg, rank, scale)?;
+        let fwd = forward_full(
+            ctx, layers, loras, gdn_loras, head, d, gdn_dims, cfg, rank, scale,
+        )?;
         for p in &fwd.positions {
             nll_sum += position_nll(&p.logits, p.target) as f64;
             n += 1;
@@ -363,6 +491,12 @@ pub fn eval_chain_nll(
     Ok((nll_sum / n.max(1) as f64) as f32)
 }
 
+/// Reverse-mode NLL + gradients over the assembled multi-layer tape.
+///
+/// `num_slots`/`grads` cover the GQA LoRA slots (surface-A, unchanged).
+/// `num_gdn_slots`/the returned `Vec<GdnLoraParams>` cover the GDN LoRA slots
+/// (surface-B, ported from lattice PR #202) — empty when no GDN layer in the
+/// materialised range carries a LoRA slot.
 #[allow(clippy::too_many_arguments)]
 pub fn nll_and_grads(
     fwd: &FullFwd,
@@ -370,15 +504,20 @@ pub fn nll_and_grads(
     loras: &[LoraParams],
     head: &Head<'_>,
     d: &Dims,
+    gdn_dims: &GdnDims,
     num_slots: usize,
+    num_gdn_slots: usize,
     rank: usize,
     scale: f32,
-) -> Result<(f32, usize, Vec<Grads>)> {
+) -> Result<(f32, usize, Vec<Grads>, Vec<GdnLoraParams>)> {
     let hidden = d.hidden;
     let seq = fwd.h_final.len() / hidden;
     let n_comp = fwd.positions.len().max(1) as f32;
     let mut grads: Vec<Grads> = (0..num_slots)
         .map(|_| LoraParams::zeros(rank, d))
+        .collect::<Result<Vec<_>>>()?;
+    let mut gdn_grads: Vec<GdnLoraParams> = (0..num_gdn_slots)
+        .map(|_| GdnLoraParams::zeros(rank, hidden, gdn_dims))
         .collect::<Result<Vec<_>>>()?;
 
     let mut d_h = vec![0.0f32; seq * hidden];
@@ -467,9 +606,22 @@ pub fn nll_and_grads(
                 let gdn_w = lw.gdn.ok_or_else(|| {
                     TuneError::Validation("GDN layer missing weights in backward".to_string())
                 })?;
-                let mut dx = vec![0.0f32; seq * hidden];
-                gdn_backward(&d_h_mid, saved, gdn_w, &mut dx);
-                dx
+                let g = gdn_backward(&d_h_mid, saved, gdn_w);
+                if let Some(slot) = lw.lora_slot {
+                    gdn_grads[slot] = GdnLoraParams {
+                        a_qkv: g.grad_a_qkv,
+                        b_qkv: g.grad_b_qkv,
+                        a_z: g.grad_a_z,
+                        b_z: g.grad_b_z,
+                        a_b: g.grad_a_b,
+                        b_b: g.grad_b_b,
+                        a_a: g.grad_a_a,
+                        b_a: g.grad_b_a,
+                        a_out: g.grad_a_out,
+                        b_out: g.grad_b_out,
+                    };
+                }
+                g.dx
             }
         };
 
@@ -488,7 +640,7 @@ pub fn nll_and_grads(
         d_h = d_h_new;
     }
 
-    Ok((nll_sum as f32, fwd.positions.len(), grads))
+    Ok((nll_sum as f32, fwd.positions.len(), grads, gdn_grads))
 }
 
 pub fn shifted(gamma: &[f32]) -> Vec<f32> {
@@ -563,5 +715,143 @@ pub fn apply_adam_updates(
             0.0,
             false,
         );
+    }
+}
+
+/// Adam step for the GDN LoRA slots (surface-B). Mirrors `apply_adam_updates`
+/// but steps all 5 GDN projections' A/B pairs (10 arrays/slot) instead of the
+/// 2 GQA projections' A/B pairs (4 arrays/slot).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_gdn_adam_updates(
+    adam: &mut AdamState,
+    gdn_loras: &mut [GdnLoraParams],
+    gdn_grads: &[GdnLoraParams],
+    slot_layers: &[usize],
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps_adam: f32,
+) {
+    for slot in 0..slot_layers.len() {
+        let li = slot_layers[slot];
+        macro_rules! step {
+            ($field:ident, $tag:literal) => {
+                adam.step(
+                    &format!("l{li}_gdn_{}", $tag),
+                    &mut gdn_loras[slot].$field,
+                    &gdn_grads[slot].$field,
+                    lr,
+                    beta1,
+                    beta2,
+                    eps_adam,
+                    0.0,
+                    false,
+                );
+            };
+        }
+        step!(a_qkv, "a_qkv");
+        step!(b_qkv, "b_qkv");
+        step!(a_z, "a_z");
+        step!(b_z, "b_z");
+        step!(a_b, "a_b");
+        step!(b_b, "b_b");
+        step!(a_a, "a_a");
+        step!(b_a, "b_a");
+        step!(a_out, "a_out");
+        step!(b_out, "b_out");
+    }
+}
+
+#[cfg(test)]
+mod gdn_lora_tests {
+    use super::*;
+
+    fn tiny_gdn_dims() -> GdnDims {
+        // hidden=16, num_kh=2, value_heads=4, key_dim=4, value_dim=4 — matches
+        // the shapes exercised by gdn_backward's own multi-head gradcheck fixture.
+        GdnDims {
+            num_kh: 2,
+            value_heads: 4,
+            key_dim: 4,
+            value_dim: 4,
+            qkv_dim: 2 * (2 * 4) + 4 * 4, // 2*key_dim*num_kh + value_heads*value_dim = 32
+            output_dim: 4 * 4,            // value_heads * value_dim = 16
+            kernel_size: 3,
+            scale: 0.5,
+        }
+    }
+
+    #[test]
+    fn gdn_lora_params_zeros_shapes_match_gdn_dims() {
+        let gd = tiny_gdn_dims();
+        let hidden = 16;
+        let rank = 3;
+        let p = GdnLoraParams::zeros(rank, hidden, &gd).expect("zeros should not overflow");
+
+        assert_eq!(p.a_qkv.len(), rank * hidden);
+        assert_eq!(p.b_qkv.len(), gd.qkv_dim * rank);
+        assert_eq!(p.a_z.len(), rank * hidden);
+        assert_eq!(p.b_z.len(), gd.output_dim * rank);
+        assert_eq!(p.a_b.len(), rank * hidden);
+        assert_eq!(p.b_b.len(), gd.value_heads * rank);
+        assert_eq!(p.a_a.len(), rank * hidden);
+        assert_eq!(p.b_a.len(), gd.value_heads * rank);
+        assert_eq!(p.a_out.len(), rank * gd.output_dim);
+        assert_eq!(p.b_out.len(), hidden * rank);
+        // Zero-initialised.
+        assert!(p.a_qkv.iter().all(|&v| v == 0.0));
+        assert!(p.b_out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn gdn_lora_params_zeros_rejects_overflowing_rank() {
+        let gd = tiny_gdn_dims();
+        // rank so large that rank * hidden overflows usize on any platform.
+        let err = GdnLoraParams::zeros(usize::MAX / 2, 16, &gd);
+        assert!(err.is_err(), "overflowing rank*hidden should be rejected");
+    }
+
+    #[test]
+    fn apply_gdn_adam_updates_moves_nonzero_grad_params() {
+        let gd = tiny_gdn_dims();
+        let hidden = 16;
+        let rank = 3;
+        let mut gdn_loras = vec![GdnLoraParams::zeros(rank, hidden, &gd).unwrap()];
+        // Non-zero, non-uniform gradient so the Adam step has a definite sign.
+        let mut grads = GdnLoraParams::zeros(rank, hidden, &gd).unwrap();
+        for (i, v) in grads.a_qkv.iter_mut().enumerate() {
+            *v = 0.01 * (i as f32 + 1.0);
+        }
+        for (i, v) in grads.b_out.iter_mut().enumerate() {
+            *v = -0.02 * (i as f32 + 1.0);
+        }
+        let gdn_grads = vec![grads];
+
+        let mut adam = AdamState::new();
+        apply_gdn_adam_updates(
+            &mut adam,
+            &mut gdn_loras,
+            &gdn_grads,
+            &[7],
+            0.1,
+            0.9,
+            0.999,
+            1e-8,
+        );
+
+        // Adam moves params opposite the gradient sign: positive grad -> param
+        // decreases from its zero init; negative grad -> param increases.
+        assert!(
+            gdn_loras[0].a_qkv.iter().all(|&v| v < 0.0),
+            "a_qkv should move negative under positive grad: {:?}",
+            gdn_loras[0].a_qkv
+        );
+        assert!(
+            gdn_loras[0].b_out.iter().all(|&v| v > 0.0),
+            "b_out should move positive under negative grad: {:?}",
+            gdn_loras[0].b_out
+        );
+        // Untouched (zero-grad) arrays stay at their zero init.
+        assert!(gdn_loras[0].a_z.iter().all(|&v| v == 0.0));
     }
 }
