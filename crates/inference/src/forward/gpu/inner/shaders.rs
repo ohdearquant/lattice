@@ -265,6 +265,26 @@ fn attention_scores(
 }
 "#;
 
+// Guarantee scope (codex round-1 medium #1 on #795): the fail-closed
+// zero-row contract below has been verified on this repository's native
+// Metal-backed WGPU adapter (`GpuModelState::new`'s
+// `wgpu::PowerPreference::HighPerformance` request, backend `Backends::all()`
+// resolving to Metal on macOS CI/dev hosts). It is NOT a WGSL-portable
+// guarantee: WGSL's Finite Math Assumption
+// (https://www.w3.org/TR/WGSL/#finite-math-assumption) permits an
+// implementation to assume NaN and infinities are absent during shader
+// execution, so a different backend (Vulkan/DX12/browser WebGPU) may
+// legally replace a poisoned value with an indeterminate finite-looking one
+// at any point after it participates in WGSL floating-point arithmetic,
+// before `is_non_finite`'s bitcast ever inspects it. Reading the raw score
+// before the `* scale` multiply (below) narrows the window but cannot close
+// it for backends whose compiler chooses to optimize on the assumption
+// upstream of that read. The claim this kernel makes is therefore: "fails
+// closed on the tested native backend"; the CPU parity / differential
+// (`e2e-parity.yml`, HF-vs-lattice greedy-token) and CPU-side
+// `attention::softmax_row` gates remain the cross-backend correctness
+// detection surface for any backend where this best-effort guard is
+// silently defeated by the finite math assumption.
 pub(super) const ATTENTION_SOFTMAX_SHADER: &str = r#"
 @group(0) @binding(0) var<storage, read_write> SCORES: array<f32>;
 @group(0) @binding(1) var<storage, read> params: array<u32>;
@@ -312,10 +332,27 @@ fn attention_softmax(
     var local_bad: u32 = 0u;
     for (var k: u32 = lid.x; k < seq_len; k = k + 128u) {
         if (k <= row) {
-            let v = SCORES[row_base + k] * scale;
-            if (is_non_finite(v)) {
+            // Inspect the raw score BEFORE it participates in any WGSL
+            // floating-point arithmetic (codex round-1 medium #1 on #795):
+            // WGSL's Finite Math Assumption
+            // (https://www.w3.org/TR/WGSL/#finite-math-assumption) permits an
+            // implementation to assume NaN/infinities are absent during
+            // shader execution, so a runtime expression that *would*
+            // mathematically produce one is legally free to return an
+            // indeterminate value instead once it has passed through an
+            // arithmetic op. Reading `SCORES[row_base + k]` and testing it
+            // via `is_non_finite` prior to the `* scale` multiply removes
+            // that multiply from the poisoned value's path -- `scale` is a
+            // host-supplied, already-finite scalar (`pf(11u)`), so deferring
+            // the check past it bought nothing but one more arithmetic step
+            // for an implementation to legally launder the bit pattern
+            // through. This narrows, but does not eliminate, the WGSL
+            // portability gap: see the guarantee-scope comment below.
+            let raw = SCORES[row_base + k];
+            if (is_non_finite(raw)) {
                 local_bad = 1u;
             } else {
+                let v = raw * scale;
                 local_max = max(local_max, v);
             }
         }

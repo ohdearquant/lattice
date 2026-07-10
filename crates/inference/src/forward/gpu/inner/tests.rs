@@ -47,23 +47,45 @@ fn tiny_model_matches_gpu_and_keeps_static_buffers() {
     assert!(max_abs < 1e-3, "max abs diff = {max_abs}");
 }
 
+/// Same tolerance `tiny_model_matches_gpu_and_keeps_static_buffers` uses to
+/// compare GPU output against its CPU reference.
+const FAIL_CLOSED_MAX_ABS_DIFF: f32 = 1e-3;
+
 /// ADR-080 C1 (#790) regression: `attention_softmax`'s WGSL kernel must fail
-/// closed by ASSIGNMENT on a NaN-poisoned score, not floor-clamp the
-/// denominator (`1.0 / max(sum_val, 1e-20)`) into a finite-looking reciprocal
-/// that then multiplies an already-NaN numerator through.
+/// closed by ASSIGNMENT on a non-finite (NaN or +/-infinite) score, not
+/// floor-clamp the denominator (`1.0 / max(sum_val, 1e-20)`) into a
+/// finite-looking reciprocal that then multiplies an already-poisoned
+/// numerator through.
 ///
 /// Isolation: corrupt a single entry of one layer's `q_proj_weight` so that
-/// exactly one attention head's Q vector is NaN at every query position,
-/// while K/V/embeddings/residual stay completely clean. Compare the GPU
-/// output against a CPU reference built from the crate's own fail-closed
-/// `softmax_row` helpers (not a plain `f32::max`-fold reimplementation).
+/// exactly one attention head's Q vector is poisoned at every query
+/// position, while K/V/embeddings/residual stay completely clean. Compares
+/// the GPU output element-wise against a CPU reference built from the
+/// crate's own fail-closed `softmax_row` helpers (not a plain `f32::max`-fold
+/// reimplementation) at the same tolerance the sibling test above uses.
 ///
-/// Mutation-sensitive: reverting `shaders.rs`'s `ATTENTION_SOFTMAX_SHADER` to
-/// the pre-fix `1.0 / max(sum_scratch[0u], 1e-20)` floor-clamp (with no
-/// pre-exp NaN scan) makes this test fail (NaN leaks into the GPU output
-/// while the CPU reference stays all-finite), confirmed at PR time.
-#[test]
-fn attention_softmax_fails_closed_on_nan_q_lane() {
+/// codex round-1 medium #2 on #795: the prior version of this test built the
+/// 253-line CPU oracle (`cpu_forward_fail_closed_reference`) but only
+/// compared NaN *counts* between GPU and CPU output, independently, never
+/// the two arrays against each other -- so an arbitrary finite garbage value
+/// in the poisoned row would have passed. `run_attention_softmax_fail_closed_case`
+/// below asserts full element-wise agreement (this is the fix) and covers
+/// all three non-finite classes the WGSL kernel's `is_non_finite` bitcast
+/// check must catch: NaN, +infinity, and -infinity.
+///
+/// Mutation-sensitive both ways (reverified against this element-wise
+/// oracle comparison, not just the old NaN-count check, in a disposable
+/// worktree under the GPU lock):
+/// - reverting `shaders.rs`'s `ATTENTION_SOFTMAX_SHADER` to the pre-fix
+///   `1.0 / max(sum_scratch[0u], 1e-20)` floor-clamp (no pre-exp scan) makes
+///   every case below fail (non-finite values leak into the GPU output while
+///   the CPU reference stays all-finite).
+/// - mutating either fail-closed branch's `SCORES[row_base + k] = 0.0;` to
+///   write an arbitrary finite nonzero constant instead makes every case
+///   below fail (the GPU row would still contain zero NaN/Inf elements, but
+///   would now diverge from the CPU reference's true zero row, which only
+///   the element-wise comparison this round added can detect).
+fn run_attention_softmax_fail_closed_case(corrupt_value: f32) {
     let config = Qwen3Config {
         vocab_size: 8,
         hidden_size: 32,
@@ -87,7 +109,7 @@ fn attention_softmax_fails_closed_on_nan_q_lane() {
     let corrupt_head_dim: usize = 3;
     let corrupt_out_idx = corrupt_head * config.head_dim + corrupt_head_dim;
     let corrupt_in_idx = 5usize;
-    weights.layers[0].q_proj_weight[corrupt_out_idx * hidden + corrupt_in_idx] = f32::NAN;
+    weights.layers[0].q_proj_weight[corrupt_out_idx * hidden + corrupt_in_idx] = corrupt_value;
 
     let gpu = match GpuModelState::new(config.clone(), &weights, runtime) {
         Ok(gpu) => gpu,
@@ -103,20 +125,49 @@ fn attention_softmax_fails_closed_on_nan_q_lane() {
     let cpu_ref = cpu_forward_fail_closed_reference(&weights, &config, &input_ids);
     assert_eq!(gpu_out.len(), cpu_ref.len());
 
-    let nan_gpu = gpu_out.iter().filter(|v| v.is_nan()).count();
-    let nan_ref = cpu_ref.iter().filter(|v| v.is_nan()).count();
+    let non_finite_ref = cpu_ref.iter().filter(|v| !v.is_finite()).count();
     assert_eq!(
-        nan_ref, 0,
-        "test bug: the fail-closed CPU reference itself produced NaN"
+        non_finite_ref, 0,
+        "test bug: the fail-closed CPU reference itself produced a \
+         non-finite value (corrupt_value = {corrupt_value})"
     );
+
+    let non_finite_gpu = gpu_out.iter().filter(|v| !v.is_finite()).count();
     assert_eq!(
-        nan_gpu,
+        non_finite_gpu,
         0,
-        "attention_softmax must fail closed (zero row) on a NaN-poisoned Q \
-         lane instead of floor-clamping the denominator (ADR-080 C1, #790); \
-         got {nan_gpu}/{} NaN elements",
+        "attention_softmax must fail closed (zero row) on a \
+         {corrupt_value}-poisoned Q lane instead of floor-clamping the \
+         denominator (ADR-080 C1, #790); got {non_finite_gpu}/{} \
+         non-finite elements",
         gpu_out.len()
     );
+
+    let mut max_abs = 0.0f32;
+    for (a, b) in cpu_ref.iter().zip(gpu_out.iter()) {
+        max_abs = max_abs.max((a - b).abs());
+    }
+    assert!(
+        max_abs < FAIL_CLOSED_MAX_ABS_DIFF,
+        "GPU output diverges element-wise from the fail-closed CPU \
+         reference (corrupt_value = {corrupt_value}): max abs diff = \
+         {max_abs} (tolerance {FAIL_CLOSED_MAX_ABS_DIFF})"
+    );
+}
+
+#[test]
+fn attention_softmax_fails_closed_on_nan_q_lane() {
+    run_attention_softmax_fail_closed_case(f32::NAN);
+}
+
+#[test]
+fn attention_softmax_fails_closed_on_positive_infinity_q_lane() {
+    run_attention_softmax_fail_closed_case(f32::INFINITY);
+}
+
+#[test]
+fn attention_softmax_fails_closed_on_negative_infinity_q_lane() {
+    run_attention_softmax_fail_closed_case(f32::NEG_INFINITY);
 }
 
 /// Same tiny-model math as [`cpu_forward_reference`], but the softmax step
