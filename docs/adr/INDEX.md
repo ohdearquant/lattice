@@ -106,8 +106,17 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [068](ADR-068-grammar-wire-contract.md)            | Pluggable Custom-Grammar Wire Contract for the OpenAI-Compatible Serving Surface | Proposed | ADR-046, 063 |
 | [069](ADR-069-vision-encoder-qwen35-recalibration.md) | Vision Encoder Recalibration for Qwen3.5-0.8B                 | Proposed     | none         |
 | [070](ADR-070-cpu-embedding-batched-encode.md)     | CPU Embedding Performance: Fused Batched Encode and the ONNX Parity Gate | Proposed | ADR-058 |
+| [071](ADR-071-gdn-state-object-priority.md)        | GDN Recurrent State as a First-Class Serveable Object — Priority and Scope | Proposed | none |
+| [072](ADR-072-weight-quantization-priority.md)     | Weight Quantization Priority (Metal)                           | Proposed     | ADR-044, 051 |
+| [073](ADR-073-kv-cache-quantization-priority.md)   | KV-Cache Quantization Priority (Metal)                          | Proposed     | ADR-048, 062, 072 |
+| [074](ADR-074-mtp-speculative-decoding-priority.md) | MTP / Speculative-Decoding Priority (Metal)                    | Proposed     | ADR-006, 050, 051, 073 |
+| [075](ADR-075-moe-expert-offload-priority.md)      | MoE Expert-Offload Priority (Metal)                             | Proposed     | ADR-053, 072, 073, 074 |
+| [076](ADR-076-adaptive-reasoning-priority.md)      | Adaptive Reasoning-Budget Priority (Metal + CPU)                | Proposed     | ADR-073, 074 |
+| [077](ADR-077-pruning-distill-priority.md)         | Pruning + Distillation Priority (Metal + CPU)                   | Proposed     | ADR-060, 073, 076 |
+| [078](ADR-078-multimodal-serving-deferral-priority.md) | Multimodal / Vision Serving Priority (Deferral)             | Proposed     | ADR-049, 069, 071 |
 | [079](ADR-079-adaptive-micro-lora-brain.md)        | Adaptive Micro-LoRA Brain — Composed Train→Govern→Compose→Route→Consume Loop | Proposed | ADR-008/031/043/045/054/056/057 |
 | [080](ADR-080-consolidation-duplicated-contracts.md) | Consolidation of Duplicated Numeric-Contract Helpers (Softmax, HTTP Serving, Decode Policy, GEMM Validation) | Proposed | ADR-058, ADR-064, ADR-066 |
+| [081](ADR-081-prefill-gemm-optimization-priority.md) | Prefill GEMM Optimization Priority (Metal) | Proposed | none |
 
 ## informational
 
