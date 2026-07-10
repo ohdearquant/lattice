@@ -369,13 +369,13 @@ unsafe fn dot_f16_f32_avx(a: &[f32], b: &[u16]) -> f32 {
 /// On macOS: bulk-converts B tiles to f32 and dispatches to Accelerate cblas_sgemm (AMX).
 /// On other platforms: per-element f16→f32 conversion with optional AVX F16C.
 pub fn matmul_bt_f16(a: &[f32], b: &[u16], c: &mut [f32], m: usize, k: usize, n: usize) {
-    let a_len = m.checked_mul(k).expect("matmul_bt_f16: m*k overflow");
-    let b_len = n.checked_mul(k).expect("matmul_bt_f16: n*k overflow");
-    let c_len = m.checked_mul(n).expect("matmul_bt_f16: m*n overflow");
-
-    assert_eq!(a.len(), a_len, "matmul_bt_f16: invalid A length");
-    assert_eq!(b.len(), b_len, "matmul_bt_f16: invalid B length");
-    assert_eq!(c.len(), c_len, "matmul_bt_f16: invalid C length");
+    // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4, held
+    // finding: this previously used `assert_eq!` — an exact-length requirement — while the
+    // canonical `matmul_bt` (and every access pattern in this function's own body, which
+    // only ever takes bounded prefixes/sub-slices of `a`/`b`/`c`) allows oversized scratch
+    // buffers. Unifies with `matmul_bt`/`matmul_bt_q8` so f32/f16/Q8 GDN projections share
+    // the same oversized-input contract instead of the f16 path rejecting valid callers.
+    crate::forward::cpu::validate_gemm_bt(a.len(), b.len(), c.len(), m, k, n, "matmul_bt_f16");
 
     if m == 0 || n == 0 {
         return;
@@ -1275,6 +1275,57 @@ mod tests {
         }
 
         assert_eq!(dst_bulk, dst_scalar);
+    }
+
+    #[test]
+    #[should_panic(expected = "a too short for m*k")]
+    fn test_matmul_bt_f16_rejects_short_a() {
+        let m = 1usize;
+        let k = 4usize;
+        let n = 2usize;
+        let a = vec![0.0f32; k - 1]; // too short
+        let b = vec![0u16; n * k];
+        let mut c = vec![0.0f32; m * n];
+        matmul_bt_f16(&a, &b, &mut c, m, k, n);
+    }
+
+    #[test]
+    #[should_panic(expected = "b too short for n*k")]
+    fn test_matmul_bt_f16_rejects_short_b() {
+        let m = 1usize;
+        let k = 4usize;
+        let n = 2usize;
+        let a = vec![0.0f32; k];
+        let b = vec![0u16; n * k - 1]; // too short
+        let mut c = vec![0.0f32; m * n];
+        matmul_bt_f16(&a, &b, &mut c, m, k, n);
+    }
+
+    #[test]
+    fn test_matmul_bt_f16_accepts_oversized_a() {
+        // ADR-080 C4: matmul_bt_f16 previously used `assert_eq!` (exact length) instead of
+        // `>=` (oversized-scratch-prefix allowed), unlike matmul_bt/matmul_bt_q8. A caller
+        // passing an oversized `a` must not panic.
+        let m = 1usize;
+        let k = 4usize;
+        let n = 2usize;
+        let a = vec![1.0f32; k + 3]; // oversized
+        let b_f32 = vec![1.0f32; n * k];
+        let b: Vec<u16> = b_f32.iter().map(|&v| F16::from_f32(v).0).collect();
+        let mut c = vec![0.0f32; m * n];
+        matmul_bt_f16(&a, &b, &mut c, m, k, n);
+        for &v in &c {
+            assert!((v - k as f32).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "shape overflow: n*k")]
+    fn test_matmul_bt_f16_rejects_overflow() {
+        let a = [0.0f32; 2];
+        let b = [0u16; 2];
+        let mut c = [0.0f32; 2];
+        matmul_bt_f16(&a, &b, &mut c, 2, 2, usize::MAX);
     }
 
     #[test]
