@@ -693,41 +693,48 @@ impl Qwen35Model {
                     &mut rng_state,
                 );
 
-                // Budget forcing: override sampled token with </think> when the
-                // reasoning budget is exhausted and the block is still open.
-                let next_id = policy.apply_override(generated_ids.len(), sampled_id);
-
-                // Grammar advance on the actually-emitted token (after any budget
-                // override): a false return signals grammar completion. Set
-                // stopped=true before breaking so the caller sees a grammar-terminal
-                // stop as stopped=true, matching decode_loop's `return Ok(true)`.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                // Track when the thinking block closes (natural or forced).
-                policy.note_emitted(next_id);
-
-                if should_stop_token(cfg, gen_cfg, next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-                policy.record_logprob(
+                // One atomic per-step transition (ADR-080 C3 / codex round-1
+                // major #3, PR #787) -- see `DecodePolicy::transition`. Set
+                // stopped=true on a grammar stop so the caller sees a
+                // grammar-terminal stop as stopped=true, matching
+                // decode_loop's `return Ok(true)`.
+                let generated_len_before = generated_ids.len();
+                let outcome = policy.transition(
                     &mut token_logprobs,
+                    sampled_id,
                     &scratch.logits[..cfg.vocab_size],
-                    next_id,
                     gen_cfg.temperature,
+                    generated_len_before,
+                    |next_id| {
+                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                            engine.advance(gs, next_id)
+                        } else {
+                            true
+                        }
+                    },
+                    |next_id| should_stop_token(cfg, gen_cfg, next_id),
+                    |next_id| {
+                        generated_ids.push(next_id);
+                        all_ids.push(next_id);
+                    },
                 );
-                // Capture close-point after push so </think> is the last reasoning token.
-                policy.capture_reasoning_end(generated_ids.len());
+
+                let (next_id, answer_budget_exhausted) = match outcome {
+                    StepOutcome::GrammarStop => {
+                        stopped = true;
+                        stop_reason = StopReason::Grammar;
+                        break;
+                    }
+                    StepOutcome::Eos => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    StepOutcome::Emitted {
+                        token_id,
+                        answer_budget_exhausted,
+                    } => (token_id, answer_budget_exhausted),
+                };
 
                 let delta = detok.push(&self.tokenizer, next_id);
                 if !delta.is_empty() {
@@ -740,7 +747,7 @@ impl Qwen35Model {
                 }
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if policy.answer_budget_exhausted(generated_ids.len()) {
+                if answer_budget_exhausted {
                     break;
                 }
             }
@@ -852,39 +859,45 @@ impl Qwen35Model {
                     &mut rng_state,
                 );
 
-                // Budget forcing: override sampled token with </think> when the
-                // reasoning budget is exhausted and the block is still open.
-                let next_id = policy.apply_override(generated_ids.len(), sampled_id);
-
-                // Grammar advance on the actually-emitted token (after any budget
-                // override): break cleanly when the grammar signals completion.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                // Track when the thinking block closes (natural or forced).
-                policy.note_emitted(next_id);
-
-                if should_stop_token(cfg, gen_cfg, next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-                policy.record_logprob(
+                // One atomic per-step transition (ADR-080 C3 / codex round-1
+                // major #3, PR #787) -- see `DecodePolicy::transition`.
+                let generated_len_before = generated_ids.len();
+                let outcome = policy.transition(
                     &mut token_logprobs,
+                    sampled_id,
                     &scratch.logits[..cfg.vocab_size],
-                    next_id,
                     gen_cfg.temperature,
+                    generated_len_before,
+                    |next_id| {
+                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                            engine.advance(gs, next_id)
+                        } else {
+                            true
+                        }
+                    },
+                    |next_id| should_stop_token(cfg, gen_cfg, next_id),
+                    |next_id| {
+                        generated_ids.push(next_id);
+                        all_ids.push(next_id);
+                    },
                 );
-                // Capture close-point after push so </think> is the last reasoning token.
-                policy.capture_reasoning_end(generated_ids.len());
+
+                let (next_id, answer_budget_exhausted) = match outcome {
+                    StepOutcome::GrammarStop => {
+                        stopped = true;
+                        stop_reason = StopReason::Grammar;
+                        break;
+                    }
+                    StepOutcome::Eos => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    StepOutcome::Emitted {
+                        token_id,
+                        answer_budget_exhausted,
+                    } => (token_id, answer_budget_exhausted),
+                };
 
                 let delta = detok.push(&self.tokenizer, next_id);
                 let mut iter_interrupted = false;
@@ -905,7 +918,7 @@ impl Qwen35Model {
                 }
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if policy.answer_budget_exhausted(generated_ids.len()) {
+                if answer_budget_exhausted {
                     break;
                 }
             }
@@ -938,44 +951,77 @@ impl Qwen35Model {
     }
 }
 
+/// Outcome of [`DecodePolicy::transition`], the one per-step call every decode
+/// loop drives through (ADR-080 C3 / codex round-1 major #3, PR #787).
+pub(crate) enum StepOutcome {
+    /// The (possibly budget-overridden) token was rejected by the backend's
+    /// own grammar advance before ever being pushed. The loop must stop with
+    /// `stopped = true`, `stop_reason = Grammar`.
+    GrammarStop,
+    /// The (possibly budget-overridden) token is EOS / a stop-token id and
+    /// was never pushed. The loop must stop with `stopped = true`,
+    /// `stop_reason = Eos`.
+    Eos,
+    /// The token was pushed (via the caller's `push` callback) and every
+    /// backend-neutral per-step control (logprobs, reasoning-end capture,
+    /// answer-budget accounting) has already been applied for it.
+    Emitted {
+        /// The actually-emitted token id (post budget-override).
+        token_id: u32,
+        /// Whether the answer-budget window has closed as of this token —
+        /// the loop should break after this iteration (in addition to its
+        /// normal cap) when this is `true`.
+        answer_budget_exhausted: bool,
+    },
+}
+
 /// Backend-neutral decode-policy state (ADR-080 C3): reasoning-budget
 /// accounting and logprobs formatting, shared by every canonical/streaming
 /// decode loop — CPU [`decode_loop`], [`decode_loop_with_stops`], both
 /// branches of [`Qwen35Model::generate_streaming_with_cancel`], and the Metal
 /// `generate_streaming` / `generate_streaming_with_prefix_cache_and_cancel_inner`
-/// loops in `crate::forward::metal_qwen35` — via a per-step forward callback
-/// seam: each backend keeps `forward_step`, grammar masking/advance,
-/// sampling, and EOS/stop-token checking entirely to itself, and only hands
-/// the policy the token its own pipeline just sampled
-/// ([`DecodePolicy::apply_override`], which may replace it with the forced
-/// `</think>` token), then reports back once the final token is actually
-/// emitted ([`DecodePolicy::note_emitted`] / [`DecodePolicy::capture_reasoning_end`])
-/// so the policy can tell the loop when the answer-budget window has closed
-/// ([`DecodePolicy::answer_budget_exhausted`]).
+/// loops in `crate::forward::metal_qwen35` — via one atomic per-step
+/// transition ([`DecodePolicy::transition`]): each backend keeps
+/// `forward_step`, grammar masking, sampling, and its own token vectors
+/// (`generated_ids` / `all_ids` or the Metal equivalents) entirely to itself,
+/// hands `transition` the token its own pipeline just sampled plus three
+/// backend callbacks (grammar-advance, EOS/stop-token check, and the push
+/// into its own vectors), and gets back a [`StepOutcome`] that already
+/// reflects budget-override, reasoning-block tracking, logprobs recording,
+/// reasoning-end capture, and the answer-budget check — in that fixed order,
+/// every time, for every site.
 ///
 /// Before this struct existed, this exact bookkeeping (`think_close_id`
 /// resolution, `thinking_closed` / `reasoning_end_len` tracking, the
 /// `decode_cap` / `force_close_think` calls, and the answer-budget break
 /// condition) was hand-duplicated across six independent decode loops —
 /// exactly the drift ADR-080 C3 exists to prevent: a seventh loop could add
-/// its own copy and silently diverge from the other six. `DecodePolicy` also
-/// owns per-step logprobs recording ([`DecodePolicy::record_logprob`]), which
-/// was already a single shared free function (`crate::sampling::record_logprob`)
-/// called identically by all six sites; wrapping it here keeps every piece of
-/// backend-neutral per-step policy under one owner.
+/// its own copy and silently diverge from the other six. The struct
+/// originally exposed each of these as a separate method
+/// (`apply_override` / `note_emitted` / `record_logprob` /
+/// `capture_reasoning_end` / `answer_budget_exhausted`), which let a call
+/// site choreograph a subset of them and skip another — codex round-1
+/// blocker #1 was exactly that failure mode: the Metal prefix-cache loop
+/// called four of the five and silently never called `record_logprob`.
+/// `transition` replaces all five with the one call above; the five
+/// constituent methods are now private to this module, so a caller in a
+/// different module (e.g. `crate::forward::metal_qwen35`) cannot reach any of
+/// them individually even by mistake — omitting `transition` is the only way
+/// to skip a control, and doing so breaks every one of these behaviors at
+/// once rather than silently dropping just one.
 ///
-/// Stop-string matching state is deliberately *not* folded into this struct:
-/// the streaming callers need [`StopStringMatcher`]'s incremental
-/// byte-holdback semantics (a partial match must never reach `on_token`),
-/// while the non-streaming path scans the fully accumulated string via
-/// `earliest_stop_match` / `earliest_stop_match_from`. Both were already
-/// unified at the type/free-function level before this PR (every streaming
-/// caller, CPU and Metal, shares the one `StopStringMatcher` type; every
-/// non-streaming caller shares the one `earliest_stop_match*` pair) — there
-/// is no per-loop duplication left to remove there, only two genuinely
-/// different consumption modes of the same shared components, mirroring the
-/// same "document, don't force" principle applied to backend-specific Metal
-/// logic elsewhere in this cluster.
+/// Stop-string matching remains outside `transition`'s return value: the
+/// streaming callers need [`StopStringMatcher`]'s incremental byte-holdback
+/// semantics (a partial match must never reach `on_token`), while the
+/// non-streaming path scans the fully accumulated string via
+/// `earliest_stop_match` / `earliest_stop_match_from`. These are genuinely
+/// different consumption shapes of the same shared components (every
+/// streaming caller, CPU and Metal, shares the one `StopStringMatcher` type;
+/// every non-streaming caller shares the one `earliest_stop_match*` pair),
+/// and both already run strictly after `transition`'s `push` callback at
+/// every site, using the token id `transition` returns — there is no
+/// remaining site where stop-matching could be silently skipped independent
+/// of the other controls this struct owns.
 pub(crate) struct DecodePolicy {
     reasoning_budget: Option<usize>,
     enable_thinking: bool,
@@ -1026,7 +1072,10 @@ impl DecodePolicy {
     /// budget is exhausted and the block is still open; a no-op pass-through
     /// otherwise. Call after sampling, before grammar-advance (the actually-emitted
     /// token, post-override, is what grammar must advance on).
-    pub(crate) fn apply_override(&self, generated_len: usize, sampled_id: u32) -> u32 {
+    ///
+    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// [`DecodePolicy::transition`], which owns the full per-step ordering.
+    fn apply_override(&self, generated_len: usize, sampled_id: u32) -> u32 {
         force_close_think(
             self.reasoning_budget,
             self.enable_thinking,
@@ -1041,7 +1090,10 @@ impl DecodePolicy {
     /// post-override token) is the `</think>` token. Call after grammar-advance
     /// succeeds, before the EOS/stop-token check — mirrors the original inline
     /// ordering across all six sites.
-    pub(crate) fn note_emitted(&mut self, next_id: u32) {
+    ///
+    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// [`DecodePolicy::transition`], which owns the full per-step ordering.
+    fn note_emitted(&mut self, next_id: u32) {
         if Some(next_id) == self.think_close_id {
             self.thinking_closed = true;
         }
@@ -1051,7 +1103,10 @@ impl DecodePolicy {
     /// closes, using the generated-token count *after* the token was pushed (so
     /// `</think>` itself is the last reasoning token, not the first answer token).
     /// A no-op once already captured or while the block is still open.
-    pub(crate) fn capture_reasoning_end(&mut self, generated_len_after_push: usize) {
+    ///
+    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// [`DecodePolicy::transition`], which owns the full per-step ordering.
+    fn capture_reasoning_end(&mut self, generated_len_after_push: usize) {
         if self.thinking_closed && self.reasoning_end_len.is_none() {
             self.reasoning_end_len = Some(generated_len_after_push);
         }
@@ -1059,7 +1114,10 @@ impl DecodePolicy {
 
     /// True once `max_new_tokens` answer tokens have followed the `</think>` close
     /// point — the decode loop should break on this, in addition to its normal cap.
-    pub(crate) fn answer_budget_exhausted(&self, generated_len: usize) -> bool {
+    ///
+    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// [`DecodePolicy::transition`], which owns the full per-step ordering.
+    fn answer_budget_exhausted(&self, generated_len: usize) -> bool {
         self.reasoning_end_len
             .is_some_and(|end| generated_len.saturating_sub(end) >= self.max_new_tokens)
     }
@@ -1067,7 +1125,10 @@ impl DecodePolicy {
     /// Thin, zero-behavior-change wrapper over `crate::sampling::record_logprob`,
     /// so logprobs formatting is owned by the same struct as the other two
     /// backend-neutral policy legs (ADR-080 C3 contract text).
-    pub(crate) fn record_logprob(
+    ///
+    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// [`DecodePolicy::transition`], which owns the full per-step ordering.
+    fn record_logprob(
         &self,
         token_logprobs: &mut Vec<TokenLogprob>,
         logits: &[f32],
@@ -1075,6 +1136,66 @@ impl DecodePolicy {
         temperature: f32,
     ) {
         record_logprob(token_logprobs, logits, token_id, temperature, self.logprobs);
+    }
+
+    /// The one per-step transition (ADR-080 C3 / codex round-1 major #3, PR
+    /// #787): atomically applies, in the fixed order every decode loop
+    /// requires, the reasoning-budget override, the backend's grammar-advance
+    /// callback, the emitted-token bookkeeping, the backend's EOS/stop-token
+    /// callback, the backend's push callback (into its own `generated_ids` /
+    /// `all_ids` or Metal-equivalent vectors), per-token logprobs recording,
+    /// reasoning-end capture, and the answer-budget check.
+    ///
+    /// `grammar_advance` and `is_eos` are backend callbacks because grammar
+    /// masking/advance and EOS/stop-token identification remain genuinely
+    /// backend-specific per ADR-080 C3 scope — each backend owns its own
+    /// `GrammarState` and `cfg.eos_token_id` / `stop_token_ids` wiring, and
+    /// `grammar_advance` must run on the *actually-emitted* (post-override)
+    /// token before `is_eos` sees it, exactly mirroring the inline ordering
+    /// every site used before this method existed. `push` is a callback
+    /// because the token vectors are owned by the caller and are also read on
+    /// the *next* loop iteration (`all_ids.last()` feeds the next
+    /// `forward_step`) — the caller cannot hand that ownership to the policy.
+    ///
+    /// Returns [`StepOutcome::GrammarStop`] / [`StepOutcome::Eos`] without
+    /// ever calling `push` when the token is rejected before emission
+    /// (matching the existing contract that a stop token is never present in
+    /// `token_ids`), or [`StepOutcome::Emitted`] once the token has been
+    /// pushed and every remaining control applied.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transition(
+        &mut self,
+        token_logprobs: &mut Vec<TokenLogprob>,
+        sampled_id: u32,
+        logits: &[f32],
+        temperature: f32,
+        generated_len_before: usize,
+        mut grammar_advance: impl FnMut(u32) -> bool,
+        mut is_eos: impl FnMut(u32) -> bool,
+        mut push: impl FnMut(u32),
+    ) -> StepOutcome {
+        let next_id = self.apply_override(generated_len_before, sampled_id);
+
+        if !grammar_advance(next_id) {
+            return StepOutcome::GrammarStop;
+        }
+
+        self.note_emitted(next_id);
+
+        if is_eos(next_id) {
+            return StepOutcome::Eos;
+        }
+
+        push(next_id);
+        let generated_len_after = generated_len_before + 1;
+
+        self.record_logprob(token_logprobs, logits, next_id, temperature);
+        self.capture_reasoning_end(generated_len_after);
+
+        StepOutcome::Emitted {
+            token_id: next_id,
+            answer_budget_exhausted: self.answer_budget_exhausted(generated_len_after),
+        }
     }
 }
 
@@ -1175,39 +1296,45 @@ fn decode_loop(
             rng_state,
         );
 
-        // Budget forcing: override the sampled token with </think> when the
-        // reasoning budget is exhausted and the block is still open.
-        let next_id = policy.apply_override(generated_ids.len(), sampled_id);
-
-        // Grammar advance on the actually-emitted token (after any budget
-        // override); a false return signals grammar completion.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state)
-            && !engine.advance(gs, next_id)
-        {
-            return Ok((true, StopReason::Grammar));
-        }
-
-        // Track when the thinking block closes (natural or forced).
-        policy.note_emitted(next_id);
-
-        if should_stop_token(cfg, gen_cfg, next_id) {
-            return Ok((true, StopReason::Eos));
-        }
-
-        generated_ids.push(next_id);
-        all_ids.push(next_id);
-        policy.record_logprob(
+        // One atomic per-step transition (ADR-080 C3 / codex round-1 major
+        // #3, PR #787): budget override, grammar-advance callback, emitted
+        // bookkeeping, EOS callback, push callback, logprobs, reasoning-end
+        // capture, and the answer-budget check, all in the fixed required
+        // order -- see `DecodePolicy::transition`.
+        let generated_len_before = generated_ids.len();
+        let outcome = policy.transition(
             token_logprobs,
+            sampled_id,
             &scratch.logits[..cfg.vocab_size],
-            next_id,
             gen_cfg.temperature,
+            generated_len_before,
+            |next_id| {
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
+                    engine.advance(gs, next_id)
+                } else {
+                    true
+                }
+            },
+            |next_id| should_stop_token(cfg, gen_cfg, next_id),
+            |next_id| {
+                generated_ids.push(next_id);
+                all_ids.push(next_id);
+            },
         );
-        // Capture close-point after push so </think> is the last reasoning token.
-        policy.capture_reasoning_end(generated_ids.len());
 
-        // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-        if policy.answer_budget_exhausted(generated_ids.len()) {
-            break;
+        match outcome {
+            StepOutcome::GrammarStop => return Ok((true, StopReason::Grammar)),
+            StepOutcome::Eos => return Ok((true, StopReason::Eos)),
+            StepOutcome::Emitted {
+                answer_budget_exhausted,
+                ..
+            } => {
+                // Answer-budget break: stop once max_new_tokens answer tokens
+                // follow </think>.
+                if answer_budget_exhausted {
+                    break;
+                }
+            }
         }
     }
     Ok((false, StopReason::Length))
@@ -1282,39 +1409,45 @@ fn decode_loop_with_stops(
             rng_state,
         );
 
-        // Budget forcing: override the sampled token with </think> when the
-        // reasoning budget is exhausted and the block is still open.
-        let next_id = policy.apply_override(generated_ids.len(), sampled_id);
-
-        // Grammar advance on the actually-emitted token (after any budget
-        // override); a false return signals grammar completion.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state)
-            && !engine.advance(gs, next_id)
-        {
-            stopped = true;
-            stop_reason = StopReason::Grammar;
-            break;
-        }
-
-        // Track when the thinking block closes (natural or forced).
-        policy.note_emitted(next_id);
-
-        if should_stop_token(cfg, gen_cfg, next_id) {
-            stopped = true;
-            stop_reason = StopReason::Eos;
-            break;
-        }
-
-        generated_ids.push(next_id);
-        all_ids.push(next_id);
-        policy.record_logprob(
+        // One atomic per-step transition (ADR-080 C3 / codex round-1 major
+        // #3, PR #787) -- see `DecodePolicy::transition`.
+        let generated_len_before = generated_ids.len();
+        let outcome = policy.transition(
             token_logprobs,
+            sampled_id,
             &scratch.logits[..cfg.vocab_size],
-            next_id,
             gen_cfg.temperature,
+            generated_len_before,
+            |next_id| {
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
+                    engine.advance(gs, next_id)
+                } else {
+                    true
+                }
+            },
+            |next_id| should_stop_token(cfg, gen_cfg, next_id),
+            |next_id| {
+                generated_ids.push(next_id);
+                all_ids.push(next_id);
+            },
         );
-        // Capture close-point after push so </think> is the last reasoning token.
-        policy.capture_reasoning_end(generated_ids.len());
+
+        let (next_id, answer_budget_exhausted) = match outcome {
+            StepOutcome::GrammarStop => {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+                break;
+            }
+            StepOutcome::Eos => {
+                stopped = true;
+                stop_reason = StopReason::Eos;
+                break;
+            }
+            StepOutcome::Emitted {
+                token_id,
+                answer_budget_exhausted,
+            } => (token_id, answer_budget_exhausted),
+        };
 
         let prev_len = full.len();
         let delta = detok.push(&model.tokenizer, next_id);
@@ -1347,8 +1480,11 @@ fn decode_loop_with_stops(
             break;
         }
 
-        // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-        if policy.answer_budget_exhausted(generated_ids.len()) {
+        // Answer-budget break: stop once max_new_tokens answer tokens follow
+        // </think>. Computed inside `transition` and carried out via the
+        // `Emitted` outcome above (`answer_budget_exhausted` is now private
+        // to this module -- only `transition` may call it).
+        if answer_budget_exhausted {
             break;
         }
     }
@@ -2569,6 +2705,53 @@ mod tests {
              logprobs entries must be dropped; got {} entries",
             result.token_logprobs.len()
         );
+    }
+
+    /// Codex round-1 major #3 (PR #787): `DecodePolicy::transition` owns
+    /// `record_logprob` internally now (the constituent method is private,
+    /// only reachable through `transition`). This asserts the positive case
+    /// the truncation test above does not: with no stop string to truncate
+    /// anything, every generated token gets exactly one `TokenLogprob` entry,
+    /// and its `token_id` matches the corresponding `token_ids` entry.
+    ///
+    /// Mutation sensitivity: commenting out the `self.record_logprob(...)`
+    /// call inside `DecodePolicy::transition` makes `token_logprobs` come
+    /// back empty while `token_ids` still has 3 entries -- this test fails
+    /// with a length mismatch (`0 != 3`) instead of passing.
+    #[test]
+    fn transition_records_one_logprob_per_generated_token() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            logprobs: Some(0),
+            ..Default::default()
+        };
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("plain generate must succeed");
+
+        assert_eq!(
+            result.token_logprobs.len(),
+            result.token_ids.len(),
+            "every generated token must get exactly one TokenLogprob entry \
+             when logprobs is requested and nothing truncates the output; \
+             got {} logprobs for {} tokens",
+            result.token_logprobs.len(),
+            result.token_ids.len()
+        );
+        for (i, (logprob, &token_id)) in result
+            .token_logprobs
+            .iter()
+            .zip(result.token_ids.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                logprob.token_id, token_id,
+                "token_logprobs[{i}] must describe the token actually emitted \
+                 at that position"
+            );
+        }
     }
 
     // -------------------------------------------------------------------

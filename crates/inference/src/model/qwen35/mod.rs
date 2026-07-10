@@ -62,7 +62,7 @@ pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_n
 // gated identically) consumer needs the re-export; `generation.rs` itself
 // uses `DecodePolicy` directly within its own module.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use generation::DecodePolicy;
+pub(crate) use generation::{DecodePolicy, StepOutcome};
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{

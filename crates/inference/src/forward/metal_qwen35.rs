@@ -565,6 +565,15 @@ mod mtp_resolve_tests {
 /// so any set `reasoning_budget` must route around it to the plain loop,
 /// which either applies budget forcing or rejects the config via
 /// `check_reasoning_budget_not_set`.
+///
+/// `gen_cfg.repetition_penalty == 1.0` is likewise load-bearing (codex round-1
+/// blocker #2, PR #787): both the MTP draft (`mtp_forward_one`) and verify
+/// steps select tokens via raw `argmax_f32_first_wins` over logits, never
+/// through `sample_token`, so a non-identity penalty configured by the caller
+/// would be silently ignored -- a set penalty can change which token is
+/// greedy-argmax-optimal, so this is an output-correctness issue, not only a
+/// performance one. Any non-1.0 penalty must route around MTP to the plain
+/// loop, which samples via `sample_token` and applies it.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn mtp_route_active(
     mtp_present: bool,
@@ -580,12 +589,15 @@ fn mtp_route_active(
         && gen_cfg.grammar.is_none()
         && gen_cfg.stop_strings.is_empty()
         && gen_cfg.reasoning_budget.is_none()
+        && gen_cfg.repetition_penalty == 1.0
 }
 
 /// Whether `generate()` should take the GDN-first self-speculative greedy
 /// branch. Mirrors the `use_self_spec` computation inline in
 /// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()` /
-/// `reasoning_budget.is_none()` route-around rationale as [`mtp_route_active`].
+/// `reasoning_budget.is_none()` / `repetition_penalty == 1.0` route-around
+/// rationale as [`mtp_route_active`] (codex round-1 blocker #2, PR #787):
+/// self-spec's verify step also selects via raw argmax, never `sample_token`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn self_spec_route_active(
     gdn_checkpoints_present: bool,
@@ -602,6 +614,7 @@ fn self_spec_route_active(
         && gen_cfg.grammar.is_none()
         && gen_cfg.stop_strings.is_empty()
         && gen_cfg.reasoning_budget.is_none()
+        && gen_cfg.repetition_penalty == 1.0
         && num_active_linear_attention_layers > 0
 }
 
@@ -707,6 +720,96 @@ mod route_predicate_tests {
             !self_spec_route_active(true, true, &gen_cfg, false, 1),
             "self-spec must not activate when reasoning_budget is set -- same \
              budget-forcing-unaware draft/verify loop as MTP"
+        );
+    }
+
+    /// Codex round-1 blocker #2 (PR #787): a non-identity `repetition_penalty`
+    /// must route around MTP even though every other MTP precondition
+    /// (present, enabled, greedy, non-compact, no grammar, no stop strings,
+    /// no reasoning budget) is satisfied. MTP's draft/verify loop selects via
+    /// raw `argmax_f32_first_wins`, never `sample_token`, so a caller-supplied
+    /// penalty would otherwise be silently ignored.
+    ///
+    /// Mutation sensitivity: removing the `repetition_penalty == 1.0` clause
+    /// from `mtp_route_active` makes this assertion fail (the route stays
+    /// active), reproducing codex's reported failure mode exactly.
+    #[test]
+    fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when repetition_penalty is not 1.0 -- its \
+             draft/verify loop selects via raw argmax and has no \
+             repetition-penalty awareness"
+        );
+    }
+
+    /// Sibling to `mtp_route_blocked_by_nonidentity_repetition_penalty` for
+    /// the self-speculative route (codex round-1 blocker #2, PR #787).
+    #[test]
+    fn self_spec_route_blocked_by_nonidentity_repetition_penalty() {
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when repetition_penalty is not 1.0 \
+             -- same raw-argmax-selecting, penalty-unaware draft/verify loop \
+             as MTP"
+        );
+    }
+
+    /// Output-level discriminating case (codex round-1 blocker #2, PR #787):
+    /// proves the route-around above is not merely cosmetic. With
+    /// `repetition_penalty = 1.0` the raw dense argmax MTP/self-spec use
+    /// (`argmax_f32_first_wins`) agrees with the canonical
+    /// repetition-penalty-aware `sample_token` path. Once a previously-seen
+    /// token depresses the raw argmax below the runner-up (same mechanism as
+    /// `test_repetition_penalty_can_flip_greedy_argmax_when_seen_in_history`
+    /// in `model::qwen35::sampling`), the two paths disagree -- exactly the
+    /// silent-divergence scenario the new predicate clause closes.
+    #[test]
+    fn nonidentity_repetition_penalty_flips_winner_vs_raw_argmax() {
+        use crate::sampling::{argmax_f32_first_wins, sample_full_logits as sample_token};
+
+        // Token 0 has the highest raw logit; token 1 is a close second, chosen
+        // so 5.0 / 1.1 falls below token 1's unpenalized 4.6.
+        let logits = [5.0_f32, 4.6, 0.1];
+        let previous_ids = [0_u32, 0, 0];
+
+        // Raw dense argmax (what MTP/self-spec actually call): always token 0,
+        // with no notion of `previous_ids` or `repetition_penalty` at all.
+        assert_eq!(
+            argmax_f32_first_wins(&logits),
+            0,
+            "raw argmax is penalty-blind by construction"
+        );
+
+        // Canonical path with the caller's non-identity penalty and the
+        // argmax token already in history: the penalized pick flips to the
+        // runner-up.
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        let mut rng = 7u64;
+        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng);
+        assert_eq!(
+            canonical, 1,
+            "sample_token must penalize the previously-seen argmax enough to \
+             flip greedy selection to the runner-up"
+        );
+
+        assert_ne!(
+            argmax_f32_first_wins(&logits),
+            canonical,
+            "raw argmax and the canonical repetition-aware pick must disagree \
+             here -- this is exactly the output-correctness gap that routing \
+             MTP/self-spec around non-identity repetition_penalty closes"
         );
     }
 }
@@ -5406,14 +5509,16 @@ mod inner {
             cmd2.wait_until_completed();
 
             // ---- Phase 3: CPU ----
+            // Codex round-1 medium #4 (PR #787): this was the one surviving
+            // production last-wins `max_by` argmax after the #280 fix -- the
+            // MTP draft-token pick, called from `generate_greedy_mtp`. Swapped
+            // for the shared first-wins `argmax_f32_first_wins` helper so a
+            // tie at the draft boundary resolves the same way as every other
+            // greedy pick in the crate (a differing draft tie can only reduce
+            // speculative acceptance, never change final target output, but
+            // the duplicate last-wins contract itself is the defect).
             let logits = unsafe { read_buffer(&*buf_logits, cfg.vocab_size) };
-            let draft_token = logits
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            let draft_token = crate::sampling::argmax_f32_first_wins(&logits);
 
             // Advance MTP KV cache.
             if let Some(ref mut mtp) = self.session.mtp {
@@ -13179,45 +13284,48 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                // Budget forcing: override sampled token with </think> when the
-                // reasoning budget is exhausted and the block is still open.
-                let next_id = policy.apply_override(generated_ids.len(), sampled_id);
-
-                // Advance grammar state after sampling (or forced token).
+                // One atomic per-step transition (ADR-080 C3 / codex round-1
+                // major #3, PR #787) -- see `DecodePolicy::transition`.
                 // Interaction note: if reasoning_budget AND grammar are both active and the
                 // grammar disallows </think> at this position, advance returns false → break.
                 // This is fail-closed (no grammar-illegal output emitted) but silent. The
                 // combination of grammar + reasoning_budget is unusual; document, don't change.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                // Track when the thinking block closes (natural or forced).
-                policy.note_emitted(next_id);
-
-                if is_stop(next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-                // #585: record this step's logprob (no-op unless requested). next_id
-                // here is the final, post-force_close_think token — step_logits is
-                // the distribution it was actually sampled/forced from.
-                policy.record_logprob(
+                let generated_len_before = generated_ids.len();
+                let outcome = policy.transition(
                     &mut token_logprobs,
+                    sampled_id,
                     &step_logits,
-                    next_id,
                     gen_cfg.temperature,
+                    generated_len_before,
+                    |next_id| {
+                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                            engine.advance(gs, next_id)
+                        } else {
+                            true
+                        }
+                    },
+                    &is_stop,
+                    |next_id| {
+                        generated_ids.push(next_id);
+                        all_ids.push(next_id);
+                    },
                 );
-                // Capture the close-point after the push so </think> is the
-                // last reasoning token (not the first answer token).
-                policy.capture_reasoning_end(generated_ids.len());
+
+                let (next_id, answer_budget_exhausted) = match outcome {
+                    crate::model::qwen35::StepOutcome::GrammarStop => {
+                        stop_reason = StopReason::Grammar;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Eos => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Emitted {
+                        token_id,
+                        answer_budget_exhausted,
+                    } => (token_id, answer_budget_exhausted),
+                };
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
                 if !delta.is_empty() {
@@ -13255,7 +13363,7 @@ mod inner {
                     break;
                 }
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if policy.answer_budget_exhausted(generated_ids.len()) {
+                if answer_budget_exhausted {
                     break;
                 }
             }
@@ -15244,6 +15352,17 @@ mod inner {
             use crate::error::InferenceError;
             use crate::kv_cache::PrefixReuseMode;
 
+            // Codex round-1 blocker #1 (PR #787): this path never wired
+            // per-token logprobs capture into the cross-turn cache decode
+            // loop (see the `token_logprobs: vec![]` returns throughout this
+            // function) -- a caller requesting `gen_cfg.logprobs` previously
+            // got `Ok` with silently empty logprobs, the exact defect ADR-080
+            // C3's apply-or-fail-closed contract exists to close. Guard-reject
+            // before any cache/state mutation rather than silently drop the
+            // field, mirroring `multimodal_generate_preflight`'s identical
+            // choice for the same not-yet-wired capability.
+            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+
             let cfg = self.engine.config.clone();
 
             let mut rng_state = match gen_cfg.seed {
@@ -15554,16 +15673,23 @@ mod inner {
             all_ids.push(next_id);
             // Backend-neutral reasoning-budget policy (ADR-080 C3), shared with
             // `generate_streaming` above and the CPU `model::qwen35::generation`
-            // loops. This path has never recorded per-token logprobs (see the
-            // `token_logprobs: vec![]` returns throughout this function) --
-            // `policy.record_logprob` is deliberately not called below, matching
-            // that pre-existing (out-of-scope-for-C3) behavior exactly.
+            // loops, driven through the one atomic `DecodePolicy::transition`
+            // (codex round-1 major #3, PR #787). `token_logprobs` below is a
+            // throwaway sink: this path does not wire per-token logprobs
+            // capture, and the `check_logprobs_not_set` guard above already
+            // rejects any request that would need it, so `gen_cfg.logprobs`
+            // is always `None` here and `transition`'s logprob recording is
+            // always a no-op (codex round-1 blocker #1, PR #787) -- passed
+            // through uniformly rather than special-cased, so this site is
+            // structurally indistinguishable from the other five at the
+            // `transition` call site.
             let mut policy = crate::model::qwen35::DecodePolicy::new(
                 gen_cfg,
                 think_close_id,
                 next_id,
                 generated_ids.len(),
             );
+            let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
@@ -15709,26 +15835,44 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                let next_id = policy.apply_override(generated_ids.len(), sampled_id);
+                // One atomic per-step transition (ADR-080 C3 / codex round-1
+                // major #3, PR #787) -- see `DecodePolicy::transition`.
+                let generated_len_before = generated_ids.len();
+                let outcome = policy.transition(
+                    &mut token_logprobs,
+                    sampled_id,
+                    &step_logits,
+                    gen_cfg.temperature,
+                    generated_len_before,
+                    |next_id| {
+                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                            engine.advance(gs, next_id)
+                        } else {
+                            true
+                        }
+                    },
+                    &is_stop,
+                    |next_id| {
+                        generated_ids.push(next_id);
+                        all_ids.push(next_id);
+                    },
+                );
 
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                policy.note_emitted(next_id);
-
-                if is_stop(next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-                policy.capture_reasoning_end(generated_ids.len());
+                let (next_id, answer_budget_exhausted) = match outcome {
+                    crate::model::qwen35::StepOutcome::GrammarStop => {
+                        stop_reason = StopReason::Grammar;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Eos => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Emitted {
+                        token_id,
+                        answer_budget_exhausted,
+                    } => (token_id, answer_budget_exhausted),
+                };
                 last_pushed_id = next_id;
                 let delta = detok.push(tokenizer, next_id);
                 if !delta.is_empty() {
@@ -15766,7 +15910,7 @@ mod inner {
                     stop_reason = StopReason::KvFull;
                     break;
                 }
-                if policy.answer_budget_exhausted(generated_ids.len()) {
+                if answer_budget_exhausted {
                     break;
                 }
             }
@@ -26513,6 +26657,76 @@ mod inner {
             assert!(
                 state.cross_turn_prefix_cache.entry.is_none(),
                 "a grammar-fail-closed turn must not leave a stale cache entry behind"
+            );
+        }
+
+        /// Codex round-1 blocker #1 (PR #787):
+        /// `generate_streaming_with_prefix_cache` never wires per-token
+        /// logprobs capture into its decode loop. Before the fix, a caller
+        /// requesting `gen_cfg.logprobs` got `Ok` back with silently empty
+        /// `token_logprobs` -- the exact silent-omission defect ADR-080 C3's
+        /// apply-or-fail-closed contract exists to close. The guard must
+        /// reject the request before any cache/state mutation, so no cache
+        /// entry is created (or consumed) for the rejected call.
+        ///
+        /// Mutation sensitivity: removing the `check_logprobs_not_set` call
+        /// at the top of `generate_streaming_with_prefix_cache_and_cancel_inner`
+        /// makes this assertion fail (the call returns `Ok` with empty
+        /// `token_logprobs` instead of `Err`).
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_logprobs_request() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: Some(5),
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a logprobs request must fail closed via \
+                 generate_streaming_with_prefix_cache() instead of silently \
+                 returning empty token_logprobs; got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "a logprobs-rejected call must not create or leave a cache \
+                 entry behind -- the guard runs before any state mutation"
             );
         }
 
