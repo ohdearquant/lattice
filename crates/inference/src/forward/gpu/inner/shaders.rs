@@ -271,9 +271,21 @@ pub(super) const ATTENTION_SOFTMAX_SHADER: &str = r#"
 
 var<workgroup> max_scratch: array<f32, 128>;
 var<workgroup> sum_scratch: array<f32, 128>;
+var<workgroup> bad_scratch: array<u32, 128>;
 
 fn pf(i: u32) -> f32 {
     return bitcast<f32>(params[i]);
+}
+
+// ADR-080 C1 fail-closed row contract: a score is "bad" (NaN or +/-infinite)
+// exactly when its IEEE-754 exponent bits are all set (0x7f800000 mask) --
+// true for NaN (nonzero mantissa) and +/-Inf (zero mantissa) alike. WGSL's
+// `max()` silently drops a NaN operand (same `maxNum` semantics the CPU
+// contract's `row_max_and_any_nan` exists to counter), so the row max alone
+// cannot be trusted to surface a poisoned score; this scans explicitly.
+fn is_non_finite(v: f32) -> bool {
+    let bits = bitcast<u32>(v);
+    return (bits & 0x7f800000u) == 0x7f800000u;
 }
 
 @compute @workgroup_size(128, 1, 1)
@@ -291,19 +303,32 @@ fn attention_softmax(
     }
 
     let row_base = ((head * seq_len) + row) * seq_len;
+
+    // Pre-exp scan: row max over valid (k <= row) scaled scores, ignoring a
+    // NaN/+-inf score for the max itself, plus a separate fail-closed flag
+    // for any such score in the valid range (mirrors
+    // `attention::softmax_row::row_fails_closed_pre_exp`).
     var local_max = -3.40282347e+38;
+    var local_bad: u32 = 0u;
     for (var k: u32 = lid.x; k < seq_len; k = k + 128u) {
         if (k <= row) {
-            local_max = max(local_max, SCORES[row_base + k] * scale);
+            let v = SCORES[row_base + k] * scale;
+            if (is_non_finite(v)) {
+                local_bad = 1u;
+            } else {
+                local_max = max(local_max, v);
+            }
         }
     }
     max_scratch[lid.x] = local_max;
+    bad_scratch[lid.x] = local_bad;
     workgroupBarrier();
 
     var stride: u32 = 64u;
     loop {
         if (lid.x < stride) {
             max_scratch[lid.x] = max(max_scratch[lid.x], max_scratch[lid.x + stride]);
+            bad_scratch[lid.x] = bad_scratch[lid.x] | bad_scratch[lid.x + stride];
         }
         workgroupBarrier();
         if (stride == 1u) {
@@ -313,6 +338,20 @@ fn attention_softmax(
     }
 
     let max_val = max_scratch[0u];
+    let row_fails_closed_pre_exp = (bad_scratch[0u] != 0u);
+
+    if (row_fails_closed_pre_exp) {
+        // Fail-closed by ASSIGNMENT (attention::softmax_row::finalize_row's
+        // `row.fill(0.0)`): never compute exp()/sum on a row already known to
+        // carry a NaN or +/-infinite score. A later multiply-through-zero on
+        // a NaN numerator would not recover to zero under IEEE-754
+        // (`NaN * 0.0 == NaN`), so this returns before any such multiply.
+        for (var k: u32 = lid.x; k < seq_len; k = k + 128u) {
+            SCORES[row_base + k] = 0.0;
+        }
+        return;
+    }
+
     var local_sum: f32 = 0.0;
     for (var k: u32 = lid.x; k < seq_len; k = k + 128u) {
         if (k <= row) {
@@ -338,10 +377,24 @@ fn attention_softmax(
         stride = stride / 2u;
     }
 
-    let inv_sum = 1.0 / max(sum_scratch[0u], 1e-20);
-    for (var k: u32 = lid.x; k < seq_len; k = k + 128u) {
-        if (k <= row) {
-            SCORES[row_base + k] = SCORES[row_base + k] * inv_sum;
+    let sum_val = sum_scratch[0u];
+    // Fail-closed finalize by ASSIGNMENT (mirrors
+    // `attention::softmax_row::finalize_row`): a non-positive or non-finite
+    // denominator zeroes the row directly. The previous
+    // `1.0 / max(sum_val, 1e-20)` floor-clamp is removed -- it manufactured a
+    // finite-looking reciprocal for a NaN `sum_val` (WGSL `max()` drops the
+    // NaN operand) while the numerator lanes were already NaN, leaking NaN
+    // into the rest of the network instead of failing the row closed (#790).
+    if (is_non_finite(sum_val) || sum_val <= 0.0) {
+        for (var k: u32 = lid.x; k < seq_len; k = k + 128u) {
+            SCORES[row_base + k] = 0.0;
+        }
+    } else {
+        let inv_sum = 1.0 / sum_val;
+        for (var k: u32 = lid.x; k < seq_len; k = k + 128u) {
+            if (k <= row) {
+                SCORES[row_base + k] = SCORES[row_base + k] * inv_sum;
+            }
         }
     }
 }

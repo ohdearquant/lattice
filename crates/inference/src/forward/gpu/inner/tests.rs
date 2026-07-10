@@ -1,5 +1,6 @@
 //! GPU-vs-CPU tiny-model tests and CPU reference helpers.
 use super::*;
+use crate::attention::softmax_row::{finalize_row, row_fails_closed_pre_exp, row_max_and_any_nan};
 
 #[test]
 fn tiny_model_matches_gpu_and_keeps_static_buffers() {
@@ -44,6 +45,258 @@ fn tiny_model_matches_gpu_and_keeps_static_buffers() {
         max_abs = max_abs.max((a - b).abs());
     }
     assert!(max_abs < 1e-3, "max abs diff = {max_abs}");
+}
+
+/// ADR-080 C1 (#790) regression: `attention_softmax`'s WGSL kernel must fail
+/// closed by ASSIGNMENT on a NaN-poisoned score, not floor-clamp the
+/// denominator (`1.0 / max(sum_val, 1e-20)`) into a finite-looking reciprocal
+/// that then multiplies an already-NaN numerator through.
+///
+/// Isolation: corrupt a single entry of one layer's `q_proj_weight` so that
+/// exactly one attention head's Q vector is NaN at every query position,
+/// while K/V/embeddings/residual stay completely clean. Compare the GPU
+/// output against a CPU reference built from the crate's own fail-closed
+/// `softmax_row` helpers (not a plain `f32::max`-fold reimplementation).
+///
+/// Mutation-sensitive: reverting `shaders.rs`'s `ATTENTION_SOFTMAX_SHADER` to
+/// the pre-fix `1.0 / max(sum_scratch[0u], 1e-20)` floor-clamp (with no
+/// pre-exp NaN scan) makes this test fail (NaN leaks into the GPU output
+/// while the CPU reference stays all-finite), confirmed at PR time.
+#[test]
+fn attention_softmax_fails_closed_on_nan_q_lane() {
+    let config = Qwen3Config {
+        vocab_size: 8,
+        hidden_size: 32,
+        num_hidden_layers: 1,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 8,
+        intermediate_size: 48,
+        max_position_embeddings: 32,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1_000_000.0,
+    };
+    let runtime = GpuRuntimeConfig {
+        max_seq_len: 8,
+        upload_embeddings_to_gpu: false,
+    };
+
+    let mut weights = make_test_weights(&config);
+    let hidden = config.hidden_size;
+    let corrupt_head: usize = 1;
+    let corrupt_head_dim: usize = 3;
+    let corrupt_out_idx = corrupt_head * config.head_dim + corrupt_head_dim;
+    let corrupt_in_idx = 5usize;
+    weights.layers[0].q_proj_weight[corrupt_out_idx * hidden + corrupt_in_idx] = f32::NAN;
+
+    let gpu = match GpuModelState::new(config.clone(), &weights, runtime) {
+        Ok(gpu) => gpu,
+        Err(GpuForwardError::NoAdapter) => return, // CI without GPU
+        Err(e) => panic!("failed to init GPU state: {e}"),
+    };
+
+    let input_ids: Vec<u32> = vec![1, 3, 2, 5, 6];
+    let gpu_out = gpu
+        .forward(&input_ids, input_ids.len())
+        .expect("GPU forward should not itself error");
+
+    let cpu_ref = cpu_forward_fail_closed_reference(&weights, &config, &input_ids);
+    assert_eq!(gpu_out.len(), cpu_ref.len());
+
+    let nan_gpu = gpu_out.iter().filter(|v| v.is_nan()).count();
+    let nan_ref = cpu_ref.iter().filter(|v| v.is_nan()).count();
+    assert_eq!(
+        nan_ref, 0,
+        "test bug: the fail-closed CPU reference itself produced NaN"
+    );
+    assert_eq!(
+        nan_gpu,
+        0,
+        "attention_softmax must fail closed (zero row) on a NaN-poisoned Q \
+         lane instead of floor-clamping the denominator (ADR-080 C1, #790); \
+         got {nan_gpu}/{} NaN elements",
+        gpu_out.len()
+    );
+}
+
+/// Same tiny-model math as [`cpu_forward_reference`], but the softmax step
+/// applies the crate's own ADR-080 C1 contract helpers explicitly
+/// (`softmax_row`) instead of a plain `f32::max` fold — this reference is
+/// provably contract-compliant rather than "whatever the naive scalar loop
+/// happens to do with a NaN input".
+fn cpu_forward_fail_closed_reference(
+    weights: &Qwen3Weights,
+    config: &Qwen3Config,
+    input_ids: &[u32],
+) -> Vec<f32> {
+    let seq_len = input_ids.len();
+    let hidden = config.hidden_size;
+    let q_dim = config.q_dim();
+    let kv_dim = config.kv_dim();
+    let head_dim = config.head_dim;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_key_value_heads;
+    let groups = config.num_groups();
+    let intermediate = config.intermediate_size;
+
+    let (rope_cos, rope_sin) = build_rope_tables(head_dim, seq_len, config.rope_theta);
+
+    let mut hidden_buf = vec![0.0f32; seq_len * hidden];
+    for (i, &tok) in input_ids.iter().enumerate() {
+        let tok = tok as usize;
+        hidden_buf[i * hidden..(i + 1) * hidden]
+            .copy_from_slice(&weights.embed_tokens[tok * hidden..(tok + 1) * hidden]);
+    }
+
+    let mut residual = vec![0.0f32; seq_len * hidden];
+    let mut q = vec![0.0f32; seq_len * q_dim];
+    let mut k = vec![0.0f32; seq_len * kv_dim];
+    let mut v = vec![0.0f32; seq_len * kv_dim];
+    let mut attn_out = vec![0.0f32; seq_len * q_dim];
+    let mut gate = vec![0.0f32; seq_len * intermediate];
+    let mut up = vec![0.0f32; seq_len * intermediate];
+
+    for layer in &weights.layers {
+        residual.copy_from_slice(&hidden_buf);
+        rms_norm_cpu(
+            &mut hidden_buf,
+            &layer.input_layernorm_weight,
+            hidden,
+            config.rms_norm_eps,
+        );
+
+        matmul_bt_cpu(
+            &hidden_buf,
+            &layer.q_proj_weight,
+            &mut q,
+            seq_len,
+            hidden,
+            q_dim,
+        );
+        matmul_bt_cpu(
+            &hidden_buf,
+            &layer.k_proj_weight,
+            &mut k,
+            seq_len,
+            hidden,
+            kv_dim,
+        );
+        matmul_bt_cpu(
+            &hidden_buf,
+            &layer.v_proj_weight,
+            &mut v,
+            seq_len,
+            hidden,
+            kv_dim,
+        );
+
+        rms_norm_cpu(&mut q, &layer.q_norm_weight, head_dim, config.rms_norm_eps);
+        rms_norm_cpu(&mut k, &layer.k_norm_weight, head_dim, config.rms_norm_eps);
+        apply_rope_cpu(&mut q, seq_len, num_heads, head_dim, &rope_cos, &rope_sin);
+        apply_rope_cpu(
+            &mut k,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            &rope_cos,
+            &rope_sin,
+        );
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        for h in 0..num_heads {
+            let kv_h = h / groups;
+            for qi in 0..seq_len {
+                let n_valid = qi + 1;
+                let mut row = vec![0.0f32; n_valid];
+                for (ki, slot) in row.iter_mut().enumerate() {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        let q_idx = (qi * num_heads + h) * head_dim + d;
+                        let k_idx = (ki * num_kv_heads + kv_h) * head_dim + d;
+                        dot += q[q_idx] * k[k_idx];
+                    }
+                    *slot = dot * scale;
+                }
+
+                // --- ADR-080 C1 contract, applied via the crate's own shared
+                // helper functions (not a reimplementation): ---
+                let (max_val, any_nan) = row_max_and_any_nan(&row);
+                if row_fails_closed_pre_exp(max_val, any_nan) {
+                    row.fill(0.0);
+                } else {
+                    let mut sum = 0.0f32;
+                    for x in row.iter_mut() {
+                        let e = (*x - max_val).exp();
+                        *x = e;
+                        sum += e;
+                    }
+                    finalize_row(&mut row, sum);
+                }
+
+                for h_ in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for (ki, &p) in row.iter().enumerate() {
+                        let v_idx = (ki * num_kv_heads + kv_h) * head_dim + h_;
+                        acc += p * v[v_idx];
+                    }
+                    attn_out[(qi * num_heads + h) * head_dim + h_] = acc;
+                }
+            }
+        }
+
+        matmul_bt_cpu(
+            &attn_out,
+            &layer.o_proj_weight,
+            &mut hidden_buf,
+            seq_len,
+            q_dim,
+            hidden,
+        );
+        add_inplace_cpu(&mut hidden_buf, &residual);
+
+        residual.copy_from_slice(&hidden_buf);
+        rms_norm_cpu(
+            &mut hidden_buf,
+            &layer.post_attention_layernorm_weight,
+            hidden,
+            config.rms_norm_eps,
+        );
+        matmul_bt_cpu(
+            &hidden_buf,
+            &layer.gate_proj_weight,
+            &mut gate,
+            seq_len,
+            hidden,
+            intermediate,
+        );
+        matmul_bt_cpu(
+            &hidden_buf,
+            &layer.up_proj_weight,
+            &mut up,
+            seq_len,
+            hidden,
+            intermediate,
+        );
+        silu_inplace_cpu(&mut gate);
+        mul_inplace_cpu(&mut gate, &up);
+        matmul_bt_cpu(
+            &gate,
+            &layer.down_proj_weight,
+            &mut hidden_buf,
+            seq_len,
+            intermediate,
+            hidden,
+        );
+        add_inplace_cpu(&mut hidden_buf, &residual);
+    }
+
+    rms_norm_cpu(
+        &mut hidden_buf,
+        &weights.norm_weight,
+        hidden,
+        config.rms_norm_eps,
+    );
+    hidden_buf
 }
 
 fn make_test_weights(config: &Qwen3Config) -> Qwen3Weights {
