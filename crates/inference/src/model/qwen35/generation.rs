@@ -2136,6 +2136,65 @@ mod tests {
         assert!(result.text.is_empty());
     }
 
+    /// `should_cancel` returning `true` on its SECOND call only -- i.e. the
+    /// pre-prefill checkpoint (call 1) sees `false` and lets prefill run,
+    /// then the post-prefill checkpoint (call 2, immediately after prefill,
+    /// before sampling) sees `true` and must stop before ANY token is
+    /// sampled or emitted. This isolates the post-prefill checkpoint
+    /// specifically (ADR-080 C2 round 2, codex round-1 medium finding #3):
+    /// the pre-prefill test above (`n == 1`) cannot tell the two checkpoints
+    /// apart, since removing the post-prefill one entirely still leaves that
+    /// test green (its cancellation already fires at checkpoint 1).
+    ///
+    /// Mutation sensitivity: removing the post-prefill `if should_cancel()`
+    /// guard (the one right after the prefill-logits copy, before grammar
+    /// masking/sampling) lets generation fall through to sampling the first
+    /// token, producing `generated_tokens > 0`, non-empty `text`, and at
+    /// least one `on_token` callback -- failing all three assertions below.
+    /// Verified by reverting that exact guard and re-running: see the PR
+    /// body's mutation log.
+    #[test]
+    fn generate_streaming_with_cancel_true_after_prefill_returns_interrupt() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let calls = std::cell::Cell::new(0usize);
+        let on_token_calls = std::cell::Cell::new(0usize);
+        let result = model
+            .generate_streaming_with_cancel(
+                "a",
+                &gen_cfg,
+                |_delta| {
+                    on_token_calls.set(on_token_calls.get() + 1);
+                    true
+                },
+                || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    n == 2
+                },
+            )
+            .expect("cancelled-after-prefill generate must succeed");
+        assert!(
+            !result.stopped,
+            "a caller cancellation is not an OpenAI stop condition"
+        );
+        assert_eq!(result.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(
+            result.generated_tokens, 0,
+            "post-prefill cancellation must stop before any token is sampled"
+        );
+        assert!(result.text.is_empty());
+        assert_eq!(
+            on_token_calls.get(),
+            0,
+            "post-prefill cancellation must stop before on_token is ever called"
+        );
+    }
+
     /// `should_cancel` flipping to `true` at the top of a later decode-loop
     /// iteration (fast path, no `stop_strings`) must stop generation before
     /// the `max_new_tokens` cap is reached, keeping the tokens already emitted
