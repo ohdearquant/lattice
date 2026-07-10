@@ -144,13 +144,15 @@ mod imp {
     /// scope (non-streaming) so it drops exactly when axum stops caring about
     /// the response — on client disconnect, or harmlessly after the request
     /// already finished normally (by then the worker has moved on anyway).
-    struct CancelOnDrop(watch::Sender<bool>);
-
-    impl Drop for CancelOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.send(true);
-        }
-    }
+    ///
+    /// ADR-080 C2 (#782): this used to be a private copy of the exact same
+    /// struct; it is now `lattice_inference::serve::CancelOnDrop`, the single
+    /// shared definition `lattice.rs`'s CPU streaming path also uses.
+    /// Production code below only ever calls `cancel_pair()` (never names
+    /// the guard type directly); the `use` is needed for the test helper's
+    /// return-type annotation, hence `#[cfg(test)]`.
+    #[cfg(test)]
+    use lattice_inference::serve::CancelOnDrop;
 
     /// Server-side sampling defaults, overridable per-request.
     #[derive(Clone)]
@@ -177,8 +179,11 @@ mod imp {
     // ─── OpenAI request shapes ───────────────────────────────────────────────
 
     /// Request body cap applied before any JSON parsing (serve DoS-hardening
-    /// rule: every size field clamps before allocation).
-    const REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
+    /// rule: every size field clamps before allocation). ADR-080 C2 (#782):
+    /// `lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES` is the single
+    /// shared constant now; both binaries previously carried this exact
+    /// value independently.
+    use lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES;
     /// Maximum number of content parts accepted per message (#649). Enforced
     /// by `validate_content_part_limits` before the typed `ChatReq` is parsed.
     const MAX_CONTENT_PARTS_PER_MESSAGE: usize = 64;
@@ -1319,7 +1324,7 @@ mod imp {
         let created = unix_secs();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
         if s.jobs
             .send(Job {
                 messages,
@@ -1346,8 +1351,6 @@ mod imp {
         // this SSE stream (moved in below) or at the end of this function for
         // the non-streaming branch. Either way that's the client disconnect
         // signal the worker checks in `run_worker_loop`.
-        let cancel_guard = CancelOnDrop(cancel_tx);
-
         if streaming {
             let stream = futures::stream::unfold(
                 (rx, Phase::Start, cancel_guard),
@@ -1877,14 +1880,14 @@ mod imp {
         /// in here for "the client is still connected").
         fn make_job() -> (Job, mpsc::UnboundedReceiver<Ev>, CancelOnDrop) {
             let (tx, rx) = mpsc::unbounded_channel::<Ev>();
-            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
             let job = Job {
                 messages: vec![ChatMessage::user("hi")],
                 cfg: GenerateConfig::default(),
                 tx,
                 cancel: cancel_rx,
             };
-            (job, rx, CancelOnDrop(cancel_tx))
+            (job, rx, cancel_guard)
         }
 
         #[test]

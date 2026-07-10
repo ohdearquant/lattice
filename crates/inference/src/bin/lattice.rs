@@ -2303,7 +2303,10 @@ mod serve {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Request body cap: 1 MiB.  Requests above this return HTTP 413.
-    const REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
+    /// ADR-080 C2 (#782): `lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES`
+    /// is the single shared constant now; both binaries previously carried
+    /// this exact value independently.
+    use lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES;
 
     // -----------------------------------------------------------------------
     // Model backend: CPU (safetensors) or Metal GPU (native Q4)
