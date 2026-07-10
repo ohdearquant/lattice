@@ -12621,6 +12621,15 @@ mod inner {
         pub message: ChatMessage,
         pub prompt_tokens: usize,
         pub completion_tokens: usize,
+        /// The engine's actual stop cause (ADR-080 C2, #746): `true` when
+        /// generation ended via an explicit stop condition (EOS,
+        /// stop-token-id, or stop-string match, mirrors
+        /// `GenerateOutput::stopped`); `false` when the token budget was
+        /// exhausted or the caller cancelled. Previously this struct carried
+        /// no stop-cause information at all, so every consumer that wanted
+        /// an OpenAI `finish_reason` had no choice but to hardcode `"stop"`
+        /// unconditionally -- exactly what `lattice_serve.rs`'s worker did.
+        pub stopped: bool,
     }
 
     /// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
@@ -12672,6 +12681,7 @@ mod inner {
                 message: ChatMessage::assistant(text),
                 prompt_tokens: result.prompt_tokens,
                 completion_tokens: result.generated_tokens,
+                stopped: result.stopped,
             })
         }
 
@@ -14488,6 +14498,7 @@ mod inner {
                 message: ChatMessage::assistant(text),
                 prompt_tokens: result.prompt_tokens,
                 completion_tokens: result.generated_tokens,
+                stopped: result.stopped,
             })
         }
     }
@@ -15898,6 +15909,7 @@ mod inner {
                     message: ChatMessage::assistant(text),
                     prompt_tokens: cached.output.prompt_tokens,
                     completion_tokens: cached.output.generated_tokens,
+                    stopped: cached.output.stopped,
                 },
                 cache: cached.cache,
             })

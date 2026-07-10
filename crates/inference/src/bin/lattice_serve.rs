@@ -88,6 +88,16 @@ mod imp {
         Done {
             prompt_tokens: usize,
             completion_tokens: usize,
+            /// The engine's actual stop cause (ADR-080 C2, #746): `true` when
+            /// generation ended via an explicit stop condition (EOS,
+            /// stop-token-id, or stop-string match), `false` when the token
+            /// budget was exhausted or the caller cancelled. Previously
+            /// discarded entirely here -- both the SSE and non-streaming
+            /// handlers below hardcoded `finish_reason: "stop"`
+            /// unconditionally, so a length-capped completion was
+            /// misreported as an explicit stop. Fed through
+            /// `lattice_inference::serve::finish_reason` at both call sites.
+            stopped: bool,
         },
         /// Generation failed closed instead of completing (#611: e.g. a
         /// grammar mask that blocks every candidate token, mirroring the
@@ -134,13 +144,15 @@ mod imp {
     /// scope (non-streaming) so it drops exactly when axum stops caring about
     /// the response — on client disconnect, or harmlessly after the request
     /// already finished normally (by then the worker has moved on anyway).
-    struct CancelOnDrop(watch::Sender<bool>);
-
-    impl Drop for CancelOnDrop {
-        fn drop(&mut self) {
-            let _ = self.0.send(true);
-        }
-    }
+    ///
+    /// ADR-080 C2 (#782): this used to be a private copy of the exact same
+    /// struct; it is now `lattice_inference::serve::CancelOnDrop`, the single
+    /// shared definition `lattice.rs`'s CPU streaming path also uses.
+    /// Production code below only ever calls `cancel_pair()` (never names
+    /// the guard type directly); the `use` is needed for the test helper's
+    /// return-type annotation, hence `#[cfg(test)]`.
+    #[cfg(test)]
+    use lattice_inference::serve::CancelOnDrop;
 
     /// Server-side sampling defaults, overridable per-request.
     #[derive(Clone)]
@@ -154,7 +166,7 @@ mod imp {
     }
 
     #[derive(Clone)]
-    struct AppState {
+    pub struct AppState {
         jobs: mpsc::UnboundedSender<Job>,
         model_id: Arc<str>,
         defaults: Defaults,
@@ -167,8 +179,11 @@ mod imp {
     // ─── OpenAI request shapes ───────────────────────────────────────────────
 
     /// Request body cap applied before any JSON parsing (serve DoS-hardening
-    /// rule: every size field clamps before allocation).
-    const REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
+    /// rule: every size field clamps before allocation). ADR-080 C2 (#782):
+    /// `lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES` is the single
+    /// shared constant now; both binaries previously carried this exact
+    /// value independently.
+    use lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES;
     /// Maximum number of content parts accepted per message (#649). Enforced
     /// by `validate_content_part_limits` before the typed `ChatReq` is parsed.
     const MAX_CONTENT_PARTS_PER_MESSAGE: usize = 64;
@@ -185,19 +200,41 @@ mod imp {
     /// A request-validation failure that must surface as HTTP 400 (#641,
     /// #649). Fail-closed: unknown roles and unsupported content parts are
     /// never coerced or dropped, they always produce one of these.
+    ///
+    /// `code` carries the OpenAI-style error code (ADR-080 C2 round 2,
+    /// codex finding #1): previously this variant was message-only, so
+    /// every validation failure collapsed to `err_response`'s generic
+    /// `"invalid_request"` fallback regardless of what specifically went
+    /// wrong -- `lattice.rs`'s `ApiError::BadRequest` already differentiated
+    /// (`invalid_role`, `unsupported_feature`, `invalid_messages`, ...) for
+    /// the equivalent checks. Codes below are chosen to match `lattice.rs`'s
+    /// codes for the SAME violation wherever an equivalent check exists on
+    /// both binaries; a handful of checks are lattice_serve-only (the #649
+    /// content-part size/count DoS hardening has no lattice.rs analog) and
+    /// get a new, stable, lattice_serve-only code instead of an invented
+    /// false match.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RequestError {
-        BadRequest(String),
+        BadRequest { message: String, code: &'static str },
     }
 
     impl RequestError {
-        fn bad_request(message: impl Into<String>) -> Self {
-            Self::BadRequest(message.into())
+        fn bad_request(message: impl Into<String>, code: &'static str) -> Self {
+            Self::BadRequest {
+                message: message.into(),
+                code,
+            }
         }
 
         fn message(&self) -> &str {
             match self {
-                Self::BadRequest(message) => message,
+                Self::BadRequest { message, .. } => message,
+            }
+        }
+
+        fn code(&self) -> &'static str {
+            match self {
+                Self::BadRequest { code, .. } => code,
             }
         }
     }
@@ -264,35 +301,49 @@ mod imp {
         if req.tools.is_some() || req.tool_choice.is_some() {
             return Err(RequestError::bad_request(
                 "tools and tool_choice are not supported by this server",
+                "unsupported_feature",
             ));
         }
         if req.n.unwrap_or(1) > 1 {
-            return Err(RequestError::bad_request("n > 1 is not supported"));
+            return Err(RequestError::bad_request(
+                "n > 1 is not supported",
+                "unsupported_feature",
+            ));
         }
         if let Some(fmt) = &req.response_format
             && fmt.r#type != "text"
         {
-            return Err(RequestError::bad_request(format!(
-                "response_format.type '{}' is not supported; use 'text'",
-                fmt.r#type
-            )));
+            return Err(RequestError::bad_request(
+                format!(
+                    "response_format.type '{}' is not supported; use 'text'",
+                    fmt.r#type
+                ),
+                "unsupported_feature",
+            ));
         }
         if req.logprobs.unwrap_or(false) || req.top_logprobs.is_some() {
             return Err(RequestError::bad_request(
                 "logprobs/top_logprobs are not supported by this server",
+                "unsupported_feature",
             ));
         }
         if req.stop.is_some() {
             return Err(RequestError::bad_request(
                 "stop is not supported by this server",
+                "unsupported_feature",
             ));
         }
         if let (Some(a), Some(b)) = (req.max_tokens, req.max_completion_tokens)
             && a != b
         {
-            return Err(RequestError::bad_request(format!(
-                "max_tokens ({a}) and max_completion_tokens ({b}) differ; supply only one"
-            )));
+            return Err(RequestError::bad_request(
+                format!("max_tokens ({a}) and max_completion_tokens ({b}) differ; supply only one"),
+                // Matches lattice.rs's `validate_max_tokens`, which uses the
+                // generic "invalid_request" code for this exact conflict
+                // (not a more specific "invalid_max_tokens" -- that code is
+                // reserved for the zero/cap cases).
+                "invalid_request",
+            ));
         }
         Ok(())
     }
@@ -314,14 +365,25 @@ mod imp {
     }
 
     impl MessageRole {
+        /// ADR-080 C2 round 2 (codex finding #1): differentiates the same
+        /// two cases `lattice.rs`'s `ValidatedRole::parse` does -- `tool`/
+        /// `developer` are real OpenAI roles this server does not implement
+        /// (`unsupported_feature`), while anything else is not an OpenAI
+        /// chat role at all (`invalid_role`). Previously both collapsed to
+        /// one generic message with no code differentiation.
         fn parse(raw: &str) -> Result<Self, RequestError> {
             match raw {
                 "system" => Ok(Self::System),
                 "user" => Ok(Self::User),
                 "assistant" => Ok(Self::Assistant),
-                other => Err(RequestError::bad_request(format!(
-                    "unsupported role '{other}'; must be 'system', 'user', or 'assistant'"
-                ))),
+                "tool" | "developer" => Err(RequestError::bad_request(
+                    format!("role '{raw}' is not supported by this server"),
+                    "unsupported_feature",
+                )),
+                other => Err(RequestError::bad_request(
+                    format!("unsupported role '{other}'; must be 'system', 'user', or 'assistant'"),
+                    "invalid_role",
+                )),
             }
         }
     }
@@ -457,6 +519,13 @@ mod imp {
                         if v.len() > MAX_CONTENT_PART_BYTES {
                             *self.violation.borrow_mut() = Some(RequestError::bad_request(
                                 part_too_large_message(self.message_index, self.part_index),
+                                // #649 DoS-hardening surface with no
+                                // lattice.rs analog (lattice.rs has no
+                                // content-part size/count limit at all) --
+                                // a new, stable, lattice_serve-only code
+                                // rather than an invented false match with
+                                // any lattice.rs code (ADR-080 C2 round 2).
+                                "content_part_limit_exceeded",
                             ));
                         }
                         Ok(())
@@ -596,6 +665,7 @@ mod imp {
                 if v.len() > MAX_CONTENT_PART_BYTES {
                     *self.violation.borrow_mut() = Some(RequestError::bad_request(
                         part_too_large_message(self.message_index, 0),
+                        "content_part_limit_exceeded",
                     ));
                 }
                 Ok(())
@@ -623,8 +693,10 @@ mod imp {
                             // is accepted and only the (MAX+1)-th is rejected.
                             if part_index > MAX_CONTENT_PARTS_PER_MESSAGE {
                                 let msg = too_many_parts_message(self.message_index);
-                                *self.violation.borrow_mut() =
-                                    Some(RequestError::bad_request(msg.clone()));
+                                *self.violation.borrow_mut() = Some(RequestError::bad_request(
+                                    msg.clone(),
+                                    "content_part_limit_exceeded",
+                                ));
                                 return Err(A::Error::custom(msg));
                             }
                         }
@@ -780,8 +852,14 @@ mod imp {
     /// clamp has run.
     fn parse_chat_req(body: &[u8]) -> Result<ChatReq, RequestError> {
         validate_content_part_limits(body)?;
-        serde_json::from_slice::<ChatReq>(body)
-            .map_err(|_| RequestError::bad_request("invalid JSON request body"))
+        serde_json::from_slice::<ChatReq>(body).map_err(|_| {
+            RequestError::bad_request(
+                "invalid JSON request body",
+                // Matches lattice.rs's JSON-extraction-failure code
+                // (ADR-080 C2 round 2, codex finding #1).
+                "invalid_request_body",
+            )
+        })
     }
 
     /// Flatten message content to plain text (#641, #649). Fails closed:
@@ -797,12 +875,21 @@ mod imp {
                     match part {
                         Part::Text { text } => out.push_str(text),
                         Part::ImageUrl { .. } => {
-                            return Err(RequestError::bad_request(IMAGE_REQUIRES_VISION_MESSAGE));
+                            // Matches lattice.rs's `message_text` image
+                            // rejection code (ADR-080 C2 round 2, codex
+                            // finding #1).
+                            return Err(RequestError::bad_request(
+                                IMAGE_REQUIRES_VISION_MESSAGE,
+                                "unsupported_feature",
+                            ));
                         }
                         Part::Unsupported { kind } => {
-                            return Err(RequestError::bad_request(format!(
-                                "unsupported content part type '{kind}'; only 'text' parts are accepted"
-                            )));
+                            return Err(RequestError::bad_request(
+                                format!(
+                                    "unsupported content part type '{kind}'; only 'text' parts are accepted"
+                                ),
+                                "unsupported_feature",
+                            ));
                         }
                     }
                 }
@@ -831,21 +918,32 @@ mod imp {
             .unwrap_or(FALLBACK_MODEL_MAX_CONTEXT)
     }
 
-    fn build_cfg(req: &ChatReq, d: &Defaults, model_max_context: usize) -> GenerateConfig {
-        // Clamp like `max_tokens`: a budget past the KV window is meaningless and
-        // would let a future `with_capacity(decode_cap(..))` abort on overflow.
-        // Reserve one slot of headroom so the worst-case decode cap below
-        // (`reasoning_budget + max_new_tokens + 1`) never exceeds the KV
-        // window even when `reasoning_budget` is absent/zero.
-        let max_new_tokens = req
+    fn build_cfg(
+        req: &ChatReq,
+        d: &Defaults,
+        model_max_context: usize,
+    ) -> Result<GenerateConfig, lattice_inference::serve::ApiError> {
+        // #745 (ADR-080 C2): reject a caller-supplied `max_tokens: 0` (or
+        // `max_completion_tokens: 0`) up front, on the alias-resolved but
+        // still-unclamped value -- previously this clamped straight through
+        // via `.min(..)` below into a zero-budget completion instead of a
+        // clear rejection. Checked before the clamp so the rejection reflects
+        // the caller's actual request, not a clamp artifact.
+        let max_new_tokens_requested = req
             .max_tokens
             // #656: `max_completion_tokens` is the current OpenAI field name;
             // `reject_unsupported` already rejected the two being present
             // and disagreeing, so whichever is set here is the caller's
             // single, unambiguous intent.
             .or(req.max_completion_tokens)
-            .unwrap_or(d.max_tokens)
-            .min(model_max_context.saturating_sub(1));
+            .unwrap_or(d.max_tokens);
+        lattice_inference::serve::reject_zero_max_tokens(max_new_tokens_requested)?;
+        // Clamp like `max_tokens`: a budget past the KV window is meaningless and
+        // would let a future `with_capacity(decode_cap(..))` abort on overflow.
+        // Reserve one slot of headroom so the worst-case decode cap below
+        // (`reasoning_budget + max_new_tokens + 1`) never exceeds the KV
+        // window even when `reasoning_budget` is absent/zero.
+        let max_new_tokens = max_new_tokens_requested.min(model_max_context.saturating_sub(1));
         // The worst-case decode cap is `reasoning_budget + max_new_tokens + 1`
         // (#551): keep it at or below the KV window the worker actually
         // allocated, not just below `model_max_context` in isolation.
@@ -858,7 +956,7 @@ mod imp {
             .or(d.reasoning_budget)
             .map(|n| n.min(reasoning_room))
             .filter(|&n| n > 0);
-        GenerateConfig {
+        Ok(GenerateConfig {
             max_new_tokens,
             temperature: req.temperature.unwrap_or(d.temperature),
             top_k: req.top_k.unwrap_or(d.top_k),
@@ -876,7 +974,7 @@ mod imp {
             // minimal server has no logprobs implementation at all, so a
             // `logprobs: true` request never reaches here (see below).
             logprobs: None,
-        }
+        })
     }
 
     /// Prefix marker used only by the KV-window pre-check in `spawn_worker`'s
@@ -915,6 +1013,32 @@ mod imp {
             ));
         }
         Ok(())
+    }
+
+    /// Tokenizes `messages` and enforces the full KV-window invariant
+    /// (`check_prompt_fits_window`) before any generation work starts.
+    ///
+    /// ADR-080 C2 round 3 (codex round-3 medium finding #2): `spawn_worker`'s
+    /// real Metal closure below and the real-router streaming
+    /// context-overflow parity test in this module's test suite both call
+    /// this EXACT function -- not two independently-written copies of the
+    /// same check -- so a mutation that guts the window enforcement here is
+    /// observed by production's own worker closure AND by the test's worker
+    /// seam identically. There is no separate test-only reimplementation of
+    /// `check_prompt_fits_window` for such a mutation to leave unmutated.
+    fn enforce_prompt_window(
+        tokenizer: &BpeTokenizer,
+        model_max_context: usize,
+        messages: &[ChatMessage],
+        cfg: &GenerateConfig,
+    ) -> Result<usize, String> {
+        let prompt_len = tokenizer
+            .tokenize(&format_chat_template(messages))
+            .real_length;
+        if let Err(msg) = check_prompt_fits_window(model_max_context, prompt_len, cfg) {
+            return Err(format!("{PROMPT_EXCEEDS_WINDOW_PREFIX}{msg}"));
+        }
+        Ok(prompt_len)
     }
 
     // ─── GPU worker thread ───────────────────────────────────────────────────
@@ -961,12 +1085,7 @@ mod imp {
                 // before doing any GPU work -- `cfg` alone was already
                 // clamped by `build_cfg`, but only against the window in
                 // isolation, not against this specific prompt's length.
-                let prompt_len = tokenizer
-                    .tokenize(&format_chat_template(messages))
-                    .real_length;
-                if let Err(msg) = check_prompt_fits_window(model_max_context, prompt_len, cfg) {
-                    return Err(format!("{PROMPT_EXCEEDS_WINDOW_PREFIX}{msg}"));
-                }
+                enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
                 // Cache-aware + cancellation-aware call (#462): reuses the
                 // previous turn's shared token prefix instead of the old
                 // unconditional `reset_state()` + full re-prefill on every
@@ -1002,7 +1121,11 @@ mod imp {
                             cached.cache.prefetched_tokens,
                             cached.cache.prompt_tokens,
                         );
-                        Ok((cached.output.prompt_tokens, cached.output.completion_tokens))
+                        Ok((
+                            cached.output.prompt_tokens,
+                            cached.output.completion_tokens,
+                            cached.output.stopped,
+                        ))
                     }
                     // Fail-closed at the engine level already (live KV/GDN
                     // state and the retained prefix entry are both reset
@@ -1025,9 +1148,13 @@ mod imp {
     /// independently of `on_token` -- including during any phase that never
     /// calls `on_token` at all (a prefill-like section, or a run of
     /// empty-delta steps) -- and stop as soon as `should_cancel` returns
-    /// `true`. Either way, return `Ok((prompt_tokens, completion_tokens))` for
-    /// whatever was actually produced before stopping (early or at the cap),
-    /// or `Err(message)` if generation itself failed closed (#611: e.g. a
+    /// `true`. Either way, return
+    /// `Ok((prompt_tokens, completion_tokens, stopped))` for whatever was
+    /// actually produced before stopping (early or at the cap) -- `stopped`
+    /// is the engine's actual stop cause (ADR-080 C2, #746: `true` for an
+    /// explicit stop condition, `false` for a length cap or cancellation),
+    /// fed through `Ev::Done` instead of being discarded -- or
+    /// `Err(message)` if generation itself failed closed (#611: e.g. a
     /// grammar mask that blocks every candidate token) rather than
     /// completing or being cancelled.
     fn run_worker_loop(
@@ -1037,7 +1164,7 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize), String>,
+        ) -> Result<(usize, usize, bool), String>,
     ) {
         while let Some(job) = job_rx.blocking_recv() {
             if *job.cancel.borrow() {
@@ -1064,10 +1191,11 @@ mod imp {
             let cancel_for_predicate = job.cancel.clone();
             let mut should_cancel = move || *cancel_for_predicate.borrow();
             match generate(&job.messages, &job.cfg, &mut on_token, &mut should_cancel) {
-                Ok((prompt_tokens, completion_tokens)) => {
+                Ok((prompt_tokens, completion_tokens, stopped)) => {
                     let _ = job.tx.send(Ev::Done {
                         prompt_tokens,
                         completion_tokens,
+                        stopped,
                     });
                 }
                 Err(message) => {
@@ -1160,11 +1288,9 @@ mod imp {
 
     async fn root() -> Json<Value> {
         let t = Instant::now();
-        let body = json!({
-            "name": "lattice",
-            "object": "engine",
-            "endpoints": ["/v1/chat/completions", "/v1/models", "/health"],
-        });
+        // ADR-080 C2 round 2: shared with lattice.rs's equivalent route so
+        // both binaries advertise the same engine-identity document.
+        let body = lattice_inference::serve::root_body();
         emit_serve_event(
             "GET",
             "/",
@@ -1178,15 +1304,9 @@ mod imp {
 
     async fn list_models(State(s): State<AppState>) -> Json<Value> {
         let t = Instant::now();
-        let body = json!({
-            "object": "list",
-            "data": [{
-                "id": s.model_id.as_ref(),
-                "object": "model",
-                "created": unix_secs(),
-                "owned_by": "lattice",
-            }],
-        });
+        // ADR-080 C2: shared with `lattice.rs`'s equivalent route so both
+        // binaries advertise the single loaded model in byte-identical shape.
+        let body = lattice_inference::serve::models_list_body(s.model_id.as_ref(), unix_secs());
         emit_serve_event(
             "GET",
             "/v1/models",
@@ -1214,14 +1334,19 @@ mod imp {
             emit_serve_event(
                 "POST",
                 "/v1/chat/completions",
-                400,
+                413,
                 None,
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
             );
+            // ADR-080 C2 round 2 (codex finding #1): previously mapped to
+            // HTTP 400 + generic "invalid_request", diverging from
+            // lattice.rs's 413 + "request_body_too_large" for the identical
+            // oversized-body condition. Aligned to match.
             return err_response(
-                StatusCode::BAD_REQUEST,
+                StatusCode::PAYLOAD_TOO_LARGE,
                 &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
+                "request_body_too_large",
             );
         };
         let req = match parse_chat_req(&body) {
@@ -1235,7 +1360,7 @@ mod imp {
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
                 );
-                return err_response(StatusCode::BAD_REQUEST, err.message());
+                return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
         if let Err(err) = reject_unsupported(&req) {
@@ -1247,7 +1372,7 @@ mod imp {
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
             );
-            return err_response(StatusCode::BAD_REQUEST, err.message());
+            return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
         }
         if req.messages.is_empty() {
             emit_serve_event(
@@ -1258,7 +1383,13 @@ mod imp {
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
             );
-            return err_response(StatusCode::BAD_REQUEST, "`messages` must not be empty");
+            // Matches lattice.rs's `validate_chat_request` code for the
+            // identical empty-messages condition (ADR-080 C2 round 2).
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "`messages` must not be empty",
+                "invalid_messages",
+            );
         }
 
         let messages: Vec<ChatMessage> = match req.messages.iter().map(to_chat_message).collect() {
@@ -1272,17 +1403,37 @@ mod imp {
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
                 );
-                return err_response(StatusCode::BAD_REQUEST, err.message());
+                return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
-        let cfg = build_cfg(&req, &s.defaults, s.model_max_context);
+        let cfg = match build_cfg(&req, &s.defaults, s.model_max_context) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                emit_serve_event(
+                    "POST",
+                    "/v1/chat/completions",
+                    400,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                );
+                // ADR-080 C2 round 2 (codex finding #1): `build_cfg` already
+                // returns the shared `lattice_inference::serve::ApiError`
+                // with the correct status+code (e.g. `invalid_max_tokens`
+                // for #745's max_tokens=0 rejection) -- routing it through
+                // `err_response`'s (StatusCode, &str) signature discarded
+                // that code and re-wrapped it as generic "invalid_request".
+                // Propagate the original error directly instead.
+                return err.into_response();
+            }
+        };
         let model_id = req.model.clone().unwrap_or_else(|| s.model_id.to_string());
         let streaming = req.stream.unwrap_or(false);
         let id = format!("chatcmpl-{}", unix_nanos());
         let created = unix_secs();
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
         if s.jobs
             .send(Job {
                 messages,
@@ -1303,18 +1454,82 @@ mod imp {
             return err_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "inference worker unavailable",
+                "internal_error",
             );
         }
         // Dropped when nobody cares about the response anymore: at the end of
         // this SSE stream (moved in below) or at the end of this function for
         // the non-streaming branch. Either way that's the client disconnect
         // signal the worker checks in `run_worker_loop`.
-        let cancel_guard = CancelOnDrop(cancel_tx);
-
         if streaming {
+            // ADR-080 C2 round 2, codex round-2 major finding #1: without this
+            // preflight, a prompt-plus-budget overflow was only discoverable
+            // AFTER the HTTP response had already committed to 200 SSE (the
+            // worker's `Ev::Rejected` arrived mid-stream, terminating with
+            // `finish_reason: "length"` instead of the 400
+            // `context_length_exceeded` the non-streaming path and
+            // `lattice.rs`'s `check_context_window` preflight both return for
+            // the identical request body). Await the worker's FIRST event
+            // before deciding the status code at all -- exactly the
+            // non-streaming branch's own ordering below, just not looping to
+            // drain every event yet. `Ev::Rejected`/`Ev::Failed` on this first
+            // event get the same un-committed 400/500 treatment as
+            // non-streaming; anything else (`Ev::Delta`/`Ev::Done`) means the
+            // request passed the worker's checks, so NOW commit to 200 SSE --
+            // carrying that already-consumed first event into the stream's
+            // state machine (`pending`) so it isn't silently dropped.
+            let Some(first_ev) = rx.recv().await else {
+                emit_serve_event(
+                    "POST",
+                    "/v1/chat/completions",
+                    500,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    true,
+                );
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "inference worker unavailable",
+                    "internal_error",
+                );
+            };
+            let first_ev = match first_ev {
+                Ev::Rejected { message } => {
+                    emit_serve_event(
+                        "POST",
+                        "/v1/chat/completions",
+                        400,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        true,
+                    );
+                    return err_response(
+                        StatusCode::BAD_REQUEST,
+                        &message,
+                        "context_length_exceeded",
+                    );
+                }
+                Ev::Failed { message } => {
+                    eprintln!("generation error (streaming): {message}");
+                    emit_serve_event(
+                        "POST",
+                        "/v1/chat/completions",
+                        500,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        true,
+                    );
+                    return err_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "inference failed",
+                        "internal_error",
+                    );
+                }
+                ev @ (Ev::Delta(_) | Ev::Done { .. }) => ev,
+            };
             let stream = futures::stream::unfold(
-                (rx, Phase::Start, cancel_guard),
-                move |(mut rx, phase, cancel_guard)| {
+                (rx, Phase::Start, cancel_guard, Some(first_ev)),
+                move |(mut rx, phase, cancel_guard, mut pending)| {
                     let id = id.clone();
                     let model = model_id.clone();
                     async move {
@@ -1329,10 +1544,13 @@ mod imp {
                                     Ok::<Event, std::convert::Infallible>(
                                         Event::default().data(chunk.to_string()),
                                     ),
-                                    (rx, Phase::Body, cancel_guard),
+                                    (rx, Phase::Body, cancel_guard, pending),
                                 ))
                             }
-                            Phase::Body => match rx.recv().await {
+                            Phase::Body => match match pending.take() {
+                                Some(ev) => Some(ev),
+                                None => rx.recv().await,
+                            } {
                                 Some(Ev::Delta(d)) => {
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
@@ -1341,21 +1559,30 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Body, cancel_guard),
+                                        (rx, Phase::Body, cancel_guard, None),
                                     ))
                                 }
                                 Some(Ev::Done {
                                     completion_tokens: ct,
+                                    stopped,
                                     ..
                                 }) => {
+                                    // ADR-080 C2, #746: the engine's actual
+                                    // stop cause, not a hardcoded "stop" --
+                                    // `finish_reason` is "length" whenever
+                                    // `stopped` is false (token cap or
+                                    // cancellation), matching `lattice.rs`'s
+                                    // contract exactly.
+                                    let finish_reason =
+                                        lattice_inference::serve::finish_reason(stopped);
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
                                         "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(ct), cancel_guard),
+                                        (rx, Phase::Done(ct), cancel_guard, None),
                                     ))
                                 }
                                 Some(Ev::Failed { message }) => {
@@ -1376,18 +1603,22 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard),
+                                        (rx, Phase::Done(0), cancel_guard, None),
                                     ))
                                 }
                                 Some(Ev::Rejected { message }) => {
-                                    // #656: the request cannot fit the model's KV
-                                    // window (prompt + requested generation). The
-                                    // status code is already committed to 200 SSE,
-                                    // so this cannot become the 400 the
-                                    // non-streaming path returns; report it as
-                                    // `finish_reason: "length"` instead of "stop"
-                                    // so a client can at least tell no content was
-                                    // actually generated for this reason.
+                                    // Structurally unreachable at this point:
+                                    // `run_worker_loop`'s `check_prompt_fits_window`
+                                    // call happens before any `Ev::Delta`/`Ev::Done`
+                                    // is ever sent for a job, so `Ev::Rejected` can
+                                    // only ever be the FIRST event a job produces --
+                                    // and the preflight above (ADR-080 C2 round 2,
+                                    // codex round-2 major finding #1) already
+                                    // intercepts that one before committing to 200
+                                    // SSE. Kept as a defensive fallback (same
+                                    // graceful-termination shape as before) in case
+                                    // that invariant ever changes rather than
+                                    // deleting the arm outright.
                                     eprintln!("request rejected (streaming): {message}");
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
@@ -1396,7 +1627,7 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard),
+                                        (rx, Phase::Done(0), cancel_guard, None),
                                     ))
                                 }
                                 None => {
@@ -1407,13 +1638,13 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard),
+                                        (rx, Phase::Done(0), cancel_guard, None),
                                     ))
                                 }
                             },
                             Phase::Done(ct) => Some((
                                 Ok(Event::default().data("[DONE]")),
-                                (rx, Phase::End(ct), cancel_guard),
+                                (rx, Phase::End(ct), cancel_guard, None),
                             )),
                             Phase::End(ct) => {
                                 emit_serve_event(
@@ -1437,15 +1668,18 @@ mod imp {
             let mut content = String::new();
             let mut prompt_tokens = 0usize;
             let mut completion_tokens = 0usize;
+            let mut stopped = false;
             while let Some(ev) = rx.recv().await {
                 match ev {
                     Ev::Delta(d) => content.push_str(&d),
                     Ev::Done {
                         prompt_tokens: pt,
                         completion_tokens: ct,
+                        stopped: s,
                     } => {
                         prompt_tokens = pt;
                         completion_tokens = ct;
+                        stopped = s;
                     }
                     Ev::Failed { message } => {
                         // Unlike streaming, the response has not been committed
@@ -1463,7 +1697,11 @@ mod imp {
                             timer.elapsed().as_secs_f64() * 1000.0,
                             false,
                         );
-                        return err_response(StatusCode::INTERNAL_SERVER_ERROR, "inference failed");
+                        return err_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "inference failed",
+                            "internal_error",
+                        );
                     }
                     Ev::Rejected { message } => {
                         // #656: client-caused request-contract violation (the
@@ -1480,17 +1718,28 @@ mod imp {
                             timer.elapsed().as_secs_f64() * 1000.0,
                             false,
                         );
-                        return err_response(StatusCode::BAD_REQUEST, &message);
+                        // Matches lattice.rs's `check_context_window` code
+                        // for the analogous prompt-plus-budget-exceeds-window
+                        // condition (ADR-080 C2 round 2, codex finding #1).
+                        return err_response(
+                            StatusCode::BAD_REQUEST,
+                            &message,
+                            "context_length_exceeded",
+                        );
                     }
                 }
             }
+            // ADR-080 C2, #746: the engine's actual stop cause, not a
+            // hardcoded "stop" -- matches the streaming path and
+            // `lattice.rs`'s non-streaming contract.
+            let finish_reason = lattice_inference::serve::finish_reason(stopped);
             let body = json!({
                 "id": id, "object": "chat.completion",
                 "created": created, "model": model_id,
                 "choices": [{
                     "index": 0,
                     "message": {"role": "assistant", "content": content},
-                    "finish_reason": "stop",
+                    "finish_reason": finish_reason,
                 }],
                 "usage": {
                     "prompt_tokens": prompt_tokens,
@@ -1510,12 +1759,39 @@ mod imp {
         }
     }
 
-    fn err_response(code: StatusCode, msg: &str) -> Response {
-        (
-            code,
-            Json(json!({"error": {"message": msg, "type": "invalid_request_error"}})),
-        )
-            .into_response()
+    /// ADR-080 C2 (#782): builds the shared `lattice_inference::serve::
+    /// ApiError` envelope instead of this binary's previous ad hoc 2-field
+    /// `{"error": {"message", "type"}}` shape (no `code`/`param` at all) --
+    /// `lattice.rs` already carried the 4-field OpenAI-style envelope; this
+    /// closes the drift so both binaries answer the same bad request with
+    /// the same JSON shape. Every existing call site passes only
+    /// `StatusCode::BAD_REQUEST`, `PAYLOAD_TOO_LARGE`, or
+    /// `INTERNAL_SERVER_ERROR`, so the status code produced here is
+    /// unchanged; only the body shape gains `code`/`param`.
+    /// `error_code` is the OpenAI-style code for the `BAD_REQUEST` branch
+    /// (ADR-080 C2 round 2, codex finding #1): previously hardcoded to the
+    /// generic `"invalid_request"` regardless of what specifically failed,
+    /// which is exactly how the `max_tokens: 0` rejection lost its
+    /// `"invalid_max_tokens"` code on the way through this function. Ignored
+    /// for the `PAYLOAD_TOO_LARGE`/`INTERNAL_SERVER_ERROR` branches, which
+    /// carry their own fixed codes in `ApiError`'s `IntoResponse` impl.
+    fn err_response(code: StatusCode, msg: &str, error_code: &'static str) -> Response {
+        use lattice_inference::serve::ApiError;
+        let api_err = if code == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::PayloadTooLarge {
+                message: msg.to_string(),
+            }
+        } else if code == StatusCode::INTERNAL_SERVER_ERROR {
+            ApiError::Internal {
+                message: msg.to_string(),
+            }
+        } else {
+            ApiError::BadRequest {
+                message: msg.to_string(),
+                code: error_code,
+            }
+        };
+        api_err.into_response()
     }
 
     /// Print a structured telemetry line to stdout for the app bridge to parse.
@@ -1607,6 +1883,29 @@ mod imp {
                 .is_some()
     }
 
+    /// Builds the daemon's router in isolation from `run()`'s process
+    /// startup (arg parsing, model loading, binding a listener) so tests --
+    /// including the cross-binary parity table in
+    /// `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` -- can drive
+    /// real HTTP requests through it via `tower::ServiceExt::oneshot`
+    /// (ADR-080 C2 round 2, codex finding #1). Deliberately does NOT install
+    /// `DefaultBodyLimit` the way `lattice.rs`'s `router()` does: this
+    /// binary enforces the same [`lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES`]
+    /// cap manually inside `chat_completions` via `to_bytes`, a documented
+    /// intentional divergence in ENFORCEMENT MECHANISM only (axum's
+    /// `DefaultBodyLimit` layer vs. a direct `to_bytes` cap) -- the
+    /// resulting status/code (413 `request_body_too_large`) is identical on
+    /// both binaries today (round 2, codex finding #1's fix; see the
+    /// `oversized_body_over_limit` parity case).
+    pub fn router(state: AppState) -> Router {
+        Router::new()
+            .route("/", get(root))
+            .route("/health", get(health))
+            .route("/v1/models", get(list_models))
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(state)
+    }
+
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<String> = std::env::args().collect();
 
@@ -1687,12 +1986,7 @@ mod imp {
             .enable_all()
             .build()?;
         rt.block_on(async move {
-            let app = Router::new()
-                .route("/", get(root))
-                .route("/health", get(health))
-                .route("/v1/models", get(list_models))
-                .route("/v1/chat/completions", post(chat_completions))
-                .with_state(state);
+            let app = router(state);
             let addr = format!("{host}:{port}");
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
@@ -1738,7 +2032,7 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize), String> {
+        ) -> Result<(usize, usize, bool), String> {
             move |_messages, _cfg, on_token, should_cancel| {
                 started.fetch_add(1, Ordering::SeqCst);
                 let mut n = 0usize;
@@ -1753,7 +2047,7 @@ mod imp {
                     n += 1;
                     ran_tokens.fetch_add(1, Ordering::SeqCst);
                 }
-                Ok((1, n))
+                Ok((1, n, false))
             }
         }
 
@@ -1774,12 +2068,12 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize), String> {
+        ) -> Result<(usize, usize, bool), String> {
             move |_messages, _cfg, on_token, should_cancel| {
                 for _ in 0..prefill_steps {
                     std::thread::sleep(Duration::from_millis(5));
                     if should_cancel() {
-                        return Ok((1, 0));
+                        return Ok((1, 0, false));
                     }
                 }
                 entered_decode.store(true, Ordering::SeqCst);
@@ -1794,7 +2088,7 @@ mod imp {
                     }
                     n += 1;
                 }
-                Ok((1, n))
+                Ok((1, n, false))
             }
         }
 
@@ -1804,14 +2098,14 @@ mod imp {
         /// in here for "the client is still connected").
         fn make_job() -> (Job, mpsc::UnboundedReceiver<Ev>, CancelOnDrop) {
             let (tx, rx) = mpsc::unbounded_channel::<Ev>();
-            let (cancel_tx, cancel_rx) = watch::channel(false);
+            let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
             let job = Job {
                 messages: vec![ChatMessage::user("hi")],
                 cfg: GenerateConfig::default(),
                 tx,
                 cancel: cancel_rx,
             };
-            (job, rx, CancelOnDrop(cancel_tx))
+            (job, rx, cancel_guard)
         }
 
         #[test]
@@ -2051,13 +2345,13 @@ mod imp {
             &GenerateConfig,
             &mut dyn FnMut(&str, u32) -> bool,
             &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize), String> {
+        ) -> Result<(usize, usize, bool), String> {
             move |_messages, _cfg, on_token, _should_cancel| {
                 if call_count.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(message.to_string());
                 }
                 let _ = on_token("x", 0);
-                Ok((1, 1))
+                Ok((1, 1, true))
             }
         }
 
@@ -2191,11 +2485,26 @@ mod imp {
 
         #[test]
         fn message_role_unknown_rejected() {
-            let err = MessageRole::parse("developer").unwrap_err();
+            // Not an OpenAI chat role at all -- `invalid_role`, matching
+            // `lattice.rs`'s `ValidatedRole::parse` for the same case.
+            let err = MessageRole::parse("moderator").unwrap_err();
             assert_eq!(
                 err.message(),
-                "unsupported role 'developer'; must be 'system', 'user', or 'assistant'"
+                "unsupported role 'moderator'; must be 'system', 'user', or 'assistant'"
             );
+            assert_eq!(err.code(), "invalid_role");
+        }
+
+        #[test]
+        fn message_role_tool_and_developer_rejected_as_unsupported_feature() {
+            // A real OpenAI role this server does not implement --
+            // `unsupported_feature`, matching `lattice.rs`'s split between
+            // "not a role" and "a role we don't support" (ADR-080 C2
+            // round 2, codex finding #1).
+            for role in ["tool", "developer"] {
+                let err = MessageRole::parse(role).unwrap_err();
+                assert_eq!(err.code(), "unsupported_feature");
+            }
         }
 
         #[test]
@@ -2271,7 +2580,7 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 8);
+            let cfg = build_cfg(&req, &defaults, 8).unwrap();
             assert!(cfg.max_new_tokens <= 8);
             let reasoning_budget = cfg.reasoning_budget.unwrap_or(0);
             assert!(reasoning_budget + cfg.max_new_tokens < 8);
@@ -2317,7 +2626,7 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 8);
+            let cfg = build_cfg(&req, &defaults, 8).unwrap();
             let err = check_prompt_fits_window(8, 2, &cfg).unwrap_err();
             assert!(
                 err.contains("2 tokens") && err.contains("8-token"),
@@ -2362,13 +2671,13 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 8);
+            let cfg = build_cfg(&req, &defaults, 8).unwrap();
             assert!(check_prompt_fits_window(8, 1, &cfg).is_err());
 
             // Same request, but the window has one more slot of room (9):
             // 1 + 6 + 1 + 1 = 9 <= 9 -- must be ACCEPTED, and `max_new_tokens`
             // must be the full requested 6, not needlessly truncated.
-            let cfg2 = build_cfg(&req, &defaults, 9);
+            let cfg2 = build_cfg(&req, &defaults, 9).unwrap();
             assert_eq!(cfg2.max_new_tokens, 6, "must not needlessly truncate");
             assert!(check_prompt_fits_window(9, 1, &cfg2).is_ok());
         }
@@ -2405,7 +2714,7 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 4096);
+            let cfg = build_cfg(&req, &defaults, 4096).unwrap();
             assert_eq!(cfg.max_new_tokens, 50);
             // prompt_len=100: 100 + 50 + 0 + 1 = 151 <= 4096.
             assert!(check_prompt_fits_window(4096, 100, &cfg).is_ok());
@@ -2463,15 +2772,40 @@ mod imp {
 
         #[tokio::test]
         async fn chat_completions_unknown_role_400() {
+            // A role string that is not an OpenAI chat role at all (as
+            // opposed to "developer"/"tool", which ARE real OpenAI roles
+            // this server just doesn't implement -- see
+            // `chat_completions_tool_and_developer_role_400_unsupported_feature`
+            // below for that split, ADR-080 C2 round 2 codex finding #1).
             let body =
-                Body::from(r#"{"messages":[{"role":"developer","content":"hi"}]}"#.to_string());
+                Body::from(r#"{"messages":[{"role":"moderator","content":"hi"}]}"#.to_string());
             let response = chat_completions(State(test_app_state()), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
                 message,
-                "unsupported role 'developer'; must be 'system', 'user', or 'assistant'"
+                "unsupported role 'moderator'; must be 'system', 'user', or 'assistant'"
             );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_tool_and_developer_role_400_unsupported_feature() {
+            for role in ["tool", "developer"] {
+                let body = Body::from(format!(
+                    r#"{{"messages":[{{"role":"{role}","content":"hi"}}]}}"#
+                ));
+                let response = chat_completions(State(test_app_state()), body).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body must be readable");
+                let v: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("response body must be valid JSON");
+                assert_eq!(
+                    v["error"]["code"], "unsupported_feature",
+                    "role '{role}' must be reported as unsupported_feature, not invalid_role"
+                );
+            }
         }
 
         #[tokio::test]
@@ -2606,6 +2940,311 @@ mod imp {
             );
         }
 
+        // ── ADR-080 C2 (#782): max_tokens=0 rejection + finish_reason round-trip ──
+
+        #[tokio::test]
+        async fn chat_completions_max_tokens_zero_400() {
+            // #745: previously clamped straight through into a zero-budget
+            // completion instead of being rejected.
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#.to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(message, "max_tokens must be at least 1");
+        }
+
+        /// Builds an `AppState` wired to a fresh `jobs` channel plus the
+        /// receiving half, so tests can stand in for the worker: reply with
+        /// whatever `Ev` sequence the test wants without a real GPU/model.
+        fn test_app_state_with_jobs() -> (AppState, mpsc::UnboundedReceiver<Job>) {
+            let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+            };
+            (state, jobs_rx)
+        }
+
+        /// #746 (ADR-080 C2): the non-streaming JSON response's
+        /// `finish_reason` must reflect the engine's actual `stopped` flag,
+        /// not a hardcoded `"stop"`. A fake worker task stands in for the
+        /// GPU, replying with a crafted `Ev::Done { stopped }` directly.
+        async fn non_streaming_finish_reason_for(stopped: bool) -> String {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.tx.send(Ev::Delta("hi".to_string()));
+                    let _ = job.tx.send(Ev::Done {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        stopped,
+                    });
+                }
+            });
+            let body = Body::from(r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string());
+            let response = chat_completions(State(state), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            let v: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("response body must be valid JSON");
+            v["choices"][0]["finish_reason"]
+                .as_str()
+                .expect("finish_reason must be a string")
+                .to_string()
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_finish_reason_stop_when_engine_stopped() {
+            assert_eq!(non_streaming_finish_reason_for(true).await, "stop");
+        }
+
+        #[tokio::test]
+        async fn chat_completions_non_streaming_finish_reason_length_when_not_stopped() {
+            // Previously this hardcoded "stop" unconditionally, so a
+            // length-capped or cancelled completion was misreported as an
+            // explicit stop condition (#746).
+            assert_eq!(non_streaming_finish_reason_for(false).await, "length");
+        }
+
+        /// Same round-trip as above, but through the SSE streaming path
+        /// (`Phase::Body`'s `Ev::Done` arm) instead of the non-streaming
+        /// JSON body.
+        async fn streaming_finish_reason_for(stopped: bool) -> String {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.tx.send(Ev::Delta("hi".to_string()));
+                    let _ = job.tx.send(Ev::Done {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        stopped,
+                    });
+                }
+            });
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
+            );
+            let response = chat_completions(State(state), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("SSE response body must be readable");
+            String::from_utf8(bytes.to_vec()).expect("SSE body must be valid UTF-8")
+        }
+
+        #[tokio::test]
+        async fn chat_completions_streaming_finish_reason_stop_when_engine_stopped() {
+            let text = streaming_finish_reason_for(true).await;
+            assert!(
+                text.contains("\"finish_reason\":\"stop\""),
+                "SSE body must carry finish_reason: stop; got: {text}"
+            );
+        }
+
+        #[tokio::test]
+        async fn chat_completions_streaming_finish_reason_length_when_not_stopped() {
+            let text = streaming_finish_reason_for(false).await;
+            assert!(
+                text.contains("\"finish_reason\":\"length\""),
+                "SSE body must carry finish_reason: length, not a hardcoded \"stop\" \
+                 (#746); got: {text}"
+            );
+        }
+
+        /// ADR-080 C2 round 2, codex round-2 major finding #1: a `stream:
+        /// true` request whose prompt overflows the model's context window
+        /// must return HTTP 400 `context_length_exceeded` BEFORE any SSE
+        /// stream is committed -- not silently commit to a 200 SSE response
+        /// that only discovers the overflow later via `Ev::Rejected`
+        /// mid-stream and terminates with `finish_reason: "length"` (the
+        /// exact drift this finding named). This fakes the worker side of
+        /// the `Ev::Rejected` contract (production code sends it from
+        /// `enforce_prompt_window` inside `run_worker_loop`, prefixed with
+        /// `PROMPT_EXCEEDS_WINDOW_PREFIX`) so the composition under test is
+        /// purely `chat_completions`'s streaming branch: does it await the
+        /// worker's first event and inspect it for `Ev::Rejected` BEFORE
+        /// calling `Sse::new(..).into_response()`, or does it commit
+        /// unconditionally?
+        ///
+        /// ADR-080 C2 round 3, codex round-3 medium finding #2: this test
+        /// pins ONLY that response-mapping contract with a request that
+        /// would NOT genuinely overflow in production (`max_tokens`
+        /// defaults to 100 against a 4096-token `model_max_context`) and a
+        /// fake task that manufactures `Ev::Rejected` directly -- it does
+        /// NOT exercise the real worker's `enforce_prompt_window` call, so
+        /// it is not, by itself, same-input real-router parity with
+        /// `lattice.rs`'s equivalent test (an earlier version of this
+        /// comment incorrectly claimed "identical request body"; it is not
+        /// -- `real_router_overflow_parity` below is the test that actually
+        /// is). Kept because it is still the cheapest, fastest pin of the
+        /// response-mapping contract in isolation.
+        ///
+        /// Mutation-sensitive: reverting the pre-`Sse::new()` `first_ev`
+        /// preflight (going back to building `stream::unfold` and
+        /// returning `Sse::new(stream).into_response()` unconditionally,
+        /// discovering `Ev::Rejected` only inside `Phase::Body`) makes this
+        /// fail -- the response status would be 200 with an SSE body
+        /// carrying a `finish_reason: "length"` terminal chunk instead of a
+        /// 400 error envelope. Verified by reverting the preflight and
+        /// re-running: see the PR body's mutation log.
+        #[tokio::test]
+        async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse() {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.tx.send(Ev::Rejected {
+                        message: "prompt has 4090 tokens, leaving 6 of the 4096-token \
+                                  context window for generation, but this request needs \
+                                  100 generated tokens plus 1 (total 4191); reduce \
+                                  max_tokens/reasoning_budget or shorten the prompt"
+                            .to_string(),
+                    });
+                }
+            });
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
+            );
+            let response = chat_completions(State(state), body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "an Ev::Rejected worker reply for a stream:true request must surface \
+                 as a pre-commit HTTP 400, not a committed 200 SSE stream"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("error response must be JSON");
+            assert_eq!(value["error"]["code"], "context_length_exceeded");
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("context window"),
+                "error message must carry the worker's actual overflow explanation, \
+                 got: {value}"
+            );
+        }
+
+        /// ADR-080 C2 round 3 (codex round-3 medium finding #2): the
+        /// same-input real-router parity the test above does NOT provide.
+        /// Drives `lattice_inference::serve::OVERFLOW_PARITY_REQUEST_BODY`
+        /// -- the SAME fixture `lattice.rs`'s `streaming_context_overflow`
+        /// module drives through its own real `Router` -- through THIS
+        /// binary's real `router()`, backed by a REAL worker thread running
+        /// the actual `run_worker_loop` + `enforce_prompt_window` production
+        /// code (a real `BpeTokenizer` from
+        /// `test_support::tiny_zero_model`, no Metal engine involved since
+        /// the request is expected to be rejected before any generation
+        /// call). `AppState.model_max_context` is set to
+        /// `OVERFLOW_PARITY_CONTEXT_WINDOW` (1024) -- the same effective
+        /// limit `lattice.rs`'s tiny test model's fixed context window uses
+        /// -- so both sides genuinely share the same input AND the same
+        /// effective context limit, not just the same JSON body.
+        ///
+        /// Mutation-sensitive: removing `enforce_prompt_window`'s call to
+        /// `check_prompt_fits_window` (i.e. having it unconditionally
+        /// return `Ok(prompt_len)`) makes this fail -- the real worker
+        /// would accept the request, `chat_completions` would commit a 200
+        /// SSE response, and this test's `StatusCode::BAD_REQUEST`
+        /// assertion would fail. This is the exact production worker-side
+        /// check codex named ("removing the production worker closure's
+        /// check_prompt_fits_window call ... would leave both the direct
+        /// handler test and the pure helper test green") -- `spawn_worker`'s
+        /// real Metal closure and this test's worker seam both call
+        /// `enforce_prompt_window`, not two independent copies of the
+        /// check, so a mutation to the shared function is observed here too.
+        ///
+        /// Gated behind `test-utils` (see
+        /// `lattice_inference::model::qwen35::test_support`) for the same
+        /// reason as `lattice.rs`'s equivalent test modules: this needs a
+        /// real (tiny) `BpeTokenizer`, which is only constructible outside
+        /// this crate's own `#[cfg(test)]` build via that feature.
+        #[cfg(feature = "test-utils")]
+        mod real_router_overflow_parity {
+            use super::*;
+            use lattice_inference::serve::{
+                OVERFLOW_PARITY_CONTEXT_WINDOW, OVERFLOW_PARITY_REQUEST_BODY,
+            };
+            use tower::ServiceExt as _;
+
+            /// A real worker thread running the actual `run_worker_loop` +
+            /// `enforce_prompt_window` production code, with a real (tiny)
+            /// tokenizer and NO Metal engine -- the generate closure is
+            /// never reached by an overflowing request, so it only needs a
+            /// trivial success stand-in for a non-overflowing one.
+            fn real_worker_state(model_max_context: usize) -> AppState {
+                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone();
+                let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
+                std::thread::spawn(move || {
+                    run_worker_loop(jobs_rx, move |messages, cfg, _on_token, _should_cancel| {
+                        let prompt_len =
+                            enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
+                        Ok((prompt_len, 0, true))
+                    });
+                });
+                AppState {
+                    jobs,
+                    model_id: Arc::from("test-model"),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
+                    model_max_context,
+                }
+            }
+
+            #[tokio::test]
+            async fn chat_completions_streaming_context_overflow_matches_lattice_real_router() {
+                let body = Body::from(OVERFLOW_PARITY_REQUEST_BODY.to_string());
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .expect("fixture request must build");
+                let response = router(real_worker_state(OVERFLOW_PARITY_CONTEXT_WINDOW))
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "the shared overflow-parity request, driven through the real \
+                     worker's production enforce_prompt_window check, must be \
+                     rejected with HTTP 400 before any SSE stream is committed -- \
+                     matching lattice.rs's real-router result for the identical \
+                     request body and effective context limit"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("error response body must be readable");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("error response must be JSON");
+                assert_eq!(value["error"]["code"], "context_length_exceeded");
+            }
+        }
+
         #[test]
         fn build_cfg_aliases_max_completion_tokens_when_max_tokens_absent() {
             let defaults = Defaults {
@@ -2636,7 +3275,7 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 4096);
+            let cfg = build_cfg(&req, &defaults, 4096).unwrap();
             assert_eq!(cfg.max_new_tokens, 42);
         }
 
@@ -2697,6 +3336,78 @@ mod imp {
                 "a mismatched `model` must reach the job queue on this surface today \
                  (expected deviation, tracked in #663)"
             );
+        }
+
+        // ── cross-binary parity table (ADR-080 C2 round 2, codex round-1
+        // finding #1) ────────────────────────────────────────────────────
+        //
+        // Drives every fixture body in
+        // `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` through
+        // THIS binary's real `Router` (via `router()`, extracted from
+        // `run()` specifically so it's testable in isolation from process
+        // startup) and compares the resulting status + error code against
+        // the case's `lattice_serve`-side expectation. `lattice.rs`'s own
+        // test module runs the SAME table against its own router, asserting
+        // the `lattice`-side expectation -- together the two prove
+        // same-input parity (or a documented, intentional divergence) at
+        // the real HTTP layer.
+        mod parity_table {
+            use super::*;
+            use lattice_inference::serve::{Binary, CHAT_COMPLETIONS_PARITY_CASES};
+            use tower::ServiceExt as _;
+
+            #[tokio::test]
+            async fn chat_completions_matches_shared_parity_table() {
+                for case in CHAT_COMPLETIONS_PARITY_CASES {
+                    let (expected_status, expected_code) = case.expected(Binary::LatticeServe);
+
+                    let app = router(test_app_state());
+                    let request = axum::http::Request::builder()
+                        .method(case.method)
+                        .uri(case.path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(case.body.build()))
+                        .expect("fixture request must build");
+                    let response = app
+                        .oneshot(request)
+                        .await
+                        .expect("router must produce a response, not a transport error");
+
+                    let status = response.status().as_u16();
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("response body reads");
+
+                    assert_eq!(
+                        status,
+                        expected_status,
+                        "case '{}': expected status {expected_status}, got {status} \
+                         (body: {})",
+                        case.name,
+                        String::from_utf8_lossy(&body)
+                    );
+
+                    // See `lattice.rs`'s mirror of this test for why 2xx
+                    // responses skip the error-code check.
+                    if !(200..300).contains(&status) {
+                        let value: serde_json::Value = serde_json::from_slice(&body)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "case '{}': non-2xx response body must be the shared \
+                                     error envelope JSON: {e} (body: {})",
+                                    case.name,
+                                    String::from_utf8_lossy(&body)
+                                )
+                            });
+                        assert_eq!(
+                            value["error"]["code"], expected_code,
+                            "case '{}': expected error code '{expected_code}', got {} \
+                             (full body: {value})",
+                            case.name, value["error"]["code"]
+                        );
+                    }
+                }
+            }
         }
     }
 }

@@ -2303,7 +2303,10 @@ mod serve {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Request body cap: 1 MiB.  Requests above this return HTTP 413.
-    const REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
+    /// ADR-080 C2 (#782): `lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES`
+    /// is the single shared constant now; both binaries previously carried
+    /// this exact value independently.
+    use lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES;
 
     // -----------------------------------------------------------------------
     // Model backend: CPU (safetensors) or Metal GPU (native Q4)
@@ -2336,6 +2339,12 @@ mod serve {
         messages: Vec<ChatMessage>,
         gen_cfg: GenerateConfig,
         on_token: Box<dyn FnMut(&str) -> bool + Send>,
+        /// Disconnect-cancellation signal (ADR-080 C2, #744): starts `false`,
+        /// flips to `true` the moment the request's
+        /// `lattice_inference::serve::CancelOnDrop` guard is dropped. Checked
+        /// by the worker independently of `on_token`, mirroring
+        /// `lattice_serve.rs`'s existing `Job::cancel` contract exactly.
+        cancel: tokio::sync::watch::Receiver<bool>,
         /// `Err` when the worker's `generate_streaming` call fails closed
         /// (#611: e.g. a grammar mask that blocks every token). Carries the
         /// same `InferenceError` the CPU path already returns from `generate`.
@@ -2394,7 +2403,24 @@ mod serve {
                 let _ = ready_tx.send(Ok(()));
 
                 while let Some(job) = job_rx.blocking_recv() {
+                    // Dequeue-time cancel check (#744): a client that
+                    // disconnected while this job was still queued behind an
+                    // earlier one must not pay for prefill at all. Mirrors
+                    // `lattice_serve.rs`'s `run_worker_loop` dequeue check.
+                    if *job.cancel.borrow() {
+                        let _ = job.reply.send(Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: 0,
+                            generated_tokens: 0,
+                            stopped: false,
+                            stop_reason: Some(lattice_inference::StopReason::Interrupt),
+                            token_logprobs: vec![],
+                        }));
+                        continue;
+                    }
                     let mut on_token = job.on_token;
+                    let cancel = job.cancel;
                     // Render via the engine's canonical ChatML template
                     // (#661) rather than a second, hand-rolled builder local
                     // to this file — see the `MetalJob::messages` doc.
@@ -2410,12 +2436,19 @@ mod serve {
                     // whenever they diverge, so correctness never depends on
                     // distinguishing clients. Mirrors the wiring already
                     // shipped in `lattice_serve.rs`.
-                    let cached = state.generate_streaming_with_prefix_cache(
+                    //
+                    // Cancellation-aware (#744): `should_cancel` is checked
+                    // before prefill, immediately after prefill, and at the
+                    // top of every decode iteration, independent of
+                    // `on_token` -- see
+                    // `generate_streaming_with_prefix_cache_and_cancel`'s doc.
+                    let cached = state.generate_streaming_with_prefix_cache_and_cancel(
                         lattice_inference::kv_cache::CrossTurnSlotId::DEFAULT,
                         &prompt,
                         &tokenizer,
                         &job.gen_cfg,
                         |delta, _token_id| on_token(delta),
+                        move || *cancel.borrow(),
                     );
                     if let Ok(c) = &cached {
                         eprintln!(
@@ -2455,11 +2488,37 @@ mod serve {
             gen_cfg: GenerateConfig,
             on_token: impl FnMut(&str) -> bool + Send + 'static,
         ) -> Result<GenerateOutput, ApiError> {
+            // `cancel = never-fires` convenience form of
+            // `generate_streaming_with_cancel`, for callers that do not wire
+            // up disconnect cancellation.
+            let (_never_cancels, cancel_rx) = tokio::sync::watch::channel(false);
+            self.generate_streaming_with_cancel(messages, gen_cfg, on_token, cancel_rx)
+                .await
+        }
+
+        /// Cancellation-aware sibling of [`Self::generate_streaming`]
+        /// (ADR-080 C2, #744): `cancel` starts `false` and flips to `true`
+        /// the moment the caller's paired
+        /// `lattice_inference::serve::CancelOnDrop` guard is dropped (client
+        /// disconnect). The worker checks it once at dequeue (before paying
+        /// for prefill on an already-abandoned job) and independently of
+        /// `on_token` via `generate_streaming_with_prefix_cache_and_cancel`'s
+        /// `should_cancel` predicate — before prefill, immediately after
+        /// prefill, and at the top of every decode iteration. Mirrors
+        /// `lattice_serve.rs`'s `Job::cancel` contract exactly.
+        async fn generate_streaming_with_cancel(
+            &self,
+            messages: Vec<ChatMessage>,
+            gen_cfg: GenerateConfig,
+            on_token: impl FnMut(&str) -> bool + Send + 'static,
+            cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<GenerateOutput, ApiError> {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             let job = MetalJob {
                 messages,
                 gen_cfg,
                 on_token: Box::new(on_token),
+                cancel,
                 reply: reply_tx,
             };
             self.jobs.send(job).map_err(|_| ApiError::Internal {
@@ -2491,6 +2550,35 @@ mod serve {
             tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
             max_context: usize,
         },
+        /// Test-only seam (ADR-080 C2 round 2, codex round-2 medium finding
+        /// #3): wraps a real tiny model for `tokenize_len`/`max_context`/
+        /// `tokenizer` (so request validation stays realistic) but
+        /// substitutes the CPU streaming generation call itself with an
+        /// injected closure. This lets a test observe `should_cancel` being
+        /// polled by the EXACT production composition in
+        /// `chat_completions`'s CPU streaming arm -- the same `on_token`/
+        /// `should_cancel` construction and `cancel_rx` wiring real
+        /// requests use -- independently of a real decode loop's timing,
+        /// isolating cancellation-signal wiring from `on_token`'s own
+        /// failed-send stop condition (the exact ambiguity the disconnect
+        /// test's mutation gap left open). Never constructible outside
+        /// `--features test-utils`.
+        #[cfg(all(feature = "test-utils", test))]
+        CpuFakeGenerate {
+            model: Arc<lattice_inference::model::qwen35::Qwen35Model>,
+            #[allow(clippy::type_complexity)]
+            generate: Arc<
+                dyn Fn(
+                        &str,
+                        &lattice_inference::model::qwen35_config::GenerateConfig,
+                        &mut dyn FnMut(&str) -> bool,
+                        &mut dyn FnMut() -> bool,
+                    )
+                        -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                    + Send
+                    + Sync,
+            >,
+        },
     }
 
     impl ModelBackend {
@@ -2499,6 +2587,10 @@ mod serve {
                 ModelBackend::Cpu(m) => m.tokenizer().tokenize(text).real_length,
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { tokenizer, .. } => tokenizer.tokenize(text).real_length,
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { model, .. } => {
+                    model.tokenizer().tokenize(text).real_length
+                }
             }
         }
 
@@ -2507,6 +2599,8 @@ mod serve {
                 ModelBackend::Cpu(m) => m.max_context(),
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { max_context, .. } => *max_context,
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { model, .. } => model.max_context(),
             }
         }
 
@@ -2517,6 +2611,8 @@ mod serve {
                 ModelBackend::Cpu(m) => m.tokenizer(),
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { tokenizer, .. } => tokenizer,
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { model, .. } => model.tokenizer(),
             }
         }
 
@@ -2577,73 +2673,16 @@ mod serve {
     }
 
     // -----------------------------------------------------------------------
-    // Error type
+    // Error type (ADR-080 C2, #782): shared verbatim with `lattice_serve.rs`
+    // via `lattice_inference::serve::ApiError` -- this binary's local
+    // `ApiError`/`ErrorBody`/`ErrorDetail`/`IntoResponse` were byte-identical
+    // to the shared definition, so they are gone; every existing
+    // `ApiError::BadRequest { message, code }` / `PayloadTooLarge` /
+    // `Internal` construction site below is unaffected (same variant names
+    // and fields).
     // -----------------------------------------------------------------------
 
-    /// Structured HTTP error that serialises to the OpenAI error envelope so
-    /// that clients can parse failure responses uniformly.
-    #[derive(Debug)]
-    pub enum ApiError {
-        /// Caller mistake — HTTP 400.
-        BadRequest { message: String, code: &'static str },
-        /// Request body exceeds size limit — HTTP 413.
-        PayloadTooLarge { message: String },
-        /// Server-side failure — HTTP 500.
-        Internal { message: String },
-    }
-
-    #[derive(Serialize)]
-    struct ErrorBody {
-        error: ErrorDetail,
-    }
-
-    #[derive(Serialize)]
-    struct ErrorDetail {
-        message: String,
-        r#type: &'static str,
-        code: String,
-        param: Option<String>,
-    }
-
-    impl IntoResponse for ApiError {
-        fn into_response(self) -> Response {
-            match self {
-                ApiError::BadRequest { message, code } => {
-                    let body = Json(ErrorBody {
-                        error: ErrorDetail {
-                            message,
-                            r#type: "invalid_request_error",
-                            code: code.to_string(),
-                            param: None,
-                        },
-                    });
-                    (StatusCode::BAD_REQUEST, body).into_response()
-                }
-                ApiError::PayloadTooLarge { message } => {
-                    let body = Json(ErrorBody {
-                        error: ErrorDetail {
-                            message,
-                            r#type: "invalid_request_error",
-                            code: "request_body_too_large".to_string(),
-                            param: None,
-                        },
-                    });
-                    (StatusCode::PAYLOAD_TOO_LARGE, body).into_response()
-                }
-                ApiError::Internal { message } => {
-                    let body = Json(ErrorBody {
-                        error: ErrorDetail {
-                            message,
-                            r#type: "server_error",
-                            code: "internal_error".to_string(),
-                            param: None,
-                        },
-                    });
-                    (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
-                }
-            }
-        }
-    }
+    use lattice_inference::serve::ApiError;
 
     // -----------------------------------------------------------------------
     // Request / response types
@@ -2866,12 +2905,13 @@ mod serve {
                 });
             }
         };
-        if effective == 0 {
-            return Err(ApiError::BadRequest {
-                message: "max_tokens must be at least 1".to_string(),
-                code: "invalid_max_tokens",
-            });
-        }
+        // ADR-080 C2, #745: the zero-rejection itself is the shared contract
+        // (`lattice_serve.rs`'s `build_cfg` silently clamped a
+        // client-supplied `max_tokens: 0` through instead of rejecting it);
+        // the cap-reject below stays local since the two binaries'
+        // over-cap policies deliberately differ (this one rejects, the
+        // daemon clamps to the model's context window).
+        lattice_inference::serve::reject_zero_max_tokens(effective)?;
         if effective > max_tokens_cap {
             return Err(ApiError::BadRequest {
                 message: format!("max_tokens {effective} exceeds server limit {max_tokens_cap}"),
@@ -3191,15 +3231,16 @@ mod serve {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Maps a `GenerateOutput` to the OpenAI `finish_reason` string.
-    ///
-    /// Returns `"stop"` when the library explicitly ended generation via a stop
-    /// condition (EOS token, stop-token-id, or stop-string match); `"length"` when
-    /// the token budget was exhausted without a stop condition.
+    /// Maps a `GenerateOutput` to the OpenAI `finish_reason` string (ADR-080
+    /// C2, #746): delegates to the shared `lattice_inference::serve::
+    /// finish_reason`, which both binaries now use so the mapping cannot
+    /// drift between them again -- `lattice_serve.rs`'s worker previously
+    /// hardcoded `"stop"` unconditionally instead of carrying the engine's
+    /// `stopped` flag through.
     pub(super) fn finish_reason_for(
         output: &lattice_inference::model::qwen35_config::GenerateOutput,
     ) -> &'static str {
-        if output.stopped { "stop" } else { "length" }
+        lattice_inference::serve::finish_reason(output.stopped)
     }
 
     /// Resolve a token id back to its OpenAI `logprobs` text/bytes representation (#585).
@@ -3269,6 +3310,31 @@ mod serve {
 
     pub async fn health() -> Json<HealthResponse> {
         Json(HealthResponse { status: "ok" })
+    }
+
+    /// `GET /` (ADR-080 C2 round 2, codex finding #1): a minimal engine-
+    /// identity/endpoint-discovery document, in the same shape
+    /// `lattice_serve.rs` already served on its own daemon -- this binary
+    /// had no equivalent route at all, an undocumented route-set divergence
+    /// the review's route audit caught (the PR body's "routes now match
+    /// 1:1" claim was false until this route landed).
+    pub async fn root() -> Json<Value> {
+        Json(lattice_inference::serve::root_body())
+    }
+
+    /// `GET /v1/models` (ADR-080 C2, #746's sibling gap): advertises the
+    /// single loaded model, in the same shape `lattice_serve.rs` already
+    /// served on its own daemon -- this binary had no equivalent route at
+    /// all before this change.
+    pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
+        let created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Json(lattice_inference::serve::models_list_body(
+            &state.model_id,
+            created,
+        ))
     }
 
     /// Everything `chat_completions` must check about a request *before* it
@@ -3438,6 +3504,55 @@ mod serve {
         })
     }
 
+    /// The `on_token`/`should_cancel` composition for CPU-style streaming
+    /// generation, constructed in exactly ONE place and shared by the real
+    /// `ModelBackend::Cpu` arm and the test-only `CpuFakeGenerate` arm below
+    /// (ADR-080 C2 round 3, codex round-3 medium finding #1). Before this,
+    /// each arm rebuilt `move || *cancel_rx.borrow()` independently, so a
+    /// disposable-worktree mutation that broke ONLY the real `Cpu` arm's
+    /// predicate left the `CpuFakeGenerate`-only post-drop oracle green --
+    /// it was pinning a copy, not the production call site. Both arms now
+    /// funnel through this one function, so mutating the shared predicate
+    /// here is observed by the fake-arm-driven test too: there is no
+    /// separate copy left unmutated.
+    #[allow(clippy::type_complexity)]
+    fn spawn_cpu_style_streaming_generation(
+        tx: futures::channel::mpsc::UnboundedSender<StreamMsg>,
+        cancel_rx: tokio::sync::watch::Receiver<bool>,
+        prompt: String,
+        gen_cfg: lattice_inference::model::qwen35_config::GenerateConfig,
+        generate: Arc<
+            dyn Fn(
+                    &str,
+                    &lattice_inference::model::qwen35_config::GenerateConfig,
+                    &mut dyn FnMut(&str) -> bool,
+                    &mut dyn FnMut() -> bool,
+                )
+                    -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                + Send
+                + Sync,
+        >,
+        finish_streaming: impl FnOnce(GenerateOutput) + Send + 'static,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            let tx_delta = tx.clone();
+            let mut on_token = move |delta: &str| {
+                tx_delta
+                    .unbounded_send(StreamMsg::Delta(delta.to_string()))
+                    .is_ok()
+            };
+            let mut should_cancel = move || *cancel_rx.borrow();
+            let result = generate(&prompt, &gen_cfg, &mut on_token, &mut should_cancel);
+            match result {
+                Ok(output) => finish_streaming(output),
+                Err(e) => {
+                    eprintln!("generation error (streaming): {e}");
+                    let _ = tx.unbounded_send(StreamMsg::Failed);
+                }
+            }
+        });
+    }
+
     pub async fn chat_completions(
         State(state): State<AppState>,
         result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
@@ -3516,11 +3631,18 @@ mod serve {
             // sends at most one `Delta` per generated token and generation halts at
             // the cap, so the worst-case buffer is a few thousand short strings —
             // the same order the non-streaming path already holds as one buffered
-            // string. There is no true backpressure (an unbounded send never
-            // blocks); if the client disconnects mid-stream the producer keeps
-            // generating to the cap and the ignored send errors drain harmlessly.
-            // Per-token backpressure / disconnect-cancellation is a future refinement.
+            // string.
+            //
+            // Disconnect cancellation (ADR-080 C2, #744): `cancel_guard` is
+            // moved into the `body_stream` closure below, so it drops the
+            // instant axum drops this response's stream (client disconnect).
+            // Dropping it flips `cancel_rx` to `true`, which both backends
+            // poll independently of `on_token` (before prefill, immediately
+            // after prefill, and at the top of every decode iteration) —
+            // closing the gap the old comment here used to document as "a
+            // future refinement".
             let (tx, rx) = futures::channel::mpsc::unbounded::<StreamMsg>();
+            let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
 
             let stream_id = response_id.clone();
             let stream_model = state.model_id.clone();
@@ -3546,32 +3668,50 @@ mod serve {
 
             match model {
                 ModelBackend::Cpu(cpu_model) => {
-                    tokio::task::spawn_blocking(move || {
-                        let tx_delta = tx.clone();
-                        let result = cpu_model.generate_streaming(&prompt, &gen_cfg, |delta| {
-                            // Send each incremental text delta; ignore if the receiver
-                            // dropped (client disconnected).
-                            let _ = tx_delta.unbounded_send(StreamMsg::Delta(delta.to_string()));
-                        });
-                        match result {
-                            Ok(output) => finish_streaming(output),
-                            Err(e) => {
-                                eprintln!("generation error (streaming): {e}");
-                                let _ = tx.unbounded_send(StreamMsg::Failed);
-                            }
-                        }
+                    // Delegates through the SAME shared helper the test-only
+                    // `CpuFakeGenerate` arm below uses (codex round-3 medium
+                    // finding #1) -- only the generation call itself
+                    // (`cpu_model.generate_streaming_with_cancel` here, an
+                    // injected closure there) differs; the `should_cancel`
+                    // predicate is constructed once, by the helper, for both.
+                    #[allow(clippy::type_complexity)]
+                    let generate: Arc<
+                        dyn Fn(
+                                &str,
+                                &lattice_inference::model::qwen35_config::GenerateConfig,
+                                &mut dyn FnMut(&str) -> bool,
+                                &mut dyn FnMut() -> bool,
+                            )
+                                -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                            + Send
+                            + Sync,
+                    > = Arc::new(move |p, c, on_token, should_cancel| {
+                        cpu_model.generate_streaming_with_cancel(p, c, on_token, should_cancel)
                     });
+                    spawn_cpu_style_streaming_generation(
+                        tx,
+                        cancel_rx,
+                        prompt,
+                        gen_cfg,
+                        generate,
+                        finish_streaming,
+                    );
                 }
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { handle, .. } => {
                     tokio::spawn(async move {
                         let tx_delta = tx.clone();
                         let result = handle
-                            .generate_streaming(chat_messages, gen_cfg, move |delta| {
-                                tx_delta
-                                    .unbounded_send(StreamMsg::Delta(delta.to_string()))
-                                    .is_ok()
-                            })
+                            .generate_streaming_with_cancel(
+                                chat_messages,
+                                gen_cfg,
+                                move |delta| {
+                                    tx_delta
+                                        .unbounded_send(StreamMsg::Delta(delta.to_string()))
+                                        .is_ok()
+                                },
+                                cancel_rx,
+                            )
                             .await;
                         match result {
                             Ok(output) => finish_streaming(output),
@@ -3581,6 +3721,23 @@ mod serve {
                             }
                         }
                     });
+                }
+                // ADR-080 C2 round 2/3, codex round-3 medium finding #1: goes
+                // through the exact same `spawn_cpu_style_streaming_generation`
+                // helper as the real `Cpu` arm above -- there is no separate
+                // `should_cancel` construction here to leave un-mutated. Only
+                // the injected `generate` closure differs; this is the seam a
+                // post-drop cancellation probe test substitutes.
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { generate, .. } => {
+                    spawn_cpu_style_streaming_generation(
+                        tx,
+                        cancel_rx,
+                        prompt,
+                        gen_cfg,
+                        generate,
+                        finish_streaming,
+                    );
                 }
             }
 
@@ -3612,6 +3769,11 @@ mod serve {
 
             // Map each StreamMsg from the channel into one or two SSE events.
             let body_stream = rx.flat_map(move |msg| {
+                // Keeps `cancel_guard` alive for exactly as long as this
+                // stream is: the moment axum drops the whole SSE response
+                // (client disconnect), this closure -- and the guard moved
+                // into it -- drops too, flipping `cancel_rx` to `true`.
+                let _cancel_guard_tied_to_stream_lifetime = &cancel_guard;
                 let id = stream_id.clone();
                 let mdl = stream_model.clone();
                 match msg {
@@ -3720,6 +3882,27 @@ mod serve {
                             message: "inference failed".to_string(),
                         }
                     })?,
+                // Non-streaming isn't the round-2 medium finding #3 probe's
+                // concern -- only the streaming arm's `generate` override
+                // matters for that -- so this delegates to the real tiny
+                // model exactly like `ModelBackend::Cpu` above.
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { model, .. } => {
+                    tokio::task::spawn_blocking(move || model.generate(&prompt, &gen_cfg))
+                        .await
+                        .map_err(|e| {
+                            eprintln!("task join error: {e}");
+                            ApiError::Internal {
+                                message: "inference failed".to_string(),
+                            }
+                        })?
+                        .map_err(|e| {
+                            eprintln!("generation error: {e}");
+                            ApiError::Internal {
+                                message: "inference failed".to_string(),
+                            }
+                        })?
+                }
             };
 
             // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
@@ -3774,7 +3957,9 @@ mod serve {
 
     pub fn router(state: AppState) -> Router {
         Router::new()
+            .route("/", get(root))
             .route("/health", get(health))
+            .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
             .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
             .with_state(state)
@@ -4682,31 +4867,22 @@ mod serve {
         // Error envelope JSON shape
         // -----------------------------------------------------------------------
 
-        #[test]
-        fn error_envelope_bad_request_shape() {
+        /// Drains an `axum::response::Response` body into a parsed `Value`,
+        /// for asserting on the shared `lattice_inference::serve::ApiError`
+        /// envelope shape (ADR-080 C2, #782) from this binary's own tests.
+        async fn response_json(response: axum::response::Response) -> serde_json::Value {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body reads");
+            serde_json::from_slice(&body).expect("response body is valid JSON")
+        }
+
+        #[tokio::test]
+        async fn error_envelope_bad_request_shape() {
             let err = ApiError::BadRequest {
                 message: "test error".to_string(),
                 code: "invalid_request",
             };
-            // Verify the error serialises to the OpenAI envelope shape:
-            // {"error":{"message":"...","type":"invalid_request_error","code":"...","param":null}}
-            let body = ErrorBody {
-                error: ErrorDetail {
-                    message: "test error".to_string(),
-                    r#type: "invalid_request_error",
-                    code: "invalid_request".to_string(),
-                    param: None,
-                },
-            };
-            let json = serde_json::to_string(&body).unwrap();
-            assert!(json.contains("\"error\""));
-            assert!(json.contains("\"message\":\"test error\""));
-            assert!(json.contains("\"type\":\"invalid_request_error\""));
-            assert!(json.contains("\"code\":\"invalid_request\""));
-            assert!(json.contains("\"param\":null"));
-            // Ensure it is NOT a bare message — must be nested under "error".
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-            assert!(v["error"].is_object(), "top-level key must be 'error'");
             // Variant check kept separate so we know err itself was constructed correctly.
             assert!(matches!(
                 err,
@@ -4715,35 +4891,41 @@ mod serve {
                     ..
                 }
             ));
+            // Verify the shared ApiError serialises to the OpenAI envelope shape:
+            // {"error":{"message":"...","type":"invalid_request_error","code":"...","param":null}}
+            let response = ApiError::BadRequest {
+                message: "test error".to_string(),
+                code: "invalid_request",
+            }
+            .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let v = response_json(response).await;
+            assert!(v["error"].is_object(), "top-level key must be 'error'");
+            assert_eq!(v["error"]["message"], "test error");
+            assert_eq!(v["error"]["type"], "invalid_request_error");
+            assert_eq!(v["error"]["code"], "invalid_request");
+            assert!(v["error"]["param"].is_null());
         }
 
-        #[test]
-        fn error_envelope_payload_too_large_shape() {
-            let body = ErrorBody {
-                error: ErrorDetail {
-                    message: "request body exceeds 1 MiB limit".to_string(),
-                    r#type: "invalid_request_error",
-                    code: "request_body_too_large".to_string(),
-                    param: None,
-                },
-            };
-            let json = serde_json::to_string(&body).unwrap();
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        #[tokio::test]
+        async fn error_envelope_payload_too_large_shape() {
+            let response = ApiError::PayloadTooLarge {
+                message: "request body exceeds 1 MiB limit".to_string(),
+            }
+            .into_response();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let v = response_json(response).await;
             assert_eq!(v["error"]["code"], "request_body_too_large");
         }
 
-        #[test]
-        fn error_envelope_internal_shape() {
-            let body = ErrorBody {
-                error: ErrorDetail {
-                    message: "inference failed".to_string(),
-                    r#type: "server_error",
-                    code: "internal_error".to_string(),
-                    param: None,
-                },
-            };
-            let json = serde_json::to_string(&body).unwrap();
-            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        #[tokio::test]
+        async fn error_envelope_internal_shape() {
+            let response = ApiError::Internal {
+                message: "inference failed".to_string(),
+            }
+            .into_response();
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let v = response_json(response).await;
             assert_eq!(v["error"]["type"], "server_error");
             assert_eq!(v["error"]["code"], "internal_error");
         }
@@ -5177,6 +5359,611 @@ mod serve {
             };
             let validated = validate_chat_request(&req, "served-model", 256, 4096).unwrap();
             assert_eq!(validated.logprobs, Some(3));
+        }
+
+        // -----------------------------------------------------------------------
+        // Shared `AppState` builder for the router-level test modules below --
+        // both need a real (tiny, deterministic) CPU model, gated behind
+        // `test-utils` (see `lattice_inference::model::qwen35::test_support`)
+        // for the same reason: bin targets can't see this crate's own
+        // `#[cfg(test)]`-only fixtures across the bin/lib compilation
+        // boundary, only a real Cargo feature crosses it.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        fn tiny_state(max_tokens_cap: usize) -> AppState {
+            let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
+            AppState {
+                model: ModelBackend::Cpu(Arc::new(model)),
+                default_max_tokens: max_tokens_cap,
+                max_tokens_cap,
+                model_id: "test-model".to_string(),
+                request_counter: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // HTTP-level client-disconnect cancellation (ADR-080 C2 round 2, codex
+        // round-1 finding #2) -- gated behind `test-utils` (see
+        // `lattice_inference::model::qwen35::test_support`) because it needs a
+        // real, tiny, deterministic CPU model to exercise the actual
+        // `chat_completions` -> `body_stream`'s `cancel_guard` capture ->
+        // `generate_streaming_with_cancel` composition end to end, not just the
+        // primitive (already unit/mutation-tested in
+        // `model/qwen35/generation.rs`) or the guard type (already unit-tested
+        // in `serve/mod.rs`) in isolation. Codex's review: "the disclosed
+        // HTTP-level disconnect test gap ... does not waive that gate."
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod disconnect_cancellation {
+            use super::*;
+            use http_body_util::BodyExt;
+            use std::time::Duration;
+
+            /// The tiny test model's context window is a fixed 1024 tokens
+            /// (`test_support::tiny_zero_model`'s `max_position_embeddings`),
+            /// so `max_tokens` here must leave room for the rendered prompt
+            /// (well under 1024) -- "effectively unbounded relative to this
+            /// test's timeouts" rather than the vastly larger figure a real
+            /// model's context window would allow.
+            const NEAR_MAX_CONTEXT_TOKENS: usize = 900;
+
+            fn tiny_state() -> AppState {
+                super::tiny_state(NEAR_MAX_CONTEXT_TOKENS)
+            }
+
+            /// Proves the real `chat_completions` streaming composition --
+            /// not just its primitives in isolation -- actually stops
+            /// generation on client disconnect. A tiny all-zero-weight model
+            /// with `max_tokens` near the tiny model's 1024-token context window means
+            /// uncancelled generation would keep running far longer than
+            /// this test's timeouts; it reads two real SSE frames (proving
+            /// generation is genuinely under way) before dropping the
+            /// response body to simulate a disconnect.
+            ///
+            /// Mutation-sensitive to codex's named regression: if
+            /// `let _cancel_guard_tied_to_stream_lifetime = &cancel_guard;`
+            /// is removed from `body_stream`'s `flat_map` closure in
+            /// `chat_completions`, `cancel_guard` is no longer captured by
+            /// anything and drops at the end of `chat_completions`'s own
+            /// function body -- i.e. before the response is even returned to
+            /// the caller, let alone before the client could disconnect.
+            /// That flips `cancel_rx` immediately, so
+            /// `generate_streaming_with_cancel`'s pre-prefill checkpoint
+            /// returns `Interrupt` with zero tokens generated. Frame 1 (the
+            /// role chunk) still arrives unconditionally either way, and a
+            /// *second* frame still arrives either way too -- but under the
+            /// mutation it is the finish chunk (`finish_reason: "length"` --
+            /// the shared `finish_reason()` mapping has no `"interrupt"`
+            /// string; a cancelled/interrupted result reports `"length"`
+            /// exactly like a token-cap stop, see its own doc comment --
+            /// no `content`) sent by `finish_streaming` for a zero-token
+            /// result, not a real content delta. A test that only checks "a
+            /// second frame arrived and was Ok" cannot tell these apart, so
+            /// this asserts the frame's actual JSON payload shape: real code
+            /// path yields `finish_reason: null` + a string `delta.content`;
+            /// the mutated path yields a non-null `finish_reason` and no
+            /// `content`, and the second `assert!` fails. Verified by
+            /// reverting that exact line and re-running: see the PR body's
+            /// mutation log.
+            #[tokio::test]
+            async fn chat_completions_streaming_disconnect_stops_generation() {
+                let req = ChatCompletionRequest {
+                    model: "test-model".to_string(),
+                    messages: vec![user_msg("hi")],
+                    max_tokens: Some(NEAR_MAX_CONTEXT_TOKENS),
+                    stream: Some(true),
+                    ..bare_req()
+                };
+
+                let response = chat_completions(State(tiny_state()), Ok(Json(req)))
+                    .await
+                    .expect("streaming request must be accepted");
+                assert_eq!(response.status(), StatusCode::OK);
+
+                let mut body = response.into_body();
+
+                // Frame 1: the role chunk, emitted unconditionally before any
+                // generation output (`futures::stream::once(role_chunk).chain(body_stream)`).
+                tokio::time::timeout(Duration::from_secs(10), body.frame())
+                    .await
+                    .expect("role chunk frame must arrive quickly")
+                    .expect("role chunk frame must exist")
+                    .expect("role chunk frame must be Ok");
+
+                // Frame 2: must be a genuine content delta from the tiny
+                // model's decode loop, not the finish chunk. A frame merely
+                // *arriving* here does not prove generation ran: if
+                // `cancel_guard` is no longer tied to the stream, it drops
+                // (flipping `cancel_rx`) before the blocking task's
+                // pre-prefill checkpoint, `generate_streaming_with_cancel`
+                // returns `Interrupt` with zero tokens, and
+                // `finish_streaming` sends `StreamMsg::Done` immediately --
+                // which *also* produces a well-formed, `Ok` SSE frame here,
+                // just one carrying `finish_reason: "length"` (the shared
+                // mapping has no `"interrupt"` string; see
+                // `lattice_inference::serve::finish_reason`'s doc comment)
+                // and no `content` instead of a real delta. So this asserts
+                // the frame's actual payload shape, not just its arrival.
+                let frame = tokio::time::timeout(Duration::from_secs(10), body.frame())
+                    .await
+                    .expect(
+                        "a second frame must arrive quickly -- if this times out, \
+                         nothing at all was sent after the role chunk",
+                    )
+                    .expect("second frame must exist")
+                    .expect("second frame must be Ok");
+                let data = frame
+                    .into_data()
+                    .expect("second frame must carry data (not trailers)");
+                let text = std::str::from_utf8(&data).expect("SSE frame must be UTF-8");
+                let payload = text
+                    .strip_prefix("data: ")
+                    .unwrap_or(text)
+                    .trim_end_matches(['\n', '\r']);
+                let chunk: serde_json::Value =
+                    serde_json::from_str(payload).expect("SSE frame must carry a JSON chunk");
+                let choice = &chunk["choices"][0];
+                assert!(
+                    choice["finish_reason"].is_null(),
+                    "second frame must be a content delta, not the finish chunk \
+                     (generation was interrupted before producing any output, \
+                     i.e. cancel_guard fired before the stream had a chance to \
+                     run): {chunk}"
+                );
+                assert!(
+                    choice["delta"]["content"].is_string(),
+                    "second frame must carry delta.content (a real generated \
+                     token), got: {chunk}"
+                );
+
+                // Client disconnect: drop the body. `cancel_guard` (captured
+                // by `body_stream`'s `flat_map` closure) drops with it,
+                // flipping the paired `cancel_rx` -- the CPU decode loop's
+                // `generate_streaming_with_cancel` polls that flag at the top
+                // of every iteration (already unit/mutation-tested in
+                // `model/qwen35/generation.rs`) and stops within one step
+                // instead of running toward `max_tokens` (900). This
+                // test's own fast, deterministic completion (it does not hang
+                // waiting on the now-unobservable background task) is the
+                // practical proof: dropping never blocks, and the tiny
+                // model's decode loop is fast enough on the blocking-thread
+                // pool that a broken cancellation path would otherwise pin a
+                // thread pool worker in an unbounded loop for the remainder
+                // of the test process's life -- observable across this
+                // binary's full test run as sporadic slowdowns/hangs in
+                // later tests sharing the pool, not just this test in
+                // isolation.
+                drop(body);
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Post-drop generator-side cancellation probe (ADR-080 C2 round 2,
+        // codex round-2 medium finding #3): `chat_completions_streaming_
+        // disconnect_stops_generation` above proves guard retention BEFORE
+        // the response is returned (frame 2 is a real content delta), but
+        // does NOT prove `should_cancel` reaching the generator AFTER the
+        // drop, independently of `on_token`'s own failed-send stop
+        // condition -- codex's exact reverse mutation (`cancel_rx`
+        // predicate replaced by `move || false`, `on_token`'s failed-send
+        // path left intact) left that test green in 0.02s, because the
+        // failed send alone stops a real decode loop just as fast as a
+        // correctly wired cancellation would.
+        //
+        // This test isolates the two signals: `ModelBackend::CpuFakeGenerate`
+        // (test-only, see its doc comment) sends exactly ONE delta -- so
+        // `on_token` is never called again after that point -- then enters a
+        // phase that polls ONLY `should_cancel`, in a loop that never touches
+        // `on_token`/the reply channel at all, and reports which of two
+        // outcomes ended that loop over a side channel `chat_completions`
+        // itself never sees. Because the probe stops polling `on_token`
+        // entirely after the first delta, `on_token`'s failed-send masking
+        // effect (the exact thing that hid finding #3 from the original
+        // test) cannot fire here -- only `should_cancel`'s own return value
+        // can end the loop.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod post_drop_cancellation_probe {
+            use super::*;
+            use http_body_util::BodyExt;
+            use std::sync::Mutex;
+            use std::time::Duration;
+
+            /// One real delta, then a bounded should_cancel-only poll loop.
+            /// `MAX_POLLS` * `POLL_INTERVAL` (10s) comfortably exceeds the
+            /// test's own 10s await-completion timeout below, so a broken
+            /// `should_cancel` wiring (the `move || false` mutation) makes
+            /// the outer `tokio::time::timeout` fire first with a clear
+            /// failure message, rather than this loop silently reporting
+            /// "exhausted" first in a way that could be confused with a
+            /// flake.
+            const MAX_POLLS: usize = 4000;
+            const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+            /// Same rationale as `disconnect_cancellation`'s constant of the
+            /// same value: the tiny test model's context window is a fixed
+            /// 1024 tokens, so this stays comfortably under it while still
+            /// being "effectively unbounded" relative to this test's own
+            /// timeouts.
+            const NEAR_MAX_CONTEXT_TOKENS: usize = 900;
+
+            /// `should_cancel`'s reading taken after the test's `checkpoint1`
+            /// signal (sent the instant `chat_completions(..).await`
+            /// returns, before the test reads any SSE frame or drops
+            /// anything) but before the `go` signal (sent only after
+            /// `drop(body)`). Must be `false` in correctly-wired code:
+            /// `cancel_guard` is still alive at this point (held by
+            /// `body_stream`'s `flat_map` closure, itself alive because the
+            /// test hasn't dropped the body/receiver yet), so `cancel_rx`
+            /// cannot have flipped. A `true` reading here is the direct,
+            /// timing-independent signature of finding #1's mutation (guard
+            /// capture removed): `cancel_guard` is then just an unused
+            /// local that drops the instant `chat_completions` returns --
+            /// gating this read on `checkpoint1` (rather than reading it
+            /// immediately after `on_token`, which raced against
+            /// `chat_completions`'s own return on an early version of this
+            /// test and non-deterministically read `false` even under the
+            /// mutation) guarantees the read happens causally after that
+            /// return, so an unused `cancel_guard` has unconditionally
+            /// already dropped by the time this reads it.
+            #[derive(Debug, PartialEq)]
+            struct ProbeOutcome {
+                pre_drop_cancelled: bool,
+                post_drop: PostDropOutcome,
+            }
+
+            #[derive(Debug, PartialEq)]
+            enum PostDropOutcome {
+                /// `should_cancel` returned `true` after this many polls
+                /// following the test's `go` signal (sent only after
+                /// `drop(body)`) -- the correctly-wired behavior.
+                CancelledAfterPolls(usize),
+                /// The poll budget was exhausted without `should_cancel`
+                /// ever returning `true` -- the `move || false` mutation's
+                /// signature (an unthreaded/replaced predicate that can
+                /// never observe the drop).
+                ExhaustedWithoutCancel,
+            }
+
+            /// Builds an `AppState` whose CPU streaming generation is the
+            /// injected `generate` closure instead of the real tiny model's
+            /// decode loop, via `ModelBackend::CpuFakeGenerate`. Tokenizer/
+            /// context-window behavior still comes from a real tiny model
+            /// (`tiny_zero_model()`), so request validation ahead of the
+            /// streaming branch is unchanged from the other HTTP-level
+            /// tests in this file.
+            fn tiny_state_with_fake_cpu_generate(
+                max_tokens_cap: usize,
+                generate: impl Fn(
+                    &str,
+                    &lattice_inference::model::qwen35_config::GenerateConfig,
+                    &mut dyn FnMut(&str) -> bool,
+                    &mut dyn FnMut() -> bool,
+                )
+                    -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                + Send
+                + Sync
+                + 'static,
+            ) -> AppState {
+                let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
+                AppState {
+                    model: ModelBackend::CpuFakeGenerate {
+                        model: Arc::new(model),
+                        generate: Arc::new(generate),
+                    },
+                    default_max_tokens: max_tokens_cap,
+                    max_tokens_cap,
+                    model_id: "test-model".to_string(),
+                    request_counter: Arc::new(AtomicU64::new(0)),
+                }
+            }
+
+            /// Mutation-sensitive to BOTH of codex's named regressions
+            /// independently, via a test<->generator handshake that removes
+            /// the timing race a plain poll-and-time-it design would have
+            /// (an early, timing-dependent version of this test observed
+            /// `CancelledAfterPolls(1)` even under mutation (a), because
+            /// `cancel_guard` -- unused once its capture is removed --
+            /// drops at `chat_completions`'s own return, which can race
+            /// ahead of or behind the generator's first poll depending on
+            /// blocking-thread-pool scheduling):
+            ///
+            /// (a) removing `body_stream`'s
+            ///     `let _cancel_guard_tied_to_stream_lifetime = &cancel_guard;`
+            ///     capture flips `cancel_rx` the instant `chat_completions`
+            ///     returns -- before the test even reads its first SSE
+            ///     frame, let alone drops the body. `pre_drop_cancelled`
+            ///     (read BEFORE the generator waits on the `go` signal,
+            ///     which the test only sends after `drop(body)`) captures
+            ///     exactly this: `true` here is impossible under correct
+            ///     wiring regardless of scheduling, since `cancel_guard` is
+            ///     provably still alive at that point.
+            /// (b) replacing the CPU `should_cancel` predicate
+            ///     (`move || *cancel_rx.borrow()`) with `move || false`
+            ///     means the post-`go` poll loop never observes `true`, so
+            ///     it exhausts `MAX_POLLS` and reports
+            ///     `PostDropOutcome::ExhaustedWithoutCancel`.
+            #[tokio::test]
+            async fn chat_completions_streaming_disconnect_cancellation_reaches_generator_post_drop()
+             {
+                let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<ProbeOutcome>();
+                let outcome_tx = Mutex::new(Some(outcome_tx));
+                let (checkpoint1_tx, checkpoint1_rx) = std::sync::mpsc::channel::<()>();
+                let checkpoint1_rx = Mutex::new(Some(checkpoint1_rx));
+                let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+                let go_rx = Mutex::new(Some(go_rx));
+
+                let state = tiny_state_with_fake_cpu_generate(
+                    NEAR_MAX_CONTEXT_TOKENS,
+                    move |_prompt, _cfg, on_token, should_cancel| {
+                        // One real delta -- exactly what the disconnect test
+                        // above reads as its second frame -- so
+                        // `chat_completions`'s SSE framing has genuine
+                        // content before this probe phase begins. Queued
+                        // into the reply channel immediately; the test can
+                        // read it as frame 2 regardless of whether this
+                        // thread is later blocked waiting on `checkpoint1`.
+                        on_token("probe");
+
+                        // Block until the test confirms `chat_completions`
+                        // itself has already returned (see `pre_drop_cancelled`'s
+                        // doc comment on why this ordering, not an
+                        // immediate post-`on_token` read, is what makes the
+                        // next line's reading timing-independent).
+                        if let Some(rx) = checkpoint1_rx.lock().unwrap().take() {
+                            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+                        }
+                        let pre_drop_cancelled = should_cancel();
+
+                        // Block until the test signals it has dropped the
+                        // body (or give up after 10s so a broken handshake
+                        // fails this test instead of hanging the process).
+                        if let Some(rx) = go_rx.lock().unwrap().take() {
+                            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+                        }
+
+                        let mut polls = 0usize;
+                        let post_drop = loop {
+                            if should_cancel() {
+                                break PostDropOutcome::CancelledAfterPolls(polls);
+                            }
+                            if polls >= MAX_POLLS {
+                                break PostDropOutcome::ExhaustedWithoutCancel;
+                            }
+                            polls += 1;
+                            std::thread::sleep(POLL_INTERVAL);
+                        };
+                        if let Some(tx) = outcome_tx.lock().unwrap().take() {
+                            let _ = tx.send(ProbeOutcome {
+                                pre_drop_cancelled,
+                                post_drop,
+                            });
+                        }
+                        Ok(GenerateOutput {
+                            text: "probe".to_string(),
+                            token_ids: vec![],
+                            prompt_tokens: 1,
+                            generated_tokens: 1,
+                            stopped: false,
+                            stop_reason: Some(
+                                lattice_inference::stop_reason::StopReason::Interrupt,
+                            ),
+                            token_logprobs: vec![],
+                        })
+                    },
+                );
+
+                let req = ChatCompletionRequest {
+                    model: "test-model".to_string(),
+                    messages: vec![user_msg("hi")],
+                    max_tokens: Some(NEAR_MAX_CONTEXT_TOKENS),
+                    stream: Some(true),
+                    ..bare_req()
+                };
+                let response = chat_completions(State(state), Ok(Json(req)))
+                    .await
+                    .expect("streaming request must be accepted");
+                // `chat_completions` has now unconditionally returned, so an
+                // unused `cancel_guard` (mutation (a)) has already dropped;
+                // signal the generator it may take its `pre_drop_cancelled`
+                // reading.
+                let _ = checkpoint1_tx.send(());
+                let mut body = response.into_body();
+
+                // Frame 1: role chunk.
+                tokio::time::timeout(Duration::from_secs(10), body.frame())
+                    .await
+                    .expect("role chunk frame must arrive quickly")
+                    .expect("role chunk frame must exist")
+                    .expect("role chunk frame must be Ok");
+
+                // Frame 2: the fake generator's one real delta.
+                tokio::time::timeout(Duration::from_secs(10), body.frame())
+                    .await
+                    .expect("delta frame must arrive quickly")
+                    .expect("delta frame must exist")
+                    .expect("delta frame must be Ok");
+
+                // Client disconnect: drop the body. The fake generator is
+                // waiting on `go_rx`, having already called `on_token` and
+                // taken its `pre_drop_cancelled` reading.
+                drop(body);
+                let _ = go_tx.send(());
+
+                let outcome = tokio::time::timeout(Duration::from_secs(10), outcome_rx)
+                    .await
+                    .expect(
+                        "the fake generator's post-drop probe phase must signal \
+                         completion within 10s of the client disconnecting -- a \
+                         timeout here means should_cancel never observed the \
+                         disconnect at all",
+                    )
+                    .expect("probe outcome sender must not be dropped without sending");
+
+                assert!(
+                    !outcome.pre_drop_cancelled,
+                    "should_cancel must read false before the test has dropped the \
+                     response body -- a true reading here means cancel_guard had \
+                     already dropped (e.g. because it is no longer tied to the \
+                     stream's lifetime) well before any disconnect happened: \
+                     {outcome:?}"
+                );
+                assert!(
+                    matches!(outcome.post_drop, PostDropOutcome::CancelledAfterPolls(_)),
+                    "should_cancel must return true within the poll budget after \
+                     the test drops the response body -- exhausting the budget \
+                     means the disconnect signal never reached the generator at \
+                     all: {outcome:?}"
+                );
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Streaming context-overflow status parity (ADR-080 C2 round 2, codex
+        // round-2 major finding #1): `lattice.rs` already gets this right
+        // structurally -- `prepare_chat_request`'s context-window preflight
+        // (`check_context_window`) runs unconditionally, before
+        // `chat_completions` ever branches on `req.stream` -- so a `stream:
+        // true` request that overflows the model's context window returns
+        // HTTP 400 `context_length_exceeded` before any SSE stream is ever
+        // built. `cm_serve_context_window_checked_before_stop_parsing` above
+        // already pins the underlying cascade ordering as a pure function;
+        // this drives the SAME contract through the real `Router`.
+        //
+        // ADR-080 C2 round 3, codex round-3 medium finding #2: this now
+        // builds its request from `lattice_inference::serve`'s shared
+        // `OVERFLOW_PARITY_*` constants -- the SAME body/limits
+        // `lattice_serve.rs`'s `real_router_overflow_parity` module drives
+        // through its own real router and real worker -- so the two really
+        // are the identical request the old doc comment here merely
+        // claimed. The tiny test model's context window
+        // (`test_support::tiny_zero_model`'s `max_position_embeddings`) is
+        // fixed at `OVERFLOW_PARITY_CONTEXT_WINDOW` (1024) precisely so this
+        // side's "effective context limit" matches the daemon side's
+        // explicitly-configured `AppState.model_max_context` of the same
+        // value, per codex's finding.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod streaming_context_overflow {
+            use super::*;
+            use lattice_inference::serve::{
+                OVERFLOW_PARITY_MAX_TOKENS_CAP, OVERFLOW_PARITY_REQUEST_BODY,
+            };
+            use tower::ServiceExt as _;
+
+            #[tokio::test]
+            async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse()
+            {
+                let body = axum::body::Body::from(OVERFLOW_PARITY_REQUEST_BODY.to_string());
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .expect("fixture request must build");
+                let response = router(tiny_state(OVERFLOW_PARITY_MAX_TOKENS_CAP))
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "an over-context stream:true request must be rejected with HTTP \
+                     400 before any SSE stream is committed, matching \
+                     lattice_serve.rs's equivalent preflight for the identical \
+                     shared-fixture request body"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("error response body must be readable");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("error response must be JSON");
+                assert_eq!(value["error"]["code"], "context_length_exceeded");
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Cross-binary `/v1/chat/completions` parity table (ADR-080 C2 round 2,
+        // codex round-1 finding #1): drives every fixture body in
+        // `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` through
+        // THIS binary's real `Router` via `tower::ServiceExt::oneshot`, and
+        // compares the resulting status + error code against the case's
+        // `lattice`-side expectation. `lattice_serve.rs`'s own test module
+        // runs the SAME table against its own router, asserting the
+        // `lattice_serve`-side expectation -- together the two prove
+        // same-input parity (or a documented, intentional divergence) at the
+        // real HTTP layer, not just in each binary's private validation
+        // helpers. Gated behind `test-utils` for the same reason as
+        // `disconnect_cancellation`: `router()` needs a real `AppState`,
+        // which needs a real (tiny) CPU model.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod parity_table {
+            use super::*;
+            use lattice_inference::serve::{Binary, CHAT_COMPLETIONS_PARITY_CASES};
+            use tower::ServiceExt as _;
+
+            /// Small enough that `max_tokens_over_cap_reject_vs_clamp`'s
+            /// 999999 genuinely exceeds both `default_max_tokens` and
+            /// `max_tokens_cap`.
+            const CAP: usize = 64;
+
+            #[tokio::test]
+            async fn chat_completions_matches_shared_parity_table() {
+                for case in CHAT_COMPLETIONS_PARITY_CASES {
+                    let (expected_status, expected_code) = case.expected(Binary::Lattice);
+
+                    let app = router(tiny_state(CAP));
+                    let request = axum::http::Request::builder()
+                        .method(case.method)
+                        .uri(case.path)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(case.body.build()))
+                        .expect("fixture request must build");
+                    let response = app
+                        .oneshot(request)
+                        .await
+                        .expect("router must produce a response, not a transport error");
+
+                    let status = response.status().as_u16();
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("response body reads");
+
+                    assert_eq!(
+                        status,
+                        expected_status,
+                        "case '{}': expected status {expected_status}, got {status} \
+                         (body: {})",
+                        case.name,
+                        String::from_utf8_lossy(&body)
+                    );
+
+                    // A non-2xx status must carry the expected shared error
+                    // code; a 2xx status has no error envelope to check
+                    // (the `max_tokens_over_cap_reject_vs_clamp` divergence
+                    // case is the only non-error entry today, and even its
+                    // "success" side is a harness-artifact 500 -- see the
+                    // case's own doc comment in `serve/mod.rs`).
+                    if !(200..300).contains(&status) {
+                        let value: serde_json::Value = serde_json::from_slice(&body)
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "case '{}': non-2xx response body must be the shared \
+                                     error envelope JSON: {e} (body: {})",
+                                    case.name,
+                                    String::from_utf8_lossy(&body)
+                                )
+                            });
+                        assert_eq!(
+                            value["error"]["code"], expected_code,
+                            "case '{}': expected error code '{expected_code}', got {} \
+                             (full body: {value})",
+                            case.name, value["error"]["code"]
+                        );
+                    }
+                }
+            }
         }
     }
 }

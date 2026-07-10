@@ -360,12 +360,55 @@ impl Qwen35Model {
     /// the shared path. This ensures that no change here can silently alter the
     /// non-streaming `generate` path, which is pinned by the e2e-parity CI gate
     /// (greedy token match vs HF transformers). `on_token` is the only addition.
+    ///
+    /// `should_cancel = || false` convenience form of
+    /// [`Self::generate_streaming_with_cancel`]; both share this one
+    /// implementation.
     pub fn generate_streaming(
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
         mut on_token: impl FnMut(&str),
     ) -> Result<GenerateOutput, InferenceError> {
+        self.generate_streaming_with_cancel(
+            prompt,
+            gen_cfg,
+            |delta| {
+                on_token(delta);
+                true
+            },
+            || false,
+        )
+    }
+
+    /// Cancellation-aware sibling of [`Self::generate_streaming`] (ADR-080 C2,
+    /// ports the Metal `MetalQwen35State::generate_streaming_with_cancel`
+    /// contract to the CPU backend, closing #744: previously `lattice.rs`'s CPU
+    /// streaming path had no way to observe a client disconnect at all and ran
+    /// to the token cap after the client left).
+    ///
+    /// `should_cancel` is polled independently of `on_token`: before the
+    /// prefill pass starts, immediately after it returns, and at the top of
+    /// every decode iteration — all before any further work runs for that
+    /// step. `on_token` itself also stops generation the moment it returns
+    /// `false` (the caller could not forward the delta, e.g. the SSE receiver
+    /// was dropped). Either signal short-circuits the trailing
+    /// incomplete-UTF-8 flush too, since the caller is no longer consuming
+    /// the stream by then. Both stopping paths report
+    /// `stopped: false, stop_reason: Some(StopReason::Interrupt)` — a
+    /// cancellation is not an OpenAI "stop condition", matching the Metal
+    /// contract exactly.
+    pub fn generate_streaming_with_cancel<F, C>(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        mut on_token: F,
+        mut should_cancel: C,
+    ) -> Result<GenerateOutput, InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
         let cfg = &self.config;
 
         let mut rng_state = initial_rng_state(gen_cfg.seed);
@@ -425,6 +468,22 @@ impl Qwen35Model {
         // zero-cost when `gen_cfg.logprobs` is `None` (the default path).
         let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
+        // Checked independently of `on_token`: a client that disconnected
+        // between dequeue and here must not pay for the (potentially large)
+        // prefill pass below. Mirrors the Metal
+        // `generate_streaming_with_cancel`'s first `should_cancel` checkpoint.
+        if should_cancel() {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+                stopped: false, // caller interrupted the stream, not a stop condition
+                stop_reason: Some(StopReason::Interrupt),
+                token_logprobs: vec![],
+            });
+        }
+
         // Prompt prefill: try the batched (dense-config) path first, which
         // performs one layer pass over all prompt positions plus a single
         // final-token vocab projection, instead of `prompt_len` full
@@ -477,6 +536,23 @@ impl Qwen35Model {
         // before copying the prefill result in, whichever path produced it.
         scratch.ensure_capacity(cfg, prompt_len);
         scratch.logits[..cfg.vocab_size].copy_from_slice(&prefill_logits);
+
+        // The prefill call itself cannot be interrupted mid-flight, so this
+        // is the earliest point a disconnect that happened *during* prefill
+        // can be observed -- before paying for grammar masking or sampling
+        // on its output. Mirrors the Metal `generate_streaming_with_cancel`'s
+        // second `should_cancel` checkpoint.
+        if should_cancel() {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: prompt_len,
+                generated_tokens: 0,
+                stopped: false, // caller interrupted the stream, not a stop condition
+                stop_reason: Some(StopReason::Interrupt),
+                token_logprobs: vec![],
+            });
+        }
 
         // Grammar mask on the post-prefill logits, identical to the generate() path.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
@@ -564,15 +640,35 @@ impl Qwen35Model {
             let delta = detok.push(&self.tokenizer, next_id);
             if !delta.is_empty() {
                 text.push_str(&delta);
-                on_token(&delta);
+                if !on_token(&delta) {
+                    return Ok(GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: false, // caller interrupted the stream, not a stop condition
+                        stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs,
+                    });
+                }
             }
 
             let mut stopped = false;
+            let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
             // Decode loop (mirrors decode_loop free function exactly).
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
             for _ in 1..cap {
+                // Checked before any per-step work, independent of whether this
+                // iteration's delta ends up non-empty -- closes the gap where a
+                // run of tokens decoding to an incomplete UTF-8 tail would
+                // otherwise never reach the on_token check below.
+                if should_cancel() {
+                    stopped_by_caller = true;
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
                 let pos = kv_cache.seq_len;
                 let Some(&last_token) = all_ids.last() else {
                     return Err(InferenceError::Inference("empty generation state".into()));
@@ -657,7 +753,11 @@ impl Qwen35Model {
                 let delta = detok.push(&self.tokenizer, next_id);
                 if !delta.is_empty() {
                     text.push_str(&delta);
-                    on_token(&delta);
+                    if !on_token(&delta) {
+                        stopped_by_caller = true;
+                        stop_reason = StopReason::Interrupt;
+                        break;
+                    }
                 }
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
@@ -669,11 +769,14 @@ impl Qwen35Model {
             }
 
             // Flush any trailing incomplete bytes (generation truncated mid-codepoint)
-            // so the streamed deltas concatenate to exactly the returned text.
-            let tail = detok.finish();
-            if !tail.is_empty() {
-                text.push_str(&tail);
-                on_token(&tail);
+            // so the streamed deltas concatenate to exactly the returned text. Skip
+            // when the caller asked to stop -- it is no longer consuming the stream.
+            if !stopped_by_caller {
+                let tail = detok.finish();
+                if !tail.is_empty() {
+                    text.push_str(&tail);
+                    on_token(&tail);
+                }
             }
 
             Ok(GenerateOutput {
@@ -690,8 +793,30 @@ impl Qwen35Model {
             // never emit a partial stop prefix before we can confirm it is not a match.
             let mut streamer = StopStringMatcher::new(&gen_cfg.stop_strings);
 
+            // `StopStringMatcher::push`'s sink is `FnMut(&str)` (no return
+            // value), so a caller-requested stop is threaded through a
+            // captured flag instead -- mirrors the Metal
+            // `generate_streaming_with_cancel`'s `caller_interrupted` idiom
+            // exactly, for the same structural reason.
+            let mut caller_interrupted = false;
             let first_delta = detok.push(&self.tokenizer, next_id);
-            if streamer.push(&first_delta, &mut on_token) {
+            let stop_matched = streamer.push(&first_delta, &mut |s| {
+                if !caller_interrupted && !on_token(s) {
+                    caller_interrupted = true;
+                }
+            });
+            if caller_interrupted {
+                return Ok(GenerateOutput {
+                    text: streamer.into_text(),
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: false, // caller interrupted the stream, not a stop condition
+                    stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs,
+                });
+            }
+            if stop_matched {
                 // Stop matched in the very first token.
                 // token_ids already contain next_id; cannot un-generate it.
                 return Ok(GenerateOutput {
@@ -706,11 +831,17 @@ impl Qwen35Model {
             }
 
             let mut stopped = false;
+            let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
             // Decode loop for the string-stop path.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
             for _ in 1..cap {
+                if should_cancel() {
+                    stopped_by_caller = true;
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
                 let pos = kv_cache.seq_len;
                 let Some(&last_token) = all_ids.last() else {
                     return Err(InferenceError::Inference("empty generation state".into()));
@@ -791,7 +922,18 @@ impl Qwen35Model {
                 }
 
                 let delta = detok.push(&self.tokenizer, next_id);
-                if streamer.push(&delta, &mut on_token) {
+                let mut iter_interrupted = false;
+                let stop_matched = streamer.push(&delta, &mut |s| {
+                    if !iter_interrupted && !on_token(s) {
+                        iter_interrupted = true;
+                    }
+                });
+                if iter_interrupted {
+                    stopped_by_caller = true;
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
+                if stop_matched {
                     stopped = true;
                     stop_reason = StopReason::Eos;
                     break;
@@ -806,11 +948,18 @@ impl Qwen35Model {
             }
 
             // Natural-end flush (no-op if a stop was already hit inside the loop).
-            streamer.finish(&detok.finish(), &mut on_token);
-            // finish() may itself complete a stop in the tail bytes.
-            if streamer.stopped() && !stopped {
-                stopped = true;
-                stop_reason = StopReason::Eos;
+            // Skip when the caller asked to stop -- it is no longer consuming
+            // the stream, and `on_token`'s return value here would not change
+            // why generation actually stopped.
+            if !stopped_by_caller {
+                streamer.finish(&detok.finish(), &mut |s| {
+                    on_token(s);
+                });
+                // finish() may itself complete a stop in the tail bytes.
+                if streamer.stopped() && !stopped {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
+                }
             }
 
             Ok(GenerateOutput {
@@ -1932,6 +2081,261 @@ mod tests {
              sampled token, not the forced token"
         );
         assert_eq!(result.generated_tokens, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_streaming_with_cancel mutation-sensitive tests (ADR-080 C2, #744)
+    // -----------------------------------------------------------------------
+    //
+    // Zero-weight model: greedy sampling always picks token 0, which decodes to
+    // the literal text "<unk>" -- a non-empty delta on every step, so both the
+    // pre-loop first-token emission and every decode-loop iteration produce a
+    // delta for `on_token` to observe. This gives fully deterministic
+    // cancellation-checkpoint counting without relying on random-weight output.
+
+    /// `should_cancel` returning `true` before the prefill pass starts (the
+    /// very first checkpoint) must short-circuit generation entirely: no
+    /// prefill, no sampling, `generated_tokens == 0`.
+    ///
+    /// Mutation sensitivity: removing this checkpoint (or its early return)
+    /// makes generation fall through to prefill + sampling, producing
+    /// `generated_tokens > 0` and failing the assertion below.
+    #[test]
+    fn generate_streaming_with_cancel_true_before_prefill_returns_interrupt() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        // Cancel on the very first `should_cancel` call only (the pre-prefill
+        // checkpoint), so this test pins THAT checkpoint specifically rather
+        // than any-of-the-four checkpoints: if the pre-prefill check were
+        // removed, the post-prefill checkpoint (call 2) would see `false` and
+        // generation would run to completion instead of stopping at
+        // `generated_tokens == 0`.
+        let calls = std::cell::Cell::new(0usize);
+        let result = model
+            .generate_streaming_with_cancel(
+                "a",
+                &gen_cfg,
+                |_delta| true,
+                || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    n == 1
+                },
+            )
+            .expect("cancelled-before-prefill generate must succeed");
+        assert!(
+            !result.stopped,
+            "a caller cancellation is not an OpenAI stop condition"
+        );
+        assert_eq!(result.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(result.generated_tokens, 0);
+        assert!(result.text.is_empty());
+    }
+
+    /// `should_cancel` returning `true` on its SECOND call only -- i.e. the
+    /// pre-prefill checkpoint (call 1) sees `false` and lets prefill run,
+    /// then the post-prefill checkpoint (call 2, immediately after prefill,
+    /// before sampling) sees `true` and must stop before ANY token is
+    /// sampled or emitted. This isolates the post-prefill checkpoint
+    /// specifically (ADR-080 C2 round 2, codex round-1 medium finding #3):
+    /// the pre-prefill test above (`n == 1`) cannot tell the two checkpoints
+    /// apart, since removing the post-prefill one entirely still leaves that
+    /// test green (its cancellation already fires at checkpoint 1).
+    ///
+    /// Mutation sensitivity: removing the post-prefill `if should_cancel()`
+    /// guard (the one right after the prefill-logits copy, before grammar
+    /// masking/sampling) lets generation fall through to sampling the first
+    /// token, producing `generated_tokens > 0`, non-empty `text`, and at
+    /// least one `on_token` callback -- failing all three assertions below.
+    /// Verified by reverting that exact guard and re-running: see the PR
+    /// body's mutation log.
+    #[test]
+    fn generate_streaming_with_cancel_true_after_prefill_returns_interrupt() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let calls = std::cell::Cell::new(0usize);
+        let on_token_calls = std::cell::Cell::new(0usize);
+        let result = model
+            .generate_streaming_with_cancel(
+                "a",
+                &gen_cfg,
+                |_delta| {
+                    on_token_calls.set(on_token_calls.get() + 1);
+                    true
+                },
+                || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    n == 2
+                },
+            )
+            .expect("cancelled-after-prefill generate must succeed");
+        assert!(
+            !result.stopped,
+            "a caller cancellation is not an OpenAI stop condition"
+        );
+        assert_eq!(result.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(
+            result.generated_tokens, 0,
+            "post-prefill cancellation must stop before any token is sampled"
+        );
+        assert!(result.text.is_empty());
+        assert_eq!(
+            on_token_calls.get(),
+            0,
+            "post-prefill cancellation must stop before on_token is ever called"
+        );
+    }
+
+    /// `should_cancel` flipping to `true` at the top of a later decode-loop
+    /// iteration (fast path, no `stop_strings`) must stop generation before
+    /// the `max_new_tokens` cap is reached, keeping the tokens already emitted
+    /// before the flip.
+    ///
+    /// Call count: checkpoint 1 (pre-prefill) = call 1, checkpoint 2
+    /// (post-prefill) = call 2, first decode-loop top = call 3. Flipping true
+    /// at call 3 means the loop never runs its body, so only the one
+    /// pre-loop token (emitted right after prefill, before the decode loop
+    /// starts) is generated.
+    ///
+    /// Mutation sensitivity: removing the decode-loop's `should_cancel` check
+    /// lets generation run to `max_new_tokens` (10), failing
+    /// `generated_tokens == 1`.
+    #[test]
+    fn generate_streaming_with_cancel_mid_decode_stops_early_fast_path() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 10,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let calls = std::cell::Cell::new(0usize);
+        let result = model
+            .generate_streaming_with_cancel(
+                "a",
+                &gen_cfg,
+                |_delta| true,
+                || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    n >= 3
+                },
+            )
+            .expect("mid-decode cancel generate must succeed");
+        assert!(!result.stopped);
+        assert_eq!(result.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(
+            result.generated_tokens, 1,
+            "should_cancel flipping true at the first decode-loop checkpoint must stop \
+             after exactly the one pre-loop token; got {}",
+            result.generated_tokens
+        );
+    }
+
+    /// `on_token` returning `false` on the very first (pre-loop) delta must
+    /// stop generation immediately, in the fast path (no `stop_strings`).
+    ///
+    /// Mutation sensitivity: dropping the `if !on_token(&delta)` early return
+    /// after the pre-loop delta lets generation continue into the decode
+    /// loop, failing `generated_tokens == 1`.
+    #[test]
+    fn generate_streaming_with_cancel_on_token_false_stops_generation_fast_path() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 10,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let result = model
+            .generate_streaming_with_cancel("a", &gen_cfg, |_delta| false, || false)
+            .expect("on_token-false generate must succeed");
+        assert!(!result.stopped);
+        assert_eq!(result.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(
+            result.generated_tokens, 1,
+            "on_token returning false on the very first delta must stop after exactly \
+             one token; got {}",
+            result.generated_tokens
+        );
+    }
+
+    /// Same `on_token`-returns-`false` cancellation, but in the `stop_strings`
+    /// path (`StopStringMatcher`'s sink has no return value, so cancellation
+    /// is threaded through a captured `caller_interrupted` flag instead --
+    /// this test pins that alternate code path independently of the fast
+    /// path above).
+    ///
+    /// Mutation sensitivity: dropping the `caller_interrupted` check after
+    /// the pre-loop `streamer.push` call lets generation continue into the
+    /// decode loop, failing `generated_tokens == 1`.
+    #[test]
+    fn generate_streaming_with_cancel_on_token_false_stops_generation_stop_string_path() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 10,
+            temperature: 0.0,
+            stop_strings: vec!["ZZZZ".to_string()],
+            ..Default::default()
+        };
+        let result = model
+            .generate_streaming_with_cancel("a", &gen_cfg, |_delta| false, || false)
+            .expect("on_token-false generate (stop-string path) must succeed");
+        assert!(!result.stopped);
+        assert_eq!(result.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(
+            result.generated_tokens, 1,
+            "on_token returning false on the very first delta must stop after exactly \
+             one token in the stop-string path too; got {}",
+            result.generated_tokens
+        );
+    }
+
+    /// Same mid-decode `should_cancel` cancellation as the fast-path test
+    /// above, but in the `stop_strings` path -- pins that the decode loop's
+    /// `should_cancel` checkpoint is present in both branches, not just the
+    /// fast path.
+    ///
+    /// Mutation sensitivity: removing the decode-loop's `should_cancel` check
+    /// in the `stop_strings` branch lets generation run to `max_new_tokens`
+    /// (10), failing `generated_tokens == 1`.
+    #[test]
+    fn generate_streaming_with_cancel_mid_decode_stops_early_stop_string_path() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 10,
+            temperature: 0.0,
+            stop_strings: vec!["ZZZZ".to_string()],
+            ..Default::default()
+        };
+        let calls = std::cell::Cell::new(0usize);
+        let result = model
+            .generate_streaming_with_cancel(
+                "a",
+                &gen_cfg,
+                |_delta| true,
+                || {
+                    let n = calls.get() + 1;
+                    calls.set(n);
+                    n >= 3
+                },
+            )
+            .expect("mid-decode cancel generate (stop-string path) must succeed");
+        assert!(!result.stopped);
+        assert_eq!(result.stop_reason, Some(StopReason::Interrupt));
+        assert_eq!(
+            result.generated_tokens, 1,
+            "should_cancel flipping true at the first decode-loop checkpoint must stop \
+             after exactly the one pre-loop token (stop-string path); got {}",
+            result.generated_tokens
+        );
     }
 
     /// Stop-string truncation must drop `token_logprobs` entries whose decoded
