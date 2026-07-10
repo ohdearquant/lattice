@@ -41,20 +41,18 @@ fn test_gpu_trainer_forward() {
         return;
     }
 
-    // Explicit SGD: the only optimizer arm that does not fail loudly (#797 —
-    // Adam/AdamW/SGDMomentum/RMSprop all error until GPU buffer bindings are
-    // wired). This test exercises forward+loss, not the optimizer step.
-    let config = TrainingConfig {
-        optimizer: OptimizerConfig {
-            optimizer: Optimizer::SGD,
-            ..Default::default()
-        },
-        ..TrainingConfig::quick()
-    };
-
+    // #797: every GpuOptimizer arm (Adam/AdamW/SGDMomentum/SGD/RMSprop) now
+    // fails loudly instead of performing a silent no-op update, so the full
+    // `train_batch` pipeline (forward -> backward -> update_weights -> LR
+    // step) can never complete today regardless of optimizer choice. This
+    // test's actual subject is forward-pass + loss computation, not the
+    // optimizer, so it calls `forward_batch`/`compute_loss` directly —
+    // bypassing `update_weights` entirely — to keep verifying exactly what
+    // it verified before, without depending on optimizer behavior that is
+    // honestly unimplemented.
     let mut trainer = GpuTrainerBuilder::new(6, 6)
         .hidden(16, Activation::ReLU)
-        .config(config)
+        .config(TrainingConfig::quick())
         .build()
         .unwrap();
 
@@ -65,10 +63,14 @@ fn test_gpu_trainer_forward() {
     );
 
     let batch = Batch::from_examples(vec![example], 0);
-    let result = trainer.train_batch(&batch);
 
-    assert!(result.is_ok());
-    let loss = result.unwrap();
+    let (outputs, _activations) = trainer
+        .forward_batch(&batch)
+        .expect("forward pass should succeed");
+    let loss = trainer
+        .compute_loss(&outputs, &batch)
+        .expect("loss computation should succeed");
+
     assert!(loss > 0.0);
 }
 
@@ -272,7 +274,7 @@ fn test_update_rmsprop_fails_loud() {
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
-fn test_update_sgd_plain() {
+fn test_update_sgd_fails_loud() {
     if skip_if_no_gpu() {
         return;
     }
@@ -292,15 +294,21 @@ fn test_update_sgd_plain() {
         .build()
         .unwrap();
 
-    for _ in 0..3 {
-        let batch = make_test_batch(2);
-        let result = trainer.train_batch(&batch);
-        assert!(
-            result.is_ok(),
-            "Plain SGD training step failed: {:?}",
-            result.err()
-        );
-    }
+    // #797: plain SGD is not real SGD either — its previous body used a
+    // constant placeholder gradient magnitude (never the actual per-layer
+    // gradients) and had no mutable weight write-back path from GpuNetwork,
+    // so any computed values were always discarded. It must fail loudly
+    // like every other GpuOptimizer arm rather than report success for a
+    // step that changed nothing.
+    let batch = make_test_batch(2);
+    let result = trainer.train_batch(&batch);
+
+    let err = result.expect_err("plain SGD GPU optimizer must fail until it is real SGD");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SGD") && msg.contains("not implemented"),
+        "unexpected error message: {msg}"
+    );
 }
 
 #[test]
@@ -332,14 +340,20 @@ fn test_learning_rate_tracking() {
         return;
     }
 
-    // SGD, not Adam: this test targets learning-rate-schedule tracking, which
-    // is orthogonal to the optimizer's weight-update mechanism. Adam/AdamW/
-    // SGDMomentum/RMSprop all fail loudly until GPU buffer bindings are
-    // wired (#797); SGD is the one arm that still runs `train_batch` to
-    // completion.
+    // #797: every GpuOptimizer arm fails loudly now (none is real yet), so
+    // `train_batch` cannot reach the LR-schedule update line (it runs after
+    // `update_weights()?` in `train_batch`, and `?` returns early on error
+    // regardless of which optimizer is configured). This test's original
+    // assertion — that `current_lr()` reflects the schedule after a batch —
+    // cannot be verified honestly until a real optimizer arm lands, so
+    // instead of dodging via a "harmless" optimizer choice (there isn't
+    // one), this test now asserts what *is* true today: a failed optimizer
+    // step propagates the error and does not silently advance the learning
+    // rate. This is a real, currently-meaningful invariant (no partial/silent
+    // state drift on failure), not a weakened stand-in for LR tracking.
     let config = TrainingConfig {
         optimizer: OptimizerConfig {
-            optimizer: Optimizer::SGD,
+            optimizer: Optimizer::Adam,
             learning_rate: 0.001,
             ..Default::default()
         },
@@ -356,10 +370,20 @@ fn test_learning_rate_tracking() {
     assert!((initial_lr - 0.001).abs() < 1e-6);
 
     let batch = make_test_batch(2);
-    trainer.train_batch(&batch).unwrap();
+    let result = trainer.train_batch(&batch);
+    assert!(
+        result.is_err(),
+        "train_batch must fail until a real GPU optimizer arm lands (#797)"
+    );
 
-    let updated_lr = trainer.current_lr();
-    assert!(updated_lr > 0.0);
+    // current_lr must be untouched: the LR-schedule assignment in
+    // `train_batch` runs strictly after the optimizer-update `?`, so a
+    // failed update must never advance it.
+    let lr_after_failed_step = trainer.current_lr();
+    assert!(
+        (lr_after_failed_step - initial_lr).abs() < 1e-9,
+        "learning rate must not change on a failed optimizer step: {initial_lr} -> {lr_after_failed_step}"
+    );
 }
 
 #[test]

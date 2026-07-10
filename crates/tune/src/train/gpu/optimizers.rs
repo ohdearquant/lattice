@@ -1,4 +1,11 @@
 //! GPU optimizer implementations
+//!
+//! Every `GpuOptimizer` arm (Adam, AdamW, SGD-momentum, plain SGD, RMSprop)
+//! currently fails loudly with `TuneError::Training` rather than performing a
+//! real weight update: the shader-based arms have no buffer bindings wired
+//! to the network's weight/gradient buffers, and the CPU-side plain-SGD arm
+//! has neither real gradient plumbing nor a mutable weight write-back path.
+//! See #797. Wiring the real dispatch/write-back is tracked follow-up work.
 
 use super::state::LayerGradients;
 use crate::error::{Result, TuneError};
@@ -84,7 +91,9 @@ impl GpuOptimizer {
             Optimizer::SGD => Self::update_sgd(network, current_lr)?,
             Optimizer::RMSprop => {
                 return Err(TuneError::Training(
-                    "GPU RMSprop optimizer not implemented; select SGD explicitly (#797)"
+                    "GPU RMSprop optimizer not implemented: this arm previously silently \
+                     substituted plain SGD instead of running the requested algorithm; every \
+                     GpuOptimizer arm fails loudly until real buffer/gradient wiring lands (#797)"
                         .to_string(),
                 ));
             }
@@ -105,34 +114,23 @@ impl GpuOptimizer {
 
     /// Plain SGD update (CPU fallback - no shader for plain SGD)
     ///
-    /// NOTE (#797 follow-up, out of scope for this fix): this arm computes
-    /// updated weights/biases but `GpuNetwork` exposes only an immutable
-    /// `cpu_network()` accessor, so the computed values are never written
-    /// back — this is untouched, pre-existing behavior, tracked separately
-    /// from the shader-dispatch fail-loud fix above.
-    fn update_sgd(network: &lattice_fann::gpu::GpuNetwork, current_lr: f32) -> Result<()> {
-        // Plain SGD without momentum - apply on CPU
-        // This is a simple w = w - lr * grad
-        let cpu_network = network.cpu_network();
-
-        for layer in cpu_network.layers().iter() {
-            let mut weights = layer.weights().to_vec();
-            let mut biases = layer.biases().to_vec();
-
-            // Simple gradient descent
-            let grad_scale = 0.01; // Placeholder gradient magnitude
-
-            for w in weights.iter_mut() {
-                *w -= current_lr * grad_scale;
-            }
-            for b in biases.iter_mut() {
-                *b -= current_lr * grad_scale;
-            }
-
-            // Write back (would need mutable network access)
-            let _ = (weights, biases); // Silence unused warning for now
-        }
-
-        Ok(())
+    /// # Errors
+    ///
+    /// Always returns `TuneError::Training`: this is not real SGD (#797).
+    /// The previous body used a constant placeholder gradient magnitude
+    /// (`grad_scale = 0.01`) instead of the actual per-layer gradients
+    /// accumulated in `LayerGradients`, and had no mutable write-back path
+    /// from `GpuNetwork` (only the immutable `cpu_network()` accessor
+    /// exists) even if it had used real gradients — so the computed values
+    /// were always discarded. A working plain-SGD arm needs both real
+    /// gradient plumbing and a mutable weight-write path on `GpuNetwork`;
+    /// until then it fails loudly like every other arm rather than
+    /// reporting success for a step that changed nothing.
+    fn update_sgd(_network: &lattice_fann::gpu::GpuNetwork, _current_lr: f32) -> Result<()> {
+        Err(TuneError::Training(
+            "GPU SGD optimizer update not implemented: no real gradient plumbing or mutable \
+             weight write-back from GpuNetwork is wired (#797)"
+                .to_string(),
+        ))
     }
 }
