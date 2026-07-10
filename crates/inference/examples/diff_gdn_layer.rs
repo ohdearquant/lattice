@@ -99,7 +99,25 @@ fn main() {
         eps,
     );
     let mut mat_out = vec![0.0f32; seq_len * hidden];
-    gdn_forward_save(&normed, gdn_w, cfg, &mut saved, &mut mat_out);
+    gdn_forward_save(
+        &normed,
+        gdn_w,
+        cfg,
+        &mut saved,
+        &mut mat_out,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        0.0,
+    );
 
     assert_eq!(mat_out.len(), real_out.len(), "output length mismatch");
     let (mut max_diff, mut argmax) = (0.0f32, 0usize);
