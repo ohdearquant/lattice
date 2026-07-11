@@ -1381,12 +1381,10 @@ mod inner {
     }
 
     /// Compiled MSL pipeline state objects.
-    #[allow(dead_code)] // pipeline handles for kernels staged for future dispatch paths
     pub(crate) struct MetalQwen35Pipelines {
         gemv_decode: ComputePipelineState,
         gemv_decode_wide: ComputePipelineState,
         gemv_q8: ComputePipelineState,
-        gemv_q8_wide: ComputePipelineState,
         rms_norm: ComputePipelineState,
         partial_rope: ComputePipelineState,
         per_head_rms_norm: ComputePipelineState,
@@ -1416,11 +1414,9 @@ mod inner {
         fused_residual_add_norm_batch: ComputePipelineState,
         gemm_q8: ComputePipelineState,
         gemm_q8_tiled: Option<ComputePipelineState>,
-        topk_first_pass: ComputePipelineState,
         topk_merge_pass: ComputePipelineState,
         argmax_first: ComputePipelineState,
         argmax_merge: ComputePipelineState,
-        topk_fast_first: ComputePipelineState,
         // Hierarchical k=50 SIMD-group tournament kernels (R2)
         topk_select50_first: ComputePipelineState,
         topk_select50_merge: ComputePipelineState,
@@ -2466,132 +2462,22 @@ mod inner {
 
     /// Convert f32 to IEEE-754 half-precision (f16) stored as u16 bits.
     ///
-    /// Handles signed zero, subnormals, infinities, and NaN. Uses round-to-nearest-even
-    /// for the mantissa truncation to minimize systematic bias.
+    /// Thin wrapper over the single always-compiled scalar encoder in
+    /// [`crate::weights::half_bits`] (lattice#799) — this module used to
+    /// carry its own independent copy of the bit-twiddling arithmetic.
     #[inline]
     fn f32_to_f16(x: f32) -> u16 {
-        let bits = x.to_bits();
-        let sign = ((bits >> 16) & 0x8000) as u16;
-        let exp = ((bits >> 23) & 0xff) as i32;
-        let frac = bits & 0x007f_ffff;
-
-        // Inf or NaN
-        if exp == 0xff {
-            if frac == 0 {
-                return sign | 0x7c00; // infinity
-            }
-            // NaN: preserve some payload, ensure it stays NaN
-            let mut payload = ((frac >> 13) as u16) & 0x03ff;
-            if payload == 0 {
-                payload = 1; // quiet NaN needs nonzero mantissa
-            }
-            payload |= 0x0200; // set quiet bit
-            return sign | 0x7c00 | payload;
-        }
-
-        // Zero or f32 subnormal (becomes f16 zero)
-        if exp == 0 {
-            return sign;
-        }
-
-        let exp32 = exp - 127; // unbiased exponent
-
-        // Overflow to infinity
-        if exp32 > 15 {
-            return sign | 0x7c00;
-        }
-
-        // Normal f16 range
-        if exp32 >= -14 {
-            let mut exp16 = (exp32 + 15) as u16;
-            let mut frac16 = round_shift_right_even(frac, 13) as u16;
-
-            // Mantissa overflow -> carry into exponent
-            if frac16 == 0x0400 {
-                frac16 = 0;
-                exp16 += 1;
-                if exp16 >= 0x1f {
-                    return sign | 0x7c00; // overflow to infinity
-                }
-            }
-
-            return sign | (exp16 << 10) | frac16;
-        }
-
-        // Subnormal f16 range
-        let mant = frac | 0x0080_0000; // add implicit 1
-        let shift = (-exp32 - 1) as u32;
-        if shift >= 32 {
-            return sign; // underflow to zero
-        }
-
-        let frac16 = round_shift_right_even(mant, shift) as u16;
-        if frac16 == 0 {
-            return sign;
-        }
-        // If rounding carried into exponent bit, it becomes smallest normal
-        if frac16 == 0x0400 {
-            return sign | 0x0400;
-        }
-
-        sign | frac16
-    }
-
-    /// Round-to-nearest-even right shift for mantissa truncation.
-    #[inline]
-    fn round_shift_right_even(value: u32, shift: u32) -> u32 {
-        if shift == 0 {
-            return value;
-        }
-        if shift >= 32 {
-            return 0;
-        }
-
-        let base = value >> shift;
-        let mask = (1u32 << shift) - 1;
-        let remainder = value & mask;
-        let half = 1u32 << (shift - 1);
-
-        if remainder > half || (remainder == half && (base & 1) != 0) {
-            base + 1
-        } else {
-            base
-        }
+        crate::weights::half_bits::f32_to_f16_bits(x)
     }
 
     /// Convert f16 bits (u16) back to f32.
     ///
     /// Used for CPU-side reads of f16 weight buffers when needed (e.g., small
-    /// GDN projections dispatched on CPU).
+    /// GDN projections dispatched on CPU). Thin wrapper over
+    /// [`crate::weights::half_bits::f16_bits_to_f32`] (lattice#799).
     #[inline]
     fn f16_to_f32(bits: u16) -> f32 {
-        let sign = ((bits >> 15) & 0x1) as u32;
-        let exp = ((bits >> 10) & 0x1f) as u32;
-        let frac = (bits & 0x03ff) as u32;
-
-        let f32_bits = match (exp, frac) {
-            // Zero
-            (0, 0) => sign << 31,
-            // Subnormal
-            (0, _) => {
-                let mut mant = frac;
-                let mut e = -14i32;
-                while (mant & 0x0400) == 0 {
-                    mant <<= 1;
-                    e -= 1;
-                }
-                mant &= 0x03ff;
-                (sign << 31) | (((e + 127) as u32) << 23) | (mant << 13)
-            }
-            // Infinity
-            (0x1f, 0) => (sign << 31) | 0x7f80_0000,
-            // NaN
-            (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13),
-            // Normal
-            _ => (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
-        };
-
-        f32::from_bits(f32_bits)
+        crate::weights::half_bits::f16_bits_to_f32(bits)
     }
 
     /// Convert a contiguous slice of IEEE-754 half-precision values (stored as u16 bits)
@@ -2994,7 +2880,6 @@ mod inner {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
                 gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
@@ -3040,11 +2925,9 @@ mod inner {
                 fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
                 gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_first_pass: make_pipeline("logits_topk_first_pass")?,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
                 argmax_first: make_pipeline("logits_argmax_first")?,
                 argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_fast_first: make_pipeline("logits_topk_fast_first")?,
                 topk_select50_first: make_pipeline("logits_topk_select50_first")?,
                 topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
                 decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
@@ -13865,7 +13748,6 @@ mod inner {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
                 gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
@@ -13911,11 +13793,9 @@ mod inner {
                 fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
                 gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_first_pass: make_pipeline("logits_topk_first_pass")?,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
                 argmax_first: make_pipeline("logits_argmax_first")?,
                 argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_fast_first: make_pipeline("logits_topk_fast_first")?,
                 topk_select50_first: make_pipeline("logits_topk_select50_first")?,
                 topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
                 decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
