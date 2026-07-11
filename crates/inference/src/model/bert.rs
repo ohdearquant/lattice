@@ -1217,7 +1217,7 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    #[ignore]
+    #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn test_encode_output_shape_and_l2_norm() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
@@ -1237,7 +1237,7 @@ mod tests {
     /// fallback). Asserts the from-bytes embedding matches `from_directory`'s
     /// output for the same model bit-for-bit within float tolerance.
     #[test]
-    #[ignore]
+    #[ignore = "requires LATTICE_INFERENCE_BYTES_MODEL_DIR"]
     fn test_from_bytes_matches_from_directory() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_BYTES_MODEL_DIR") else {
             return;
@@ -1300,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn test_encode_batch_matches_per_item_encode_mixed_lengths() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn test_encode_batch_boundary_max_and_min_length() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
@@ -1435,7 +1435,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[ignore]
+    #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn encode_batch_packed_matches_padded() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
@@ -1657,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn test_ffn_intermediate_lora_delta_lands_before_gelu() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
