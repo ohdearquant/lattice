@@ -775,7 +775,9 @@ fn convert_f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks_exact(2) {
-        out.push(f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])));
+        out.push(crate::weights::half_bits::f16_bits_to_f32(
+            u16::from_le_bytes([chunk[0], chunk[1]]),
+        ));
     }
     out
 }
@@ -785,40 +787,11 @@ fn convert_bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for chunk in bytes.chunks_exact(2) {
-        out.push(bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])));
+        out.push(crate::weights::half_bits::bf16_bits_to_f32(
+            u16::from_le_bytes([chunk[0], chunk[1]]),
+        ));
     }
     out
-}
-
-#[cfg(feature = "f16")]
-fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
-}
-
-#[cfg(feature = "f16")]
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 0x1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x03ff) as u32;
-
-    let f32_bits = match (exp, frac) {
-        (0, 0) => sign << 31,
-        (0, _) => {
-            let mut mant = frac;
-            let mut e = -14i32;
-            while (mant & 0x0400) == 0 {
-                mant <<= 1;
-                e -= 1;
-            }
-            mant &= 0x03ff;
-            (sign << 31) | (((e + 127) as u32) << 23) | (mant << 13)
-        }
-        (0x1f, 0) => (sign << 31) | 0x7f80_0000,
-        (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13),
-        _ => (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
-    };
-
-    f32::from_bits(f32_bits)
 }
 
 /// Owned backing store for Qwen weights loaded from a sharded checkpoint.

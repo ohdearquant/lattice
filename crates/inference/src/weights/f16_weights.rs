@@ -18,11 +18,7 @@
 use crate::error::InferenceError;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::weights::SafetensorsFile;
-
-const F16_SIGN_MASK: u16 = 0x8000;
-const F16_EXP_MASK: u16 = 0x7c00;
-const F16_FRAC_MASK: u16 = 0x03ff;
-const F16_IMPLICIT_ONE: u32 = 0x0080_0000;
+use crate::weights::half_bits::{f16_bits_to_f32, f32_to_f16_bits};
 
 /// **Unstable**: IEEE 754 half-precision float wrapper; used for bandwidth-efficient weight storage.
 ///
@@ -54,114 +50,6 @@ impl F16 {
     pub fn to_f32(self) -> f32 {
         f16_bits_to_f32(self.0)
     }
-}
-
-#[inline]
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 0x1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & F16_FRAC_MASK) as u32;
-
-    let f32_bits = match (exp, frac) {
-        (0, 0) => sign << 31,
-        (0, _) => {
-            let mut mant = frac;
-            let mut e = -14i32;
-            while (mant & 0x0400) == 0 {
-                mant <<= 1;
-                e -= 1;
-            }
-            mant &= 0x03ff;
-            (sign << 31) | (((e + 127) as u32) << 23) | (mant << 13)
-        }
-        (0x1f, 0) => (sign << 31) | 0x7f80_0000,
-        (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13),
-        _ => (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
-    };
-
-    f32::from_bits(f32_bits)
-}
-
-#[inline]
-fn round_shift_right_even(value: u32, shift: u32) -> u32 {
-    if shift == 0 {
-        return value;
-    }
-    if shift >= 32 {
-        return 0;
-    }
-
-    let base = value >> shift;
-    let mask = (1u32 << shift) - 1;
-    let remainder = value & mask;
-    let half = 1u32 << (shift - 1);
-
-    if remainder > half || (remainder == half && (base & 1) != 0) {
-        base + 1
-    } else {
-        base
-    }
-}
-
-#[inline]
-fn f32_to_f16_bits(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 16) as u16) & F16_SIGN_MASK;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let frac = bits & 0x007f_ffff;
-
-    if exp == 0xff {
-        if frac == 0 {
-            return sign | F16_EXP_MASK;
-        }
-        let mut payload = (frac >> 13) as u16;
-        if payload == 0 {
-            payload = 1;
-        }
-        payload |= 0x0200;
-        return sign | F16_EXP_MASK | (payload & F16_FRAC_MASK);
-    }
-
-    if exp == 0 {
-        return sign;
-    }
-
-    let exp32 = exp - 127;
-
-    if exp32 > 15 {
-        return sign | F16_EXP_MASK;
-    }
-
-    if exp32 >= -14 {
-        let mut exp16 = (exp32 + 15) as u16;
-        let mut frac16 = round_shift_right_even(frac, 13) as u16;
-
-        if frac16 == 0x0400 {
-            frac16 = 0;
-            exp16 += 1;
-            if exp16 >= 0x1f {
-                return sign | F16_EXP_MASK;
-            }
-        }
-
-        return sign | (exp16 << 10) | frac16;
-    }
-
-    let mant = frac | F16_IMPLICIT_ONE;
-    let shift = (-exp32 - 1) as u32;
-    if shift >= 32 {
-        return sign;
-    }
-
-    let frac16 = round_shift_right_even(mant, shift) as u16;
-    if frac16 == 0 {
-        return sign;
-    }
-    if frac16 == 0x0400 {
-        return sign | 0x0400;
-    }
-
-    sign | frac16
 }
 
 /// **Unstable**: bulk f16-to-f32 conversion; SIMD path selection may change.
