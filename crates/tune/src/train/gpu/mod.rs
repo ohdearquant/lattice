@@ -21,6 +21,19 @@ use std::sync::Arc;
 ///
 /// Provides GPU-accelerated forward/backward passes and weight updates
 /// using lattice-fann's wgpu backend.
+///
+/// # Current limitation
+///
+/// [`Self::train_batch`] returns `Err(TuneError::Training(_))` for every
+/// optimizer choice (Adam, AdamW, SGD-momentum, plain SGD, RMSprop): the
+/// GPU-shader optimizer dispatch has no buffer bindings wired to the
+/// network's weight/gradient buffers, and the CPU-side plain-SGD arm has
+/// neither real gradient plumbing nor a mutable weight write-back path.
+/// Forward pass and loss computation work correctly — [`Self::validate`] is
+/// a forward-only path that does not touch the optimizer. Only the
+/// weight-update step is unimplemented. See
+/// <https://github.com/ohdearquant/lattice/issues/797>. This note will be
+/// removed once that wiring lands.
 pub struct GpuTrainer {
     /// GPU context (device, queue, shader manager)
     ctx: Arc<GpuContext>,
@@ -180,8 +193,6 @@ impl GpuTrainer {
     ///
     /// Returns the batch loss.
     pub fn train_batch(&mut self, batch: &Batch) -> Result<f32> {
-        self.global_step += 1;
-
         // Forward pass
         let (outputs, activations) = self.forward_batch(batch)?;
 
@@ -203,6 +214,14 @@ impl GpuTrainer {
 
         // Update weights
         self.update_weights()?;
+
+        // Only a fully completed step (forward + backward + optimizer
+        // update all succeeded) counts toward global_step/LR/epoch
+        // accounting. A failed step above must not advance this counter —
+        // see #797: every GpuOptimizer arm currently errors until real
+        // buffer/gradient wiring lands, so this guards against every
+        // failed call silently inflating the step count.
+        self.global_step += 1;
 
         // Update learning rate
         self.current_lr = self.config.lr_schedule.get_lr(
