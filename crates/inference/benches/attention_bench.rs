@@ -425,7 +425,7 @@ fn run_benchmark() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manual benchmark, not a correctness gate"]
 fn attention_benchmark() {
     run_benchmark();
 }
