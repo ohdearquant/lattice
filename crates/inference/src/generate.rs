@@ -11,6 +11,43 @@
 //!                        ↓                           ↓
 //!                   fill KV cache              append to KV cache
 //! ```
+//!
+//! # Deprecated (since 0.5.1, removal targeted for 0.6.0)
+//!
+//! This module's decode loop (built on [`crate::model::QwenModel`]/[`crate::model::QwenConfig`])
+//! is repository-dead: an exact-reference sweep of the workspace finds no production caller
+//! (bin, example, library, or app), only this module's own tests, doc comments, and a benchmark
+//! wrapper around its unrelated `compute_attention` internals. It duplicates the canonical
+//! Qwen3.5 decode loop ([`crate::model::Qwen35Model::generate`] /
+//! [`crate::model::Qwen35Model::generate_streaming`]), which has been the actively maintained
+//! path since PR #680 wired the batched-prefill core directly into it.
+//!
+//! **Embedding users** (consumers of [`crate::model::QwenModel`] via `lattice-embed`) are
+//! unaffected by this deprecation — `QwenModel::encode` is live production code (ADR-017) and
+//! nothing it depends on is being removed. Only the generic text-decode stack built on top of it
+//! (`generate`, `GenerateConfig`, `GenerateOutput` — all in this module) is being retired.
+//!
+//! **Text-generation users** should migrate to [`crate::model::Qwen35Model::generate`] /
+//! [`crate::model::Qwen35Model::generate_streaming`] and [`crate::model::GenerateConfig`] (the
+//! Qwen3.5 model's own config type, distinct from this module's `GenerateConfig`). The two
+//! `GenerateConfig`/`GenerateOutput` pairs are **not** drop-in compatible; verified field-by-field
+//! mapping (read at source, `crates/inference/src/model/qwen35_config.rs`):
+//!
+//! | This module (`crate::generate::GenerateConfig`) | Canonical (`crate::model::GenerateConfig`) | Notes |
+//! |---|---|---|
+//! | `max_new_tokens: usize` | `max_new_tokens: usize` | same name and meaning |
+//! | `sampling: SamplingConfig` | `temperature`, `top_k`, `top_p`, `repetition_penalty` | canonical flattens the nested `SamplingConfig` into top-level fields |
+//! | `eos_token_id: Option<u32>` | *(none — read from `Qwen35Config::eos_token_id`)* | canonical EOS is fixed per loaded model, not per-request; use `stop_token_ids: Vec<u32>` for additional per-request stop tokens |
+//! | `include_prompt: bool` | *(no equivalent)* | canonical `generate`/`generate_streaming` **always** exclude the prompt from `GenerateOutput::text`/`token_ids` — there is no option to include it. A caller relying on `include_prompt = true` must prepend the prompt string to `GenerateOutput::text` itself after calling the canonical path. |
+//! | `grammar: Option<Arc<GrammarEngine>>` | `grammar: Option<Arc<GrammarEngine>>` | same name and type |
+//! | `kv_cache_capacity: Option<usize>` | *(no equivalent)* | canonical path sizes its KV cache from `prompt_len` + the effective decode cap; there is no opt-in per-request cache-capacity clamp |
+//!
+//! `GenerateOutput`'s `stop_reason`/stop-token-exclusion contract is unchanged in the canonical
+//! type (see `crates/inference/src/stop_token_contract.rs`), so no migration is needed there
+//! beyond the field differences above.
+//!
+//! Both APIs in this module continue to work exactly as before during the deprecation window —
+//! this is a notice-only change, not a behavior change.
 
 use crate::attention::gqa::GqaConfig;
 use crate::error::InferenceError;
@@ -24,6 +61,14 @@ use std::sync::Arc;
 
 /// **Unstable**: text generation configuration; fields and defaults are
 /// subject to change as the generation API matures.
+#[deprecated(
+    since = "0.5.1",
+    note = "crate::generate is repository-dead and duplicates the canonical Qwen3.5 decode loop; \
+            text-generation users should migrate to Qwen35Model::generate / generate_streaming \
+            with model::GenerateConfig (embedding users of QwenModel are unaffected). \
+            See the module-level migration guide in crates/inference/src/generate.rs. \
+            Scheduled for removal in 0.6.0."
+)]
 #[derive(Clone)]
 pub struct GenerateConfig {
     /// Maximum number of new tokens to generate.
@@ -55,6 +100,7 @@ pub struct GenerateConfig {
     pub kv_cache_capacity: Option<usize>,
 }
 
+#[allow(deprecated)] // Self is already deprecated; this impl only needs to keep compiling during the window (issue #807)
 impl std::fmt::Debug for GenerateConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GenerateConfig")
@@ -68,6 +114,7 @@ impl std::fmt::Debug for GenerateConfig {
     }
 }
 
+#[allow(deprecated)] // Self is already deprecated; this impl only needs to keep compiling during the window (issue #807)
 impl Default for GenerateConfig {
     fn default() -> Self {
         Self {
@@ -91,6 +138,14 @@ impl Default for GenerateConfig {
 /// in this crate honours this contract (see the `stop_token_contract` test
 /// module for the cross-path regression sweep). `generated_tokens` always
 /// equals `token_ids.len()`.
+#[deprecated(
+    since = "0.5.1",
+    note = "crate::generate is repository-dead and duplicates the canonical Qwen3.5 decode loop; \
+            text-generation users should migrate to Qwen35Model::generate / generate_streaming \
+            with model::qwen35_config::GenerateOutput (embedding users of QwenModel are unaffected). \
+            See the module-level migration guide in crates/inference/src/generate.rs. \
+            Scheduled for removal in 0.6.0."
+)]
 #[derive(Debug)]
 pub struct GenerateOutput {
     /// The generated text (excluding prompt unless include_prompt is set).
@@ -409,6 +464,15 @@ fn has_finite_logit(logits: &[f32]) -> bool {
 /// Qwen3 models tie `lm_head` weights with `embed_tokens` (transposed).
 /// The logits are computed as: `logits = hidden_state @ embed_tokens^T`.
 /// This avoids loading a separate lm_head weight.
+#[deprecated(
+    since = "0.5.1",
+    note = "crate::generate::generate is repository-dead and duplicates the canonical Qwen3.5 \
+            decode loop; text-generation users should migrate to Qwen35Model::generate / \
+            generate_streaming (embedding users of QwenModel are unaffected). \
+            See the module-level migration guide in crates/inference/src/generate.rs. \
+            Scheduled for removal in 0.6.0."
+)]
+#[allow(deprecated)] // body reads/constructs the equally-deprecated GenerateConfig/GenerateOutput fields (issue #807)
 pub fn generate(
     model: &QwenModel,
     prompt: &str,
@@ -1228,6 +1292,7 @@ pub mod bench_support {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // covers this deprecation window's own regression tests (issue #807)
 mod tests {
     use super::*;
 
