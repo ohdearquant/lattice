@@ -276,10 +276,12 @@ helpers (`metal_gpu_required_message`, `unrecognized_format_message`) moved, unm
 behavior, into a new `crates/inference/src/model_format.rs` — a `pub mod` of the library crate
 rather than a `pub(crate)` module of one binary, because separate Cargo `[[bin]]` targets
 (`lattice`, `lattice_serve`, `chat_metal`) cannot see one another's `pub(crate)` items; only a
-library module is visible to all three. The module is documented unstable and
-internal-binaries-only (not part of the crate's public API surface) rather than hidden behind
-`#[doc(hidden)]`, matching the existing convention set by the C2 `serve` module (also a
-cross-binary-only shared contract, also a plain documented `pub mod`, not `#[doc(hidden)]`).
+library module is visible to all three. The module is a plain `pub mod` (externally nameable,
+so public for semver purposes) documented as unstable and internal-use, with compatibility
+following the crate's Experimental stability policy rather than semver-relevant deprecation
+cycles, rather than hidden behind `#[doc(hidden)]`, matching the existing convention set by the
+C2 `serve` module (also a cross-binary-only shared contract, also a plain documented `pub mod`,
+not `#[doc(hidden)]`).
 All three binaries now `match` on the shared `ModelFormat` enum (`Safetensors | Q4 | Unknown`)
 instead of a bespoke boolean or a partial re-check; the message helpers give `lattice_serve.rs`
 and `chat_metal.rs` the same fail-closed `Unknown`-directory error `lattice.rs` already had,

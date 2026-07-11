@@ -70,6 +70,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model_format::{ModelFormat, detect_format};
     use lattice_inference::tokenizer::{BpeTokenizer, Tokenizer};
 
     let home = std::env::var("HOME")?;
@@ -111,19 +112,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let max_ctx = grid.iter().copied().max().unwrap_or(512);
 
-    // Detect Q4 dir (same heuristic as bench_decode_ab).
-    let is_q4_dir = !dir.join("model.safetensors").exists()
-        && std::fs::read_dir(dir)
-            .ok()
-            .and_then(|mut entries| {
-                entries.find(|e| {
-                    e.as_ref()
-                        .ok()
-                        .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".q4")))
-                        .unwrap_or(false)
-                })
-            })
-            .is_some();
+    // Detect Q4 dir via the canonical detector (same dispatch as bench_decode_ab).
+    // Unknown falls through to the safetensors branch below, matching this
+    // binary's pre-existing two-way (Q4 / not-Q4) behavior exactly.
+    let is_q4 = matches!(detect_format(dir), ModelFormat::Q4);
 
     let tokenizer_dir_str =
         std::env::var("LATTICE_TOKENIZER_DIR").unwrap_or_else(|_| model_dir_str.clone());
@@ -131,7 +123,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "[slopefit] loading {model_dir_str} ({})",
-        if is_q4_dir { "Q4" } else { "safetensors" }
+        if is_q4 { "Q4" } else { "safetensors" }
     );
 
     // Tokenizer first — the KV cache must hold the *padded* prompt, and the pad
@@ -165,7 +157,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Load model — same dual ownership pattern as bench_decode_ab.
     let mut metal: MetalQwen35State;
 
-    if is_q4_dir {
+    if is_q4 {
         let cfg = if dir.join("config.json").exists() {
             Qwen35Config::from_config_json(&dir.join("config.json"))
                 .map_err(|e| format!("config.json parse: {e}"))?

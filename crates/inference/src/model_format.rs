@@ -5,10 +5,12 @@
 //! `chat_metal`) -- which are separate Cargo binary targets and therefore
 //! cannot see one another's `pub(crate)` items -- can share a single
 //! model-directory format decision instead of each carrying its own copy. It
-//! is not part of `lattice-inference`'s documented public API and may change
-//! shape without a semver-relevant deprecation cycle; downstream consumers of
-//! this crate should go through [`crate::model`] and [`crate::forward`]
-//! instead. See the crate-level `Stability tier: Experimental` note in
+//! is public but unstable and internal-use: `pub mod model_format` is
+//! externally nameable, but its compatibility follows the crate's
+//! Experimental stability policy rather than semver-relevant deprecation
+//! cycles, and it may change shape at any time; downstream consumers of this
+//! crate should go through [`crate::model`] and [`crate::forward`] instead.
+//! See the crate-level `Stability tier: Experimental` note in
 //! `lib.rs` and `docs/adr/ADR-080-consolidation-duplicated-contracts.md`
 //! (implementation record amendment) for the full rationale.
 //!
