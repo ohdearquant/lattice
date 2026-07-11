@@ -628,6 +628,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::model::qwen35_config::{
         GenerateConfig, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
     };
+    use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use std::io::Write;
 
@@ -703,19 +704,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir = model_dir.as_path();
 
-    let is_q4_dir = !dir.join("model.safetensors").exists()
-        && !dir.join("model.safetensors.index.json").exists()
-        && std::fs::read_dir(dir)
-            .ok()
-            .and_then(|mut entries| {
-                entries.find(|e| {
-                    e.as_ref()
-                        .ok()
-                        .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".q4")))
-                        .unwrap_or(false)
-                })
-            })
-            .is_some();
+    let format = model_format::detect_format(dir);
 
     // Tokenizer lives alongside the model; for Q4 models --tokenizer-dir or env var override.
     let tokenizer_dir_str = parse_arg(&args, "--tokenizer-dir")
@@ -735,58 +724,59 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ── Load model ───────────────────────────────────────────────────────────
 
     let mut metal;
-    let model_format; // "bf16" | "q4"
+    let model_format_label; // "bf16" | "q4"
 
-    if is_q4_dir {
-        eprintln!(
-            "[chat_metal] Detected Q4 model directory: {}",
-            dir.display()
-        );
-        let cfg = if dir.join("config.json").exists() {
-            Qwen35Config::from_config_json(&dir.join("config.json"))
-                .map_err(|e| format!("failed to parse config.json: {e}"))?
-        } else {
-            eprintln!("[chat_metal] No config.json; using qwen36_27b preset");
-            Qwen35Config::qwen36_27b()
-        };
-        eprintln!("[chat_metal] Loading Q4 model...");
-        let t0 = std::time::Instant::now();
-        metal =
-            MetalQwen35State::from_q4_dir(dir, &tokenizer_dir.join("tokenizer.json"), &cfg, 4096)
-                .map_err(|e| format!("failed to initialize Metal from Q4 dir: {e}"))?;
-        eprintln!(
-            "[chat_metal] Q4 model loaded in {:.1}s",
-            t0.elapsed().as_secs_f64()
-        );
-        model_format = "q4";
-    } else {
-        if !dir.join("model.safetensors").exists()
-            && !dir.join("model.safetensors.index.json").exists()
-        {
-            return Err(format!(
-                "no model found at {} (expected model.safetensors or .q4 files)",
+    match format {
+        ModelFormat::Q4 => {
+            eprintln!(
+                "[chat_metal] Detected Q4 model directory: {}",
                 dir.display()
+            );
+            let cfg = if dir.join("config.json").exists() {
+                Qwen35Config::from_config_json(&dir.join("config.json"))
+                    .map_err(|e| format!("failed to parse config.json: {e}"))?
+            } else {
+                eprintln!("[chat_metal] No config.json; using qwen36_27b preset");
+                Qwen35Config::qwen36_27b()
+            };
+            eprintln!("[chat_metal] Loading Q4 model...");
+            let t0 = std::time::Instant::now();
+            metal = MetalQwen35State::from_q4_dir(
+                dir,
+                &tokenizer_dir.join("tokenizer.json"),
+                &cfg,
+                4096,
             )
-            .into());
+            .map_err(|e| format!("failed to initialize Metal from Q4 dir: {e}"))?;
+            eprintln!(
+                "[chat_metal] Q4 model loaded in {:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
+            model_format_label = "q4";
         }
-        eprintln!("[chat_metal] Loading bf16 model from {}...", dir.display());
-        let t0 = std::time::Instant::now();
-        let model =
-            Qwen35Model::from_safetensors(dir).map_err(|e| format!("failed to load model: {e}"))?;
-        let cfg = model.config().clone();
-        eprintln!(
-            "[chat_metal] Model loaded in {:.1}s",
-            t0.elapsed().as_secs_f64()
-        );
-        eprintln!("[chat_metal] Initializing Metal GPU...");
-        let t1 = std::time::Instant::now();
-        metal = MetalQwen35State::new(model.weights(), &cfg, 4096)
-            .map_err(|e| format!("failed to init Metal: {e}"))?;
-        eprintln!(
-            "[chat_metal] Metal ready in {:.1}s",
-            t1.elapsed().as_secs_f64()
-        );
-        model_format = "bf16";
+        ModelFormat::Safetensors => {
+            eprintln!("[chat_metal] Loading bf16 model from {}...", dir.display());
+            let t0 = std::time::Instant::now();
+            let model = Qwen35Model::from_safetensors(dir)
+                .map_err(|e| format!("failed to load model: {e}"))?;
+            let cfg = model.config().clone();
+            eprintln!(
+                "[chat_metal] Model loaded in {:.1}s",
+                t0.elapsed().as_secs_f64()
+            );
+            eprintln!("[chat_metal] Initializing Metal GPU...");
+            let t1 = std::time::Instant::now();
+            metal = MetalQwen35State::new(model.weights(), &cfg, 4096)
+                .map_err(|e| format!("failed to init Metal: {e}"))?;
+            eprintln!(
+                "[chat_metal] Metal ready in {:.1}s",
+                t1.elapsed().as_secs_f64()
+            );
+            model_format_label = "bf16";
+        }
+        ModelFormat::Unknown => {
+            return Err(model_format::unrecognized_format_message(dir).into());
+        }
     }
 
     // ── Load LoRA adapter (if requested) ────────────────────────────────────
@@ -925,7 +915,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &mut metal,
                     &tokenizer,
                     &req_cfg,
-                    model_format,
+                    model_format_label,
                     lora_tag,
                 ) {
                     eprintln!("[chat_metal] serve: generation stopped: {e}");
@@ -947,7 +937,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &mut metal,
             &tokenizer,
             &gen_cfg,
-            model_format,
+            model_format_label,
             lora_tag,
         )?;
         return Ok(());
@@ -958,7 +948,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use std::io::BufRead;
 
     let lora_tag = if has_lora { "+LoRA" } else { "" };
-    eprintln!("\n=== GPU Metal {model_format}{lora_tag} — Qwen3.5 Chat ===");
+    eprintln!("\n=== GPU Metal {model_format_label}{lora_tag} — Qwen3.5 Chat ===");
     eprintln!("Type your message. Empty line or Ctrl-D to quit.\n");
 
     let system_msg = ChatMessage::system("You are a helpful assistant. Be concise and direct.");
@@ -1025,7 +1015,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             0.0
         };
         eprintln!(
-            "[{} prompt + {} gen in {:.1}ms = {:.1} tok/s | GPU Metal {model_format} | cache: {:?} reused {}/{}]",
+            "[{} prompt + {} gen in {:.1}ms = {:.1} tok/s | GPU Metal {model_format_label} | cache: {:?} reused {}/{}]",
             result.prompt_tokens,
             result.completion_tokens,
             elapsed.as_secs_f64() * 1000.0,

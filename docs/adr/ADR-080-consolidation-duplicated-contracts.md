@@ -14,6 +14,10 @@
 - C3 — backend-neutral decode policy, apply-or-fail-closed: PR #787 (merged 2026-07-10).
 - C4 — checked GEMM argument validator at every safe entry point: PR #796
   (merged 2026-07-11).
+- Amendment (#829) — canonical model-directory format detector (`ModelFormat`/
+  `detect_format`, plus its two error-message helpers) consolidated into
+  `crates/inference/src/model_format.rs`, shared by `lattice`, `lattice_serve`,
+  and `chat_metal`; see "Amendment: model-format detector consolidation" below.
 
 The cluster defect tickets (#739–#741, resolved by C1; #744–#746, resolved by C2) are
 closed against the merged PRs above. The non-cluster audit items from the same sweep
@@ -250,6 +254,56 @@ macOS FFI call, validate standalone WGPU/Metal GEMM slices before dispatch, prom
 GEMV checks to release-active validation shared with the safe wrapper, reject short activations in
 the training SwiGLU projection, and unify oversized-input handling across f32/f16/Q8 GDN
 projections.
+
+### Amendment (2026-07-11): model-format detector consolidation (#829)
+
+**Scope note.** This ADR was originally scoped to the four numeric-contract clusters above
+(softmax, http-serve, sampling-decode, matmul-gemm). A fifth, smaller duplicated-decision
+site was found in the same `src/bin/` surface C2 already touches: model-directory format
+detection (safetensors vs. native Q4 vs. unrecognized) was implemented independently in
+`lattice.rs` (`backend::detect_format`, enum-valued, with its own unit tests),
+`lattice_serve.rs` (`detect_q4`, bool-valued), and `chat_metal.rs` (`is_q4_dir`, bool-valued,
+plus a fourth, partial decision site that only re-checked safetensors absence inside the
+non-Q4 branch). This joins the shared-contract set this ADR already establishes for the two
+HTTP binaries in C2, so the fix is recorded here as an amendment to the existing Accepted
+decision rather than a new ADR. **This does not change the ADR's Status or its four original
+clusters** — it extends the implementation record with a fifth, out-of-cluster consolidation
+that follows the same "extract one small, checked, module-level helper" pattern C1–C4 already
+establish.
+
+**Extraction plan.** `ModelFormat`, `detect_format`, and the two format-specific error-message
+helpers (`metal_gpu_required_message`, `unrecognized_format_message`) moved, unmodified in
+behavior for `lattice.rs`, `lattice_serve.rs`, and `chat_metal.rs` (their own detectors were
+already index-aware), into a new `crates/inference/src/model_format.rs` — a `pub mod` of the library crate
+rather than a `pub(crate)` module of one binary, because separate Cargo `[[bin]]` targets
+(`lattice`, `lattice_serve`, `chat_metal`) cannot see one another's `pub(crate)` items; only a
+library module is visible to all three. The module is a plain `pub mod` (externally nameable,
+so public for semver purposes) documented as unstable and internal-use, with compatibility
+following the crate's Experimental stability policy rather than semver-relevant deprecation
+cycles, rather than hidden behind `#[doc(hidden)]`, matching the existing convention set by the
+C2 `serve` module (also a cross-binary-only shared contract, also a plain documented `pub mod`,
+not `#[doc(hidden)]`).
+All three binaries now `match` on the shared `ModelFormat` enum (`Safetensors | Q4 | Unknown`)
+instead of a bespoke boolean or a partial re-check; the message helpers give `lattice_serve.rs`
+and `chat_metal.rs` the same fail-closed `Unknown`-directory error `lattice.rs` already had,
+closing a real behavior gap (`lattice_serve.rs` previously had no explicit `Unknown` case at
+all — an unrecognized directory fell through to a generic "safetensors load failed" error from
+the CPU loader instead of a clear "not a recognized model directory" message).
+
+The three benchmark binaries (`bench_decode_ab.rs`, `bench_decode_slopefit.rs`,
+`bench_logit_dump.rs`) were migrated onto the same `detect_format` in a follow-up commit,
+closing the repository-wide sibling gate. That migration is not behavior-unmodified: each
+bench binary's removed inline heuristic checked only `model.safetensors`, never
+`model.safetensors.index.json`, before falling through to a `.q4` scan. A directory containing
+both an index file and stray `.q4` files therefore used to route those three binaries to the Q4
+loader; the canonical detector's index-aware precedence now routes the same directory to
+`Safetensors`. Ordinary safetensors-only, ordinary Q4-only, and Unknown/no-sentinel directories
+are unaffected. See `detect_format_prefers_safetensors_index_over_q4_files` in
+`model_format.rs` for the regression test covering this case.
+
+**Resolves**: #829 — one canonical model-format detector, zero remaining local
+re-implementations in `lattice.rs`, `lattice_serve.rs`, `chat_metal.rs`, or the three
+benchmark binaries.
 
 ## What we are NOT doing
 

@@ -72,6 +72,7 @@ mod imp {
     use lattice_inference::model::qwen35_config::{
         GenerateConfig, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
     };
+    use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::tokenizer::Tokenizer as _;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use serde::Deserialize;
@@ -1057,12 +1058,12 @@ mod imp {
     fn spawn_worker(
         model_dir: std::path::PathBuf,
         tokenizer_path: std::path::PathBuf,
-        is_q4: bool,
+        format: ModelFormat,
         ready: std::sync::mpsc::Sender<Result<WorkerReady, String>>,
     ) -> mpsc::UnboundedSender<Job> {
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
         std::thread::spawn(move || {
-            let loaded = load_model(&model_dir, &tokenizer_path, is_q4);
+            let loaded = load_model(&model_dir, &tokenizer_path, format);
             let LoadedModel {
                 mut metal,
                 tokenizer,
@@ -1226,48 +1227,56 @@ mod imp {
     fn load_model(
         model_dir: &std::path::Path,
         tokenizer_path: &std::path::Path,
-        is_q4: bool,
+        format: ModelFormat,
     ) -> Result<LoadedModel, String> {
         let tokenizer = BpeTokenizer::from_tokenizer_json(tokenizer_path)
             .map_err(|e| format!("tokenizer load failed ({}): {e}", tokenizer_path.display()))?;
 
-        if is_q4 {
-            let has_config_json = model_dir.join("config.json").exists();
-            let cfg = if has_config_json {
-                Qwen35Config::from_config_json(&model_dir.join("config.json"))
-                    .map_err(|e| format!("config.json parse failed: {e}"))?
-            } else {
-                Qwen35Config::qwen36_27b()
-            };
-            let requested_context = if has_config_json {
-                model_context_from_config(Some(&cfg))
-            } else {
-                model_context_from_config(None)
-            };
-            let metal =
-                MetalQwen35State::from_q4_dir(model_dir, tokenizer_path, &cfg, requested_context)
-                    .map_err(|e| format!("Q4 model load failed: {e}"))?;
-            let model_max_context = metal.max_context();
-            Ok(LoadedModel {
-                metal,
-                tokenizer,
-                format: "q4".to_string(),
-                model_max_context,
-            })
-        } else {
-            let model = Qwen35Model::from_safetensors(model_dir)
-                .map_err(|e| format!("safetensors load failed: {e}"))?;
-            let cfg = model.config().clone();
-            let requested_context = model_context_from_config(Some(&cfg));
-            let metal = MetalQwen35State::new(model.weights(), &cfg, requested_context)
-                .map_err(|e| format!("Metal init failed: {e}"))?;
-            let model_max_context = metal.max_context();
-            Ok(LoadedModel {
-                metal,
-                tokenizer,
-                format: "bf16".to_string(),
-                model_max_context,
-            })
+        match format {
+            ModelFormat::Q4 => {
+                let has_config_json = model_dir.join("config.json").exists();
+                let cfg = if has_config_json {
+                    Qwen35Config::from_config_json(&model_dir.join("config.json"))
+                        .map_err(|e| format!("config.json parse failed: {e}"))?
+                } else {
+                    Qwen35Config::qwen36_27b()
+                };
+                let requested_context = if has_config_json {
+                    model_context_from_config(Some(&cfg))
+                } else {
+                    model_context_from_config(None)
+                };
+                let metal = MetalQwen35State::from_q4_dir(
+                    model_dir,
+                    tokenizer_path,
+                    &cfg,
+                    requested_context,
+                )
+                .map_err(|e| format!("Q4 model load failed: {e}"))?;
+                let model_max_context = metal.max_context();
+                Ok(LoadedModel {
+                    metal,
+                    tokenizer,
+                    format: "q4".to_string(),
+                    model_max_context,
+                })
+            }
+            ModelFormat::Safetensors => {
+                let model = Qwen35Model::from_safetensors(model_dir)
+                    .map_err(|e| format!("safetensors load failed: {e}"))?;
+                let cfg = model.config().clone();
+                let requested_context = model_context_from_config(Some(&cfg));
+                let metal = MetalQwen35State::new(model.weights(), &cfg, requested_context)
+                    .map_err(|e| format!("Metal init failed: {e}"))?;
+                let model_max_context = metal.max_context();
+                Ok(LoadedModel {
+                    metal,
+                    tokenizer,
+                    format: "bf16".to_string(),
+                    model_max_context,
+                })
+            }
+            ModelFormat::Unknown => Err(model_format::unrecognized_format_message(model_dir)),
         }
     }
 
@@ -1867,22 +1876,6 @@ mod imp {
         }
     }
 
-    fn detect_q4(dir: &std::path::Path) -> bool {
-        !dir.join("model.safetensors").exists()
-            && !dir.join("model.safetensors.index.json").exists()
-            && std::fs::read_dir(dir)
-                .ok()
-                .and_then(|mut entries| {
-                    entries.find(|e| {
-                        e.as_ref()
-                            .ok()
-                            .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".q4")))
-                            .unwrap_or(false)
-                    })
-                })
-                .is_some()
-    }
-
     /// Builds the daemon's router in isolation from `run()`'s process
     /// startup (arg parsing, model loading, binding a listener) so tests --
     /// including the cross-binary parity table in
@@ -1916,7 +1909,7 @@ mod imp {
         if !model_dir.exists() {
             return Err(format!("model directory not found: {}", model_dir.display()).into());
         }
-        let is_q4 = detect_q4(&model_dir);
+        let format = model_format::detect_format(&model_dir);
         let tokenizer_path = parse_arg(&args, "--tokenizer-dir")
             .map(|d| std::path::Path::new(&d).join("tokenizer.json"))
             .unwrap_or_else(|| model_dir.join("tokenizer.json"));
@@ -1955,10 +1948,14 @@ mod imp {
         eprintln!(
             "[lattice_serve] loading model from {} ({}) ...",
             model_dir.display(),
-            if is_q4 { "q4" } else { "bf16" }
+            match format {
+                ModelFormat::Q4 => "q4",
+                ModelFormat::Safetensors => "bf16",
+                ModelFormat::Unknown => "unknown",
+            }
         );
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let jobs = spawn_worker(model_dir.clone(), tokenizer_path, is_q4, ready_tx);
+        let jobs = spawn_worker(model_dir.clone(), tokenizer_path, format, ready_tx);
         let WorkerReady {
             format: fmt,
             model_max_context,
