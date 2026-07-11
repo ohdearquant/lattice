@@ -25494,6 +25494,209 @@ mod inner {
             }
 
             // --------------------------------------------------------------
+            // #862 round-2 major-2 follow-up: multi-token gdn_chunk_materialize_c32
+            // dispatch (the CHUNKED PREFILL path #850's integration ask names) exercising
+            // REAL within-chunk conv-window carryover, not a single n_tokens=1 dispatch.
+            //
+            // `gdn_chunk_materialize_c32`'s per-token loop (`for (uint j=0u;j<ci;j++)`)
+            // reads each tap directly from the flat `gdn_qkv` input array by absolute
+            // token index (`src = global_row+tap-buf_len`; `src<0` reads pre-chunk
+            // `conv_buf` history, `src>=0` reads `gdn_qkv[src*qkv_dim+ch]`), so a NaN raw
+            // value written at token 0's channel contaminates every token whose tap
+            // window includes token 0 -- tokens 0,1,2,3 for `ks=4` (this kernel's
+            // `constexpr ks=4u`, i.e. `buf_len=3`) -- and is naturally absent (no register
+            // carryover needed, it is pure array indexing) for token 4 onward. This is the
+            // dispatch-time analog of the decode-path `apply_causal_conv1d` rolling buffer
+            // proven in `gdn_fused::tests::gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel`.
+            //
+            // Reference construction (same reasoning as the decode-path test above): BOTH
+            // poisoned and reference runs hold the target head's whole channel-span
+            // exactly zero for tokens 0..ks (the full contamination window), differing
+            // only by the single NaN scalar at [token 0, poisoned_channel]. Tokens ks..N-1
+            // ("at least 4 subsequent clean tokens") use ordinary ORDINARY per-token
+            // random data identically in both runs. Whole-vector zero-by-assignment on a
+            // non-finite reduced norm is bit-identical to true-zero-weight arithmetic for
+            // as long as the corruption sits in the window, and the two runs are governed
+            // by the SAME per-token raw array for every clean token, so they are proven
+            // bit-identical, and finite, at every token, with no further guard dependency
+            // once the window closes.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_chunk_materialize_c32_multi_token(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                gdn_qkv: &[f32], // [n_tokens, qkv_dim] flat, qkv_dim = 3*KD
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+                n_tokens: u32,
+            ) -> (Vec<f32>, Vec<f32>) {
+                const KD: u32 = 128;
+                const VD: u32 = 128;
+                const HD: u32 = 16;
+                const BUF_LEN: u32 = 3; // ks - 1
+                let q_total = KD;
+                let v_offset = q_total * 2;
+                let qkv_dim = v_offset + VD;
+
+                let conv_buf_state =
+                    make_zero_buffer(device, (qkv_dim * BUF_LEN) as usize, "conv_buf");
+                let gdn_qkv_buf = f32_buf(device, gdn_qkv, "gdn_qkv");
+                let conv_weight_buf = f32_buf(
+                    device,
+                    &vec![0.25f32; (qkv_dim * 4) as usize],
+                    "conv_weight",
+                );
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let out_q_buf = make_zero_buffer(device, (KD * n_tokens) as usize, "out_q");
+                let out_k_buf = make_zero_buffer(device, (KD * n_tokens) as usize, "out_k");
+                let out_v_buf = make_zero_buffer(device, (VD * n_tokens) as usize, "out_v");
+                let out_bla_buf = make_zero_buffer(device, (2 * n_tokens) as usize, "out_bla");
+
+                let params = GdnChunkParams {
+                    key_dim: KD,
+                    value_dim: VD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset,
+                    qkv_dim,
+                    output_dim: VD,
+                    chunk_size: n_tokens,
+                    n_tokens,
+                    num_chunks: 1,
+                    active_chunk: 0,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&conv_buf_state), 0);
+                enc.set_buffer(1, Some(&gdn_qkv_buf), 0);
+                enc.set_buffer(2, Some(&conv_weight_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&out_q_buf), 0);
+                enc.set_buffer(9, Some(&out_k_buf), 0);
+                enc.set_buffer(10, Some(&out_v_buf), 0);
+                enc.set_buffer(11, Some(&out_bla_buf), 0);
+                enc.set_bytes(
+                    12,
+                    std::mem::size_of::<GdnChunkParams>() as u64,
+                    &params as *const GdnChunkParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_q_buf, (KD * n_tokens) as usize),
+                    read_f32(&out_k_buf, (KD * n_tokens) as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_chunk_materialize_c32_multi_token_k_poison_window_state_isolation() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!(
+                        "skipping gdn_chunk_materialize_c32_multi_token_k_poison_window_state_isolation: no Metal device"
+                    );
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_chunk_materialize_c32");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 16;
+                const WINDOW: u32 = 4; // ks (kernel_size), matches the kernel's constexpr ks=4u
+                const CLEAN_TAIL: u32 = 4; // #862 round-2 major-2: "at least 4 subsequent clean tokens"
+                const N_TOKENS: u32 = WINDOW + CLEAN_TAIL;
+                let qkv_dim = 3 * KD; // [Q(128) | K(128) | V(128)] per token
+                let hidden_in = lcg_vec(41, HD as usize);
+                let in_proj_b = lcg_vec(42, HD as usize);
+                let in_proj_a = lcg_vec(43, HD as usize);
+
+                // K channel span (label fixed to K: the shipping-path production gap
+                // #862 round 1 found; the sibling single-token test above already
+                // covers both Q and K for a single dispatch).
+                let (lo, hi) = (KD as usize, 2 * KD as usize);
+
+                let base = lcg_vec(44, (qkv_dim * N_TOKENS) as usize);
+                let mut poisoned = base.clone();
+                let mut reference = base.clone();
+                // Zero the K channel span for every token in the window (0..WINDOW) in
+                // BOTH runs -- the only reference construction for which "bit-identical
+                // to the poisoned run" is achievable (see module doc comment above).
+                for t in 0..WINDOW {
+                    let row = (t * qkv_dim) as usize;
+                    for v in poisoned[row + lo..row + hi].iter_mut() {
+                        *v = 0.0;
+                    }
+                    for v in reference[row + lo..row + hi].iter_mut() {
+                        *v = 0.0;
+                    }
+                }
+                // Poison exactly one lane, only at token 0.
+                poisoned[lo] = f32::NAN;
+
+                let (outq_p, outk_p) = run_gdn_chunk_materialize_c32_multi_token(
+                    &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a, N_TOKENS,
+                );
+                let (outq_r, outk_r) = run_gdn_chunk_materialize_c32_multi_token(
+                    &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
+                    N_TOKENS,
+                );
+
+                assert_no_nonfinite(
+                    "gdn_chunk_materialize_c32[multi-token-K]",
+                    "out_q (all tokens)",
+                    &outq_p,
+                );
+                assert_no_nonfinite(
+                    "gdn_chunk_materialize_c32[multi-token-K]",
+                    "out_k (all tokens)",
+                    &outk_p,
+                );
+                assert_eq!(
+                    outq_p, outq_r,
+                    "gdn_chunk_materialize_c32[multi-token-K-poisoned]: out_q must be \
+                     bit-identical to the never-poisoned (explicit-zero-window) reference \
+                     at every token (Q was never touched by the K poison; this also \
+                     confirms the poison doesn't cross-contaminate the other head channel)"
+                );
+                for t in 0..N_TOKENS as usize {
+                    let row = t * KD as usize;
+                    assert_eq!(
+                        outk_p[row..row + KD as usize],
+                        outk_r[row..row + KD as usize],
+                        "gdn_chunk_materialize_c32[multi-token-K-poisoned]: token {t}'s \
+                         out_k must be bit-identical to the never-poisoned \
+                         (explicit-zero-window) reference -- token {t} is {} the ks={WINDOW} \
+                         contamination window",
+                        if (t as u32) < WINDOW {
+                            "inside"
+                        } else {
+                            "past (fully recovered from)"
+                        }
+                    );
+                }
+            }
+
+            // --------------------------------------------------------------
             // decode_reference.metal oracle hardening: this kernel is a
             // frozen test-only correctness oracle (used by the flash-decode
             // parity suite above), not a live production kernel, but per

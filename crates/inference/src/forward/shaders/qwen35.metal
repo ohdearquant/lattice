@@ -1044,6 +1044,11 @@ kernel void gdn_recurrence_fused(
     if (tid == 0) { bp = 0; for (uint s = 0; s < 4; s++) bp += sg_buf[s]; sg_buf[0] = 1.0f / (1.0f + exp(-bp)); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float beta_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (beta) above before the
+    // alpha reduction below overwrites sg_buf[sgitg]. Without this barrier a fast
+    // simdgroup can clobber slot 0 with an alpha partial while a lagging simdgroup is
+    // still reading beta_val out of it.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Alpha
     device const half* wa = in_proj_a + h * hd;
@@ -1055,6 +1060,9 @@ kernel void gdn_recurrence_fused(
     if (tid == 0) { ap = 0; for (uint s = 0; s < 4; s++) ap += sg_buf[s]; sg_buf[0] = ap; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float alpha_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (alpha) above before the
+    // Q-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // L2 normalize Q
     // ADR-080 C1 fail-closed (#850): NaN * 0.0f == NaN under IEEE-754, so a NaN lane in
@@ -1103,6 +1111,9 @@ kernel void gdn_recurrence_fused(
     if (tid == 0) { float kq = 0.0f; for (uint s = 0; s < 4; s++) kq += sg_buf[s]; sg_buf[0] = kq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float k_dot_q = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (k_dot_q) above before the
+    // gated-RMS-norm reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Single pass: compute kv_mem and old_q together (saves one S read vs original)
     device float* S_h = S_all + h * vd * kd;
@@ -1191,6 +1202,9 @@ kernel void gdn_recurrence_fused_q36(
     if (tid == 0) { bp = 0; for (uint s = 0; s < 4; s++) bp += sg_buf[s]; sg_buf[0] = 1.0f / (1.0f + exp(-bp)); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float beta_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (beta) above before the
+    // alpha reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Alpha = hidden @ in_proj_a[h]
     device const half* wa = in_proj_a + h * hd;
@@ -1202,6 +1216,9 @@ kernel void gdn_recurrence_fused_q36(
     if (tid == 0) { ap = 0; for (uint s = 0; s < 4; s++) ap += sg_buf[s]; sg_buf[0] = ap; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float alpha_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (alpha) above before the
+    // Q-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // L2 normalize Q — kd=128 == thread_count, no ARRAY-BOUNDS ternary needed, but the
     // norm-validity ternary below is still required (ADR-080 C1 fail-closed, #850): a
@@ -1245,6 +1262,9 @@ kernel void gdn_recurrence_fused_q36(
     if (tid == 0) { float kq = 0.0f; for (uint s = 0; s < 4; s++) kq += sg_buf[s]; sg_buf[0] = kq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float k_dot_q = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (k_dot_q) above before the
+    // gated-RMS-norm reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // H2: load S row into thread-local cache, compute kv_mem and old_q in one pass.
     // s_cache holds the values so the update loop reads cache instead of device memory.
@@ -1326,6 +1346,9 @@ kernel void gdn_precompute_keys(
     if (tid == 0) { bp = 0; for (uint s = 0; s < 4; s++) bp += sg_buf[s]; sg_buf[0] = 1.0f / (1.0f + exp(-bp)); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float beta_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (beta) above before the
+    // alpha reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Alpha = hidden @ in_proj_a[h]  — per VALUE head
     device const half* wa = in_proj_a + h * hd;
@@ -1337,6 +1360,9 @@ kernel void gdn_precompute_keys(
     if (tid == 0) { ap = 0; for (uint s = 0; s < 4; s++) ap += sg_buf[s]; sg_buf[0] = ap; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float alpha_val = sg_buf[0];
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (alpha) above before the
+    // Q-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Q/K stay per KEY head (repeat_interleave: k_head = h / ratio)
     // ADR-080 C1 fail-closed (#850): assign 0.0f to the whole vector directly on an
