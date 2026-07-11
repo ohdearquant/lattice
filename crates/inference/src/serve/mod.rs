@@ -309,6 +309,18 @@ pub enum FieldExpectation {
         json_pointer: &'static str,
         len: usize,
     },
+    /// The pointed-to field must be a JSON string starting with `prefix`
+    /// (issue #828 round 2 medium finding: dynamic response IDs are checked
+    /// by type/prefix, not exact value -- a response ID's suffix varies by
+    /// request timestamp/sequence).
+    StringPrefix {
+        json_pointer: &'static str,
+        prefix: &'static str,
+    },
+    /// The pointed-to field must be a JSON number representable as `u64`
+    /// (issue #828 round 2 medium finding: timestamps are checked by type,
+    /// not exact value).
+    UnsignedInt { json_pointer: &'static str },
 }
 
 impl FieldExpectation {
@@ -352,6 +364,29 @@ impl FieldExpectation {
                      absent (body: {body})"
                 )),
             },
+            FieldExpectation::StringPrefix {
+                json_pointer,
+                prefix,
+            } => match body.pointer(json_pointer).and_then(Value::as_str) {
+                Some(s) if s.starts_with(prefix) => Ok(()),
+                Some(s) => Err(format!(
+                    "field '{json_pointer}': expected a string starting with '{prefix}', got \
+                     '{s}' (body: {body})"
+                )),
+                None => Err(format!(
+                    "field '{json_pointer}': expected a string starting with '{prefix}', field \
+                     is absent or not a string (body: {body})"
+                )),
+            },
+            FieldExpectation::UnsignedInt { json_pointer } => {
+                match body.pointer(json_pointer).and_then(Value::as_u64) {
+                    Some(_) => Ok(()),
+                    None => Err(format!(
+                        "field '{json_pointer}': expected an unsigned integer, field is \
+                         absent or not representable as u64 (body: {body})"
+                    )),
+                }
+            }
         }
     }
 }
@@ -502,6 +537,26 @@ pub fn check_sse_events(body: &str, expected: &[EventExpectation]) -> Result<(),
                 })?;
                 match frame {
                     SseFrame::Chunk(c) if matches!(classify_chunk(c), ChunkKind::RoleOpener) => {
+                        // Issue #828 round 2 medium finding: dynamic /id and
+                        // /created are type/prefix-checked on the opener
+                        // chunk too, not only the non-streaming JSON
+                        // baseline -- every `chat.completion.chunk` this
+                        // binary emits carries both fields.
+                        FieldExpectation::StringPrefix {
+                            json_pointer: "/id",
+                            prefix: "chatcmpl-",
+                        }
+                        .check(c)
+                        .map_err(|e| {
+                            format!("phase {phase_idx} (RoleOpener) chunk field check failed: {e}")
+                        })?;
+                        FieldExpectation::UnsignedInt {
+                            json_pointer: "/created",
+                        }
+                        .check(c)
+                        .map_err(|e| {
+                            format!("phase {phase_idx} (RoleOpener) chunk field check failed: {e}")
+                        })?;
                         idx += 1;
                     }
                     other => {
@@ -692,6 +747,76 @@ pub struct ProductionAdapterObservation {
     /// token budget (`false`) -- mirrors [`GenerateOutput::stopped`] /
     /// `Ev::Done`'s `stopped` field.
     pub stopped: bool,
+}
+
+/// The exact ChatML rendering both binaries' production code produces for a
+/// single `{role: "user", content: "hi there"}` message -- `lattice.rs`'s
+/// `render_prompt` and `lattice_serve.rs`'s (shared-engine)
+/// `format_chat_template` use the identical
+/// `"<|im_start|>{role}\n{content}<|im_end|>\n"` + trailing
+/// `"<|im_start|>assistant\n"` template. A ground-truth literal, not a call
+/// into either binary's render function, so a template regression in either
+/// binary is visible against this fixture instead of round-tripping through
+/// the same (possibly mutated) function that produced it (issue #828 round 2
+/// major finding).
+pub const OBSERVATION_GOLDEN_USER_HI_THERE_CHATML: &str =
+    "<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n";
+
+/// Full expected value for a [`ProductionAdapterObservation`] (issue #828
+/// round 2 major finding): every `GenerateConfigSnapshot` field, the exact
+/// rendered prompt or normalized message list, the exact prompt-token count,
+/// and the terminal outcome -- one shared comparison both binaries' tests
+/// call, instead of each asserting a different hand-picked subset of fields.
+pub struct ExpectedObservation<'a> {
+    pub gen_cfg: GenerateConfigSnapshot,
+    pub rendered_prompt: Option<&'a str>,
+    pub messages: Option<&'a [(&'a str, &'a str)]>,
+    pub prompt_tokens: usize,
+    pub stopped: bool,
+}
+
+/// Asserts every field of `obs` against `expected`, panicking with a
+/// specific field name on the first mismatch (issue #828 round 2 major
+/// finding). Used by both `lattice.rs`'s and `lattice_serve.rs`'s
+/// `production_adapter_observation` test modules so neither binary can drift
+/// back to asserting only a hand-picked subset of `GenerateConfigSnapshot`'s
+/// thirteen fields.
+pub fn assert_observation_matches(
+    obs: &ProductionAdapterObservation,
+    expected: &ExpectedObservation<'_>,
+) {
+    assert_eq!(
+        obs.gen_cfg, expected.gen_cfg,
+        "GenerateConfigSnapshot mismatch: observed {:?}, expected {:?}",
+        obs.gen_cfg, expected.gen_cfg
+    );
+    assert_eq!(
+        obs.rendered_prompt.as_deref(),
+        expected.rendered_prompt,
+        "rendered_prompt mismatch: observed {:?}, expected {:?}",
+        obs.rendered_prompt,
+        expected.rendered_prompt
+    );
+    let expected_messages: Option<Vec<(String, String)>> = expected.messages.map(|m| {
+        m.iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect()
+    });
+    assert_eq!(
+        obs.messages, expected_messages,
+        "messages mismatch: observed {:?}, expected {:?}",
+        obs.messages, expected_messages
+    );
+    assert_eq!(
+        obs.prompt_tokens, expected.prompt_tokens,
+        "prompt_tokens mismatch: observed {}, expected {}",
+        obs.prompt_tokens, expected.prompt_tokens
+    );
+    assert_eq!(
+        obs.stopped, expected.stopped,
+        "stopped (terminal outcome) mismatch: observed {}, expected {}",
+        obs.stopped, expected.stopped
+    );
 }
 
 /// Shared fixture table for both binaries' `/v1/chat/completions` HTTP
@@ -932,6 +1057,13 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         lattice: ExpectedResponse::Json {
             status: 200,
             fields: &[
+                FieldExpectation::StringPrefix {
+                    json_pointer: "/id",
+                    prefix: "chatcmpl-",
+                },
+                FieldExpectation::UnsignedInt {
+                    json_pointer: "/created",
+                },
                 FieldExpectation::Eq {
                     json_pointer: "/object",
                     scalar: Scalar::Str("chat.completion"),
@@ -971,6 +1103,13 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         lattice_serve: ExpectedResponse::Json {
             status: 200,
             fields: &[
+                FieldExpectation::StringPrefix {
+                    json_pointer: "/id",
+                    prefix: "chatcmpl-",
+                },
+                FieldExpectation::UnsignedInt {
+                    json_pointer: "/created",
+                },
                 FieldExpectation::Eq {
                     json_pointer: "/object",
                     scalar: Scalar::Str("chat.completion"),
@@ -1381,7 +1520,7 @@ mod tests {
     #[test]
     fn check_sse_events_accepts_well_formed_baseline_stream() {
         let body = sse_body(&[
-            r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{"content":"hel"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
@@ -1393,7 +1532,7 @@ mod tests {
     #[test]
     fn check_sse_events_requires_at_least_one_content_delta() {
         let body = sse_body(&[
-            r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
             "[DONE]",
         ]);
@@ -1404,7 +1543,7 @@ mod tests {
     #[test]
     fn check_sse_events_rejects_wrong_finish_reason() {
         let body = sse_body(&[
-            r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
             "[DONE]",
@@ -1415,7 +1554,7 @@ mod tests {
     #[test]
     fn check_sse_events_rejects_missing_done_sentinel() {
         let body = sse_body(&[
-            r#"{"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"id":"chatcmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
             r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
         ]);
@@ -1424,6 +1563,21 @@ mod tests {
             err.contains("Done") || err.contains("stream ended"),
             "error: {err}"
         );
+    }
+
+    #[test]
+    fn check_sse_events_rejects_role_opener_missing_id_or_created() {
+        let missing_id = sse_body(&[
+            r#"{"created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        ]);
+        let err = check_sse_events(&missing_id, &[EventExpectation::RoleOpener]).unwrap_err();
+        assert!(err.contains("/id"), "error: {err}");
+
+        let missing_created = sse_body(&[
+            r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        ]);
+        let err = check_sse_events(&missing_created, &[EventExpectation::RoleOpener]).unwrap_err();
+        assert!(err.contains("/created"), "error: {err}");
     }
 
     #[test]

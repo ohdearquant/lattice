@@ -3514,12 +3514,32 @@ mod imp {
         #[cfg(feature = "test-utils")]
         mod production_adapter_observation {
             use super::*;
-            use lattice_inference::serve::{GenerateConfigSnapshot, ProductionAdapterObservation};
+            use lattice_inference::serve::{
+                ExpectedObservation, GenerateConfigSnapshot,
+                OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, ProductionAdapterObservation,
+                assert_observation_matches,
+            };
             use std::sync::Mutex;
 
-            #[tokio::test]
-            async fn chat_completions_non_streaming_observation_captures_real_config_and_messages()
-            {
+            /// Mirrors `lattice.rs`'s equivalent helper (issue #828 round 2):
+            /// fires the fixed `{"messages":[{"role":"user","content":"hi
+            /// there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}`
+            /// request through a REAL background thread running the actual
+            /// `run_worker_loop` + `enforce_prompt_window` production code (real
+            /// tiny tokenizer, no Metal engine) -- only the terminal generation
+            /// call is replaced with a canned completion. `stopped` is threaded
+            /// through a single local variable into both the recorded
+            /// observation and the returned tuple's third element, and the
+            /// real `enforce_prompt_window` return value is the ONLY source for
+            /// `prompt_tokens` -- round 2 major finding fixed the prior
+            /// `prompt_tokens: 3` / `stopped: true` independent literals.
+            async fn run_observed(
+                model_max_context: usize,
+                stopped: bool,
+            ) -> ProductionAdapterObservation {
+                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone();
                 let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> =
                     Arc::new(Mutex::new(None));
                 let observed_for_worker = Arc::clone(&observed);
@@ -3543,6 +3563,13 @@ mod imp {
                                 (role.to_string(), m.content.clone())
                             })
                             .collect();
+                        // Real production check (mutation-sensitive to
+                        // `enforce_prompt_window`/`check_prompt_fits_window`
+                        // exactly like `real_router_overflow_parity`/
+                        // `baseline_fake_worker_state` above); its measured
+                        // length IS what gets reported below.
+                        let prompt_tokens =
+                            enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
                         *observed_for_worker
                             .lock()
                             .expect("observation mutex poisoned") =
@@ -3550,11 +3577,11 @@ mod imp {
                                 rendered_prompt: None,
                                 messages: Some(normalized),
                                 gen_cfg: GenerateConfigSnapshot::from(cfg),
-                                prompt_tokens: 3,
-                                stopped: true,
+                                prompt_tokens,
+                                stopped,
                             });
                         on_token("ok", 1);
-                        Ok((3, 1, true))
+                        Ok((prompt_tokens, 1, stopped))
                     });
                 });
                 let state = AppState {
@@ -3568,7 +3595,7 @@ mod imp {
                         repetition_penalty: 1.1,
                         reasoning_budget: None,
                     },
-                    model_max_context: 4096,
+                    model_max_context,
                 };
                 let body = Body::from(
                     r#"{"messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#
@@ -3577,18 +3604,64 @@ mod imp {
                 let response = chat_completions(State(state), body).await;
                 assert_eq!(response.status(), StatusCode::OK);
 
-                let obs = observed
+                observed
                     .lock()
                     .expect("observation mutex poisoned")
                     .clone()
-                    .expect("the injected worker-loop generate closure must have recorded an observation");
-                assert_eq!(obs.gen_cfg.temperature, 1.3);
-                assert_eq!(obs.gen_cfg.top_p, 0.55);
-                assert_eq!(obs.gen_cfg.max_new_tokens, 9);
-                assert_eq!(obs.gen_cfg.seed, Some(7));
-                assert_eq!(
-                    obs.messages.as_deref(),
-                    Some([("user".to_string(), "hi there".to_string())].as_slice())
+                    .expect("the injected worker-loop generate closure must have recorded an observation")
+            }
+
+            /// The `GenerateConfig` `lattice_serve.rs`'s real `build_cfg` must
+            /// produce for the fixed request `run_observed` sends, given
+            /// `run_observed`'s `Defaults` above: every explicitly-set field
+            /// mirrors the request; `build_cfg` always sets the remaining
+            /// fields (`stop_token_ids`, `enable_thinking`, `enable_mtp`,
+            /// `grammar`, `reasoning_budget`, `logprobs`, `stop_strings`) to
+            /// the exact same values `GenerateConfig::default()` carries.
+            fn expected_gen_cfg() -> GenerateConfigSnapshot {
+                GenerateConfigSnapshot::from(
+                    &lattice_inference::model::qwen35_config::GenerateConfig {
+                        max_new_tokens: 9,
+                        temperature: 1.3,
+                        top_p: 0.55,
+                        seed: Some(7),
+                        ..Default::default()
+                    },
+                )
+            }
+
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_config_and_messages()
+            {
+                let obs = run_observed(4096, true).await;
+                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone();
+                let expected_prompt_tokens = tokenizer
+                    .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+                    .real_length;
+                assert_observation_matches(
+                    &obs,
+                    &ExpectedObservation {
+                        gen_cfg: expected_gen_cfg(),
+                        rendered_prompt: None,
+                        messages: Some(&[("user", "hi there")]),
+                        prompt_tokens: expected_prompt_tokens,
+                        stopped: true,
+                    },
+                );
+            }
+
+            /// Proves `stopped` is genuinely derived from what the worker's
+            /// generation closure returned, not an independent hardcoded
+            /// literal (round 2 major finding: this was previously
+            /// `stopped: true` regardless of the closure's actual return).
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_stopped_false() {
+                let obs = run_observed(4096, false).await;
+                assert!(
+                    !obs.stopped,
+                    "observation must report the worker's actual stopped=false, not a hardcoded true"
                 );
             }
         }

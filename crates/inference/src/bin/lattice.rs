@@ -6069,12 +6069,26 @@ mod serve {
         #[cfg(feature = "test-utils")]
         mod production_adapter_observation {
             use super::*;
-            use lattice_inference::serve::{GenerateConfigSnapshot, ProductionAdapterObservation};
+            use lattice_inference::serve::{
+                ExpectedObservation, GenerateConfigSnapshot,
+                OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, ProductionAdapterObservation,
+                assert_observation_matches,
+            };
             use std::sync::Mutex;
             use tower::ServiceExt as _;
 
-            #[tokio::test]
-            async fn chat_completions_non_streaming_observation_captures_real_config_and_prompt() {
+            /// Builds the fixture state + fires the fixed `{"messages":[{"role":
+            /// "user","content":"hi there"}],"temperature":1.3,"top_p":0.55,
+            /// "seed":7,"max_tokens":9}` request against a real router, with the
+            /// injected `CpuFakeGenerate` closure recording a
+            /// `ProductionAdapterObservation` -- strictly below the real
+            /// request-parse/`render_prompt`/`GenerateConfig`-construction path
+            /// (issue #828). `stopped` is threaded through a single local
+            /// variable into both the recorded observation and the returned
+            /// `GenerateOutput`, so a caller of this helper can vary it and prove
+            /// the observation genuinely mirrors what the seam returned rather
+            /// than an independent hardcoded literal (round 2 major finding).
+            async fn run_observed(stopped: bool) -> ProductionAdapterObservation {
                 let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
                 let tokenizer = model.tokenizer().clone();
                 let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> =
@@ -6101,15 +6115,19 @@ mod serve {
                             messages: None,
                             gen_cfg: GenerateConfigSnapshot::from(cfg),
                             prompt_tokens,
-                            stopped: true,
+                            stopped,
                         });
                     Ok(GenerateOutput {
                         text: "ok".to_string(),
                         token_ids: vec![1],
                         prompt_tokens,
                         generated_tokens: 1,
-                        stopped: true,
-                        stop_reason: Some(lattice_inference::StopReason::Eos),
+                        stopped,
+                        stop_reason: if stopped {
+                            Some(lattice_inference::StopReason::Eos)
+                        } else {
+                            None
+                        },
                         token_logprobs: vec![],
                     })
                 });
@@ -6136,26 +6154,70 @@ mod serve {
                     .expect("router must produce a response, not a transport error");
                 assert_eq!(response.status(), StatusCode::OK);
 
-                let obs = observed
+                observed
                     .lock()
                     .expect("observation mutex poisoned")
                     .clone()
-                    .expect("the injected generate closure must have recorded an observation");
-                assert_eq!(obs.gen_cfg.temperature, 1.3);
-                assert_eq!(obs.gen_cfg.top_p, 0.55);
-                assert_eq!(obs.gen_cfg.max_new_tokens, 9);
-                assert_eq!(obs.gen_cfg.seed, Some(7));
-                assert!(
-                    obs.rendered_prompt
-                        .as_deref()
-                        .is_some_and(|p| p.contains("hi there")),
-                    "the rendered prompt handed to the real generation seam must carry \
-                     the request's actual message content: {:?}",
-                    obs.rendered_prompt
+                    .expect("the injected generate closure must have recorded an observation")
+            }
+
+            /// The `GenerateConfig` `lattice.rs`'s real `chat_completions` ->
+            /// `prepare_chat_request`/`build_cfg`-equivalent construction (see
+            /// its `let gen_cfg = ...` literal in this file) must produce for the
+            /// fixed request body `run_observed` sends: every explicitly-set
+            /// field mirrors the request, every other field is
+            /// `GenerateConfig::default()` -- exactly like production's own
+            /// `..Default::default()` tail.
+            fn expected_gen_cfg() -> GenerateConfigSnapshot {
+                GenerateConfigSnapshot::from(
+                    &lattice_inference::model::qwen35_config::GenerateConfig {
+                        max_new_tokens: 9,
+                        temperature: 1.3,
+                        top_p: 0.55,
+                        seed: Some(7),
+                        stop_strings: vec![],
+                        logprobs: None,
+                        ..Default::default()
+                    },
+                )
+            }
+
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_config_and_prompt() {
+                let obs = run_observed(true).await;
+                let expected_prompt_tokens = {
+                    let tokenizer =
+                        lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                            .tokenizer()
+                            .clone();
+                    tokenizer
+                        .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+                        .real_length
+                };
+                assert_observation_matches(
+                    &obs,
+                    &ExpectedObservation {
+                        gen_cfg: expected_gen_cfg(),
+                        rendered_prompt: Some(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML),
+                        messages: None,
+                        prompt_tokens: expected_prompt_tokens,
+                        stopped: true,
+                    },
                 );
+            }
+
+            /// Proves `ProductionAdapterObservation::stopped` is genuinely
+            /// derived from what the generation seam returned, not an
+            /// independent hardcoded literal (round 2 major finding: the
+            /// pre-fix `lattice_serve.rs` observation stored `stopped: true`
+            /// unconditionally). Running the exact same request through
+            /// `run_observed(false)` must observe `stopped == false`.
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_stopped_false() {
+                let obs = run_observed(false).await;
                 assert!(
-                    obs.prompt_tokens > 0,
-                    "prompt_tokens must be measured by the real tokenizer, not left at 0"
+                    !obs.stopped,
+                    "observation must report the seam's actual stopped=false, not a hardcoded true"
                 );
             }
         }
