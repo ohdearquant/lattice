@@ -1467,8 +1467,8 @@ class CellAggregate:
 
 @dataclass(frozen=True)
 class CellRecord:
-    """One row of the north-star queryable shape (Ocean's gate
-    requirement, via Leo): "largest stable gaps by metric/context/quant"
+    """One row of the north-star queryable shape (program design
+    requirement): "largest stable gaps by metric/context/quant"
     must be queryable WITHOUT a later schema change. `cell_id`,
     `metric_family`, `context_point`, `quant_tier`, and `device` are the
     stable grouping/ranking keys; `aggregate` carries the point
@@ -2108,7 +2108,7 @@ def validate_promotion_record(record: PromotionRecord, *, min_null_sessions: int
 
 
 # --------------------------------------------------------------------------
-# North-star ranking query (Ocean's requirement, via Leo): "largest
+# North-star ranking query (program design requirement): "largest
 # stable gaps by metric/context/quant" must be queryable without a later
 # schema change. See tests/test_bench_run_record.py for the deterministic
 # proof.
