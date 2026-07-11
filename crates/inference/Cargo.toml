@@ -328,6 +328,7 @@ harness = false
 [[bench]]
 name = "f16_convert_bench"
 harness = false
+required-features = ["bench-internals"]
 
 [lints]
 workspace = true
