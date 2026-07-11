@@ -73,12 +73,32 @@ entry for every yielded window -- the harness never re-invokes the engine
 to synthesize a second measurement, and never fabricates one from the
 single call's own wall-clock time for more than the primary window.
 Missing `component_ns` (or a missing window entry within it) raises
-`AdapterContractError`, fail-closed. The requested model/quantization is
-passed into `EngineAdapter.run()`; an adapter that invokes a different
-artifact than requested (fallback, missing checkpoint, ...) reports the
-actual identity back via `AdapterRunResult.actual_model`/
-`actual_quantization`, and raw observations always record the actual
-invoked identity, never a value merely assumed from the profile.
+`AdapterContractError`, fail-closed. Every explicit `measured_calls` plan
+is ALSO validated against `profile.windows`: the flattened
+`yields_windows` across the whole plan must cover every declared window
+exactly once -- a missing window silently erases a slope, an undeclared
+window produces an observation outside the report contract, and a window
+yielded twice silently doubles that window's sample count/aggregation
+weight. All three are rejected fail-closed at parse time, naming the
+engine index and the missing/undeclared/duplicate windows.
+
+A SECOND earlier version of this module additionally assumed the
+MEASURED prompt could stay profile-wide (`profile.prompt`, passed
+verbatim to every engine's measured calls). That assumption was ALSO
+FALSE: `bench_compare_1k.py` requires each engine to receive a DIFFERENT
+measured prompt for the same nominal context -- Lattice and MLX build a
+tokenizer-padded prompt, Ollama builds a distinct character-count-
+heuristic prompt. `EngineRunGroup.measured_prompt` (mirroring
+`warmup_prompt`) lets an engine override the measured prompt; the harness
+passes exactly that resolved string to the adapter and hashes exactly
+that string, never a placeholder the adapter is trusted to reinterpret --
+prompt construction stays a harness-owned request, not an adapter
+implementation detail. The requested model/quantization is passed into
+`EngineAdapter.run()`; an adapter that invokes a different artifact than
+requested (fallback, missing checkpoint, ...) reports the actual identity
+back via `AdapterRunResult.actual_model`/`actual_quantization`, and raw
+observations always record the actual invoked identity, never a value
+merely assumed from the profile.
 
 Raw JSONL observation schema (the contract; see `OBSERVATION_FIELDS` /
 `validate_observation`): schema version, git SHA, profile name, engine +
@@ -380,6 +400,18 @@ class EngineRunGroup:
     stays profile-wide (every legacy script keeps the repeat COUNT
     uniform across engines; only the call shape/order/token-budget
     differs per engine).
+
+    `measured_prompt`, when given, overrides `profile.prompt` for THIS
+    engine's measured calls only -- mirroring `warmup_prompt`'s override
+    of the warmup prompt. `bench_compare_1k.py` needs this: Lattice and
+    MLX build a tokenizer-padded prompt to reach a target context length,
+    while Ollama builds a character-count-heuristic prompt for the SAME
+    target -- two different strings for the same nominal context. The
+    harness passes exactly the resolved prompt (per-engine override or
+    `profile.prompt`) to the adapter and hashes exactly that string, never
+    a placeholder the adapter is trusted to reinterpret: prompt
+    construction/ownership stays in the harness's request, not the
+    adapter's implementation.
     """
 
     name: str
@@ -390,6 +422,7 @@ class EngineRunGroup:
     quantization: str
     measured_calls: tuple[MeasuredCall, ...] | None = None
     measured_order: str = "window_major"
+    measured_prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +466,7 @@ _ENGINE_GROUP_ALLOWED_KEYS = frozenset(
         "quantization",
         "measured_order",
         "measured_calls",
+        "measured_prompt",
     }
 )
 _MEASURED_CALL_ALLOWED_KEYS = frozenset({"n_tokens", "yields_windows"})
@@ -655,7 +689,55 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
                         f"must not contain duplicates, got {call_yields}"
                     )
                 parsed_calls.append(MeasuredCall(n_tokens=call_n_tokens, yields_windows=tuple(call_yields)))
+
+            # Fail-closed relationship check: the flattened yields_windows
+            # across the WHOLE plan (one pass through `calls`) must cover
+            # profile.windows exactly once each -- no missing window (an
+            # erased slope), no undeclared window (an observation outside
+            # the report contract), and no window yielded twice across
+            # different calls (a silently doubled sample count/aggregation
+            # weight). Order across the flattened plan is NOT required to
+            # match `windows`' order: measured_order/call order governs
+            # REPLAY order (window-major vs repeat-major), not which
+            # windows exist -- only coverage (each exactly once) is
+            # enforced here.
+            flattened_windows = [w for c in parsed_calls for w in c.yields_windows]
+            flattened_counts: dict[int, int] = {}
+            for w in flattened_windows:
+                flattened_counts[w] = flattened_counts.get(w, 0) + 1
+            declared_windows = set(windows)
+            flattened_set = set(flattened_windows)
+            missing_windows = sorted(declared_windows - flattened_set)
+            undeclared_windows = sorted(flattened_set - declared_windows)
+            duplicate_windows = sorted(w for w, c in flattened_counts.items() if c > 1 and w in declared_windows)
+            if missing_windows or undeclared_windows or duplicate_windows:
+                problems = []
+                if missing_windows:
+                    problems.append(f"missing window(s) {missing_windows}")
+                if undeclared_windows:
+                    problems.append(f"undeclared window(s) {undeclared_windows}")
+                if duplicate_windows:
+                    problems.append(f"duplicate window(s) {duplicate_windows}")
+                raise ProfileConfigError(
+                    f"profile {name!r}: engines[{idx}] measured_calls yields_windows "
+                    f"must cover profile windows {windows} exactly once each: {'; '.join(problems)}"
+                )
+
             eg_measured_calls = tuple(parsed_calls)
+
+        # measured_prompt: overrides profile.prompt for THIS engine's
+        # measured calls only (mirrors warmup_prompt). Optional at any
+        # measured_calls value -- unused (falls back to profile.prompt)
+        # when omitted.
+        eg_measured_prompt_raw = eg_raw.get("measured_prompt")
+        if eg_measured_prompt_raw is not None:
+            if not isinstance(eg_measured_prompt_raw, str):
+                raise ProfileConfigError(f"profile {name!r}: engines[{idx}] measured_prompt must be a string")
+            if not eg_measured_prompt_raw:
+                raise ProfileConfigError(
+                    f"profile {name!r}: engines[{idx}] measured_prompt must be non-empty if provided"
+                )
+        eg_measured_prompt = eg_measured_prompt_raw
 
         engine_groups.append(
             EngineRunGroup(
@@ -667,6 +749,7 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
                 quantization=eg_quantization,
                 measured_calls=eg_measured_calls,
                 measured_order=eg_measured_order,
+                measured_prompt=eg_measured_prompt,
             )
         )
 
@@ -850,9 +933,13 @@ def run_profile(
     (Ollama's one-call-yields-two-windows shape) produces one Observation
     per yielded window from a SINGLE adapter invocation, using
     `AdapterRunResult.component_ns` for every window's `elapsed_ns` — see
-    `MeasuredCall` and `AdapterContractError`. `order_index` is a single
-    counter across the entire call, so a later statistical pass (issue
-    #714) can test for order/thermal bias without another schema
+    `MeasuredCall` and `AdapterContractError`. Every measured call for a
+    group uses that group's `measured_prompt` (default: `profile.prompt`)
+    — the exact string is what is passed to `adapter.run(prompt=...)` and
+    what `prompt_hash` records, never a placeholder the adapter
+    reinterprets (see `EngineRunGroup.measured_prompt`). `order_index` is
+    a single counter across the entire call, so a later statistical pass
+    (issue #714) can test for order/thermal bias without another schema
     migration.
     """
     resolved_git_sha = git_sha_value if git_sha_value is not None else git_sha(repo_root)
@@ -1027,8 +1114,16 @@ def run_profile(
                 )
 
         # Measured calls: this engine's own plan (default or explicit),
-        # replayed window-major or repeat-major per group.measured_order.
+        # replayed window-major or repeat-major per group.measured_order,
+        # using this engine's own measured prompt (default: profile.prompt)
+        # -- e.g. bench_compare_1k.py's Lattice/MLX tokenizer-padded prompt
+        # vs Ollama's character-count-heuristic prompt for the same
+        # nominal context: two different strings, hashed exactly as sent.
         calls = group.measured_calls if group.measured_calls is not None else _default_measured_calls()
+        group_measured_prompt = group.measured_prompt if group.measured_prompt is not None else profile.prompt
+        group_measured_prompt_hash = (
+            measured_prompt_hash if group.measured_prompt is None else prompt_hash(group.measured_prompt)
+        )
         if group.measured_order == "window_major":
             for call in calls:
                 for run_index in range(1, profile.measured_repeats + 1):
@@ -1036,8 +1131,8 @@ def run_profile(
                         adapter=adapter,
                         group=group,
                         call=call,
-                        call_prompt=profile.prompt,
-                        call_prompt_hash=measured_prompt_hash,
+                        call_prompt=group_measured_prompt,
+                        call_prompt_hash=group_measured_prompt_hash,
                         run_index=run_index,
                     )
         else:  # "repeat_major"
@@ -1047,8 +1142,8 @@ def run_profile(
                         adapter=adapter,
                         group=group,
                         call=call,
-                        call_prompt=profile.prompt,
-                        call_prompt_hash=measured_prompt_hash,
+                        call_prompt=group_measured_prompt,
+                        call_prompt_hash=group_measured_prompt_hash,
                         run_index=run_index,
                     )
 

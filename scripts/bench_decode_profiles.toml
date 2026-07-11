@@ -33,7 +33,18 @@
 # repeat-major, alternating `(1, 100)` every repeat). An engine whose
 # shape the default can't represent sets its own `measured_calls`
 # (an explicit ordered call plan) and/or `measured_order` -- see schema
-# below.
+# below. Every explicit `measured_calls` plan's flattened `yields_windows`
+# must cover `windows` exactly once each (fail-closed at parse time) --
+# missing/undeclared/duplicate windows are all rejected.
+#
+# The MEASURED `prompt` is ALSO not always uniform across engines:
+# `bench_compare_1k.py` needs Lattice/MLX to receive a tokenizer-padded
+# prompt and Ollama to receive a DIFFERENT character-count-heuristic
+# prompt for the same nominal context. `measured_prompt` on an engine
+# group overrides `profile.prompt` for that engine's measured calls only
+# (mirrors `warmup_prompt`'s override of the warmup prompt) -- the exact
+# string is what is sent to the adapter and what the raw observation's
+# `prompt_hash` records, never a placeholder.
 #
 # This file intentionally defines no profiles yet. The five live consumers
 # (`bench_apples_to_apples.sh`, `bench_apples_precise.sh`, `bench_q4_apples.sh`,
@@ -64,7 +75,11 @@
 #                              bench_compare_1k.py shape)
 #     measured_calls           list[table], optional; overrides the default
 #                              measured plan (one call per `windows` entry,
-#                              yields_windows=[that window]); each table:
+#                              yields_windows=[that window]); flattened
+#                              yields_windows across the WHOLE list must
+#                              cover `windows` exactly once each (fail-closed:
+#                              missing/undeclared/duplicate windows rejected);
+#                              each table:
 #       n_tokens                 int, > 0 (completion-token budget for this call)
 #       yields_windows            list[int], non-empty, no duplicates -- the
 #                                window(s) this ONE call produces an
@@ -74,7 +89,13 @@
 #                                to return AdapterRunResult.component_ns with
 #                                an entry for every listed window -- see
 #                                bench_decode_harness.py:AdapterRunResult.
-#   prompt                   string, non-empty (the MEASURED-window prompt)
+#     measured_prompt           string, non-empty, optional; overrides the
+#                              profile's `prompt` for THIS engine's measured
+#                              calls only (e.g. Ollama's character-count
+#                              heuristic prompt vs Lattice/MLX's
+#                              tokenizer-padded `prompt`)
+#   prompt                   string, non-empty (the default MEASURED prompt,
+#                            used by any engine without its own `measured_prompt`)
 #   aggregation              "median" (default) or "trimmed_mean"
 #   trim                     int, >= 0; only valid when aggregation = "trimmed_mean"
 #   requested_prompt_tokens  int, optional
@@ -110,15 +131,21 @@
 # quantization = "q4"
 #
 # Example 2 (not a live profile -- illustrates bench_compare_1k.py's three
-# distinct measured shapes: Lattice window-major (the default, no
-# measured_calls needed), Ollama's one-call-yields-two-windows shape, and
-# MLX's repeat-major alternation; uncomment and rename to activate):
+# distinct measured shapes AND its two distinct measured prompts: Lattice
+# window-major (the default, no measured_calls needed) and MLX
+# repeat-major both use the profile-wide tokenizer-padded `prompt`;
+# Ollama's one-call-yields-two-windows shape uses its OWN
+# `measured_prompt` override (a character-count-heuristic prompt for the
+# same nominal context, per bench_compare_1k.py's actual two-method
+# prompt-building split -- NOT a placeholder an adapter reinterprets: the
+# harness sends this exact string and hashes it); uncomment and rename to
+# activate):
 #
 # [profiles.example_agentic]
 # description = "example only, see bench_compare_1k.py for the real profile"
 # windows = [1, 100]
 # measured_repeats = 5
-# prompt = "<ctx-padded prompt, built per-engine at the adapter level>"
+# prompt = "<tokenizer-padded prompt for the target ctx length, shared by lattice/mlx>"
 # aggregation = "median"
 #
 # [[profiles.example_agentic.engines]]
@@ -134,6 +161,7 @@
 # warmup_prompt = "hi"
 # model = "qwen3.5:0.8b"
 # quantization = "q8"
+# measured_prompt = "<char-count-heuristic prompt for the same target ctx length>"
 # [[profiles.example_agentic.engines.measured_calls]]
 # n_tokens = 100
 # yields_windows = [1, 100]
