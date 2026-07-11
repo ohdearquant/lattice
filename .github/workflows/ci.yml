@@ -223,14 +223,64 @@ jobs:
       - name: inference — serve-surface capability-matrix fixtures (macOS only)
         if: runner.os == 'macOS'
         run: |
-          cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu
+          # test-utils (issue #828) gates the real tiny tokenizer
+          # `lattice_serve.rs`'s own `parity_table`/`production_adapter_
+          # observation` modules now need to drive `enforce_prompt_window`
+          # for real behind the shared field-level parity rows -- without
+          # it here those modules would silently not compile/run under
+          # this job, the same gap the test-utils comment below already
+          # documents for `lattice.rs`.
+          #
+          # issue #828 round 2 medium finding: piping through `tee` would
+          # report the PIPESTATUS-losing `tee` exit code to the shell, and
+          # even with correct exit-status propagation, a step that only
+          # checks the overall `cargo test` exit code cannot tell "both
+          # test-utils-gated modules ran" apart from "the feature/module was
+          # gated out and the other ~39 binary tests still exited 0" -- the
+          # silent-skip mode this hunk's own comment above describes. Write
+          # each binary's full output straight to a log (no pipe), preserve
+          # `cargo test`'s own exit status via `$?` (not a piped command's),
+          # THEN require an exact `parity_table::... ok` and
+          # `production_adapter_observation::... ok` proof marker in that
+          # log before the step can pass -- a module that silently stopped
+          # compiling/running fails this step even though the rest of the
+          # binary's tests still exit 0.
+          check_test_utils_modules_ran() {
+            local log="$1"
+            local bin_label="$2"
+            if ! grep -qE 'parity_table::.* \.\.\. ok' "$log"; then
+              echo "::error::${bin_label}: parity_table test module did not run (issue #828 CI proof marker missing) -- check the test-utils feature gate"
+              return 1
+            fi
+            if ! grep -qE 'production_adapter_observation::.* \.\.\. ok' "$log"; then
+              echo "::error::${bin_label}: production_adapter_observation test module did not run (issue #828 CI proof marker missing) -- check the test-utils feature gate"
+              return 1
+            fi
+          }
+
+          cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu,test-utils > lattice_serve_test.log 2>&1
+          lattice_serve_status=$?
+          cat lattice_serve_test.log
+          if [ "$lattice_serve_status" -ne 0 ]; then
+            echo "::error::cargo test --bin lattice_serve failed (exit $lattice_serve_status)"
+            exit "$lattice_serve_status"
+          fi
+          check_test_utils_modules_ran lattice_serve_test.log lattice_serve
+
           cargo test -p lattice-inference --bin chat_metal --features f16,metal-gpu
           # test-utils (ADR-080 C2 round 2) gates the tiny zero-weight CPU
           # model the lattice.rs HTTP-level client-disconnect test needs to
           # exercise the real chat_completions -> body_stream cancel_guard
           # -> generate_streaming_with_cancel composition; without it here
           # that test would silently not compile/run under this job.
-          cargo test -p lattice-inference --bin lattice --features f16,metal-gpu,test-utils
+          cargo test -p lattice-inference --bin lattice --features f16,metal-gpu,test-utils > lattice_test.log 2>&1
+          lattice_status=$?
+          cat lattice_test.log
+          if [ "$lattice_status" -ne 0 ]; then
+            echo "::error::cargo test --bin lattice failed (exit $lattice_status)"
+            exit "$lattice_status"
+          fi
+          check_test_utils_modules_ran lattice_test.log lattice
       # The metal-gpu surface was BUILT and linted above but never RUN, so Metal
       # correctness tests (e.g. the Q4 decode dispatch-geometry regression #384)
       # were local-only — a green CI here verified compilation, not behavior.
@@ -244,6 +294,28 @@ jobs:
         env:
           LATTICE_METAL_TEST_ENFORCE: '1'
         run: cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture
+      # ADR-080 C1 / #789: the `forward::metal::` module's assembled-MSL check and the
+      # The NaN/+inf fused_attention fail-closed regressions (#789) silently
+      # early-returned when no Metal device was present and were never actually run
+      # by any required workflow — the `q4` filter above does not match this module.
+      # LATTICE_METAL_TEST_ENFORCE=1 makes a missing device or failed pass
+      # construction a hard test failure instead of a skip, matching the Q4 and
+      # grammar steps' convention; the exact-count grep guards against a silently
+      # zero-matching filter the same way those steps do. The gating command writes
+      # its log directly (no pipe) so its exit status gates on its own.
+      - name: inference — metal-gpu fused_attention fail-closed gate (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-fused-attention-failclosed-test.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib forward::metal:: -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a
       # grammar that blocked every token silently emitted token 0 instead of
@@ -463,6 +535,21 @@ jobs:
       - uses: raven-actions/actionlint@v2.2.0
         with:
           version: '1.7.12'
+
+  # Deterministic fake-adapter unit tests + raw-observation schema validation
+  # for the decode-benchmark harness core (issue #813 step 1). Stdlib-only,
+  # no engine binary or model weights required — cheap ubuntu-only, so it is
+  # ungated like typos/actionlint above rather than routed through ci-gate.
+  bench-decode-harness-tests:
+    name: bench-decode-harness-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: python3 tests/test_bench_decode_harness.py
+        run: python3 tests/test_bench_decode_harness.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is

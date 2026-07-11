@@ -152,6 +152,14 @@ This section traces the decoder (Qwen3) generate path end to end. All references
 `crates/inference/src/` unless a full path is given. The encoder (BERT/BGE) path is
 structurally similar but uses bidirectional attention and skips the KV cache and decode loop.
 
+**Deprecated (since 0.5.1, removal targeted for 0.6.0, issue #807):** `crate::generate` (the
+path traced below) is repository-dead — it has no production caller — and duplicates the
+canonical, actively maintained Qwen3.5 decode loop. Text-generation users should use
+`Qwen35Model::generate` / `Qwen35Model::generate_streaming` instead; see the
+[Qwen3.5 Generation Path](#qwen35-generation-path) section below. This trace is kept for anyone
+still debugging the deprecated path during its deprecation window; embedding users of
+`QwenModel` (via `lattice-embed`) are unaffected either way.
+
 ### 1. Model Load
 
 `QwenModel::load` (`model/qwen.rs`) opens the model directory and calls
@@ -314,7 +322,8 @@ local safetensors directory -> Qwen35Model::from_safetensors
   -> load_weights                                    (model/qwen35/loading.rs)
   -> BpeTokenizer::from_tokenizer_json                (tokenizer.json)
   -> Tokenizer::tokenize(prompt)                      (tokenizer/common.rs)
-  -> prefill_prompt                                   (forward/batch_prefill.rs)
+  -> prefill_tokens_batched_for_generate              (forward/batch_prefill.rs)
+       -> prefill_prompt                              (forward/batch_prefill.rs)
   -> sample_token (first generated token)             (model/qwen35/sampling.rs)
   -> forward_step (decode loop, one call per token)   (model/qwen35/forward.rs)
   -> sample_token (each subsequent generated token)
@@ -323,11 +332,19 @@ local safetensors directory -> Qwen35Model::from_safetensors
 `Qwen35Model::from_safetensors` (`model/qwen35/model.rs`) resolves either `model.safetensors` or
 a sharded `model.safetensors.index.json`, validates the required tensor names against the
 config, then calls `load_weights` to materialize embedding, layer, and norm weights, and loads
-the tokenizer from `tokenizer.json`. Generation itself (`Qwen35Model::generate_with_batch_prefill`,
-`forward/batch_prefill.rs`) tokenizes the prompt with `Tokenizer::tokenize`, runs a single batched
-`prefill_prompt` pass over the whole prompt, samples the first token with `sample_token`, then
-enters a decode loop that calls the single-token `forward_step` (`model/qwen35/forward.rs`) and
+the tokenizer from `tokenizer.json`. Generation itself is the canonical `Qwen35Model::generate` /
+`Qwen35Model::generate_streaming` (`model/qwen35/generation.rs`): both tokenize the prompt with
+`Tokenizer::tokenize`, then delegate their prefill phase to
+`Qwen35Model::prefill_tokens_batched_for_generate` (`forward/batch_prefill.rs`), which runs a
+single batched `prefill_prompt` pass over the whole prompt (PR #680) and returns the final
+prompt position's logits. Both then sample the first token with `sample_token`, and enter a
+decode loop that calls the single-token `forward_step` (`model/qwen35/forward.rs`) and
 `sample_token` once per generated token.
+
+Note: `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`) is a separate,
+**deprecated** (since 0.5.1, issue #807) standalone decode loop that predates the delegation
+above — it calls the same batched-prefill core directly but is not the canonical entry point.
+New callers should use `Qwen35Model::generate` / `generate_streaming`.
 
 Note: the tokenizer trait method is `tokenize`, not `encode` — `encode` is a method on the
 separate `QwenModel` embedding path (`model/qwen.rs`), not on the `Tokenizer` trait used here.
