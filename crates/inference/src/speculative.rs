@@ -943,7 +943,7 @@ impl<'a> MtpVerifier<'a> {
                 self.scratch.scores[scores_start + t] = dot * scale;
             }
 
-            // ADR-080 C1: fail-closed softmax row contract (#785 round-1 blocker 1).
+            // ADR-080 C1: fail-closed softmax row contract (#785).
             // This is MtpVerifier's own GQA attention over its KV cache, not a
             // vocabulary/logit softmax -- a NaN/`+inf` cached score must zero the
             // whole row, not silently poison every weight via `1.0 / sum_exp`.
@@ -4515,7 +4515,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// ADR-080 C1 (#785 round-1 blocker 1): `MtpVerifier::forward_one`'s own GQA
+    /// ADR-080 C1 (#785): `MtpVerifier::forward_one`'s own GQA
     /// attention over its KV cache is a production attention row, not a
     /// vocabulary/logit softmax (the PR body's original classification was wrong).
     /// A NaN cached K row must zero the whole attention-context row for every

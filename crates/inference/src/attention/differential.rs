@@ -724,7 +724,7 @@ mod tests {
     // test_diff_attn_partial_nan_row_fails_closed_in_full
     // ---------------------------------------------------------------
 
-    /// #785 round-1 medium 2 (codex): poisoning a WHOLE Q row (as
+    /// #785: poisoning a WHOLE Q row (as
     /// `test_diff_attn_nan_score_fails_closed` does) makes every lane of that
     /// row NaN together, so it can't distinguish "zero the whole row" from a
     /// buggy "zero only the NaN lane(s), normalize the rest" mutation -- both

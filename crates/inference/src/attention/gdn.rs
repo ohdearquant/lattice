@@ -873,7 +873,7 @@ mod tests {
 
     /// ADR-080 C1 fail-closed (#850): GDN state persists across tokens, so a NaN Q
     /// lane must not leak past the token it appears in. Unlike an earlier version of
-    /// this test (see #862 review round 1, major finding 3), the poison here is
+    /// this test (see #862), the poison here is
     /// applied via a weight object used ONLY for step 0 -- steps 1 and 2 run with
     /// ordinary, never-zeroed, never-poisoned weights in BOTH the poisoned and
     /// reference runs, so this actually proves "one poisoned token, then two clean

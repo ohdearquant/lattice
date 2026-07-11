@@ -241,8 +241,8 @@ impl LoraAdapter {
                 ("in_proj_z", false) => (config.hidden_size, config.linear_output_dim()),
                 // beta/alpha are projected per VALUE head (matches the shipping
                 // gdn_fused forward and the f16 weight loader), not per key head
-                // (#792 codex round-1 blocker: this was linear_num_key_heads,
-                // wrong for asymmetric 4B/27B shapes where value_heads != key_heads).
+                // (#792: this was linear_num_key_heads, wrong for asymmetric
+                // 4B/27B shapes where value_heads != key_heads).
                 ("in_proj_b", false) => (config.hidden_size, config.linear_num_value_heads()),
                 ("in_proj_a", false) => (config.hidden_size, config.linear_num_value_heads()),
                 ("out_proj", false) => (config.linear_output_dim(), config.hidden_size),
@@ -543,7 +543,7 @@ mod tests {
             }
         }
 
-        /// Regression for #792 codex round-1 blocker: in_proj_b/in_proj_a
+        /// Regression for #792: in_proj_b/in_proj_a
         /// dims must be keyed by `linear_num_value_heads()`, not
         /// `linear_num_key_heads`. Asymmetric-head configs (key_heads !=
         /// value_heads) are the only ones that can tell these apart —

@@ -58,7 +58,7 @@ Router::new()
     .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
 ```
 
-Both `GET /` and `GET /v1/models` landed in ADR-080 C2 round 2 (#786, codex round-1 finding #1):
+Both `GET /` and `GET /v1/models` landed in ADR-080 C2 (#786):
 `lattice serve` previously had neither route. `GET /` and `/v1/models`' response bodies are now
 built from the shared `lattice_inference::serve::root_body`/`models_list_body` helpers so both
 binaries return byte-identical shapes for the same inputs. No `/v1/completions`, no admin/metrics

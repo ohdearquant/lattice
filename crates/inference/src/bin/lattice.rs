@@ -2373,8 +2373,8 @@ mod serve {
             tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
             max_context: usize,
         },
-        /// Test-only seam (ADR-080 C2 round 2, codex round-2 medium finding
-        /// #3): wraps a real tiny model for `tokenize_len`/`max_context`/
+        /// Test-only seam (ADR-080 C2): wraps a real tiny model for
+        /// `tokenize_len`/`max_context`/
         /// `tokenizer` (so request validation stays realistic) but
         /// substitutes the CPU streaming generation call itself with an
         /// injected closure. This lets a test observe `should_cancel` being
@@ -3135,7 +3135,7 @@ mod serve {
         Json(HealthResponse { status: "ok" })
     }
 
-    /// `GET /` (ADR-080 C2 round 2, codex finding #1): a minimal engine-
+    /// `GET /` (ADR-080 C2): a minimal engine-
     /// identity/endpoint-discovery document, in the same shape
     /// `lattice_serve.rs` already served on its own daemon -- this binary
     /// had no equivalent route at all, an undocumented route-set divergence
@@ -3330,7 +3330,7 @@ mod serve {
     /// The `on_token`/`should_cancel` composition for CPU-style streaming
     /// generation, constructed in exactly ONE place and shared by the real
     /// `ModelBackend::Cpu` arm and the test-only `CpuFakeGenerate` arm below
-    /// (ADR-080 C2 round 3, codex round-3 medium finding #1). Before this,
+    /// (ADR-080 C2). Before this,
     /// each arm rebuilt `move || *cancel_rx.borrow()` independently, so a
     /// disposable-worktree mutation that broke ONLY the real `Cpu` arm's
     /// predicate left the `CpuFakeGenerate`-only post-drop oracle green --
@@ -3492,8 +3492,7 @@ mod serve {
             match model {
                 ModelBackend::Cpu(cpu_model) => {
                     // Delegates through the SAME shared helper the test-only
-                    // `CpuFakeGenerate` arm below uses (codex round-3 medium
-                    // finding #1) -- only the generation call itself
+                    // `CpuFakeGenerate` arm below uses -- only the generation call itself
                     // (`cpu_model.generate_streaming_with_cancel` here, an
                     // injected closure there) differs; the `should_cancel`
                     // predicate is constructed once, by the helper, for both.
@@ -3545,7 +3544,7 @@ mod serve {
                         }
                     });
                 }
-                // ADR-080 C2 round 2/3, codex round-3 medium finding #1: goes
+                // ADR-080 C2: goes
                 // through the exact same `spawn_cpu_style_streaming_generation`
                 // helper as the real `Cpu` arm above -- there is no separate
                 // `should_cancel` construction here to leave un-mutated. Only
@@ -3705,7 +3704,7 @@ mod serve {
                             message: "inference failed".to_string(),
                         }
                     })?,
-                // ADR-080 C2 round 2 (codex round-2 medium finding #3) added
+                // ADR-080 C2 added
                 // this variant for the streaming arm's cancellation probe
                 // only, so non-streaming used to bypass the injected
                 // `generate` closure entirely and delegate straight to the
@@ -5215,15 +5214,14 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // HTTP-level client-disconnect cancellation (ADR-080 C2 round 2, codex
-        // round-1 finding #2) -- gated behind `test-utils` (see
+        // HTTP-level client-disconnect cancellation (ADR-080 C2) -- gated behind `test-utils` (see
         // `lattice_inference::model::qwen35::test_support`) because it needs a
         // real, tiny, deterministic CPU model to exercise the actual
         // `chat_completions` -> `body_stream`'s `cancel_guard` capture ->
         // `generate_streaming_with_cancel` composition end to end, not just the
         // primitive (already unit/mutation-tested in
         // `model/qwen35/generation.rs`) or the guard type (already unit-tested
-        // in `serve/mod.rs`) in isolation. Codex's review: "the disclosed
+        // in `serve/mod.rs`) in isolation. "The disclosed
         // HTTP-level disconnect test gap ... does not waive that gate."
         // -----------------------------------------------------------------------
         #[cfg(feature = "test-utils")]
@@ -5253,7 +5251,7 @@ mod serve {
             /// generation is genuinely under way) before dropping the
             /// response body to simulate a disconnect.
             ///
-            /// Mutation-sensitive to codex's named regression: if
+            /// Mutation-sensitive to a known regression: if
             /// `let _cancel_guard_tied_to_stream_lifetime = &cancel_guard;`
             /// is removed from `body_stream`'s `flat_map` closure in
             /// `chat_completions`, `cancel_guard` is no longer captured by
@@ -5371,13 +5369,13 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // Post-drop generator-side cancellation probe (ADR-080 C2 round 2,
-        // codex round-2 medium finding #3): `chat_completions_streaming_
+        // Post-drop generator-side cancellation probe (ADR-080 C2):
+        // `chat_completions_streaming_
         // disconnect_stops_generation` above proves guard retention BEFORE
         // the response is returned (frame 2 is a real content delta), but
         // does NOT prove `should_cancel` reaching the generator AFTER the
         // drop, independently of `on_token`'s own failed-send stop
-        // condition -- codex's exact reverse mutation (`cancel_rx`
+        // condition -- the exact reverse mutation (`cancel_rx`
         // predicate replaced by `move || false`, `on_token`'s failed-send
         // path left intact) left that test green in 0.02s, because the
         // failed send alone stops a real decode loop just as fast as a
@@ -5491,7 +5489,7 @@ mod serve {
                 }
             }
 
-            /// Mutation-sensitive to BOTH of codex's named regressions
+            /// Mutation-sensitive to BOTH known regressions
             /// independently, via a test<->generator handshake that removes
             /// the timing race a plain poll-and-time-it design would have
             /// (an early, timing-dependent version of this test observed
@@ -5652,8 +5650,7 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // Streaming context-overflow status parity (ADR-080 C2 round 2, codex
-        // round-2 major finding #1): `lattice.rs` already gets this right
+        // Streaming context-overflow status parity (ADR-080 C2): `lattice.rs` already gets this right
         // structurally -- `prepare_chat_request`'s context-window preflight
         // (`check_context_window`) runs unconditionally, before
         // `chat_completions` ever branches on `req.stream` -- so a `stream:
@@ -5663,7 +5660,7 @@ mod serve {
         // already pins the underlying cascade ordering as a pure function;
         // this drives the SAME contract through the real `Router`.
         //
-        // ADR-080 C2 round 3, codex round-3 medium finding #2: this now
+        // ADR-080 C2: this now
         // builds its request from `lattice_inference::serve`'s shared
         // `OVERFLOW_PARITY_*` constants -- the SAME body/limits
         // `lattice_serve.rs`'s `real_router_overflow_parity` module drives
@@ -5674,7 +5671,7 @@ mod serve {
         // fixed at `OVERFLOW_PARITY_CONTEXT_WINDOW` (1024) precisely so this
         // side's "effective context limit" matches the daemon side's
         // explicitly-configured `AppState.model_max_context` of the same
-        // value, per codex's finding.
+        // value.
         // -----------------------------------------------------------------------
         #[cfg(feature = "test-utils")]
         mod streaming_context_overflow {
@@ -5716,8 +5713,8 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // Cross-binary `/v1/chat/completions` parity table (ADR-080 C2 round 2,
-        // codex round-1 finding #1): drives every fixture body in
+        // Cross-binary `/v1/chat/completions` parity table (ADR-080 C2):
+        // drives every fixture body in
         // `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` through
         // THIS binary's real `Router` via `tower::ServiceExt::oneshot`, and
         // compares the resulting status + error code against the case's
@@ -5889,7 +5886,7 @@ mod serve {
         // actually called with, then returns a canned result; it never
         // recomputes `build_cfg`/`validate_temperature`/etc. itself.
         //
-        // DISPUTED (issue #828 fix-round 3, codex round-2 medium finding #1):
+        // DISPUTED (issue #828):
         // this observation captures `rendered_prompt`, not `messages`, and
         // that is the real shape of this seam, not an omission. `chat_completions`
         // computes `to_chat_messages(&req.messages)` (the normalized message
@@ -5907,7 +5904,7 @@ mod serve {
         //
         // Observing `messages` at the CPU seam authentically (not by
         // re-deriving `to_chat_messages` independently in the test, which
-        // would be tautological -- exactly the round-1 major finding this
+        // would be tautological -- exactly the bug this
         // module was written to fix) would require a `MetalFakeGenerate`
         // test double for `ModelBackend::Metal`. `MetalHandle::spawn`
         // hard-requires loading a real Q4 model directory onto a real Metal

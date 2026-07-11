@@ -35,7 +35,7 @@ mixture = ["dep:lattice-fann"]
 # Opt-in only: the default decode path stays byte-identical when this is off.
 gdn-state-counters = []
 # Exposes test-only fixture constructors (currently: a tiny all-zero-weight
-# Qwen35Model, ADR-080 C2 round 2) as `pub` library API, gated so they never
+# Qwen35Model, ADR-080 C2) as `pub` library API, gated so they never
 # ship in a normal build. Needed because bin targets (lattice.rs,
 # lattice_serve.rs) link against this crate as an ordinary dependency and
 # cannot see its `#[cfg(test)]`-only internals -- only a real Cargo feature
@@ -202,7 +202,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 # Partial-body polling (`BodyExt::frame`) for the `lattice.rs` HTTP-level
-# client-disconnect test (ADR-080 C2 round 2, codex finding #2): axum's own
+# client-disconnect test (ADR-080 C2): axum's own
 # `to_bytes` reads to EOF or errors past a byte cap, neither of which lets a
 # test read N real SSE frames then drop the body mid-stream to simulate a
 # disconnect. Already an axum 0.8 transitive dependency at the same version;
@@ -210,10 +210,10 @@ tempfile = { workspace = true }
 http-body-util = { workspace = true }
 # Drives real HTTP requests (built from `CHAT_COMPLETIONS_PARITY_CASES`
 # fixture bodies) through each binary's `Router` via `ServiceExt::oneshot`
-# for the cross-binary parity table (ADR-080 C2 round 2, codex finding #1).
+# for the cross-binary parity table (ADR-080 C2).
 # Already an axum 0.8 transitive dependency (axum's `Router` implements
 # `tower::Service`); `util` is the feature gating `ServiceExt`/`oneshot`,
-# kept at this use site (round-2 minor finding #4: the version itself moved
+# kept at this use site (the version itself moved
 # to `[workspace.dependencies]`, feature selection stays local).
 tower = { workspace = true, features = ["util"] }
 

@@ -64,7 +64,7 @@ const FAIL_CLOSED_MAX_ABS_DIFF: f32 = 1e-3;
 /// crate's own fail-closed `softmax_row` helpers (not a plain `f32::max`-fold
 /// reimplementation) at the same tolerance the sibling test above uses.
 ///
-/// codex round-1 medium #2 on #795: the prior version of this test built the
+/// #795: the prior version of this test built the
 /// 253-line CPU oracle (`cpu_forward_fail_closed_reference`) but only
 /// compared NaN *counts* between GPU and CPU output, independently, never
 /// the two arrays against each other -- so an arbitrary finite garbage value

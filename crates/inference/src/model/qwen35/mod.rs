@@ -34,8 +34,8 @@ pub(crate) use eval::{log_softmax_nll, run_strided_perplexity};
 #[cfg(test)]
 mod tests;
 
-/// Test-only tiny zero-weight model construction (ADR-080 C2 round 2, codex
-/// finding #2), gated behind the `test-utils` Cargo feature so it never
+/// Test-only tiny zero-weight model construction (ADR-080 C2), gated behind
+/// the `test-utils` Cargo feature so it never
 /// ships in a normal build -- see the module doc comment for why this can't
 /// just be `#[cfg(test)]` like the library's own internal test fixtures.
 #[cfg(feature = "test-utils")]
@@ -64,7 +64,7 @@ pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_n
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::{DecodePolicy, StepOutcome, StopCheckOutcome};
 // Sibling guard for `enable_mtp` on the cross-turn prefix-cache path, which
-// has no MTP draft/verify wiring (codex round-2 medium #4, PR #787). Only
+// has no MTP draft/verify wiring (PR #787). Only
 // that Metal-only path needs it, same gate as `DecodePolicy`/`StepOutcome`.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::check_mtp_not_requested;

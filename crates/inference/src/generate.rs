@@ -1183,7 +1183,7 @@ fn compute_attention(
                 l = l * alpha + (s - m_new).exp();
                 m = m_new;
             }
-            // ADR-080 C1 (#785 round-1 medium 1): route the final decision
+            // ADR-080 C1 (#785): route the final decision
             // through the shared row-finalizer. Behavior-preserving -- `l`
             // reaches the same `<= 0.0`/non-finite outcomes as the manual
             // `if l > 0.0 { .. } else { scores.fill(0.0) }` this replaces.
@@ -1239,7 +1239,7 @@ fn compute_attention(
                 }
             }
 
-            // Softmax. ADR-080 C1 (#785 round-1 medium 1): route the final
+            // Softmax. ADR-080 C1 (#785): route the final
             // decision through the shared row-finalizer -- behavior-preserving,
             // real (unclamped) `.exp()` already reaches the same full-row-zero
             // outcome via NaN-into-`sum` propagation that the manual
@@ -1621,7 +1621,7 @@ mod tests {
             output[0]
         );
         assert_eq!(output[0], 0.0, "failed-closed row must be zeroed");
-        // ADR-080 C1 (#785 round-1 medium 1) clean-row parity check: query 1's
+        // ADR-080 C1 (#785) clean-row parity check: query 1's
         // clean row must still normalize through `finalize_row` to the exact
         // weighted average, not merely stay finite. Both keys score equally
         // (q[1] == 0.0 dotted with either k), so softmax is a uniform 0.5/0.5

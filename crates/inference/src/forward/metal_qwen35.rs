@@ -87,7 +87,7 @@ impl From<std::path::PathBuf> for MtpLoadErr {
 
 /// One MTP tensor's values as read from disk, before Metal buffer
 /// creation — deliberately `Device`-free so flavor selection and shape
-/// validation are unit-testable without a GPU (#636 round-1 medium #3).
+/// validation are unit-testable without a GPU (#636).
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 #[derive(Debug)]
 enum MtpTensorSource {
@@ -146,7 +146,7 @@ impl MtpTensorSource {
 ///
 /// Also validates the resolved tensor's on-disk shape against
 /// `expected_shape`: a same-numel transposed file loads and generates
-/// tokens but produces garbage MTP drafts (#636 round-1 medium #1), so
+/// tokens but produces garbage MTP drafts (#636), so
 /// shape mismatches are rejected the same way as an incompatible
 /// artifact rather than silently accepted.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
@@ -209,7 +209,7 @@ fn resolve_mtp_projection(
 /// checkpoint flavor; a `.q4` sibling under a norm's name is treated
 /// as an incompatible artifact rather than silently ignored (defense
 /// in depth — should never occur on a checkpoint from either
-/// quantizer). Also validates on-disk shape (#636 round-1 medium #1).
+/// quantizer). Also validates on-disk shape (#636).
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn resolve_mtp_norm(
     q4_dir: &std::path::Path,
@@ -300,11 +300,11 @@ mod mtp_resolve_tests {
     // (ADR-051 Phase 1: MTP counter-rotation needs unquantized weights).
     // `resolve_mtp_projection`/`resolve_mtp_norm` must accept both flavors,
     // reject a stale `.q4` MTP sibling under a QuaRot (`is_quarot=true`)
-    // directory (round-1 MAJOR), and reject a transposed/mismatched tensor
-    // shape (round-1 medium #1). These tests live at the file top level,
+    // directory, and reject a transposed/mismatched tensor
+    // shape. These tests live at the file top level,
     // compiled unconditionally in any test build -- not gated on `metal-gpu`
     // -- so this coverage never skip-passes on a Metal-less CI runner
-    // (round-1 medium #3, hardened further in round 2: see the module doc
+    // (see the module doc
     // comment above `mtp_tensor_path` for why this code moved out of
     // `mod inner` entirely).
 
@@ -412,7 +412,7 @@ mod mtp_resolve_tests {
     }
 
     // --- CPU-only, Device-free coverage of the flavor/shape logic itself ---
-    // (round-1 medium #3: these never skip on a Metal-less CI runner.)
+    // (these never skip on a Metal-less CI runner.)
 
     #[test]
     fn resolve_mtp_projection_prefers_q4_when_allowed() {
@@ -544,7 +544,7 @@ mod mtp_resolve_tests {
 }
 
 // -----------------------------------------------------------------------------
-// MTP / self-spec route-around predicates (codex round-1 medium #1, PR #657) --
+// MTP / self-spec route-around predicates (PR #657) --
 // pure, `Device`-free, compiled unconditionally in test builds (same pattern
 // as the `resolve_mtp_*` functions above: `mod inner` re-imports these via
 // `use super::{...}` so the two real dispatch sites in `generate()` stay
@@ -566,8 +566,8 @@ mod mtp_resolve_tests {
 /// which either applies budget forcing or rejects the config via
 /// `check_reasoning_budget_not_set`.
 ///
-/// `gen_cfg.repetition_penalty == 1.0` is likewise load-bearing (codex round-1
-/// blocker #2, PR #787): both the MTP draft (`mtp_forward_one`) and verify
+/// `gen_cfg.repetition_penalty == 1.0` is likewise load-bearing (PR #787):
+/// both the MTP draft (`mtp_forward_one`) and verify
 /// steps select tokens via raw `argmax_f32_first_wins` over logits, never
 /// through `sample_token`, so a non-identity penalty configured by the caller
 /// would be silently ignored -- a set penalty can change which token is
@@ -575,8 +575,8 @@ mod mtp_resolve_tests {
 /// performance one. Any non-1.0 penalty must route around MTP to the plain
 /// loop, which samples via `sample_token` and applies it.
 ///
-/// `gen_cfg.logprobs.is_none()` is likewise load-bearing (codex round-2
-/// blocker #1, PR #787): `generate_greedy_mtp` unconditionally returns
+/// `gen_cfg.logprobs.is_none()` is likewise load-bearing (PR #787):
+/// `generate_greedy_mtp` unconditionally returns
 /// `token_logprobs: vec![]`, so a set `logprobs` request must route around
 /// MTP to the plain loop, which either captures logprobs or rejects the
 /// config via `check_logprobs_not_set`.
@@ -603,9 +603,9 @@ fn mtp_route_active(
 /// branch. Mirrors the `use_self_spec` computation inline in
 /// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()` /
 /// `reasoning_budget.is_none()` / `repetition_penalty == 1.0` route-around
-/// rationale as [`mtp_route_active`] (codex round-1 blocker #2, PR #787):
+/// rationale as [`mtp_route_active`] (PR #787):
 /// self-spec's verify step also selects via raw argmax, never `sample_token`.
-/// `gen_cfg.logprobs.is_none()` is the same round-2 blocker #1 route-around
+/// `gen_cfg.logprobs.is_none()` is the same route-around
 /// as [`mtp_route_active`]: `generate_greedy_self_spec` also unconditionally
 /// returns `token_logprobs: vec![]`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
@@ -663,7 +663,7 @@ mod route_predicate_tests {
         assert!(mtp_route_active(true, true, &gen_cfg, false));
     }
 
-    /// Codex medium #1: non-empty `stop_strings` must route around MTP even
+    /// Non-empty `stop_strings` must route around MTP even
     /// though every other MTP precondition (present, enabled, greedy,
     /// non-compact, no grammar) is satisfied.
     #[test]
@@ -683,7 +683,7 @@ mod route_predicate_tests {
         assert!(self_spec_route_active(true, true, &gen_cfg, false, 1));
     }
 
-    /// Codex medium #1: non-empty `stop_strings` must route around
+    /// Non-empty `stop_strings` must route around
     /// self-speculative decode even though every other precondition
     /// (checkpoints present, env set, greedy, non-compact, no grammar, has
     /// linear-attention layers) is satisfied.
@@ -734,7 +734,7 @@ mod route_predicate_tests {
         );
     }
 
-    /// Codex round-1 blocker #2 (PR #787): a non-identity `repetition_penalty`
+    /// PR #787: a non-identity `repetition_penalty`
     /// must route around MTP even though every other MTP precondition
     /// (present, enabled, greedy, non-compact, no grammar, no stop strings,
     /// no reasoning budget) is satisfied. MTP's draft/verify loop selects via
@@ -743,7 +743,7 @@ mod route_predicate_tests {
     ///
     /// Mutation sensitivity: removing the `repetition_penalty == 1.0` clause
     /// from `mtp_route_active` makes this assertion fail (the route stays
-    /// active), reproducing codex's reported failure mode exactly.
+    /// active), reproducing the reported failure mode exactly.
     #[test]
     fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
         let gen_cfg = GenerateConfig {
@@ -759,7 +759,7 @@ mod route_predicate_tests {
     }
 
     /// Sibling to `mtp_route_blocked_by_nonidentity_repetition_penalty` for
-    /// the self-speculative route (codex round-1 blocker #2, PR #787).
+    /// the self-speculative route (PR #787).
     #[test]
     fn self_spec_route_blocked_by_nonidentity_repetition_penalty() {
         let gen_cfg = GenerateConfig {
@@ -774,7 +774,7 @@ mod route_predicate_tests {
         );
     }
 
-    /// Output-level discriminating case (codex round-1 blocker #2, PR #787):
+    /// Output-level discriminating case (PR #787):
     /// proves the route-around above is not merely cosmetic. With
     /// `repetition_penalty = 1.0` the raw dense argmax MTP/self-spec use
     /// (`argmax_f32_first_wins`) agrees with the canonical
@@ -824,7 +824,7 @@ mod route_predicate_tests {
         );
     }
 
-    /// Codex round-2 blocker #1 (PR #787): a set `logprobs` must route
+    /// PR #787: a set `logprobs` must route
     /// around MTP even though every other MTP precondition (present,
     /// enabled, greedy, non-compact, no grammar, no stop strings, no
     /// reasoning budget, identity repetition penalty) is satisfied.
@@ -832,12 +832,12 @@ mod route_predicate_tests {
     /// so a caller requesting logprobs would otherwise get `Ok` with the
     /// requested output silently absent.
     ///
-    /// Codex's exact falsification recipe: add `logprobs: Some(0)` to the
+    /// Falsification recipe: add `logprobs: Some(0)` to the
     /// otherwise-active predicate fixture and assert the route is inactive.
     ///
     /// Mutation sensitivity: removing the `logprobs.is_none()` clause from
     /// `mtp_route_active` makes this assertion fail (the route stays
-    /// active), reproducing codex's reported failure mode exactly.
+    /// active), reproducing the reported failure mode exactly.
     #[test]
     fn mtp_route_blocked_by_set_logprobs() {
         let gen_cfg = GenerateConfig {
@@ -852,7 +852,7 @@ mod route_predicate_tests {
     }
 
     /// Sibling to `mtp_route_blocked_by_set_logprobs` for the
-    /// self-speculative route (codex round-2 blocker #1, PR #787):
+    /// self-speculative route (PR #787):
     /// `generate_greedy_self_spec` has the same unconditional empty-vector
     /// return.
     #[test]
@@ -1535,7 +1535,7 @@ mod inner {
     /// full-vocab nucleus sampling once the tail is truncated, so exact mode is
     /// the default and the approximation is opt-in only.
     ///
-    /// Review round-1 finding 2: `top_k == 50` intentionally stays out of
+    /// `top_k == 50` intentionally stays out of
     /// `LM_HEAD_LOCAL_KS` and therefore falls through to `CpuFallback` here, so
     /// the caller re-resolves it via `choose_gpu_topk_route`'s `HierarchicalK50`
     /// path, which still does a full-logit GEMV before its compact dispatch.
@@ -3497,7 +3497,7 @@ mod inner {
                         raw_out: make_zero_buffer(device, bp * output_dim, "gdn_chunk_raw_out"),
                     }
                 },
-                // Review round-1 finding 3: this `[vocab_size]` buffer is allocated
+                // This `[vocab_size]` buffer is allocated
                 // once per session and reused for both the compact and exact
                 // routes, so a compact-only generation still carries it. Issue
                 // #171's threadgroup-reduction claim is about *dispatch*, not
@@ -5563,7 +5563,7 @@ mod inner {
             cmd2.wait_until_completed();
 
             // ---- Phase 3: CPU ----
-            // Codex round-1 medium #4 (PR #787): this was the one surviving
+            // PR #787: this was the one surviving
             // production last-wins `max_by` argmax after the #280 fix -- the
             // MTP draft-token pick, called from `generate_greedy_mtp`. Swapped
             // for the shared first-wins `argmax_f32_first_wins` helper so a
@@ -8659,8 +8659,8 @@ mod inner {
             // already applies it via `stop_text_state` further down.
             crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
 
-            // Reject logprobs before any prefill/state work (codex round-2
-            // blocker #1, PR #787): this entry point unconditionally returns
+            // Reject logprobs before any prefill/state work (PR #787): this
+            // entry point unconditionally returns
             // `token_logprobs: vec![]` on every return path below (including
             // the MTP and self-spec fast-path delegations), so a caller
             // requesting `gen_cfg.logprobs` would otherwise get `Ok` with the
@@ -8721,7 +8721,7 @@ mod inner {
                     _ => gen_cfg.top_k,
                 };
             } else {
-                // Issue #171 review round-1 finding 1: clear any compact request
+                // Issue #171: clear any compact request
                 // left over from a prior compact-eligible generation on this same
                 // state so the exact full-logit path isn't starved by stale state.
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -9335,7 +9335,7 @@ mod inner {
             // alive would let a later cache-aware call restore GDN state for
             // KV rows that no longer represent it (finding 2).
             self.cross_turn_prefix_cache.clear();
-            // Issue #171 review round-1 finding 1: a compact top-k request from a
+            // Issue #171: a compact top-k request from a
             // prior generation must not leak into the next one. Without this, a
             // caller that reuses one `MetalQwen35State` for a compact-eligible
             // generation followed by an exact-required generation (grammar,
@@ -13071,7 +13071,7 @@ mod inner {
                     _ => gen_cfg.top_k,
                 };
             } else {
-                // Issue #171 review round-1 finding 1: clear any compact request
+                // Issue #171: clear any compact request
                 // left over from a prior compact-eligible generation on this same
                 // state so the exact full-logit path isn't starved by stale state.
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -13206,7 +13206,7 @@ mod inner {
             // `reasoning_end_len` seed covers the budget=1 edge case exactly as
             // the pre-extraction inline bookkeeping did. Shared with the CPU
             // `model::qwen35::generation` loops -- see `DecodePolicy`'s doc comment.
-            // `DecodePolicy::init` (codex round-2 major #2, PR #787) records
+            // `DecodePolicy::init` (PR #787) records
             // the prefill token's logprob (#585, no-op unless requested) in
             // the same call that constructs the policy -- replaces the
             // freestanding `record_logprob(...)` call this site used to make
@@ -13214,8 +13214,7 @@ mod inner {
             // `forward_prefill()` populated it above, and reflects the same
             // distribution `next_id` was sampled from.
             // `streaming: true` selects `StopMode::Streaming`'s incremental
-            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
-            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` -- `policy.stop_mode`
             // now owns the `StopStringMatcher` this call site used to
             // construct and drive by hand.
             let mut policy = crate::model::qwen35::DecodePolicy::init(
@@ -13330,8 +13329,8 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                // One atomic per-step transition (ADR-080 C3 / codex round-1
-                // major #3, PR #787) -- see `DecodePolicy::transition`.
+                // One atomic per-step transition (ADR-080 C3, PR #787) --
+                // see `DecodePolicy::transition`.
                 // Interaction note: if reasoning_budget AND grammar are both active and the
                 // grammar disallows </think> at this position, advance returns false → break.
                 // This is fail-closed (no grammar-illegal output emitted) but silent. The
@@ -13339,8 +13338,7 @@ mod inner {
                 //
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` or
                 // `Disabled` at construction) now owns this path's byte-
-                // holdback stop check itself (codex round-3 major #1, PR
-                // #787 / Leo's ruling) -- this call site supplies only
+                // holdback stop check itself -- this call site supplies only
                 // `decode_delta` (this loop's own detokenizer) and the
                 // shared `text`/`throwaway_offsets` buffers.
                 let generated_len_before = generated_ids.len();
@@ -15393,8 +15391,8 @@ mod inner {
             C: FnMut() -> bool,
         {
             // Config preflight checks live here, in the public wrapper, and
-            // must return BEFORE the `match` below (codex round-2 medium #3,
-            // PR #787): the error-recovery arm of that `match` unconditionally
+            // must return BEFORE the `match` below (PR #787): the
+            // error-recovery arm of that `match` unconditionally
             // calls `reset_state()` and removes the cache slot on ANY `Err`
             // from `_inner`, including a not-yet-attempted preflight
             // rejection. A caller passing an unsupported config (e.g.
@@ -15668,7 +15666,7 @@ mod inner {
                     _ => gen_cfg.top_k,
                 };
             } else {
-                // Issue #171 review round-1 finding 1: clear any compact request
+                // Issue #171: clear any compact request
                 // left over from a prior compact-eligible generation on this same
                 // state so the exact full-logit path isn't starved by stale state.
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -15813,19 +15811,18 @@ mod inner {
             // Backend-neutral reasoning-budget policy (ADR-080 C3), shared with
             // `generate_streaming` above and the CPU `model::qwen35::generation`
             // loops, driven through the one atomic `DecodePolicy::transition`
-            // (codex round-1 major #3, PR #787). `token_logprobs` below is a
+            // (PR #787). `token_logprobs` below is a
             // throwaway sink: this path does not wire per-token logprobs
             // capture, and the `check_logprobs_not_set` guard above already
             // rejects any request that would need it, so `gen_cfg.logprobs`
             // is always `None` here and `DecodePolicy::init` / `transition`'s
-            // logprob recording is always a no-op (codex round-1 blocker #1,
-            // PR #787) -- passed through uniformly rather than special-cased,
+            // logprob recording is always a no-op -- passed through uniformly
+            // rather than special-cased,
             // so this site is structurally indistinguishable from the other
             // five at the `DecodePolicy::init` / `transition` call sites.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
             // `streaming: true` selects `StopMode::Streaming`'s incremental
-            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
-            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` -- `policy.stop_mode`
             // now owns the `StopStringMatcher` this call site used to
             // construct and drive by hand.
             let mut policy = crate::model::qwen35::DecodePolicy::init(
@@ -15960,8 +15957,7 @@ mod inner {
 
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` or
                 // `Disabled` at construction) now owns this path's byte-
-                // holdback stop check itself (codex round-3 major #1, PR
-                // #787 / Leo's ruling) -- this call site supplies only
+                // holdback stop check itself -- this call site supplies only
                 // `decode_delta` (this loop's own detokenizer) and the
                 // shared `text`/`throwaway_offsets` buffers.
                 let generated_len_before = generated_ids.len();
@@ -20669,7 +20665,7 @@ mod inner {
             }
         }
 
-        /// Regression (issue #171 review round-1 finding 1): a compact top-k
+        /// Regression (issue #171): a compact top-k
         /// request from one generation must not survive `reset_state()` into
         /// the next generation on the same `MetalQwen35State`. Production
         /// callers rely on this exact mechanism — every `generate_streaming`/
@@ -20861,7 +20857,7 @@ mod inner {
                     baseline.reset_state();
                     blocked.reset_state();
                     // `reset_state` clears `compact_route`/`compact_topk` (issue #171
-                    // review round-1 finding 1 — a prior generation's compact request
+                    // — a prior generation's compact request
                     // must not leak into the next one). This test drives `forward_step`
                     // directly rather than through `generate_streaming`'s route-decision
                     // block, so it must re-apply the compact-route configuration itself
@@ -20930,8 +20926,8 @@ mod inner {
 
         /// `generate_multimodal` with `max_new_tokens == 0` must return zero
         /// generated tokens without running prefill or sampling (#612 sibling-
-        /// invocation-path audit found this 4th guard site; #621 review round 1
-        /// flagged it as missing mutation-sensitive coverage).
+        /// invocation-path audit found this 4th guard site; #621 flagged it
+        /// as missing mutation-sensitive coverage).
         ///
         /// Unlike the CPU-side zero-budget tests (which use empty weight vecs
         /// to make mutation trivially observable via a panic), Metal GPU state
@@ -21045,8 +21041,8 @@ mod inner {
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
                     baseline.reset_state();
-                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
-                    // review round-1 finding 1). This test drives `forward_step`
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171).
+                    // This test drives `forward_step`
                     // directly rather than through `generate_streaming`'s
                     // route-decision block, so it must re-apply each state's
                     // compact-route configuration after every reset, exactly as a
@@ -21332,7 +21328,7 @@ mod inner {
         /// `Qwen35Model` path), so this leg uses a reduced default position
         /// count to keep runtime sane; override via
         /// `LATTICE_TEST_Q4_GREEDY_POSITIONS`. Same reset/re-apply-compact-route
-        /// discipline as the f16 leg (issue #171 review round-1 finding 1).
+        /// discipline as the f16 leg (issue #171).
         #[test]
         fn lm_head_q4_real_checkpoint_greedy_agreement() {
             let Some(_) = Device::system_default() else {
@@ -21368,8 +21364,8 @@ mod inner {
                 if pos_in_window >= reset_every {
                     baseline.reset_state();
                     blocked.reset_state();
-                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
-                    // review round-1 finding 1); re-apply after every reset exactly as
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171);
+                    // re-apply after every reset exactly as
                     // a real caller starting a fresh `generate_*` call would via the
                     // route-decision block.
                     blocked.session.compact_route = GpuTopkRoute::BlockArgmax;
@@ -21479,8 +21475,8 @@ mod inner {
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
                     baseline.reset_state();
-                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
-                    // review round-1 finding 1); re-apply each state's compact-route
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171);
+                    // re-apply each state's compact-route
                     // configuration after every reset, exactly as a real caller
                     // starting a fresh `generate_*` call would via the route-decision
                     // block.
@@ -22073,7 +22069,7 @@ mod inner {
         /// char-boundary clamp that `single_char_vocab_tokenizer` (all 1-byte
         /// tokens) cannot exercise on its own.
         ///
-        /// Codex round-1 medium #2 (PR #657): the previous version of this
+        /// PR #657: the previous version of this
         /// fixture inserted the literal chars `"世"`/`"界"` as BPE vocab
         /// *strings*. Qwen's real decode path reverses GPT-2 byte-level token
         /// strings through `byte_decoder` (`detokenize.rs::append_token_bytes`);
@@ -23091,7 +23087,7 @@ mod inner {
         }
 
         /// Sibling to `metal_generate_plain_rejects_reasoning_budget_config`
-        /// (codex round-2 blocker #1, PR #787): `MetalQwen35State::generate`
+        /// (PR #787): `MetalQwen35State::generate`
         /// (the plain/direct entry point) unconditionally returns
         /// `token_logprobs: vec![]` on every return path, including the MTP
         /// and self-spec fast-path delegations, and had no
@@ -23133,7 +23129,7 @@ mod inner {
             assert!(
                 matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
                 "MetalQwen35State::generate must fail closed with InvalidInput when \
-                 logprobs is set (codex round-2 blocker #1, PR #787); got {result:?}"
+                 logprobs is set (PR #787); got {result:?}"
             );
         }
 
@@ -25117,7 +25113,7 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // Stress/repeat coverage for the #862 WAR-hazard
                     // fix (Q->K threadgroup_barrier after every sg_buf[0] consumer):
                     // a passing single dispatch does not prove the race is closed
                     // (simdgroups are not required to advance in lockstep, so the
@@ -25266,7 +25262,7 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // Stress/repeat coverage for the #862 WAR-hazard
                     // fix; see the identical comment in
                     // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
                     for _ in 0..20 {
@@ -25414,7 +25410,7 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // Stress/repeat coverage for the #862 WAR-hazard
                     // fix (this kernel has TWO fixed handoffs: Q->K and K->k_dot_q);
                     // see the identical comment in
                     // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
@@ -27774,8 +27770,7 @@ mod inner {
             );
         }
 
-        /// Codex round-1 blocker #1 (PR #787):
-        /// `generate_streaming_with_prefix_cache` never wires per-token
+        /// PR #787: `generate_streaming_with_prefix_cache` never wires per-token
         /// logprobs capture into its decode loop. Before the fix, a caller
         /// requesting `gen_cfg.logprobs` got `Ok` back with silently empty
         /// `token_logprobs` -- the exact silent-omission defect ADR-080 C3's
@@ -27844,7 +27839,7 @@ mod inner {
             );
         }
 
-        /// Codex round-2 medium #3 (PR #787): the round-1 fix guarded the
+        /// PR #787: an earlier fix guarded the
         /// NO-entry case, but not the case where a valid entry already
         /// exists. The public wrapper
         /// `generate_streaming_with_prefix_cache_and_cancel` used to catch
@@ -27928,7 +27923,7 @@ mod inner {
             );
         }
 
-        /// Codex round-2 medium #4 (PR #787): the prefix-cache path accepts
+        /// PR #787: the prefix-cache path accepts
         /// `GenerateConfig` but never reads `enable_mtp`, unlike the direct
         /// Metal `generate()` entry point, which resolves it and delegates
         /// to `generate_greedy_mtp`. An active MTP request (explicit

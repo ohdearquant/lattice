@@ -751,7 +751,7 @@ const LOGPROB_NEG_SENTINEL: f32 = -1.0e9;
 /// non-finite (e.g. every logit non-finite) or `token_id` is outside the
 /// vocabulary covered by `logits`.
 ///
-/// `pub(crate)` (codex round-3 medium #2, PR #787 / Leo's ruling): this is
+/// `pub(crate)` (PR #787): this is
 /// the pure-computation half of what `record_logprob` used to expose as one
 /// combined `pub(crate)` function. `DecodePolicy::record_logprob`
 /// (`model::qwen35::generation`) is the only place that pushes the result
@@ -2379,7 +2379,7 @@ mod tests {
 
     // `record_logprob`'s noop/appends behavior moved to
     // `model::qwen35::generation`'s `DecodePolicy::record_logprob` tests
-    // (codex round-3 medium #2, PR #787 / Leo's ruling) -- see
+    // (PR #787) -- see
     // `decode_policy_record_logprob_noop_when_not_requested` and
     // `transition_records_one_logprob_per_generated_token` there. The
     // freestanding `pub(crate) record_logprob` this module used to export no

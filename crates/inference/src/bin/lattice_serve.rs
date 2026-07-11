@@ -202,8 +202,8 @@ mod imp {
     /// #649). Fail-closed: unknown roles and unsupported content parts are
     /// never coerced or dropped, they always produce one of these.
     ///
-    /// `code` carries the OpenAI-style error code (ADR-080 C2 round 2,
-    /// codex finding #1): previously this variant was message-only, so
+    /// `code` carries the OpenAI-style error code (ADR-080 C2): previously
+    /// this variant was message-only, so
     /// every validation failure collapsed to `err_response`'s generic
     /// `"invalid_request"` fallback regardless of what specifically went
     /// wrong -- `lattice.rs`'s `ApiError::BadRequest` already differentiated
@@ -366,7 +366,7 @@ mod imp {
     }
 
     impl MessageRole {
-        /// ADR-080 C2 round 2 (codex finding #1): differentiates the same
+        /// ADR-080 C2: differentiates the same
         /// two cases `lattice.rs`'s `ValidatedRole::parse` does -- `tool`/
         /// `developer` are real OpenAI roles this server does not implement
         /// (`unsupported_feature`), while anything else is not an OpenAI
@@ -857,7 +857,7 @@ mod imp {
             RequestError::bad_request(
                 "invalid JSON request body",
                 // Matches lattice.rs's JSON-extraction-failure code
-                // (ADR-080 C2 round 2, codex finding #1).
+                // (ADR-080 C2).
                 "invalid_request_body",
             )
         })
@@ -877,8 +877,7 @@ mod imp {
                         Part::Text { text } => out.push_str(text),
                         Part::ImageUrl { .. } => {
                             // Matches lattice.rs's `message_text` image
-                            // rejection code (ADR-080 C2 round 2, codex
-                            // finding #1).
+                            // rejection code (ADR-080 C2).
                             return Err(RequestError::bad_request(
                                 IMAGE_REQUIRES_VISION_MESSAGE,
                                 "unsupported_feature",
@@ -1019,7 +1018,7 @@ mod imp {
     /// Tokenizes `messages` and enforces the full KV-window invariant
     /// (`check_prompt_fits_window`) before any generation work starts.
     ///
-    /// ADR-080 C2 round 3 (codex round-3 medium finding #2): `spawn_worker`'s
+    /// ADR-080 C2: `spawn_worker`'s
     /// real Metal closure below and the real-router streaming
     /// context-overflow parity test in this module's test suite both call
     /// this EXACT function -- not two independently-written copies of the
@@ -1348,7 +1347,7 @@ mod imp {
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
             );
-            // ADR-080 C2 round 2 (codex finding #1): previously mapped to
+            // ADR-080 C2: previously mapped to
             // HTTP 400 + generic "invalid_request", diverging from
             // lattice.rs's 413 + "request_body_too_large" for the identical
             // oversized-body condition. Aligned to match.
@@ -1426,7 +1425,7 @@ mod imp {
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
                 );
-                // ADR-080 C2 round 2 (codex finding #1): `build_cfg` already
+                // ADR-080 C2: `build_cfg` already
                 // returns the shared `lattice_inference::serve::ApiError`
                 // with the correct status+code (e.g. `invalid_max_tokens`
                 // for #745's max_tokens=0 rejection) -- routing it through
@@ -1471,7 +1470,7 @@ mod imp {
         // the non-streaming branch. Either way that's the client disconnect
         // signal the worker checks in `run_worker_loop`.
         if streaming {
-            // ADR-080 C2 round 2, codex round-2 major finding #1: without this
+            // ADR-080 C2: without this
             // preflight, a prompt-plus-budget overflow was only discoverable
             // AFTER the HTTP response had already committed to 200 SSE (the
             // worker's `Ev::Rejected` arrived mid-stream, terminating with
@@ -1621,8 +1620,7 @@ mod imp {
                                     // call happens before any `Ev::Delta`/`Ev::Done`
                                     // is ever sent for a job, so `Ev::Rejected` can
                                     // only ever be the FIRST event a job produces --
-                                    // and the preflight above (ADR-080 C2 round 2,
-                                    // codex round-2 major finding #1) already
+                                    // and the preflight above (ADR-080 C2) already
                                     // intercepts that one before committing to 200
                                     // SSE. Kept as a defensive fallback (same
                                     // graceful-termination shape as before) in case
@@ -1729,7 +1727,7 @@ mod imp {
                         );
                         // Matches lattice.rs's `check_context_window` code
                         // for the analogous prompt-plus-budget-exceeds-window
-                        // condition (ADR-080 C2 round 2, codex finding #1).
+                        // condition (ADR-080 C2).
                         return err_response(
                             StatusCode::BAD_REQUEST,
                             &message,
@@ -1778,7 +1776,7 @@ mod imp {
     /// `INTERNAL_SERVER_ERROR`, so the status code produced here is
     /// unchanged; only the body shape gains `code`/`param`.
     /// `error_code` is the OpenAI-style code for the `BAD_REQUEST` branch
-    /// (ADR-080 C2 round 2, codex finding #1): previously hardcoded to the
+    /// (ADR-080 C2): previously hardcoded to the
     /// generic `"invalid_request"` regardless of what specifically failed,
     /// which is exactly how the `max_tokens: 0` rejection lost its
     /// `"invalid_max_tokens"` code on the way through this function. Ignored
@@ -1881,14 +1879,14 @@ mod imp {
     /// including the cross-binary parity table in
     /// `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` -- can drive
     /// real HTTP requests through it via `tower::ServiceExt::oneshot`
-    /// (ADR-080 C2 round 2, codex finding #1). Deliberately does NOT install
+    /// (ADR-080 C2). Deliberately does NOT install
     /// `DefaultBodyLimit` the way `lattice.rs`'s `router()` does: this
     /// binary enforces the same [`lattice_inference::serve::REQUEST_BODY_LIMIT_BYTES`]
     /// cap manually inside `chat_completions` via `to_bytes`, a documented
     /// intentional divergence in ENFORCEMENT MECHANISM only (axum's
     /// `DefaultBodyLimit` layer vs. a direct `to_bytes` cap) -- the
     /// resulting status/code (413 `request_body_too_large`) is identical on
-    /// both binaries today (round 2, codex finding #1's fix; see the
+    /// both binaries today (see the
     /// `oversized_body_over_limit` parity case).
     pub fn router(state: AppState) -> Router {
         Router::new()
@@ -2496,8 +2494,7 @@ mod imp {
         fn message_role_tool_and_developer_rejected_as_unsupported_feature() {
             // A real OpenAI role this server does not implement --
             // `unsupported_feature`, matching `lattice.rs`'s split between
-            // "not a role" and "a role we don't support" (ADR-080 C2
-            // round 2, codex finding #1).
+            // "not a role" and "a role we don't support" (ADR-080 C2).
             for role in ["tool", "developer"] {
                 let err = MessageRole::parse(role).unwrap_err();
                 assert_eq!(err.code(), "unsupported_feature");
@@ -2773,7 +2770,7 @@ mod imp {
             // opposed to "developer"/"tool", which ARE real OpenAI roles
             // this server just doesn't implement -- see
             // `chat_completions_tool_and_developer_role_400_unsupported_feature`
-            // below for that split, ADR-080 C2 round 2 codex finding #1).
+            // below for that split, ADR-080 C2).
             let body =
                 Body::from(r#"{"messages":[{"role":"moderator","content":"hi"}]}"#.to_string());
             let response = chat_completions(State(test_app_state()), body).await;
@@ -3061,13 +3058,13 @@ mod imp {
             );
         }
 
-        /// ADR-080 C2 round 2, codex round-2 major finding #1: a `stream:
+        /// ADR-080 C2: a `stream:
         /// true` request whose prompt overflows the model's context window
         /// must return HTTP 400 `context_length_exceeded` BEFORE any SSE
         /// stream is committed -- not silently commit to a 200 SSE response
         /// that only discovers the overflow later via `Ev::Rejected`
         /// mid-stream and terminates with `finish_reason: "length"` (the
-        /// exact drift this finding named). This fakes the worker side of
+        /// exact drift this test catches). This fakes the worker side of
         /// the `Ev::Rejected` contract (production code sends it from
         /// `enforce_prompt_window` inside `run_worker_loop`, prefixed with
         /// `PROMPT_EXCEEDS_WINDOW_PREFIX`) so the composition under test is
@@ -3076,7 +3073,7 @@ mod imp {
         /// calling `Sse::new(..).into_response()`, or does it commit
         /// unconditionally?
         ///
-        /// ADR-080 C2 round 3, codex round-3 medium finding #2: this test
+        /// ADR-080 C2: this test
         /// pins ONLY that response-mapping contract with a request that
         /// would NOT genuinely overflow in production (`max_tokens`
         /// defaults to 100 against a 4096-token `model_max_context`) and a
@@ -3137,7 +3134,7 @@ mod imp {
             );
         }
 
-        /// ADR-080 C2 round 3 (codex round-3 medium finding #2): the
+        /// ADR-080 C2: the
         /// same-input real-router parity the test above does NOT provide.
         /// Drives `lattice_inference::serve::OVERFLOW_PARITY_REQUEST_BODY`
         /// -- the SAME fixture `lattice.rs`'s `streaming_context_overflow`
@@ -3159,7 +3156,8 @@ mod imp {
         /// would accept the request, `chat_completions` would commit a 200
         /// SSE response, and this test's `StatusCode::BAD_REQUEST`
         /// assertion would fail. This is the exact production worker-side
-        /// check codex named ("removing the production worker closure's
+        /// check that removing `spawn_worker`'s reliance on it would leave
+        /// undetected ("removing the production worker closure's
         /// check_prompt_fits_window call ... would leave both the direct
         /// handler test and the pure helper test green") -- `spawn_worker`'s
         /// real Metal closure and this test's worker seam both call
@@ -3335,8 +3333,7 @@ mod imp {
             );
         }
 
-        // ── cross-binary parity table (ADR-080 C2 round 2, codex round-1
-        // finding #1) ────────────────────────────────────────────────────
+        // ── cross-binary parity table (ADR-080 C2) ─────────────────────────
         //
         // Drives every fixture body in
         // `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` through
