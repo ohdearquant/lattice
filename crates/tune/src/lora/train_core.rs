@@ -210,6 +210,294 @@ impl GdnLoraParams {
     }
 }
 
+/// Geometry inputs shared by every tape entry point: the flat per-array
+/// dimensions (`Dims`), the GDN-specific dimensions (`GdnDims`), and the model
+/// config both were derived from. Held as references so the tape borrows the
+/// caller's already-computed geometry instead of cloning it per call.
+pub struct TapeGeometry<'a> {
+    dims: &'a Dims,
+    gdn_dims: &'a GdnDims,
+    model: &'a Qwen35Config,
+}
+
+impl<'a> TapeGeometry<'a> {
+    /// Bundle references to the tape's geometry. Consistency between `dims`,
+    /// `gdn_dims`, and `model` is checked by [`TrainCtx::try_new`], not here —
+    /// this constructor is a plain aggregate, not a validator.
+    pub fn new(dims: &'a Dims, gdn_dims: &'a GdnDims, model: &'a Qwen35Config) -> Self {
+        Self {
+            dims,
+            gdn_dims,
+            model,
+        }
+    }
+}
+
+/// The private, execution-only `{rank, scale}` pair derived from
+/// `alpha / rank` by [`TrainCtx::try_new`]. Not adapter governance (the
+/// adapter descriptor scoped to issue #615 owns rank/alpha/target-module
+/// governance) — this is just the two scalars the forward/backward tape
+/// multiplies LoRA deltas by.
+struct LoraExecution {
+    rank: usize,
+    scale: f32,
+}
+
+/// The GQA-slot and GDN-slot layer index layout for a materialised tape run.
+/// `gqa_layers[slot]` / `gdn_layers[slot]` give the global model layer index
+/// trained by that slot; slot count is the slice length (see
+/// [`TrainCtx::num_gqa_slots`] / [`TrainCtx::num_gdn_slots`]).
+pub struct SlotLayout<'a> {
+    gqa_layers: &'a [usize],
+    gdn_layers: &'a [usize],
+}
+
+impl<'a> SlotLayout<'a> {
+    /// Bundle the GQA/GDN slot-layer index slices. Uniqueness, in-range, and
+    /// mixer-kind agreement are checked by [`TrainCtx::try_new`], not here.
+    pub fn new(gqa_layers: &'a [usize], gdn_layers: &'a [usize]) -> Self {
+        Self {
+            gqa_layers,
+            gdn_layers,
+        }
+    }
+}
+
+/// Adam hyperparameters shared by every optimizer step in a training run.
+pub struct AdamConfig {
+    learning_rate: f32,
+    beta1: f32,
+    beta2: f32,
+    epsilon: f32,
+}
+
+impl AdamConfig {
+    /// Bundle Adam hyperparameters. Finiteness is checked by
+    /// [`TrainCtx::try_new`], not here.
+    pub fn new(learning_rate: f32, beta1: f32, beta2: f32, epsilon: f32) -> Self {
+        Self {
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+        }
+    }
+}
+
+/// Validated, immutable run context for the training tape's core entry
+/// points (`forward_full`, `eval_chain_nll`, `nll_and_grads`,
+/// `apply_adam_updates`, `apply_gdn_adam_updates`).
+///
+/// `TrainCtx::try_new` is the only constructor: it validates rank and
+/// hyperparameter finiteness, checks that `geometry`'s `Dims`/`GdnDims` agree
+/// with `geometry.model`, and checks that `slots`' GQA/GDN layer indices are
+/// each unique, in-range for `geometry.model`, and never claim the same layer
+/// index for both mixer kinds. A `TrainCtx` cannot exist unless all of that
+/// holds, so callers of the narrowed entry points no longer have to
+/// reconstruct — or get wrong — the positional-argument agreement the old
+/// ten-argument signatures relied on.
+///
+/// Non-goal: `TrainCtx` owns geometry, layout, and optimizer policy only — it
+/// never owns weights, caches, gradients, LoRA vectors, or optimizer state
+/// (see issue #844's Non-goals).
+pub struct TrainCtx<'a> {
+    geometry: TapeGeometry<'a>,
+    lora: LoraExecution,
+    slots: SlotLayout<'a>,
+    adam: AdamConfig,
+}
+
+impl<'a> TrainCtx<'a> {
+    /// Construct a validated `TrainCtx`.
+    ///
+    /// `alpha` is not stored: the execution-only `scale = alpha / rank` is
+    /// derived once here and held privately alongside `rank`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(TuneError::Validation)` if:
+    /// - `rank == 0`.
+    /// - `alpha`, `adam.learning_rate`, `adam.beta1`, `adam.beta2`, or
+    ///   `adam.epsilon` is non-finite (NaN or +/-inf).
+    /// - `geometry.dims` or `geometry.gdn_dims` disagree with
+    ///   `geometry.model` (a geometry built from a different config than the
+    ///   one the tape will index weights through).
+    /// - `slots.gqa_layers` or `slots.gdn_layers` contains a duplicate layer
+    ///   index, an index `>= geometry.model.num_hidden_layers`, or a layer
+    ///   index that appears in both lists (a mixer-kind conflict: the same
+    ///   layer cannot be trained as both GQA and GDN).
+    pub fn try_new(
+        geometry: TapeGeometry<'a>,
+        rank: usize,
+        alpha: f32,
+        slots: SlotLayout<'a>,
+        adam: AdamConfig,
+    ) -> Result<Self> {
+        if rank == 0 {
+            return Err(TuneError::Validation(
+                "TrainCtx::try_new: rank must be > 0".to_string(),
+            ));
+        }
+        if !alpha.is_finite() {
+            return Err(TuneError::Validation(format!(
+                "TrainCtx::try_new: alpha must be finite, got {alpha}"
+            )));
+        }
+        for (name, v) in [
+            ("learning_rate", adam.learning_rate),
+            ("beta1", adam.beta1),
+            ("beta2", adam.beta2),
+            ("epsilon", adam.epsilon),
+        ] {
+            if !v.is_finite() {
+                return Err(TuneError::Validation(format!(
+                    "TrainCtx::try_new: adam.{name} must be finite, got {v}"
+                )));
+            }
+        }
+
+        let d = geometry.dims;
+        let m = geometry.model;
+        if d.hidden != m.hidden_size
+            || d.vocab != m.vocab_size
+            || d.num_q_heads != m.num_attention_heads
+            || d.num_kv_heads != m.num_key_value_heads
+            || d.head_dim != m.head_dim
+            || d.rope_dim != m.rope_dim()
+            || d.inter != m.intermediate_size
+            || d.q_dim != m.full_q_dim()
+            || d.kv_dim != m.full_kv_dim()
+            || (d.eps - m.rms_norm_eps).abs() > 1e-9
+        {
+            return Err(TuneError::Validation(
+                "TrainCtx::try_new: Dims does not match TapeGeometry.model".to_string(),
+            ));
+        }
+        let expected_gdn = GdnDims::from_cfg(m);
+        let gd = geometry.gdn_dims;
+        if gd.num_kh != expected_gdn.num_kh
+            || gd.value_heads != expected_gdn.value_heads
+            || gd.key_dim != expected_gdn.key_dim
+            || gd.value_dim != expected_gdn.value_dim
+            || gd.qkv_dim != expected_gdn.qkv_dim
+            || gd.output_dim != expected_gdn.output_dim
+            || gd.kernel_size != expected_gdn.kernel_size
+            || (gd.scale - expected_gdn.scale).abs() > 1e-9
+        {
+            return Err(TuneError::Validation(
+                "TrainCtx::try_new: GdnDims does not match TapeGeometry.model".to_string(),
+            ));
+        }
+
+        let num_hidden_layers = m.num_hidden_layers;
+        let mut seen = std::collections::HashSet::new();
+        for &li in slots.gqa_layers {
+            if li >= num_hidden_layers {
+                return Err(TuneError::Validation(format!(
+                    "TrainCtx::try_new: gqa slot layer {li} out of range (model has {num_hidden_layers} layers)"
+                )));
+            }
+            if !seen.insert(li) {
+                return Err(TuneError::Validation(format!(
+                    "TrainCtx::try_new: duplicate gqa slot layer {li}"
+                )));
+            }
+        }
+        let mut seen_gdn = std::collections::HashSet::new();
+        for &li in slots.gdn_layers {
+            if li >= num_hidden_layers {
+                return Err(TuneError::Validation(format!(
+                    "TrainCtx::try_new: gdn slot layer {li} out of range (model has {num_hidden_layers} layers)"
+                )));
+            }
+            if !seen_gdn.insert(li) {
+                return Err(TuneError::Validation(format!(
+                    "TrainCtx::try_new: duplicate gdn slot layer {li}"
+                )));
+            }
+            if seen.contains(&li) {
+                return Err(TuneError::Validation(format!(
+                    "TrainCtx::try_new: layer {li} claimed by both gqa and gdn slot layouts \
+                     (mixer-kind/slot-index mismatch)"
+                )));
+            }
+        }
+
+        let scale = alpha / rank as f32;
+        Ok(Self {
+            geometry,
+            lora: LoraExecution { rank, scale },
+            slots,
+            adam,
+        })
+    }
+
+    /// Number of GQA LoRA slots (== `slots.gqa_layers.len()`).
+    pub fn num_gqa_slots(&self) -> usize {
+        self.slots.gqa_layers.len()
+    }
+
+    /// Number of GDN LoRA slots (== `slots.gdn_layers.len()`).
+    pub fn num_gdn_slots(&self) -> usize {
+        self.slots.gdn_layers.len()
+    }
+
+    /// Global model layer index per GQA slot.
+    pub fn gqa_layers(&self) -> &[usize] {
+        self.slots.gqa_layers
+    }
+
+    /// Global model layer index per GDN slot.
+    pub fn gdn_layers(&self) -> &[usize] {
+        self.slots.gdn_layers
+    }
+
+    /// LoRA rank.
+    pub fn rank(&self) -> usize {
+        self.lora.rank
+    }
+
+    /// Execution-only LoRA scale (`alpha / rank`).
+    pub fn scale(&self) -> f32 {
+        self.lora.scale
+    }
+
+    /// Flat per-array dimensions.
+    pub fn dims(&self) -> &Dims {
+        self.geometry.dims
+    }
+
+    /// GDN-specific dimensions.
+    pub fn gdn_dims(&self) -> &GdnDims {
+        self.geometry.gdn_dims
+    }
+
+    /// The model config the geometry was derived from.
+    pub fn model(&self) -> &Qwen35Config {
+        self.geometry.model
+    }
+
+    /// Adam learning rate.
+    pub fn learning_rate(&self) -> f32 {
+        self.adam.learning_rate
+    }
+
+    /// Adam beta1.
+    pub fn beta1(&self) -> f32 {
+        self.adam.beta1
+    }
+
+    /// Adam beta2.
+    pub fn beta2(&self) -> f32 {
+        self.adam.beta2
+    }
+
+    /// Adam epsilon.
+    pub fn epsilon(&self) -> f32 {
+        self.adam.epsilon
+    }
+}
+
 pub struct SeqCtx {
     pub h_in: Vec<f32>,
     pub cos: Vec<f32>,
@@ -283,19 +571,19 @@ fn position_nll(logits: &[f32], target: u32) -> f32 {
     (-log_prob) as f32
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn forward_full(
     ctx: &SeqCtx,
     layers: &[LayerW<'_>],
     loras: &[LoraParams],
     gdn_loras: &[GdnLoraParams],
     head: &Head<'_>,
-    d: &Dims,
-    gdn_dims: &GdnDims,
-    cfg: &Qwen35Config,
-    rank: usize,
-    scale: f32,
+    train: &TrainCtx<'_>,
 ) -> Result<FullFwd> {
+    let d = train.dims();
+    let gdn_dims = train.gdn_dims();
+    let cfg = train.model();
+    let rank = train.rank();
+    let scale = train.scale();
     let hidden = d.hidden;
     let seq = ctx.seq_len;
     let mut h = ctx.h_in.clone();
@@ -464,25 +752,18 @@ pub fn forward_full(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn eval_chain_nll(
     caches: &[SeqCtx],
     layers: &[LayerW<'_>],
     loras: &[LoraParams],
     gdn_loras: &[GdnLoraParams],
     head: &Head<'_>,
-    d: &Dims,
-    gdn_dims: &GdnDims,
-    cfg: &Qwen35Config,
-    rank: usize,
-    scale: f32,
+    train: &TrainCtx<'_>,
 ) -> Result<f32> {
     let mut nll_sum = 0.0f64;
     let mut n = 0usize;
     for ctx in caches {
-        let fwd = forward_full(
-            ctx, layers, loras, gdn_loras, head, d, gdn_dims, cfg, rank, scale,
-        )?;
+        let fwd = forward_full(ctx, layers, loras, gdn_loras, head, train)?;
         for p in &fwd.positions {
             nll_sum += position_nll(&p.logits, p.target) as f64;
             n += 1;
@@ -497,19 +778,19 @@ pub fn eval_chain_nll(
 /// `num_gdn_slots`/the returned `Vec<GdnLoraParams>` cover the GDN LoRA slots
 /// (surface-B, ported from lattice PR #202) — empty when no GDN layer in the
 /// materialised range carries a LoRA slot.
-#[allow(clippy::too_many_arguments)]
 pub fn nll_and_grads(
     fwd: &FullFwd,
     layers: &[LayerW<'_>],
     loras: &[LoraParams],
     head: &Head<'_>,
-    d: &Dims,
-    gdn_dims: &GdnDims,
-    num_slots: usize,
-    num_gdn_slots: usize,
-    rank: usize,
-    scale: f32,
+    train: &TrainCtx<'_>,
 ) -> Result<(f32, usize, Vec<Grads>, Vec<GdnLoraParams>)> {
+    let d = train.dims();
+    let gdn_dims = train.gdn_dims();
+    let rank = train.rank();
+    let scale = train.scale();
+    let num_slots = train.num_gqa_slots();
+    let num_gdn_slots = train.num_gdn_slots();
     let hidden = d.hidden;
     let seq = fwd.h_final.len() / hidden;
     let n_comp = fwd.positions.len().max(1) as f32;
@@ -658,17 +939,17 @@ pub fn rand_fill(rng: &mut u64, n: usize, amp: f32) -> Vec<f32> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn apply_adam_updates(
     adam: &mut AdamState,
     loras: &mut [LoraParams],
     grads: &[Grads],
-    slot_layers: &[usize],
-    lr: f32,
-    beta1: f32,
-    beta2: f32,
-    eps_adam: f32,
+    train: &TrainCtx<'_>,
 ) {
+    let slot_layers = train.gqa_layers();
+    let lr = train.learning_rate();
+    let beta1 = train.beta1();
+    let beta2 = train.beta2();
+    let eps_adam = train.epsilon();
     for slot in 0..slot_layers.len() {
         let li = slot_layers[slot];
         adam.step(
@@ -721,17 +1002,17 @@ pub fn apply_adam_updates(
 /// Adam step for the GDN LoRA slots (surface-B). Mirrors `apply_adam_updates`
 /// but steps all 5 GDN projections' A/B pairs (10 arrays/slot) instead of the
 /// 2 GQA projections' A/B pairs (4 arrays/slot).
-#[allow(clippy::too_many_arguments)]
 pub fn apply_gdn_adam_updates(
     adam: &mut AdamState,
     gdn_loras: &mut [GdnLoraParams],
     gdn_grads: &[GdnLoraParams],
-    slot_layers: &[usize],
-    lr: f32,
-    beta1: f32,
-    beta2: f32,
-    eps_adam: f32,
+    train: &TrainCtx<'_>,
 ) {
+    let slot_layers = train.gdn_layers();
+    let lr = train.learning_rate();
+    let beta1 = train.beta1();
+    let beta2 = train.beta2();
+    let eps_adam = train.epsilon();
     for slot in 0..slot_layers.len() {
         let li = slot_layers[slot];
         macro_rules! step {
@@ -827,17 +1108,38 @@ mod gdn_lora_tests {
         }
         let gdn_grads = vec![grads];
 
+        // apply_gdn_adam_updates only reads `train`'s gdn slot layout and Adam
+        // hyperparameters (not its geometry), so a real preset's consistent
+        // Dims/GdnDims/Qwen35Config triple is enough here — it need not match
+        // `gd` (the tiny fixture the GdnLoraParams shapes above were built
+        // from).
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let dims = Dims {
+            hidden: cfg.hidden_size,
+            vocab: cfg.vocab_size,
+            num_q_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            rope_dim: cfg.rope_dim(),
+            inter: cfg.intermediate_size,
+            q_dim: cfg.full_q_dim(),
+            kv_dim: cfg.full_kv_dim(),
+            eps: cfg.rms_norm_eps,
+        };
+        let real_gdn_dims = GdnDims::from_cfg(&cfg);
+        let gqa_layers: [usize; 0] = [];
+        let gdn_layers = [7usize];
+        let train = TrainCtx::try_new(
+            TapeGeometry::new(&dims, &real_gdn_dims, &cfg),
+            rank,
+            (rank as f32) * 2.0,
+            SlotLayout::new(&gqa_layers, &gdn_layers),
+            AdamConfig::new(0.1, 0.9, 0.999, 1e-8),
+        )
+        .expect("valid TrainCtx");
+
         let mut adam = AdamState::new();
-        apply_gdn_adam_updates(
-            &mut adam,
-            &mut gdn_loras,
-            &gdn_grads,
-            &[7],
-            0.1,
-            0.9,
-            0.999,
-            1e-8,
-        );
+        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train);
 
         // Adam moves params opposite the gradient sign: positive grad -> param
         // decreases from its zero init; negative grad -> param increases.
@@ -853,5 +1155,250 @@ mod gdn_lora_tests {
         );
         // Untouched (zero-grad) arrays stay at their zero init.
         assert!(gdn_loras[0].a_z.iter().all(|&v| v == 0.0));
+    }
+}
+
+#[cfg(test)]
+mod train_ctx_tests {
+    use super::*;
+
+    /// A geometry triple that satisfies `TrainCtx::try_new`'s consistency
+    /// check by construction: `Dims`/`GdnDims` are derived from the same
+    /// `Qwen35Config` the way every real call site (`train.rs`,
+    /// `train_grad_full.rs`) builds them.
+    struct Geometry {
+        cfg: Qwen35Config,
+        dims: Dims,
+        gdn_dims: GdnDims,
+    }
+
+    fn valid_geometry() -> Geometry {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let dims = Dims {
+            hidden: cfg.hidden_size,
+            vocab: cfg.vocab_size,
+            num_q_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            rope_dim: cfg.rope_dim(),
+            inter: cfg.intermediate_size,
+            q_dim: cfg.full_q_dim(),
+            kv_dim: cfg.full_kv_dim(),
+            eps: cfg.rms_norm_eps,
+        };
+        let gdn_dims = GdnDims::from_cfg(&cfg);
+        Geometry {
+            cfg,
+            dims,
+            gdn_dims,
+        }
+    }
+
+    fn valid_adam() -> AdamConfig {
+        AdamConfig::new(1e-3, 0.9, 0.999, 1e-8)
+    }
+
+    /// `TrainCtx` intentionally has no `Debug` impl (it borrows a `Qwen35Config`
+    /// among other things, and nothing needs to print one), so
+    /// `Result::unwrap_err` isn't available — extract the error message by hand.
+    fn expect_err(result: Result<TrainCtx<'_>>) -> String {
+        match result {
+            Ok(_) => panic!("expected TrainCtx::try_new to reject this input"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn try_new_accepts_valid_inputs() {
+        let g = valid_geometry();
+        let gqa = [19usize, 23];
+        let gdn = [20usize, 21, 22];
+        let train = TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        )
+        .expect("valid geometry/rank/slots/adam must construct a TrainCtx");
+        assert_eq!(train.num_gqa_slots(), 2);
+        assert_eq!(train.num_gdn_slots(), 3);
+        assert_eq!(train.rank(), 8);
+        assert!((train.scale() - 2.0).abs() < 1e-6); // alpha / rank = 16 / 8
+    }
+
+    /// Mutation-sensitive: an out-of-range GQA slot layer (>= num_hidden_layers)
+    /// must be rejected — without this guard the tape indexes
+    /// `model.weights.layers[idx]` (or an equivalent slot array) out of bounds.
+    #[test]
+    fn try_new_rejects_out_of_range_slot_layer() {
+        let g = valid_geometry();
+        let gqa = [g.cfg.num_hidden_layers]; // one past the last valid index
+        let gdn: [usize; 0] = [];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("out of range"),
+            "expected out-of-range rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: a duplicate layer index within one slot list must
+    /// be rejected — two slots claiming the same layer would silently alias
+    /// the same LoRA weights to two different gradient accumulators.
+    #[test]
+    fn try_new_rejects_duplicate_slot_layer() {
+        let g = valid_geometry();
+        let gqa = [19usize, 19];
+        let gdn: [usize; 0] = [];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("duplicate"),
+            "expected duplicate-layer rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: a layer index claimed by both the GQA and GDN
+    /// slot lists is a mixer-kind conflict — the same layer cannot be
+    /// trained as both mixer kinds in one materialised tape.
+    #[test]
+    fn try_new_rejects_mixer_kind_slot_index_mismatch() {
+        let g = valid_geometry();
+        let gqa = [19usize];
+        let gdn = [19usize];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("mixer-kind"),
+            "expected mixer-kind/slot-index mismatch rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_zero_rank() {
+        let g = valid_geometry();
+        let gqa = [19usize];
+        let gdn: [usize; 0] = [];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+            0,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("rank"),
+            "expected rank-zero rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: non-finite alpha must be rejected before it can
+    /// propagate into `scale = alpha / rank` and poison every LoRA-scaled
+    /// forward/backward computation with NaN/inf.
+    #[test]
+    fn try_new_rejects_non_finite_alpha() {
+        let g = valid_geometry();
+        let gqa = [19usize];
+        let gdn: [usize; 0] = [];
+        for bad_alpha in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = expect_err(TrainCtx::try_new(
+                TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+                8,
+                bad_alpha,
+                SlotLayout::new(&gqa, &gdn),
+                valid_adam(),
+            ));
+            assert!(
+                err.contains("alpha"),
+                "expected alpha rejection for {bad_alpha}; got: {err}"
+            );
+        }
+    }
+
+    /// Mutation-sensitive: non-finite Adam hyperparameters (learning rate,
+    /// beta1, beta2, epsilon) must each be rejected — any one of them
+    /// propagates NaN/inf into every optimizer step.
+    #[test]
+    fn try_new_rejects_non_finite_adam_hyperparams() {
+        let g = valid_geometry();
+        let gqa = [19usize];
+        let gdn: [usize; 0] = [];
+        let cases: [(&str, AdamConfig); 4] = [
+            ("learning_rate", AdamConfig::new(f32::NAN, 0.9, 0.999, 1e-8)),
+            ("beta1", AdamConfig::new(1e-3, f32::INFINITY, 0.999, 1e-8)),
+            ("beta2", AdamConfig::new(1e-3, 0.9, f32::NEG_INFINITY, 1e-8)),
+            ("epsilon", AdamConfig::new(1e-3, 0.9, 0.999, f32::NAN)),
+        ];
+        for (name, adam) in cases {
+            let err = expect_err(TrainCtx::try_new(
+                TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+                8,
+                16.0,
+                SlotLayout::new(&gqa, &gdn),
+                adam,
+            ));
+            assert!(err.contains(name), "expected {name} rejection; got: {err}");
+        }
+    }
+
+    /// Mutation-sensitive: `Dims` built from a different model than
+    /// `TapeGeometry.model` must be rejected — this is the geometry-
+    /// consistency check the ten-argument signatures had no way to enforce.
+    #[test]
+    fn try_new_rejects_dims_model_mismatch() {
+        let g = valid_geometry();
+        let mut mismatched_dims = g.dims;
+        mismatched_dims.hidden += 1;
+        let gqa = [19usize];
+        let gdn: [usize; 0] = [];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&mismatched_dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("Dims"),
+            "expected Dims/model mismatch rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: `GdnDims` built from a different model than
+    /// `TapeGeometry.model` must be rejected, mirroring the `Dims` check.
+    #[test]
+    fn try_new_rejects_gdn_dims_model_mismatch() {
+        let g = valid_geometry();
+        let mut mismatched_gdn = g.gdn_dims;
+        mismatched_gdn.value_heads += 1;
+        let gqa = [19usize];
+        let gdn: [usize; 0] = [];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &mismatched_gdn, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("GdnDims"),
+            "expected GdnDims/model mismatch rejection; got: {err}"
+        );
     }
 }
