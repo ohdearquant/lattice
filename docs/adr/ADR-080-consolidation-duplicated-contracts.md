@@ -1,8 +1,23 @@
 # ADR-080: Consolidation of Duplicated Numeric-Contract Helpers (Softmax, HTTP Serving, Decode Policy, GEMM Validation)
 
-**Status**: Proposed
+**Status**: Implemented (clusters C1–C4 merged; remaining audit items tracked as open issues)
 **Kind**: Aspirational
-**Date**: 2026-07-09
+**Date**: 2026-07-09 (status updated 2026-07-11)
+
+**Implementation record** (verified against merged PRs at `origin/main @ 32697ed0e`):
+
+- C1 — shared fail-closed softmax row finalizer: PR #785 (merged 2026-07-10); the
+  companion dead-kernel deletion and Metal `fused_attention` fail-closed finalize
+  landed in PR #794 (merged 2026-07-11), with the WGPU counterpart in PR #795.
+- C2 — shared HTTP serving contract for `lattice` + `lattice_serve`: PR #786
+  (merged 2026-07-10).
+- C3 — backend-neutral decode policy, apply-or-fail-closed: PR #787 (merged 2026-07-10).
+- C4 — checked GEMM argument validator at every safe entry point: PR #796
+  (merged 2026-07-11).
+
+Non-cluster audit items from the same sweep remain open and track their own work
+independently (see the per-family checklists and standalone items referenced under
+**Issues** below); their state does not gate this ADR's status.
 **Crate**: lattice-inference (`crates/inference/src/attention/`, `src/forward/`, `src/bin/`,
 `src/model/qwen35/`)
 **Research**: Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; adversarially verified at the audited commit; re-verified at `origin/main @ 0699e60cc`)
