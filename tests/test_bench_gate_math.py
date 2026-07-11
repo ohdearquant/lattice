@@ -129,6 +129,48 @@ class BootstrapMeanTest(unittest.TestCase):
             gm.bootstrap_upper_bound([1.0], [True], 10, rng, corrected_alpha=1.5)
 
 
+class BootstrapLowerBoundTest(unittest.TestCase):
+    """The FAIL rule needs a one-sided LOWER bound, not
+    `bootstrap_upper_bound`'s `(1 - alpha)` upper tail. These fixtures
+    pin the orientation."""
+
+    def test_near_null_lower_bound_at_or_below_threshold(self):
+        # point estimate (mean=0.07) sits just above threshold
+        # log(1.07)=0.067659, but the sample has enough spread that the
+        # corrected LOWER bound must sit at or below the threshold --
+        # i.e. this is NOT a confirmed FAIL.
+        tau = math.log(1.07)
+        values = [0.05, 0.09, 0.06, 0.08, 0.04, 0.10, 0.07]
+        order_ab = [True, False, True, False, True, False, True]
+        rng = random.Random(123)
+        lower = gm.bootstrap_lower_bound(values, order_ab, 2000, rng, corrected_alpha=0.01)
+        self.assertLessEqual(lower, tau)
+
+    def test_stable_ten_percent_slowdown_lower_bound_above_threshold(self):
+        # a deterministic (zero-variance) 10% slowdown must clear the 7%
+        # FAIL threshold at the corrected LOWER bound.
+        tau = math.log(1.07)
+        values = [math.log(1.10)] * 7
+        order_ab = [True, False, True, False, True, False, True]
+        rng = random.Random(123)
+        lower = gm.bootstrap_lower_bound(values, order_ab, 2000, rng, corrected_alpha=0.01)
+        self.assertGreater(lower, tau)
+
+    def test_lower_bound_never_exceeds_upper_bound(self):
+        rng_lo = random.Random(11)
+        rng_hi = random.Random(11)
+        values = [0.1, 0.2, 0.15, 0.3, 0.05, 0.25, 0.18]
+        order_ab = [True, False, True, False, True, False, True]
+        lower = gm.bootstrap_lower_bound(values, order_ab, 1000, rng_lo, corrected_alpha=0.01)
+        upper = gm.bootstrap_upper_bound(values, order_ab, 1000, rng_hi, corrected_alpha=0.01)
+        self.assertLessEqual(lower, upper)
+
+    def test_invalid_alpha_rejected(self):
+        rng = random.Random(1)
+        with self.assertRaises(gm.GateMathError):
+            gm.bootstrap_lower_bound([1.0], [True], 10, rng, corrected_alpha=0.0)
+
+
 # --------------------------------------------------------------------------
 # Holm step-down
 # --------------------------------------------------------------------------
@@ -172,13 +214,14 @@ class HolmRejectTest(unittest.TestCase):
 
 
 class ClopperPearsonTest(unittest.TestCase):
-    def test_zero_failures_twenty_sessions_matches_mathcheck(self):
-        # Leo's mathcheck sim.py: n=20, k=0 -> 95% upper CP bound = 13.91%
+    def test_zero_failures_twenty_sessions_matches_independent_check(self):
+        # cross-checked against an independent Monte-Carlo simulation:
+        # n=20, k=0 -> 95% upper CP bound = 13.91%
         bound = gm.clopper_pearson_upper(k=0, n=20, conf=0.95)
         self.assertAlmostEqual(bound, 0.1391, places=3)
 
     def test_zero_failures_three_hundred_sessions_below_one_percent(self):
-        # mathcheck: n=300, k=0 -> 95% upper CP bound = 0.99%
+        # independent check: n=300, k=0 -> 95% upper CP bound = 0.99%
         bound = gm.clopper_pearson_upper(k=0, n=300, conf=0.95)
         self.assertLess(bound, 0.01)
         self.assertAlmostEqual(bound, 0.0099, places=3)
@@ -309,6 +352,187 @@ class LoadPolicyTest(unittest.TestCase):
     def test_missing_file_rejected(self):
         with self.assertRaises(gm.PolicyConfigError):
             gm.load_policy(Path("/nonexistent/perf-policy.toml"))
+
+
+# --------------------------------------------------------------------------
+# Registered per-metric policy lookup (never a family heuristic)
+# --------------------------------------------------------------------------
+
+
+class ResolveMetricPolicyTest(unittest.TestCase):
+    def test_flat_family_metric_resolves_class_a(self):
+        doc = gm.load_policy()
+        table = gm.resolve_metric_policy(doc, "decode", "decode_tok_s")
+        self.assertEqual(table["noise_class"], "A")
+
+    def test_nested_family_metric_resolves_class_b(self):
+        # embed.batch_p95 is registered class B (min nine pairs) -- a
+        # family-name heuristic that lumped every embed metric into class
+        # A family-name heuristic would silently under-require this cell.
+        doc = gm.load_policy()
+        table = gm.resolve_metric_policy(doc, "embed", "batch_p95")
+        self.assertEqual(table["noise_class"], "B")
+
+    def test_nested_family_sibling_metric_resolves_class_a(self):
+        doc = gm.load_policy()
+        table = gm.resolve_metric_policy(doc, "embed", "texts_s")
+        self.assertEqual(table["noise_class"], "A")
+
+    def test_unregistered_family_rejected(self):
+        doc = gm.load_policy()
+        with self.assertRaises(gm.PolicyConfigError):
+            gm.resolve_metric_policy(doc, "bogus_family", "decode_tok_s")
+
+    def test_unregistered_metric_in_flat_family_rejected(self):
+        doc = gm.load_policy()
+        with self.assertRaises(gm.PolicyConfigError):
+            gm.resolve_metric_policy(doc, "decode", "bogus_metric")
+
+    def test_unregistered_metric_in_nested_family_rejected(self):
+        doc = gm.load_policy()
+        with self.assertRaises(gm.PolicyConfigError):
+            gm.resolve_metric_policy(doc, "embed", "bogus_metric")
+
+    def test_class_c_metric_resolves(self):
+        doc = gm.load_policy()
+        table = gm.resolve_metric_policy(doc, "memory", "model_load_time")
+        self.assertEqual(table["noise_class"], "C")
+
+
+# --------------------------------------------------------------------------
+# The complete per-family gate evaluator (Holm + fail_margin_multiplier,
+# integrated -- not just unit-tested helpers)
+# --------------------------------------------------------------------------
+
+
+class EvaluateFamilyGateTest(unittest.TestCase):
+    def _bands(self):
+        return gm.parse_cv_bands(
+            [
+                {"max_cv": 0.015, "required_n_class_a": 7, "required_n_class_b": 9, "fail_margin_multiplier": 1.0},
+                {"max_cv": 0.05, "required_n_class_a": 25, "required_n_class_b": 25, "fail_margin_multiplier": 1.0},
+                {"max_cv": 1.0, "required_n_class_a": 25, "required_n_class_b": 25, "fail_margin_multiplier": 2.0},
+            ]
+        )
+
+    def test_empty_family_rejected(self):
+        with self.assertRaises(gm.GateMathError):
+            gm.evaluate_family_gate([], self._bands())
+
+    def test_single_cell_strong_regression_fails(self):
+        order_ab = (True, False, True, False, True, False, True)
+        values = tuple([math.log(1.10)] * 7)  # deterministic 10% slowdown
+        cell = gm.CellGateInput(
+            cell_id="decode:strong", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        rng = random.Random(1)
+        results = gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=500, rng=rng)
+        self.assertEqual(results[0].verdict, "FAIL")
+        self.assertTrue(results[0].holm_reject)
+
+    def test_single_cell_null_passes(self):
+        order_ab = (True, False, True, False, True, False, True)
+        values = (0.0,) * 7  # no slowdown at all
+        cell = gm.CellGateInput(
+            cell_id="decode:null", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        rng = random.Random(1)
+        results = gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=500, rng=rng)
+        self.assertEqual(results[0].verdict, "PASS")
+        self.assertFalse(results[0].holm_reject)
+
+    def test_holm_ordering_changes_the_verdict(self):
+        """Adversarial fixture: two
+        cells whose bootstrap p-values are BOTH individually below the
+        naive uncorrected alpha=0.05, but whose Holm step-down across the
+        2-cell family rejects NEITHER, because the smaller of the two
+        p-values fails to clear the first (tighter, alpha/2) Holm step --
+        which halts the step-down, so the second cell is never rejected
+        either, regardless of its own p-value. A naive per-cell 0.05
+        check would have flagged both as FAIL; the family evaluator does
+        not. This is the concrete, checkable case where ONLY the Holm
+        step-down (never a per-cell threshold) determines the verdict."""
+        tau = math.log(1.07)
+
+        def cell(cid):
+            base = tau + 0.005
+            spread = 0.02
+            values = (
+                base - spread, base + spread, base - spread * 0.5, base + spread * 0.5,
+                base - spread * 0.2, base + spread * 0.2, base,
+            )
+            order_ab = (True, False, True, False, True, False, True)
+            return gm.CellGateInput(
+                cell_id=cid, values=values, order_ab=order_ab,
+                measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+            )
+
+        cell_a, cell_b = cell("a"), cell("b")
+        rng = random.Random(0)
+        results = gm.evaluate_family_gate([cell_a, cell_b], self._bands(), bootstrap_replicates=2000, rng=rng)
+        p_a, p_b = results[0].p_value, results[1].p_value
+        # Precondition: a naive, uncorrected per-cell check would flag
+        # both (this is what makes the fixture adversarial -- ordering,
+        # not magnitude, is what changes the verdict).
+        self.assertLess(p_a, 0.05)
+        self.assertLess(p_b, 0.05)
+        # Holm, evaluated over the family, rejects neither.
+        self.assertFalse(results[0].holm_reject)
+        self.assertFalse(results[1].holm_reject)
+        self.assertNotEqual(results[0].verdict, "FAIL")
+        self.assertNotEqual(results[1].verdict, "FAIL")
+
+    def test_high_cv_margin_flips_fail_to_non_fail(self):
+        """Adversarial fixture: the SAME
+        effect size (a deterministic 8% slowdown) is a confirmed FAIL at
+        the low-CV band's raw fail_pct margin (multiplier 1.0) but is NOT
+        a FAIL once the same cell is measured at high CV and the
+        registered `fail_margin_multiplier` (2.0) widens the threshold --
+        proving `fail_margin_multiplier` is actually consumed by the
+        gate decision, not just unit-tested in isolation."""
+        order_ab = (True, False, True, False, True, False, True)
+        values = tuple([math.log(1.08)] * 7)  # deterministic 8% slowdown
+
+        low_cv_cell = gm.CellGateInput(
+            cell_id="lowcv", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        high_cv_cell = gm.CellGateInput(
+            cell_id="highcv", values=values, order_ab=order_ab,
+            measured_cv=0.08, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+
+        low_result = gm.evaluate_family_gate([low_cv_cell], self._bands(), bootstrap_replicates=500, rng=random.Random(5))
+        high_result = gm.evaluate_family_gate([high_cv_cell], self._bands(), bootstrap_replicates=500, rng=random.Random(5))
+
+        self.assertEqual(low_result[0].fail_margin_multiplier, 1.0)
+        self.assertEqual(low_result[0].verdict, "FAIL")
+
+        self.assertEqual(high_result[0].fail_margin_multiplier, 2.0)
+        self.assertNotEqual(high_result[0].verdict, "FAIL")
+
+    def test_mismatched_lengths_rejected(self):
+        cell = gm.CellGateInput(
+            cell_id="bad", values=(1.0, 2.0), order_ab=(True,),
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        with self.assertRaises(gm.GateMathError):
+            gm.evaluate_family_gate([cell], self._bands())
+
+    def test_results_preserve_input_order(self):
+        order_ab = (True, False, True, False, True, False, True)
+        cell_first = gm.CellGateInput(
+            cell_id="first", values=(0.0,) * 7, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        cell_second = gm.CellGateInput(
+            cell_id="second", values=tuple([math.log(1.10)] * 7), order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        results = gm.evaluate_family_gate([cell_first, cell_second], self._bands(), bootstrap_replicates=500, rng=random.Random(2))
+        self.assertEqual([r.cell_id for r in results], ["first", "second"])
 
 
 if __name__ == "__main__":

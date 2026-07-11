@@ -1499,7 +1499,12 @@ class CellRecord:
 class PromotionRecord:
     """Correction 3's record shape: reports the ACHIEVED
     Clopper-Pearson bound from (`null_sessions`, `failures`), never an
-    asserted bound tighter than that math allows. See
+    asserted bound tighter than that math allows. `mainline_sessions`
+    must clear the policy's `min_mainline_sessions` (a shadow cell needs
+    live mainline evidence, not just null A/A calibration) and
+    `invalid_pair_replacements` must not exceed the policy's registered
+    `max_invalid_pair_replacements` cap: an earlier revision accepted a
+    0-mainline-session promotion and had no replacement cap at all. See
     `validate_promotion_record`."""
 
     cell_id: str
@@ -1508,6 +1513,7 @@ class PromotionRecord:
     failures: int
     cp_bound_95: float
     mainline_sessions: int
+    invalid_pair_replacements: int
 
 
 # --------------------------------------------------------------------------
@@ -1792,7 +1798,10 @@ def _require_list(value: object, ctx: str) -> list:
 
 
 _PROMOTION_RECORD_KEYS = frozenset(
-    {"cell_id", "policy_version", "null_sessions", "failures", "cp_bound_95", "mainline_sessions"}
+    {
+        "cell_id", "policy_version", "null_sessions", "failures", "cp_bound_95", "mainline_sessions",
+        "invalid_pair_replacements",
+    }
 )
 
 
@@ -1801,7 +1810,7 @@ def parse_promotion_record(d: dict) -> PromotionRecord:
     cell_id = d["cell_id"]
     if not isinstance(cell_id, str) or not cell_id:
         raise RunRecordValidationError("promotion_record: cell_id must be a non-empty string")
-    for key in ("policy_version", "null_sessions", "failures", "mainline_sessions"):
+    for key in ("policy_version", "null_sessions", "failures", "mainline_sessions", "invalid_pair_replacements"):
         val = d[key]
         if isinstance(val, bool) or not isinstance(val, int) or val < 0:
             raise RunRecordValidationError(f"promotion_record: {key} must be a non-negative int")
@@ -1819,6 +1828,7 @@ def parse_promotion_record(d: dict) -> PromotionRecord:
         failures=d["failures"],
         cp_bound_95=float(cp_bound),
         mainline_sessions=d["mainline_sessions"],
+        invalid_pair_replacements=d["invalid_pair_replacements"],
     )
 
 
@@ -2000,34 +2010,118 @@ def validate_registry_coverage(records: Sequence[CellRecord], groups: Sequence[E
 # Fail-closed run-record validator
 # --------------------------------------------------------------------------
 
+_REQUIRED_SINGLE_PHASES = ("load_start", "backend_ready", "prefill_start", "prefill_end")
+_PHASE_NAME_RANK = {name: i for i, name in enumerate(PHASE_EVENT_NAMES)}
+
+
+def _validate_phase_sequence(phase_events: Sequence[PhaseEvent], cell_id: str) -> None:
+    """Validate the load->prefill->decode measurement-boundary sequence:
+    a non-unsupported cell must carry a phase-event sequence that (a) is
+    non-empty, (b)
+    contains exactly one each of `load_start`, `backend_ready`,
+    `prefill_start`, `prefill_end`, (c) contains at least one
+    `token_available` event, (d) never runs `monotonic_ns` backwards, and
+    (e) never regresses phase order (each single-shot phase's rank in
+    `PHASE_EVENT_NAMES` must be non-decreasing across the sequence, and
+    `token_available` events must carry strictly increasing
+    `token_index`). This is the measurement-boundary proof the contract
+    promises -- an empty or misordered sequence proves nothing."""
+    if not phase_events:
+        raise RunRecordValidationError(
+            f"INFRA-FAIL: cell {cell_id!r} has no phase_events -- the load->prefill->decode "
+            "measurement boundary must be proven, never assumed"
+        )
+    seen_single: set[str] = set()
+    token_seen = False
+    last_rank = -1
+    last_ns = -1
+    last_token_index = -1
+    for ev in phase_events:
+        rank = _PHASE_NAME_RANK[ev.name]
+        if rank < last_rank:
+            raise RunRecordValidationError(
+                f"INFRA-FAIL: cell {cell_id!r} phase_events out of order at {ev.name!r} -- the "
+                "load->prefill->decode sequence must never regress"
+            )
+        if ev.monotonic_ns < last_ns:
+            raise RunRecordValidationError(
+                f"INFRA-FAIL: cell {cell_id!r} phase_events monotonic_ns went backwards at {ev.name!r}"
+            )
+        if ev.name == "token_available":
+            token_index = ev.token_index if ev.token_index is not None else -1
+            if token_seen and token_index <= last_token_index:
+                raise RunRecordValidationError(
+                    f"INFRA-FAIL: cell {cell_id!r} phase_events token_available token_index "
+                    "did not strictly increase"
+                )
+            last_token_index = token_index
+            token_seen = True
+        else:
+            if ev.name in seen_single:
+                raise RunRecordValidationError(
+                    f"INFRA-FAIL: cell {cell_id!r} phase_events: phase {ev.name!r} appears more than once"
+                )
+            seen_single.add(ev.name)
+        last_rank = rank
+        last_ns = ev.monotonic_ns
+    missing = [n for n in _REQUIRED_SINGLE_PHASES if n not in seen_single]
+    if missing:
+        raise RunRecordValidationError(
+            f"INFRA-FAIL: cell {cell_id!r} phase_events missing required phase(s) {missing} -- the "
+            "measurement boundary must be proven with the full load->prefill->decode sequence"
+        )
+    if not token_seen:
+        raise RunRecordValidationError(
+            f"INFRA-FAIL: cell {cell_id!r} phase_events has no token_available marker -- the decode "
+            "measurement boundary is unproven without at least one"
+        )
+
 
 def validate_run_record(
     record: CellRecord,
     *,
     expected_repo_sha: str | None = None,
     current_policy_sha: str | None = None,
+    policy: dict | None = None,
 ) -> None:
     """Fail-closed validation of ONE `CellRecord` against DESIGN.md's
     `INFRA-FAIL` taxonomy (section 4 "What blocks a PR"). Raises
     `RunRecordValidationError` naming the specific reason; returns `None`
     on success. Registry coverage (a MISSING cell) is a separate check
     (`validate_registry_coverage`) since it operates over a whole run,
-    not one record.
+    not one record. `policy` defaults to `bench_gate_math.load_policy()`
+    (the shipped `perf-policy.toml`) when not supplied.
 
     Checks, each one a named `INFRA-FAIL` reason from DESIGN.md:
       - missing path proof: a `device == "metal"` cell must carry >= 1
         non-empty `path_proof` marker.
-      - missing lock receipt: a `device == "metal"` cell must carry a
-        `LockReceipt` named `"metal-gpu"` that was `held_continuously`.
+      - missing lock receipts: a `device == "metal"` cell must carry BOTH
+        a `"metal-gpu"` and a `"heavy-lane"` `LockReceipt`, each
+        `held_continuously` -- no Metal observation exists without both
+        the outer heavy-lane and the GPU receipt.
+      - missing/empty resource samples: a `device == "metal"` cell must
+        carry >= 1 `ResourceSample` -- the contention/memory-footprint
+        proof the Metal lane's receipts promise.
+      - missing or misordered phase-event sequence: every non-unsupported
+        cell must carry a validated `load_start -> backend_ready ->
+        prefill_start -> prefill_end -> token_available(+)` sequence (see
+        `_validate_phase_sequence`) -- the measurement boundary must be
+        proven, not assumed.
       - non-finite metric: enforced already at `parse_cell_aggregate`
         (kept here as a defense-in-depth re-check for records built by
         hand rather than parsed from JSON).
-      - low valid-n / missing measured-CV (correction 1): a `PASS`/`WARN`/
-        `FAIL` cell (not `unsupported`) must carry `measured_cv` and
-        `n_valid >= required_n` from `bench_gate_math.required_n` at that
-        CV and the cell's noise class implied by `metric_family` -- a
-        cell with no `measured_cv` on record can never be validated as
-        sufficiently powered and is rejected outright.
+      - low valid-n / missing measured-CV / submitter-controlled
+        required_n (correction 1): a `PASS`/`WARN`/`FAIL` cell (not
+        `unsupported`) must carry `measured_cv`; the cell's noise class is
+        resolved from the REGISTERED per-metric policy
+        (`bench_gate_math.resolve_metric_policy`), never a family-name
+        heuristic, and its `required_n` is RE-DERIVED from that class and
+        the measured CV via `bench_gate_math.required_n` -- a record whose
+        `required_n` field is missing or does not match the re-derived
+        value is rejected outright (required_n is policy-derived, never
+        submitter-controlled), and so is `n_valid < required_n`. Class "C"
+        (informational/trend-only) metrics are exempt from this
+        derivation -- they never gate a required cell.
       - post-run threshold change: if `current_policy_sha` is given, it
         must equal `record.provenance.policy_sha` -- the gate must have
         been evaluated against the policy content it claims.
@@ -2047,6 +2141,23 @@ def validate_run_record(
                 f"INFRA-FAIL: cell {record.cell_id!r} is device=metal but carries no continuously-held "
                 "'metal-gpu' lock_receipt -- no Metal observation exists without a lock receipt"
             )
+        heavy_lane_locks = [
+            lr for lr in record.lock_receipts if lr.lock_name == "heavy-lane" and lr.held_continuously
+        ]
+        if not heavy_lane_locks:
+            raise RunRecordValidationError(
+                f"INFRA-FAIL: cell {record.cell_id!r} is device=metal but carries no continuously-held "
+                "'heavy-lane' lock_receipt -- Metal contention proof requires BOTH the outer "
+                "heavy-lane and the metal-gpu receipt, held continuously"
+            )
+        if not record.resource_samples:
+            raise RunRecordValidationError(
+                f"INFRA-FAIL: cell {record.cell_id!r} is device=metal but carries no resource_samples "
+                "-- the Metal contention/memory-footprint proof requires at least one sample"
+            )
+
+    if record.verdict != "unsupported":
+        _validate_phase_sequence(record.phase_events, record.cell_id)
 
     agg = record.aggregate
     for label, val in (("point_estimate", agg.point_estimate), ("ci_low", agg.ci_low), ("ci_high", agg.ci_high)):
@@ -2059,12 +2170,35 @@ def validate_run_record(
                 f"INFRA-FAIL: cell {record.cell_id!r} has no measured_cv on record -- correction 1 refuses "
                 "to promote/gate any cell whose required-n cannot be derived from a measured same-session CV"
             )
-        cell_class = "B" if record.metric_family in ("prefill_ttft", "memory") and record.metric_name != "prefill_tok_s" else "A"
-        if agg.required_n is not None and agg.n_valid < agg.required_n:
+        policy_doc = policy if policy is not None else bench_gate_math.load_policy()
+        try:
+            metric_policy = bench_gate_math.resolve_metric_policy(policy_doc, record.metric_family, record.metric_name)
+            noise_class = metric_policy["noise_class"]
+        except bench_gate_math.PolicyConfigError as exc:
             raise RunRecordValidationError(
-                f"INFRA-FAIL: cell {record.cell_id!r} n_valid={agg.n_valid} < required_n={agg.required_n} "
-                f"(measured_cv={agg.measured_cv}, class {cell_class}) -- n too small"
-            )
+                f"INFRA-FAIL: cell {record.cell_id!r}: {exc}"
+            ) from exc
+
+        if noise_class in ("A", "B"):
+            cv_bands = bench_gate_math.parse_cv_bands(policy_doc["cv_bands"])
+            try:
+                derived_required_n, _fail_margin = bench_gate_math.required_n(agg.measured_cv, cv_bands, noise_class)
+            except bench_gate_math.GateMathError as exc:
+                raise RunRecordValidationError(f"INFRA-FAIL: cell {record.cell_id!r}: {exc}") from exc
+            if agg.required_n != derived_required_n:
+                raise RunRecordValidationError(
+                    f"INFRA-FAIL: cell {record.cell_id!r} required_n={agg.required_n!r} does not match "
+                    f"the policy-derived required_n={derived_required_n!r} for measured_cv={agg.measured_cv!r} "
+                    f"class {noise_class!r} -- required_n is derived from the registered policy, "
+                    "never submitter-controlled metadata"
+                )
+            if agg.n_valid < derived_required_n:
+                raise RunRecordValidationError(
+                    f"INFRA-FAIL: cell {record.cell_id!r} n_valid={agg.n_valid} < required_n={derived_required_n} "
+                    f"(measured_cv={agg.measured_cv}, class {noise_class}) -- n too small"
+                )
+        # class "C": informational/trend-only, never gates a required cell
+        # (perf-policy.toml) -- no required_n derivation applies.
 
     if current_policy_sha is not None and record.provenance.policy_sha != current_policy_sha:
         raise RunRecordValidationError(
@@ -2080,20 +2214,74 @@ def validate_run_record(
         )
 
 
-def validate_promotion_record(record: PromotionRecord, *, min_null_sessions: int = 20) -> None:
-    """Correction 3, enforced: a `PromotionRecord` must have
-    `null_sessions >= min_null_sessions` (DESIGN.md's ">= 20 same-SHA
-    null A/A sessions"), and its asserted `cp_bound_95` must be >= the
-    TRUE Clopper-Pearson upper bound `bench_gate_math.clopper_pearson_upper`
-    computes from `(failures, null_sessions)` -- never a tighter,
-    aspirational number. This is what makes shadow-promotion honest: the
-    record reports the bound the math actually allows, not a claim that
-    298 sessions were run when only `null_sessions` were."""
-    if record.null_sessions < min_null_sessions:
+def validate_promotion_record(
+    record: PromotionRecord,
+    *,
+    policy: dict | None = None,
+    min_null_sessions: int | None = None,
+    min_mainline_sessions: int | None = None,
+) -> None:
+    """Correction 3, enforced, consuming the VERSIONED policy: an earlier
+    revision hard-coded `min_null_sessions=20` and never examined
+    `mainline_sessions` or a replacement cap at all:
+
+      - `null_sessions >= policy["promotion"]["min_null_aa_sessions"]`
+        (DESIGN.md's ">= 20 same-SHA null A/A sessions").
+      - `mainline_sessions >= policy["promotion"]["min_mainline_sessions"]`
+        -- a shadow cell needs live mainline evidence, not just null A/A
+        calibration, before promotion.
+      - `invalid_pair_replacements <= policy["promotion"]["max_invalid_pair_replacements"]`
+        -- an unbounded replacement budget would let a cell keep
+        re-rolling null sessions until it got a favorable run.
+      - the asserted `cp_bound_95` must be >= the TRUE Clopper-Pearson
+        upper bound `bench_gate_math.clopper_pearson_upper` computes from
+        `(failures, null_sessions)` -- never a tighter, aspirational
+        number.
+
+    `min_null_sessions`/`min_mainline_sessions` override the policy value
+    when explicitly supplied (mainly for tests); `policy` defaults to
+    `bench_gate_math.load_policy()` when not supplied.
+    """
+    policy_doc = policy if policy is not None else bench_gate_math.load_policy()
+    promotion_policy = policy_doc.get("promotion")
+    if not isinstance(promotion_policy, dict):
         raise RunRecordValidationError(
-            f"promotion of cell {record.cell_id!r} requires >= {min_null_sessions} null A/A sessions, "
+            "promotion policy: perf-policy.toml is missing or has a malformed [promotion] table"
+        )
+
+    resolved_min_null = min_null_sessions if min_null_sessions is not None else promotion_policy.get("min_null_aa_sessions")
+    resolved_min_mainline = (
+        min_mainline_sessions if min_mainline_sessions is not None else promotion_policy.get("min_mainline_sessions")
+    )
+    replacement_cap = promotion_policy.get("max_invalid_pair_replacements")
+    for label, val in (
+        ("min_null_aa_sessions", resolved_min_null),
+        ("min_mainline_sessions", resolved_min_mainline),
+        ("max_invalid_pair_replacements", replacement_cap),
+    ):
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+            raise RunRecordValidationError(
+                f"promotion policy: {label} must be a registered non-negative int, got {val!r} -- "
+                "an incomplete promotion policy fails closed, never defaults silently"
+            )
+
+    if record.null_sessions < resolved_min_null:
+        raise RunRecordValidationError(
+            f"promotion of cell {record.cell_id!r} requires >= {resolved_min_null} null A/A sessions, "
             f"got {record.null_sessions}"
         )
+    if record.mainline_sessions < resolved_min_mainline:
+        raise RunRecordValidationError(
+            f"promotion of cell {record.cell_id!r} requires >= {resolved_min_mainline} mainline sessions, "
+            f"got {record.mainline_sessions} -- null A/A calibration alone is not live mainline evidence"
+        )
+    if record.invalid_pair_replacements > replacement_cap:
+        raise RunRecordValidationError(
+            f"promotion of cell {record.cell_id!r} reports invalid_pair_replacements="
+            f"{record.invalid_pair_replacements}, exceeding the registered cap of {replacement_cap} -- "
+            "an exhausted replacement budget is an INFRA-FAIL, never a silent retry"
+        )
+
     true_bound = bench_gate_math.clopper_pearson_upper(record.failures, record.null_sessions)
     # Tolerance accommodates realistic rounding of a REPORTED bound (e.g.
     # "13.91%" rounded to 4 decimal places is 1e-5-scale below the exact

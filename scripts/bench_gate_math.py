@@ -175,14 +175,53 @@ def bootstrap_upper_bound(
     corrected_alpha: float,
 ) -> float:
     """The `(1 - corrected_alpha)` percentile of the bootstrap mean
-    distribution — the corrected one-sided upper confidence bound DESIGN.md
-    requires alongside the p-value for the FAIL decision ("FAIL requires
-    both effect size and corrected confidence bound cross its threshold").
+    distribution — a two-sided-diagnostic UPPER confidence bound, useful
+    for reporting/inspection only. This is NOT the bound the FAIL decision
+    consumes: `evaluate_family_gate`'s FAIL rule needs a one-sided LOWER
+    bound (a slowdown is positive and the claimed hypothesis is
+    `mean_slowdown > threshold`; confirming FAIL requires the LOWER bound
+    to itself exceed the threshold). Do not wire this function's result
+    into `CellAggregate.corrected_lower_bound` or any FAIL rule — use
+    `bootstrap_lower_bound` for that; an earlier revision of this module
+    conflated the two tails, which silently overstated regression
+    evidence.
     """
     if not (0.0 < corrected_alpha < 1.0):
         raise GateMathError(f"corrected_alpha must be in (0, 1), got {corrected_alpha!r}")
     boot_means = sorted(order_stratified_bootstrap_means(values, order_ab, b, rng))
     idx = min(len(boot_means) - 1, math.ceil((1.0 - corrected_alpha) * len(boot_means)) - 1)
+    idx = max(idx, 0)
+    return boot_means[idx]
+
+
+def bootstrap_lower_bound(
+    values: Sequence[float],
+    order_ab: Sequence[bool],
+    b: int,
+    rng: random.Random,
+    *,
+    corrected_alpha: float,
+) -> float:
+    """The `corrected_alpha` percentile of the bootstrap mean distribution
+    — the corrected ONE-SIDED LOWER confidence bound DESIGN.md's FAIL rule
+    actually needs alongside the p-value ("FAIL requires both effect size
+    and corrected confidence bound cross its threshold"). A slowdown is
+    positive and the claimed hypothesis is `mean_slowdown > threshold`; a
+    confirmed FAIL needs a LOWER one-sided bound above the threshold, not
+    an upper one (`bootstrap_upper_bound` computes the wrong tail for this
+    purpose — see its docstring). The percentile-interval lower endpoint
+    sits at the alpha percentile, not `1 - alpha`
+    (https://tsapps.nist.gov/publication/get_pdf.cfm?pub_id=917303).
+
+    This is the function `evaluate_family_gate` calls to populate
+    `CellGateResult.corrected_lower_bound`, which is in turn what a
+    validator must require to exceed the (margin-scaled) fail threshold
+    before confirming FAIL.
+    """
+    if not (0.0 < corrected_alpha < 1.0):
+        raise GateMathError(f"corrected_alpha must be in (0, 1), got {corrected_alpha!r}")
+    boot_means = sorted(order_stratified_bootstrap_means(values, order_ab, b, rng))
+    idx = min(len(boot_means) - 1, math.ceil(corrected_alpha * len(boot_means)) - 1)
     idx = max(idx, 0)
     return boot_means[idx]
 
@@ -345,6 +384,174 @@ def required_n(measured_cv: float, cv_bands: Sequence[CvBand], cell_class: str) 
         f"(highest is {cv_bands[-1].max_cv!r}) -- perf-policy.toml's catch-all band should have "
         "prevented this; treat as a policy-config bug, not a valid cell"
     )
+
+
+def resolve_metric_policy(policy_doc: dict, metric_family: str, metric_name: str) -> dict:
+    """Look up the registered per-metric policy table for
+    `(metric_family, metric_name)` in a loaded `perf-policy.toml` document
+    (`load_policy`'s return value). `[[families]]` entries come in two
+    shapes: a FLAT family table carrying its own `noise_class`/`warn_pct`/
+    `fail_pct` plus a `metrics` list of the metric names it covers (e.g.
+    `[families.decode]`), or a NESTED family table keyed by metric name,
+    each sub-table carrying its own `noise_class`/`warn_pct`/`fail_pct`
+    (e.g. `[families.prefill_ttft.ttft]`). This is the registered lookup
+    a validator MUST use to derive a cell's noise class -- never a
+    family-name heuristic: an earlier revision used a hard-coded
+    `family in (...)` shortcut that silently mis-classified
+    `embed.batch_p95` as class A when the policy registers it class B.
+
+    Raises `PolicyConfigError` when the family or metric is not
+    registered, or the resolved table has no valid `noise_class` -- an
+    unregistered metric can never be assumed class A (the cheapest,
+    least-scrutinized band).
+    """
+    families = policy_doc.get("families")
+    if not isinstance(families, dict):
+        raise PolicyConfigError("perf-policy.toml: [families] must be a table")
+    entry = families.get(metric_family)
+    if not isinstance(entry, dict):
+        raise PolicyConfigError(
+            f"perf-policy.toml: family {metric_family!r} is not registered under [families] "
+            "-- an unregistered family can never be assumed a default noise class"
+        )
+    if "metrics" in entry:
+        metrics = entry.get("metrics")
+        if not isinstance(metrics, list) or metric_name not in metrics:
+            raise PolicyConfigError(
+                f"perf-policy.toml: metric {metric_name!r} is not registered under family "
+                f"{metric_family!r} (registered metrics: {metrics!r})"
+            )
+        table = entry
+    else:
+        table = entry.get(metric_name)
+        if not isinstance(table, dict):
+            raise PolicyConfigError(
+                f"perf-policy.toml: metric {metric_name!r} is not registered under family "
+                f"{metric_family!r}"
+            )
+    noise_class = table.get("noise_class")
+    if noise_class not in CELL_CLASSES:
+        raise PolicyConfigError(
+            f"perf-policy.toml: family {metric_family!r} metric {metric_name!r} has no valid "
+            f"noise_class (must be one of {CELL_CLASSES}, got {noise_class!r})"
+        )
+    return table
+
+
+# --------------------------------------------------------------------------
+# Per-family gate evaluator (Holm + fail_margin_multiplier, integrated)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CellGateInput:
+    """One required cell's raw paired log-slowdown samples plus its
+    registered family-policy thresholds (already resolved via
+    `resolve_metric_policy`), the input `evaluate_family_gate` needs to
+    reach a PASS/WARN/FAIL verdict for that cell within its family."""
+
+    cell_id: str
+    values: tuple[float, ...]
+    order_ab: tuple[bool, ...]
+    measured_cv: float
+    cell_class: str  # "A" or "B" -- selects the cv_bands column
+    warn_pct: float
+    fail_pct: float
+
+
+@dataclass(frozen=True)
+class CellGateResult:
+    """One cell's gate-evaluator verdict, alongside the numbers that
+    produced it (queryable/loggable without re-running the bootstrap)."""
+
+    cell_id: str
+    point_estimate: float
+    p_value: float
+    corrected_lower_bound: float
+    holm_reject: bool
+    measured_cv: float
+    required_n: int
+    fail_margin_multiplier: float
+    verdict: str  # "PASS" | "WARN" | "FAIL"
+
+
+def evaluate_family_gate(
+    cells: Sequence[CellGateInput],
+    cv_bands: Sequence[CvBand],
+    *,
+    alpha_familywise: float = 0.05,
+    bootstrap_replicates: int = 2000,
+    rng: random.Random | None = None,
+) -> list[CellGateResult]:
+    """The complete per-family gate evaluator: computes a one-sided
+    bootstrap p-value per required cell against that cell's own
+    (CV-band-margin-scaled) FAIL threshold, Holm-corrects the p-values
+    across every cell in the SAME required family at `alpha_familywise`
+    (never per-cell alpha -- an uncorrected per-cell 0.05 across N
+    required cells inflates the familywise false-FAIL rate to
+    `1 - (1 - 0.05)**N`), and combines the Holm-reject decision with the
+    corrected one-sided LOWER bound (`bootstrap_lower_bound`, never
+    `bootstrap_upper_bound` -- see that function's docstring) to reach a
+    verdict.
+
+    FAIL requires ALL of:
+      - Holm rejects H0 for this cell at `alpha_familywise` across the
+        family, AND
+      - the corrected one-sided LOWER bound itself exceeds
+        `fail_pct * fail_margin_multiplier` (the high-CV band widens the
+        margin instead of inflating `n` further -- correction 1).
+    Anything short of both, but with a point estimate past `warn_pct` (or
+    past `fail_pct` without confirmed statistical significance), is WARN
+    -- DESIGN.md: "a point estimate crossing with an inconclusive bound
+    is WARN, never PASS." Everything else is PASS.
+
+    Order-preserving: `results[i]` corresponds to `cells[i]`, matching
+    `holm_reject`'s own input-order-preserving contract.
+    """
+    if not cells:
+        raise GateMathError("evaluate_family_gate requires at least one cell")
+    if rng is None:
+        rng = random.Random()
+
+    prelim: list[tuple[CellGateInput, int, float, float, float, float]] = []
+    for cell in cells:
+        if len(cell.values) != len(cell.order_ab):
+            raise GateMathError(f"cell {cell.cell_id!r}: values and order_ab must be the same length")
+        req_n, margin = required_n(cell.measured_cv, cv_bands, cell.cell_class)
+        tau_fail = math.log(1.0 + cell.fail_pct * margin)
+        point_estimate = statistics.fmean(cell.values)
+        p = one_sided_bootstrap_pvalue(cell.values, cell.order_ab, tau_fail, bootstrap_replicates, rng)
+        prelim.append((cell, req_n, margin, tau_fail, point_estimate, p))
+
+    rejects = holm_reject([p for *_rest, p in prelim], alpha=alpha_familywise)
+    corrected_alpha = alpha_familywise / len(prelim)
+
+    results: list[CellGateResult] = []
+    for (cell, req_n, margin, tau_fail, point_estimate, p), reject in zip(prelim, rejects):
+        lower_bound = bootstrap_lower_bound(
+            cell.values, cell.order_ab, bootstrap_replicates, rng, corrected_alpha=corrected_alpha
+        )
+        tau_warn = math.log(1.0 + cell.warn_pct)
+        if reject and lower_bound > tau_fail:
+            verdict = "FAIL"
+        elif point_estimate > tau_warn:
+            verdict = "WARN"
+        else:
+            verdict = "PASS"
+        results.append(
+            CellGateResult(
+                cell_id=cell.cell_id,
+                point_estimate=point_estimate,
+                p_value=p,
+                corrected_lower_bound=lower_bound,
+                holm_reject=reject,
+                measured_cv=cell.measured_cv,
+                required_n=req_n,
+                fail_margin_multiplier=margin,
+                verdict=verdict,
+            )
+        )
+    return results
 
 
 # --------------------------------------------------------------------------
