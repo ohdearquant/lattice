@@ -120,8 +120,6 @@ kernel void rope(
     x[base + half_dim + pair] = x0 * sin_val + x1 * cos_val;
 }
 
-}
-
 // ===== Fused Attention: Q@K^T + causal softmax + scores@V in one kernel =====
 // Eliminates the global scores buffer. Online softmax in registers.
 // FA_HEAD_DIM and FA_GQA_GROUPS are injected from model config at compile time.
