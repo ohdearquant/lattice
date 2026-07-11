@@ -223,7 +223,14 @@ jobs:
       - name: inference — serve-surface capability-matrix fixtures (macOS only)
         if: runner.os == 'macOS'
         run: |
-          cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu
+          # test-utils (issue #828) gates the real tiny tokenizer
+          # `lattice_serve.rs`'s own `parity_table`/`production_adapter_
+          # observation` modules now need to drive `enforce_prompt_window`
+          # for real behind the shared field-level parity rows -- without
+          # it here those modules would silently not compile/run under
+          # this job, the same gap the test-utils comment below already
+          # documents for `lattice.rs`.
+          cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu,test-utils
           cargo test -p lattice-inference --bin chat_metal --features f16,metal-gpu
           # test-utils (ADR-080 C2 round 2) gates the tiny zero-weight CPU
           # model the lattice.rs HTTP-level client-disconnect test needs to
