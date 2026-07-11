@@ -209,11 +209,23 @@ pub fn matvec_ternary_scalar(
     k: usize,
     output: &mut [f32],
 ) {
-    debug_assert_eq!(x_q.len(), k);
-    debug_assert_eq!(alphas.len(), n);
-    debug_assert!(output.len() >= n);
-
     let row_bytes = packed_row_bytes(k);
+    // Release-active, overflow-first, packed-ternary-layout contract (ADR-080 C4, held
+    // finding): this was previously `debug_assert!`-gated only. In release, the tail
+    // remainder loop below iterates `x_q.iter().enumerate().take(k).skip(rem_start)` —
+    // `.take()` silently truncates rather than panicking when `x_q` is shorter than `k`,
+    // so a too-short activation slice produced a silently wrong (under-summed) result
+    // instead of a deterministic panic. Validated before any indexing below.
+    crate::forward::cpu::validate_ternary_matvec_args(
+        x_q.len(),
+        alphas.len(),
+        packed_w.len(),
+        output.len(),
+        n,
+        k,
+        row_bytes,
+        "matvec_ternary_scalar",
+    );
 
     for row in 0..n {
         let row_base = row * row_bytes;
@@ -269,8 +281,9 @@ pub fn matvec_ternary_scalar(
 ///
 /// Caller must ensure this runs only on a target with NEON enabled. `x_q`,
 /// `alphas`, `packed_w`, and `output` must satisfy the dimensions described
-/// by `n` and `k`; the function checks those invariants in debug builds before
-/// using unchecked indexing in the SIMD loop.
+/// by `n` and `k`; the function validates those invariants in all builds
+/// (release-active, via `validate_ternary_matvec_args`) before using unchecked
+/// indexing in the SIMD loop.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub unsafe fn matvec_ternary_neon(
@@ -284,12 +297,23 @@ pub unsafe fn matvec_ternary_neon(
 ) {
     use std::arch::aarch64::*;
 
-    debug_assert_eq!(x_q.len(), k);
-    debug_assert_eq!(alphas.len(), n);
-    debug_assert!(output.len() >= n);
-    debug_assert!(packed_w.len() >= n * packed_row_bytes(k));
-
     let row_bytes = packed_row_bytes(k);
+    // Release-active, overflow-first, packed-ternary-layout contract (ADR-080 C4, held
+    // finding): shared with `matvec_ternary_scalar` so both the safe scalar wrapper and
+    // this unsafe NEON kernel enforce the identical contract instead of independently
+    // re-deriving (and drifting on) the same bounds check. This kernel additionally reads
+    // via `get_unchecked` below, so a missed/weakened check here is memory-unsafe, not
+    // merely a wrong-result risk.
+    crate::forward::cpu::validate_ternary_matvec_args(
+        x_q.len(),
+        alphas.len(),
+        packed_w.len(),
+        output.len(),
+        n,
+        k,
+        row_bytes,
+        "matvec_ternary_neon",
+    );
 
     // Masks for extracting 2-bit fields from packed bytes.
     let mask_2bit = vdupq_n_u8(0x03);
@@ -384,12 +408,19 @@ pub unsafe fn matvec_ternary_neon(
 /// - `n`: number of output rows
 /// - `k`: number of input columns
 pub fn matmul_ternary(x: &[f32], packed_w: &[u8], alphas: &[f32], n: usize, k: usize) -> Vec<f32> {
-    assert_eq!(x.len(), k, "activation length must equal k");
-    assert_eq!(alphas.len(), n, "alphas length must equal n");
-    assert_eq!(
+    let row_bytes = packed_row_bytes(k);
+    // Release-active, overflow-first, packed-ternary-layout contract (ADR-080 C4) — the
+    // same shared validator `matvec_ternary_scalar`/`matvec_ternary_neon` use, checked here
+    // too since `output` (freshly allocated below) doesn't exist yet at this point.
+    crate::forward::cpu::validate_ternary_matvec_args(
+        x.len(),
+        alphas.len(),
         packed_w.len(),
-        n * packed_row_bytes(k),
-        "packed weights size mismatch"
+        n, // output not yet allocated; its length will be exactly n below
+        n,
+        k,
+        row_bytes,
+        "matmul_ternary",
     );
 
     let (x_q, gamma) = quantize_activation(x);
@@ -927,6 +958,25 @@ mod tests {
             }
         }
 
+        // ADR-080 C4 held finding: `matvec_ternary_neon` previously validated with
+        // `debug_assert!` only, independently of the scalar path. Shared
+        // `validate_ternary_matvec_args` now gates both; release-active here matters
+        // most since this kernel reads via `get_unchecked`.
+        #[test]
+        #[should_panic(expected = "x_q too short for k")]
+        fn matvec_ternary_neon_rejects_short_x_q() {
+            let n = 2;
+            let k = 32;
+            let weights = vec![1.0f32; n * k];
+            let (packed, alphas) = pack_ternary(&weights, n, k);
+            let x_q = vec![1i8; k - 1]; // too short
+            let mut output = vec![0.0f32; n];
+            // SAFETY: never reached — the validator panics before any `get_unchecked` read.
+            unsafe {
+                matvec_ternary_neon(&x_q, 1.0, &packed, &alphas, n, k, &mut output);
+            }
+        }
+
         #[test]
         fn test_neon_all_zero_weights() {
             let n = 2;
@@ -997,6 +1047,92 @@ mod tests {
                 output[i],
                 k
             );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // validate_ternary_matvec_args: release-active rejection (ADR-080 C4 held finding —
+    // the scalar path previously silently truncated a too-short `x`/`x_q` via
+    // `.take(k).skip(rem_start)` in the remainder loop instead of panicking).
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "x_q too short for k")]
+    fn matmul_ternary_rejects_short_activation() {
+        let n = 2;
+        let k = 32;
+        let weights = vec![1.0f32; n * k];
+        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let x = vec![1.0f32; k - 1]; // too short
+        let _ = matmul_ternary(&x, &packed, &alphas, n, k);
+    }
+
+    #[test]
+    #[should_panic(expected = "alphas too short for n")]
+    fn matmul_ternary_rejects_short_alphas() {
+        let n = 2;
+        let k = 32;
+        let weights = vec![1.0f32; n * k];
+        let (packed, _alphas) = pack_ternary(&weights, n, k);
+        let x = vec![1.0f32; k];
+        let short_alphas = vec![1.0f32; n - 1];
+        let _ = matmul_ternary(&x, &packed, &short_alphas, n, k);
+    }
+
+    #[test]
+    #[should_panic(expected = "packed_w too short for n*packed_row_bytes")]
+    fn matmul_ternary_rejects_short_packed_w() {
+        let n = 2;
+        let k = 32;
+        let weights = vec![1.0f32; n * k];
+        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let short_packed = &packed[..packed.len() - 1];
+        let x = vec![1.0f32; k];
+        let _ = matmul_ternary(&x, short_packed, &alphas, n, k);
+    }
+
+    #[test]
+    #[should_panic(expected = "x_q too short for k")]
+    fn matvec_ternary_scalar_rejects_short_x_q() {
+        let n = 2;
+        let k = 32;
+        let weights = vec![1.0f32; n * k];
+        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let x_q = vec![1i8; k - 1]; // too short
+        let mut output = vec![0.0f32; n];
+        matvec_ternary_scalar(&x_q, 1.0, &packed, &alphas, n, k, &mut output);
+    }
+
+    #[test]
+    #[should_panic(expected = "x_q too short for k")]
+    fn matvec_ternary_scalar_rejects_short_x_q_remainder_path() {
+        // #796 round 1 finding 4: k=32/len=31 above triggers an incidental native
+        // out-of-bounds panic from the full-byte loop (`x_q[31]`) rather than exercising the
+        // silent-truncation remainder path (k % 4 != 0, lines ~253-261 above), which only
+        // runs for `rem_start < k`. Use k=5 (rem_start=4, one remainder weight) with
+        // x_q.len()=4 so, with the validator reverse-mutated out, the remainder loop's
+        // `.take(k).skip(rem_start)` would silently iterate zero elements and the function
+        // would return normally instead of panicking — the guard is what makes this red.
+        let n = 2;
+        let k = 5;
+        let weights = vec![1.0f32; n * k];
+        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let x_q = vec![1i8; k - 1]; // too short, ends inside the remainder range
+        let mut output = vec![0.0f32; n];
+        matvec_ternary_scalar(&x_q, 1.0, &packed, &alphas, n, k, &mut output);
+    }
+
+    #[test]
+    fn matvec_ternary_scalar_accepts_oversized_buffers() {
+        let n = 2;
+        let k = 32;
+        let weights = vec![1.0f32; n * k];
+        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let x_q = vec![1i8; k + 4]; // oversized
+        let mut output = vec![0.0f32; n + 4]; // oversized
+        matvec_ternary_scalar(&x_q, 1.0, &packed, &alphas, n, k, &mut output);
+        for row in output.iter().take(n) {
+            assert!((*row - k as f32).abs() < 1.5);
         }
     }
 
