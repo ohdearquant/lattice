@@ -358,6 +358,12 @@ impl<'a> TrainCtx<'a> {
 
         let d = geometry.dims;
         let m = geometry.model;
+        if !d.eps.is_finite() {
+            return Err(TuneError::Validation(format!(
+                "TrainCtx::try_new: Dims.eps must be finite, got {}",
+                d.eps
+            )));
+        }
         if d.hidden != m.hidden_size
             || d.vocab != m.vocab_size
             || d.num_q_heads != m.num_attention_heads
@@ -375,6 +381,12 @@ impl<'a> TrainCtx<'a> {
         }
         let expected_gdn = GdnDims::from_cfg(m);
         let gd = geometry.gdn_dims;
+        if !gd.scale.is_finite() {
+            return Err(TuneError::Validation(format!(
+                "TrainCtx::try_new: GdnDims.scale must be finite, got {}",
+                gd.scale
+            )));
+        }
         if gd.num_kh != expected_gdn.num_kh
             || gd.value_heads != expected_gdn.value_heads
             || gd.key_dim != expected_gdn.key_dim
@@ -397,6 +409,12 @@ impl<'a> TrainCtx<'a> {
                     "TrainCtx::try_new: gqa slot layer {li} out of range (model has {num_hidden_layers} layers)"
                 )));
             }
+            if !m.is_full_attention(li) {
+                return Err(TuneError::Validation(format!(
+                    "TrainCtx::try_new: gqa slot layer {li} is not a full-attention (GQA) layer \
+                     in this model (mixer-kind/slot-index mismatch)"
+                )));
+            }
             if !seen.insert(li) {
                 return Err(TuneError::Validation(format!(
                     "TrainCtx::try_new: duplicate gqa slot layer {li}"
@@ -408,6 +426,12 @@ impl<'a> TrainCtx<'a> {
             if li >= num_hidden_layers {
                 return Err(TuneError::Validation(format!(
                     "TrainCtx::try_new: gdn slot layer {li} out of range (model has {num_hidden_layers} layers)"
+                )));
+            }
+            if m.is_full_attention(li) {
+                return Err(TuneError::Validation(format!(
+                    "TrainCtx::try_new: gdn slot layer {li} is a full-attention (GQA) layer in \
+                     this model, not GatedDeltaNet (mixer-kind/slot-index mismatch)"
                 )));
             }
             if !seen_gdn.insert(li) {
@@ -443,57 +467,57 @@ impl<'a> TrainCtx<'a> {
     }
 
     /// Global model layer index per GQA slot.
-    pub fn gqa_layers(&self) -> &[usize] {
+    fn gqa_layers(&self) -> &[usize] {
         self.slots.gqa_layers
     }
 
     /// Global model layer index per GDN slot.
-    pub fn gdn_layers(&self) -> &[usize] {
+    fn gdn_layers(&self) -> &[usize] {
         self.slots.gdn_layers
     }
 
     /// LoRA rank.
-    pub fn rank(&self) -> usize {
+    fn rank(&self) -> usize {
         self.lora.rank
     }
 
     /// Execution-only LoRA scale (`alpha / rank`).
-    pub fn scale(&self) -> f32 {
+    fn scale(&self) -> f32 {
         self.lora.scale
     }
 
     /// Flat per-array dimensions.
-    pub fn dims(&self) -> &Dims {
+    fn dims(&self) -> &Dims {
         self.geometry.dims
     }
 
     /// GDN-specific dimensions.
-    pub fn gdn_dims(&self) -> &GdnDims {
+    fn gdn_dims(&self) -> &GdnDims {
         self.geometry.gdn_dims
     }
 
     /// The model config the geometry was derived from.
-    pub fn model(&self) -> &Qwen35Config {
+    fn model(&self) -> &Qwen35Config {
         self.geometry.model
     }
 
     /// Adam learning rate.
-    pub fn learning_rate(&self) -> f32 {
+    fn learning_rate(&self) -> f32 {
         self.adam.learning_rate
     }
 
     /// Adam beta1.
-    pub fn beta1(&self) -> f32 {
+    fn beta1(&self) -> f32 {
         self.adam.beta1
     }
 
     /// Adam beta2.
-    pub fn beta2(&self) -> f32 {
+    fn beta2(&self) -> f32 {
         self.adam.beta2
     }
 
     /// Adam epsilon.
-    pub fn epsilon(&self) -> f32 {
+    fn epsilon(&self) -> f32 {
         self.adam.epsilon
     }
 }
@@ -1128,7 +1152,14 @@ mod gdn_lora_tests {
         };
         let real_gdn_dims = GdnDims::from_cfg(&cfg);
         let gqa_layers: [usize; 0] = [];
-        let gdn_layers = [7usize];
+        // Layer 7 was a full-attention (GQA) layer on the 0.8B preset — an
+        // arbitrary index was fine before TrainCtx validated per-slot mixer
+        // kind. Now the fixture must name an actual GatedDeltaNet layer.
+        assert!(
+            !cfg.is_full_attention(20),
+            "layer 20 must be GDN on the 0.8B preset"
+        );
+        let gdn_layers = [20usize];
         let train = TrainCtx::try_new(
             TapeGeometry::new(&dims, &real_gdn_dims, &cfg),
             rank,
@@ -1271,7 +1302,10 @@ mod train_ctx_tests {
 
     /// Mutation-sensitive: a layer index claimed by both the GQA and GDN
     /// slot lists is a mixer-kind conflict — the same layer cannot be
-    /// trained as both mixer kinds in one materialised tape.
+    /// trained as both mixer kinds in one materialised tape. (Layer 19 is
+    /// full-attention on the 0.8B preset, so this also exercises the
+    /// one-sided "gdn slot layer is actually GQA" rejection below — either
+    /// way, `TrainCtx` must not construct.)
     #[test]
     fn try_new_rejects_mixer_kind_slot_index_mismatch() {
         let g = valid_geometry();
@@ -1287,6 +1321,78 @@ mod train_ctx_tests {
         assert!(
             err.contains("mixer-kind"),
             "expected mixer-kind/slot-index mismatch rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive, one-sided misclassification: layer 20 is
+    /// GatedDeltaNet (not full-attention) on the 0.8B preset, so it must be
+    /// rejected when claimed as a GQA slot even though nothing else conflicts.
+    #[test]
+    fn try_new_rejects_gqa_slot_layer_wrong_kind() {
+        let g = valid_geometry();
+        assert!(
+            !g.cfg.is_full_attention(20),
+            "fixture assumption: layer 20 must be GDN on the 0.8B preset"
+        );
+        let gqa = [20usize];
+        let gdn: [usize; 0] = [];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("mixer-kind"),
+            "expected gqa-slot-wrong-kind rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive, one-sided misclassification: layer 19 is
+    /// full-attention (GQA) on the 0.8B preset, so it must be rejected when
+    /// claimed as a GDN slot even though nothing else conflicts.
+    #[test]
+    fn try_new_rejects_gdn_slot_layer_wrong_kind() {
+        let g = valid_geometry();
+        assert!(
+            g.cfg.is_full_attention(19),
+            "fixture assumption: layer 19 must be full-attention on the 0.8B preset"
+        );
+        let gqa: [usize; 0] = [];
+        let gdn = [19usize];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("mixer-kind"),
+            "expected gdn-slot-wrong-kind rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: the exact swap codex round 1 found unrejected
+    /// pre-fix — `gqa_layers = [20]` (actually GDN), `gdn_layers = [19]`
+    /// (actually GQA) — both wrong, together. Must be rejected; before this
+    /// fix `TrainCtx::try_new(...).is_ok()` on this input.
+    #[test]
+    fn try_new_rejects_gqa_gdn_slot_swap_19_20() {
+        let g = valid_geometry();
+        let gqa = [20usize];
+        let gdn = [19usize];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("mixer-kind"),
+            "expected 19/20 swap rejection; got: {err}"
         );
     }
 
@@ -1399,6 +1505,54 @@ mod train_ctx_tests {
         assert!(
             err.contains("GdnDims"),
             "expected GdnDims/model mismatch rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: NaN bypasses `(a - b).abs() > 1e-9` (NaN
+    /// comparisons are always false), so a non-finite `Dims.eps` would
+    /// silently pass the tolerance check and poison every RMSNorm call in
+    /// the tape. The finite check ahead of the tolerance comparison must
+    /// catch it explicitly.
+    #[test]
+    fn try_new_rejects_non_finite_dims_eps() {
+        let g = valid_geometry();
+        let mut nan_dims = g.dims;
+        nan_dims.eps = f32::NAN;
+        let gqa = [19usize];
+        let gdn: [usize; 0] = [];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&nan_dims, &g.gdn_dims, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("eps"),
+            "expected non-finite Dims.eps rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: same NaN-bypasses-tolerance hole as `Dims.eps`,
+    /// for `GdnDims.scale` — a non-finite scale would poison every
+    /// GatedDeltaNet forward/backward call in the tape.
+    #[test]
+    fn try_new_rejects_non_finite_gdn_scale() {
+        let g = valid_geometry();
+        let mut nan_gdn = g.gdn_dims;
+        nan_gdn.scale = f32::NAN;
+        let gqa = [19usize];
+        let gdn: [usize; 0] = [];
+        let err = expect_err(TrainCtx::try_new(
+            TapeGeometry::new(&g.dims, &nan_gdn, &g.cfg),
+            8,
+            16.0,
+            SlotLayout::new(&gqa, &gdn),
+            valid_adam(),
+        ));
+        assert!(
+            err.contains("scale"),
+            "expected non-finite GdnDims.scale rejection; got: {err}"
         );
     }
 }
