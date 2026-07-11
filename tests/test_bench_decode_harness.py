@@ -74,11 +74,25 @@ class _FakeClock:
 
 
 class _FakeAdapter:
-    """Deterministic fake engine adapter: fixed tok/s, exact requested token counts."""
+    """Deterministic fake engine adapter: fixed tok/s, exact requested token counts.
 
-    def __init__(self, engine_version: str = "fake-1.0", native_ns_per_token: int | None = None):
+    `component_ns`, when given, is returned verbatim as
+    `AdapterRunResult.component_ns` on every call -- for tests exercising a
+    `MeasuredCall` with `len(yields_windows) > 1` (e.g. Ollama's
+    one-call-yields-two-windows shape), where every call in the test only
+    ever requests the one multi-yield `n_tokens` budget so a single static
+    map is sufficient.
+    """
+
+    def __init__(
+        self,
+        engine_version: str = "fake-1.0",
+        native_ns_per_token: int | None = None,
+        component_ns: dict[int, int] | None = None,
+    ):
         self.engine_version = engine_version
         self.native_ns_per_token = native_ns_per_token
+        self.component_ns = component_ns
         self.calls: list[tuple[int, bool, str, str]] = []
 
     def run(
@@ -91,6 +105,7 @@ class _FakeAdapter:
             actual_prompt_tokens=len(prompt.split()),
             native_ns=native_ns,
             engine_version=self.engine_version,
+            component_ns=self.component_ns,
         )
 
 
@@ -101,12 +116,18 @@ def _engine(
     warmup_prompt: str | None = None,
     model: str = "qwen3.5-0.8b",
     quantization: str = "q8",
+    measured_order: str | None = None,
+    measured_calls: list[dict] | None = None,
 ) -> dict:
     d = {"name": name, "warmup_repeats": warmup_repeats, "model": model, "quantization": quantization}
     if warmup_tokens is not None:
         d["warmup_tokens"] = warmup_tokens
     if warmup_prompt is not None:
         d["warmup_prompt"] = warmup_prompt
+    if measured_order is not None:
+        d["measured_order"] = measured_order
+    if measured_calls is not None:
+        d["measured_calls"] = measured_calls
     return d
 
 
@@ -346,6 +367,121 @@ class ProfileConfigTest(unittest.TestCase):
     def test_empty_engine_quantization_rejected(self):
         with self.assertRaisesRegex(harness.ProfileConfigError, "quantization must be non-empty"):
             _profile(engines=[_engine(quantization="")])
+
+    # -- Round-3 blocker fix: measured_order / measured_calls, the
+    # per-engine measured-schedule contract that windows/measured_repeats
+    # alone could not represent (bench_compare_1k.py). --
+
+    def test_measured_order_defaults_to_window_major(self):
+        profile = _profile(engines=[_engine()])
+        self.assertEqual(profile.engine_groups[0].measured_order, "window_major")
+
+    def test_measured_order_accepts_repeat_major(self):
+        profile = _profile(engines=[_engine(measured_order="repeat_major")])
+        self.assertEqual(profile.engine_groups[0].measured_order, "repeat_major")
+
+    def test_measured_order_rejects_unknown_value(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "measured_order"):
+            _profile(engines=[_engine(measured_order="engine_major")])
+
+    def test_measured_order_wrong_type_rejected(self):
+        raw_engine = {
+            "name": "fake",
+            "warmup_repeats": 0,
+            "model": "m",
+            "quantization": "q8",
+            "measured_order": 1,
+        }
+        with self.assertRaisesRegex(harness.ProfileConfigError, "measured_order"):
+            _profile(engines=[raw_engine])
+
+    def test_measured_calls_defaults_to_none(self):
+        profile = _profile(engines=[_engine()])
+        self.assertIsNone(profile.engine_groups[0].measured_calls)
+
+    def test_measured_calls_parsed_into_tuple_of_measured_call(self):
+        profile = _profile(
+            engines=[_engine(measured_calls=[{"n_tokens": 100, "yields_windows": [1, 100]}])]
+        )
+        calls = profile.engine_groups[0].measured_calls
+        self.assertEqual(calls, (harness.MeasuredCall(n_tokens=100, yields_windows=(1, 100)),))
+
+    def test_measured_calls_empty_list_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "measured_calls.*non-empty"):
+            _profile(engines=[_engine(measured_calls=[])])
+
+    def test_measured_calls_entry_not_a_table_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "measured_calls\\[0\\].*table"):
+            _profile(engines=[_engine(measured_calls=["not-a-table"])])
+
+    def test_measured_calls_unexpected_key_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "unexpected key.*prompt_override"):
+            _profile(
+                engines=[
+                    _engine(
+                        measured_calls=[
+                            {"n_tokens": 100, "yields_windows": [100], "prompt_override": "x"}
+                        ]
+                    )
+                ]
+            )
+
+    def test_measured_calls_missing_n_tokens_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "missing required key.*n_tokens"):
+            _profile(engines=[_engine(measured_calls=[{"yields_windows": [100]}])])
+
+    def test_measured_calls_missing_yields_windows_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "missing required key.*yields_windows"):
+            _profile(engines=[_engine(measured_calls=[{"n_tokens": 100}])])
+
+    def test_measured_calls_n_tokens_must_be_positive(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "n_tokens.*positive"):
+            _profile(engines=[_engine(measured_calls=[{"n_tokens": 0, "yields_windows": [1]}])])
+
+    def test_measured_calls_n_tokens_wrong_type_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "n_tokens"):
+            _profile(engines=[_engine(measured_calls=[{"n_tokens": "100", "yields_windows": [100]}])])
+
+    def test_measured_calls_n_tokens_bool_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "n_tokens"):
+            _profile(engines=[_engine(measured_calls=[{"n_tokens": True, "yields_windows": [1]}])])
+
+    def test_measured_calls_yields_windows_must_be_non_empty(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "yields_windows.*non-empty"):
+            _profile(engines=[_engine(measured_calls=[{"n_tokens": 100, "yields_windows": []}])])
+
+    def test_measured_calls_yields_windows_entry_must_be_positive(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "yields_windows.*positive"):
+            _profile(engines=[_engine(measured_calls=[{"n_tokens": 100, "yields_windows": [0]}])])
+
+    def test_measured_calls_yields_windows_entry_bool_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "yields_windows.*positive"):
+            _profile(engines=[_engine(measured_calls=[{"n_tokens": 100, "yields_windows": [True]}])])
+
+    def test_measured_calls_yields_windows_duplicate_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "yields_windows.*duplicate"):
+            _profile(engines=[_engine(measured_calls=[{"n_tokens": 100, "yields_windows": [1, 1]}])])
+
+    def test_measured_calls_multiple_entries_parsed_in_order(self):
+        profile = _profile(
+            engines=[
+                _engine(
+                    measured_order="repeat_major",
+                    measured_calls=[
+                        {"n_tokens": 1, "yields_windows": [1]},
+                        {"n_tokens": 100, "yields_windows": [100]},
+                    ],
+                )
+            ]
+        )
+        calls = profile.engine_groups[0].measured_calls
+        self.assertEqual(
+            calls,
+            (
+                harness.MeasuredCall(n_tokens=1, yields_windows=(1,)),
+                harness.MeasuredCall(n_tokens=100, yields_windows=(100,)),
+            ),
+        )
 
     def test_unexpected_engine_key_rejected(self):
         bad_engine = {"name": "fake", "warmup_repeats": 0, "model": "m", "quantization": "q8", "warmups": 1}
@@ -696,6 +832,13 @@ class RunProfileTest(unittest.TestCase):
         warmup is scheduled once, at its OWN 8-token budget -- distinct
         from both measured windows (32, 256) -- entirely before its
         measured runs, exactly reproducing the legacy script's call order.
+
+        Engine order is Lattice -> Ollama -> MLX, matching
+        `bench_q4_apples.sh`'s (and `bench_apples_to_apples.sh`'s,
+        `bench_apples_precise.sh`'s) actual script section order -- NOT
+        Lattice -> MLX -> Ollama (a round-3 review finding: an earlier
+        version of this test asserted the wrong global order while
+        claiming to reproduce the legacy schedule).
         """
         profile = harness._parse_profile(
             "q4_apples",
@@ -705,17 +848,17 @@ class RunProfileTest(unittest.TestCase):
                 "prompt": "the quick brown fox",
                 "engines": [
                     _engine("lattice", warmup_repeats=0, model="qwen3.5-0.8b-q4", quantization="q4"),
-                    _engine("mlx", warmup_repeats=1, warmup_tokens=8, model="qwen3.5-0.8b", quantization="q4"),
                     _engine("ollama", warmup_repeats=0, model="qwen3.5:0.8b", quantization="q8"),
+                    _engine("mlx", warmup_repeats=1, warmup_tokens=8, model="qwen3.5-0.8b", quantization="q4"),
                 ],
             },
         )
         lattice = _FakeAdapter()
-        mlx = _FakeAdapter()
         ollama = _FakeAdapter()
+        mlx = _FakeAdapter()
         result = harness.run_profile(
             profile,
-            {"lattice": lattice, "mlx": mlx, "ollama": ollama},
+            {"lattice": lattice, "ollama": ollama, "mlx": mlx},
             clock=_FakeClock(),
             git_sha_value="x",
             hardware_id_value="h",
@@ -736,6 +879,15 @@ class RunProfileTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
+            ollama.calls,
+            [
+                (32, False, "qwen3.5:0.8b", "q8"),
+                (32, False, "qwen3.5:0.8b", "q8"),
+                (256, False, "qwen3.5:0.8b", "q8"),
+                (256, False, "qwen3.5:0.8b", "q8"),
+            ],
+        )
+        self.assertEqual(
             mlx.calls,
             [
                 (8, True, "qwen3.5-0.8b", "q4"),
@@ -745,22 +897,14 @@ class RunProfileTest(unittest.TestCase):
                 (256, False, "qwen3.5-0.8b", "q4"),
             ],
         )
-        self.assertEqual(
-            ollama.calls,
-            [
-                (32, False, "qwen3.5:0.8b", "q8"),
-                (32, False, "qwen3.5:0.8b", "q8"),
-                (256, False, "qwen3.5:0.8b", "q8"),
-                (256, False, "qwen3.5:0.8b", "q8"),
-            ],
-        )
 
         # Engine run order in the raw observation stream matches the
         # profile's engines order exactly: all of lattice's rows, then all
-        # of mlx's, then all of ollama's.
+        # of ollama's, then all of mlx's -- the legacy Lattice -> Ollama ->
+        # MLX global order.
         self.assertEqual(
             [o.engine for o in result.observations],
-            ["lattice"] * 4 + ["mlx"] * 5 + ["ollama"] * 4,
+            ["lattice"] * 4 + ["ollama"] * 4 + ["mlx"] * 5,
         )
 
         # Per-row identity: each observation records ITS OWN engine's
@@ -861,6 +1005,330 @@ class RunProfileTest(unittest.TestCase):
         self.assertEqual(warmup_obs.prompt_hash, harness.prompt_hash("a distinct warmup prompt"))
         self.assertEqual(measured_obs.prompt_hash, harness.prompt_hash("the measured prompt"))
         self.assertNotEqual(warmup_obs.prompt_hash, measured_obs.prompt_hash)
+
+    # -- Round-3 blocker fix: the MEASURED-side schedule contract
+    # (`measured_calls` / `measured_order` / `AdapterRunResult.
+    # component_ns`), added because windows/measured_repeats alone cannot
+    # represent bench_compare_1k.py's three distinct measured shapes. --
+
+    def test_measured_order_repeat_major_alternates_calls_per_repeat(self):
+        """MLX's bench_compare_1k.py shape: an explicit two-call plan
+        (1-token, 100-token) replayed repeat-major -- (1, 100) alternating
+        every repeat -- NOT window-major (all 1s then all 100s)."""
+        profile = harness._parse_profile(
+            "agentic_mlx_only",
+            {
+                "windows": [1, 100],
+                "measured_repeats": 3,
+                "prompt": "the padded ctx prompt",
+                "engines": [
+                    _engine(
+                        "fake",
+                        measured_order="repeat_major",
+                        measured_calls=[
+                            {"n_tokens": 1, "yields_windows": [1]},
+                            {"n_tokens": 100, "yields_windows": [100]},
+                        ],
+                    )
+                ],
+            },
+        )
+        adapter = _FakeAdapter()
+        harness.run_profile(
+            profile, {"fake": adapter}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+        )
+        expected = [(1, False, "qwen3.5-0.8b", "q8"), (100, False, "qwen3.5-0.8b", "q8")] * 3
+        self.assertEqual(adapter.calls, expected)
+
+    def test_measured_calls_default_matches_explicit_window_major_equivalent(self):
+        """Sanity: an engine with no measured_calls (implicit default,
+        derived from profile.windows) produces the identical call sequence
+        as the same shape written out explicitly with measured_order=
+        'window_major' (the default)."""
+        implicit = harness._parse_profile(
+            "implicit", {"windows": [32, 256], "measured_repeats": 2, "prompt": "x", "engines": [_engine()]}
+        )
+        explicit = harness._parse_profile(
+            "explicit",
+            {
+                "windows": [32, 256],
+                "measured_repeats": 2,
+                "prompt": "x",
+                "engines": [
+                    _engine(
+                        measured_calls=[
+                            {"n_tokens": 32, "yields_windows": [32]},
+                            {"n_tokens": 256, "yields_windows": [256]},
+                        ]
+                    )
+                ],
+            },
+        )
+        a1, a2 = _FakeAdapter(), _FakeAdapter()
+        harness.run_profile(implicit, {"fake": a1}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h")
+        harness.run_profile(explicit, {"fake": a2}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h")
+        self.assertEqual(a1.calls, a2.calls)
+
+    def test_measured_call_multi_yield_uses_component_ns_for_elapsed_ns(self):
+        """Ollama's bench_compare_1k.py shape: ONE 100-token call per
+        repeat yields BOTH a window=1 and a window=100 observation, with
+        elapsed_ns for each coming from the adapter-reported component --
+        never from the harness's own single wall-clock span for the whole
+        call (which would conflate the two components)."""
+        profile = harness._parse_profile(
+            "agentic_ollama_only",
+            {
+                "windows": [1, 100],
+                "measured_repeats": 2,
+                "prompt": "the padded ctx prompt",
+                "engines": [_engine("fake", measured_calls=[{"n_tokens": 100, "yields_windows": [1, 100]}])],
+            },
+        )
+        adapter = _FakeAdapter(component_ns={1: 40_000_000, 100: 400_000_000})
+        result = harness.run_profile(
+            profile, {"fake": adapter}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+        )
+        # Exactly ONE physical call per repeat -- the harness never
+        # re-invokes the engine to synthesize the second window.
+        self.assertEqual(adapter.calls, [(100, False, "qwen3.5-0.8b", "q8")] * 2)
+
+        measured = [o for o in result.observations if not o.warmup]
+        self.assertEqual([o.requested_completion_tokens for o in measured], [1, 100, 1, 100])
+        self.assertEqual([o.elapsed_ns for o in measured], [40_000_000, 400_000_000, 40_000_000, 400_000_000])
+        # Both windows from the SAME physical call share the same
+        # run_index (they are one repeat's two derived readings) and the
+        # SAME actual_completion_tokens (the real underlying call
+        # requested/generated 100 tokens, regardless of which window a
+        # given derived observation represents).
+        self.assertEqual([o.run_index for o in measured], [1, 1, 2, 2])
+        self.assertTrue(all(o.actual_completion_tokens == 100 for o in measured))
+
+    def test_measured_call_multi_yield_missing_component_ns_raises(self):
+        profile = harness._parse_profile(
+            "agentic_ollama_only",
+            {
+                "windows": [1, 100],
+                "measured_repeats": 1,
+                "prompt": "x",
+                "engines": [_engine("fake", measured_calls=[{"n_tokens": 100, "yields_windows": [1, 100]}])],
+            },
+        )
+        adapter = _FakeAdapter()  # component_ns=None
+        with self.assertRaisesRegex(harness.AdapterContractError, "component_ns is None"):
+            harness.run_profile(
+                profile, {"fake": adapter}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+            )
+
+    def test_measured_call_multi_yield_missing_window_entry_raises(self):
+        profile = harness._parse_profile(
+            "agentic_ollama_only",
+            {
+                "windows": [1, 100],
+                "measured_repeats": 1,
+                "prompt": "x",
+                "engines": [_engine("fake", measured_calls=[{"n_tokens": 100, "yields_windows": [1, 100]}])],
+            },
+        )
+        adapter = _FakeAdapter(component_ns={100: 400_000_000})  # window=1 missing
+        with self.assertRaisesRegex(harness.AdapterContractError, r"missing entries for window\(s\) \[1\]"):
+            harness.run_profile(
+                profile, {"fake": adapter}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+            )
+
+    def test_agentic_style_global_flattened_sequence_lattice_ollama_mlx(self):
+        """The round-3 blocker fix, end to end: reproduce
+        `bench_compare_1k.py`'s complete Lattice -> Ollama -> MLX stream in
+        one profile. Lattice is window-major (all 1-token then all
+        100-token calls, the default shape). Ollama warms once at 4
+        tokens with its own 'hi' prompt, then issues ONE 100-token call
+        per repeat yielding both a window=1 (TTFT) and window=100 (total)
+        observation via component_ns. MLX warms once at 4 tokens with its
+        own 'BASE' prompt, then alternates (1, 100) every repeat
+        (repeat-major)."""
+        profile = harness._parse_profile(
+            "agentic",
+            {
+                "windows": [1, 100],
+                "measured_repeats": 2,
+                "prompt": "the padded ctx prompt",
+                "engines": [
+                    _engine("lattice", model="qwen3.5-0.8b", quantization="q8"),
+                    _engine(
+                        "ollama",
+                        warmup_repeats=1,
+                        warmup_tokens=4,
+                        warmup_prompt="hi",
+                        model="qwen3.5:0.8b",
+                        quantization="q8",
+                        measured_calls=[{"n_tokens": 100, "yields_windows": [1, 100]}],
+                    ),
+                    _engine(
+                        "mlx",
+                        warmup_repeats=1,
+                        warmup_tokens=4,
+                        warmup_prompt="BASE",
+                        model="qwen3.5-0.8b",
+                        quantization="q8",
+                        measured_order="repeat_major",
+                        measured_calls=[
+                            {"n_tokens": 1, "yields_windows": [1]},
+                            {"n_tokens": 100, "yields_windows": [100]},
+                        ],
+                    ),
+                ],
+            },
+        )
+        lattice = _FakeAdapter()
+        ollama = _FakeAdapter(component_ns={1: 40_000_000, 100: 400_000_000})
+        mlx = _FakeAdapter()
+        result = harness.run_profile(
+            profile,
+            {"lattice": lattice, "ollama": ollama, "mlx": mlx},
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+
+        # Lattice: no warmup, all 1-token calls then all 100-token calls.
+        self.assertEqual(
+            lattice.calls,
+            [
+                (1, False, "qwen3.5-0.8b", "q8"),
+                (1, False, "qwen3.5-0.8b", "q8"),
+                (100, False, "qwen3.5-0.8b", "q8"),
+                (100, False, "qwen3.5-0.8b", "q8"),
+            ],
+        )
+        # Ollama: one 4-token 'hi' warmup, then exactly TWO physical
+        # 100-token calls (one per repeat) -- never four.
+        self.assertEqual(
+            ollama.calls,
+            [
+                (4, True, "qwen3.5:0.8b", "q8"),
+                (100, False, "qwen3.5:0.8b", "q8"),
+                (100, False, "qwen3.5:0.8b", "q8"),
+            ],
+        )
+        # MLX: one 4-token 'BASE' warmup, then (1, 100) alternating per repeat.
+        self.assertEqual(
+            mlx.calls,
+            [
+                (4, True, "qwen3.5-0.8b", "q8"),
+                (1, False, "qwen3.5-0.8b", "q8"),
+                (100, False, "qwen3.5-0.8b", "q8"),
+                (1, False, "qwen3.5-0.8b", "q8"),
+                (100, False, "qwen3.5-0.8b", "q8"),
+            ],
+        )
+
+        # Global observation stream: all of lattice's rows (4, no warmup),
+        # then all of ollama's (1 warmup + 4 measured -- two calls, two
+        # yielded windows each), then all of mlx's (1 warmup + 4 measured).
+        self.assertEqual(
+            [o.engine for o in result.observations],
+            ["lattice"] * 4 + ["ollama"] * 5 + ["mlx"] * 5,
+        )
+        # Ollama's measured rows: window=1 (TTFT-equivalent, from
+        # component_ns) immediately followed by window=100 (total), twice.
+        ollama_measured = [o for o in result.observations if o.engine == "ollama" and not o.warmup]
+        self.assertEqual([o.requested_completion_tokens for o in ollama_measured], [1, 100, 1, 100])
+        self.assertEqual(
+            [o.elapsed_ns for o in ollama_measured], [40_000_000, 400_000_000, 40_000_000, 400_000_000]
+        )
+        # MLX's measured rows alternate (1, 100) per repeat -- repeat-major.
+        mlx_measured = [o for o in result.observations if o.engine == "mlx" and not o.warmup]
+        self.assertEqual([o.requested_completion_tokens for o in mlx_measured], [1, 100, 1, 100])
+
+    def test_precise_style_global_flattened_sequence_all_three_engines(self):
+        """`bench_apples_precise.sh` reproduced with its actual three
+        engines (Lattice, Ollama, MLX), each warming identically -- twice
+        at N2=512, once before both measured windows -- confirming the
+        warmup mechanism holds across every engine in the real script, not
+        just a single stand-in adapter."""
+        profile = harness._parse_profile(
+            "precise",
+            {
+                "windows": [64, 512],
+                "measured_repeats": 3,
+                "prompt": "the quick brown fox",
+                "engines": [
+                    _engine("lattice", warmup_repeats=2, warmup_tokens=512, model="qwen3.5-0.8b", quantization="q8"),
+                    _engine("ollama", warmup_repeats=2, warmup_tokens=512, model="qwen3.5:0.8b", quantization="q8"),
+                    _engine("mlx", warmup_repeats=2, warmup_tokens=512, model="qwen3.5-0.8b", quantization="q8"),
+                ],
+            },
+        )
+        lattice, ollama, mlx = _FakeAdapter(), _FakeAdapter(), _FakeAdapter()
+        result = harness.run_profile(
+            profile,
+            {"lattice": lattice, "ollama": ollama, "mlx": mlx},
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        expected_per_engine = (
+            [(512, True, "qwen3.5-0.8b", "q8")] * 2
+            + [(64, False, "qwen3.5-0.8b", "q8")] * 3
+            + [(512, False, "qwen3.5-0.8b", "q8")] * 3
+        )
+        expected_ollama = (
+            [(512, True, "qwen3.5:0.8b", "q8")] * 2
+            + [(64, False, "qwen3.5:0.8b", "q8")] * 3
+            + [(512, False, "qwen3.5:0.8b", "q8")] * 3
+        )
+        self.assertEqual(lattice.calls, expected_per_engine)
+        self.assertEqual(ollama.calls, expected_ollama)
+        self.assertEqual(mlx.calls, expected_per_engine)
+        self.assertEqual(
+            [o.engine for o in result.observations],
+            ["lattice"] * 8 + ["ollama"] * 8 + ["mlx"] * 8,
+        )
+
+    def test_context_scaling_style_global_flattened_sequence_all_three_engines(self):
+        """`bench_context_scaling.sh` reproduced with its actual three
+        engines: only MLX warms (once, at 4 tokens, before the N1=8
+        baseline and every N2 comparison window) -- Lattice and Ollama
+        have no separate warmup step in this script."""
+        profile = harness._parse_profile(
+            "context_scaling",
+            {
+                "windows": [8, 64, 128, 256],
+                "measured_repeats": 2,
+                "prompt": "the quick brown fox",
+                "engines": [
+                    _engine("lattice", warmup_repeats=0, model="qwen3.5-0.8b", quantization="q8"),
+                    _engine("ollama", warmup_repeats=0, model="qwen3.5:0.8b", quantization="q8"),
+                    _engine("mlx", warmup_repeats=1, warmup_tokens=4, model="qwen3.5-0.8b", quantization="q8"),
+                ],
+            },
+        )
+        lattice, ollama, mlx = _FakeAdapter(), _FakeAdapter(), _FakeAdapter()
+        result = harness.run_profile(
+            profile,
+            {"lattice": lattice, "ollama": ollama, "mlx": mlx},
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        no_warmup_expected = (
+            [(8, False, "qwen3.5-0.8b", "q8")] * 2
+            + [(64, False, "qwen3.5-0.8b", "q8")] * 2
+            + [(128, False, "qwen3.5-0.8b", "q8")] * 2
+            + [(256, False, "qwen3.5-0.8b", "q8")] * 2
+        )
+        self.assertEqual(lattice.calls, no_warmup_expected)
+        self.assertEqual(
+            ollama.calls,
+            [(c[0], c[1], "qwen3.5:0.8b", "q8") for c in no_warmup_expected],
+        )
+        self.assertEqual(
+            mlx.calls,
+            [(4, True, "qwen3.5-0.8b", "q8")] + no_warmup_expected,
+        )
+        self.assertEqual(
+            [o.engine for o in result.observations],
+            ["lattice"] * 8 + ["ollama"] * 8 + ["mlx"] * 9,
+        )
 
 
 # --------------------------------------------------------------------------

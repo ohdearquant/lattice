@@ -25,10 +25,13 @@ engine request always resolves as "missing" (see `--allow-missing-engine`).
 
 A profile's `engines` list is an ordered set of per-engine run groups, not
 a flat list of names: each entry carries its own warmup schedule
-(`warmup_repeats`, `warmup_tokens`, optional `warmup_prompt`), `model`, and
-`quantization` (see `EngineRunGroup`), because the legacy scripts this
-harness consolidates give each engine its own warmup shape and, for the
-Q4/Q8 comparison, a different quantization per engine within one profile.
+(`warmup_repeats`, `warmup_tokens`, optional `warmup_prompt`), its own
+MEASURED schedule (`measured_calls`, `measured_order` -- see below), and
+`model`/`quantization` (see `EngineRunGroup`), because the legacy scripts
+this harness consolidates give each engine its own warmup shape, its own
+measured call shape, and, for the Q4/Q8 comparison, a different
+quantization per engine within one profile.
+
 A warmup is an explicit pre-window batch: `warmup_repeats` calls at
 `warmup_tokens` completion tokens execute ONCE per engine, entirely before
 that engine's measured windows -- never once per window -- so
@@ -37,12 +40,43 @@ that engine's measured windows -- never once per window -- so
 `bench_context_scaling.sh`'s single pre-loop 4-token MLX warmup are each
 exactly representable, including `bench_compare_1k.py`'s distinct
 per-engine warmup prompts via `warmup_prompt` (defaults to `profile.prompt`
-when omitted). `windows`, `measured_repeats`, and the measured `prompt`
-stay profile-wide because every legacy script keeps those uniform across
-engines; only the warmup differs per engine. The requested model/
-quantization is passed into `EngineAdapter.run()`; an adapter that invokes
-a different artifact than requested (fallback, missing checkpoint, ...)
-reports the actual identity back via `AdapterRunResult.actual_model`/
+when omitted).
+
+An EARLIER version of this module claimed `windows`/`measured_repeats`
+alone (profile-wide, one call per window, executed uniformly as
+`[w1 x R, w2 x R, ...]` for every engine) were sufficient to represent
+every legacy script's MEASURED schedule. That claim was FALSE:
+`bench_compare_1k.py` has three different measured shapes in one profile
+-- Lattice runs all 1-token calls then all 100-token calls (window-major,
+which the uniform default does reproduce); Ollama issues exactly ONE
+100-token call per repeat and derives BOTH a window=1 (TTFT) and a
+window=100 (total) observation from that single response's two
+engine-reported timing components; MLX alternates a 1-token call and a
+100-token call inside every repeat (repeat-major, not window-major). No
+choice of profile-wide `windows`/`measured_repeats` can produce all three.
+
+Each `EngineRunGroup` therefore carries an optional `measured_calls`: an
+ordered tuple of `MeasuredCall(n_tokens, yields_windows)`. When omitted,
+the harness derives the default -- one call per `profile.windows` entry,
+`yields_windows=(window,)` -- which reproduces every uniform-window
+script (`bench_apples_to_apples.sh`, `bench_apples_precise.sh`,
+`bench_q4_apples.sh`, `bench_context_scaling.sh`, and Lattice's half of
+`bench_compare_1k.py`) unchanged. `measured_order` (`"window_major"`,
+the default, or `"repeat_major"`) controls whether the call plan replays
+as "all repeats of call[0], then all repeats of call[1], ..." or "one
+full pass through the call plan per repeat" -- MLX's alternating
+`bench_compare_1k.py` shape needs `"repeat_major"`. A `MeasuredCall` with
+`len(yields_windows) > 1` (Ollama's shape: one 100-token call yielding
+both window=1 and window=100) requires the adapter to report
+`AdapterRunResult.component_ns`, a `{window: elapsed_ns}` map with an
+entry for every yielded window -- the harness never re-invokes the engine
+to synthesize a second measurement, and never fabricates one from the
+single call's own wall-clock time for more than the primary window.
+Missing `component_ns` (or a missing window entry within it) raises
+`AdapterContractError`, fail-closed. The requested model/quantization is
+passed into `EngineAdapter.run()`; an adapter that invokes a different
+artifact than requested (fallback, missing checkpoint, ...) reports the
+actual identity back via `AdapterRunResult.actual_model`/
 `actual_quantization`, and raw observations always record the actual
 invoked identity, never a value merely assumed from the profile.
 
@@ -102,6 +136,16 @@ class ObservationValidationError(ValueError):
 
 class MissingEngineError(RuntimeError):
     """A profile requested an engine with no adapter registered for it."""
+
+
+class AdapterContractError(RuntimeError):
+    """An adapter's returned result did not satisfy the harness's measured-call
+    contract for a multi-window `MeasuredCall` (missing or incomplete
+    `AdapterRunResult.component_ns`). Fail-closed: the harness never
+    re-invokes the engine to synthesize a missing measurement, and never
+    fabricates one from the call's own wall-clock time for more than the
+    call's primary window.
+    """
 
 
 # --------------------------------------------------------------------------
@@ -275,24 +319,67 @@ def write_jsonl(observations: list[Observation], path: Path) -> None:
 
 
 @dataclass(frozen=True)
+class MeasuredCall:
+    """One call within an engine's measured schedule.
+
+    `n_tokens` is the completion-token budget actually requested from the
+    adapter for this call. `yields_windows` names, in order, which
+    window(s) (`requested_completion_tokens` values recorded in the raw
+    observations) this ONE call produces a measured observation for. The
+    common case is `len(yields_windows) == 1` (one call -> one
+    observation, `yields_windows == (n_tokens,)`) -- every legacy script
+    except `bench_compare_1k.py`'s Ollama adapter fits this shape.
+    Ollama's shape is the exception: it issues one `n_tokens=100` call per
+    repeat and derives BOTH a window=1 (TTFT) and a window=100 (total)
+    observation from that single response's two engine-reported timing
+    components, so `yields_windows == (1, 100)` for a call with
+    `n_tokens == 100`. When `len(yields_windows) > 1`, every yielded
+    window's `elapsed_ns` comes from `AdapterRunResult.component_ns`
+    (adapter-reported), never from the harness's own wall-clock
+    measurement of the whole call and never fabricated -- see
+    `AdapterRunResult.component_ns` and `AdapterContractError`.
+    """
+
+    n_tokens: int
+    yields_windows: tuple[int, ...]
+
+
+_MEASURED_ORDER_VALUES = ("window_major", "repeat_major")
+
+
+@dataclass(frozen=True)
 class EngineRunGroup:
     """One engine's schedule within a profile.
 
-    Every legacy script gives each engine its own warmup schedule and its
-    own model/quantization identity (`bench_apples_to_apples.sh`: only MLX
-    gets a warmup, once, at 8 tokens, before the N1/N2 loop;
-    `bench_apples_precise.sh`: every engine warms twice at N2=512, once
-    before both measured windows; `bench_context_scaling.sh`: MLX warms
-    once at 4 tokens before the baseline/comparison loop;
-    `bench_compare_1k.py`: Ollama and MLX each warm at 4 tokens with their
-    own warmup prompt, distinct from the measured prompt). A warmup is
-    therefore an explicit pre-window batch -- `warmup_repeats` calls at
+    Every legacy script gives each engine its own warmup schedule, its
+    own measured call shape, and its own model/quantization identity
+    (`bench_apples_to_apples.sh`: only MLX gets a warmup, once, at 8
+    tokens, before the N1/N2 loop; `bench_apples_precise.sh`: every
+    engine warms twice at N2=512, once before both measured windows;
+    `bench_context_scaling.sh`: MLX warms once at 4 tokens before the
+    baseline/comparison loop; `bench_compare_1k.py`: Ollama and MLX each
+    warm at 4 tokens with their own warmup prompt, distinct from the
+    measured prompt, AND the three engines' MEASURED shapes differ --
+    Lattice is window-major `[1 x R, 100 x R]`, MLX is repeat-major
+    `(1, 100) x R`, and Ollama is one 100-token call per repeat yielding
+    both a window=1 and a window=100 observation). A warmup is an
+    explicit pre-window batch -- `warmup_repeats` calls at
     `warmup_tokens` completion tokens, using `warmup_prompt` if given or
     `profile.prompt` otherwise -- executed once per engine, entirely
-    before that engine's measured windows, never once per window.
-    `measured_repeats`, `windows`, and the measured `prompt` stay
-    profile-wide because every legacy script keeps those uniform across
-    engines; only the warmup differs per engine.
+    before that engine's measured calls, never once per window.
+
+    `measured_calls`, when given, overrides the default measured schedule
+    (one call per `profile.windows` entry, `yields_windows=(window,)`)
+    with an explicit ordered `MeasuredCall` tuple -- required for Ollama's
+    single-call-yields-two-windows shape, optional for engines that only
+    need a different token budget than `profile.windows` implies.
+    `measured_order` (`"window_major"`, the default, or `"repeat_major"`)
+    controls whether the (default or explicit) call plan replays as "all
+    repeats of call[0], then all repeats of call[1], ..." or "one full
+    pass through the call plan per repeat"; `profile.measured_repeats`
+    stays profile-wide (every legacy script keeps the repeat COUNT
+    uniform across engines; only the call shape/order/token-budget
+    differs per engine).
     """
 
     name: str
@@ -301,6 +388,8 @@ class EngineRunGroup:
     warmup_prompt: str | None
     model: str
     quantization: str
+    measured_calls: tuple[MeasuredCall, ...] | None = None
+    measured_order: str = "window_major"
 
 
 @dataclass(frozen=True)
@@ -335,8 +424,18 @@ _PROFILE_ALLOWED_KEYS = frozenset(
     }
 )
 _ENGINE_GROUP_ALLOWED_KEYS = frozenset(
-    {"name", "warmup_repeats", "warmup_tokens", "warmup_prompt", "model", "quantization"}
+    {
+        "name",
+        "warmup_repeats",
+        "warmup_tokens",
+        "warmup_prompt",
+        "model",
+        "quantization",
+        "measured_order",
+        "measured_calls",
+    }
 )
+_MEASURED_CALL_ALLOWED_KEYS = frozenset({"n_tokens", "yields_windows"})
 
 
 def load_profiles_file(path: Path) -> tuple[int, dict[str, ProfileConfig]]:
@@ -489,6 +588,75 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
         if not eg_quantization:
             raise ProfileConfigError(f"profile {name!r}: engines[{idx}] quantization must be non-empty")
 
+        # measured_order: how this engine's measured call plan (default or
+        # explicit measured_calls) replays across profile.measured_repeats
+        # -- "window_major" (all repeats of call[0], then call[1], ...) or
+        # "repeat_major" (one full pass through the plan per repeat, the
+        # shape MLX's alternating bench_compare_1k.py calls need).
+        eg_measured_order = eg_raw.get("measured_order", "window_major")
+        if not isinstance(eg_measured_order, str) or eg_measured_order not in _MEASURED_ORDER_VALUES:
+            raise ProfileConfigError(
+                f"profile {name!r}: engines[{idx}] measured_order must be one of "
+                f"{_MEASURED_ORDER_VALUES}, got {eg_measured_order!r}"
+            )
+
+        # measured_calls: an explicit ordered call plan overriding the
+        # default (one call per profile.windows entry). Required for any
+        # engine whose measured shape the default cannot represent (e.g.
+        # Ollama's one-call-yields-two-windows shape).
+        eg_measured_calls_raw = eg_raw.get("measured_calls")
+        eg_measured_calls: tuple[MeasuredCall, ...] | None = None
+        if eg_measured_calls_raw is not None:
+            if not isinstance(eg_measured_calls_raw, list) or not eg_measured_calls_raw:
+                raise ProfileConfigError(
+                    f"profile {name!r}: engines[{idx}] measured_calls must be a non-empty list"
+                )
+            parsed_calls: list[MeasuredCall] = []
+            for call_idx, call_raw in enumerate(eg_measured_calls_raw):
+                if not isinstance(call_raw, dict):
+                    raise ProfileConfigError(
+                        f"profile {name!r}: engines[{idx}] measured_calls[{call_idx}] must be a table"
+                    )
+                call_extra = set(call_raw) - _MEASURED_CALL_ALLOWED_KEYS
+                if call_extra:
+                    raise ProfileConfigError(
+                        f"profile {name!r}: engines[{idx}] measured_calls[{call_idx}] has "
+                        f"unexpected key(s): {sorted(call_extra)}"
+                    )
+                call_missing = _MEASURED_CALL_ALLOWED_KEYS - set(call_raw)
+                if call_missing:
+                    raise ProfileConfigError(
+                        f"profile {name!r}: engines[{idx}] measured_calls[{call_idx}] missing "
+                        f"required key(s): {sorted(call_missing)}"
+                    )
+                call_n_tokens = call_raw["n_tokens"]
+                if isinstance(call_n_tokens, bool) or not isinstance(call_n_tokens, int) or call_n_tokens <= 0:
+                    raise ProfileConfigError(
+                        f"profile {name!r}: engines[{idx}] measured_calls[{call_idx}] n_tokens "
+                        f"must be a positive int, got {call_n_tokens!r}"
+                    )
+                call_yields_raw = call_raw["yields_windows"]
+                if not isinstance(call_yields_raw, list) or not call_yields_raw:
+                    raise ProfileConfigError(
+                        f"profile {name!r}: engines[{idx}] measured_calls[{call_idx}] yields_windows "
+                        "must be a non-empty list"
+                    )
+                call_yields: list[int] = []
+                for y in call_yields_raw:
+                    if isinstance(y, bool) or not isinstance(y, int) or y <= 0:
+                        raise ProfileConfigError(
+                            f"profile {name!r}: engines[{idx}] measured_calls[{call_idx}] yields_windows "
+                            f"entries must be positive integers, got {y!r}"
+                        )
+                    call_yields.append(y)
+                if len(set(call_yields)) != len(call_yields):
+                    raise ProfileConfigError(
+                        f"profile {name!r}: engines[{idx}] measured_calls[{call_idx}] yields_windows "
+                        f"must not contain duplicates, got {call_yields}"
+                    )
+                parsed_calls.append(MeasuredCall(n_tokens=call_n_tokens, yields_windows=tuple(call_yields)))
+            eg_measured_calls = tuple(parsed_calls)
+
         engine_groups.append(
             EngineRunGroup(
                 name=eg_name,
@@ -497,6 +665,8 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
                 warmup_prompt=eg_warmup_prompt,
                 model=eg_model,
                 quantization=eg_quantization,
+                measured_calls=eg_measured_calls,
+                measured_order=eg_measured_order,
             )
         )
 
@@ -561,6 +731,19 @@ class AdapterRunResult:
     that falls back to a different artifact than requested (a missing
     checkpoint, a resolved default, ...) MUST set these so the raw
     observation records what actually ran, not what was asked for.
+
+    `component_ns` is REQUIRED when the harness's `MeasuredCall` for this
+    invocation declared `len(yields_windows) > 1` (one physical call
+    producing observations for multiple windows, e.g. Ollama deriving
+    both a TTFT-equivalent and a total-equivalent reading from one
+    `/api/generate` response): it must map every window in
+    `yields_windows` to that window's adapter-reported elapsed
+    nanoseconds. It is ignored when the call yields exactly one window
+    (that window's `elapsed_ns` always comes from the harness's own
+    wall-clock measurement of the call). A missing map, or a map missing
+    an entry for one of the declared windows, raises
+    `AdapterContractError` -- the harness never fabricates a component it
+    was not told.
     """
 
     actual_completion_tokens: int
@@ -569,6 +752,7 @@ class AdapterRunResult:
     engine_version: str = "unknown"
     actual_model: str | None = None
     actual_quantization: str | None = None
+    component_ns: Mapping[int, int] | None = None
 
 
 class EngineAdapter(Protocol):
@@ -650,16 +834,26 @@ def run_profile(
     group (in `profile.engine_groups` order), that engine's warmup batch —
     `warmup_repeats` calls at `warmup_tokens` completion tokens, using
     `warmup_prompt` if given or `profile.prompt` otherwise — executes
-    ONCE, entirely before any of that engine's measured windows (never
-    once per window; this is what makes `bench_apples_to_apples.sh`'s
-    single pre-loop MLX warmup, `bench_apples_precise.sh`'s twice-at-N2
-    warmup, and `bench_context_scaling.sh`'s single pre-loop warmup all
-    exactly representable). Measured runs then execute for each window (in
-    `profile.windows` order — `windows[0]` is the shared baseline,
-    executed once and reused for every comparison window that follows it).
-    `order_index` is a single counter across the entire call, so a later
-    statistical pass (issue #714) can test for order/thermal bias without
-    another schema migration.
+    ONCE, entirely before any of that engine's measured calls (never once
+    per window; this is what makes `bench_apples_to_apples.sh`'s single
+    pre-loop MLX warmup, `bench_apples_precise.sh`'s twice-at-N2 warmup,
+    and `bench_context_scaling.sh`'s single pre-loop warmup all exactly
+    representable).
+
+    Measured calls then execute per the group's OWN plan: `group.
+    measured_calls` if given, else the default derived from
+    `profile.windows` (one call per window, `yields_windows=(window,)`).
+    `group.measured_order` selects "window_major" (default -- all repeats
+    of call[0], then all repeats of call[1], ...) or "repeat_major" (one
+    full pass through the call plan per repeat -- MLX's alternating
+    `bench_compare_1k.py` shape). A call with more than one yielded window
+    (Ollama's one-call-yields-two-windows shape) produces one Observation
+    per yielded window from a SINGLE adapter invocation, using
+    `AdapterRunResult.component_ns` for every window's `elapsed_ns` — see
+    `MeasuredCall` and `AdapterContractError`. `order_index` is a single
+    counter across the entire call, so a later statistical pass (issue
+    #714) can test for order/thermal bias without another schema
+    migration.
     """
     resolved_git_sha = git_sha_value if git_sha_value is not None else git_sha(repo_root)
     resolved_hardware_id = hardware_id_value if hardware_id_value is not None else hardware_id()
@@ -681,26 +875,17 @@ def run_profile(
     observations: list[Observation] = []
     order_index = 0
 
-    def _record(
+    def _append_observation(
         *,
-        adapter: EngineAdapter,
         group: EngineRunGroup,
-        call_prompt: str,
+        result: AdapterRunResult,
         call_prompt_hash: str,
-        n_tokens: int,
+        window: int,
         is_warmup: bool,
         run_index: int,
+        elapsed_ns: int,
     ) -> None:
         nonlocal order_index
-        t0 = clock()
-        result = adapter.run(
-            prompt=call_prompt,
-            n_tokens=n_tokens,
-            warmup=is_warmup,
-            model=group.model,
-            quantization=group.quantization,
-        )
-        t1 = clock()
         actual_model = result.actual_model if result.actual_model is not None else group.model
         actual_quantization = (
             result.actual_quantization if result.actual_quantization is not None else group.quantization
@@ -716,12 +901,12 @@ def run_profile(
             prompt_hash=call_prompt_hash,
             requested_prompt_tokens=profile.requested_prompt_tokens,
             actual_prompt_tokens=result.actual_prompt_tokens,
-            requested_completion_tokens=n_tokens,
+            requested_completion_tokens=window,
             actual_completion_tokens=result.actual_completion_tokens,
             warmup=is_warmup,
             run_index=run_index,
             order_index=order_index,
-            elapsed_ns=t1 - t0,
+            elapsed_ns=elapsed_ns,
             engine_native_ns=result.native_ns,
             hardware_id=resolved_hardware_id,
             timestamp=timestamp_fn(),
@@ -730,12 +915,100 @@ def run_profile(
         observations.append(obs)
         order_index += 1
 
+    def _record(
+        *,
+        adapter: EngineAdapter,
+        group: EngineRunGroup,
+        call_prompt: str,
+        call_prompt_hash: str,
+        n_tokens: int,
+        is_warmup: bool,
+        run_index: int,
+    ) -> None:
+        """Single call, single window (warmup calls always take this path)."""
+        t0 = clock()
+        result = adapter.run(
+            prompt=call_prompt,
+            n_tokens=n_tokens,
+            warmup=is_warmup,
+            model=group.model,
+            quantization=group.quantization,
+        )
+        t1 = clock()
+        _append_observation(
+            group=group,
+            result=result,
+            call_prompt_hash=call_prompt_hash,
+            window=n_tokens,
+            is_warmup=is_warmup,
+            run_index=run_index,
+            elapsed_ns=t1 - t0,
+        )
+
+    def _record_measured_call(
+        *,
+        adapter: EngineAdapter,
+        group: EngineRunGroup,
+        call: MeasuredCall,
+        call_prompt: str,
+        call_prompt_hash: str,
+        run_index: int,
+    ) -> None:
+        """One measured call, possibly yielding more than one window's
+        observation from a single adapter invocation (see `MeasuredCall`).
+        """
+        t0 = clock()
+        result = adapter.run(
+            prompt=call_prompt,
+            n_tokens=call.n_tokens,
+            warmup=False,
+            model=group.model,
+            quantization=group.quantization,
+        )
+        t1 = clock()
+        if len(call.yields_windows) == 1:
+            _append_observation(
+                group=group,
+                result=result,
+                call_prompt_hash=call_prompt_hash,
+                window=call.yields_windows[0],
+                is_warmup=False,
+                run_index=run_index,
+                elapsed_ns=t1 - t0,
+            )
+            return
+        if result.component_ns is None:
+            raise AdapterContractError(
+                f"engine {group.name!r}: measured call n_tokens={call.n_tokens} declares "
+                f"yields_windows={call.yields_windows} but AdapterRunResult.component_ns is None"
+            )
+        missing_windows = [w for w in call.yields_windows if w not in result.component_ns]
+        if missing_windows:
+            raise AdapterContractError(
+                f"engine {group.name!r}: measured call n_tokens={call.n_tokens} "
+                f"component_ns is missing entries for window(s) {missing_windows} "
+                f"(declared yields_windows={call.yields_windows})"
+            )
+        for window in call.yields_windows:
+            _append_observation(
+                group=group,
+                result=result,
+                call_prompt_hash=call_prompt_hash,
+                window=window,
+                is_warmup=False,
+                run_index=run_index,
+                elapsed_ns=result.component_ns[window],
+            )
+
+    def _default_measured_calls() -> tuple[MeasuredCall, ...]:
+        return tuple(MeasuredCall(n_tokens=w, yields_windows=(w,)) for w in profile.windows)
+
     for group in profile.engine_groups:
         if group.name not in active:
             continue
         adapter = adapters[group.name]
 
-        # Warmup batch: once, before any measured window, at the group's
+        # Warmup batch: once, before any measured call, at the group's
         # own token budget and prompt (default: profile.prompt).
         if group.warmup_repeats > 0:
             warmup_prompt = group.warmup_prompt if group.warmup_prompt is not None else profile.prompt
@@ -753,18 +1026,31 @@ def run_profile(
                     run_index=run_index,
                 )
 
-        # Measured windows: run_index resets per window.
-        for window in profile.windows:
+        # Measured calls: this engine's own plan (default or explicit),
+        # replayed window-major or repeat-major per group.measured_order.
+        calls = group.measured_calls if group.measured_calls is not None else _default_measured_calls()
+        if group.measured_order == "window_major":
+            for call in calls:
+                for run_index in range(1, profile.measured_repeats + 1):
+                    _record_measured_call(
+                        adapter=adapter,
+                        group=group,
+                        call=call,
+                        call_prompt=profile.prompt,
+                        call_prompt_hash=measured_prompt_hash,
+                        run_index=run_index,
+                    )
+        else:  # "repeat_major"
             for run_index in range(1, profile.measured_repeats + 1):
-                _record(
-                    adapter=adapter,
-                    group=group,
-                    call_prompt=profile.prompt,
-                    call_prompt_hash=measured_prompt_hash,
-                    n_tokens=window,
-                    is_warmup=False,
-                    run_index=run_index,
-                )
+                for call in calls:
+                    _record_measured_call(
+                        adapter=adapter,
+                        group=group,
+                        call=call,
+                        call_prompt=profile.prompt,
+                        call_prompt_hash=measured_prompt_hash,
+                        run_index=run_index,
+                    )
 
     return HarnessRunResult(
         profile=profile,

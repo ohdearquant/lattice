@@ -12,16 +12,28 @@
 # ordered array, not a flat name list -- because the legacy scripts this
 # harness consolidates give each engine its own warmup shape (e.g. only
 # MLX warms up in `bench_apples_to_apples.sh`, once, at 8 tokens, before
-# the N1/N2 loop) and, for the Q4/Q8 comparison in `bench_q4_apples.sh`, a
-# different quantization per engine within one profile (Lattice Q4, MLX
-# Q4, Ollama Q8 as reference only). A warmup is an explicit pre-window
-# batch: `warmup_repeats` calls at `warmup_tokens` completion tokens run
-# ONCE per engine, entirely before that engine's measured windows -- never
-# once per window -- so `bench_apples_precise.sh`'s "warm twice at N2=512
-# before both windows" and `bench_context_scaling.sh`'s "warm once at 4
-# tokens before the baseline/comparison loop" are both exactly
-# representable, including `bench_compare_1k.py`'s distinct per-engine
-# warmup prompts via `warmup_prompt`.
+# the N1/N2 loop), its own MEASURED call shape (see below), and, for the
+# Q4/Q8 comparison in `bench_q4_apples.sh`, a different quantization per
+# engine within one profile (Lattice Q4, MLX Q4, Ollama Q8 as reference
+# only). A warmup is an explicit pre-window batch: `warmup_repeats` calls
+# at `warmup_tokens` completion tokens run ONCE per engine, entirely
+# before that engine's measured calls -- never once per window -- so
+# `bench_apples_precise.sh`'s "warm twice at N2=512 before both windows"
+# and `bench_context_scaling.sh`'s "warm once at 4 tokens before the
+# baseline/comparison loop" are both exactly representable, including
+# `bench_compare_1k.py`'s distinct per-engine warmup prompts via
+# `warmup_prompt`.
+#
+# `windows`/`measured_repeats` alone are NOT always sufficient to
+# represent an engine's measured shape: `bench_compare_1k.py` has THREE
+# different measured shapes in one profile (Lattice: window-major
+# `[1 x R, 100 x R]`, the default derived from `windows`; Ollama: ONE
+# 100-token call per repeat, yielding both a window=1 and a window=100
+# observation from that single response's two timing components; MLX:
+# repeat-major, alternating `(1, 100)` every repeat). An engine whose
+# shape the default can't represent sets its own `measured_calls`
+# (an explicit ordered call plan) and/or `measured_order` -- see schema
+# below.
 #
 # This file intentionally defines no profiles yet. The five live consumers
 # (`bench_apples_to_apples.sh`, `bench_apples_precise.sh`, `bench_q4_apples.sh`,
@@ -44,6 +56,24 @@
 #                              warmup_repeats == 0
 #     model                    string, non-empty
 #     quantization             string, non-empty
+#     measured_order           "window_major" (default) or "repeat_major";
+#                              window_major = all repeats of measured_calls[0],
+#                              then all repeats of measured_calls[1], ...;
+#                              repeat_major = one full pass through
+#                              measured_calls per repeat (MLX's alternating
+#                              bench_compare_1k.py shape)
+#     measured_calls           list[table], optional; overrides the default
+#                              measured plan (one call per `windows` entry,
+#                              yields_windows=[that window]); each table:
+#       n_tokens                 int, > 0 (completion-token budget for this call)
+#       yields_windows            list[int], non-empty, no duplicates -- the
+#                                window(s) this ONE call produces an
+#                                observation for. len() > 1 (e.g. Ollama
+#                                deriving both a window=1 and a window=100
+#                                reading from one call) REQUIRES the adapter
+#                                to return AdapterRunResult.component_ns with
+#                                an entry for every listed window -- see
+#                                bench_decode_harness.py:AdapterRunResult.
 #   prompt                   string, non-empty (the MEASURED-window prompt)
 #   aggregation              "median" (default) or "trimmed_mean"
 #   trim                     int, >= 0; only valid when aggregation = "trimmed_mean"
@@ -67,17 +97,61 @@
 # quantization = "q4"
 #
 # [[profiles.example_q4_apples.engines]]
+# name = "ollama"
+# warmup_repeats = 0
+# model = "qwen3.5:0.8b"
+# quantization = "q8"
+#
+# [[profiles.example_q4_apples.engines]]
 # name = "mlx"
 # warmup_repeats = 1
 # warmup_tokens = 8
 # model = "qwen3.5-0.8b"
 # quantization = "q4"
 #
-# [[profiles.example_q4_apples.engines]]
-# name = "ollama"
+# Example 2 (not a live profile -- illustrates bench_compare_1k.py's three
+# distinct measured shapes: Lattice window-major (the default, no
+# measured_calls needed), Ollama's one-call-yields-two-windows shape, and
+# MLX's repeat-major alternation; uncomment and rename to activate):
+#
+# [profiles.example_agentic]
+# description = "example only, see bench_compare_1k.py for the real profile"
+# windows = [1, 100]
+# measured_repeats = 5
+# prompt = "<ctx-padded prompt, built per-engine at the adapter level>"
+# aggregation = "median"
+#
+# [[profiles.example_agentic.engines]]
+# name = "lattice"
 # warmup_repeats = 0
+# model = "qwen3.5-0.8b"
+# quantization = "q8"
+#
+# [[profiles.example_agentic.engines]]
+# name = "ollama"
+# warmup_repeats = 1
+# warmup_tokens = 4
+# warmup_prompt = "hi"
 # model = "qwen3.5:0.8b"
 # quantization = "q8"
+# [[profiles.example_agentic.engines.measured_calls]]
+# n_tokens = 100
+# yields_windows = [1, 100]
+#
+# [[profiles.example_agentic.engines]]
+# name = "mlx"
+# warmup_repeats = 1
+# warmup_tokens = 4
+# warmup_prompt = "BASE"
+# model = "qwen3.5-0.8b"
+# quantization = "q8"
+# measured_order = "repeat_major"
+# [[profiles.example_agentic.engines.measured_calls]]
+# n_tokens = 1
+# yields_windows = [1]
+# [[profiles.example_agentic.engines.measured_calls]]
+# n_tokens = 100
+# yields_windows = [100]
 
 schema_version = 1
 
