@@ -6,6 +6,7 @@
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod gpu {
+    use crate::forward::cpu::{validate_gemm_bt, validate_gemm_nn};
     use metal::*;
     use std::sync::OnceLock;
 
@@ -129,6 +130,11 @@ mod gpu {
         k: usize,
         n: usize,
     ) -> bool {
+        // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4,
+        // held finding: this standalone Metal wrapper previously had NO argument validation
+        // at all). Validated before any GPU buffer is created from these slices below.
+        validate_gemm_bt(a.len(), b.len(), c.len(), m, k, n, "metal_matmul_bt");
+
         let work = (m as u64) * (n as u64) * (k as u64);
         if work < GPU_DISPATCH_THRESHOLD {
             return false;
@@ -159,6 +165,10 @@ mod gpu {
     ///
     /// GPU-accelerated C = A @ B. Returns true if GPU was used.
     pub fn metal_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) -> bool {
+        // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4,
+        // held finding — see `metal_matmul_bt`).
+        validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "metal_matmul");
+
         let work = (m as u64) * (n as u64) * (k as u64);
         if work < GPU_DISPATCH_THRESHOLD {
             return false;
@@ -208,4 +218,41 @@ pub fn metal_matmul(
     _n: usize,
 ) -> bool {
     false
+}
+
+// --- release-active argument validation (ADR-080 C4 held finding) ---
+// These panic before any Metal device/buffer is touched, so they run without a GPU present:
+// `validate_gemm_bt`/`validate_gemm_nn` are called unconditionally at the top of
+// `metal_matmul_bt`/`metal_matmul`, ahead of the GPU-availability check.
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+mod tests {
+    use super::{metal_matmul, metal_matmul_bt};
+
+    #[test]
+    #[should_panic(expected = "b too short for n*k")]
+    fn metal_matmul_bt_rejects_short_b() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 1]; // needs n*k = 2
+        let mut c = [0.0f32; 1];
+        metal_matmul_bt(&a, &b, &mut c, 1, 1, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "shape overflow: n*k")]
+    fn metal_matmul_bt_rejects_overflow() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 2];
+        let mut c = [0.0f32; 2];
+        // m*k = 2*2 = 4 (no overflow); n*k = usize::MAX*2 overflows.
+        metal_matmul_bt(&a, &b, &mut c, 2, 2, usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "b too short for k*n")]
+    fn metal_matmul_rejects_short_b() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 1]; // needs k*n = 2
+        let mut c = [0.0f32; 1];
+        metal_matmul(&a, &b, &mut c, 1, 1, 2);
+    }
 }

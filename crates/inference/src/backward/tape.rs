@@ -89,6 +89,29 @@ pub fn swiglu_forward(
     hidden: usize,
     inter: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4, held
+    // finding): gate_pre/up_pre are each an `A(1,hidden) @ B(inter,hidden)^T` matvec (`x`
+    // plays A, `w_gate`/`w_up` play B). Previously this silently truncated a too-short `x`
+    // via `.zip(x.iter())` (no panic, just a wrong, under-summed dot product) instead of
+    // rejecting the shape like `matmul_bt`/the materialized GQA training forward do.
+    crate::forward::cpu::validate_gemm_bt(
+        x.len(),
+        w_gate.len(),
+        inter,
+        1,
+        hidden,
+        inter,
+        "swiglu_forward:gate",
+    );
+    crate::forward::cpu::validate_gemm_bt(
+        x.len(),
+        w_up.len(),
+        inter,
+        1,
+        hidden,
+        inter,
+        "swiglu_forward:up",
+    );
     let mut gate_pre = vec![0.0f32; inter];
     let mut up_pre = vec![0.0f32; inter];
     for i in 0..inter {
@@ -114,7 +137,18 @@ pub fn swiglu_forward(
         })
         .collect();
 
-    // down_proj
+    // down_proj: `out = A(1,inter) @ B(hidden,inter)^T` (`mixed` plays A, `w_down` plays B).
+    // `mixed` is freshly computed above at exactly `inter` elements, but `w_down` is
+    // caller-supplied and gets the same release-active shape check as gate/up above.
+    crate::forward::cpu::validate_gemm_bt(
+        mixed.len(),
+        w_down.len(),
+        hidden,
+        1,
+        inter,
+        hidden,
+        "swiglu_forward:down",
+    );
     let mut out = vec![0.0f32; hidden];
     for i in 0..hidden {
         out[i] = w_down[i * inter..(i + 1) * inter]
@@ -149,6 +183,58 @@ mod tests {
         let hidden = 2;
         let inter = 3;
         let x = vec![1.0f32, -0.5];
+        let w_gate = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0];
+        let w_up = vec![0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let w_down = vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let (out, gate_pre, up_pre) = swiglu_forward(&x, &w_gate, &w_up, &w_down, hidden, inter);
+        assert_eq!(out.len(), hidden);
+        assert_eq!(gate_pre.len(), inter);
+        assert_eq!(up_pre.len(), inter);
+    }
+
+    // ADR-080 C4 held finding: `swiglu_forward` previously truncated a too-short `x` via
+    // `.zip(x.iter())` silently instead of rejecting the shape like `matmul_bt` does.
+    #[test]
+    #[should_panic(expected = "a too short for m*k")]
+    fn swiglu_forward_rejects_short_activation() {
+        let hidden = 2;
+        let inter = 3;
+        let x = vec![1.0f32]; // too short: needs hidden = 2
+        let w_gate = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0];
+        let w_up = vec![0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let w_down = vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let _ = swiglu_forward(&x, &w_gate, &w_up, &w_down, hidden, inter);
+    }
+
+    #[test]
+    #[should_panic(expected = "b too short for n*k")]
+    fn swiglu_forward_rejects_short_w_gate() {
+        let hidden = 2;
+        let inter = 3;
+        let x = vec![1.0f32, -0.5];
+        let w_gate = vec![1.0f32, 0.0]; // too short: needs inter*hidden = 6
+        let w_up = vec![0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let w_down = vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let _ = swiglu_forward(&x, &w_gate, &w_up, &w_down, hidden, inter);
+    }
+
+    #[test]
+    #[should_panic(expected = "b too short for n*k")]
+    fn swiglu_forward_rejects_short_w_down() {
+        let hidden = 2;
+        let inter = 3;
+        let x = vec![1.0f32, -0.5];
+        let w_gate = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0];
+        let w_up = vec![0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5];
+        let w_down = vec![1.0f32, 0.0]; // too short: needs hidden*inter = 6
+        let _ = swiglu_forward(&x, &w_gate, &w_up, &w_down, hidden, inter);
+    }
+
+    #[test]
+    fn swiglu_forward_accepts_oversized_activation() {
+        let hidden = 2;
+        let inter = 3;
+        let x = vec![1.0f32, -0.5, 99.0]; // oversized by 1
         let w_gate = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0];
         let w_up = vec![0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5];
         let w_down = vec![1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0];
