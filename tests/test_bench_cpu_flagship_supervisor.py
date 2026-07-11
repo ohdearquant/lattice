@@ -327,11 +327,29 @@ class PercentileTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+def _fake_raw_phase_events() -> list[dict]:
+    """A minimal, valid load->prefill->decode phase-event sequence
+    satisfying bench_decode_harness._validate_phase_sequence: exactly one
+    each of the four single-shot phases in rank order, plus one
+    token_available. Shape-matches compute_trial_metrics's
+    "raw_phase_events" output (name/monotonic_ns/token_index).
+    token_index is 1-indexed (>= 1), matching both parse_phase_event's
+    requirement and the real qwen35_generate binary's own convention
+    (its first emitted token_available carries token_index=1, not 0)."""
+    return [
+        {"name": "load_start", "monotonic_ns": 0, "token_index": None},
+        {"name": "backend_ready", "monotonic_ns": 40_000_000, "token_index": None},
+        {"name": "prefill_start", "monotonic_ns": 40_000_000, "token_index": None},
+        {"name": "prefill_end", "monotonic_ns": 55_000_000, "token_index": None},
+        {"name": "token_available", "monotonic_ns": 59_000_000, "token_index": 1},
+    ]
+
+
 def _fake_session(decode_values_a: list[float], decode_values_b: list[float]) -> dict:
     assert len(decode_values_a) == len(decode_values_b)
     n = len(decode_values_a)
-    arm_a = [{"decode_tok_s": v} for v in decode_values_a]
-    arm_b = [{"decode_tok_s": v} for v in decode_values_b]
+    arm_a = [{"decode_tok_s": v, "raw_phase_events": _fake_raw_phase_events()} for v in decode_values_a]
+    arm_b = [{"decode_tok_s": v, "raw_phase_events": _fake_raw_phase_events()} for v in decode_values_b]
     pairs = [
         {
             "pair_index": i,
@@ -418,9 +436,11 @@ class ValidateRunRecordRoundTripTest(unittest.TestCase):
         if not gate_eligible:
             verdict = "unsupported"
             unsupported_reason = "n_valid < required_n (test fixture)"
+            phase_events: tuple = ()
         else:
             verdict = "PASS"
             unsupported_reason = None
+            phase_events = tuple(harness.parse_phase_event(ev) for ev in session["arm_a"][0]["raw_phase_events"])
         return harness.CellRecord(
             cell_id=harness.cell_id("decode", "qwen3.5-small", "f16", "cpu", 512),
             metric_family="decode",
@@ -435,7 +455,7 @@ class ValidateRunRecordRoundTripTest(unittest.TestCase):
             unsupported_reason=unsupported_reason,
             path_proof=("cpu:qwen35_generate::generate_streaming_with_cancel",),
             lock_receipts=(),
-            phase_events=(),
+            phase_events=phase_events,
             resource_samples=(),
             provenance=self._provenance(),
             order_balance=tuple(diag["order_balance"]),

@@ -517,6 +517,17 @@ def compute_trial_metrics(trial: dict) -> dict:
         "peak_phys_footprint_by_phase": peak_by_phase,
         "delta_matches_generated_tokens": summary.get("delta_matches_generated_tokens"),
         "stopped": summary.get("stopped"),
+        # Raw phase events (name/monotonic_ns/token_index only, dropping the
+        # parent-clock-correlation bookkeeping) -- #877's
+        # `_validate_phase_sequence` requires every non-"unsupported"
+        # CellRecord to carry a real, non-empty, correctly-ordered
+        # load_start->backend_ready->prefill_start->prefill_end->
+        # token_available(+) sequence as the measurement-boundary proof.
+        # `build_decode_cell_aggregate` / `main()` picks one representative
+        # trial's events for the assembled record.
+        "raw_phase_events": [
+            {"name": e["name"], "monotonic_ns": e["child_ns"], "token_index": e["token_index"]} for e in events
+        ],
     }
 
 
@@ -638,6 +649,13 @@ def build_decode_cell_aggregate(session: dict, policy: dict, rng_seed: int) -> t
     meant to establish; this module computes it directly from the arms it
     already ran rather than requiring a separate calibration pass, since
     this PR's demonstration IS an A/A session (see `run_paired_sessions`).
+
+    `cell_class` is resolved from the REGISTERED policy
+    (`bench_gate_math.resolve_metric_policy`) for `("decode",
+    "decode_tok_s")`, never a hard-coded family-name heuristic -- matching
+    `validate_run_record`'s own re-derivation, so this module's
+    `required_n` always agrees with what the validator independently
+    recomputes.
     """
     arm_a = session["arm_a"]
     arm_b = session["arm_b"]
@@ -662,8 +680,9 @@ def build_decode_cell_aggregate(session: dict, policy: dict, rng_seed: int) -> t
     else:
         measured_cv = None
 
+    metric_policy = gate_math.resolve_metric_policy(policy, "decode", "decode_tok_s")
+    cell_class = metric_policy["noise_class"]
     cv_bands = gate_math.parse_cv_bands(policy["cv_bands"])
-    cell_class = "A"  # decode family, per perf-policy.toml's [families.decode] noise_class
     required_n: int | None = None
     if measured_cv is not None:
         required_n, _fail_margin = gate_math.required_n(measured_cv, cv_bands, cell_class)
@@ -875,6 +894,20 @@ def main(argv: list[str] | None = None) -> int:
             verdict = "PASS"
         unsupported_reason = None
 
+    # #877's _validate_phase_sequence requires every non-"unsupported"
+    # CellRecord to carry a real, correctly-ordered load_start->
+    # backend_ready->prefill_start->prefill_end->token_available(+)
+    # sequence as the measurement-boundary proof. Pair 0's arm A trial is
+    # the representative sequence for this record (an "unsupported"
+    # verdict skips this check entirely, so an empty tuple there is fine
+    # and cheaper than parsing events nobody will validate).
+    if verdict != "unsupported":
+        representative_events = tuple(
+            harness.parse_phase_event(ev) for ev in session["arm_a"][0]["raw_phase_events"]
+        )
+    else:
+        representative_events = ()
+
     record = harness.CellRecord(
         cell_id=cid,
         metric_family="decode",
@@ -889,7 +922,7 @@ def main(argv: list[str] | None = None) -> int:
         unsupported_reason=unsupported_reason,
         path_proof=("cpu:qwen35_generate::generate_streaming_with_cancel",),
         lock_receipts=(),
-        phase_events=(),
+        phase_events=representative_events,
         resource_samples=(),
         provenance=provenance,
         order_balance=tuple(diagnostics["order_balance"]),
