@@ -15,6 +15,15 @@
 #   lattice-inference: elementwise_cpu_bench
 #   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
+#
+# lattice#714: the lattice-embed `simd` bench target is entirely sub-microsecond
+# SIMD micro-benches, confirmed noise-dominated in --quick mode (two same-
+# toolchain A/A runs on identical refs flipped FAIL/WARN sign on dozens of its
+# entries, rotating across most of the file's groups run to run). In --quick
+# mode (the default), every group produced by that target is measured and
+# reported but excluded from the FAIL/WARN gate and exit code — see the
+# "informational" section of the report. --full mode gates it normally, so a
+# real embed SIMD regression is still caught there.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -104,11 +113,31 @@ fi
   cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
 )
 
+# --- Quick-mode informational-groups (lattice#714) ---
+# The embed `simd` target's groups are the confirmed noise-floor source; in
+# --quick mode, derive the exact group list from the already-built HEAD
+# binary (so it tracks the source file automatically) and mark them
+# informational-only for this run's gate. --full mode leaves this empty.
+INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
+rm -f "$INFO_GROUPS_FILE"
+if [ -n "$QUICK_FLAGS" ] && [ "$BENCHES_EMBED" = "simd" ]; then
+  (
+    cd "$HEAD_DIR"
+    cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null \
+      | awk -F/ '/: benchmark$/{print $1}' \
+      | sort -u > "$INFO_GROUPS_FILE"
+  )
+fi
+
 # --- Report ---
 echo ""
 echo "=== Full gate report ==="
+GATE_ARGS=(--baseline-name compare-base)
+if [ -s "$INFO_GROUPS_FILE" ]; then
+  GATE_ARGS+=(--informational-groups-file "$INFO_GROUPS_FILE")
+fi
 if [ -d "$HEAD_DIR/target/criterion" ]; then
-  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" --baseline-name compare-base 2>&1 || true
+  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || true
 fi
 
 echo ""

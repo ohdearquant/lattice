@@ -11,11 +11,24 @@ For every Criterion bench under target/criterion/, read change/estimates.json
 
 Usage:
   perf-bench-gate.py <criterion_root> <arch_label> [--out report.md]
+  perf-bench-gate.py <criterion_root> <arch_label> --informational-groups-file <path>
 
 Exit codes:
-  0 — pass (no FAILs)
-  1 — at least one FAIL (regression > 7% confirmed by 95% CI)
+  0 — pass (no gated FAILs)
+  1 — at least one gated FAIL (regression > 7% confirmed by 95% CI)
   2 — parse error / bad input
+
+--informational-groups-file (lattice#714): quick-mode Criterion runs on
+sub-microsecond micro-benches (lattice-embed's `simd` bench target) are
+dominated by scheduler/thermal jitter rather than code changes — confirmed
+by two same-toolchain quick-mode A/A runs on identical refs flipping FAIL/
+WARN sign across dozens of entries (lattice#714). Groups listed in this file
+(one Criterion top-level group name per line, e.g. from `cargo bench ... --
+--list`) are still measured and reported, but excluded from the FAIL/WARN
+gate and the exit code — they render in a separate "informational" section
+labeled below quick-mode resolution. This file should only be passed for
+quick-mode runs; full-mode (tight-CI) runs gate every group normally so a
+real embed SIMD regression is still caught.
 """
 
 from __future__ import annotations
@@ -47,6 +60,13 @@ class BenchResult:
     def ci_low_pct(self) -> float: return self.ci_low * 100.0
     @property
     def ci_high_pct(self) -> float: return self.ci_high * 100.0
+    @property
+    def group(self) -> str:
+        """Top-level Criterion group name (name is 'group/function/param' or 'group/param')."""
+        return self.name.split("/", 1)[0]
+
+    def is_informational(self, informational_groups: frozenset[str]) -> bool:
+        return self.group in informational_groups
 
     def verdict(self) -> str:
         if self.ci_low_pct > FAIL_PCT:
@@ -56,6 +76,26 @@ class BenchResult:
         if self.point_pct < CELEBRATE_PCT and self.ci_high_pct < 0:
             return "WIN"
         return "PASS"
+
+
+def load_informational_groups(path: Path | None) -> frozenset[str]:
+    """Load top-level group names to exclude from gating (lattice#714).
+
+    One group name per line; blank lines and '#'-prefixed comments ignored.
+    """
+    if path is None:
+        return frozenset()
+    if not path.exists():
+        print(f"warn: --informational-groups-file {path} does not exist — gating "
+              f"every group normally", file=sys.stderr)
+        return frozenset()
+    groups = set()
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        groups.add(line)
+    return frozenset(groups)
 
 
 def find_change_files(root: Path) -> list[Path]:
@@ -139,10 +179,18 @@ def parse_bench(change_file: Path, root: Path, baseline_name: str) -> BenchResul
                        new_ns=new_ns, old_ns=old_ns)
 
 
-def render_report(results: list[BenchResult], arch: str) -> str:
-    fails = [r for r in results if r.verdict() == "FAIL"]
-    warns = [r for r in results if r.verdict() == "WARN"]
-    wins = [r for r in results if r.verdict() == "WIN"]
+def render_report(results: list[BenchResult], arch: str,
+                   informational_groups: frozenset[str] = frozenset()) -> str:
+    gated = [r for r in results if not r.is_informational(informational_groups)]
+    info = [r for r in results if r.is_informational(informational_groups)]
+
+    fails = [r for r in gated if r.verdict() == "FAIL"]
+    warns = [r for r in gated if r.verdict() == "WARN"]
+    wins = [r for r in gated if r.verdict() == "WIN"]
+
+    info_fails = [r for r in info if r.verdict() == "FAIL"]
+    info_warns = [r for r in info if r.verdict() == "WARN"]
+    info_wins = [r for r in info if r.verdict() == "WIN"]
 
     lines = [f"### `{arch}` — perf regression report\n"]
     if fails:
@@ -152,7 +200,7 @@ def render_report(results: list[BenchResult], arch: str) -> str:
     if wins:
         lines.append(f"**🚀 {len(wins)} confirmed improvement**")
     if not (fails or warns or wins):
-        lines.append(f"✅ All {len(results)} benches within noise band (±{WARN_PCT}%)")
+        lines.append(f"✅ All {len(gated)} gated benches within noise band (±{WARN_PCT}%)")
     lines.append("")
 
     if fails or warns or wins:
@@ -166,6 +214,23 @@ def render_report(results: list[BenchResult], arch: str) -> str:
             )
         lines.append("")
 
+    if info:
+        lines.append(
+            f"**ℹ️ {len(info)} informational** (below quick-mode resolution — "
+            f"lattice-embed SIMD micro-benches, tracked in #714; not gated here, "
+            f"re-run `--full` for a gated verdict)"
+        )
+        if info_fails or info_warns or info_wins:
+            lines.append("| Bench | Δ point | 95% CI | new ns | base ns | (would-be verdict) |")
+            lines.append("|---|---:|---|---:|---:|---|")
+            for r in sorted(info_fails + info_warns + info_wins, key=lambda r: -r.ci_low_pct):
+                icon = {"FAIL": "❌", "WARN": "⚠", "WIN": "🚀"}[r.verdict()]
+                lines.append(
+                    f"| `{r.name}` | {r.point_pct:+.2f}% | [{r.ci_low_pct:+.2f}%, {r.ci_high_pct:+.2f}%] "
+                    f"| {r.new_ns:.1f} | {r.old_ns:.1f} | {icon} {r.verdict()} (informational) |"
+                )
+        lines.append("")
+
     lines.append(
         f"<details><summary>All {len(results)} measurements</summary>\n\n"
         "| Bench | Δ point | CI-lower | CI-upper |\n|---|---:|---:|---:|"
@@ -177,8 +242,15 @@ def render_report(results: list[BenchResult], arch: str) -> str:
     lines.append("\n</details>\n")
     lines.append(
         f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
-        f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails. Override via PR label `bench-allow-regression`._\n"
+        f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails. Override via PR label `bench-allow-regression`._"
     )
+    if informational_groups:
+        lines.append(
+            f"_{len(informational_groups)} group(s) excluded from gating as quick-mode "
+            f"informational-only (lattice#714): {', '.join(sorted(informational_groups))}._\n"
+        )
+    else:
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -288,6 +360,43 @@ def run_selftest() -> int:
         if "bench_multi" not in stderr_text or "refusing to guess" not in stderr_text:
             failures.append("multi-sibling layout: no loud refusal warning emitted")
 
+        # lattice#714: informational-groups exclusion. Two confirmed FAILs, one in a
+        # group named as informational (quick-mode embed-SIMD noise floor), one not —
+        # the exit-code fail count and the gated report section must only count the
+        # real one; the informational one must still be measured and reported.
+        noisy_dir = root / "grp_f" / "noisy_fail"
+        _fabricate_bench(noisy_dir, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+        real_dir = root / "grp_g" / "real_fail"
+        _fabricate_bench(real_dir, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+
+        for cf in find_change_files(root):
+            r = parse_bench(cf, root, baseline_name="compare-base")
+            if r is not None:
+                results[r.name] = r
+
+        informational = frozenset({"grp_f"})
+        all_results = list(results.values())
+        gated_fails = [
+            r for r in all_results
+            if r.verdict() == "FAIL" and not r.is_informational(informational)
+        ]
+        if "grp_f/noisy_fail" not in results or "grp_g/real_fail" not in results:
+            failures.append("informational-groups fixture: benches not parsed")
+        elif not results["grp_f/noisy_fail"].is_informational(informational):
+            failures.append("informational-groups: grp_f/noisy_fail not classified informational")
+        elif results["grp_g/real_fail"].is_informational(informational):
+            failures.append("informational-groups: grp_g/real_fail wrongly classified informational")
+        elif any(r.name == "grp_f/noisy_fail" for r in gated_fails):
+            failures.append("informational-groups: noisy FAIL leaked into gated fail count")
+        elif not any(r.name == "grp_g/real_fail" for r in gated_fails):
+            failures.append("informational-groups: real FAIL missing from gated fail count")
+
+        report = render_report(all_results, "selftest-arch", informational)
+        if "grp_g/real_fail" not in report:
+            failures.append("informational-groups: real FAIL missing from rendered report")
+        if "ℹ️" not in report or "grp_f/noisy_fail" not in report:
+            failures.append("informational-groups: noisy FAIL not shown in informational section")
+
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)
     if failures:
@@ -308,6 +417,10 @@ def main() -> int:
     ap.add_argument("--baseline-name", default="compare-base",
                     help="Named-baseline dir to look for when base/ is absent "
                          "(default: compare-base, matching bench-compare.sh)")
+    ap.add_argument("--informational-groups-file", type=Path, default=None,
+                    help="Path to a file listing Criterion top-level group names (one per "
+                         "line) to measure+report but exclude from gating/exit-code — quick-"
+                         "mode noise-floor groups (lattice#714). Omit for full-mode runs.")
     ap.add_argument("--selftest", action="store_true",
                     help="Run the fixture self-test (no criterion_root/arch needed) and exit")
     args = ap.parse_args()
@@ -343,12 +456,16 @@ def main() -> int:
         print("error: change files found but all failed to parse", file=sys.stderr)
         return 2
 
-    report = render_report(results, args.arch)
+    informational_groups = load_informational_groups(args.informational_groups_file)
+    report = render_report(results, args.arch, informational_groups)
     print(report)
     if args.out:
         args.out.write_text(report)
 
-    fails = sum(1 for r in results if r.verdict() == "FAIL")
+    fails = sum(
+        1 for r in results
+        if r.verdict() == "FAIL" and not r.is_informational(informational_groups)
+    )
     return 1 if fails > 0 else 0
 
 
