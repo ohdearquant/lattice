@@ -40,11 +40,19 @@
 //! | `eos_token_id: Option<u32>` | *(none — read from `Qwen35Config::eos_token_id`)* | canonical EOS is fixed per loaded model, not per-request; use `stop_token_ids: Vec<u32>` for additional per-request stop tokens |
 //! | `include_prompt: bool` | *(no equivalent)* | canonical `generate`/`generate_streaming` **always** exclude the prompt from `GenerateOutput::text`/`token_ids` — there is no option to include it. A caller relying on `include_prompt = true` must prepend the prompt string to `GenerateOutput::text` itself after calling the canonical path. |
 //! | `grammar: Option<Arc<GrammarEngine>>` | `grammar: Option<Arc<GrammarEngine>>` | same name and type |
-//! | `kv_cache_capacity: Option<usize>` | *(no equivalent)* | canonical path sizes its KV cache from `prompt_len` + the effective decode cap; there is no opt-in per-request cache-capacity clamp |
+//! | `kv_cache_capacity: Option<usize>` | *(no equivalent)* | the canonical cache has no per-request capacity clamp: it reserves the prompt length on the dense batched-prefill path and grows as decode appends tokens |
 //!
-//! `GenerateOutput`'s `stop_reason`/stop-token-exclusion contract is unchanged in the canonical
-//! type (see `crates/inference/src/stop_token_contract.rs`), so no migration is needed there
-//! beyond the field differences above.
+//! `GenerateOutput` field mapping (the two output types are also NOT drop-in compatible):
+//!
+//! | this module's `GenerateOutput` | canonical `model::GenerateOutput` | notes |
+//! |---|---|---|
+//! | `text: String` | `text: String` | same meaning (canonical never includes the prompt) |
+//! | `token_ids: Vec<u32>` | `token_ids: Vec<u32>` | same stop-token-exclusion contract (see `crate::stop_token_contract`) |
+//! | `prompt_tokens: usize` | `prompt_tokens: usize` | same |
+//! | `generated_tokens: usize` | `generated_tokens: usize` | same |
+//! | `stopped_by_eos: bool` | `stopped: bool` | **broader semantics**: canonical `stopped` is true for ANY stop condition (EOS, stop token, or stop string), not only EOS. Callers needing EOS-specific behavior must check `stop_reason == Some(StopReason::Eos)` instead. |
+//! | `stop_reason: Option<StopReason>` | `stop_reason: Option<StopReason>` | same |
+//! | *(none)* | `token_logprobs: Vec<TokenLogprob>` | new in the canonical type; empty unless `GenerateConfig::logprobs` was requested |
 //!
 //! Both APIs in this module continue to work exactly as before during the deprecation window —
 //! this is a notice-only change, not a behavior change.
