@@ -1581,7 +1581,7 @@ mod tests {
     /// Compares tiled vs materialized (reference) per-head attention for
     /// bge-small (head_dim=32) and bge-base (head_dim=64) configurations.
     #[test]
-    #[ignore]
+    #[ignore = "manual tiled-vs-materialized performance bench; run explicitly, not part of the correctness gate"]
     fn bench_attention_tiled_vs_materialized() {
         use std::time::Instant;
 
