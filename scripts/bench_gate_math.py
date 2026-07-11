@@ -251,6 +251,41 @@ def holm_reject(pvalues: Sequence[float], alpha: float = 0.05) -> list[bool]:
     return reject
 
 
+def _holm_tested_tails(pvalues: Sequence[float], alpha: float) -> tuple[list[bool], list[float]]:
+    """Internal: replicates `holm_reject`'s own ascending-p-value order and
+    step-down stopping rule to determine, for each cell in INPUT order,
+    whether the executed procedure actually evaluated that rank's `alpha /
+    (m - k)` tail before the first failed comparison halted it, and that
+    tail itself (`0.0` where untested -- callers must gate on the `tested`
+    flag, never use an untested tail).
+
+    The rank at which the procedure stops (its first failed comparison) WAS
+    tested -- it just did not reject. Only ranks STRICTLY AFTER that one
+    were never evaluated at their less-stringent tail; `holm_reject` never
+    ran a comparison for them, so no bound computed "at their tail" is an
+    executed Holm bound. Deliberately duplicates `holm_reject`'s loop
+    (rather than calling it) so a test that mocks/mutates the public
+    `holm_reject` symbol cannot also change which ranks this function
+    reports as tested -- testedness is a property of the real step-down
+    order, independent of whatever reject-decision function a caller
+    plugs in.
+    """
+    m = len(pvalues)
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    tested = [False] * m
+    tail = [0.0] * m
+    still_rejecting = True
+    for k, i in enumerate(order):
+        if not still_rejecting:
+            break
+        crit = alpha / (m - k)
+        tested[i] = True
+        tail[i] = crit
+        if pvalues[i] > crit:
+            still_rejecting = False
+    return tested, tail
+
+
 # --------------------------------------------------------------------------
 # Correction 3: exact Clopper-Pearson bound, reported not asserted
 # --------------------------------------------------------------------------
@@ -462,12 +497,18 @@ class CellGateInput:
 @dataclass(frozen=True)
 class CellGateResult:
     """One cell's gate-evaluator verdict, alongside the numbers that
-    produced it (queryable/loggable without re-running the bootstrap)."""
+    produced it (queryable/loggable without re-running the bootstrap).
+
+    `corrected_lower_bound` is `None` when the Holm step-down procedure
+    never reached this cell's rank (it stopped at an earlier, more
+    significant rank first) -- there is no executed-at-this-tail bound to
+    report, and a cell in that state can never reach FAIL regardless of
+    its `holm_reject` flag (see `evaluate_family_gate`)."""
 
     cell_id: str
     point_estimate: float
     p_value: float
-    corrected_lower_bound: float
+    corrected_lower_bound: float | None
     holm_reject: bool
     measured_cv: float
     required_n: int
@@ -508,6 +549,16 @@ def evaluate_family_gate(
         stricter bound already gates every cell); the bound and the
         decision must be the SAME test, evaluated at the SAME per-cell
         alpha.
+      - A cell's rank is only assigned a bound if Holm's step-down
+        procedure actually EXECUTED a comparison at that rank. The
+        step-down stops at the first failed comparison (`holm_reject`);
+        every rank strictly after that stop was never tested at its
+        `alpha / (m - k)` tail, so `corrected_lower_bound` is `None` for
+        those cells -- reporting a bound at an untested, less-stringent
+        tail would expose FAIL-level-looking evidence for a hypothesis
+        the procedure never actually evaluated at that level, silently
+        disagreeing with its own `holm_reject` flag. A cell with a `None`
+        bound can never reach FAIL, regardless of its `holm_reject` value.
     Anything short of both, but with a point estimate past `warn_pct` (or
     past `fail_pct` without confirmed statistical significance), is WARN
     -- DESIGN.md: "a point estimate crossing with an inconclusive bound
@@ -551,26 +602,26 @@ def evaluate_family_gate(
         prelim.append((cell, req_n, margin, tau_fail, point_estimate, p))
 
     pvalues = [p for *_rest, p in prelim]
-    m = len(prelim)
     rejects = holm_reject(pvalues, alpha=alpha_familywise)
-    # The exact step-down tail each cell was tested at in `holm_reject`:
-    # ascending-p-value rank k (0-indexed) -> alpha/(m-k), matching that
-    # function's own `crit = alpha / (m - k)` at each step. Cell-specific,
-    # not the fixed alpha/m Bonferroni tail -- see the docstring above.
-    rank_order = sorted(range(m), key=lambda i: pvalues[i])
-    cell_alpha = [0.0] * m
-    for k, i in enumerate(rank_order):
-        cell_alpha[i] = alpha_familywise / (m - k)
+    # The exact step-down tail each cell was ACTUALLY TESTED at in the real
+    # Holm procedure -- `tested[i]` is False for any rank strictly after the
+    # step-down's first failed comparison (see `_holm_tested_tails`).
+    # Computed independently of `rejects` above (never derived from a
+    # caller-supplied/mocked `holm_reject`) so testedness always reflects
+    # the real step-down order.
+    tested, cell_alpha = _holm_tested_tails(pvalues, alpha_familywise)
 
     results: list[CellGateResult] = []
-    for (cell, req_n, margin, tau_fail, point_estimate, p), reject, corrected_alpha in zip(
-        prelim, rejects, cell_alpha
+    for (cell, req_n, margin, tau_fail, point_estimate, p), reject, corrected_alpha, was_tested in zip(
+        prelim, rejects, cell_alpha, tested
     ):
-        lower_bound = bootstrap_lower_bound(
-            cell.values, cell.order_ab, bootstrap_replicates, rng, corrected_alpha=corrected_alpha
-        )
+        lower_bound: float | None = None
+        if was_tested:
+            lower_bound = bootstrap_lower_bound(
+                cell.values, cell.order_ab, bootstrap_replicates, rng, corrected_alpha=corrected_alpha
+            )
         tau_warn = math.log(1.0 + cell.warn_pct)
-        if reject and lower_bound > tau_fail:
+        if reject and lower_bound is not None and lower_bound > tau_fail:
             verdict = "FAIL"
         elif point_estimate > tau_warn:
             verdict = "WARN"

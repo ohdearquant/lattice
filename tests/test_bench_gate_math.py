@@ -491,17 +491,108 @@ class EvaluateFamilyGateTest(unittest.TestCase):
         actual verdict -- every cell's lower bound was fixed at the
         strictest step-0 Bonferroni tail regardless of Holm's per-cell
         step-down assignment, so Holm's reject flag was never the thing
-        separating FAIL from non-FAIL. This fixture reuses the SAME
-        two-cell family as `test_holm_ordering_changes_the_verdict` and
-        directly swaps `holm_reject` for a naive uncorrected `p <= alpha`
-        check via `mock.patch.object`, re-running the evaluator with an
-        identically-seeded RNG so the bootstrap draws line up. Under the
-        real, coherent step-down evaluator neither cell reaches FAIL (the
-        family-level Holm step halts at the first cell); under the naive
-        mutation, the cell whose own rank-assigned tail already clears
-        its fail threshold DOES flip to FAIL -- the decision-effective
-        proof that Holm's step-down, not a fixed bound, drives the
-        verdict."""
+        separating FAIL from non-FAIL.
+
+        Follow-up adversarial-review finding: an intermediate fix made
+        every rank's bound track its Holm-assigned tail (`alpha / (m -
+        rank)`) unconditionally, but the step-down procedure actually
+        STOPS at its first failed comparison -- ranks after that stop are
+        never evaluated at their less-stringent tail, so exposing a bound
+        there was a bound for a hypothesis Holm never tested. This
+        fixture is tuned (base
+        offset/spread/seed) so the family's rank-0 cell (`b`, always
+        tested -- the step-down evaluates it before any stop can occur)
+        sits in the gap between its own strict Holm tail (alpha/2=0.025)
+        and the naive uncorrected `alpha=0.05` check: `b`'s real p-value
+        clears 0.05 but not 0.025, and `b`'s real (always-computed,
+        tested-rank) bound independently clears the fail threshold. That
+        makes `b` -- not the untested rank-1 cell `a` -- the cell whose
+        verdict is decision-sensitive to Holm's real per-cell tail:
+        swapping `holm_reject` for naive `p <= alpha` flips only `b` to
+        FAIL, and `a` remains unable to reach FAIL in either run because
+        the real step-down never tests rank 1 here (its bound is `None`
+        regardless of which reject-decision function is plugged in --
+        see `test_stopped_holm_rank_never_exposes_a_bound`)."""
+        tau = math.log(1.07)
+
+        def cell(cid):
+            base = tau + 0.008
+            spread = 0.03
+            values = (
+                base - spread, base + spread, base - spread * 0.5, base + spread * 0.5,
+                base - spread * 0.2, base + spread * 0.2, base,
+            )
+            order_ab = (True, False, True, False, True, False, True)
+            return gm.CellGateInput(
+                cell_id=cid, values=values, order_ab=order_ab,
+                measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+            )
+
+        cell_a, cell_b = cell("a"), cell("b")
+
+        real_results = gm.evaluate_family_gate(
+            [cell_a, cell_b], self._bands(), bootstrap_replicates=2000, rng=random.Random(15)
+        )
+        # Precondition: the real, coherent evaluator confirms neither cell
+        # as FAIL (rank 1 is never tested by the real step-down here, and
+        # rank 0 fails its own strict alpha/2 comparison).
+        self.assertFalse(real_results[0].holm_reject)
+        self.assertFalse(real_results[1].holm_reject)
+        self.assertNotEqual(real_results[0].verdict, "FAIL")
+        self.assertNotEqual(real_results[1].verdict, "FAIL")
+        # The untested rank (a) never gets a bound, real run or not.
+        self.assertIsNone(real_results[0].corrected_lower_bound)
+        self.assertIsNotNone(real_results[1].corrected_lower_bound)
+
+        def naive_reject(pvalues, alpha=0.05):
+            return [p <= alpha for p in pvalues]
+
+        with mock.patch.object(gm, "holm_reject", naive_reject):
+            mutated_results = gm.evaluate_family_gate(
+                [cell_a, cell_b], self._bands(), bootstrap_replicates=2000, rng=random.Random(15)
+            )
+
+        # The mutation must change at least one cell's ACTUAL verdict
+        # (not merely its internal holm_reject flag) from non-FAIL to
+        # FAIL -- proof that the shipped evaluator's FAIL rule depends on
+        # the real Holm step-down, not just on crossing a fixed bound.
+        flips = [
+            (real.cell_id, real.verdict, mutated.verdict)
+            for real, mutated in zip(real_results, mutated_results)
+            if real.verdict != "FAIL" and mutated.verdict == "FAIL"
+        ]
+        self.assertTrue(flips, f"expected at least one non-FAIL->FAIL flip, got {flips!r}")
+        # The untested rank (a) must stay un-FAIL-able even under the
+        # naive mutation -- its bound is a property of the real step-down
+        # order, not of whichever reject function is plugged in, so a
+        # naive/liberal reject flag alone can never manufacture a FAIL out
+        # of a hypothesis the real procedure never tested.
+        self.assertIsNone(mutated_results[0].corrected_lower_bound)
+        self.assertNotEqual(mutated_results[0].verdict, "FAIL")
+
+    def test_stopped_holm_rank_never_exposes_a_bound(self):
+        """Adversarial-review finding (`scripts/bench_gate_math.py:556`):
+        the family evaluator used to assign every rank `k` the tail
+        `alpha / (m - k)`
+        and report a `corrected_lower_bound` at that tail even for ranks
+        AFTER `holm_reject`'s step-down had already stopped (its first
+        failed comparison) -- those cells were never actually tested at
+        that level. Concrete evidence from the adversarial review: with
+        p-values `a=0.040`, `b=0.037` (this exact fixture, seed 0), Holm's
+        step-down stops at rank 0 (`b`: 0.037 > its own alpha/2=0.025
+        tail), so rank 1 (`a`, alpha/1=0.05 tail) is never evaluated --
+        yet the prior code reported `a.corrected_lower_bound=0.068087`,
+        ABOVE the 7% fail threshold `log(1.07)=0.067659`, while `a.
+        holm_reject` was `False`. That is a flag/bound disagreement for a
+        hypothesis the executed procedure never tested at that tail.
+
+        This fixture is the "two-cell family where Holm stops at rank 0"
+        stop-case: `a` (rank 1, untested) must report `None`, never a
+        threshold-clearing float, and its verdict can never be FAIL. `b`
+        (rank 0, the stopping rank) WAS tested -- it gets a real bound --
+        and stays non-FAIL because Holm did not reject it there either.
+        General coherence: across the whole family, no non-rejected cell
+        may ever expose a bound that clears its own fail threshold."""
         tau = math.log(1.07)
 
         def cell(cid):
@@ -518,35 +609,41 @@ class EvaluateFamilyGateTest(unittest.TestCase):
             )
 
         cell_a, cell_b = cell("a"), cell("b")
-
-        real_results = gm.evaluate_family_gate(
+        results = gm.evaluate_family_gate(
             [cell_a, cell_b], self._bands(), bootstrap_replicates=2000, rng=random.Random(0)
         )
-        # Precondition matching test_holm_ordering_changes_the_verdict:
-        # the real, coherent evaluator confirms neither cell as FAIL.
-        self.assertFalse(real_results[0].holm_reject)
-        self.assertFalse(real_results[1].holm_reject)
-        self.assertNotEqual(real_results[0].verdict, "FAIL")
-        self.assertNotEqual(real_results[1].verdict, "FAIL")
+        by_id = {r.cell_id: r for r in results}
 
-        def naive_reject(pvalues, alpha=0.05):
-            return [p <= alpha for p in pvalues]
+        # Reproduces the adversarial-review evidence: a's own p-value
+        # (rank 1, the higher one) is not below either tail, so it is
+        # never rejected -- and, post-fix, never tested at all.
+        self.assertAlmostEqual(by_id["a"].p_value, 0.04, places=6)
+        self.assertAlmostEqual(by_id["b"].p_value, 0.037, places=6)
+        self.assertFalse(by_id["a"].holm_reject)
+        self.assertFalse(by_id["b"].holm_reject)
 
-        with mock.patch.object(gm, "holm_reject", naive_reject):
-            mutated_results = gm.evaluate_family_gate(
-                [cell_a, cell_b], self._bands(), bootstrap_replicates=2000, rng=random.Random(0)
-            )
+        # The untested rank (a) reports no bound at all -- not the old
+        # 0.068087 threshold-clearing figure.
+        self.assertIsNone(by_id["a"].corrected_lower_bound)
+        self.assertNotEqual(by_id["a"].verdict, "FAIL")
 
-        # The mutation must change at least one cell's ACTUAL verdict
-        # (not merely its internal holm_reject flag) from non-FAIL to
-        # FAIL -- proof that the shipped evaluator's FAIL rule depends on
-        # the real Holm step-down, not just on crossing a fixed bound.
-        flips = [
-            (real.cell_id, real.verdict, mutated.verdict)
-            for real, mutated in zip(real_results, mutated_results)
-            if real.verdict != "FAIL" and mutated.verdict == "FAIL"
-        ]
-        self.assertTrue(flips, f"expected at least one non-FAIL->FAIL flip, got {flips!r}")
+        # The stopping rank (b) WAS tested -- it has a real bound -- and
+        # that bound stays below the fail threshold, so it too is non-FAIL.
+        self.assertIsNotNone(by_id["b"].corrected_lower_bound)
+        self.assertLess(by_id["b"].corrected_lower_bound, tau)
+        self.assertNotEqual(by_id["b"].verdict, "FAIL")
+
+        # General coherence assertion: no non-rejected
+        # cell anywhere in this family may report a threshold-clearing
+        # corrected_lower_bound -- a None bound trivially satisfies this,
+        # a tested-but-not-rejected bound must sit at or below tau.
+        for r in results:
+            if not r.holm_reject:
+                self.assertTrue(
+                    r.corrected_lower_bound is None or r.corrected_lower_bound <= tau,
+                    f"non-rejected cell {r.cell_id!r} exposed a threshold-clearing bound "
+                    f"{r.corrected_lower_bound!r} > tau_fail={tau!r}",
+                )
 
     def test_undersampled_cell_rejected_before_resampling(self):
         """Major 3: a cell reporting fewer raw pairs than its own
