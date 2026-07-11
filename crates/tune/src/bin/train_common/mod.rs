@@ -230,12 +230,13 @@ mod tests {
     #[test]
     fn verify_tbv_passes_exactly_at_boundary() {
         // diff > TBV_MAX_ABS_DIFF is the failure condition, so diff ==
-        // TBV_MAX_ABS_DIFF (not strictly greater) must still pass. Tolerance
-        // is f32-precision-scaled (~1e-7 relative), not an arbitrary 1e-9:
-        // `1.0 + TBV_MAX_ABS_DIFF` and the boundary constant do not round to
-        // bit-identical f32 values.
-        let obs = verify_tbv("ctx", 1.0, 1.0 + TBV_MAX_ABS_DIFF).unwrap();
-        assert!((obs.diff - TBV_MAX_ABS_DIFF).abs() < 1e-6);
+        // TBV_MAX_ABS_DIFF (not strictly greater) must still pass. The pair
+        // (TBV_MAX_ABS_DIFF, 0.0) subtracts to the constant EXACTLY in f32,
+        // so this test sits on the boundary bit-for-bit; a `1.0` vs
+        // `1.0 + TBV_MAX_ABS_DIFF` pair rounds to a diff slightly below the
+        // constant and would not catch a `>=` mutation.
+        let obs = verify_tbv("ctx", TBV_MAX_ABS_DIFF, 0.0).unwrap();
+        assert!(obs.diff == TBV_MAX_ABS_DIFF);
     }
 
     #[test]
