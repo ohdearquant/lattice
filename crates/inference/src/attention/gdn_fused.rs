@@ -1988,19 +1988,18 @@ mod tests {
     ///
     /// ## Assertions
     ///
-    /// - Every step (0-7): finite output and finite complete state (fail-closed, no
-    ///   silent NaN propagation, ever).
-    /// - Every step (0-7): output AND `state.snapshot()` (both `s_matrices` and
-    ///   `conv_buffer`) are bit-identical between poisoned and reference runs. This
-    ///   holds inside the window (steps 0-3) because both runs' K-row weights are
-    ///   identically zero there except the one poisoned lane, whose NaN is proven
-    ///   (finiteness assertion) not to leak past the guard; it holds after the window
-    ///   (steps 4-7) because `conv_buffer` for the poisoned channel has, by step 4,
-    ///   evicted step 0's value entirely (`t0+4` above) and both runs feed the SAME
-    ///   `weights_clean` and SAME tokens into an now-identical buffer, so the match from
-    ///   step 4 onward is unconditional (no guard involvement needed) once the window
-    ///   value has aged out -- the concrete "recovers to bit-identical once aged out of
-    ///   the conv window" proof #862 round-2 major-3 asked for.
+    /// - Every step (0-7): output and `s_matrices` are finite AND bit-identical between
+    ///   poisoned and reference runs (fail-closed: the NaN never leaks past the guard
+    ///   into the recurrent state or the output).
+    /// - Post-step snapshots 0-2: the poisoned run's raw `conv_buffer` still contains
+    ///   exactly the one tracked NaN (raw storage is pre-guard by design), so the
+    ///   COMPLETE snapshot differs from the reference there — the assertions pin this
+    ///   expected divergence explicitly rather than claiming full-state identity.
+    /// - Post-step snapshot 3 onward: step 0's poisoned value has aged out of the
+    ///   conv window, and the complete `state.snapshot()` (both `s_matrices` and
+    ///   `conv_buffer`) is finite and bit-identical to the reference unconditionally
+    ///   (no guard involvement needed) -- the concrete "recovers to bit-identical once
+    ///   aged out of the conv window" proof #862 round-2 major-3 asked for.
     ///
     /// Mutation-sensitive: reverting the `!norm_sq.is_finite()` guard in
     /// `simd_l2_normalize` (any backend) makes the poisoned run's step-0 output/state
