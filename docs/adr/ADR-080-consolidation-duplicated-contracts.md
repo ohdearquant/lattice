@@ -1,6 +1,6 @@
 # ADR-080: Consolidation of Duplicated Numeric-Contract Helpers (Softmax, HTTP Serving, Decode Policy, GEMM Validation)
 
-**Status**: Implemented (clusters C1–C4 merged; remaining audit items tracked as open issues)
+**Status**: Accepted (clusters C1–C4 implemented and merged; see implementation record below)
 **Kind**: Aspirational
 **Date**: 2026-07-09 (status updated 2026-07-11)
 
@@ -15,9 +15,10 @@
 - C4 — checked GEMM argument validator at every safe entry point: PR #796
   (merged 2026-07-11).
 
-Non-cluster audit items from the same sweep remain open and track their own work
-independently (see the per-family checklists and standalone items referenced under
-**Issues** below); their state does not gate this ADR's status.
+The cluster defect tickets (#739–#741, resolved by C1; #744–#746, resolved by C2) are
+closed against the merged PRs above. The non-cluster audit items from the same sweep
+(#764–#777, per-family checklists and standalone items) remain open and track their
+own work independently; their state does not gate this ADR's acceptance.
 **Crate**: lattice-inference (`crates/inference/src/attention/`, `src/forward/`, `src/bin/`,
 `src/model/qwen35/`)
 **Research**: Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; adversarially verified at the audited commit; re-verified at `origin/main @ 0699e60cc`)
