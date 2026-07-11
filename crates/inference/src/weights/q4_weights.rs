@@ -98,8 +98,13 @@ pub struct Q4Tensor {
 }
 
 // ---------------------------------------------------------------------------
-// Module-local f16 ↔ f32 helpers (no `half` crate dependency).
-// Mirrors the implementation in `forward/metal_qwen35.rs:1907–2034`.
+// f16 ↔ f32 / bf16 → f32 helpers.
+//
+// Thin wrappers over the single always-compiled scalar decoder in
+// `crate::weights::half_bits` (lattice#799) — kept as separate `q4_`-prefixed
+// functions here only to preserve this module's existing call-site names
+// and `pub(crate)` visibility; no conversion arithmetic lives in this file
+// anymore.
 // ---------------------------------------------------------------------------
 
 /// Convert `f32` to IEEE-754 half-precision stored as a `u16` bit pattern.
@@ -108,119 +113,14 @@ pub struct Q4Tensor {
 /// subnormals, and overflow (→ ±∞).
 #[inline]
 pub(crate) fn q4_f32_to_f16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let frac = bits & 0x007f_ffff;
-
-    // Inf or NaN
-    if exp == 0xff {
-        if frac == 0 {
-            return sign | 0x7c00; // ±∞
-        }
-        // NaN: preserve payload, ensure quiet bit is set.
-        let mut payload = ((frac >> 13) as u16) & 0x03ff;
-        if payload == 0 {
-            payload = 1;
-        }
-        payload |= 0x0200;
-        return sign | 0x7c00 | payload;
-    }
-
-    // Zero or f32 subnormal (underflows to f16 zero)
-    if exp == 0 {
-        return sign;
-    }
-
-    let exp32 = exp - 127; // unbiased exponent
-
-    // Overflow → ±∞
-    if exp32 > 15 {
-        return sign | 0x7c00;
-    }
-
-    // Normal f16 range
-    if exp32 >= -14 {
-        let mut exp16 = (exp32 + 15) as u16;
-        let mut frac16 = round_shift_right_even(frac, 13) as u16;
-        // Mantissa overflow: carry into exponent
-        if frac16 == 0x0400 {
-            frac16 = 0;
-            exp16 += 1;
-            if exp16 >= 0x1f {
-                return sign | 0x7c00;
-            }
-        }
-        return sign | (exp16 << 10) | frac16;
-    }
-
-    // Subnormal f16 range
-    let mant = frac | 0x0080_0000;
-    let shift = (-exp32 - 1) as u32;
-    if shift >= 32 {
-        return sign;
-    }
-    let frac16 = round_shift_right_even(mant, shift) as u16;
-    if frac16 == 0 {
-        return sign;
-    }
-    if frac16 == 0x0400 {
-        return sign | 0x0400; // smallest normal f16
-    }
-    sign | frac16
-}
-
-/// Round-to-nearest-even right shift for mantissa truncation.
-#[inline]
-fn round_shift_right_even(value: u32, shift: u32) -> u32 {
-    if shift == 0 {
-        return value;
-    }
-    if shift >= 32 {
-        return 0;
-    }
-    let base = value >> shift;
-    let mask = (1u32 << shift) - 1;
-    let remainder = value & mask;
-    let half = 1u32 << (shift - 1);
-    if remainder > half || (remainder == half && (base & 1) != 0) {
-        base + 1
-    } else {
-        base
-    }
+    crate::weights::half_bits::f32_to_f16_bits(x)
 }
 
 /// Convert an IEEE-754 f16 bit pattern (`u16`) back to `f32`.
 #[inline]
 pub(crate) fn q4_f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 0x1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x03ff) as u32;
-
-    let f32_bits = match (exp, frac) {
-        (0, 0) => sign << 31,
-        (0, _) => {
-            // Subnormal: find leading 1, normalize.
-            let mut mant = frac;
-            let mut e = -14i32;
-            while (mant & 0x0400) == 0 {
-                mant <<= 1;
-                e -= 1;
-            }
-            mant &= 0x03ff;
-            (sign << 31) | (((e + 127) as u32) << 23) | (mant << 13)
-        }
-        (0x1f, 0) => (sign << 31) | 0x7f80_0000, // ±∞
-        (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13), // NaN
-        _ => (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
-    };
-
-    f32::from_bits(f32_bits)
+    crate::weights::half_bits::f16_bits_to_f32(bits)
 }
-
-// ---------------------------------------------------------------------------
-// BF16 helper (for BF16-format shard loading)
-// ---------------------------------------------------------------------------
 
 /// Convert a BF16 bit pattern (`u16`) to `f32`.
 ///
@@ -228,7 +128,7 @@ pub(crate) fn q4_f16_to_f32(bits: u16) -> f32 {
 /// is a lossless widening. Handles ±0, ±∞, NaN, and subnormals correctly.
 #[inline]
 fn bf16_to_f32(v: u16) -> f32 {
-    f32::from_bits((v as u32) << 16)
+    crate::weights::half_bits::bf16_bits_to_f32(v)
 }
 
 // ---------------------------------------------------------------------------
