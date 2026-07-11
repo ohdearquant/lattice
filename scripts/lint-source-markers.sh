@@ -24,7 +24,8 @@
 # Exit codes follow explicit ripgrep semantics, not implicit pass-through:
 #   0 = clean (no violations)
 #   1 = violations found (printed to stdout)
-#   2 = lint failure (ripgrep or the offender filter itself errored) --
+#   2 = lint failure (a tempfile could not be created, ripgrep errored, the
+#       offender filter errored, or a matches/violations write failed) --
 #       never a silent pass
 #
 # Usage:
@@ -90,30 +91,78 @@ lint_paths() {
         return 0
     fi
 
-    # rc == 0: at least one comment-leading marker line. Keep only the ones
-    # that lack a same-line issue reference. grep's exit status is checked
-    # explicitly rather than pass-through-normalized: rc=0 means offenders
-    # exist, rc=1 means every line carried a reference (no offenders, not a
-    # failure), and rc>1 is a filter-stage failure that must not be silently
-    # treated as "clean" (a `|| true` here would normalize rc>1 to success).
-    offenders="$(printf '%s\n' "$matches" | grep -vE "$ISSUE_REF_RE")"
+    # rc == 0: at least one comment-leading marker line. Materialize the
+    # matches into a checked temp file rather than piping them through a
+    # second process (`printf ... | grep ...`): under POSIX pipeline-status
+    # semantics an ordinary pipeline's exit status is its LAST command's
+    # status only, so a failed producer (printf) would be silently masked
+    # by a successful grep. Writing to a real file lets each stage's own
+    # exit status be checked independently.
+    printf '%s\n' "$matches" > "$MATCHES_FILE"
+    write_rc=$?
+    if [ "$write_rc" -ne 0 ]; then
+        echo "lint-source-markers: failed writing $label matches to the matches tempfile (exit $write_rc)" >&2
+        return 2
+    fi
+
+    # Keep only the lines that lack a same-line issue reference. grep's exit
+    # status is checked explicitly rather than pass-through-normalized:
+    # rc=0 means offenders exist, rc=1 means every line carried a reference
+    # (no offenders, not a failure), and rc>1 is a filter-stage failure that
+    # must not be silently treated as "clean" (a `|| true` here would
+    # normalize rc>1 to success).
+    offenders="$(grep -vE "$ISSUE_REF_RE" "$MATCHES_FILE")"
     filter_rc=$?
     if [ "$filter_rc" -gt 1 ]; then
         echo "lint-source-markers: offender filter failed scanning $label (exit $filter_rc)" >&2
         return 2
     fi
+
     if [ -n "$offenders" ]; then
         printf '%s\n' "$offenders" >> "$VIOLATIONS_FILE"
+        append_rc=$?
+        if [ "$append_rc" -ne 0 ]; then
+            echo "lint-source-markers: failed appending $label offenders to the violations file (exit $append_rc)" >&2
+            return 2
+        fi
     fi
     return 0
 }
 
 run_lint() {
     scan_root="${1:-$REPO_ROOT}"
+
+    # Every mktemp call is checked immediately, before any rg invocation:
+    # an unchecked mktemp failure would leave its variable empty, so every
+    # later `rg ... 2>"$RG_ERR_FILE"` or write against it targets an empty
+    # filename, rg/writes fail quietly, and the caller reads that as "no
+    # markers" -- turning a lint-infrastructure failure into a false clean.
     tmp_violations="$(mktemp)"
+    mktemp_rc=$?
+    if [ "$mktemp_rc" -ne 0 ] || [ -z "$tmp_violations" ]; then
+        echo "lint-source-markers: failed to create the violations tempfile (mktemp exit $mktemp_rc)" >&2
+        return 2
+    fi
+
     tmp_rg_err="$(mktemp)"
+    mktemp_rc=$?
+    if [ "$mktemp_rc" -ne 0 ] || [ -z "$tmp_rg_err" ]; then
+        echo "lint-source-markers: failed to create the ripgrep-error tempfile (mktemp exit $mktemp_rc)" >&2
+        rm -f "$tmp_violations"
+        return 2
+    fi
+
+    tmp_matches="$(mktemp)"
+    mktemp_rc=$?
+    if [ "$mktemp_rc" -ne 0 ] || [ -z "$tmp_matches" ]; then
+        echo "lint-source-markers: failed to create the matches tempfile (mktemp exit $mktemp_rc)" >&2
+        rm -f "$tmp_violations" "$tmp_rg_err"
+        return 2
+    fi
+
     VIOLATIONS_FILE="$tmp_violations"
     RG_ERR_FILE="$tmp_rg_err"
+    MATCHES_FILE="$tmp_matches"
     status=0
 
     (
@@ -132,18 +181,18 @@ run_lint() {
     status=$?
 
     if [ "$status" -eq 2 ]; then
-        rm -f "$tmp_violations" "$tmp_rg_err"
+        rm -f "$tmp_violations" "$tmp_rg_err" "$tmp_matches"
         return 2
     fi
 
     if [ -s "$tmp_violations" ]; then
         echo "lint-source-markers: found TODO/FIXME/HACK/XXX markers without a same-line issue reference (#N or lattice#N):" >&2
         sort -u "$tmp_violations" >&2
-        rm -f "$tmp_violations" "$tmp_rg_err"
+        rm -f "$tmp_violations" "$tmp_rg_err" "$tmp_matches"
         return 1
     fi
 
-    rm -f "$tmp_violations" "$tmp_rg_err"
+    rm -f "$tmp_violations" "$tmp_rg_err" "$tmp_matches"
     return 0
 }
 
@@ -290,6 +339,17 @@ EOF
     run_lint "$sb"
     check "* TODO block-comment leader line flagged" 1 "$?"
 
+    # 11b. `/// TODO` outer doc comment without a reference -> rc 1. Retained
+    # as the original positive control for the pre-existing `///` form
+    # (distinct from the `//!` inner-doc and block-comment forms above).
+    reset_tree
+    cat > "$sb/crates/outer_doc.rs" <<'EOF'
+/// TODO: outer doc comment marker
+fn main() {}
+EOF
+    run_lint "$sb"
+    check "/// TODO outer doc comment flagged" 1 "$?"
+
     # 12. Referenced forms of the newly covered comment shapes stay clean,
     # confirming the new alternatives don't just flag unconditionally.
     reset_tree
@@ -308,6 +368,16 @@ fn main() {}
 EOF
     run_lint "$sb"
     check "//! TODO(#1) inner doc comment not flagged" 0 "$?"
+
+    reset_tree
+    cat > "$sb/crates/block_leader_ref.rs" <<'EOF'
+/*
+ * TODO(lattice#1): multiline block comment leader, referenced
+ */
+fn main() {}
+EOF
+    run_lint "$sb"
+    check "* TODO(lattice#1) block-comment leader line not flagged" 0 "$?"
 
     # 13. Known approximation: marker-shaped text inside string literals is
     # flagged (documented in the script header, not a bug). These are
@@ -341,6 +411,118 @@ text = "${hash_char} FIXME: this is inside a Python string literal, not a commen
 EOF
     run_lint "$sb"
     check "KNOWN approximation: Python string literal containing a hash+FIXME marker flagged" 1 "$?"
+
+    # Capture the real mktemp's absolute path once, before any PATH
+    # shadowing below, so the stubs that delegate to it (fixtures 15-16)
+    # don't recurse into themselves via a PATH re-lookup of the bare name.
+    real_mktemp="$(command -v mktemp)"
+
+    # 14. mktemp failure itself surfaces as a lint failure, not a silent
+    # clean pass (an unchecked mktemp leaves its variable empty, and every
+    # later rg/write against an empty filename fails quietly, reading as
+    # "no markers"). Shadows `mktemp` on PATH with an always-failing stub,
+    # with a known offender present in the tree.
+    reset_tree
+    cat > "$sb/crates/valid_hash.rs" <<'EOF'
+fn main() {
+    // TODO(i2): must not be silently lost to a mktemp failure
+}
+EOF
+    fake_bin_dir="$(mktemp -d)"
+    cat > "$fake_bin_dir/mktemp" <<'EOF'
+#!/bin/sh
+echo "injected mktemp failure" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin_dir/mktemp"
+    old_path="$PATH"
+    PATH="$fake_bin_dir:$PATH"
+    export PATH
+    run_lint "$sb"
+    mktemp_fail_rc=$?
+    PATH="$old_path"
+    export PATH
+    rm -rf "$fake_bin_dir"
+    check "mktemp failure surfaces as lint failure, offender present" 2 "$mktemp_fail_rc"
+
+    # 15. Matches-tempfile write failure (the producer side of the former
+    # printf|grep pipeline) surfaces as a lint failure with the offender
+    # present. Shadows `mktemp` with a stub that counts its own invocations
+    # and, ONLY on run_lint's 3rd call (the matches tempfile -- see the 1st
+    # = violations, 2nd = ripgrep-error, 3rd = matches order in run_lint),
+    # returns a path under a directory that is never created. mktemp itself
+    # still reports success (rc=0, non-empty path), so this exercises the
+    # write check, not the mktemp check above. Every other call delegates
+    # to the real mktemp so the ripgrep-error and violations tempfiles are
+    # unaffected.
+    reset_tree
+    cat > "$sb/crates/valid_hash.rs" <<'EOF'
+fn main() {
+    // TODO(i2): must not be silently lost to a matches-write failure
+}
+EOF
+    fake_bin_dir="$(mktemp -d)"
+    counter_file="$(mktemp)"
+    printf '0' > "$counter_file"
+    bogus_dir="$fake_bin_dir/nonexistent-target-dir"
+    cat > "$fake_bin_dir/mktemp" <<STUBEOF
+#!/bin/sh
+count=\$(cat "$counter_file" 2>/dev/null || echo 0)
+count=\$((count + 1))
+printf '%s' "\$count" > "$counter_file"
+if [ "\$count" -eq 3 ]; then
+    printf '%s\n' "$bogus_dir/bogus-matches-\$count"
+    exit 0
+fi
+"$real_mktemp" "\$@"
+STUBEOF
+    chmod +x "$fake_bin_dir/mktemp"
+    old_path="$PATH"
+    PATH="$fake_bin_dir:$PATH"
+    export PATH
+    run_lint "$sb"
+    matches_write_fail_rc=$?
+    PATH="$old_path"
+    export PATH
+    rm -rf "$fake_bin_dir" "$counter_file"
+    check "matches-tempfile write failure surfaces as lint failure, offender present" 2 "$matches_write_fail_rc"
+
+    # 16. Violations-file append failure surfaces as a lint failure with the
+    # offender present. Same counting-stub technique as fixture 15, but
+    # targets run_lint's 1st mktemp call (the violations tempfile), so the
+    # matches write and grep filter both succeed and the failure is
+    # isolated to the final append step.
+    reset_tree
+    cat > "$sb/crates/valid_hash.rs" <<'EOF'
+fn main() {
+    // TODO(i2): must not be silently lost to a violations-append failure
+}
+EOF
+    fake_bin_dir="$(mktemp -d)"
+    counter_file="$(mktemp)"
+    printf '0' > "$counter_file"
+    bogus_dir="$fake_bin_dir/nonexistent-target-dir"
+    cat > "$fake_bin_dir/mktemp" <<STUBEOF
+#!/bin/sh
+count=\$(cat "$counter_file" 2>/dev/null || echo 0)
+count=\$((count + 1))
+printf '%s' "\$count" > "$counter_file"
+if [ "\$count" -eq 1 ]; then
+    printf '%s\n' "$bogus_dir/bogus-violations-\$count"
+    exit 0
+fi
+"$real_mktemp" "\$@"
+STUBEOF
+    chmod +x "$fake_bin_dir/mktemp"
+    old_path="$PATH"
+    PATH="$fake_bin_dir:$PATH"
+    export PATH
+    run_lint "$sb"
+    violations_append_fail_rc=$?
+    PATH="$old_path"
+    export PATH
+    rm -rf "$fake_bin_dir" "$counter_file"
+    check "violations-file append failure surfaces as lint failure, offender present" 2 "$violations_append_fail_rc"
 
     rm -rf "$(dirname "$sb")"
 
