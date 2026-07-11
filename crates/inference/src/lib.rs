@@ -36,6 +36,10 @@ pub mod forward;
 /// Model configs and loaders (BERT, Qwen, Qwen3.5, BitNet). Each submodule owns its
 /// safetensors load path and forward-pass dispatch; see [`weights`], [`tokenizer`], and [`forward`].
 pub mod model;
+/// Canonical model-directory format detector (`ModelFormat`/`detect_format`) shared by
+/// the `lattice`, `lattice_serve`, and `chat_metal` binaries (ADR-080 amendment, #829).
+/// **Unstable, internal-binaries-only** -- see the module's own doc comment.
+pub mod model_format;
 /// Tokenizer implementations (`WordPiece`, `SentencePiece`, byte-level BPE) behind the
 /// [`Tokenizer`] trait, plus the [`load_tokenizer`] auto-detect helper. See [`model`].
 pub mod tokenizer;

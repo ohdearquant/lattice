@@ -24,8 +24,7 @@
 // Usage: train_grad_layer23 --model-dir <path> --data-dir <path> [--steps 25]
 //        [--lr 1e-3] [--rank 8] [--alpha 16] [--max-train 3] [--seq-len 64]
 
-use std::io::BufRead;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use lattice_inference::backward::attention_gqa::{gqa_backward, gqa_forward_with_cache};
@@ -35,20 +34,12 @@ use lattice_inference::model::qwen35::Qwen35Model;
 use lattice_inference::tokenizer::Tokenizer;
 use lattice_tune::lora::AdamState;
 
+mod train_common;
+use train_common::{ArgView, load_jsonl, verify_tbv};
+
 /// Top GQA (Full-attention) layer of Qwen3.5-0.8B. GQA layers are at
 /// [3, 7, 11, 15, 19, 23]; 23 is the top one, so it needs no GDN backward.
 const LAYER: usize = 23;
-
-fn parse_arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-}
-
-fn parse_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|a| a == flag)
-}
 
 fn usage() {
     eprintln!(
@@ -67,66 +58,6 @@ Options:
   --save       <PATH>   Save trained adapter as PEFT safetensors (requires --features train-backward)
   -h, --help            Print this help"
     );
-}
-
-fn default_model_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".lattice")
-        .join("models")
-        .join("qwen3.5-0.8b")
-}
-
-struct Sample {
-    tokens: Vec<u32>,
-    completion_start: usize,
-}
-
-fn load_jsonl(
-    path: &Path,
-    tokenizer: &dyn Tokenizer,
-    seq_len: usize,
-    max_samples: usize,
-) -> Result<Vec<Sample>, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    let mut out = Vec::new();
-    for line in reader.lines() {
-        if out.len() >= max_samples {
-            break;
-        }
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = serde_json::from_str(line)?;
-        let prompt = v["prompt"].as_str().unwrap_or("").to_string();
-        let completion = v["completion"].as_str().unwrap_or("").to_string();
-        if prompt.is_empty() || completion.is_empty() {
-            continue;
-        }
-        let mut full = prompt.clone();
-        full.push_str(&completion);
-        let prompt_tok = tokenizer.tokenize(&prompt);
-        let full_tok = tokenizer.tokenize(&full);
-        let prompt_ids: Vec<u32> = prompt_tok.input_ids[..prompt_tok.real_length].to_vec();
-        let full_ids: Vec<u32> = full_tok.input_ids[..full_tok.real_length].to_vec();
-        let total = full_ids.len();
-        if total < 2 || total > seq_len {
-            continue;
-        }
-        let completion_start = prompt_ids.len();
-        if completion_start == 0 || completion_start >= total {
-            continue;
-        }
-        out.push(Sample {
-            tokens: full_ids,
-            completion_start,
-        });
-    }
-    Ok(out)
 }
 
 /// One sample's frozen layer-23 context: the residual entering layer 23 (from
@@ -400,41 +331,81 @@ fn shifted(gamma: &[f32]) -> Vec<f32> {
     gamma.iter().map(|g| 1.0 + g).collect()
 }
 
+/// Typed CLI config for `train_grad_layer23`. Field defaults are the
+/// documented contract in `usage()` and issue #845's flag table — the
+/// snapshot tests below pin them.
+struct Config {
+    model_dir: PathBuf,
+    data_dir: PathBuf,
+    steps: usize,
+    lr: f32,
+    rank: usize,
+    alpha: f32,
+    seq_len_cap: usize,
+    max_train: usize,
+    log_every: usize,
+    save_path: Option<String>,
+}
+
+fn parse_config(argv: &ArgView) -> Config {
+    Config {
+        model_dir: argv
+            .arg("--model-dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(train_common::default_model_dir),
+        data_dir: argv
+            .arg("--data-dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(train_common::default_data_dir),
+        steps: argv
+            .arg("--steps")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(25),
+        lr: argv
+            .arg("--lr")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1e-3),
+        rank: argv.arg("--rank").and_then(|s| s.parse().ok()).unwrap_or(8),
+        alpha: argv
+            .arg("--alpha")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16.0),
+        seq_len_cap: argv
+            .arg("--seq-len")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64),
+        max_train: argv
+            .arg("--max-train")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3),
+        log_every: argv
+            .arg("--log-every")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5),
+        save_path: argv.arg("--save"),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if parse_flag(&args, "-h") || parse_flag(&args, "--help") {
+    let argv = ArgView::new(&args);
+    if argv.flag("-h") || argv.flag("--help") {
         usage();
         return Ok(());
     }
 
-    let model_dir = parse_arg(&args, "--model-dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_model_dir);
-    let data_dir = parse_arg(&args, "--data-dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data/lora-train"));
-    let steps: usize = parse_arg(&args, "--steps")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(25);
-    let lr: f32 = parse_arg(&args, "--lr")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-3);
-    let rank: usize = parse_arg(&args, "--rank")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let alpha: f32 = parse_arg(&args, "--alpha")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16.0);
-    let seq_len_cap: usize = parse_arg(&args, "--seq-len")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
-    let max_train: usize = parse_arg(&args, "--max-train")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let log_every: usize = parse_arg(&args, "--log-every")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    let save_path = parse_arg(&args, "--save");
+    let Config {
+        model_dir,
+        data_dir,
+        steps,
+        lr,
+        rank,
+        alpha,
+        seq_len_cap,
+        max_train,
+        log_every,
+        save_path,
+    } = parse_config(&argv);
 
     println!("=== exact-gradient LoRA trainer (layer {LAYER}, gated GQA) ===");
     println!("model-dir:  {}", model_dir.display());
@@ -575,17 +546,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let end = s0.tokens.len() - 1;
         let model_masked: f32 = model_nlls[start..end].iter().sum::<f32>() / (end - start) as f32;
         let chain_masked = eval_nll(&caches[..1], &weights, &zero_lora, &dims);
-        let diff = (model_masked - chain_masked).abs();
+        let observation = verify_tbv(
+            "train_grad_layer23 chain check (sample 0) — layer-23 forward vs model",
+            model_masked,
+            chain_masked,
+        )?;
         println!(
-            "\n  TBV (sample 0): model={model_masked:.5}  chain={chain_masked:.5}  diff={diff:.2e}"
+            "\n  TBV (sample 0): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}",
+            observation.diff
         );
-        if diff > 1e-2 {
-            return Err(format!(
-                "TBV failed: chain NLL diverges from real model by {diff:.3e} (>1e-2) — \
-                 the layer-23 forward does not match the model"
-            )
-            .into());
-        }
     }
 
     let mut adam = AdamState::new();
@@ -741,4 +710,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_contract_tests {
+    use super::*;
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        let mut v = vec!["train_grad_layer23".to_string()];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn defaults_match_documented_table() {
+        let a = args(&[]);
+        let cfg = parse_config(&ArgView::new(&a));
+        assert_eq!(cfg.data_dir, PathBuf::from("data/lora-train"));
+        assert_eq!(cfg.steps, 25);
+        assert_eq!(cfg.lr, 1e-3);
+        assert_eq!(cfg.rank, 8);
+        assert_eq!(cfg.alpha, 16.0);
+        assert_eq!(cfg.seq_len_cap, 64);
+        assert_eq!(cfg.max_train, 3);
+        assert_eq!(cfg.log_every, 5);
+        assert_eq!(cfg.save_path, None);
+        assert_eq!(cfg.model_dir, train_common::default_model_dir());
+    }
+
+    #[test]
+    fn explicit_flags_override_defaults() {
+        let a = args(&[
+            "--model-dir",
+            "/tmp/m",
+            "--data-dir",
+            "/tmp/d",
+            "--steps",
+            "7",
+            "--lr",
+            "3e-4",
+            "--rank",
+            "2",
+            "--alpha",
+            "4",
+            "--seq-len",
+            "16",
+            "--max-train",
+            "1",
+            "--log-every",
+            "2",
+            "--save",
+            "/tmp/out.safetensors",
+        ]);
+        let cfg = parse_config(&ArgView::new(&a));
+        assert_eq!(cfg.model_dir, PathBuf::from("/tmp/m"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/tmp/d"));
+        assert_eq!(cfg.steps, 7);
+        assert_eq!(cfg.lr, 3e-4);
+        assert_eq!(cfg.rank, 2);
+        assert_eq!(cfg.alpha, 4.0);
+        assert_eq!(cfg.seq_len_cap, 16);
+        assert_eq!(cfg.max_train, 1);
+        assert_eq!(cfg.log_every, 2);
+        assert_eq!(cfg.save_path, Some("/tmp/out.safetensors".to_string()));
+    }
+
+    #[test]
+    fn help_flags_detected_via_arg_view() {
+        let a = args(&["-h"]);
+        assert!(ArgView::new(&a).flag("-h"));
+        let a = args(&["--help"]);
+        assert!(ArgView::new(&a).flag("--help"));
+    }
 }

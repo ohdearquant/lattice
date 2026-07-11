@@ -258,24 +258,6 @@ kernel void add_buf(
     dst[gid] += src[gid];
 }
 
-// ===== BF16 utilities =====
-inline float bf16_to_float(ushort x) {
-    return as_type<float>(uint(x) << 16);
-}
-
-inline float silu_act(float x) {
-    return x / (1.0f + exp(-x));
-}
-
-// ===== BF16 Rectangular GEMM: C[M,N] = A[M,K](f32) @ B[N,K](bf16)^T =====
-// B stored as ushort (BF16), decoded in threadgroup memory staging.
-
-// Inline helper: decode ushort4 (BF16) to float4.
-inline float4 bf16x4_to_float4(ushort4 v) {
-    return float4(bf16_to_float(v.x), bf16_to_float(v.y),
-                  bf16_to_float(v.z), bf16_to_float(v.w));
-}
-
 // ===== Fused QK Norm + RoPE (Fusion C from R3-08) =====
 // One threadgroup per (token, head, family). family 0=Q, 1=K.
 // Replaces: Q-norm + K-norm + RoPE-Q + RoPE-K (4 dispatches → 1).

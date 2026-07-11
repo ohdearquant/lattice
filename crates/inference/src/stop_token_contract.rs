@@ -253,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercises the deprecated path itself during its deprecation window (issue #807)
     fn qwen35_model_generate_with_batch_prefill_excludes_stop_token() {
         let model = zero_layer_qwen35_model();
         let out = model

@@ -6,11 +6,13 @@
 //! If you instead wire it from `lib.rs`, the same code works after promoting the
 //! touched internals to `pub(crate)`.
 //!
-//! The legacy `generate()` method already exists in `qwen35_model.rs`, so this
-//! module exposes the replacement body as `generate_with_batch_prefill()` to
-//! avoid a duplicate inherent-method definition. Integration is a one-line swap:
-//! either rename this method to `generate`, or have the existing `generate()`
-//! delegate to it.
+//! This module's `Qwen35Model::prefill_tokens_batched_for_generate` batched-prefill
+//! core is what the canonical `Qwen35Model::generate` / `generate_streaming`
+//! (`crates/inference/src/model/qwen35/generation.rs`) delegate their own prefill phase
+//! to (PR #680). [`Qwen35Model::generate_with_batch_prefill`] predates that delegation:
+//! it is a standalone, now-redundant decode loop built directly on the same core and is
+//! **deprecated** as of 0.5.1 (issue #807) — new callers should use the canonical
+//! `generate` / `generate_streaming` methods instead.
 //!
 //! LoRA adapters are applied per-token in all projection steps, matching the
 //! decode path. Each `matmul_bt` over the `[seq_len, dim]` batch is followed by
@@ -361,15 +363,26 @@ impl Qwen35Model {
         )
     }
 
-    /// **Unstable**: batched prefill generate; API will stabilize once legacy generate is removed.
+    /// **Unstable**: batched prefill generate.
     ///
-    /// Replacement generate body that uses `prefill_prompt()` for the prompt
+    /// A standalone generate body that uses `prefill_prompt()` for the prompt
     /// phase and then falls back to the existing single-token decode loop.
     ///
-    /// Rename this method to `generate()` once the legacy implementation is
-    /// removed from `qwen35_model.rs`, or have the legacy `generate()` delegate
-    /// to this method.
-    #[allow(dead_code)] // TODO(#1958): roadmap — replace legacy generate() once prefill API stabilises
+    /// This method predates the canonical [`Qwen35Model::generate`] /
+    /// [`Qwen35Model::generate_streaming`] delegating their own prefill phase to
+    /// `Self::prefill_tokens_batched_for_generate` (the same batched-prefill core
+    /// this method calls internally, see `crates/inference/src/model/qwen35/generation.rs`
+    /// around line 153). That delegation, wired in PR #680, made this method's
+    /// independent decode loop redundant; it has no production caller (issue #807).
+    #[deprecated(
+        since = "0.5.1",
+        note = "generate_with_batch_prefill is repository-dead and duplicates the canonical \
+                Qwen3.5 decode loop (Qwen35Model::generate / generate_streaming, which already \
+                delegate their prefill phase to the same batched-prefill core this method calls). \
+                Migrate to Qwen35Model::generate / generate_streaming. \
+                Scheduled for removal in 0.6.0."
+    )]
+    #[allow(dead_code)] // TODO(#1958): roadmap — remove in 0.6.0 (tracked by issue #807's follow-up removal PR)
     pub fn generate_with_batch_prefill(
         &self,
         prompt: &str,
@@ -1210,6 +1223,7 @@ fn softplus_prefill(x: f32) -> f32 {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // exercises generate_with_batch_prefill itself during its deprecation window (issue #807)
 mod tests {
     use super::*;
     use crate::lora_hook::LoraHook;
