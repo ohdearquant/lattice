@@ -286,6 +286,7 @@ def run_selftest() -> int:
     """
     import contextlib
     import io
+    import subprocess
     import tempfile
 
     failures: list[str] = []
@@ -397,50 +398,94 @@ def run_selftest() -> int:
         if "ℹ️" not in report or "grp_f/noisy_fail" not in report:
             failures.append("informational-groups: noisy FAIL not shown in informational section")
 
-        # lattice#714 / PR #872 review: the shell-side allowlist handoff. Use
-        # the exact two group names bench-compare.sh's INFO_GROUPS_ALLOWLIST
-        # writes to the informational-groups file, plus an *unapproved* embed
-        # group (simd_normalize, a real group in the same bench target with
-        # no noise evidence) and an inference group (rms_norm, a different
-        # bench target entirely) — both must still gate as FAIL, proving the
-        # allowlist is a narrow, exact-name exemption and not a target-wide
-        # or cross-target bypass.
-        allowlist_dir = root / "allowlist"
-        approved_a = allowlist_dir / "simd_dot_product" / "384"
-        _fabricate_bench(approved_a, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-        approved_b = allowlist_dir / "simd_cosine_similarity" / "384"
-        _fabricate_bench(approved_b, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-        unapproved_embed = allowlist_dir / "simd_normalize" / "384"
-        _fabricate_bench(unapproved_embed, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-        unapproved_inference = allowlist_dir / "rms_norm" / "4096"
-        _fabricate_bench(unapproved_inference, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-
-        allowlist_results: dict[str, BenchResult] = {}
-        for cf in find_change_files(allowlist_dir):
-            r = parse_bench(cf, allowlist_dir, baseline_name="compare-base")
-            if r is not None:
-                allowlist_results[r.name] = r
-
-        shell_allowlist = frozenset({"simd_dot_product", "simd_cosine_similarity"})
-        needed = {
-            "simd_dot_product/384", "simd_cosine_similarity/384",
-            "simd_normalize/384", "rms_norm/4096",
-        }
-        if not needed.issubset(allowlist_results):
-            failures.append("allowlist-handoff fixture: not all benches parsed")
+        # lattice#714: the shell-side allowlist handoff, exercised end-to-
+        # end. An earlier fixture kept its own hardcoded `shell_allowlist`
+        # set instead of reading it from the actual shell code — a
+        # regression that added a group only to bench-compare.sh's array
+        # (e.g. simd_normalize) stayed invisible. Run the real helper
+        # (scripts/lib/bench-informational-groups.sh, the same file
+        # bench-compare.sh sources for production runs) against a
+        # controlled Criterion `--list`-shaped listing, feed its emitted
+        # file into the Python classifier, and assert the full
+        # pipeline: only the two approved names come out of the shell step,
+        # and an unapproved embed group, an inference group, and a
+        # similarly-prefixed-but-distinct embed group all still gate.
+        helper = Path(__file__).resolve().parent / "lib" / "bench-informational-groups.sh"
+        if not helper.exists():
+            failures.append(f"allowlist-handoff: shell helper missing at {helper}")
         else:
-            allowlist_gated_fails = {
-                r.name for r in allowlist_results.values()
-                if r.verdict() == "FAIL" and not r.is_informational(shell_allowlist)
-            }
-            if "simd_dot_product/384" in allowlist_gated_fails:
-                failures.append("allowlist-handoff: approved simd_dot_product leaked into gated fails")
-            if "simd_cosine_similarity/384" in allowlist_gated_fails:
-                failures.append("allowlist-handoff: approved simd_cosine_similarity leaked into gated fails")
-            if "simd_normalize/384" not in allowlist_gated_fails:
-                failures.append("allowlist-handoff: unapproved embed group simd_normalize did not gate")
-            if "rms_norm/4096" not in allowlist_gated_fails:
-                failures.append("allowlist-handoff: inference group rms_norm did not gate")
+            listing_dir = root / "allowlist-listing"
+            listing_dir.mkdir(parents=True, exist_ok=True)
+            listing_file = listing_dir / "list.txt"
+            listing_file.write_text(
+                "simd_dot_product/scalar/384: benchmark\n"
+                "simd_dot_product/simd/384: benchmark\n"
+                "simd_cosine_similarity/scalar/384: benchmark\n"
+                "simd_cosine_similarity/simd/384: benchmark\n"
+                "simd_normalize/scalar/384: benchmark\n"
+                "simd_dot_product_extra/scalar/384: benchmark\n"
+                "rms_norm/4096: benchmark\n"
+            )
+            proc = subprocess.run(
+                ["bash", str(helper), str(listing_file)],
+                capture_output=True, text=True, timeout=30,
+            )
+            shell_emitted = frozenset(
+                ln.strip() for ln in proc.stdout.splitlines() if ln.strip()
+            )
+            if proc.returncode != 0:
+                failures.append(
+                    f"allowlist-handoff: shell helper exited {proc.returncode}: {proc.stderr}"
+                )
+            elif shell_emitted != {"simd_dot_product", "simd_cosine_similarity"}:
+                failures.append(
+                    "allowlist-handoff: shell helper emitted "
+                    f"{sorted(shell_emitted)}, expected exactly "
+                    "['simd_cosine_similarity', 'simd_dot_product']"
+                )
+            else:
+                allowlist_dir = root / "allowlist"
+                approved_a = allowlist_dir / "simd_dot_product" / "384"
+                _fabricate_bench(approved_a, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+                approved_b = allowlist_dir / "simd_cosine_similarity" / "384"
+                _fabricate_bench(approved_b, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+                unapproved_embed = allowlist_dir / "simd_normalize" / "384"
+                _fabricate_bench(unapproved_embed, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+                unapproved_extra = allowlist_dir / "simd_dot_product_extra" / "384"
+                _fabricate_bench(unapproved_extra, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+                unapproved_inference = allowlist_dir / "rms_norm" / "4096"
+                _fabricate_bench(unapproved_inference, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+
+                allowlist_results: dict[str, BenchResult] = {}
+                for cf in find_change_files(allowlist_dir):
+                    r = parse_bench(cf, allowlist_dir, baseline_name="compare-base")
+                    if r is not None:
+                        allowlist_results[r.name] = r
+
+                needed = {
+                    "simd_dot_product/384", "simd_cosine_similarity/384",
+                    "simd_normalize/384", "simd_dot_product_extra/384", "rms_norm/4096",
+                }
+                if not needed.issubset(allowlist_results):
+                    failures.append("allowlist-handoff fixture: not all benches parsed")
+                else:
+                    allowlist_gated_fails = {
+                        r.name for r in allowlist_results.values()
+                        if r.verdict() == "FAIL" and not r.is_informational(shell_emitted)
+                    }
+                    if "simd_dot_product/384" in allowlist_gated_fails:
+                        failures.append("allowlist-handoff: approved simd_dot_product leaked into gated fails")
+                    if "simd_cosine_similarity/384" in allowlist_gated_fails:
+                        failures.append("allowlist-handoff: approved simd_cosine_similarity leaked into gated fails")
+                    if "simd_normalize/384" not in allowlist_gated_fails:
+                        failures.append("allowlist-handoff: unapproved embed group simd_normalize did not gate")
+                    if "simd_dot_product_extra/384" not in allowlist_gated_fails:
+                        failures.append(
+                            "allowlist-handoff: unapproved simd_dot_product_extra "
+                            "did not gate (prefix/substring exemption leak)"
+                        )
+                    if "rms_norm/4096" not in allowlist_gated_fails:
+                        failures.append("allowlist-handoff: inference group rms_norm did not gate")
 
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)

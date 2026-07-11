@@ -118,38 +118,33 @@ fi
 # Fixed, reviewed allowlist of the issue-evidenced noisy groups only — NOT a
 # target-wide dump. lattice#714's quantitative reproduction (same-toolchain
 # A/A runs on identical refs, --quick mode) confined every flip-signed FAIL/
-# WARN to these two lattice-embed `simd` groups; no other group in that
-# target has issue-backed noise evidence, so no other group is exempted here.
+# WARN to two lattice-embed `simd` groups; no other group in that target has
+# issue-backed noise evidence, so no other group is exempted here. The
+# allowlist itself and the intersection-with-the-real-listing logic live in
+# scripts/lib/bench-informational-groups.sh, invoked below — kept in its own
+# file (rather than inline here) so scripts/perf-bench-gate.py --selftest can
+# run the exact same shell code against a controlled listing and catch a
+# shell-only regression, not just a Python-classifier one.
 # This list is embed-`simd`-specific: names are matched against the Criterion
 # top-level group name only (scripts/perf-bench-gate.py), so it must never be
 # extended with a name that could collide with a `lattice-inference` group —
 # if that ever becomes a concern, namespace by target (e.g. "embed:<group>")
 # on both sides of the handoff instead of trusting name uniqueness. Adding a
-# group here requires the same kind of same-toolchain A/A quantitative
-# evidence that justified these two, reviewed in a PR — never derived
+# group requires the same kind of same-toolchain A/A quantitative evidence
+# that justified the current two, reviewed in a PR — never derived
 # automatically from `--list`, which would silently exempt every future
-# group added to the target (see PR #872 review discussion).
-INFO_GROUPS_ALLOWLIST=(
-  "simd_dot_product"
-  "simd_cosine_similarity"
-)
+# group added to the target.
 INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
 rm -f "$INFO_GROUPS_FILE"
 if [ -n "$QUICK_FLAGS" ] && [ "$BENCHES_EMBED" = "simd" ]; then
   (
     cd "$HEAD_DIR"
-    # Intersect the fixed allowlist with the groups actually selected/listed
-    # for this run, so a stale or renamed allowlist entry never silently
-    # no-ops instead of gating (--list reflects both the built binary and any
-    # BENCH_GROUPS_EMBED filter already applied).
-    LISTED_GROUPS=$(cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null \
-      | awk -F/ '/: benchmark$/{print $1}' \
-      | sort -u)
-    for grp in "${INFO_GROUPS_ALLOWLIST[@]}"; do
-      if grep -qxF "$grp" <<< "$LISTED_GROUPS"; then
-        echo "$grp"
-      fi
-    done > "$INFO_GROUPS_FILE"
+    # --list reflects both the built binary and any BENCH_GROUPS_EMBED filter
+    # already applied; the helper intersects it against the fixed allowlist
+    # so a stale or renamed allowlist entry fails closed (never gates) rather
+    # than silently no-op'ing into "everything is informational."
+    cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null \
+      | "$REPO/scripts/lib/bench-informational-groups.sh" > "$INFO_GROUPS_FILE"
   )
 fi
 
