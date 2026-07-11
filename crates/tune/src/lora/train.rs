@@ -452,7 +452,7 @@ mod tests {
     // Run with:
     //   cargo test -p lattice-tune --features train-backward -- train --ignored
 
-    #[ignore]
+    #[ignore = "requires a real model checkpoint; placeholder/documentation-only test"]
     #[test]
     fn placeholder_requires_real_model() {
         // Intentionally empty: a real model checkpoint is required to exercise
