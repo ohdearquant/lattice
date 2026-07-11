@@ -23,6 +23,19 @@ then `bench_decode_profiles.toml` carries no profile definitions and the
 `run` subcommand below has nothing registered in `ADAPTER_REGISTRY`, so an
 engine request always resolves as "missing" (see `--allow-missing-engine`).
 
+A profile's `engines` list is an ordered set of per-engine run groups, not
+a flat list of names: each entry carries its own `warmup_repeats`, `model`,
+and `quantization` (see `EngineRunGroup`), because the legacy scripts this
+harness consolidates give each engine its own warmup schedule and, for the
+Q4/Q8 comparison, a different quantization per engine within one profile.
+`windows`, `measured_repeats`, and `prompt` stay profile-wide because every
+legacy script keeps those uniform across engines. The requested
+model/quantization is passed into `EngineAdapter.run()`; an adapter that
+invokes a different artifact than requested (fallback, missing checkpoint,
+...) reports the actual identity back via `AdapterRunResult.actual_model`/
+`actual_quantization`, and raw observations always record the actual
+invoked identity, never a value merely assumed from the profile.
+
 Raw JSONL observation schema (the contract; see `OBSERVATION_FIELDS` /
 `validate_observation`): schema version, git SHA, profile name, engine +
 version, model/quantization, prompt hash, requested and actual prompt/
@@ -31,7 +44,13 @@ harness-measured elapsed nanoseconds, an optional engine-native nanosecond
 figure, a hardware identifier, and a timestamp. Reports render from this raw
 data; they are not the source of truth.
 
-Run with: python3 -m unittest tests/test_bench_decode_harness.py -v
+`trimmed_mean` aggregation reports `slope_ci95_legacy`: the pre-existing
+`bench_apples_precise.sh` normal-approximation spread heuristic, carried
+over unchanged. It is NOT a coverage-valid 95% confidence interval for the
+slope -- statistical-methodology correction is explicitly out of scope for
+issue #813 and is deferred to a separately reviewed follow-up.
+
+Run with: python3 tests/test_bench_decode_harness.py -v
 (the module itself is stdlib-only; no engine binaries or third-party
 packages are required to exercise it).
 """
@@ -246,19 +265,54 @@ def write_jsonl(observations: list[Observation], path: Path) -> None:
 
 
 @dataclass(frozen=True)
+class EngineRunGroup:
+    """One engine's schedule within a profile.
+
+    Every legacy script gives each engine its own warmup count and its own
+    model/quantization identity (`bench_apples_to_apples.sh`: only MLX gets
+    a warmup; `bench_q4_apples.sh`: Lattice and MLX run Q4, Ollama runs Q8 as
+    a reference). `measured_repeats`, `windows`, and `prompt` stay profile-
+    wide because every legacy script keeps those uniform across engines.
+    """
+
+    name: str
+    warmup_repeats: int
+    model: str
+    quantization: str
+
+
+@dataclass(frozen=True)
 class ProfileConfig:
     name: str
     description: str
     windows: tuple[int, ...]
-    warmup_repeats: int
     measured_repeats: int
-    engines: tuple[str, ...]
+    engine_groups: tuple[EngineRunGroup, ...]
     prompt: str
-    model: str
-    quantization: str
     aggregation: str = "median"
     trim: int = 0
     requested_prompt_tokens: int | None = None
+
+    @property
+    def engines(self) -> tuple[str, ...]:
+        """Engine names in schedule order (for aggregation/reporting)."""
+        return tuple(g.name for g in self.engine_groups)
+
+
+_TOP_LEVEL_ALLOWED_KEYS = frozenset({"schema_version", "profiles"})
+_PROFILE_ALLOWED_KEYS = frozenset(
+    {
+        "description",
+        "windows",
+        "measured_repeats",
+        "engines",
+        "prompt",
+        "aggregation",
+        "trim",
+        "requested_prompt_tokens",
+    }
+)
+_ENGINE_GROUP_ALLOWED_KEYS = frozenset({"name", "warmup_repeats", "model", "quantization"})
 
 
 def load_profiles_file(path: Path) -> tuple[int, dict[str, ProfileConfig]]:
@@ -269,6 +323,10 @@ def load_profiles_file(path: Path) -> tuple[int, dict[str, ProfileConfig]]:
         raise ProfileConfigError(f"{path}: invalid TOML: {exc}") from exc
     except OSError as exc:
         raise ProfileConfigError(f"{path}: could not read profiles file: {exc}") from exc
+
+    extra_top = set(doc) - _TOP_LEVEL_ALLOWED_KEYS
+    if extra_top:
+        raise ProfileConfigError(f"{path}: unexpected top-level key(s): {sorted(extra_top)}")
 
     schema_version = doc.get("schema_version")
     if schema_version != SCHEMA_VERSION:
@@ -289,6 +347,10 @@ def load_profiles_file(path: Path) -> tuple[int, dict[str, ProfileConfig]]:
 
 
 def _parse_profile(name: str, raw: dict) -> ProfileConfig:
+    extra = set(raw) - _PROFILE_ALLOWED_KEYS
+    if extra:
+        raise ProfileConfigError(f"profile {name!r}: unexpected key(s): {sorted(extra)}")
+
     def require(key: str, expected_type: type) -> object:
         if key not in raw:
             raise ProfileConfigError(f"profile {name!r}: missing required key {key!r}")
@@ -301,7 +363,14 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
             )
         return value
 
-    description = str(raw.get("description", ""))
+    if "description" in raw:
+        if not isinstance(raw["description"], str):
+            raise ProfileConfigError(
+                f"profile {name!r}: key 'description' must be str, got {type(raw['description']).__name__}"
+            )
+        description = raw["description"]
+    else:
+        description = ""
 
     windows_raw = require("windows", list)
     if len(windows_raw) < 2:
@@ -314,10 +383,6 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
     if windows != sorted(windows) or len(set(windows)) != len(windows):
         raise ProfileConfigError(f"profile {name!r}: windows must be strictly increasing, got {windows}")
 
-    warmup_repeats = require("warmup_repeats", int)
-    if warmup_repeats < 0:
-        raise ProfileConfigError(f"profile {name!r}: warmup_repeats must be >= 0")
-
     measured_repeats = require("measured_repeats", int)
     if measured_repeats < 1:
         raise ProfileConfigError(f"profile {name!r}: measured_repeats must be >= 1")
@@ -325,26 +390,57 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
     engines_raw = require("engines", list)
     if not engines_raw:
         raise ProfileConfigError(f"profile {name!r}: engines must not be empty")
-    engines: list[str] = []
-    for e in engines_raw:
-        if not isinstance(e, str) or not e:
-            raise ProfileConfigError(f"profile {name!r}: engines entries must be non-empty strings")
-        engines.append(e)
-    if len(set(engines)) != len(engines):
-        raise ProfileConfigError(f"profile {name!r}: engines must not contain duplicates, got {engines}")
+    engine_groups: list[EngineRunGroup] = []
+    seen_names: set[str] = set()
+    for idx, eg_raw in enumerate(engines_raw):
+        if not isinstance(eg_raw, dict):
+            raise ProfileConfigError(f"profile {name!r}: engines[{idx}] must be a table")
+        eg_extra = set(eg_raw) - _ENGINE_GROUP_ALLOWED_KEYS
+        if eg_extra:
+            raise ProfileConfigError(f"profile {name!r}: engines[{idx}] has unexpected key(s): {sorted(eg_extra)}")
+
+        def eg_require(key: str, expected_type: type, *, _idx: int = idx, _eg_raw: dict = eg_raw) -> object:
+            if key not in _eg_raw:
+                raise ProfileConfigError(f"profile {name!r}: engines[{_idx}] missing required key {key!r}")
+            value = _eg_raw[key]
+            if expected_type is int and isinstance(value, bool):
+                raise ProfileConfigError(f"profile {name!r}: engines[{_idx}] key {key!r} must be int, got bool")
+            if not isinstance(value, expected_type):
+                raise ProfileConfigError(
+                    f"profile {name!r}: engines[{_idx}] key {key!r} must be "
+                    f"{expected_type.__name__}, got {type(value).__name__}"
+                )
+            return value
+
+        eg_name = eg_require("name", str)
+        if not eg_name:
+            raise ProfileConfigError(f"profile {name!r}: engines[{idx}] name must be non-empty")
+        if eg_name in seen_names:
+            raise ProfileConfigError(f"profile {name!r}: engines must not contain duplicate name {eg_name!r}")
+        seen_names.add(eg_name)
+
+        eg_warmup = eg_require("warmup_repeats", int)
+        if eg_warmup < 0:
+            raise ProfileConfigError(f"profile {name!r}: engines[{idx}] warmup_repeats must be >= 0")
+
+        eg_model = eg_require("model", str)
+        if not eg_model:
+            raise ProfileConfigError(f"profile {name!r}: engines[{idx}] model must be non-empty")
+
+        eg_quantization = eg_require("quantization", str)
+        if not eg_quantization:
+            raise ProfileConfigError(f"profile {name!r}: engines[{idx}] quantization must be non-empty")
+
+        engine_groups.append(
+            EngineRunGroup(name=eg_name, warmup_repeats=eg_warmup, model=eg_model, quantization=eg_quantization)
+        )
 
     prompt = require("prompt", str)
     if not prompt:
         raise ProfileConfigError(f"profile {name!r}: prompt must be non-empty")
-    model = require("model", str)
-    if not model:
-        raise ProfileConfigError(f"profile {name!r}: model must be non-empty")
-    quantization = require("quantization", str)
-    if not quantization:
-        raise ProfileConfigError(f"profile {name!r}: quantization must be non-empty")
 
-    aggregation = str(raw.get("aggregation", "median"))
-    if aggregation not in AGGREGATION_METHODS:
+    aggregation = raw.get("aggregation", "median")
+    if not isinstance(aggregation, str) or aggregation not in AGGREGATION_METHODS:
         raise ProfileConfigError(
             f"profile {name!r}: aggregation must be one of {AGGREGATION_METHODS}, got {aggregation!r}"
         )
@@ -370,12 +466,9 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
         name=name,
         description=description,
         windows=tuple(windows),
-        warmup_repeats=warmup_repeats,
         measured_repeats=measured_repeats,
-        engines=tuple(engines),
+        engine_groups=tuple(engine_groups),
         prompt=prompt,
-        model=model,
-        quantization=quantization,
         aggregation=aggregation,
         trim=trim,
         requested_prompt_tokens=requested_prompt_tokens,
@@ -395,16 +488,28 @@ class AdapterRunResult:
     counts, discard samples, or compute verdicts. `native_ns`, when present,
     is surfaced as a diagnostic field alongside the harness-measured timing,
     never as a replacement for it.
+
+    `actual_model`/`actual_quantization` report the identity the adapter
+    actually invoked. They default to `None`, meaning "the requested
+    identity was invoked verbatim" -- the harness then records the
+    requested `model`/`quantization` it passed into `run()`. An adapter
+    that falls back to a different artifact than requested (a missing
+    checkpoint, a resolved default, ...) MUST set these so the raw
+    observation records what actually ran, not what was asked for.
     """
 
     actual_completion_tokens: int
     actual_prompt_tokens: int | None = None
     native_ns: int | None = None
     engine_version: str = "unknown"
+    actual_model: str | None = None
+    actual_quantization: str | None = None
 
 
 class EngineAdapter(Protocol):
-    def run(self, *, prompt: str, n_tokens: int, warmup: bool) -> AdapterRunResult: ...
+    def run(
+        self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
+    ) -> AdapterRunResult: ...
 
 
 # Populated by engine-adapter modules landed alongside each script migration
@@ -476,25 +581,26 @@ def run_profile(
 ) -> HarnessRunResult:
     """Execute `profile` against `adapters` and return every raw observation.
 
-    Run order is the requested schedule in list order: for each engine (in
-    `profile.engines` order), for each window (in `profile.windows` order —
-    `windows[0]` is the shared baseline, executed once and reused for every
-    comparison window that follows it), warmup runs first, then measured
-    runs. `order_index` is a single counter across the entire call, so a
-    later statistical pass (issue #714) can test for order/thermal bias
-    without another schema migration.
+    Run order is the requested schedule in list order: for each engine run
+    group (in `profile.engine_groups` order), for each window (in
+    `profile.windows` order — `windows[0]` is the shared baseline, executed
+    once and reused for every comparison window that follows it), that
+    engine's own warmup runs first, then measured runs. `order_index` is a
+    single counter across the entire call, so a later statistical pass
+    (issue #714) can test for order/thermal bias without another schema
+    migration.
     """
     resolved_git_sha = git_sha_value if git_sha_value is not None else git_sha(repo_root)
     resolved_hardware_id = hardware_id_value if hardware_id_value is not None else hardware_id()
     p_hash = prompt_hash(profile.prompt)
 
-    active: dict[str, EngineAdapter] = {}
+    active: dict[str, EngineRunGroup] = {}
     missing: list[str] = []
-    for engine in profile.engines:
-        if engine in adapters:
-            active[engine] = adapters[engine]
+    for group in profile.engine_groups:
+        if group.name in adapters:
+            active[group.name] = group
         else:
-            missing.append(engine)
+            missing.append(group.name)
     if missing and not allow_missing_engine:
         raise MissingEngineError(
             f"profile {profile.name!r} requires engine adapter(s) {missing} that are not registered; "
@@ -503,24 +609,34 @@ def run_profile(
 
     observations: list[Observation] = []
     order_index = 0
-    for engine_name in profile.engines:
-        adapter = active.get(engine_name)
-        if adapter is None:
+    for group in profile.engine_groups:
+        if group.name not in active:
             continue
+        adapter = adapters[group.name]
         for window in profile.windows:
-            for is_warmup, count in ((True, profile.warmup_repeats), (False, profile.measured_repeats)):
+            for is_warmup, count in ((True, group.warmup_repeats), (False, profile.measured_repeats)):
                 for run_index in range(1, count + 1):
                     t0 = clock()
-                    result = adapter.run(prompt=profile.prompt, n_tokens=window, warmup=is_warmup)
+                    result = adapter.run(
+                        prompt=profile.prompt,
+                        n_tokens=window,
+                        warmup=is_warmup,
+                        model=group.model,
+                        quantization=group.quantization,
+                    )
                     t1 = clock()
+                    actual_model = result.actual_model if result.actual_model is not None else group.model
+                    actual_quantization = (
+                        result.actual_quantization if result.actual_quantization is not None else group.quantization
+                    )
                     obs = Observation(
                         schema_version=SCHEMA_VERSION,
                         git_sha=resolved_git_sha,
                         profile=profile.name,
-                        engine=engine_name,
+                        engine=group.name,
                         engine_version=result.engine_version,
-                        model=profile.model,
-                        quantization=profile.quantization,
+                        model=actual_model,
+                        quantization=actual_quantization,
                         prompt_hash=p_hash,
                         requested_prompt_tokens=profile.requested_prompt_tokens,
                         actual_prompt_tokens=result.actual_prompt_tokens,
@@ -555,7 +671,17 @@ class SlopeResult:
     baseline_window: int
     window: int
     slope_tok_per_s: float
-    slope_ci95: float | None
+    # Legacy normal-approximation heuristic carried over verbatim from
+    # `bench_apples_precise.sh:118-143` (issue #813 explicitly defers
+    # statistical-methodology changes to a separately reviewed follow-up).
+    # This is NOT a coverage-valid 95% confidence interval for the slope:
+    # it treats the trimmed subset as an ordinary sample, applies a
+    # large-sample z=1.96 multiplier regardless of the retained sample
+    # size, and combines the two window CIs with relative-error
+    # (product/ratio) propagation rather than the sensitivity-coefficient
+    # propagation a difference-then-reciprocal statistic requires. Present
+    # it to a reader as a legacy spread heuristic only, never as "±95% CI".
+    slope_ci95_legacy: float | None
     baseline_n: int
     window_n: int
 
@@ -573,14 +699,21 @@ def _median_stat(values: list[float]) -> tuple[float, None]:
 
 
 def _trimmed_mean_stat(values: list[float], trim: int) -> tuple[float, float]:
+    """Trimmed mean + the legacy normal-approximation spread heuristic.
+
+    The second return value is `bench_apples_precise.sh`'s pre-existing
+    `1.96 * stdev / sqrt(n)` heuristic over the *retained* (trimmed)
+    subset, carried over verbatim rather than corrected -- see
+    `SlopeResult.slope_ci95_legacy` for why it is not a coverage-valid CI.
+    """
     ordered = sorted(values)
     trimmed = ordered[trim: len(ordered) - trim] if trim > 0 and len(ordered) > 2 * trim else ordered
     mean = statistics.mean(trimmed)
     if len(trimmed) > 1:
-        ci95 = 1.96 * (statistics.stdev(trimmed) / math.sqrt(len(trimmed)))
+        ci95_legacy = 1.96 * (statistics.stdev(trimmed) / math.sqrt(len(trimmed)))
     else:
-        ci95 = 0.0
-    return mean, ci95
+        ci95_legacy = 0.0
+    return mean, ci95_legacy
 
 
 def _window_stat(values: list[float], aggregation: str, trim: int) -> tuple[float, float | None]:
@@ -595,6 +728,12 @@ def aggregate(run_result: HarnessRunResult) -> list[SlopeResult]:
     `slope_tok_per_s = (window - baseline_window) / (T(window) - T(baseline))`,
     with `T` the profile's configured aggregation of measured (non-warmup)
     elapsed time. `baseline_window` is always `profile.windows[0]`.
+
+    `SlopeResult.slope_ci95_legacy`, when the profile uses `trimmed_mean`
+    aggregation, is the pre-existing `bench_apples_precise.sh` spread
+    heuristic propagated through the slope's product/ratio form -- a
+    legacy carry-over, not a corrected or coverage-valid CI (issue #813
+    defers statistical-methodology changes to a separate review).
     """
     profile = run_result.profile
     baseline_window = profile.windows[0]
@@ -603,31 +742,33 @@ def aggregate(run_result: HarnessRunResult) -> list[SlopeResult]:
         baseline_values = _measured_elapsed_seconds(run_result.observations, engine, baseline_window)
         if not baseline_values:
             continue
-        baseline_mean, baseline_ci = _window_stat(baseline_values, profile.aggregation, profile.trim)
+        baseline_mean, baseline_ci_legacy = _window_stat(baseline_values, profile.aggregation, profile.trim)
         for window in profile.windows[1:]:
             values = _measured_elapsed_seconds(run_result.observations, engine, window)
             if not values:
                 continue
-            window_mean, window_ci = _window_stat(values, profile.aggregation, profile.trim)
+            window_mean, window_ci_legacy = _window_stat(values, profile.aggregation, profile.trim)
             dt = window_mean - baseline_mean
             slope = (window - baseline_window) / dt if dt > 0 else float("nan")
-            slope_ci: float | None = None
+            slope_ci_legacy: float | None = None
             if (
                 profile.aggregation == "trimmed_mean"
-                and baseline_ci is not None
-                and window_ci is not None
+                and baseline_ci_legacy is not None
+                and window_ci_legacy is not None
                 and baseline_mean > 0
                 and window_mean > 0
                 and slope == slope  # not NaN
             ):
-                slope_ci = slope * math.sqrt((baseline_ci / baseline_mean) ** 2 + (window_ci / window_mean) ** 2)
+                slope_ci_legacy = slope * math.sqrt(
+                    (baseline_ci_legacy / baseline_mean) ** 2 + (window_ci_legacy / window_mean) ** 2
+                )
             results.append(
                 SlopeResult(
                     engine=engine,
                     baseline_window=baseline_window,
                     window=window,
                     slope_tok_per_s=slope,
-                    slope_ci95=slope_ci,
+                    slope_ci95_legacy=slope_ci_legacy,
                     baseline_n=len(baseline_values),
                     window_n=len(values),
                 )
@@ -658,11 +799,16 @@ def render_report(run_result: HarnessRunResult, slopes: list[SlopeResult]) -> st
     if not slopes:
         lines.append("  (no measured data)")
         return "\n".join(lines)
-    lines.append(f"  {'engine':<10}{'window':>8}{'slope tok/s':>13}{'±95% CI':>10}{'native tok/s':>14}{'n(base/win)':>13}")
-    lines.append("  " + "-" * 68)
+    # "legacy ±CI" -- the normal-approximation heuristic carried over from
+    # bench_apples_precise.sh, not a coverage-valid 95% CI. See
+    # SlopeResult.slope_ci95_legacy.
+    lines.append(
+        f"  {'engine':<10}{'window':>8}{'slope tok/s':>13}{'legacy ±CI':>11}{'native tok/s':>14}{'n(base/win)':>13}"
+    )
+    lines.append("  " + "-" * 69)
     for s in slopes:
         native = native_throughput(run_result, s.engine)
-        ci_str = f"{s.slope_ci95:10.1f}" if s.slope_ci95 is not None else f"{'—':>10}"
+        ci_str = f"{s.slope_ci95_legacy:11.1f}" if s.slope_ci95_legacy is not None else f"{'—':>11}"
         native_str = f"{native:14.1f}" if native is not None else f"{'—':>14}"
         lines.append(
             f"  {s.engine:<10}{s.window:>8}{s.slope_tok_per_s:13.1f}{ci_str}{native_str}"

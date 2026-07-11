@@ -476,8 +476,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: python3 -m unittest tests/test_bench_decode_harness.py
-        run: python3 -m unittest discover -s tests -p 'test_bench_decode_harness.py' -v
+      - name: python3 tests/test_bench_decode_harness.py
+        run: python3 tests/test_bench_decode_harness.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is

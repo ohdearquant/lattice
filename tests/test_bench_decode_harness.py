@@ -3,7 +3,7 @@
 Deterministic fake-adapter tests and raw-schema validation only -- no engine
 binary is required to run this file, matching the harness-core landing gate.
 
-Run with: python3 -m unittest tests/test_bench_decode_harness.py -v
+Run with: python3 tests/test_bench_decode_harness.py -v
 (or `python3 -m pytest tests/test_bench_decode_harness.py -v` -- no
 pytest-only features are used).
 """
@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
+import statistics
 import sys
 import tempfile
 import unittest
@@ -77,10 +79,12 @@ class _FakeAdapter:
     def __init__(self, engine_version: str = "fake-1.0", native_ns_per_token: int | None = None):
         self.engine_version = engine_version
         self.native_ns_per_token = native_ns_per_token
-        self.calls: list[tuple[int, bool]] = []
+        self.calls: list[tuple[int, bool, str, str]] = []
 
-    def run(self, *, prompt: str, n_tokens: int, warmup: bool) -> "harness.AdapterRunResult":
-        self.calls.append((n_tokens, warmup))
+    def run(
+        self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
+    ) -> "harness.AdapterRunResult":
+        self.calls.append((n_tokens, warmup, model, quantization))
         native_ns = self.native_ns_per_token * n_tokens if self.native_ns_per_token else None
         return harness.AdapterRunResult(
             actual_completion_tokens=n_tokens,
@@ -90,16 +94,19 @@ class _FakeAdapter:
         )
 
 
+def _engine(
+    name: str = "fake", warmup_repeats: int = 0, model: str = "qwen3.5-0.8b", quantization: str = "q8"
+) -> dict:
+    return {"name": name, "warmup_repeats": warmup_repeats, "model": model, "quantization": quantization}
+
+
 def _profile(**overrides) -> "harness.ProfileConfig":
     raw = {
         "description": "unit test profile",
         "windows": [32, 256],
-        "warmup_repeats": 0,
         "measured_repeats": 3,
-        "engines": ["fake"],
+        "engines": [_engine()],
         "prompt": "the quick brown fox",
-        "model": "qwen3.5-0.8b",
-        "quantization": "q8",
     }
     raw.update(overrides)
     return harness._parse_profile("unit_test", raw)
@@ -214,6 +221,11 @@ class ProfileConfigTest(unittest.TestCase):
         profile = _profile()
         self.assertEqual(profile.windows, (32, 256))
         self.assertEqual(profile.aggregation, "median")
+        self.assertEqual(profile.engines, ("fake",))
+        self.assertEqual(len(profile.engine_groups), 1)
+        self.assertEqual(profile.engine_groups[0].warmup_repeats, 0)
+        self.assertEqual(profile.engine_groups[0].model, "qwen3.5-0.8b")
+        self.assertEqual(profile.engine_groups[0].quantization, "q8")
 
     def test_single_window_rejected(self):
         with self.assertRaisesRegex(harness.ProfileConfigError, "at least 2"):
@@ -227,10 +239,6 @@ class ProfileConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.ProfileConfigError, "strictly increasing"):
             _profile(windows=[32, 32])
 
-    def test_negative_warmup_rejected(self):
-        with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_repeats"):
-            _profile(warmup_repeats=-1)
-
     def test_zero_measured_repeats_rejected(self):
         with self.assertRaisesRegex(harness.ProfileConfigError, "measured_repeats"):
             _profile(measured_repeats=0)
@@ -239,9 +247,57 @@ class ProfileConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.ProfileConfigError, "engines"):
             _profile(engines=[])
 
-    def test_duplicate_engines_rejected(self):
-        with self.assertRaisesRegex(harness.ProfileConfigError, "duplicates"):
-            _profile(engines=["fake", "fake"])
+    def test_engine_entry_must_be_a_table(self):
+        # The old flat `engines = ["fake"]` name-list shape is no longer
+        # representable -- every engine now needs its own warmup/model/
+        # quantization, so a bare string entry is rejected.
+        with self.assertRaisesRegex(harness.ProfileConfigError, "must be a table"):
+            _profile(engines=["fake"])
+
+    def test_duplicate_engine_names_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "duplicate"):
+            _profile(engines=[_engine("fake"), _engine("fake")])
+
+    def test_empty_engine_name_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "name must be non-empty"):
+            _profile(engines=[_engine(name="")])
+
+    def test_negative_engine_warmup_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_repeats"):
+            _profile(engines=[_engine(warmup_repeats=-1)])
+
+    def test_empty_engine_model_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "model must be non-empty"):
+            _profile(engines=[_engine(model="")])
+
+    def test_empty_engine_quantization_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "quantization must be non-empty"):
+            _profile(engines=[_engine(quantization="")])
+
+    def test_unexpected_engine_key_rejected(self):
+        bad_engine = {"name": "fake", "warmup_repeats": 0, "model": "m", "quantization": "q8", "warmups": 1}
+        with self.assertRaisesRegex(harness.ProfileConfigError, "unexpected key"):
+            _profile(engines=[bad_engine])
+
+    def test_missing_required_engine_key_rejected(self):
+        raw = {
+            "windows": [32, 256],
+            "measured_repeats": 3,
+            "engines": [{"name": "fake", "warmup_repeats": 0, "model": "m"}],  # quantization omitted
+            "prompt": "x",
+        }
+        with self.assertRaisesRegex(harness.ProfileConfigError, "quantization"):
+            harness._parse_profile("bad", raw)
+
+    def test_missing_required_top_level_key_rejected(self):
+        raw = {
+            "windows": [32, 256],
+            "measured_repeats": 3,
+            "engines": [_engine()],
+            # prompt omitted
+        }
+        with self.assertRaisesRegex(harness.ProfileConfigError, "prompt"):
+            harness._parse_profile("bad", raw)
 
     def test_unknown_aggregation_rejected(self):
         with self.assertRaisesRegex(harness.ProfileConfigError, "aggregation"):
@@ -255,18 +311,33 @@ class ProfileConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(harness.ProfileConfigError, "trim"):
             _profile(aggregation="trimmed_mean", trim=2, measured_repeats=3)
 
-    def test_missing_required_key_rejected(self):
-        raw = {
-            "windows": [32, 256],
-            "warmup_repeats": 0,
-            "measured_repeats": 3,
-            "engines": ["fake"],
-            "prompt": "x",
-            "model": "m",
-            # quantization omitted
-        }
-        with self.assertRaisesRegex(harness.ProfileConfigError, "quantization"):
-            harness._parse_profile("bad", raw)
+    def test_description_wrong_type_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "description"):
+            _profile(description=123)
+
+    # -- Fail-closed on unknown/misspelled profile keys (round-1 major: a
+    # typo in an optional methodology key must never silently fall back to
+    # a default instead of being rejected). --
+
+    def test_misspelled_aggregation_key_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, r"unexpected key.*aggregtion"):
+            _profile(aggregtion="trimmed_mean")
+
+    def test_misspelled_trim_key_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, r"unexpected key.*trmi"):
+            _profile(trmi=1)
+
+    def test_misspelled_measured_repeats_key_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, r"unexpected key.*measured_repeat\b"):
+            _profile(measured_repeat=3)
+
+    def test_misspelled_requested_prompt_tokens_key_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, r"unexpected key.*requested_prompt_tokenz"):
+            _profile(requested_prompt_tokenz=10)
+
+    def test_misspelled_description_key_rejected(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, r"unexpected key.*description2"):
+            _profile(description2="typo")
 
 
 class LoadProfilesFileTest(unittest.TestCase):
@@ -282,6 +353,16 @@ class LoadProfilesFileTest(unittest.TestCase):
             with self.assertRaisesRegex(harness.ProfileConfigError, "schema_version"):
                 harness.load_profiles_file(path)
 
+    def test_unexpected_top_level_key_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profiles.toml"
+            path.write_text(
+                "schema_version = 1\nextra_top_level_key = true\n\n[profiles]\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(harness.ProfileConfigError, "unexpected top-level key"):
+                harness.load_profiles_file(path)
+
     def test_named_profile_round_trips(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "profiles.toml"
@@ -291,10 +372,12 @@ schema_version = 1
 
 [profiles.smoke]
 windows = [32, 256]
-warmup_repeats = 1
 measured_repeats = 5
-engines = ["fake"]
 prompt = "hello world"
+
+[[profiles.smoke.engines]]
+name = "fake"
+warmup_repeats = 1
 model = "qwen3.5-0.8b"
 quantization = "q8"
 """,
@@ -303,7 +386,54 @@ quantization = "q8"
             _, profiles = harness.load_profiles_file(path)
             self.assertIn("smoke", profiles)
             self.assertEqual(profiles["smoke"].windows, (32, 256))
-            self.assertEqual(profiles["smoke"].warmup_repeats, 1)
+            self.assertEqual(profiles["smoke"].engines, ("fake",))
+            self.assertEqual(profiles["smoke"].engine_groups[0].warmup_repeats, 1)
+
+    def test_heterogeneous_q4_q8_profile_round_trips(self):
+        # Reproduces bench_q4_apples.sh's shape in one profile: Lattice and
+        # MLX both run Q4, Ollama runs Q8 as a reference only, and only MLX
+        # gets a warmup (bench_apples_to_apples.sh's pattern).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profiles.toml"
+            path.write_text(
+                """
+schema_version = 1
+
+[profiles.q4_apples]
+windows = [32, 256]
+measured_repeats = 5
+prompt = "hello world"
+
+[[profiles.q4_apples.engines]]
+name = "lattice"
+warmup_repeats = 0
+model = "qwen3.5-0.8b-q4"
+quantization = "q4"
+
+[[profiles.q4_apples.engines]]
+name = "mlx"
+warmup_repeats = 1
+model = "qwen3.5-0.8b"
+quantization = "q4"
+
+[[profiles.q4_apples.engines]]
+name = "ollama"
+warmup_repeats = 0
+model = "qwen3.5:0.8b"
+quantization = "q8"
+""",
+                encoding="utf-8",
+            )
+            _, profiles = harness.load_profiles_file(path)
+            profile = profiles["q4_apples"]
+            self.assertEqual(profile.engines, ("lattice", "mlx", "ollama"))
+            groups = {g.name: g for g in profile.engine_groups}
+            self.assertEqual(groups["lattice"].warmup_repeats, 0)
+            self.assertEqual(groups["lattice"].quantization, "q4")
+            self.assertEqual(groups["mlx"].warmup_repeats, 1)
+            self.assertEqual(groups["mlx"].quantization, "q4")
+            self.assertEqual(groups["ollama"].warmup_repeats, 0)
+            self.assertEqual(groups["ollama"].quantization, "q8")
 
 
 # --------------------------------------------------------------------------
@@ -313,7 +443,7 @@ quantization = "q8"
 
 class RunProfileTest(unittest.TestCase):
     def test_produces_expected_observation_count(self):
-        profile = _profile(warmup_repeats=2, measured_repeats=3, windows=[32, 256])
+        profile = _profile(engines=[_engine(warmup_repeats=2)], measured_repeats=3, windows=[32, 256])
         adapter = _FakeAdapter()
         result = harness.run_profile(
             profile,
@@ -327,7 +457,7 @@ class RunProfileTest(unittest.TestCase):
         self.assertEqual(result.missing_engines, ())
 
     def test_warmup_flag_and_run_index_reset_per_group(self):
-        profile = _profile(warmup_repeats=2, measured_repeats=3, windows=[32, 256])
+        profile = _profile(engines=[_engine(warmup_repeats=2)], measured_repeats=3, windows=[32, 256])
         result = harness.run_profile(
             profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
         )
@@ -338,7 +468,7 @@ class RunProfileTest(unittest.TestCase):
         self.assertEqual([o.run_index for o in measured], [1, 2, 3])
 
     def test_order_index_strictly_increasing(self):
-        profile = _profile(warmup_repeats=1, measured_repeats=2, windows=[32, 128, 256])
+        profile = _profile(engines=[_engine(warmup_repeats=1)], measured_repeats=2, windows=[32, 128, 256])
         result = harness.run_profile(
             profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
         )
@@ -348,7 +478,7 @@ class RunProfileTest(unittest.TestCase):
     def test_baseline_window_executed_once_not_per_comparison(self):
         # Mirrors bench_context_scaling.sh's shape: N1 is a shared baseline
         # run once, not re-executed for every comparison window.
-        profile = _profile(warmup_repeats=0, measured_repeats=4, windows=[8, 64, 128, 256])
+        profile = _profile(measured_repeats=4, windows=[8, 64, 128, 256])
         result = harness.run_profile(
             profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
         )
@@ -359,14 +489,14 @@ class RunProfileTest(unittest.TestCase):
         class _DriftingAdapter:
             engine_version = "drift-1.0"
 
-            def run(self, *, prompt, n_tokens, warmup):
+            def run(self, *, prompt, n_tokens, warmup, model, quantization):
                 return harness.AdapterRunResult(
                     actual_completion_tokens=n_tokens - 1,  # engine stopped one token early
                     actual_prompt_tokens=7,
                     engine_version=self.engine_version,
                 )
 
-        profile = _profile(warmup_repeats=0, measured_repeats=1, windows=[32, 256])
+        profile = _profile(measured_repeats=1, windows=[32, 256])
         result = harness.run_profile(
             profile, {"fake": _DriftingAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
         )
@@ -375,7 +505,7 @@ class RunProfileTest(unittest.TestCase):
             self.assertEqual(obs.actual_prompt_tokens, 7)
 
     def test_every_observation_is_schema_valid(self):
-        profile = _profile(warmup_repeats=1, measured_repeats=2, windows=[32, 256])
+        profile = _profile(engines=[_engine(warmup_repeats=1)], measured_repeats=2, windows=[32, 256])
         result = harness.run_profile(
             profile,
             {"fake": _FakeAdapter(native_ns_per_token=30_000)},
@@ -387,12 +517,12 @@ class RunProfileTest(unittest.TestCase):
             harness.validate_observation(obs.to_dict())  # must not raise
 
     def test_missing_engine_fails_closed_by_default(self):
-        profile = _profile(engines=["fake", "ghost"])
+        profile = _profile(engines=[_engine("fake"), _engine("ghost")])
         with self.assertRaises(harness.MissingEngineError):
             harness.run_profile(profile, {"fake": _FakeAdapter()}, clock=_FakeClock())
 
     def test_missing_engine_allowed_with_flag(self):
-        profile = _profile(engines=["fake", "ghost"])
+        profile = _profile(engines=[_engine("fake"), _engine("ghost")])
         result = harness.run_profile(
             profile,
             {"fake": _FakeAdapter()},
@@ -405,12 +535,140 @@ class RunProfileTest(unittest.TestCase):
         self.assertTrue(all(o.engine == "fake" for o in result.observations))
 
     def test_missing_engine_never_fabricates_observations(self):
-        profile = _profile(engines=["ghost"])
+        profile = _profile(engines=[_engine("ghost")])
         result = harness.run_profile(
             profile, {}, allow_missing_engine=True, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
         )
         self.assertEqual(result.observations, ())
         self.assertEqual(result.missing_engines, ("ghost",))
+
+    def test_adapter_default_identity_matches_requested(self):
+        profile = _profile(
+            engines=[_engine("fake", model="qwen3.5-0.8b-q4", quantization="q4")],
+            measured_repeats=1,
+            windows=[32, 256],
+        )
+        result = harness.run_profile(
+            profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+        )
+        for obs in result.observations:
+            self.assertEqual(obs.model, "qwen3.5-0.8b-q4")
+            self.assertEqual(obs.quantization, "q4")
+
+    def test_adapter_reported_actual_identity_overrides_requested(self):
+        class _DriftingIdentityAdapter:
+            engine_version = "drift-1.0"
+
+            def run(self, *, prompt, n_tokens, warmup, model, quantization):
+                return harness.AdapterRunResult(
+                    actual_completion_tokens=n_tokens,
+                    actual_prompt_tokens=4,
+                    engine_version=self.engine_version,
+                    actual_model="qwen3.5-0.8b-fallback",
+                    actual_quantization="q8",
+                )
+
+        profile = _profile(
+            engines=[_engine("fake", model="qwen3.5-0.8b-q4", quantization="q4")],
+            measured_repeats=1,
+            windows=[32, 256],
+        )
+        result = harness.run_profile(
+            profile,
+            {"fake": _DriftingIdentityAdapter()},
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        for obs in result.observations:
+            # The profile requested Q4, but the adapter reports it actually
+            # invoked a fallback Q8 artifact -- the raw observation must
+            # record what actually ran, never the requested identity.
+            self.assertEqual(obs.model, "qwen3.5-0.8b-fallback")
+            self.assertEqual(obs.quantization, "q8")
+
+    def test_heterogeneous_engine_schedule_exact_call_sequence_and_identities(self):
+        """The blocker fix: reproduce bench_q4_apples.sh (Lattice Q4, MLX
+        Q4, Ollama Q8-reference) with bench_apples_to_apples.sh's MLX-only
+        warmup, all inside one profile."""
+        profile = harness._parse_profile(
+            "q4_apples",
+            {
+                "windows": [32, 256],
+                "measured_repeats": 2,
+                "prompt": "the quick brown fox",
+                "engines": [
+                    _engine("lattice", warmup_repeats=0, model="qwen3.5-0.8b-q4", quantization="q4"),
+                    _engine("mlx", warmup_repeats=1, model="qwen3.5-0.8b", quantization="q4"),
+                    _engine("ollama", warmup_repeats=0, model="qwen3.5:0.8b", quantization="q8"),
+                ],
+            },
+        )
+        lattice = _FakeAdapter()
+        mlx = _FakeAdapter()
+        ollama = _FakeAdapter()
+        result = harness.run_profile(
+            profile,
+            {"lattice": lattice, "mlx": mlx, "ollama": ollama},
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+
+        # Exact call sequence per engine. lattice/ollama: 0 warmup + 2
+        # measured per window = 4 calls. mlx: 1 warmup + 2 measured per
+        # window = 6 calls -- the MLX-only-warmup mix bench_apples_to_apples.sh
+        # needs, now representable within a single profile.
+        self.assertEqual(
+            lattice.calls,
+            [
+                (32, False, "qwen3.5-0.8b-q4", "q4"),
+                (32, False, "qwen3.5-0.8b-q4", "q4"),
+                (256, False, "qwen3.5-0.8b-q4", "q4"),
+                (256, False, "qwen3.5-0.8b-q4", "q4"),
+            ],
+        )
+        self.assertEqual(
+            mlx.calls,
+            [
+                (32, True, "qwen3.5-0.8b", "q4"),
+                (32, False, "qwen3.5-0.8b", "q4"),
+                (32, False, "qwen3.5-0.8b", "q4"),
+                (256, True, "qwen3.5-0.8b", "q4"),
+                (256, False, "qwen3.5-0.8b", "q4"),
+                (256, False, "qwen3.5-0.8b", "q4"),
+            ],
+        )
+        self.assertEqual(
+            ollama.calls,
+            [
+                (32, False, "qwen3.5:0.8b", "q8"),
+                (32, False, "qwen3.5:0.8b", "q8"),
+                (256, False, "qwen3.5:0.8b", "q8"),
+                (256, False, "qwen3.5:0.8b", "q8"),
+            ],
+        )
+
+        # Engine run order in the raw observation stream matches the
+        # profile's engines order exactly: all of lattice's rows, then all
+        # of mlx's, then all of ollama's.
+        self.assertEqual(
+            [o.engine for o in result.observations],
+            ["lattice"] * 4 + ["mlx"] * 6 + ["ollama"] * 4,
+        )
+
+        # Per-row identity: each observation records ITS OWN engine's
+        # requested model/quantization, never another engine's or a
+        # profile-wide value (the blocker this schema fixes).
+        for obs in result.observations:
+            if obs.engine == "lattice":
+                self.assertEqual((obs.model, obs.quantization), ("qwen3.5-0.8b-q4", "q4"))
+            elif obs.engine == "mlx":
+                self.assertEqual((obs.model, obs.quantization), ("qwen3.5-0.8b", "q4"))
+            elif obs.engine == "ollama":
+                self.assertEqual((obs.model, obs.quantization), ("qwen3.5:0.8b", "q8"))
+            else:  # pragma: no cover -- defensive, should be unreachable
+                self.fail(f"unexpected engine {obs.engine!r}")
 
 
 # --------------------------------------------------------------------------
@@ -423,7 +681,7 @@ class AggregateTest(unittest.TestCase):
         # Fixed 1ms-per-call harness clock overhead is negligible next to the
         # adapter's own synthetic timing, so drive elapsed_ns directly via a
         # clock that advances by a known amount per adapter call.
-        profile = _profile(warmup_repeats=0, measured_repeats=3, windows=[32, 256], aggregation="median")
+        profile = _profile(measured_repeats=3, windows=[32, 256], aggregation="median")
         # 10 tok/s target: dt = (256-32)/10 = 22.4s. Each window's 3 measured
         # runs get identical elapsed_ns so the median is exact.
         # window 32: elapsed = 3.2s/call (32 tok @ 10 tok/s)
@@ -436,24 +694,60 @@ class AggregateTest(unittest.TestCase):
         slopes = harness.aggregate(result)
         self.assertEqual(len(slopes), 1)
         self.assertAlmostEqual(slopes[0].slope_tok_per_s, 10.0, places=6)
-        self.assertIsNone(slopes[0].slope_ci95)
+        self.assertIsNone(slopes[0].slope_ci95_legacy)
 
-    def test_trimmed_mean_slope_has_ci(self):
-        profile = _profile(
-            warmup_repeats=0, measured_repeats=5, windows=[32, 256], aggregation="trimmed_mean", trim=1
-        )
-        steps = [3.0e9, 3.2e9, 3.2e9, 3.2e9, 3.4e9, 25.0e9, 25.6e9, 25.6e9, 25.6e9, 26.0e9]
-        clock = _StepClock(steps)
+    def test_trimmed_mean_stat_exact_with_asymmetric_outliers(self):
+        # Direct unit test of the trimming primitive: a low and a high
+        # outlier that trimming must remove for the trimmed mean to differ
+        # measurably from the plain mean. Mutation `trimmed = ordered`
+        # (dropping the trim entirely) changes this result from 3.2 to
+        # 4.52 -- verified locally by reverting the trim slice and
+        # confirming this test fails, then restoring it.
+        values = [3.0, 3.1, 3.2, 3.3, 10.0]
+        trimmed_subset = [3.1, 3.2, 3.3]
+        expected_mean = statistics.mean(trimmed_subset)
+        expected_ci_legacy = 1.96 * statistics.stdev(trimmed_subset) / math.sqrt(len(trimmed_subset))
+
+        mean, ci_legacy = harness._trimmed_mean_stat(values, trim=1)
+
+        self.assertAlmostEqual(mean, expected_mean, places=10)
+        self.assertAlmostEqual(ci_legacy, expected_ci_legacy, places=10)
+        # The untrimmed mean is far enough away that a trim-removal
+        # mutation cannot accidentally still pass these assertions.
+        self.assertNotAlmostEqual(mean, statistics.mean(values), places=1)
+
+    def test_trimmed_mean_slope_exact_with_asymmetric_outliers(self):
+        profile = _profile(measured_repeats=5, windows=[32, 256], aggregation="trimmed_mean", trim=1)
+        # Both windows carry one high outlier each so the plain mean and
+        # the trimmed mean diverge; the trimmed subset is known exactly, so
+        # the expected slope and legacy CI are computable by hand from it.
+        baseline_steps = [3.0e9, 3.1e9, 3.2e9, 3.3e9, 10.0e9]
+        window_steps = [25.0e9, 25.1e9, 25.2e9, 25.3e9, 40.0e9]
+        clock = _StepClock(baseline_steps + window_steps)
         result = harness.run_profile(
             profile, {"fake": _FakeAdapter()}, clock=clock, git_sha_value="x", hardware_id_value="h"
         )
         slopes = harness.aggregate(result)
         self.assertEqual(len(slopes), 1)
-        self.assertIsNotNone(slopes[0].slope_ci95)
-        self.assertGreater(slopes[0].slope_tok_per_s, 0)
+
+        trimmed_baseline = [3.1, 3.2, 3.3]
+        trimmed_window = [25.1, 25.2, 25.3]
+        expected_baseline_mean = statistics.mean(trimmed_baseline)
+        expected_window_mean = statistics.mean(trimmed_window)
+        expected_baseline_ci = 1.96 * statistics.stdev(trimmed_baseline) / math.sqrt(len(trimmed_baseline))
+        expected_window_ci = 1.96 * statistics.stdev(trimmed_window) / math.sqrt(len(trimmed_window))
+        expected_slope = (256 - 32) / (expected_window_mean - expected_baseline_mean)
+        expected_ci_legacy = expected_slope * math.sqrt(
+            (expected_baseline_ci / expected_baseline_mean) ** 2
+            + (expected_window_ci / expected_window_mean) ** 2
+        )
+
+        self.assertAlmostEqual(slopes[0].slope_tok_per_s, expected_slope, places=6)
+        self.assertIsNotNone(slopes[0].slope_ci95_legacy)
+        self.assertAlmostEqual(slopes[0].slope_ci95_legacy, expected_ci_legacy, places=6)
 
     def test_multi_window_produces_one_slope_per_comparison_window(self):
-        profile = _profile(warmup_repeats=0, measured_repeats=2, windows=[8, 64, 128])
+        profile = _profile(measured_repeats=2, windows=[8, 64, 128])
         result = harness.run_profile(
             profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
         )
@@ -462,7 +756,7 @@ class AggregateTest(unittest.TestCase):
         self.assertTrue(all(s.baseline_window == 8 for s in slopes))
 
     def test_native_throughput_uses_actual_completion_tokens(self):
-        profile = _profile(warmup_repeats=0, measured_repeats=1, windows=[32, 256])
+        profile = _profile(measured_repeats=1, windows=[32, 256])
         result = harness.run_profile(
             profile,
             {"fake": _FakeAdapter(native_ns_per_token=1_000_000)},  # 1000 tok/s native
@@ -475,7 +769,7 @@ class AggregateTest(unittest.TestCase):
         self.assertAlmostEqual(native, 1000.0, places=3)
 
     def test_native_throughput_none_when_unreported(self):
-        profile = _profile(warmup_repeats=0, measured_repeats=1, windows=[32, 256])
+        profile = _profile(measured_repeats=1, windows=[32, 256])
         result = harness.run_profile(
             profile, {"fake": _FakeAdapter(native_ns_per_token=None)}, clock=_FakeClock(),
             git_sha_value="x", hardware_id_value="h",
@@ -508,7 +802,7 @@ class _StepClock:
 
 class RenderReportTest(unittest.TestCase):
     def test_report_mentions_profile_and_missing_engines(self):
-        profile = _profile(engines=["fake", "ghost"])
+        profile = _profile(engines=[_engine("fake"), _engine("ghost")])
         result = harness.run_profile(
             profile,
             {"fake": _FakeAdapter()},
@@ -524,7 +818,7 @@ class RenderReportTest(unittest.TestCase):
         self.assertIn("fake", report)
 
     def test_report_handles_no_measured_data(self):
-        profile = _profile(engines=["ghost"])
+        profile = _profile(engines=[_engine("ghost")])
         result = harness.run_profile(profile, {}, allow_missing_engine=True, clock=_FakeClock())
         report = harness.render_report(result, harness.aggregate(result))
         self.assertIn("no measured data", report)
@@ -563,10 +857,12 @@ schema_version = 1
 
 [profiles.smoke]
 windows = [32, 256]
-warmup_repeats = 0
 measured_repeats = 1
-engines = ["nonexistent-engine"]
 prompt = "hello"
+
+[[profiles.smoke.engines]]
+name = "nonexistent-engine"
+warmup_repeats = 0
 model = "m"
 quantization = "q8"
 """,
@@ -584,10 +880,12 @@ schema_version = 1
 
 [profiles.smoke]
 windows = [32, 256]
-warmup_repeats = 0
 measured_repeats = 1
-engines = ["nonexistent-engine"]
 prompt = "hello"
+
+[[profiles.smoke.engines]]
+name = "nonexistent-engine"
+warmup_repeats = 0
 model = "m"
 quantization = "q8"
 """,

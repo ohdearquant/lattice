@@ -2,10 +2,18 @@
 #
 # Each `[profiles.<name>]` table fully specifies one decode-benchmark
 # configuration for `scripts/bench_decode_harness.py run --profile <name>`:
-# the window schedule, warmup/measured repeat counts, engines, aggregation
-# method, and the fixed prompt. `windows[0]` is the shared baseline; every
-# later value in `windows` is compared against it to compute a marginal
-# decode-throughput slope (see `bench_decode_harness.py:aggregate`).
+# the window schedule, measured repeat count, per-engine run groups,
+# aggregation method, and the fixed prompt. `windows[0]` is the shared
+# baseline; every later value in `windows` is compared against it to
+# compute a marginal decode-throughput slope (see
+# `bench_decode_harness.py:aggregate`).
+#
+# Every engine gets its own `[[profiles.<name>.engines]]` table -- an
+# ordered array, not a flat name list -- because the legacy scripts this
+# harness consolidates give each engine its own warmup schedule (e.g. only
+# MLX warms up in `bench_apples_to_apples.sh`) and, for the Q4/Q8
+# comparison in `bench_q4_apples.sh`, a different quantization per engine
+# within one profile (Lattice Q4, MLX Q4, Ollama Q8 as reference only).
 #
 # This file intentionally defines no profiles yet. The five live consumers
 # (`bench_apples_to_apples.sh`, `bench_apples_precise.sh`, `bench_q4_apples.sh`,
@@ -15,17 +23,47 @@
 # exact parameters before it is added below.
 #
 # Schema (for reference; enforced by `bench_decode_harness.py:_parse_profile`):
-#   description             string, optional
-#   windows                 list[int], >= 2 entries, strictly increasing
-#   warmup_repeats           int, >= 0
+#   description              string, optional
+#   windows                  list[int], >= 2 entries, strictly increasing
 #   measured_repeats         int, >= 1
-#   engines                  list[string], non-empty, no duplicates
+#   engines                  list[table], non-empty, no duplicate `name`s;
+#                            each table:
+#     name                     string, non-empty
+#     warmup_repeats           int, >= 0
+#     model                    string, non-empty
+#     quantization             string, non-empty
 #   prompt                   string, non-empty
-#   model                    string, non-empty
-#   quantization             string, non-empty
 #   aggregation              "median" (default) or "trimmed_mean"
 #   trim                     int, >= 0; only valid when aggregation = "trimmed_mean"
 #   requested_prompt_tokens  int, optional
+#
+# Example (not a live profile -- illustrates the Q4/Q8-mixed shape from
+# bench_q4_apples.sh; uncomment and rename to activate):
+#
+# [profiles.example_q4_apples]
+# description = "example only, see bench_q4_apples.sh for the real profile"
+# windows = [32, 256]
+# measured_repeats = 5
+# prompt = "The quick brown fox jumps over the lazy dog."
+# aggregation = "median"
+#
+# [[profiles.example_q4_apples.engines]]
+# name = "lattice"
+# warmup_repeats = 0
+# model = "qwen3.5-0.8b-q4"
+# quantization = "q4"
+#
+# [[profiles.example_q4_apples.engines]]
+# name = "mlx"
+# warmup_repeats = 1
+# model = "qwen3.5-0.8b"
+# quantization = "q4"
+#
+# [[profiles.example_q4_apples.engines]]
+# name = "ollama"
+# warmup_repeats = 0
+# model = "qwen3.5:0.8b"
+# quantization = "q8"
 
 schema_version = 1
 
