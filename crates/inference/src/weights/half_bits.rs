@@ -172,13 +172,28 @@ mod tests {
         (bits.wrapping_add(half) >> 16) as u16
     }
 
+    /// A signaling-NaN f16 bit pattern: all-ones exponent, nonzero mantissa,
+    /// mantissa MSB (the quiet bit, bit 9) clear.
+    fn is_signaling_nan_bits(bits: u16) -> bool {
+        let exp = (bits >> 10) & 0x1f;
+        let frac = bits & 0x03ff;
+        exp == 0x1f && frac != 0 && (frac & 0x0200) == 0
+    }
+
     #[test]
-    fn f16_bits_to_f32_exhaustive_roundtrip_matches_ieee754() {
-        // Exhaustive check over all 65,536 f16 bit patterns: widening to f32
-        // and narrowing back with our own encoder must reproduce the
-        // original bits, except where IEEE-754 legitimately collapses
-        // distinct encodings (only signaling-vs-quiet NaN payload variance,
-        // which f32_to_f16_bits always normalizes to a canonical quiet NaN).
+    fn f16_widen_narrow_composition_round_trips_self_consistently() {
+        // NOTE: this test only proves `f16_bits_to_f32` and `f32_to_f16_bits`
+        // are mutually consistent (encode(decode(bits)) == bits) — it does
+        // NOT prove either function matches IEEE-754 or an external decoder,
+        // because both sides of the comparison come from this module. A
+        // decode bug that is exactly undone by a matching encode bug (or
+        // vice versa) passes this test silently: a wrong infinity decode
+        // constant and ties-away-from-zero rounding were both injected as
+        // test mutations and left this test green. Independent
+        // verification against a third-party decoder lives in
+        // `f16_bits_to_f32_matches_independent_half_crate_oracle` and
+        // `f16_bits_to_f32_signaling_nan_is_lossless_widen_independent_of_decoder`
+        // below; do not treat this test alone as a correctness guarantee.
         for bits in 0u32..=0xffff {
             let bits = bits as u16;
             let widened = f16_bits_to_f32(bits);
@@ -197,6 +212,161 @@ mod tests {
                 "roundtrip mismatch: bits={bits:#06x} widened={widened} narrowed={narrowed:#06x}"
             );
         }
+    }
+
+    /// Independent-oracle equivalence check (lattice#799):
+    /// for every non-signaling-NaN f16 bit pattern (zero, subnormal, normal,
+    /// infinity, quiet NaN), `f16_bits_to_f32` must produce the exact same
+    /// f32 bits as the third-party `half` crate's `f16::from_bits().to_f32()`
+    /// — a decoder this module shares no code with. `half` is already an
+    /// unconditional workspace dependency (`half.workspace = true` in
+    /// `crates/inference/Cargo.toml`, used directly elsewhere in this crate,
+    /// e.g. `kv_cache/flat.rs`), so this adds no new dependency.
+    ///
+    /// Signaling NaN bit patterns are excluded here on purpose, not skipped
+    /// out of laziness: on this machine `half::f16::to_f32()` dispatches to
+    /// the AArch64 hardware `fcvt` instruction (via runtime
+    /// `is_aarch64_feature_detected!("fp16")`), and ARM's FCVT forces the
+    /// quiet bit on a signaling-NaN operand per the architecture's default
+    /// NaN-propagation rule for conversions. That is correct, real hardware
+    /// behavior for `half`, but it means `half` does NOT perform a pure
+    /// lossless bit-widen for signaling NaNs on this platform — comparing
+    /// against it here would fail on all 1,022 signaling-NaN patterns for a
+    /// reason that has nothing to do with `half_bits`. This module's own
+    /// documented contract (preserve the signaling/quiet distinction
+    /// exactly, matching a pure software widen) is verified independently,
+    /// without going through `half`, in the sibling test below.
+    #[test]
+    fn f16_bits_to_f32_matches_independent_half_crate_oracle() {
+        let mut checked = 0u32;
+        for bits in 0u32..=0xffff {
+            let bits = bits as u16;
+            if is_signaling_nan_bits(bits) {
+                continue;
+            }
+            let ours = f16_bits_to_f32(bits).to_bits();
+            let oracle = half::f16::from_bits(bits).to_f32().to_bits();
+            assert_eq!(
+                ours, oracle,
+                "f16_bits_to_f32({bits:#06x}) diverges from the `half` crate oracle: \
+                 ours={ours:#010x} oracle={oracle:#010x}"
+            );
+            checked += 1;
+        }
+        // 65,536 total patterns minus the 1,022 excluded signaling NaNs
+        // (511 payloads x 2 signs) confirms the exclusion is exact, not an
+        // accidentally-empty sweep.
+        assert_eq!(
+            checked,
+            65536 - 1022,
+            "expected exactly the non-signaling-NaN f16 bit space to be checked"
+        );
+    }
+
+    /// Independent, hand-derived (not decoder-composed) check that signaling
+    /// NaN widening is a pure lossless bit-widen: sign preserved, exponent
+    /// field forced all-ones, and the f32 mantissa is exactly the f16
+    /// mantissa left-shifted by 13 with the low 13 bits zero-filled — the
+    /// textbook IEEE-754 widening formula, computed here directly from the
+    /// bit pattern rather than by calling any function in this module. This
+    /// is what makes the signaling/quiet distinction claim in
+    /// `f16_bits_to_f32`'s doc comment independently verifiable even though
+    /// the third-party oracle above cannot be used for these patterns (see
+    /// its doc comment for why).
+    #[test]
+    fn f16_bits_to_f32_signaling_nan_is_lossless_widen_independent_of_decoder() {
+        let mut checked = 0u32;
+        for bits in 0u32..=0xffff {
+            let bits = bits as u16;
+            if !is_signaling_nan_bits(bits) {
+                continue;
+            }
+            let sign = (bits >> 15) & 0x1;
+            let frac = (bits & 0x03ff) as u32;
+            let expected_bits = ((sign as u32) << 31) | 0x7f80_0000 | (frac << 13);
+
+            let widened = f16_bits_to_f32(bits);
+            assert!(
+                widened.is_nan(),
+                "signaling NaN bits {bits:#06x} must widen to NaN"
+            );
+            assert_eq!(
+                widened.to_bits(),
+                expected_bits,
+                "signaling NaN {bits:#06x} did not widen losslessly: \
+                 got={:#010x} expected={expected_bits:#010x}",
+                widened.to_bits()
+            );
+            // The signaling bit (mantissa MSB, f32 bit 22) must stay clear —
+            // a decoder that force-quiets NaNs (like this platform's `half`
+            // hardware path) would set it and this assertion would catch it.
+            assert_eq!(
+                widened.to_bits() & 0x0040_0000,
+                0,
+                "signaling NaN {bits:#06x} must NOT be quieted by decode"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 1022, "expected exactly 511 payloads x 2 signs");
+    }
+
+    /// Independent boundary check (lattice#799) at the
+    /// subnormal/normal f16 encoding edge, computed from literal f32 values
+    /// (not by calling `f16_bits_to_f32`) and verified against the `half`
+    /// crate oracle. The smallest normal f16 is 2^-14 (bits `0x0400`); the
+    /// largest subnormal is 2^-14 * (1023/1024) (bits `0x03ff`).
+    #[test]
+    fn f32_to_f16_bits_subnormal_normal_boundary_matches_independent_oracle() {
+        let smallest_normal = 2f32.powi(-14);
+        let largest_subnormal = 2f32.powi(-14) * (1023.0 / 1024.0);
+        // One ULP below the subnormal/normal boundary on each side (f16
+        // subnormal ULP is 2^-24), staying inside its own bin.
+        let just_below_boundary = largest_subnormal - 2f32.powi(-25); // rounds down, stays subnormal
+        let just_above_boundary = smallest_normal + 2f32.powi(-25); // rounds up, stays normal
+
+        for v in [
+            largest_subnormal,
+            smallest_normal,
+            just_below_boundary,
+            just_above_boundary,
+        ] {
+            let ours = f32_to_f16_bits(v);
+            let oracle = half::f16::from_f32(v).to_bits();
+            assert_eq!(
+                ours, oracle,
+                "f32_to_f16_bits({v}) diverges from the `half` crate oracle at the \
+                 subnormal/normal boundary: ours={ours:#06x} oracle={oracle:#06x}"
+            );
+        }
+        assert_eq!(f32_to_f16_bits(largest_subnormal), 0x03ff);
+        assert_eq!(f32_to_f16_bits(smallest_normal), 0x0400);
+    }
+
+    /// Independent boundary check (lattice#799) at the
+    /// finite/infinity f16 encoding edge, computed from literal f32 values
+    /// and verified against the `half` crate oracle. `65504.0` (bits
+    /// `0x7bff`) is the largest finite f16; the f16 ULP at that exponent is
+    /// 32, so `65504 + 16 = 65520` is the exact round-to-nearest-even
+    /// midpoint between the largest finite value and overflow to infinity.
+    #[test]
+    fn f32_to_f16_bits_finite_infinity_boundary_matches_independent_oracle() {
+        let f16_max = 65504.0f32;
+        let midpoint = 65520.0f32;
+        let just_below_midpoint = 65519.0f32; // rounds down, stays finite
+        let just_above_midpoint = 65521.0f32; // rounds up, overflows to infinity
+
+        for v in [f16_max, midpoint, just_below_midpoint, just_above_midpoint] {
+            let ours = f32_to_f16_bits(v);
+            let oracle = half::f16::from_f32(v).to_bits();
+            assert_eq!(
+                ours, oracle,
+                "f32_to_f16_bits({v}) diverges from the `half` crate oracle at the \
+                 finite/infinity boundary: ours={ours:#06x} oracle={oracle:#06x}"
+            );
+        }
+        assert_eq!(f32_to_f16_bits(f16_max), 0x7bff);
+        assert_eq!(f32_to_f16_bits(just_below_midpoint), 0x7bff);
+        assert_eq!(f32_to_f16_bits(just_above_midpoint), 0x7c00);
     }
 
     #[test]
