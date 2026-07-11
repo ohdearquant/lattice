@@ -70,6 +70,29 @@ def _aggregate(**overrides) -> harness.CellAggregate:
     return harness.parse_cell_aggregate(d)
 
 
+def _phase_events(n_tokens: int = 2) -> tuple[harness.PhaseEvent, ...]:
+    """A valid, canonically-ordered load->prefill->decode phase-event
+    sequence -- the default every `_cell_record` fixture carries unless a
+    test is specifically exercising `_validate_phase_sequence`."""
+    events = [
+        harness.parse_phase_event({"name": "load_start", "monotonic_ns": 0}),
+        harness.parse_phase_event({"name": "backend_ready", "monotonic_ns": 10}),
+        harness.parse_phase_event({"name": "prefill_start", "monotonic_ns": 20}),
+        harness.parse_phase_event({"name": "prefill_end", "monotonic_ns": 30}),
+    ]
+    for i in range(n_tokens):
+        events.append(
+            harness.parse_phase_event({"name": "token_available", "monotonic_ns": 40 + i * 5, "token_index": i + 1})
+        )
+    return tuple(events)
+
+
+def _resource_sample(**overrides) -> harness.ResourceSample:
+    d = {"monotonic_ns": 5, "phys_footprint_bytes": 1_000_000}
+    d.update(overrides)
+    return harness.parse_resource_sample(d)
+
+
 def _cell_record(**overrides) -> harness.CellRecord:
     return harness.CellRecord(
         cell_id=overrides.pop("cell_id", "decode:qwen3.5-small:f16:cpu:1024"),
@@ -85,7 +108,7 @@ def _cell_record(**overrides) -> harness.CellRecord:
         unsupported_reason=overrides.pop("unsupported_reason", None),
         path_proof=overrides.pop("path_proof", ()),
         lock_receipts=overrides.pop("lock_receipts", ()),
-        phase_events=overrides.pop("phase_events", ()),
+        phase_events=overrides.pop("phase_events", _phase_events()),
         resource_samples=overrides.pop("resource_samples", ()),
         provenance=overrides.pop("provenance", _provenance()),
         order_balance=overrides.pop("order_balance", (4, 3)),
@@ -103,6 +126,24 @@ def _metal_lock(**overrides) -> harness.LockReceipt:
     }
     d.update(overrides)
     return harness.parse_lock_receipt(d)
+
+
+def _heavy_lane_lock(**overrides) -> harness.LockReceipt:
+    d = {
+        "lock_name": "heavy-lane",
+        "acquired_at": "2026-07-11T00:00:00+00:00",
+        "released_at": "2026-07-11T00:05:00+00:00",
+        "held_continuously": True,
+        "wait_seconds": 0.2,
+    }
+    d.update(overrides)
+    return harness.parse_lock_receipt(d)
+
+
+def _metal_locks() -> tuple[harness.LockReceipt, ...]:
+    """Both continuously-held receipts a device=metal cell needs: the
+    outer heavy-lane receipt AND the metal-gpu receipt."""
+    return (_heavy_lane_lock(), _metal_lock())
 
 
 # --------------------------------------------------------------------------
@@ -177,12 +218,19 @@ class ProvenanceParseTest(unittest.TestCase):
 
 class MissingPathProofTest(unittest.TestCase):
     def test_metal_cell_without_path_proof_fails_closed(self):
-        record = _cell_record(device="metal", path_proof=(), lock_receipts=(_metal_lock(),))
+        record = _cell_record(
+            device="metal", path_proof=(), lock_receipts=_metal_locks(), resource_samples=(_resource_sample(),)
+        )
         with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*path_proof"):
             harness.validate_run_record(record)
 
     def test_metal_cell_with_path_proof_passes(self):
-        record = _cell_record(device="metal", path_proof=("attention_dispatch_counter>0",), lock_receipts=(_metal_lock(),))
+        record = _cell_record(
+            device="metal",
+            path_proof=("attention_dispatch_counter>0",),
+            lock_receipts=_metal_locks(),
+            resource_samples=(_resource_sample(),),
+        )
         harness.validate_run_record(record)  # must not raise
 
     def test_cpu_cell_needs_no_path_proof(self):
@@ -198,15 +246,113 @@ class MissingLockReceiptTest(unittest.TestCase):
 
     def test_metal_cell_with_released_not_held_continuously_fails_closed(self):
         bad_lock = _metal_lock(held_continuously=False)
-        record = _cell_record(device="metal", path_proof=("proof",), lock_receipts=(bad_lock,))
+        record = _cell_record(device="metal", path_proof=("proof",), lock_receipts=(_heavy_lane_lock(), bad_lock))
         with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*lock_receipt"):
             harness.validate_run_record(record)
 
     def test_metal_cell_with_wrong_lock_name_fails_closed(self):
-        wrong_lock = _metal_lock(lock_name="heavy-lane")
-        record = _cell_record(device="metal", path_proof=("proof",), lock_receipts=(wrong_lock,))
+        wrong_lock = _metal_lock(lock_name="something-else")
+        record = _cell_record(device="metal", path_proof=("proof",), lock_receipts=(_heavy_lane_lock(), wrong_lock))
         with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*lock_receipt"):
             harness.validate_run_record(record)
+
+    def test_metal_cell_with_only_metal_gpu_lock_fails_closed(self):
+        """A Metal record with ONLY the metal-gpu
+        receipt (no heavy-lane) must reject -- both locks are required."""
+        record = _cell_record(
+            device="metal", path_proof=("proof",), lock_receipts=(_metal_lock(),), resource_samples=(_resource_sample(),)
+        )
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*heavy-lane"):
+            harness.validate_run_record(record)
+
+    def test_metal_cell_with_only_heavy_lane_lock_fails_closed(self):
+        """A Metal record with ONLY the heavy-lane
+        receipt (no metal-gpu) must reject -- both locks are required."""
+        record = _cell_record(
+            device="metal", path_proof=("proof",), lock_receipts=(_heavy_lane_lock(),), resource_samples=(_resource_sample(),)
+        )
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*metal-gpu"):
+            harness.validate_run_record(record)
+
+    def test_metal_cell_without_resource_samples_fails_closed(self):
+        """A non-unsupported Metal record with both
+        locks but empty resource_samples must reject -- the
+        contention/memory-footprint proof is missing."""
+        record = _cell_record(
+            device="metal", path_proof=("proof",), lock_receipts=_metal_locks(), resource_samples=()
+        )
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*resource_samples"):
+            harness.validate_run_record(record)
+
+    def test_metal_cell_with_both_locks_and_samples_passes(self):
+        record = _cell_record(
+            device="metal", path_proof=("proof",), lock_receipts=_metal_locks(), resource_samples=(_resource_sample(),)
+        )
+        harness.validate_run_record(record)  # must not raise
+
+
+class PhaseSequenceTest(unittest.TestCase):
+    """Every non-unsupported record must carry a
+    validated, correctly-ordered phase-event sequence."""
+
+    def test_empty_phase_events_fails_closed(self):
+        record = _cell_record(phase_events=())
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*phase_events"):
+            harness.validate_run_record(record)
+
+    def test_missing_required_phase_fails_closed(self):
+        events = tuple(ev for ev in _phase_events() if ev.name != "prefill_end")
+        record = _cell_record(phase_events=events)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*missing required phase"):
+            harness.validate_run_record(record)
+
+    def test_no_token_available_fails_closed(self):
+        events = tuple(ev for ev in _phase_events() if ev.name != "token_available")
+        record = _cell_record(phase_events=events)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*token_available"):
+            harness.validate_run_record(record)
+
+    def test_out_of_order_phases_fails_closed(self):
+        events = (
+            harness.parse_phase_event({"name": "prefill_start", "monotonic_ns": 0}),
+            harness.parse_phase_event({"name": "load_start", "monotonic_ns": 10}),
+            harness.parse_phase_event({"name": "backend_ready", "monotonic_ns": 20}),
+            harness.parse_phase_event({"name": "prefill_end", "monotonic_ns": 30}),
+            harness.parse_phase_event({"name": "token_available", "monotonic_ns": 40, "token_index": 1}),
+        )
+        record = _cell_record(phase_events=events)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*out of order"):
+            harness.validate_run_record(record)
+
+    def test_monotonic_ns_backwards_fails_closed(self):
+        events = (
+            harness.parse_phase_event({"name": "load_start", "monotonic_ns": 100}),
+            harness.parse_phase_event({"name": "backend_ready", "monotonic_ns": 10}),
+            harness.parse_phase_event({"name": "prefill_start", "monotonic_ns": 20}),
+            harness.parse_phase_event({"name": "prefill_end", "monotonic_ns": 30}),
+            harness.parse_phase_event({"name": "token_available", "monotonic_ns": 40, "token_index": 1}),
+        )
+        record = _cell_record(phase_events=events)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*backwards"):
+            harness.validate_run_record(record)
+
+    def test_non_increasing_token_index_fails_closed(self):
+        events = _phase_events()[:4] + (
+            harness.parse_phase_event({"name": "token_available", "monotonic_ns": 40, "token_index": 2}),
+            harness.parse_phase_event({"name": "token_available", "monotonic_ns": 45, "token_index": 2}),
+        )
+        record = _cell_record(phase_events=events)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*token_index"):
+            harness.validate_run_record(record)
+
+    def test_unsupported_cell_exempt_from_phase_sequence(self):
+        agg = _aggregate(measured_cv=None, required_n=None, n_valid=0)
+        record = _cell_record(phase_events=(), aggregate=agg, verdict="unsupported", unsupported_reason="no checkpoint yet")
+        harness.validate_run_record(record)  # must not raise
+
+    def test_valid_sequence_passes(self):
+        record = _cell_record(phase_events=_phase_events())
+        harness.validate_run_record(record)  # must not raise
 
 
 class NonFiniteMetricTest(unittest.TestCase):
@@ -270,6 +416,61 @@ class LowValidNTest(unittest.TestCase):
         agg = _aggregate(measured_cv=None, required_n=None, n_valid=0)
         record = _cell_record(aggregate=agg, verdict="unsupported", unsupported_reason="no checkpoint yet")
         harness.validate_run_record(record)  # must not raise
+
+
+class SubmitterControlledRequiredNTest(unittest.TestCase):
+    """required_n must be RE-DERIVED from the registered
+    per-metric policy and the measured CV -- never trusted as optional,
+    submitter-supplied record metadata."""
+
+    def test_cv_three_percent_with_required_n_none_fails_closed(self):
+        # decode/decode_tok_s is class A; CV 3% -> policy requires n=25,
+        # not the n=7 band. required_n=None can never match.
+        agg = _aggregate(n_valid=0, required_n=None, measured_cv=0.03)
+        record = _cell_record(aggregate=agg)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*required_n"):
+            harness.validate_run_record(record)
+
+    def test_forged_required_n_seven_at_cv_three_percent_fails_closed(self):
+        # a submitter claims required_n=7 (matching a low, easy n_valid)
+        # at CV 3%, where the registered policy actually derives n=25.
+        agg = _aggregate(n_valid=7, required_n=7, measured_cv=0.03)
+        record = _cell_record(aggregate=agg)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*required_n"):
+            harness.validate_run_record(record)
+
+    def test_embed_batch_p95_class_b_with_seven_pairs_fails_closed(self):
+        # embed.batch_p95 is registered class B (min nine pairs at low
+        # CV); a family-name heuristic that treated it as class A
+        # silently accepted seven (the concrete regression this guards).
+        agg = _aggregate(n_valid=7, required_n=7, measured_cv=0.01)
+        record = _cell_record(metric_family="embed", metric_name="batch_p95", aggregate=agg)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*required_n"):
+            harness.validate_run_record(record)
+
+    def test_embed_batch_p95_class_b_with_nine_pairs_passes(self):
+        agg = _aggregate(n_valid=9, required_n=9, measured_cv=0.01)
+        record = _cell_record(metric_family="embed", metric_name="batch_p95", aggregate=agg)
+        harness.validate_run_record(record)  # must not raise
+
+    def test_decode_at_cv_three_percent_with_correct_required_n_passes(self):
+        agg = _aggregate(n_valid=25, required_n=25, measured_cv=0.03)
+        record = _cell_record(aggregate=agg)
+        harness.validate_run_record(record)  # must not raise
+
+    def test_class_c_metric_exempt_from_required_n_derivation(self):
+        # memory.model_load_time is registered class C (informational
+        # only, never gates a required cell) -- no required_n derivation
+        # applies, so a null required_n on a low n_valid does not reject.
+        agg = _aggregate(n_valid=1, required_n=None, measured_cv=0.20)
+        record = _cell_record(metric_family="memory", metric_name="model_load_time", aggregate=agg)
+        harness.validate_run_record(record)  # must not raise
+
+    def test_unregistered_metric_fails_closed(self):
+        agg = _aggregate(n_valid=7, required_n=7, measured_cv=0.01)
+        record = _cell_record(metric_family="decode", metric_name="not_a_registered_metric", aggregate=agg)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL"):
+            harness.validate_run_record(record)
 
 
 class PostRunThresholdChangeTest(unittest.TestCase):
@@ -397,6 +598,7 @@ class PromotionRecordTest(unittest.TestCase):
             "failures": 0,
             "cp_bound_95": 0.14,  # rounded UP from the true ~0.1391 bound -- honest, not tighter
             "mainline_sessions": 10,
+            "invalid_pair_replacements": 0,
         }
         d.update(overrides)
         return harness.parse_promotion_record(d)
@@ -440,8 +642,105 @@ class PromotionRecordTest(unittest.TestCase):
                     "failures": 6,
                     "cp_bound_95": 0.5,
                     "mainline_sessions": 0,
+                    "invalid_pair_replacements": 0,
                 }
             )
+
+    def test_policy_version_mismatch_fails_closed(self):
+        # A record claiming policy_version=999 while all threshold values
+        # are actually v1-shaped must never be evaluated under v1's
+        # thresholds -- it must reject on the version binding itself,
+        # before any threshold comparison runs.
+        record = self._promotion(policy_version=999)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "policy_version=999"):
+            harness.validate_promotion_record(record)
+
+    def test_policy_version_match_passes(self):
+        record = self._promotion(policy_version=1)
+        harness.validate_promotion_record(record)  # must not raise
+
+    def test_missing_invalid_pair_replacements_rejected_at_parse(self):
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "missing required field"):
+            harness.parse_promotion_record(
+                {
+                    "cell_id": "x",
+                    "policy_version": 1,
+                    "null_sessions": 20,
+                    "failures": 0,
+                    "cp_bound_95": 0.14,
+                    "mainline_sessions": 10,
+                }
+            )
+
+
+class PromotionMainlineSessionsTest(unittest.TestCase):
+    """An earlier revision accepted a 20-null,
+    0-mainline-session promotion because `mainline_sessions` was never
+    examined. The policy registers `min_mainline_sessions = 10`."""
+
+    def _promotion(self, **overrides):
+        d = {
+            "cell_id": "decode:qwen3.5-small:f16:cpu:1024",
+            "policy_version": 1,
+            "null_sessions": 20,
+            "failures": 0,
+            "cp_bound_95": 0.14,
+            "mainline_sessions": 10,
+            "invalid_pair_replacements": 0,
+        }
+        d.update(overrides)
+        return harness.parse_promotion_record(d)
+
+    def test_zero_mainline_sessions_fails_closed(self):
+        record = self._promotion(mainline_sessions=0)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "mainline sessions"):
+            harness.validate_promotion_record(record)
+
+    def test_nine_mainline_sessions_fails_closed(self):
+        record = self._promotion(mainline_sessions=9)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "mainline sessions"):
+            harness.validate_promotion_record(record)
+
+    def test_ten_mainline_sessions_passes(self):
+        record = self._promotion(mainline_sessions=10)
+        harness.validate_promotion_record(record)  # must not raise
+
+
+class PromotionReplacementCapTest(unittest.TestCase):
+    """The registered replacement cap
+    (`max_invalid_pair_replacements = 3`) must be enforced fail-closed,
+    and a policy that omits the cap must reject rather than silently
+    default."""
+
+    def _promotion(self, **overrides):
+        d = {
+            "cell_id": "decode:qwen3.5-small:f16:cpu:1024",
+            "policy_version": 1,
+            "null_sessions": 20,
+            "failures": 0,
+            "cp_bound_95": 0.14,
+            "mainline_sessions": 10,
+            "invalid_pair_replacements": 0,
+        }
+        d.update(overrides)
+        return harness.parse_promotion_record(d)
+
+    def test_within_cap_passes(self):
+        record = self._promotion(invalid_pair_replacements=3)
+        harness.validate_promotion_record(record)  # must not raise
+
+    def test_exceeding_cap_fails_closed(self):
+        record = self._promotion(invalid_pair_replacements=4)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "invalid_pair_replacements"):
+            harness.validate_promotion_record(record)
+
+    def test_missing_cap_in_policy_fails_closed(self):
+        doc = harness.bench_gate_math.load_policy()
+        broken_promotion = {k: v for k, v in doc["promotion"].items() if k != "max_invalid_pair_replacements"}
+        broken_policy = {**doc, "promotion": broken_promotion}
+        record = self._promotion(invalid_pair_replacements=0)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "max_invalid_pair_replacements"):
+            harness.validate_promotion_record(record, policy=broken_policy)
 
 
 # --------------------------------------------------------------------------

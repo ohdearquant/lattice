@@ -149,6 +149,20 @@ def order_stratified_bootstrap_means(
     return means
 
 
+def _pvalue_from_boot_means(boot_means: Sequence[float], tau_log: float, b: int) -> float:
+    """Extraction-only half of `one_sided_bootstrap_pvalue`: turns an
+    ALREADY-GENERATED bootstrap-mean sample into the one-sided p-value,
+    without drawing any new resamples. Factored out so `evaluate_family_gate`
+    can derive the p-value and (later, at Holm's assigned tail) the lower
+    bound from the SAME retained sample instead of two independent bootstrap
+    draws — see `_lower_bound_from_sorted_boot_means` and the round-4
+    adversarial-review finding at `evaluate_family_gate`'s call sites for why
+    two independent draws break the percentile duality the module claims.
+    """
+    p = sum(1 for m in boot_means if m <= tau_log) / len(boot_means)
+    return max(p, 1.0 / b)
+
+
 def one_sided_bootstrap_pvalue(
     values: Sequence[float],
     order_ab: Sequence[bool],
@@ -162,8 +176,7 @@ def one_sided_bootstrap_pvalue(
     trivially always-reject.
     """
     boot_means = order_stratified_bootstrap_means(values, order_ab, b, rng)
-    p = sum(1 for m in boot_means if m <= tau_log) / len(boot_means)
-    return max(p, 1.0 / b)
+    return _pvalue_from_boot_means(boot_means, tau_log, b)
 
 
 def bootstrap_upper_bound(
@@ -175,9 +188,16 @@ def bootstrap_upper_bound(
     corrected_alpha: float,
 ) -> float:
     """The `(1 - corrected_alpha)` percentile of the bootstrap mean
-    distribution — the corrected one-sided upper confidence bound DESIGN.md
-    requires alongside the p-value for the FAIL decision ("FAIL requires
-    both effect size and corrected confidence bound cross its threshold").
+    distribution — a two-sided-diagnostic UPPER confidence bound, useful
+    for reporting/inspection only. This is NOT the bound the FAIL decision
+    consumes: `evaluate_family_gate`'s FAIL rule needs a one-sided LOWER
+    bound (a slowdown is positive and the claimed hypothesis is
+    `mean_slowdown > threshold`; confirming FAIL requires the LOWER bound
+    to itself exceed the threshold). Do not wire this function's result
+    into `CellAggregate.corrected_lower_bound` or any FAIL rule — use
+    `bootstrap_lower_bound` for that; an earlier revision of this module
+    conflated the two tails, which silently overstated regression
+    evidence.
     """
     if not (0.0 < corrected_alpha < 1.0):
         raise GateMathError(f"corrected_alpha must be in (0, 1), got {corrected_alpha!r}")
@@ -185,6 +205,54 @@ def bootstrap_upper_bound(
     idx = min(len(boot_means) - 1, math.ceil((1.0 - corrected_alpha) * len(boot_means)) - 1)
     idx = max(idx, 0)
     return boot_means[idx]
+
+
+def _lower_bound_from_sorted_boot_means(
+    sorted_boot_means: Sequence[float], *, corrected_alpha: float
+) -> float:
+    """Extraction-only half of `bootstrap_lower_bound`: turns an
+    ALREADY-GENERATED, ALREADY-SORTED bootstrap-mean sample into the
+    `corrected_alpha`-percentile lower bound, without drawing any new
+    resamples. See `_pvalue_from_boot_means` for why this split exists.
+    """
+    if not (0.0 < corrected_alpha < 1.0):
+        raise GateMathError(f"corrected_alpha must be in (0, 1), got {corrected_alpha!r}")
+    idx = min(len(sorted_boot_means) - 1, math.ceil(corrected_alpha * len(sorted_boot_means)) - 1)
+    idx = max(idx, 0)
+    return sorted_boot_means[idx]
+
+
+def bootstrap_lower_bound(
+    values: Sequence[float],
+    order_ab: Sequence[bool],
+    b: int,
+    rng: random.Random,
+    *,
+    corrected_alpha: float,
+) -> float:
+    """The `corrected_alpha` percentile of the bootstrap mean distribution
+    — the corrected ONE-SIDED LOWER confidence bound DESIGN.md's FAIL rule
+    actually needs alongside the p-value ("FAIL requires both effect size
+    and corrected confidence bound cross its threshold"). A slowdown is
+    positive and the claimed hypothesis is `mean_slowdown > threshold`; a
+    confirmed FAIL needs a LOWER one-sided bound above the threshold, not
+    an upper one (`bootstrap_upper_bound` computes the wrong tail for this
+    purpose — see its docstring). The percentile-interval lower endpoint
+    sits at the alpha percentile, not `1 - alpha`
+    (https://tsapps.nist.gov/publication/get_pdf.cfm?pub_id=917303).
+
+    This is a standalone-resample convenience wrapper; `evaluate_family_gate`
+    does NOT call this function (it would draw a second, independent
+    bootstrap distribution from the one `one_sided_bootstrap_pvalue` already
+    drew for the same cell, breaking percentile duality between the p-value
+    and the bound — the round-4 adversarial-review finding). Instead it
+    calls `_lower_bound_from_sorted_boot_means` directly on the SAME sample
+    it already generated for the p-value.
+    """
+    if not (0.0 < corrected_alpha < 1.0):
+        raise GateMathError(f"corrected_alpha must be in (0, 1), got {corrected_alpha!r}")
+    boot_means = sorted(order_stratified_bootstrap_means(values, order_ab, b, rng))
+    return _lower_bound_from_sorted_boot_means(boot_means, corrected_alpha=corrected_alpha)
 
 
 # --------------------------------------------------------------------------
@@ -210,6 +278,41 @@ def holm_reject(pvalues: Sequence[float], alpha: float = 0.05) -> list[bool]:
         else:
             still_rejecting = False
     return reject
+
+
+def _holm_tested_tails(pvalues: Sequence[float], alpha: float) -> tuple[list[bool], list[float]]:
+    """Internal: replicates `holm_reject`'s own ascending-p-value order and
+    step-down stopping rule to determine, for each cell in INPUT order,
+    whether the executed procedure actually evaluated that rank's `alpha /
+    (m - k)` tail before the first failed comparison halted it, and that
+    tail itself (`0.0` where untested -- callers must gate on the `tested`
+    flag, never use an untested tail).
+
+    The rank at which the procedure stops (its first failed comparison) WAS
+    tested -- it just did not reject. Only ranks STRICTLY AFTER that one
+    were never evaluated at their less-stringent tail; `holm_reject` never
+    ran a comparison for them, so no bound computed "at their tail" is an
+    executed Holm bound. Deliberately duplicates `holm_reject`'s loop
+    (rather than calling it) so a test that mocks/mutates the public
+    `holm_reject` symbol cannot also change which ranks this function
+    reports as tested -- testedness is a property of the real step-down
+    order, independent of whatever reject-decision function a caller
+    plugs in.
+    """
+    m = len(pvalues)
+    order = sorted(range(m), key=lambda i: pvalues[i])
+    tested = [False] * m
+    tail = [0.0] * m
+    still_rejecting = True
+    for k, i in enumerate(order):
+        if not still_rejecting:
+            break
+        crit = alpha / (m - k)
+        tested[i] = True
+        tail[i] = crit
+        if pvalues[i] > crit:
+            still_rejecting = False
+    return tested, tail
 
 
 # --------------------------------------------------------------------------
@@ -345,6 +448,295 @@ def required_n(measured_cv: float, cv_bands: Sequence[CvBand], cell_class: str) 
         f"(highest is {cv_bands[-1].max_cv!r}) -- perf-policy.toml's catch-all band should have "
         "prevented this; treat as a policy-config bug, not a valid cell"
     )
+
+
+def resolve_metric_policy(policy_doc: dict, metric_family: str, metric_name: str) -> dict:
+    """Look up the registered per-metric policy table for
+    `(metric_family, metric_name)` in a loaded `perf-policy.toml` document
+    (`load_policy`'s return value). `[[families]]` entries come in two
+    shapes: a FLAT family table carrying its own `noise_class`/`warn_pct`/
+    `fail_pct` plus a `metrics` list of the metric names it covers (e.g.
+    `[families.decode]`), or a NESTED family table keyed by metric name,
+    each sub-table carrying its own `noise_class`/`warn_pct`/`fail_pct`
+    (e.g. `[families.prefill_ttft.ttft]`). This is the registered lookup
+    a validator MUST use to derive a cell's noise class -- never a
+    family-name heuristic: an earlier revision used a hard-coded
+    `family in (...)` shortcut that silently mis-classified
+    `embed.batch_p95` as class A when the policy registers it class B.
+
+    Raises `PolicyConfigError` when the family or metric is not
+    registered, or the resolved table has no valid `noise_class` -- an
+    unregistered metric can never be assumed class A (the cheapest,
+    least-scrutinized band).
+    """
+    families = policy_doc.get("families")
+    if not isinstance(families, dict):
+        raise PolicyConfigError("perf-policy.toml: [families] must be a table")
+    entry = families.get(metric_family)
+    if not isinstance(entry, dict):
+        raise PolicyConfigError(
+            f"perf-policy.toml: family {metric_family!r} is not registered under [families] "
+            "-- an unregistered family can never be assumed a default noise class"
+        )
+    if "metrics" in entry:
+        metrics = entry.get("metrics")
+        if not isinstance(metrics, list) or metric_name not in metrics:
+            raise PolicyConfigError(
+                f"perf-policy.toml: metric {metric_name!r} is not registered under family "
+                f"{metric_family!r} (registered metrics: {metrics!r})"
+            )
+        table = entry
+    else:
+        table = entry.get(metric_name)
+        if not isinstance(table, dict):
+            raise PolicyConfigError(
+                f"perf-policy.toml: metric {metric_name!r} is not registered under family "
+                f"{metric_family!r}"
+            )
+    noise_class = table.get("noise_class")
+    if noise_class not in CELL_CLASSES:
+        raise PolicyConfigError(
+            f"perf-policy.toml: family {metric_family!r} metric {metric_name!r} has no valid "
+            f"noise_class (must be one of {CELL_CLASSES}, got {noise_class!r})"
+        )
+    return table
+
+
+# --------------------------------------------------------------------------
+# Per-family gate evaluator (Holm + fail_margin_multiplier, integrated)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CellGateInput:
+    """One required cell's raw paired log-slowdown samples plus its
+    registered family-policy thresholds (already resolved via
+    `resolve_metric_policy`), the input `evaluate_family_gate` needs to
+    reach a PASS/WARN/FAIL verdict for that cell within its family."""
+
+    cell_id: str
+    values: tuple[float, ...]
+    order_ab: tuple[bool, ...]
+    measured_cv: float
+    cell_class: str  # "A" or "B" -- selects the cv_bands column
+    warn_pct: float
+    fail_pct: float
+
+
+@dataclass(frozen=True)
+class CellGateResult:
+    """One cell's gate-evaluator verdict, alongside the numbers that
+    produced it (queryable/loggable without re-running the bootstrap).
+
+    `corrected_lower_bound` is `None` when the Holm step-down procedure
+    never reached this cell's rank (it stopped at an earlier, more
+    significant rank first) -- there is no executed-at-this-tail bound to
+    report, and a cell in that state can never reach FAIL regardless of
+    its `holm_reject` flag (see `evaluate_family_gate`)."""
+
+    cell_id: str
+    point_estimate: float
+    p_value: float
+    corrected_lower_bound: float | None
+    holm_reject: bool
+    measured_cv: float
+    required_n: int
+    fail_margin_multiplier: float
+    verdict: str  # "PASS" | "WARN" | "FAIL"
+
+
+def evaluate_family_gate(
+    cells: Sequence[CellGateInput],
+    cv_bands: Sequence[CvBand],
+    *,
+    alpha_familywise: float = 0.05,
+    bootstrap_replicates: int = 2000,
+    rng: random.Random | None = None,
+) -> list[CellGateResult]:
+    """The complete per-family gate evaluator: computes a one-sided
+    bootstrap p-value per required cell against that cell's own
+    (CV-band-margin-scaled) FAIL threshold, Holm-corrects the p-values
+    across every cell in the SAME required family at `alpha_familywise`
+    (never per-cell alpha -- an uncorrected per-cell 0.05 across N
+    required cells inflates the familywise false-FAIL rate to
+    `1 - (1 - 0.05)**N`), and combines the Holm-reject decision with the
+    corrected one-sided LOWER bound (`bootstrap_lower_bound`, never
+    `bootstrap_upper_bound` -- see that function's docstring) to reach a
+    verdict.
+
+    FAIL requires ALL of:
+      - Holm rejects H0 for this cell at `alpha_familywise` across the
+        family, AND
+      - that SAME cell's own Holm-assigned step-down tail (`alpha /
+        (m - rank)`, the exact level `holm_reject` tested it at, never a
+        single alpha/m Bonferroni tail fixed across the whole family)
+        exceeds `fail_pct * fail_margin_multiplier` (the high-CV band
+        widens the margin instead of inflating `n` further -- correction
+        1). Fixing every cell's bound at the strictest step-0 tail would
+        make Holm decision-inert (its reject flag could never be the
+        thing separating FAIL from non-FAIL, since a fixed, uniformly
+        stricter bound already gates every cell); the bound and the
+        decision must be the SAME test, evaluated at the SAME per-cell
+        alpha.
+      - A cell's rank is only assigned a bound if Holm's step-down
+        procedure actually EXECUTED a comparison at that rank. The
+        step-down stops at the first failed comparison (`holm_reject`);
+        every rank strictly after that stop was never tested at its
+        `alpha / (m - k)` tail, so `corrected_lower_bound` is `None` for
+        those cells -- reporting a bound at an untested, less-stringent
+        tail would expose FAIL-level-looking evidence for a hypothesis
+        the procedure never actually evaluated at that level, silently
+        disagreeing with its own `holm_reject` flag. A cell with a `None`
+        bound can never reach FAIL, regardless of its `holm_reject` value.
+    Anything short of both, but with a point estimate past `warn_pct` (or
+    past `fail_pct` without confirmed statistical significance), is WARN
+    -- DESIGN.md: "a point estimate crossing with an inconclusive bound
+    is WARN, never PASS." Everything else is PASS.
+
+    Fails closed (raises `GateMathError`) before any resampling if a
+    cell's raw pair count is short of its own policy-derived `required_n`
+    or contains a non-finite value -- this mirrors
+    `bench_decode_harness.validate_run_record`'s INFRA-FAIL treatment of
+    the same two conditions on an already-aggregated record, so a cell
+    can never reach a PASS/WARN/FAIL verdict on malformed or
+    under-sampled raw evidence via either entry point.
+
+    Order-preserving: `results[i]` corresponds to `cells[i]`, matching
+    `holm_reject`'s own input-order-preserving contract.
+
+    Percentile duality (round-4 adversarial-review fix): the p-value and the
+    lower bound for a given cell are extracted from ONE retained
+    bootstrap-mean sample (`order_stratified_bootstrap_means` is called
+    exactly once per cell, up front), never from two independent bootstrap
+    draws. Drawing the bound from a second, independent resample -- the
+    prior shape of this function -- does not preserve the docstring's "SAME
+    test, evaluated at the SAME per-cell alpha" claim: a tested-but-not-
+    rejected cell could still expose a threshold-clearing bound purely from
+    resampling noise between the two draws (round-4 finding: single cell,
+    `base=log(1.07)+0.005`, `spread=0.02`, `bootstrap_replicates=2000`,
+    `random.Random(108)` gave `p_value=0.051` (correctly not rejected) but
+    an independently-drawn `corrected_lower_bound=0.0680872...`, above the
+    7% threshold `log(1.07)=0.06765864847381486`). With one shared sample,
+    `p_final > corrected_alpha` (not rejected) algebraically forces the
+    `corrected_alpha`-percentile bound to sit at or below tau: not-rejected
+    means `p_final = max(count(<=tau)/b, 1/b) > corrected_alpha`, so
+    (assuming the floor did not fire, guaranteed below) MORE than
+    `corrected_alpha * b` of the shared sample's means are already `<= tau`
+    -- at least as many as the bound's own rank `ceil(corrected_alpha *
+    b)`, so the bound (that rank's order statistic) is itself `<= tau`.
+
+    This duality only holds if the p-value floor (`max(p, 1/b)`, module
+    docstring correction 2) never sits ABOVE the tightest tail Holm will
+    actually test (`alpha_familywise / len(cells)`, at step-down rank 0):
+    a floored p-value that exceeds that tail could report not-rejected for
+    a cell whose true (unfloored, zero-count) bootstrap distribution is
+    entirely past tau -- which the shared sample would then also report as
+    a bound above tau. Rather than let that reintroduce the same class of
+    incoherence, this function fails closed (before any resampling) when
+    `bootstrap_replicates` is too small for the family size at
+    `alpha_familywise` to guarantee the floor can never sit above that
+    tightest tail.
+    """
+    if not cells:
+        raise GateMathError("evaluate_family_gate requires at least one cell")
+    if rng is None:
+        rng = random.Random()
+
+    smallest_tail = alpha_familywise / len(cells)
+    if bootstrap_replicates * smallest_tail < 1.0:
+        min_replicates = math.ceil(1.0 / smallest_tail)
+        raise GateMathError(
+            f"bootstrap_replicates={bootstrap_replicates} is too low for a family of {len(cells)} "
+            f"cell(s) at alpha_familywise={alpha_familywise}: the smallest tail Holm's step-down "
+            f"will ever test is alpha_familywise/{len(cells)}={smallest_tail!r}, and the p-value "
+            "floor `max(p, 1/b)` can only resolve tails of size >= 1/bootstrap_replicates. Fewer "
+            f"than {min_replicates} replicates lets the floor sit ABOVE that tightest tail, so a "
+            "cell whose true (unfloored) bootstrap count at that tail is genuinely zero -- every "
+            "bootstrap mean already past tau -- would be floored to a p-value that reports "
+            "not-rejected while its own shared-sample bound still clears the fail threshold, "
+            "reintroducing the exact p-value/bound incoherence this function otherwise fixes for "
+            "every executed rank. Increase bootstrap_replicates, or evaluate fewer cells per family."
+        )
+
+    prelim: list[tuple[CellGateInput, int, float, float, float, float, list[float]]] = []
+    for cell in cells:
+        if len(cell.values) != len(cell.order_ab):
+            raise GateMathError(f"cell {cell.cell_id!r}: values and order_ab must be the same length")
+        req_n, margin = required_n(cell.measured_cv, cv_bands, cell.cell_class)
+        if len(cell.values) < req_n:
+            raise GateMathError(
+                f"cell {cell.cell_id!r}: only {len(cell.values)} raw pairs, requires >= {req_n} "
+                f"at measured_cv={cell.measured_cv!r} class {cell.cell_class!r} -- an under-sampled cell "
+                "fails closed before any resampling, never PASSes on insufficient evidence"
+            )
+        if any(not math.isfinite(v) for v in cell.values):
+            raise GateMathError(
+                f"cell {cell.cell_id!r}: raw values contain a non-finite entry -- a malformed cell "
+                "fails closed before any resampling, never reaches a PASS/WARN/FAIL verdict"
+            )
+        tau_fail = math.log(1.0 + cell.fail_pct * margin)
+        point_estimate = statistics.fmean(cell.values)
+        # ONE retained bootstrap-mean sample per cell -- both the p-value
+        # (now) and, if this rank is tested by the real step-down (below),
+        # the lower bound (later) are extracted from THIS SAME sample. Never
+        # call `one_sided_bootstrap_pvalue`/`bootstrap_lower_bound` here:
+        # each draws its own independent sample from `rng`, which is exactly
+        # the percentile-duality bug this restructure fixes.
+        boot_means = order_stratified_bootstrap_means(
+            cell.values, cell.order_ab, bootstrap_replicates, rng
+        )
+        p = _pvalue_from_boot_means(boot_means, tau_fail, bootstrap_replicates)
+        prelim.append((cell, req_n, margin, tau_fail, point_estimate, p, sorted(boot_means)))
+
+    pvalues = [p for *_rest, p, _boot in prelim]
+    rejects = holm_reject(pvalues, alpha=alpha_familywise)
+    # The exact step-down tail each cell was ACTUALLY TESTED at in the real
+    # Holm procedure -- `tested[i]` is False for any rank strictly after the
+    # step-down's first failed comparison (see `_holm_tested_tails`).
+    # Computed independently of `rejects` above (never derived from a
+    # caller-supplied/mocked `holm_reject`) so testedness always reflects
+    # the real step-down order.
+    tested, cell_alpha = _holm_tested_tails(pvalues, alpha_familywise)
+
+    results: list[CellGateResult] = []
+    for (
+        cell,
+        req_n,
+        margin,
+        tau_fail,
+        point_estimate,
+        p,
+        sorted_boot_means,
+    ), reject, corrected_alpha, was_tested in zip(prelim, rejects, cell_alpha, tested):
+        lower_bound: float | None = None
+        if was_tested:
+            # Same retained sample as the p-value above -- NOT a fresh
+            # `bootstrap_lower_bound` draw (see the docstring's percentile-
+            # duality note and that function's own docstring).
+            lower_bound = _lower_bound_from_sorted_boot_means(
+                sorted_boot_means, corrected_alpha=corrected_alpha
+            )
+        tau_warn = math.log(1.0 + cell.warn_pct)
+        if reject and lower_bound is not None and lower_bound > tau_fail:
+            verdict = "FAIL"
+        elif point_estimate > tau_warn:
+            verdict = "WARN"
+        else:
+            verdict = "PASS"
+        results.append(
+            CellGateResult(
+                cell_id=cell.cell_id,
+                point_estimate=point_estimate,
+                p_value=p,
+                corrected_lower_bound=lower_bound,
+                holm_reject=reject,
+                measured_cv=cell.measured_cv,
+                required_n=req_n,
+                fail_margin_multiplier=margin,
+                verdict=verdict,
+            )
+        )
+    return results
 
 
 # --------------------------------------------------------------------------

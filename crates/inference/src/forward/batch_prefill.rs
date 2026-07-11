@@ -1562,7 +1562,7 @@ mod tests {
     ///
     /// `cargo test --release bench_prefill_vs_sequential -- --nocapture --ignored`
     #[test]
-    #[ignore]
+    #[ignore = "release-mode manual performance bench"]
     fn bench_prefill_vs_sequential() {
         let cfg = benchmark_config();
         let model = build_random_model(cfg.clone(), 0xface_cafe_dead_beef);

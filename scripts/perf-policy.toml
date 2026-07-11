@@ -31,9 +31,9 @@ policy_version = 1
 # (100%) so no measured CV can fall through uncovered — enforced by
 # `bench_gate_math.parse_cv_bands`.
 #
-# Evidence (Leo's math-verification pass, mathcheck sim.py /
-# sim2_power_curve.py — internal artifacts, summarized here so the policy
-# is self-explaining without them): at cv~=1% n=7 already has ~99% power
+# Evidence (cross-checked by an independent Monte-Carlo power simulation,
+# summarized here so the policy is self-explaining without it): at cv~=1%
+# n=7 already has ~99% power
 # against a true 10% regression (class A, decode family, FAIL=7%). At
 # cv~=3%, n=7 only has ~47-63% power; n~=23-25 restores ~80-84%. At
 # cv>=8%, even n=30 caps out near ~31% power — inflating n further stops
@@ -93,6 +93,15 @@ min_null_aa_sessions = 20
 min_mainline_sessions = 10
 target_false_fail_rate = 0.01
 theoretical_sessions_for_bound_lt_1pct_at_95conf = 298
+# Correction 3 addendum: a shadow cell's null A/A calibration sessions
+# can include invalid-pair
+# replacements (a pair discarded and re-run because of an infra hiccup,
+# not a real measurement). Capping how many replacements a promotion
+# record may report keeps "20 null sessions" honest -- an unbounded
+# replacement budget would let a cell keep re-rolling until it got a
+# favorable run. Exhausting the cap without a clean session is an
+# INFRA-FAIL for that promotion attempt, not a silent retry.
+max_invalid_pair_replacements = 3
 
 # ---------------------------------------------------------------------------
 # Initial registered policy (DESIGN.md section 4 table). `noise_class` is
