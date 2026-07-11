@@ -144,7 +144,13 @@ pub fn matmul_bt_q8(a: &[f32], b_q: &Q8Matrix, c: &mut [f32], m: usize, k: usize
     assert!(m.checked_mul(k).is_some(), "matmul shape overflow: m*k");
     assert!(n.checked_mul(k).is_some(), "matmul shape overflow: n*k");
     assert!(m.checked_mul(n).is_some(), "matmul shape overflow: m*n");
-    assert_eq!(a.len(), m * k, "A length does not match m * k");
+    // Oversized-scratch-prefix allow-list (ADR-080 C4): `>=`, not `assert_eq!`. Every access
+    // to `a` below is a bounded sub-slice (`a[i*k..(i+1)*k]`), so a caller-supplied `a`
+    // longer than `m*k` is sound — unifies with `matmul_bt`/`matmul_bt_f16`'s contract
+    // instead of this Q8 path alone rejecting valid oversized callers. `b_q.rows`/`b_q.cols`
+    // are the matrix's own declared shape (not a raw buffer length), so those stay an exact
+    // shape-mismatch check, not a buffer-size check.
+    assert!(a.len() >= m * k, "A length does not match m * k");
     assert_eq!(b_q.rows, n, "B_q rows do not match n");
     assert_eq!(b_q.cols, k, "B_q cols do not match k");
     assert_eq!(

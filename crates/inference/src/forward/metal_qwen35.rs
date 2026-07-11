@@ -28931,7 +28931,7 @@ mod mtp_greedy_round_tests {
     fn plain_greedy_oracle(logit_rows: &[Vec<f32>], max_len: usize) -> Vec<u32> {
         let mut out = Vec::new();
         for row in logit_rows.iter().take(max_len) {
-            let token = argmax(row);
+            let token = crate::speculative::argmax(row) as u32;
             if is_stop(token) {
                 break;
             }
@@ -28940,14 +28940,19 @@ mod mtp_greedy_round_tests {
         out
     }
 
-    fn argmax(logits: &[f32]) -> u32 {
-        logits
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0)
+    // Regression test (#806): the oracle's argmax must be first-wins, matching
+    // `crate::speculative::argmax`'s documented tie-break contract. A last-wins
+    // oracle would silently mask a first-wins regression in the production
+    // Metal decode path whenever two logits tie exactly.
+    #[test]
+    fn plain_greedy_oracle_argmax_is_first_wins_on_ties() {
+        let logit_rows = vec![vec![1.0, 1.0, 0.0]];
+        let out = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(
+            out,
+            vec![0],
+            "tie must resolve to the first index, not the last"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -28984,7 +28989,7 @@ mod mtp_greedy_round_tests {
             if out.len() >= max_len {
                 break;
             }
-            let pending_token = argmax(&logit_rows[pos]);
+            let pending_token = crate::speculative::argmax(&logit_rows[pos]) as u32;
 
             // Case A: pending is a stop token. Stop-token contract (#613):
             // excluded from the output. For subsequent rounds,
@@ -29010,15 +29015,15 @@ mod mtp_greedy_round_tests {
             draft_idx += 1;
 
             let target_logits_0 = &logit_rows[pos + 1];
-            let accepted = draft_token == argmax(target_logits_0);
+            let accepted = draft_token == crate::speculative::argmax(target_logits_0) as u32;
             let bonus_token = if accepted {
                 if pos + 2 < logit_rows.len() {
-                    argmax(&logit_rows[pos + 2])
+                    crate::speculative::argmax(&logit_rows[pos + 2]) as u32
                 } else {
                     0 // no further prediction available; use 0 (non-stop)
                 }
             } else {
-                argmax(target_logits_0)
+                crate::speculative::argmax(target_logits_0) as u32
             };
 
             match mtp_greedy_round(pending_token, draft_token, accepted, bonus_token, is_stop) {
@@ -29460,7 +29465,10 @@ mod mtp_greedy_round_tests {
                 oracle,
                 mtp,
                 "trial {trial}: oracle != mtp\n  logit_winners={:?}\n  draft_seq={:?}\n  oracle={:?}\n  mtp={:?}",
-                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                logit_rows
+                    .iter()
+                    .map(|r| crate::speculative::argmax(r) as u32)
+                    .collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
                 mtp
@@ -29506,7 +29514,10 @@ mod mtp_greedy_round_tests {
                 oracle,
                 mtp,
                 "trial {trial} (max_len={max_len}): oracle != mtp\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  mtp={:?}",
-                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                logit_rows
+                    .iter()
+                    .map(|r| crate::speculative::argmax(r) as u32)
+                    .collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
                 mtp
@@ -29596,7 +29607,7 @@ mod mtp_greedy_round_tests {
             if out.len() >= max_len {
                 break;
             }
-            let pending_token = argmax(&logit_rows[pos]);
+            let pending_token = crate::speculative::argmax(&logit_rows[pos]) as u32;
             if is_stop(pending_token) {
                 // Stop-token contract (#613): excluded from `out`. The
                 // loop-top guard already confirmed out.len() < max_len, so
@@ -29617,15 +29628,15 @@ mod mtp_greedy_round_tests {
             draft_idx += 1;
 
             let target_logits_0 = &logit_rows[pos + 1];
-            let accepted = draft_token == argmax(target_logits_0);
+            let accepted = draft_token == crate::speculative::argmax(target_logits_0) as u32;
             let bonus_token = if accepted {
                 if pos + 2 < logit_rows.len() {
-                    argmax(&logit_rows[pos + 2])
+                    crate::speculative::argmax(&logit_rows[pos + 2]) as u32
                 } else {
                     0
                 }
             } else {
-                argmax(target_logits_0)
+                crate::speculative::argmax(target_logits_0) as u32
             };
 
             match mtp_greedy_round(pending_token, draft_token, accepted, bonus_token, is_stop) {
@@ -29836,16 +29847,6 @@ mod self_spec_eos_tests {
         id == EOS
     }
 
-    fn argmax(logits: &[f32]) -> u32 {
-        logits
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0)
-    }
-
     // -----------------------------------------------------------------------
     // Plain-greedy oracle: check is_stop, then push, bounded by max_len.
     // Stop-token contract (#613): the stop token is never in the output — it
@@ -29855,13 +29856,28 @@ mod self_spec_eos_tests {
     fn plain_greedy_oracle(logit_rows: &[Vec<f32>], max_len: usize) -> Vec<u32> {
         let mut out = Vec::new();
         for row in logit_rows.iter().take(max_len) {
-            let token = argmax(row);
+            let token = crate::speculative::argmax(row) as u32;
             if is_stop(token) {
                 break;
             }
             out.push(token);
         }
         out
+    }
+
+    // Regression test (#806): the oracle's argmax must be first-wins, matching
+    // `crate::speculative::argmax`'s documented tie-break contract. A last-wins
+    // oracle would silently mask a first-wins regression in the production
+    // Metal decode path whenever two logits tie exactly.
+    #[test]
+    fn plain_greedy_oracle_argmax_is_first_wins_on_ties() {
+        let logit_rows = vec![vec![1.0, 1.0, 0.0]];
+        let out = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(
+            out,
+            vec![0],
+            "tie must resolve to the first index, not the last"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -29904,7 +29920,7 @@ mod self_spec_eos_tests {
         // max_new_tokens==0 guard already returns separately (Length)
         // before this check ever runs, so budget is never the reason this
         // branch produces an empty output.
-        let pending_first = argmax(&logit_rows[pos]);
+        let pending_first = crate::speculative::argmax(&logit_rows[pos]) as u32;
         if is_stop(pending_first) {
             return out;
         }
@@ -29924,7 +29940,7 @@ mod self_spec_eos_tests {
                 if out.len() >= max_len || pos + 1 >= logit_rows.len() {
                     break;
                 }
-                let next = argmax(&logit_rows[pos + 1]);
+                let next = crate::speculative::argmax(&logit_rows[pos + 1]) as u32;
                 // Stop-token contract (#613): never push the terminating token.
                 if is_stop(next) {
                     break;
@@ -29942,7 +29958,7 @@ mod self_spec_eos_tests {
             round += 1;
 
             // Verify: target agrees with draft if argmax(logit_rows[pos+1]) == draft.
-            let target_at_pos1 = argmax(&logit_rows[pos + 1]);
+            let target_at_pos1 = crate::speculative::argmax(&logit_rows[pos + 1]) as u32;
             let accepted = target_at_pos1 == draft;
 
             if accepted {
@@ -29965,7 +29981,7 @@ mod self_spec_eos_tests {
                 if next_pending_pos >= logit_rows.len() {
                     break;
                 }
-                let next_pending = argmax(&logit_rows[next_pending_pos]);
+                let next_pending = crate::speculative::argmax(&logit_rows[next_pending_pos]) as u32;
                 // Stop-token contract (#613): never push next_pending when
                 // it is itself the stop.
                 if is_stop(next_pending) {
@@ -30253,7 +30269,10 @@ mod self_spec_eos_tests {
                 oracle,
                 sim,
                 "trial {trial} (fallback={fallback}): oracle != sim\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  sim={:?}",
-                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                logit_rows
+                    .iter()
+                    .map(|r| crate::speculative::argmax(r) as u32)
+                    .collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
                 sim,
@@ -30298,7 +30317,10 @@ mod self_spec_eos_tests {
                 oracle,
                 sim,
                 "trial {trial} (max_len={max_len}, fallback={fallback}): oracle != sim\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  sim={:?}",
-                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                logit_rows
+                    .iter()
+                    .map(|r| crate::speculative::argmax(r) as u32)
+                    .collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
                 sim,
@@ -30367,7 +30389,7 @@ mod self_spec_eos_tests {
         let mut stopped = false;
         let mut pos = 0usize;
 
-        let pending_first = argmax(&logit_rows[pos]);
+        let pending_first = crate::speculative::argmax(&logit_rows[pos]) as u32;
         if is_stop(pending_first) {
             // Stop-token contract (#613): excluded from `out` regardless of
             // budget. `stopped` still reflects whether budget was available
@@ -30394,7 +30416,7 @@ mod self_spec_eos_tests {
                 // simulation mutation-sensitive for FIX 2: when budget is exactly full
                 // after pushing pending, the stop token is clipped → stopped stays false.
                 if pos + 1 < logit_rows.len() {
-                    let next = argmax(&logit_rows[pos + 1]);
+                    let next = crate::speculative::argmax(&logit_rows[pos + 1]) as u32;
                     if is_stop(next) {
                         // Stop-token contract (#613): never push `next`.
                         // FIX 2: stopped=true only when budget allowed
@@ -30418,7 +30440,7 @@ mod self_spec_eos_tests {
             let draft = draft_seq[round];
             round += 1;
 
-            let target_at_pos1 = argmax(&logit_rows[pos + 1]);
+            let target_at_pos1 = crate::speculative::argmax(&logit_rows[pos + 1]) as u32;
             let accepted = target_at_pos1 == draft;
 
             if accepted {
@@ -30443,7 +30465,7 @@ mod self_spec_eos_tests {
                 if next_pending_pos >= logit_rows.len() {
                     break;
                 }
-                let next_pending = argmax(&logit_rows[next_pending_pos]);
+                let next_pending = crate::speculative::argmax(&logit_rows[next_pending_pos]) as u32;
                 if is_stop(next_pending) {
                     // Stop-token contract (#613): never push next_pending.
                     // FIX 2 (full-accept path): stopped only when budget
