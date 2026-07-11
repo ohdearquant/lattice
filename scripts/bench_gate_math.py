@@ -9,11 +9,11 @@ dependency for the statistics a CI gate evaluator has to trust. Uses
 bound (not `scipy.stats.beta.ppf`) so this module never grows a third-party
 dependency the gate can't audit.
 
-Three of DESIGN.md's gate-math choices were adversarially checked against
-simulation before this module was written (Leo's math-verification pass,
-`.khive/workspaces/20260711/bench-overhaul-lattice-mathcheck/{sim.py,
-sim2_power_curve.py}` and their `*_output.txt` — internal artifacts, not
-committed here). All three corrections are encoded as executable functions,
+Three of this module's gate-math choices were adversarially checked against
+an independent Monte-Carlo simulation (power curves for the paired gate at
+several CV levels, bootstrap tail behavior at small n, and exact binomial
+bounds for promotion evidence) before the module was written.
+All three corrections are encoded as executable functions,
 not just prose, so the validator in `bench_decode_harness.py` can enforce
 them instead of merely documenting them:
 
