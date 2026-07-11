@@ -6,6 +6,7 @@
 
 #[cfg(feature = "wgpu-gpu")]
 mod inner {
+    use crate::forward::cpu::{validate_gemm_bt, validate_gemm_nn};
     use std::sync::OnceLock;
     use wgpu::util::DeviceExt;
 
@@ -356,6 +357,11 @@ fn gemm_nn(
         k: usize,
         n: usize,
     ) -> bool {
+        // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4,
+        // held finding: this standalone wgpu wrapper previously had NO argument validation
+        // at all). Validated before any GPU buffer is created from these slices below.
+        validate_gemm_bt(a.len(), b.len(), c.len(), m, k, n, "gpu_matmul_bt");
+
         if (m as u64) * (n as u64) * (k as u64) < GPU_THRESHOLD {
             return false;
         }
@@ -368,6 +374,10 @@ fn gemm_nn(
     ///
     /// GPU C = A @ B. Returns true if dispatched to GPU.
     pub fn gpu_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) -> bool {
+        // Release-active, overflow-first, oversized-scratch-allowed contract (ADR-080 C4,
+        // held finding — see `gpu_matmul_bt`).
+        validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "gpu_matmul");
+
         if (m as u64) * (n as u64) * (k as u64) < GPU_THRESHOLD {
             return false;
         }
@@ -389,4 +399,41 @@ pub fn gpu_matmul_bt(_: &[f32], _: &[f32], _: &mut [f32], _: usize, _: usize, _:
 #[cfg(not(feature = "wgpu-gpu"))]
 pub fn gpu_matmul(_: &[f32], _: &[f32], _: &mut [f32], _: usize, _: usize, _: usize) -> bool {
     false
+}
+
+// --- release-active argument validation (ADR-080 C4 held finding) ---
+// These panic before any wgpu device/buffer is touched (validated at the top of
+// `gpu_matmul_bt`/`gpu_matmul`, ahead of the GPU-availability check), so they run without a
+// GPU/adapter present.
+#[cfg(all(test, feature = "wgpu-gpu"))]
+mod tests {
+    use super::{gpu_matmul, gpu_matmul_bt};
+
+    #[test]
+    #[should_panic(expected = "b too short for n*k")]
+    fn gpu_matmul_bt_rejects_short_b() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 1]; // needs n*k = 2
+        let mut c = [0.0f32; 1];
+        gpu_matmul_bt(&a, &b, &mut c, 1, 1, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "shape overflow: n*k")]
+    fn gpu_matmul_bt_rejects_overflow() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 2];
+        let mut c = [0.0f32; 2];
+        // m*k = 2*2 = 4 (no overflow); n*k = usize::MAX*2 overflows.
+        gpu_matmul_bt(&a, &b, &mut c, 2, 2, usize::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "b too short for k*n")]
+    fn gpu_matmul_rejects_short_b() {
+        let a = [0.0f32; 2];
+        let b = [0.0f32; 1]; // needs k*n = 2
+        let mut c = [0.0f32; 1];
+        gpu_matmul(&a, &b, &mut c, 1, 1, 2);
+    }
 }

@@ -1,4 +1,5 @@
 //! General matmul helpers, preallocated matmul, transposed-B matmul, scalar fallbacks, and m=1 specialization.
+use super::gemm_validate::{validate_gemm_bt, validate_gemm_nn};
 #[cfg(not(target_os = "macos"))]
 use super::simd::simd_config;
 
@@ -31,21 +32,12 @@ pub fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 ///
 /// Matrix multiply into a pre-allocated output buffer.
 pub fn matmul_into(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    // Release-active bounds guards — see #368 (#218/#224 precedent).
-    // Overflow checks first: a wrapped shape product can make a length check pass spuriously
-    // (the #367 lesson). The unchecked multiplies below are safe only after these pass.
-    assert!(m.checked_mul(k).is_some(), "matmul shape overflow: m*k");
-    assert!(k.checked_mul(n).is_some(), "matmul shape overflow: k*n");
-    assert!(m.checked_mul(n).is_some(), "matmul shape overflow: m*n");
-    // Lower-bound (>=) is the memory-safety invariant: inputs are read only within their
-    // shape footprint (a: [0, m*k), b: [0, k*n)) and the output requires c.len() >= m*n.
-    // Some callers pass reused scratch buffers longer than the exact footprint; that is
-    // sound, and assert_eq! would false-panic on them. Note the output suffix beyond m*n
-    // is NOT part of the result and may be clobbered (matmul_scalar zeroes the full c
-    // slice) — callers needing suffix preservation must pass &mut c[..m*n].
-    assert!(a.len() >= m * k, "matmul: a too short for m*k");
-    assert!(b.len() >= k * n, "matmul: b too short for k*n");
-    assert!(c.len() >= m * n, "matmul: c too short for m*n");
+    // Release-active, overflow-first, oversized-scratch-allowed contract (#368, ADR-080 C4) —
+    // see `gemm_validate` for the shared rationale. Some callers pass reused scratch buffers
+    // longer than the exact footprint; that is sound (the check is `>=`). Note the output
+    // suffix beyond m*n is NOT part of the result and may be clobbered (matmul_scalar zeroes
+    // the full c slice) — callers needing suffix preservation must pass &mut c[..m*n].
+    validate_gemm_nn(a.len(), b.len(), c.len(), m, k, n, "matmul");
 
     // GPU dispatch is NOT in this hot path — per-call buffer creation is too slow.
     // GPU acceleration requires the full forward pass to run on-device.
@@ -64,22 +56,13 @@ pub fn matmul_into(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: u
 ///
 /// Matrix multiply with transposed B: C = A @ B^T.
 pub fn matmul_bt(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    // Release-active bounds guards — see #368 (#218/#224 precedent).
-    // Overflow checks first: a wrapped shape product can make a length check pass spuriously
-    // (the #367 lesson). Note: B is stored transposed, so its footprint is n*k, not k*n.
-    assert!(m.checked_mul(k).is_some(), "matmul shape overflow: m*k");
-    assert!(n.checked_mul(k).is_some(), "matmul shape overflow: n*k");
-    assert!(m.checked_mul(n).is_some(), "matmul shape overflow: m*n");
-    // Lower-bound (>=) is the memory-safety invariant: inputs are read only within their
-    // shape footprint (a: [0, m*k), b: [0, n*k) since B is transposed) and the output
-    // requires c.len() >= m*n. Some callers pass reused scratch buffers longer than the
-    // exact footprint; that is sound, and assert_eq! would false-panic on them. Note the
-    // output suffix beyond m*n is NOT part of the result and may be clobbered
-    // (matmul_bt_tiled zeroes the full c slice) — callers needing suffix preservation
-    // must pass &mut c[..m*n].
-    assert!(a.len() >= m * k, "matmul: a too short for m*k");
-    assert!(b.len() >= n * k, "matmul_bt: b too short for n*k");
-    assert!(c.len() >= m * n, "matmul: c too short for m*n");
+    // Release-active, overflow-first, oversized-scratch-allowed contract (#368, ADR-080 C4).
+    // Note: B is stored transposed, so its footprint is n*k, not k*n. Some callers pass
+    // reused scratch buffers longer than the exact footprint; that is sound (the check is
+    // `>=`). Note the output suffix beyond m*n is NOT part of the result and may be
+    // clobbered (matmul_bt_tiled zeroes the full c slice) — callers needing suffix
+    // preservation must pass &mut c[..m*n].
+    validate_gemm_bt(a.len(), b.len(), c.len(), m, k, n, "matmul_bt");
 
     // CPU path only — Accelerate AMX on macOS, SIMD/scalar elsewhere.
     #[cfg(target_os = "macos")]

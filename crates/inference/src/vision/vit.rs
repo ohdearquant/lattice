@@ -91,8 +91,13 @@ pub struct ViT {
 
 /// Matrix-vector multiply: y = A x where A is [rows, cols] row-major, x is [cols].
 fn matvec(a: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    assert_eq!(a.len(), rows * cols);
-    assert_eq!(x.len(), cols);
+    // ADR-080 C4: modeled as C = A @ B with m=rows, k=cols, n=1 (A is the "a" operand, x is
+    // the "b" operand, y is the not-yet-allocated "c" operand — y.len() will be exactly
+    // `rows` below, matching m*n = rows*1, so it's safe to pass `rows` directly rather than
+    // a computed product). Release-active, overflow-first, oversized-scratch-allowed,
+    // replacing the previous exact-match `assert_eq!` pair (#796 round 1 finding 3: the
+    // per-site register initially omitted vit.rs, which ADR-080 C4 explicitly names).
+    crate::forward::cpu::validate_gemm_nn(a.len(), x.len(), rows, rows, cols, 1, "vit_matvec");
     let mut y = vec![0.0f32; rows];
     for r in 0..rows {
         let row = &a[r * cols..(r + 1) * cols];
@@ -108,9 +113,28 @@ fn matvec(a: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// Batch matrix-vector: A [rows, cols] applied to each column of X [n, cols].
 /// Output is [n, rows].
 fn batch_matvec(a: &[f32], x: &[f32], n: usize, rows: usize, cols: usize) -> Vec<f32> {
-    assert_eq!(a.len(), rows * cols);
-    assert_eq!(x.len(), n * cols);
+    // Guard the output allocation itself against usize overflow (ADR-080 C4, same rationale
+    // as `matmul()` in forward/cpu/matmul.rs): an unchecked `n * rows` can wrap in release,
+    // producing a too-small allocation that would then pass a subsequent `>=` length check
+    // on the same wrapped value.
+    assert!(
+        n.checked_mul(rows).is_some(),
+        "vit_batch_matvec: output shape overflow: n*rows"
+    );
     let mut out = vec![0.0f32; n * rows];
+    // Modeled as C = A @ B^T with m=n (batch size), k=cols, n=rows (X is the "a" operand,
+    // A is the "b" operand — [rows, cols], transposed in the multiply — out is the "c"
+    // operand, already safely allocated above). Release-active, overflow-first,
+    // oversized-scratch-allowed, replacing the previous exact-match `assert_eq!` pair.
+    crate::forward::cpu::validate_gemm_bt(
+        x.len(),
+        a.len(),
+        out.len(),
+        n,
+        cols,
+        rows,
+        "vit_batch_matvec",
+    );
     for i in 0..n {
         let xi = &x[i * cols..(i + 1) * cols];
         let yi = &mut out[i * rows..(i + 1) * rows];
@@ -716,5 +740,58 @@ mod tests {
             patch_hw: cfg.patch_size as usize,
         };
         assert!(vit.forward(&img).is_err());
+    }
+
+    // ADR-080 C4 (#796 round 1 finding 3): `matvec`/`batch_matvec` were unregistered safe CPU
+    // GEMV helpers with exact-match `assert_eq!` shape checks (no overflow-first `checked_mul`
+    // guard). Now routed through the shared `validate_gemm_nn`/`validate_gemm_bt`.
+
+    #[test]
+    #[should_panic(expected = "a too short for m*k")]
+    fn vit_matvec_rejects_short_a() {
+        let a = [0.0f32; 3]; // needs rows*cols = 4
+        let x = [0.0f32; 2];
+        matvec(&a, &x, 2, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "b too short for k*n")]
+    fn vit_matvec_rejects_short_x() {
+        let a = [0.0f32; 4];
+        let x = [0.0f32; 1]; // needs cols = 2
+        matvec(&a, &x, 2, 2);
+    }
+
+    #[test]
+    fn vit_matvec_accepts_oversized_x() {
+        // Oversized-scratch-prefix allow-list: x longer than cols must not panic.
+        let a = [1.0f32, 1.0, 1.0, 1.0];
+        let x = [1.0f32, 1.0, 1.0, 99.0]; // cols=2, x has 4 elements
+        let y = matvec(&a, &x, 2, 2);
+        assert_eq!(y, vec![2.0, 2.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a too short for m*k")]
+    fn vit_batch_matvec_rejects_short_x() {
+        let a = [0.0f32; 4]; // rows*cols = 4
+        let x = [0.0f32; 3]; // needs n*cols = 4
+        batch_matvec(&a, &x, 2, 2, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "b too short for n*k")]
+    fn vit_batch_matvec_rejects_short_a() {
+        let a = [0.0f32; 3]; // needs rows*cols = 4
+        let x = [0.0f32; 4];
+        batch_matvec(&a, &x, 2, 2, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "vit_batch_matvec: output shape overflow: n*rows")]
+    fn vit_batch_matvec_rejects_output_overflow() {
+        let a = [0.0f32; 4];
+        let x = [0.0f32; 4];
+        batch_matvec(&a, &x, usize::MAX, 2, 2);
     }
 }
