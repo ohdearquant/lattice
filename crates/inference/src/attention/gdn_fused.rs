@@ -78,9 +78,21 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// ADR-080 C1 fail-closed (#850): a non-finite input lane makes `norm_sq` non-finite too
+/// (squaring any non-finite value yields +inf/NaN, and summing any non-finite term keeps
+/// the sum non-finite), so checking `norm_sq.is_finite()` alone detects the whole-vector
+/// invalid case. The whole vector is assigned the literal `0.0` directly rather than
+/// multiplied through a zeroed reciprocal (`NaN * 0.0 == NaN` under IEEE-754). Mirrors
+/// `attention::gdn::l2_normalize_vec` (the scalar reference helper).
 #[inline]
 fn scalar_l2_normalize(x: &mut [f32]) {
     let norm_sq: f32 = x.iter().map(|v| v * v).sum();
+    if !norm_sq.is_finite() {
+        for v in x.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
     let inv_norm = 1.0 / (norm_sq + 1e-6).sqrt();
     for v in x.iter_mut() {
         *v *= inv_norm;
@@ -581,6 +593,8 @@ pub fn gated_delta_net_step_fused(
 // AVX2 SIMD kernels
 // ---------------------------------------------------------------------------
 
+/// ADR-080 C1 fail-closed (#850): same whole-vector-zero-by-assignment contract as
+/// `scalar_l2_normalize` (see its doc comment for the IEEE-754 rationale).
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2,fma")]
@@ -604,6 +618,13 @@ unsafe fn simd_l2_normalize_avx2(x: &mut [f32]) {
     while i < len {
         norm_sq += x[i] * x[i];
         i += 1;
+    }
+
+    if !norm_sq.is_finite() {
+        for v in x.iter_mut() {
+            *v = 0.0;
+        }
+        return;
     }
 
     let inv_norm = 1.0 / (norm_sq + 1e-6).sqrt();
@@ -742,6 +763,8 @@ unsafe fn simd_gated_rms_norm_avx2(x: &[f32], z: &[f32], gamma: &[f32], out: &mu
 // NEON SIMD kernels
 // ---------------------------------------------------------------------------
 
+/// ADR-080 C1 fail-closed (#850): same whole-vector-zero-by-assignment contract as
+/// `scalar_l2_normalize` (see its doc comment for the IEEE-754 rationale).
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
@@ -762,6 +785,13 @@ unsafe fn simd_l2_normalize_neon(x: &mut [f32]) {
     while i < len {
         norm_sq += x[i] * x[i];
         i += 1;
+    }
+
+    if !norm_sq.is_finite() {
+        for v in x.iter_mut() {
+            *v = 0.0;
+        }
+        return;
     }
 
     let inv_norm = 1.0 / (norm_sq + 1e-6).sqrt();
@@ -1757,5 +1787,419 @@ mod tests {
         let gamma: [f32; 0] = []; // must equal x.len()
         let mut out = [0.0f32; 8];
         simd_gated_rms_norm(&x, &z, &gamma, &mut out, 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // #850 blocker 2 follow-up: the SHIPPING scalar/AVX2/NEON l2-normalize
+    // paths must fail closed identically to the reference helper.
+    // -----------------------------------------------------------------------
+
+    /// Table test for `scalar_l2_normalize` and, on the architecture the test runs on,
+    /// the concrete SIMD backend it dispatches to (AVX2 on x86_64, NEON on aarch64) plus
+    /// the public `simd_l2_normalize` dispatcher — all three must agree.
+    #[test]
+    fn simd_l2_normalize_backends_fail_closed_table() {
+        struct Case {
+            name: &'static str,
+            input: [f32; 4],
+            expect_all_zero: bool,
+        }
+        let cases = [
+            Case {
+                name: "nan_lane",
+                input: [f32::NAN, 1.0, 0.0, 2.0],
+                expect_all_zero: true,
+            },
+            Case {
+                name: "pos_inf_lane",
+                input: [f32::INFINITY, 1.0, 0.0, 2.0],
+                expect_all_zero: true,
+            },
+            Case {
+                name: "neg_inf_lane",
+                input: [1.0, f32::NEG_INFINITY, 0.0, 2.0],
+                expect_all_zero: true,
+            },
+            Case {
+                name: "all_zero",
+                input: [0.0, 0.0, 0.0, 0.0],
+                expect_all_zero: true,
+            },
+            Case {
+                name: "very_small_finite",
+                input: [1e-7, 0.0, 0.0, 0.0],
+                expect_all_zero: false,
+            },
+            Case {
+                name: "ordinary_finite",
+                input: [3.0, 4.0, 0.0, 0.0],
+                expect_all_zero: false,
+            },
+        ];
+
+        for case in &cases {
+            let mut scalar_out = case.input;
+            scalar_l2_normalize(&mut scalar_out);
+            let mut dispatch_out = case.input;
+            simd_l2_normalize(&mut dispatch_out);
+
+            assert!(
+                scalar_out.iter().all(|v| v.is_finite()),
+                "case {}: scalar_l2_normalize output must be fully finite, got {:?}",
+                case.name,
+                scalar_out
+            );
+            assert!(
+                dispatch_out.iter().all(|v| v.is_finite()),
+                "case {}: simd_l2_normalize (dispatcher) output must be fully finite, got {:?}",
+                case.name,
+                dispatch_out
+            );
+            assert_close_slice(
+                &scalar_out,
+                &dispatch_out,
+                1e-6,
+                &format!("case {}: scalar vs dispatcher", case.name),
+            );
+
+            if case.expect_all_zero {
+                assert!(
+                    scalar_out.iter().all(|&v| v == 0.0),
+                    "case {}: scalar_l2_normalize must zero the whole vector, got {:?}",
+                    case.name,
+                    scalar_out
+                );
+                assert!(
+                    dispatch_out.iter().all(|&v| v == 0.0),
+                    "case {}: simd_l2_normalize must zero the whole vector, got {:?}",
+                    case.name,
+                    dispatch_out
+                );
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma")
+                {
+                    let mut avx2_out = case.input;
+                    // SAFETY: guarded by runtime feature detection above.
+                    unsafe { simd_l2_normalize_avx2(&mut avx2_out) };
+                    assert!(
+                        avx2_out.iter().all(|v| v.is_finite()),
+                        "case {}: simd_l2_normalize_avx2 output must be fully finite, got {:?}",
+                        case.name,
+                        avx2_out
+                    );
+                    assert_close_slice(
+                        &scalar_out,
+                        &avx2_out,
+                        1e-6,
+                        &format!("case {}: scalar vs avx2", case.name),
+                    );
+                    if case.expect_all_zero {
+                        assert!(
+                            avx2_out.iter().all(|&v| v == 0.0),
+                            "case {}: simd_l2_normalize_avx2 must zero the whole vector, got {:?}",
+                            case.name,
+                            avx2_out
+                        );
+                    }
+                }
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    let mut neon_out = case.input;
+                    // SAFETY: guarded by runtime feature detection above.
+                    unsafe { simd_l2_normalize_neon(&mut neon_out) };
+                    assert!(
+                        neon_out.iter().all(|v| v.is_finite()),
+                        "case {}: simd_l2_normalize_neon output must be fully finite, got {:?}",
+                        case.name,
+                        neon_out
+                    );
+                    assert_close_slice(
+                        &scalar_out,
+                        &neon_out,
+                        1e-6,
+                        &format!("case {}: scalar vs neon", case.name),
+                    );
+                    if case.expect_all_zero {
+                        assert!(
+                            neon_out.iter().all(|&v| v == 0.0),
+                            "case {}: simd_l2_normalize_neon must zero the whole vector, got {:?}",
+                            case.name,
+                            neon_out
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #850/#862 round-2 major-3 follow-up: state-isolation proof through the SHIPPING
+    /// fused path (`gated_delta_net_step_fused`) using the REAL Qwen3.5 conv kernel size
+    /// (`linear_conv_kernel_dim == 4`, i.e. `Qwen35Config::qwen35_2b()` unmodified — no
+    /// `kernel_dim = 1` override), so `state.conv_buffer`'s rolling history is genuinely
+    /// exercised, not sidestepped.
+    ///
+    /// ## Conv-window mechanics (read from `apply_causal_conv1d` in `attention/gdn.rs`
+    /// before writing this test, per the #862 round-2 mandate)
+    ///
+    /// `apply_causal_conv1d` stores each step's RAW per-channel projection value in a
+    /// rolling `buf_len = kernel_size - 1` (= 3) history *before* L2-normalization runs;
+    /// the guard only sanitizes the L2-normalize consumer, it never retroactively cleans
+    /// what conv1d already pushed into `conv_buffer`. A raw value written at step `t0`
+    /// is read back as one of the `kernel_size` (= 4) taps at steps `t0, t0+1, t0+2,
+    /// t0+3` and is fully evicted from the window starting step `t0+4`. So a single NaN
+    /// raw projection at step 0 contaminates the reduced norm at steps 0-3 (not just
+    /// step 0), and step 4 onward is unaffected by it.
+    ///
+    /// ## What "poisoned" and "reference" mean here
+    ///
+    /// Both runs use `weights_window` (head-0's entire K row block zeroed) for ALL FOUR
+    /// window steps (0-3), not just step 0 — the poisoned run additionally sets exactly
+    /// one weight entry to NaN, ONLY at step 0. Steps 4-7 (four clean tokens, satisfying
+    /// #862 round-2's "at least 4 subsequent clean tokens" ask) use ordinary
+    /// `weights_clean`, identical in both runs.
+    ///
+    /// This is a deliberate, disclosed choice, not a narrowing of the claim: holding the
+    /// K row at true zero for the *whole* contamination window (not just step 0) is the
+    /// only reference construction for which "bit-identical to the poisoned run" is
+    /// mathematically achievable. If steps 1-3 used ordinary (nonzero) clean weights
+    /// instead, the two runs would necessarily diverge during the window: the guard
+    /// forces the WHOLE 128-lane K vector to zero the instant any one lane's reduced
+    /// norm goes non-finite, while a genuinely undisturbed run's other 127 lanes carry
+    /// real, non-zero signal at those same steps. A single corrupted lane forcing a
+    /// whole-vector zero is the documented ADR-080 contract (see PR body "Contract
+    /// decision"); it is not, and cannot be, bit-identical to what an always-clean run
+    /// would have produced at those specific steps -- the recurrent state update is not
+    /// self-correcting, so a real K contribution written at step 1-3 in a "genuinely
+    /// never touched" reference could never be un-written by a later step either way.
+    /// Holding K at true zero through the full window on BOTH sides isolates exactly the
+    /// contract this PR fixes (whole-vector zero-by-assignment on a non-finite reduced
+    /// norm) from that separate, inherent, whole-vector-zero-granularity information
+    /// cost, and is the literal question #862 round-2 major-3 asks: does the guard's
+    /// zeroing take the identical numerical path as true-zero weights, for as long as
+    /// the corruption persists in the conv window, and does state fully re-converge
+    /// (`state.snapshot()`: `s_matrices` AND `conv_buffer`) once the window closes?
+    ///
+    /// ## Assertions
+    ///
+    /// - Every step (0-7): output and `s_matrices` are finite AND bit-identical between
+    ///   poisoned and reference runs (fail-closed: the NaN never leaks past the guard
+    ///   into the recurrent state or the output).
+    /// - Post-step snapshots 0-2: the poisoned run's raw `conv_buffer` still contains
+    ///   exactly the one tracked NaN (raw storage is pre-guard by design), so the
+    ///   COMPLETE snapshot differs from the reference there — the assertions pin this
+    ///   expected divergence explicitly rather than claiming full-state identity.
+    /// - Post-step snapshot 3 onward: step 0's poisoned value has aged out of the
+    ///   conv window, and the complete `state.snapshot()` (both `s_matrices` and
+    ///   `conv_buffer`) is finite and bit-identical to the reference unconditionally
+    ///   (no guard involvement needed) -- the concrete "recovers to bit-identical once
+    ///   aged out of the conv window" proof #862 round-2 major-3 asked for.
+    ///
+    /// Mutation-sensitive: reverting the `!norm_sq.is_finite()` guard in
+    /// `simd_l2_normalize` (any backend) makes the poisoned run's step-0 output/state
+    /// NaN, which corrupts `state.s_matrices` and every subsequent step once written --
+    /// so every assertion from step 0 onward fails immediately. Note the CPU guard's
+    /// condition is `!norm_sq.is_finite()` only (no `> 1e-12` near-zero threshold) --
+    /// see `attention::gdn_fused::simd_l2_normalize*` vs. Metal's `isfinite(sg_buf[0]) &&
+    /// sg_buf[0] > 1e-12f`. This test's zero-norm case never exercises that difference:
+    /// this test's "invalid" case is a true NaN (violates `is_finite()` on both
+    /// backends), not a tiny nonzero norm (where the two backends would diverge). Do not
+    /// read this test as evidence the two backends share one near-zero contract; they do
+    /// not (see PR body "CPU vs. Metal near-zero contract").
+    #[test]
+    fn gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel() {
+        let cfg = Qwen35Config::qwen35_2b();
+        assert_eq!(
+            cfg.linear_conv_kernel_dim, 4,
+            "this test exists specifically to exercise the REAL production conv kernel \
+             size, not a degenerate override -- if qwen35_2b()'s default ever changes \
+             this test must be updated to keep testing the real value, not silently \
+             test a stale one"
+        );
+        let kernel_size = cfg.linear_conv_kernel_dim;
+        let window = kernel_size; // # of dispatch steps a single poisoned raw value contaminates
+        let clean_tail = 4; // #862 round-2 major-3: "at least 4 subsequent clean tokens"
+        let total_steps = window + clean_tail;
+
+        let (base_weights, cfg) = make_test_weights_for_cfg(cfg, 77);
+        let hidden = cfg.hidden_size;
+        let key_dim = cfg.linear_key_head_dim;
+        let num_heads = cfg.linear_num_key_heads;
+        let q_total = num_heads * key_dim;
+        let k0_row_start = q_total; // head-0 K rows begin right after all Q rows
+
+        let build_window_weights = |poison: bool| -> GatedDeltaNetWeights {
+            let mut w = base_weights.clone();
+            for r in k0_row_start..k0_row_start + key_dim {
+                let row = &mut w.in_proj_qkv[r * hidden..(r + 1) * hidden];
+                row.fill(0.0);
+            }
+            if poison {
+                // One NaN lane in the first zeroed K row: input[0] * NaN = NaN
+                // regardless of input[0]'s value (0 * NaN = NaN under IEEE-754), and
+                // every other row stays exactly 0.0 * finite = 0.0.
+                w.in_proj_qkv[k0_row_start * hidden] = f32::NAN;
+            }
+            w
+        };
+        let weights_poison = build_window_weights(true);
+        let weights_zero = build_window_weights(false);
+        let (weights_clean, _) = make_test_weights_for_cfg(cfg.clone(), 78);
+
+        let mut rng = XorShift64::new(99);
+        let mut inputs: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..total_steps {
+            let mut v = vec![0.0f32; hidden];
+            rng.fill_gaussian(&mut v, 0.1);
+            inputs.push(v);
+        }
+
+        type OutputsAndSnapshots = (Vec<Vec<f32>>, Vec<(Vec<f32>, Vec<f32>)>); // (s_matrices, conv_buffer) per step
+
+        let run = |step0_weights: &GatedDeltaNetWeights,
+                   window_weights: &GatedDeltaNetWeights|
+         -> OutputsAndSnapshots {
+            let mut state = GatedDeltaNetState::new(&cfg);
+            let mut scratch = GatedDeltaNetFusedScratch::default();
+            let mut outputs = Vec::with_capacity(total_steps);
+            let mut snapshots = Vec::with_capacity(total_steps);
+
+            for step in 0..total_steps {
+                let w = if step == 0 {
+                    step0_weights
+                } else if step < window {
+                    window_weights
+                } else {
+                    &weights_clean
+                };
+                let mut output = vec![0.0f32; hidden];
+                gated_delta_net_step_fused(
+                    &inputs[step],
+                    &mut state,
+                    w,
+                    &cfg,
+                    &mut scratch,
+                    &mut output,
+                    &crate::lora_hook::NoopLoraHook,
+                    0,
+                );
+                outputs.push(output);
+                snapshots.push(state.snapshot());
+            }
+            (outputs, snapshots)
+        };
+
+        // Both runs use the zero-K window weights at steps 1..window; only step 0
+        // differs (NaN vs true zero in one lane).
+        let (poisoned_outputs, poisoned_snapshots) = run(&weights_poison, &weights_zero);
+        let (reference_outputs, reference_snapshots) = run(&weights_zero, &weights_zero);
+
+        // `apply_causal_conv1d` stores the RAW (pre-guard) value: the single NaN raw
+        // projection written by step 0 is a genuine, expected, transient resident of
+        // `conv_buffer` for exactly `buf_len = kernel_size - 1` (== 3) POST-step
+        // snapshots (0, 1, 2) -- it shifts one slot left after every step and is fully
+        // evicted from the buffer once `buf_len` shifts have happened, i.e. by the
+        // snapshot taken after step `buf_len - 1` (== 2)'s successor, step `buf_len`
+        // (== 3). `conv_buffer` is NOT guard-sanitized (only the L2-normalize consumer
+        // is), so asserting it stays finite at every step would be asserting something
+        // the code does not do and does not need to do -- the guard's job is to stop the
+        // raw NaN from being *read* as a valid vector, not to scrub where it is stored.
+        let raw_taint_snapshots = kernel_size.saturating_sub(1); // buf_len; snapshots 0..raw_taint_snapshots hold the raw NaN
+        for step in 0..total_steps {
+            let non_finite = poisoned_outputs[step]
+                .iter()
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                non_finite, 0,
+                "step {step}: poisoned run must fail closed (finite output), found {non_finite} non-finite element(s) -- a NaN K lane leaked past simd_l2_normalize"
+            );
+            let (s_matrices, _conv_buffer) = &poisoned_snapshots[step];
+            let non_finite_s = s_matrices.iter().filter(|v| !v.is_finite()).count();
+            assert_eq!(
+                non_finite_s, 0,
+                "step {step}: poisoned run's s_matrices must fail closed (finite), found {non_finite_s} non-finite element(s) -- s_matrices is only ever updated from the GUARDED (post-L2-normalize) K vector, never from raw conv_buffer directly, so it must stay finite even while conv_buffer transiently does not"
+            );
+
+            assert_eq!(
+                poisoned_outputs[step], reference_outputs[step],
+                "step {step}: poisoned-K run output must be bit-identical to the explicit-zero-weight reference"
+            );
+            assert_eq!(
+                poisoned_snapshots[step].0, reference_snapshots[step].0,
+                "step {step}: poisoned-K run s_matrices must be bit-identical to the explicit-zero-weight reference"
+            );
+
+            let (poisoned_conv, reference_conv) =
+                (&poisoned_snapshots[step].1, &reference_snapshots[step].1);
+            let reference_non_finite = reference_conv.iter().filter(|v| !v.is_finite()).count();
+            assert_eq!(
+                reference_non_finite, 0,
+                "step {step}: the explicit-zero-weight reference never has a NaN raw \
+                 projection at all, so its conv_buffer must always be fully finite"
+            );
+            if step < raw_taint_snapshots {
+                // Inside the raw-storage taint window: exactly one conv_buffer element
+                // (the shifting slot holding step 0's raw NaN) legitimately differs --
+                // NaN in the poisoned run's raw storage, 0.0 in the reference's. Assert
+                // that difference is exactly accounted for and nothing else diverges.
+                let poisoned_non_finite = poisoned_conv.iter().filter(|v| !v.is_finite()).count();
+                assert_eq!(
+                    poisoned_non_finite,
+                    1,
+                    "step {step}: expected exactly one transient raw-NaN resident in \
+                     conv_buffer (step 0's poisoned projection, still shifting through \
+                     the buf_len={} window), found {poisoned_non_finite}",
+                    kernel_size - 1
+                );
+                let mismatches = poisoned_conv
+                    .iter()
+                    .zip(reference_conv.iter())
+                    .filter(|(p, r)| {
+                        if p.is_nan() {
+                            **r != 0.0
+                        } else {
+                            p.to_bits() != r.to_bits()
+                        }
+                    })
+                    .count();
+                assert_eq!(
+                    mismatches, 0,
+                    "step {step}: every conv_buffer element other than the one \
+                     transient raw-NaN slot must be bit-identical between the \
+                     poisoned and reference runs (found {mismatches} unexplained \
+                     mismatch(es) beyond the expected NaN-vs-0.0 slot)"
+                );
+            } else {
+                // Window fully closed: conv_buffer must now be completely finite and
+                // bit-identical -- the concrete "recovers to bit-identical once aged out
+                // of the conv window" proof #862 round-2 major-3 asked for.
+                let poisoned_non_finite = poisoned_conv.iter().filter(|v| !v.is_finite()).count();
+                assert_eq!(
+                    poisoned_non_finite,
+                    0,
+                    "step {step}: conv_buffer must be fully finite once the raw-NaN \
+                     resident has aged out of the buf_len={} rolling window, found \
+                     {poisoned_non_finite} non-finite element(s)",
+                    kernel_size - 1
+                );
+                assert_eq!(
+                    poisoned_conv, reference_conv,
+                    "step {step}: conv_buffer must be bit-identical between poisoned \
+                     and reference runs once the window has fully closed"
+                );
+            }
+        }
+
+        assert!(
+            total_steps > window,
+            "test must run strictly more steps than the conv window to prove post-window convergence"
+        );
     }
 }

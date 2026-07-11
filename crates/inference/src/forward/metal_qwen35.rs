@@ -24807,6 +24807,973 @@ mod inner {
             );
         }
 
+        // =====================================================================
+        // #850: GDN Q/K L2-normalization fail-closed — direct Metal kernel
+        // dispatch regression tests. No model checkpoint dependency; the only
+        // permitted skip is "no Metal device" (per #850's gate text: "no
+        // silent skip on a missing device or optional Qwen3.6 pipeline" —
+        // these tests build their own pipelines directly from MSL_SOURCE, so
+        // there is no optional-pipeline skip path at all).
+        //
+        // Methodology: for each of the 8 sites (4 kernels x Q/K), dispatch the
+        // SAME kernel twice with otherwise-identical inputs: once with one NaN
+        // lane injected into the Q (or K) input, once with that entire Q (or
+        // K) sub-vector explicitly zeroed instead. Per ADR-080 C1 + the #850
+        // contract (an invalid Q/K vector is assigned literal 0.0, matching
+        // ordinary zero-weight arithmetic), both runs take the SAME
+        // `!(sum_sq > 1e-12f) -> assign 0.0` branch server-side (a poisoned
+        // sum_sq is non-finite, an all-zero sum_sq is exactly 0.0 <= 1e-12f),
+        // so a correct kernel produces BIT-IDENTICAL output between the two
+        // runs. This is a Metal-vs-Metal (poisoned-vs-explicit-zero-reference)
+        // differential, not a cross-language CPU-vs-Metal one; see the PR body
+        // for why that scope was chosen. Mutation-sensitive: the pre-fix
+        // `value * guarded_zero_reciprocal` code lets the poisoned lane itself
+        // stay NaN while every OTHER lane goes to `finite * 0.0 = 0.0`, so the
+        // poisoned run diverges from the all-zero reference at exactly that
+        // lane -- the bit-identical assertion below fails under the reverted
+        // code (see the reverse-mutation proof in the PR body).
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        mod gdn_850_failclosed {
+            use super::*;
+
+            /// Matches the MSL `GdnRecurParams` struct used by
+            /// `gdn_recurrence_fused`, `gdn_recurrence_fused_q36`, and
+            /// `gdn_precompute_keys` (field-for-field, see qwen35.metal:996-1005).
+            #[repr(C)]
+            struct TestGdnRecurParams {
+                key_dim: u32,
+                value_dim: u32,
+                num_key_heads: u32,
+                num_value_heads: u32,
+                hidden_size: u32,
+                q_total: u32,
+                v_offset: u32,
+                scale: f32,
+                eps: f32,
+            }
+
+            fn compile_msl(device: &Device) -> Library {
+                let opts = CompileOptions::new();
+                device
+                    .new_library_with_source(MSL_SOURCE, &opts)
+                    .expect("MSL_SOURCE must compile")
+            }
+
+            fn pipeline_for(device: &Device, lib: &Library, name: &str) -> ComputePipelineState {
+                let func = lib
+                    .get_function(name, None)
+                    .unwrap_or_else(|e| panic!("kernel {name} not found in MSL_SOURCE: {e}"));
+                device
+                    .new_compute_pipeline_state_with_function(&func)
+                    .unwrap_or_else(|e| panic!("failed to build pipeline for {name}: {e}"))
+            }
+
+            fn f32_buf(device: &Device, data: &[f32], label: &str) -> Buffer {
+                let buf = device.new_buffer_with_data(
+                    data.as_ptr() as *const _,
+                    std::mem::size_of_val(data) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                buf.set_label(label);
+                buf
+            }
+
+            fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
+                // SAFETY: buffer is StorageModeShared, previously written by a
+                // completed command buffer, and sized for `len` f32 elements.
+                unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len).to_vec() }
+            }
+
+            fn lcg_vec(seed: u64, n: usize) -> Vec<f32> {
+                let mut state = seed;
+                (0..n)
+                    .map(|_| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        (((state >> 32) as u32) as f32 / u32::MAX as f32 - 0.5) * 0.2
+                    })
+                    .collect()
+            }
+
+            fn assert_no_nonfinite(label: &str, buf_name: &str, data: &[f32]) {
+                let bad = data.iter().filter(|v| !v.is_finite()).count();
+                assert_eq!(
+                    bad,
+                    0,
+                    "{label}: {buf_name} must fail closed (finite), got {bad} non-finite \
+                     element(s) out of {}: {data:?}",
+                    data.len()
+                );
+            }
+
+            // --------------------------------------------------------------
+            // Kernel 1: gdn_recurrence_fused. Small synthetic dims (kd=vd=8,
+            // hd=16, 1 key head, 1 value head) -- this kernel takes kd/vd/hd
+            // as runtime params (bounds-checked via `tid < kd`/`tid < vd`), so
+            // shrinking them is safe and keeps buffers tiny.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_recurrence_fused(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                kd: u32,
+                vd: u32,
+                hd: u32,
+                conv_out: &[f32],
+                s_init: &[f32],
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+            ) -> (Vec<f32>, Vec<f32>) {
+                let q_total = kd;
+                let v_offset = q_total * 2;
+                let output_dim = vd;
+
+                let s_buf = f32_buf(device, s_init, "S_all");
+                let conv_buf = f32_buf(device, conv_out, "conv_out");
+                let z_buf = f32_buf(device, &vec![0.0f32; output_dim as usize], "z_proj");
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let normw_buf = f32_buf(device, &vec![1.0f32; vd as usize], "norm_w");
+                let out_buf = make_zero_buffer(device, output_dim as usize, "output");
+
+                let params = TestGdnRecurParams {
+                    key_dim: kd,
+                    value_dim: vd,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: hd,
+                    q_total,
+                    v_offset,
+                    scale: 1.0 / (kd as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&s_buf), 0);
+                enc.set_buffer(1, Some(&conv_buf), 0);
+                enc.set_buffer(2, Some(&z_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&normw_buf), 0);
+                enc.set_buffer(9, Some(&out_buf), 0);
+                enc.set_bytes(
+                    10,
+                    std::mem::size_of::<TestGdnRecurParams>() as u64,
+                    &params as *const TestGdnRecurParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_buf, output_dim as usize),
+                    read_f32(&s_buf, (kd * vd) as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping gdn_recurrence_fused_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_recurrence_fused");
+                let queue = device.new_command_queue();
+
+                let kd = 8u32;
+                let vd = 8u32;
+                let hd = 16u32;
+                let hidden_in = lcg_vec(1, hd as usize);
+                let in_proj_b = lcg_vec(2, hd as usize);
+                let in_proj_a = lcg_vec(3, hd as usize);
+                let s_init = lcg_vec(4, (kd * vd) as usize);
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(5, (3 * kd) as usize); // [Q(kd) | K(kd) | V(kd)]
+                    let mut poisoned = base.clone();
+                    let mut reference = base.clone();
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, kd as usize)
+                    } else {
+                        (kd as usize, 2 * kd as usize)
+                    };
+                    poisoned[lo] = f32::NAN;
+                    for v in reference[lo..hi].iter_mut() {
+                        *v = 0.0;
+                    }
+
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix (Q->K threadgroup_barrier after every sg_buf[0] consumer):
+                    // a passing single dispatch does not prove the race is closed
+                    // (simdgroups are not required to advance in lockstep, so the
+                    // hazard window may or may not be hit on a given run), so this
+                    // repeats the dispatch to raise the chance of exposing it if the
+                    // barrier were ever removed again. Not a substitute for the
+                    // access-order argument the barrier itself is required by.
+                    for _ in 0..20 {
+                        let (out_p, s_p) = run_gdn_recurrence_fused(
+                            &device, &queue, &pipe, kd, vd, hd, &poisoned, &s_init, &hidden_in,
+                            &in_proj_b, &in_proj_a,
+                        );
+                        let (out_r, s_r) = run_gdn_recurrence_fused(
+                            &device, &queue, &pipe, kd, vd, hd, &reference, &s_init, &hidden_in,
+                            &in_proj_b, &in_proj_a,
+                        );
+
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused[{label}]"),
+                            "output",
+                            &out_p,
+                        );
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused[{label}]"),
+                            "S_all",
+                            &s_p,
+                        );
+                        assert_eq!(
+                            out_p, out_r,
+                            "gdn_recurrence_fused[{label}-poisoned]: output must be bit-identical \
+                             to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                        assert_eq!(
+                            s_p, s_r,
+                            "gdn_recurrence_fused[{label}-poisoned]: updated S_all must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
+                }
+            }
+
+            // --------------------------------------------------------------
+            // Kernel 2: gdn_recurrence_fused_q36. kd=vd=128, hd=5120 are
+            // Metal `constexpr` in this kernel (not runtime params), so they
+            // are NOT shrinkable; num_value_heads=1 keeps the rest of the
+            // dispatch small (k_head = h/3u still resolves to 0 for h=0).
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_recurrence_fused_q36(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                conv_out: &[f32],
+                s_init: &[f32],
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+            ) -> (Vec<f32>, Vec<f32>) {
+                const KD: u32 = 128;
+                const VD: u32 = 128;
+                const HD: u32 = 5120;
+                let q_total = KD;
+                let v_offset = q_total * 2;
+
+                let s_buf = f32_buf(device, s_init, "S_all");
+                let conv_buf = f32_buf(device, conv_out, "conv_out");
+                let z_buf = f32_buf(device, &vec![0.0f32; VD as usize], "z_proj");
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let normw_buf = f32_buf(device, &vec![1.0f32; VD as usize], "norm_w");
+                let out_buf = make_zero_buffer(device, VD as usize, "output");
+
+                let params = TestGdnRecurParams {
+                    key_dim: KD,
+                    value_dim: VD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&s_buf), 0);
+                enc.set_buffer(1, Some(&conv_buf), 0);
+                enc.set_buffer(2, Some(&z_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&normw_buf), 0);
+                enc.set_buffer(9, Some(&out_buf), 0);
+                enc.set_bytes(
+                    10,
+                    std::mem::size_of::<TestGdnRecurParams>() as u64,
+                    &params as *const TestGdnRecurParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_buf, VD as usize),
+                    read_f32(&s_buf, (KD * VD) as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_recurrence_fused_q36_fails_closed_on_nan_q_and_k_lane() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping gdn_recurrence_fused_q36_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_recurrence_fused_q36");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 5120;
+                let hidden_in = lcg_vec(11, HD as usize);
+                let in_proj_b = lcg_vec(12, HD as usize);
+                let in_proj_a = lcg_vec(13, HD as usize);
+                let s_init = lcg_vec(14, (KD * KD) as usize);
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(15, (3 * KD) as usize); // [Q(128) | K(128) | V(128)]
+                    let mut poisoned = base.clone();
+                    let mut reference = base.clone();
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, KD as usize)
+                    } else {
+                        (KD as usize, 2 * KD as usize)
+                    };
+                    poisoned[lo] = f32::NAN;
+                    for v in reference[lo..hi].iter_mut() {
+                        *v = 0.0;
+                    }
+
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix; see the identical comment in
+                    // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
+                    for _ in 0..20 {
+                        let (out_p, s_p) = run_gdn_recurrence_fused_q36(
+                            &device, &queue, &pipe, &poisoned, &s_init, &hidden_in, &in_proj_b,
+                            &in_proj_a,
+                        );
+                        let (out_r, s_r) = run_gdn_recurrence_fused_q36(
+                            &device, &queue, &pipe, &reference, &s_init, &hidden_in, &in_proj_b,
+                            &in_proj_a,
+                        );
+
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused_q36[{label}]"),
+                            "output",
+                            &out_p,
+                        );
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused_q36[{label}]"),
+                            "S_all",
+                            &s_p,
+                        );
+                        assert_eq!(
+                            out_p, out_r,
+                            "gdn_recurrence_fused_q36[{label}-poisoned]: output must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                        assert_eq!(
+                            s_p, s_r,
+                            "gdn_recurrence_fused_q36[{label}-poisoned]: updated S_all must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
+                }
+            }
+
+            // --------------------------------------------------------------
+            // Kernel 3: gdn_precompute_keys. kd=128, hd=5120 are Metal
+            // `constexpr` (not shrinkable). Writes into a split key_scratch
+            // buffer: [q_norm(128) | k_norm(128) | k_dot_q(1)] per key head,
+            // then [beta | g] per value head.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_precompute_keys(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                conv_out: &[f32],
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+            ) -> Vec<f32> {
+                const KD: u32 = 128;
+                const HD: u32 = 5120;
+                let q_total = KD;
+                let key_stride = 2 * KD + 1;
+                let scratch_len = key_stride + 2; // 1 key head + 1 value head
+
+                let conv_buf = f32_buf(device, conv_out, "conv_out");
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let scratch_buf = make_zero_buffer(device, scratch_len as usize, "key_scratch");
+
+                let params = TestGdnRecurParams {
+                    key_dim: KD,
+                    value_dim: KD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset: q_total * 2,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&conv_buf), 0);
+                enc.set_buffer(1, Some(&hidden_buf), 0);
+                enc.set_buffer(2, Some(&inb_buf), 0);
+                enc.set_buffer(3, Some(&ina_buf), 0);
+                enc.set_buffer(4, Some(&alog_buf), 0);
+                enc.set_buffer(5, Some(&dtb_buf), 0);
+                enc.set_buffer(6, Some(&scratch_buf), 0);
+                enc.set_bytes(
+                    7,
+                    std::mem::size_of::<TestGdnRecurParams>() as u64,
+                    &params as *const TestGdnRecurParams as *const _,
+                );
+                // Production dispatch shape for gdn_precompute_keys (matches
+                // encode_gdn_layer's H3 dispatch); thread_index_in_threadgroup is
+                // linear regardless of the 3D shape, so this is a fidelity match,
+                // not a correctness requirement.
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                read_f32(&scratch_buf, scratch_len as usize)
+            }
+
+            #[test]
+            fn gdn_precompute_keys_fails_closed_on_nan_q_and_k_lane() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping gdn_precompute_keys_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                // `gdn_precompute_keys` is defined unconditionally in qwen35.metal (no
+                // #ifdef gate) -- it is not actually an optional/conditionally-compiled
+                // kernel, so a missing lookup here means MSL_SOURCE was compiled but the
+                // named kernel silently failed to link, which is itself a bug this test
+                // must catch, not skip past (#862 round 1, medium finding 4: only
+                // device-absence may remain a platform-level skip).
+                let pipe_func = lib
+                    .get_function("gdn_precompute_keys", None)
+                    .expect("gdn_precompute_keys must be present in MSL_SOURCE once compiled");
+                let pipe = device
+                    .new_compute_pipeline_state_with_function(&pipe_func)
+                    .expect("build gdn_precompute_keys pipeline");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 5120;
+                let hidden_in = lcg_vec(21, HD as usize);
+                let in_proj_b = lcg_vec(22, HD as usize);
+                let in_proj_a = lcg_vec(23, HD as usize);
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(24, (2 * KD) as usize); // [Q(128) | K(128)]
+                    let mut poisoned = base.clone();
+                    let mut reference = base.clone();
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, KD as usize)
+                    } else {
+                        (KD as usize, 2 * KD as usize)
+                    };
+                    poisoned[lo] = f32::NAN;
+                    for v in reference[lo..hi].iter_mut() {
+                        *v = 0.0;
+                    }
+
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix (this kernel has TWO fixed handoffs: Q->K and K->k_dot_q);
+                    // see the identical comment in
+                    // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
+                    for _ in 0..20 {
+                        let scratch_p = run_gdn_precompute_keys(
+                            &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a,
+                        );
+                        let scratch_r = run_gdn_precompute_keys(
+                            &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
+                        );
+
+                        // scratch layout: [q_norm(128) | k_norm(128) | k_dot_q(1) | beta | g]
+                        assert_no_nonfinite(
+                            &format!("gdn_precompute_keys[{label}]"),
+                            "key_scratch",
+                            &scratch_p,
+                        );
+                        assert_eq!(
+                            scratch_p, scratch_r,
+                            "gdn_precompute_keys[{label}-poisoned]: key_scratch must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
+                }
+            }
+
+            // --------------------------------------------------------------
+            // Kernel 4: gdn_chunk_materialize_c32. Implicitly requires
+            // kd=vd=128 (the kernel indexes `kh*kd+tid` across all 128
+            // dispatched threads with no `tid < kd` bound, unlike kernel 1).
+            // Single token, single chunk (n_tokens=1, chunk_size=1,
+            // num_chunks=1) to keep the dispatch minimal; conv1d kernel_size
+            // (`ks`) is a Metal `constexpr 4u` in this kernel, independent of
+            // GdnChunkParams.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_chunk_materialize_c32(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                gdn_qkv: &[f32],
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+            ) -> (Vec<f32>, Vec<f32>) {
+                const KD: u32 = 128;
+                const VD: u32 = 128;
+                const HD: u32 = 16;
+                const BUF_LEN: u32 = 3; // ks - 1
+                let q_total = KD;
+                let v_offset = q_total * 2;
+                let qkv_dim = v_offset + VD;
+
+                let conv_buf_state =
+                    make_zero_buffer(device, (qkv_dim * BUF_LEN) as usize, "conv_buf");
+                let gdn_qkv_buf = f32_buf(device, gdn_qkv, "gdn_qkv");
+                let conv_weight_buf = f32_buf(
+                    device,
+                    &vec![0.25f32; (qkv_dim * 4) as usize],
+                    "conv_weight",
+                );
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let out_q_buf = make_zero_buffer(device, KD as usize, "out_q");
+                let out_k_buf = make_zero_buffer(device, KD as usize, "out_k");
+                let out_v_buf = make_zero_buffer(device, VD as usize, "out_v");
+                let out_bla_buf = make_zero_buffer(device, 2, "out_bla");
+
+                let params = GdnChunkParams {
+                    key_dim: KD,
+                    value_dim: VD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset,
+                    qkv_dim,
+                    output_dim: VD,
+                    chunk_size: 1,
+                    n_tokens: 1,
+                    num_chunks: 1,
+                    active_chunk: 0,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&conv_buf_state), 0);
+                enc.set_buffer(1, Some(&gdn_qkv_buf), 0);
+                enc.set_buffer(2, Some(&conv_weight_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&out_q_buf), 0);
+                enc.set_buffer(9, Some(&out_k_buf), 0);
+                enc.set_buffer(10, Some(&out_v_buf), 0);
+                enc.set_buffer(11, Some(&out_bla_buf), 0);
+                enc.set_bytes(
+                    12,
+                    std::mem::size_of::<GdnChunkParams>() as u64,
+                    &params as *const GdnChunkParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_q_buf, KD as usize),
+                    read_f32(&out_k_buf, KD as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_chunk_materialize_c32_fails_closed_on_nan_q_and_k_lane() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping gdn_chunk_materialize_c32_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_chunk_materialize_c32");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 16;
+                let hidden_in = lcg_vec(31, HD as usize);
+                let in_proj_b = lcg_vec(32, HD as usize);
+                let in_proj_a = lcg_vec(33, HD as usize);
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(34, (3 * KD) as usize); // [Q(128) | K(128) | V(128)]
+                    let mut poisoned = base.clone();
+                    let mut reference = base.clone();
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, KD as usize)
+                    } else {
+                        (KD as usize, 2 * KD as usize)
+                    };
+                    poisoned[lo] = f32::NAN;
+                    for v in reference[lo..hi].iter_mut() {
+                        *v = 0.0;
+                    }
+
+                    let (outq_p, outk_p) = run_gdn_chunk_materialize_c32(
+                        &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a,
+                    );
+                    let (outq_r, outk_r) = run_gdn_chunk_materialize_c32(
+                        &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
+                    );
+
+                    assert_no_nonfinite(
+                        &format!("gdn_chunk_materialize_c32[{label}]"),
+                        "out_q",
+                        &outq_p,
+                    );
+                    assert_no_nonfinite(
+                        &format!("gdn_chunk_materialize_c32[{label}]"),
+                        "out_k",
+                        &outk_p,
+                    );
+                    assert_eq!(
+                        outq_p, outq_r,
+                        "gdn_chunk_materialize_c32[{label}-poisoned]: out_q must be \
+                         bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                    );
+                    assert_eq!(
+                        outk_p, outk_r,
+                        "gdn_chunk_materialize_c32[{label}-poisoned]: out_k must be \
+                         bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                    );
+                }
+            }
+
+            // --------------------------------------------------------------
+            // #862 round-2 major-2 follow-up: multi-token gdn_chunk_materialize_c32
+            // dispatch (the CHUNKED PREFILL path #850's integration ask names) exercising
+            // REAL within-chunk conv-window carryover, not a single n_tokens=1 dispatch.
+            //
+            // `gdn_chunk_materialize_c32`'s per-token loop (`for (uint j=0u;j<ci;j++)`)
+            // reads each tap directly from the flat `gdn_qkv` input array by absolute
+            // token index (`src = global_row+tap-buf_len`; `src<0` reads pre-chunk
+            // `conv_buf` history, `src>=0` reads `gdn_qkv[src*qkv_dim+ch]`), so a NaN raw
+            // value written at token 0's channel contaminates every token whose tap
+            // window includes token 0 -- tokens 0,1,2,3 for `ks=4` (this kernel's
+            // `constexpr ks=4u`, i.e. `buf_len=3`) -- and is naturally absent (no register
+            // carryover needed, it is pure array indexing) for token 4 onward. This is the
+            // dispatch-time analog of the decode-path `apply_causal_conv1d` rolling buffer
+            // proven in `gdn_fused::tests::gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel`.
+            //
+            // Reference construction (same reasoning as the decode-path test above): BOTH
+            // poisoned and reference runs hold the target head's whole channel-span
+            // exactly zero for tokens 0..ks (the full contamination window), differing
+            // only by the single NaN scalar at [token 0, poisoned_channel]. Tokens ks..N-1
+            // ("at least 4 subsequent clean tokens") use ordinary ORDINARY per-token
+            // random data identically in both runs. Whole-vector zero-by-assignment on a
+            // non-finite reduced norm is bit-identical to true-zero-weight arithmetic for
+            // as long as the corruption sits in the window, and the two runs are governed
+            // by the SAME per-token raw array for every clean token, so they are proven
+            // bit-identical, and finite, at every token, with no further guard dependency
+            // once the window closes.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_chunk_materialize_c32_multi_token(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                gdn_qkv: &[f32], // [n_tokens, qkv_dim] flat, qkv_dim = 3*KD
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+                n_tokens: u32,
+            ) -> (Vec<f32>, Vec<f32>) {
+                const KD: u32 = 128;
+                const VD: u32 = 128;
+                const HD: u32 = 16;
+                const BUF_LEN: u32 = 3; // ks - 1
+                let q_total = KD;
+                let v_offset = q_total * 2;
+                let qkv_dim = v_offset + VD;
+
+                let conv_buf_state =
+                    make_zero_buffer(device, (qkv_dim * BUF_LEN) as usize, "conv_buf");
+                let gdn_qkv_buf = f32_buf(device, gdn_qkv, "gdn_qkv");
+                let conv_weight_buf = f32_buf(
+                    device,
+                    &vec![0.25f32; (qkv_dim * 4) as usize],
+                    "conv_weight",
+                );
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let out_q_buf = make_zero_buffer(device, (KD * n_tokens) as usize, "out_q");
+                let out_k_buf = make_zero_buffer(device, (KD * n_tokens) as usize, "out_k");
+                let out_v_buf = make_zero_buffer(device, (VD * n_tokens) as usize, "out_v");
+                let out_bla_buf = make_zero_buffer(device, (2 * n_tokens) as usize, "out_bla");
+
+                let params = GdnChunkParams {
+                    key_dim: KD,
+                    value_dim: VD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset,
+                    qkv_dim,
+                    output_dim: VD,
+                    chunk_size: n_tokens,
+                    n_tokens,
+                    num_chunks: 1,
+                    active_chunk: 0,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&conv_buf_state), 0);
+                enc.set_buffer(1, Some(&gdn_qkv_buf), 0);
+                enc.set_buffer(2, Some(&conv_weight_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&out_q_buf), 0);
+                enc.set_buffer(9, Some(&out_k_buf), 0);
+                enc.set_buffer(10, Some(&out_v_buf), 0);
+                enc.set_buffer(11, Some(&out_bla_buf), 0);
+                enc.set_bytes(
+                    12,
+                    std::mem::size_of::<GdnChunkParams>() as u64,
+                    &params as *const GdnChunkParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_q_buf, (KD * n_tokens) as usize),
+                    read_f32(&out_k_buf, (KD * n_tokens) as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_chunk_materialize_c32_multi_token_k_poison_window_state_isolation() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!(
+                        "skipping gdn_chunk_materialize_c32_multi_token_k_poison_window_state_isolation: no Metal device"
+                    );
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_chunk_materialize_c32");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 16;
+                const WINDOW: u32 = 4; // ks (kernel_size), matches the kernel's constexpr ks=4u
+                const CLEAN_TAIL: u32 = 4; // #862 round-2 major-2: "at least 4 subsequent clean tokens"
+                const N_TOKENS: u32 = WINDOW + CLEAN_TAIL;
+                let qkv_dim = 3 * KD; // [Q(128) | K(128) | V(128)] per token
+                let hidden_in = lcg_vec(41, HD as usize);
+                let in_proj_b = lcg_vec(42, HD as usize);
+                let in_proj_a = lcg_vec(43, HD as usize);
+
+                // K channel span (label fixed to K: the shipping-path production gap
+                // #862 round 1 found; the sibling single-token test above already
+                // covers both Q and K for a single dispatch).
+                let (lo, hi) = (KD as usize, 2 * KD as usize);
+
+                let base = lcg_vec(44, (qkv_dim * N_TOKENS) as usize);
+                let mut poisoned = base.clone();
+                let mut reference = base.clone();
+                // Zero the K channel span for every token in the window (0..WINDOW) in
+                // BOTH runs -- the only reference construction for which "bit-identical
+                // to the poisoned run" is achievable (see module doc comment above).
+                for t in 0..WINDOW {
+                    let row = (t * qkv_dim) as usize;
+                    for v in poisoned[row + lo..row + hi].iter_mut() {
+                        *v = 0.0;
+                    }
+                    for v in reference[row + lo..row + hi].iter_mut() {
+                        *v = 0.0;
+                    }
+                }
+                // Poison exactly one lane, only at token 0.
+                poisoned[lo] = f32::NAN;
+
+                let (outq_p, outk_p) = run_gdn_chunk_materialize_c32_multi_token(
+                    &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a, N_TOKENS,
+                );
+                let (outq_r, outk_r) = run_gdn_chunk_materialize_c32_multi_token(
+                    &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
+                    N_TOKENS,
+                );
+
+                assert_no_nonfinite(
+                    "gdn_chunk_materialize_c32[multi-token-K]",
+                    "out_q (all tokens)",
+                    &outq_p,
+                );
+                assert_no_nonfinite(
+                    "gdn_chunk_materialize_c32[multi-token-K]",
+                    "out_k (all tokens)",
+                    &outk_p,
+                );
+                assert_eq!(
+                    outq_p, outq_r,
+                    "gdn_chunk_materialize_c32[multi-token-K-poisoned]: out_q must be \
+                     bit-identical to the never-poisoned (explicit-zero-window) reference \
+                     at every token (Q was never touched by the K poison; this also \
+                     confirms the poison doesn't cross-contaminate the other head channel)"
+                );
+                for t in 0..N_TOKENS as usize {
+                    let row = t * KD as usize;
+                    assert_eq!(
+                        outk_p[row..row + KD as usize],
+                        outk_r[row..row + KD as usize],
+                        "gdn_chunk_materialize_c32[multi-token-K-poisoned]: token {t}'s \
+                         out_k must be bit-identical to the never-poisoned \
+                         (explicit-zero-window) reference -- token {t} is {} the ks={WINDOW} \
+                         contamination window",
+                        if (t as u32) < WINDOW {
+                            "inside"
+                        } else {
+                            "past (fully recovered from)"
+                        }
+                    );
+                }
+            }
+
+            // --------------------------------------------------------------
+            // decode_reference.metal oracle hardening: this kernel is a
+            // frozen test-only correctness oracle (used by the flash-decode
+            // parity suite above), not a live production kernel, but per
+            // #850's checklist it must not itself reproduce the
+            // multiply-through-zero bug class it exists to catch.
+            // --------------------------------------------------------------
+            #[test]
+            fn decode_attention_reference_fails_closed_on_nan_q() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping decode_attention_reference_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let opts = CompileOptions::new();
+                let lib = device
+                    .new_library_with_source(MSL_DECODE_REFERENCE, &opts)
+                    .expect("MSL_DECODE_REFERENCE must compile");
+                let pipe = pipeline_for(&device, &lib, "decode_attention_reference");
+                let queue = device.new_command_queue();
+
+                const HEAD_DIM: u32 = 8;
+                const NUM_Q_HEADS: u32 = 1;
+                const NUM_KV_HEADS: u32 = 1;
+                const CACHE_LEN: u32 = 4;
+                let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+                let mut q = lcg_vec(41, HEAD_DIM as usize);
+                q[0] = f32::NAN; // poison one Q lane -> every dot product for this head is NaN
+                let k = lcg_vec(42, (CACHE_LEN * HEAD_DIM) as usize);
+                let v = lcg_vec(43, (CACHE_LEN * HEAD_DIM) as usize);
+
+                let q_buf = f32_buf(&device, &q, "q");
+                let k_buf = f32_buf(&device, &k, "k_cache");
+                let v_buf = f32_buf(&device, &v, "v_cache");
+                let out_buf = make_zero_buffer(&device, HEAD_DIM as usize, "out");
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(&q_buf), 0);
+                enc.set_buffer(1, Some(&k_buf), 0);
+                enc.set_buffer(2, Some(&v_buf), 0);
+                enc.set_buffer(3, Some(&out_buf), 0);
+                enc.set_bytes(4, 4, &CACHE_LEN as *const u32 as *const _);
+                enc.set_bytes(5, 4, &HEAD_DIM as *const u32 as *const _);
+                enc.set_bytes(6, 4, &NUM_Q_HEADS as *const u32 as *const _);
+                enc.set_bytes(7, 4, &NUM_KV_HEADS as *const u32 as *const _);
+                enc.set_bytes(8, 4, &HEAD_DIM as *const u32 as *const _);
+                enc.set_bytes(9, 4, &HEAD_DIM as *const u32 as *const _);
+                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(NUM_Q_HEADS as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                let out = read_f32(&out_buf, HEAD_DIM as usize);
+                let nan_count = out.iter().filter(|v| !v.is_finite()).count();
+                assert_eq!(
+                    nan_count,
+                    0,
+                    "decode_attention_reference must fail closed (zero output) on a \
+                     NaN-poisoned Q lane instead of propagating NaN through the \
+                     `acc * inv_sum` finalize multiply (ADR-080 C1, #850); got \
+                     {nan_count}/{} non-finite elements: {out:?}",
+                    out.len()
+                );
+                assert!(
+                    out.iter().all(|v| *v == 0.0),
+                    "decode_attention_reference must assign the literal 0.0 row on an \
+                     invalid (non-finite) sum_exp, got {out:?}"
+                );
+            }
+        }
+
         // -------------------------------------------------------------------
         // Q8_0 non-finite input guard — mutation-sensitive (Finding 1, PR #452)
         //
