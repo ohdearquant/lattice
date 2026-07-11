@@ -23,6 +23,8 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::watch;
 
+use crate::model::qwen35_config::GenerateConfig;
+
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries
 /// already enforced this exact limit independently (`lattice.rs` via
 /// `DefaultBodyLimit::max`, `lattice_serve.rs` via `to_bytes(body, LIMIT)`);
@@ -265,38 +267,556 @@ impl CaseBody {
     }
 }
 
+/// A scalar JSON value an [`FieldExpectation::Eq`] compares against. Only
+/// the three primitive shapes the shared response contracts actually emit
+/// (OpenAI-style string enums/ids, integer counts, booleans) -- not a full
+/// `serde_json::Value` -- so a fixture row can be built entirely from
+/// `'static` literals in the shared const table below.
+#[derive(Debug, Clone, Copy)]
+pub enum Scalar {
+    Str(&'static str),
+    U64(u64),
+    Bool(bool),
+}
+
+impl Scalar {
+    fn matches(&self, value: &Value) -> bool {
+        match self {
+            Scalar::Str(s) => value.as_str() == Some(*s),
+            Scalar::U64(n) => value.as_u64() == Some(*n),
+            Scalar::Bool(b) => value.as_bool() == Some(*b),
+        }
+    }
+}
+
+/// One field-level assertion against a successful JSON response body
+/// (issue #828): a richer replacement for "just check status/error_code"
+/// that can pin the actual shape of a 2xx response -- the gap #828's `Why`
+/// section names (`CHAT_COMPLETIONS_PARITY_CASES` previously asserted
+/// nothing at all about a successful response's fields). `json_pointer`
+/// uses [`Value::pointer`]'s RFC 6901 syntax (e.g. `"/choices/0/finish_reason"`).
+#[derive(Debug, Clone, Copy)]
+pub enum FieldExpectation {
+    /// The pointed-to field must exist and equal `scalar`.
+    Eq {
+        json_pointer: &'static str,
+        scalar: Scalar,
+    },
+    /// The pointed-to field must not exist (`Value::pointer` returns `None`).
+    Absent { json_pointer: &'static str },
+    /// The pointed-to field must be a JSON array of exactly `len` elements.
+    ArrayLen {
+        json_pointer: &'static str,
+        len: usize,
+    },
+    /// The pointed-to field must be a JSON string starting with `prefix`
+    /// (issue #828 round 2 medium finding: dynamic response IDs are checked
+    /// by type/prefix, not exact value -- a response ID's suffix varies by
+    /// request timestamp/sequence).
+    StringPrefix {
+        json_pointer: &'static str,
+        prefix: &'static str,
+    },
+    /// The pointed-to field must be a JSON number representable as `u64`
+    /// (issue #828 round 2 medium finding: timestamps are checked by type,
+    /// not exact value).
+    UnsignedInt { json_pointer: &'static str },
+}
+
+impl FieldExpectation {
+    /// Checks this expectation against a decoded response body, returning a
+    /// human-readable failure description (never panics itself -- callers
+    /// decide how to surface it, e.g. via `assert!`/`panic!` with the
+    /// owning case's name for context).
+    pub fn check(&self, body: &Value) -> Result<(), String> {
+        match self {
+            FieldExpectation::Eq {
+                json_pointer,
+                scalar,
+            } => match body.pointer(json_pointer) {
+                Some(value) if scalar.matches(value) => Ok(()),
+                Some(value) => Err(format!(
+                    "field '{json_pointer}': expected {scalar:?}, got {value} (body: {body})"
+                )),
+                None => Err(format!(
+                    "field '{json_pointer}': expected {scalar:?}, field is absent (body: {body})"
+                )),
+            },
+            FieldExpectation::Absent { json_pointer } => match body.pointer(json_pointer) {
+                None => Ok(()),
+                Some(value) => Err(format!(
+                    "field '{json_pointer}': expected absent, got {value} (body: {body})"
+                )),
+            },
+            FieldExpectation::ArrayLen { json_pointer, len } => match body.pointer(json_pointer) {
+                Some(Value::Array(arr)) if arr.len() == *len => Ok(()),
+                Some(Value::Array(arr)) => Err(format!(
+                    "field '{json_pointer}': expected array of length {len}, got length {} \
+                     (body: {body})",
+                    arr.len()
+                )),
+                Some(other) => Err(format!(
+                    "field '{json_pointer}': expected an array of length {len}, got {other} \
+                     (body: {body})"
+                )),
+                None => Err(format!(
+                    "field '{json_pointer}': expected an array of length {len}, field is \
+                     absent (body: {body})"
+                )),
+            },
+            FieldExpectation::StringPrefix {
+                json_pointer,
+                prefix,
+            } => match body.pointer(json_pointer).and_then(Value::as_str) {
+                Some(s) if s.starts_with(prefix) => Ok(()),
+                Some(s) => Err(format!(
+                    "field '{json_pointer}': expected a string starting with '{prefix}', got \
+                     '{s}' (body: {body})"
+                )),
+                None => Err(format!(
+                    "field '{json_pointer}': expected a string starting with '{prefix}', field \
+                     is absent or not a string (body: {body})"
+                )),
+            },
+            FieldExpectation::UnsignedInt { json_pointer } => {
+                match body.pointer(json_pointer).and_then(Value::as_u64) {
+                    Some(_) => Ok(()),
+                    None => Err(format!(
+                        "field '{json_pointer}': expected an unsigned integer, field is \
+                         absent or not representable as u64 (body: {body})"
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// One expected SSE chunk phase, in the order OpenAI's `chat.completion.chunk`
+/// stream actually emits them (issue #828: "SSE expectations are ordered").
+/// `ContentDelta` matches one-or-more consecutive content-delta chunks --
+/// [`check_sse_events`] greedily consumes every consecutive chunk that
+/// classifies as a content delta before moving to the next expected phase --
+/// so a fixture only ever needs a single `ContentDelta` entry regardless of
+/// how many tokens the generation seam actually emitted.
+#[derive(Debug, Clone, Copy)]
+pub enum EventExpectation {
+    /// `delta: {"role":"assistant"}`, `finish_reason: null`, no `content`.
+    RoleOpener,
+    /// `delta: {"content": "..."}`, `finish_reason: null`, no `role`.
+    ContentDelta,
+    /// `delta: {}` (both `role`/`content` absent), `finish_reason` set to
+    /// this exact string.
+    Finish { finish_reason: &'static str },
+    /// The literal `data: [DONE]` sentinel event.
+    Done,
+}
+
+/// One decoded SSE `data:` payload: either a `chat.completion.chunk` JSON
+/// object, or the literal `[DONE]` sentinel.
+enum SseFrame {
+    Chunk(Value),
+    Done,
+}
+
+/// Splits a raw SSE response body into its `data:` payloads. Both binaries'
+/// SSE bodies are `axum::response::sse::Event::default().data(..)` events,
+/// which serialize as one `data: <payload>` line per event (a bare newline
+/// is never embedded in either binary's payloads: `serde_json::to_string`
+/// output for `lattice.rs`, `json!(..).to_string()` for `lattice_serve.rs`),
+/// so splitting on lines starting with `data: ` is sufficient -- no SSE
+/// multi-line/`id:`/`event:` framing to reassemble.
+fn parse_sse_frames(body: &str) -> Vec<SseFrame> {
+    body.lines()
+        .filter_map(|line| {
+            line.strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+        })
+        .map(|payload| {
+            let payload = payload.trim();
+            if payload == "[DONE]" {
+                SseFrame::Done
+            } else {
+                SseFrame::Chunk(
+                    serde_json::from_str(payload).unwrap_or_else(|e| {
+                        panic!("SSE data payload must be JSON: {e} ({payload})")
+                    }),
+                )
+            }
+        })
+        .collect()
+}
+
+/// Classification of one decoded `chat.completion.chunk` object, used
+/// internally by [`check_sse_events`]. Distinct from the public
+/// [`EventExpectation`] (whose `Finish` carries a `&'static str`) because a
+/// chunk's actual `finish_reason` is only known at parse time.
+enum ChunkKind {
+    RoleOpener,
+    ContentDelta,
+    Finish {
+        finish_reason: String,
+    },
+    /// Matches none of the three shapes above (malformed/unexpected chunk).
+    Other,
+}
+
+fn classify_chunk(chunk: &Value) -> ChunkKind {
+    let Some(choice) = chunk.pointer("/choices/0") else {
+        return ChunkKind::Other;
+    };
+    let finish_reason = choice.pointer("/finish_reason");
+    let role = choice.pointer("/delta/role");
+    let content = choice.pointer("/delta/content");
+    if finish_reason.is_none_or(Value::is_null) {
+        if role.and_then(Value::as_str) == Some("assistant") && content.is_none() {
+            return ChunkKind::RoleOpener;
+        }
+        if content.and_then(Value::as_str).is_some() && role.is_none() {
+            return ChunkKind::ContentDelta;
+        }
+        ChunkKind::Other
+    } else {
+        match finish_reason.and_then(Value::as_str) {
+            Some(reason) if role.is_none() && content.is_none() => ChunkKind::Finish {
+                finish_reason: reason.to_string(),
+            },
+            _ => ChunkKind::Other,
+        }
+    }
+}
+
+/// Asserts an SSE response body matches `expected`, in order. `ContentDelta`
+/// greedily consumes every consecutive actual chunk that classifies as a
+/// content delta (issue #828: "at least one content-delta chunk" -- the
+/// fixture only lists one `ContentDelta` phase regardless of how many
+/// tokens were actually streamed). Returns a human-readable failure
+/// description on the first mismatch.
+pub fn check_sse_events(body: &str, expected: &[EventExpectation]) -> Result<(), String> {
+    let frames = parse_sse_frames(body);
+    let mut idx = 0usize;
+    for (phase_idx, exp) in expected.iter().enumerate() {
+        match exp {
+            EventExpectation::ContentDelta => {
+                let start = idx;
+                while idx < frames.len()
+                    && matches!(
+                        &frames[idx],
+                        SseFrame::Chunk(c) if matches!(classify_chunk(c), ChunkKind::ContentDelta)
+                    )
+                {
+                    idx += 1;
+                }
+                if idx == start {
+                    return Err(format!(
+                        "expected phase {phase_idx} (ContentDelta) to match at least one \
+                         content-delta chunk at frame index {start}, but none matched"
+                    ));
+                }
+            }
+            EventExpectation::Done => match frames.get(idx) {
+                Some(SseFrame::Done) => idx += 1,
+                Some(SseFrame::Chunk(c)) => {
+                    return Err(format!(
+                        "expected phase {phase_idx} (Done) at frame index {idx}, got a \
+                         chunk instead: {c}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "expected phase {phase_idx} (Done) at frame index {idx}, but the \
+                         stream ended"
+                    ));
+                }
+            },
+            EventExpectation::RoleOpener => {
+                let frame = frames.get(idx).ok_or_else(|| {
+                    format!(
+                        "expected phase {phase_idx} (RoleOpener) at frame index {idx}, but \
+                         the stream ended"
+                    )
+                })?;
+                match frame {
+                    SseFrame::Chunk(c) if matches!(classify_chunk(c), ChunkKind::RoleOpener) => {
+                        // Issue #828 round 2 medium finding: dynamic /id and
+                        // /created are type/prefix-checked on the opener
+                        // chunk too, not only the non-streaming JSON
+                        // baseline -- every `chat.completion.chunk` this
+                        // binary emits carries both fields.
+                        FieldExpectation::StringPrefix {
+                            json_pointer: "/id",
+                            prefix: "chatcmpl-",
+                        }
+                        .check(c)
+                        .map_err(|e| {
+                            format!("phase {phase_idx} (RoleOpener) chunk field check failed: {e}")
+                        })?;
+                        FieldExpectation::UnsignedInt {
+                            json_pointer: "/created",
+                        }
+                        .check(c)
+                        .map_err(|e| {
+                            format!("phase {phase_idx} (RoleOpener) chunk field check failed: {e}")
+                        })?;
+                        idx += 1;
+                    }
+                    other => {
+                        return Err(sse_phase_mismatch(phase_idx, "RoleOpener", idx, other));
+                    }
+                }
+            }
+            EventExpectation::Finish { finish_reason } => {
+                let frame = frames.get(idx).ok_or_else(|| {
+                    format!(
+                        "expected phase {phase_idx} (Finish) at frame index {idx}, but the \
+                         stream ended"
+                    )
+                })?;
+                match frame {
+                    SseFrame::Chunk(c) => match classify_chunk(c) {
+                        ChunkKind::Finish {
+                            finish_reason: actual,
+                        } if actual == *finish_reason => {
+                            idx += 1;
+                        }
+                        _ => {
+                            return Err(format!(
+                                "expected phase {phase_idx} (Finish {{ finish_reason: \
+                                 \"{finish_reason}\" }}) at frame index {idx}, got: {c}"
+                            ));
+                        }
+                    },
+                    SseFrame::Done => {
+                        return Err(sse_phase_mismatch(phase_idx, "Finish", idx, frame));
+                    }
+                }
+            }
+        }
+    }
+    if idx != frames.len() {
+        return Err(format!(
+            "expected exactly {idx} SSE frames but the stream carried {} \
+             (trailing frames beyond every listed phase)",
+            frames.len()
+        ));
+    }
+    Ok(())
+}
+
+fn sse_phase_mismatch(phase_idx: usize, phase: &str, idx: usize, frame: &SseFrame) -> String {
+    match frame {
+        SseFrame::Chunk(c) => {
+            format!("expected phase {phase_idx} ({phase}) at frame index {idx}, got chunk: {c}")
+        }
+        SseFrame::Done => format!(
+            "expected phase {phase_idx} ({phase}) at frame index {idx}, got the [DONE] sentinel"
+        ),
+    }
+}
+
+/// A row's expected outcome for one binary (issue #828): the original
+/// coarse `(status, error_code)` pair -- now [`ExpectedResponse::Error`] --
+/// plus two richer variants for a successful response's actual JSON/SSE
+/// shape. Every pre-#828 case keeps using `Error`; the shared table's
+/// baseline/boundary rows below use `Json`/`Sse`.
+#[derive(Debug, Clone, Copy)]
+pub enum ExpectedResponse {
+    /// A non-2xx error envelope: `{"error": {"code", ...}}`.
+    Error { status: u16, code: &'static str },
+    /// A 2xx JSON body, field-checked via `fields` (empty = status-only,
+    /// e.g. `GET /`'s `root_body()` shape, which this table does not pin
+    /// field-by-field).
+    Json {
+        status: u16,
+        fields: &'static [FieldExpectation],
+    },
+    /// A 2xx SSE body, phase-checked via `events` (see [`check_sse_events`]).
+    Sse {
+        status: u16,
+        events: &'static [EventExpectation],
+    },
+}
+
+impl ExpectedResponse {
+    pub fn status(&self) -> u16 {
+        match self {
+            ExpectedResponse::Error { status, .. } => *status,
+            ExpectedResponse::Json { status, .. } => *status,
+            ExpectedResponse::Sse { status, .. } => *status,
+        }
+    }
+}
+
 /// One row of the cross-binary HTTP parity table (ADR-080 C2 round 2, codex
-/// finding #1): a request `method`/`path`/`body`, and the expected
-/// `(status, error_code)` for each binary. A case whose `divergence_reason`
-/// is `None` means both binaries must produce an identical outcome for this
-/// request (the common case, post-alignment); `Some` documents an
-/// intentional, reviewed per-binary difference -- an undocumented
-/// divergence is exactly the drift this table exists to catch. `method`/
-/// `path` were added in round 2 (codex medium finding #2) after an
-/// unguarded `GET /` route removal on `lattice.rs` left the round-1 table
-/// green: every case before that was implicitly `POST
-/// /v1/chat/completions`, so route exposure itself was never actually
-/// checked.
+/// finding #1): a request `method`/`path`/`body`, and the expected outcome
+/// for each binary. A case whose `divergence_reason` is `None` means both
+/// binaries must produce an identical outcome for this request (the common
+/// case, post-alignment); `Some` documents an intentional, reviewed
+/// per-binary difference -- an undocumented divergence is exactly the drift
+/// this table exists to catch. `method`/`path` were added in round 2 (codex
+/// medium finding #2) after an unguarded `GET /` route removal on
+/// `lattice.rs` left the round-1 table green: every case before that was
+/// implicitly `POST /v1/chat/completions`, so route exposure itself was
+/// never actually checked.
 pub struct ParityCase {
     pub name: &'static str,
     pub method: &'static str,
     pub path: &'static str,
     pub body: CaseBody,
-    lattice: (u16, &'static str),
-    lattice_serve: (u16, &'static str),
+    lattice: ExpectedResponse,
+    lattice_serve: ExpectedResponse,
     /// `Some` only for a documented intentional divergence; explains WHY the
     /// two expected outcomes differ (reviewed alongside the table, not left
-    /// to be inferred from the two tuples).
+    /// to be inferred from the two variants).
     pub divergence_reason: Option<&'static str>,
 }
 
 impl ParityCase {
-    pub fn expected(&self, binary: Binary) -> (u16, &'static str) {
+    pub fn expected(&self, binary: Binary) -> ExpectedResponse {
         match binary {
             Binary::Lattice => self.lattice,
             Binary::LatticeServe => self.lattice_serve,
         }
     }
+}
+
+/// Plain-data mirror of every [`GenerateConfig`] field (issue #828), so a
+/// test can assert against an observed config without threading a whole
+/// `GenerateConfig` -- whose `grammar: Option<Arc<GrammarEngine>>` field has
+/// no `PartialEq`/`Eq` -- through assertion machinery. `has_grammar`
+/// records only whether a grammar engine was attached, not its identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerateConfigSnapshot {
+    pub max_new_tokens: usize,
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+    pub seed: Option<u64>,
+    pub stop_token_ids: Vec<u32>,
+    pub enable_thinking: bool,
+    pub enable_mtp: Option<bool>,
+    pub has_grammar: bool,
+    pub stop_strings: Vec<String>,
+    pub reasoning_budget: Option<usize>,
+    pub logprobs: Option<usize>,
+}
+
+impl From<&GenerateConfig> for GenerateConfigSnapshot {
+    fn from(cfg: &GenerateConfig) -> Self {
+        GenerateConfigSnapshot {
+            max_new_tokens: cfg.max_new_tokens,
+            temperature: cfg.temperature,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
+            repetition_penalty: cfg.repetition_penalty,
+            seed: cfg.seed,
+            stop_token_ids: cfg.stop_token_ids.clone(),
+            enable_thinking: cfg.enable_thinking,
+            enable_mtp: cfg.enable_mtp,
+            has_grammar: cfg.grammar.is_some(),
+            stop_strings: cfg.stop_strings.clone(),
+            reasoning_budget: cfg.reasoning_budget,
+            logprobs: cfg.logprobs,
+        }
+    }
+}
+
+/// A snapshot of exactly what one request handed a binary's production
+/// generation adapter, captured from inside each binary's own deterministic
+/// test-only generation seam (issue #828) -- strictly BELOW the real
+/// request-parse/normalize/`build_cfg`-or-equivalent/handler/serialization
+/// path, which still runs unmodified for every field this struct reports.
+///
+/// The two binaries' adapters receive genuinely different shapes at that
+/// seam (`lattice.rs`'s CPU `generate`/`generate_streaming_with_cancel`
+/// entry points take an already-rendered ChatML string; `lattice_serve.rs`'s
+/// worker `generate` takes structured per-message data and renders ChatML
+/// itself further downstream) -- exactly one of `rendered_prompt`/`messages`
+/// is `Some` per capture, reflecting which shape that binary's real adapter
+/// actually receives, not a missing capture.
+#[derive(Debug, Clone)]
+pub struct ProductionAdapterObservation {
+    pub rendered_prompt: Option<String>,
+    pub messages: Option<Vec<(String, String)>>,
+    pub gen_cfg: GenerateConfigSnapshot,
+    /// The rendered prompt's tokenized length, measured by the real
+    /// tokenizer against the real rendered prompt (not a canned figure).
+    pub prompt_tokens: usize,
+    /// Whether the (canned) terminal outcome this capture's caller chose to
+    /// report was an explicit stop condition (`true`) vs. exhausting the
+    /// token budget (`false`) -- mirrors [`GenerateOutput::stopped`] /
+    /// `Ev::Done`'s `stopped` field.
+    pub stopped: bool,
+}
+
+/// The exact ChatML rendering both binaries' production code produces for a
+/// single `{role: "user", content: "hi there"}` message -- `lattice.rs`'s
+/// `render_prompt` and `lattice_serve.rs`'s (shared-engine)
+/// `format_chat_template` use the identical
+/// `"<|im_start|>{role}\n{content}<|im_end|>\n"` + trailing
+/// `"<|im_start|>assistant\n"` template. A ground-truth literal, not a call
+/// into either binary's render function, so a template regression in either
+/// binary is visible against this fixture instead of round-tripping through
+/// the same (possibly mutated) function that produced it (issue #828 round 2
+/// major finding).
+pub const OBSERVATION_GOLDEN_USER_HI_THERE_CHATML: &str =
+    "<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n";
+
+/// Full expected value for a [`ProductionAdapterObservation`] (issue #828
+/// round 2 major finding): every `GenerateConfigSnapshot` field, the exact
+/// rendered prompt or normalized message list, the exact prompt-token count,
+/// and the terminal outcome -- one shared comparison both binaries' tests
+/// call, instead of each asserting a different hand-picked subset of fields.
+pub struct ExpectedObservation<'a> {
+    pub gen_cfg: GenerateConfigSnapshot,
+    pub rendered_prompt: Option<&'a str>,
+    pub messages: Option<&'a [(&'a str, &'a str)]>,
+    pub prompt_tokens: usize,
+    pub stopped: bool,
+}
+
+/// Asserts every field of `obs` against `expected`, panicking with a
+/// specific field name on the first mismatch (issue #828 round 2 major
+/// finding). Used by both `lattice.rs`'s and `lattice_serve.rs`'s
+/// `production_adapter_observation` test modules so neither binary can drift
+/// back to asserting only a hand-picked subset of `GenerateConfigSnapshot`'s
+/// thirteen fields.
+pub fn assert_observation_matches(
+    obs: &ProductionAdapterObservation,
+    expected: &ExpectedObservation<'_>,
+) {
+    assert_eq!(
+        obs.gen_cfg, expected.gen_cfg,
+        "GenerateConfigSnapshot mismatch: observed {:?}, expected {:?}",
+        obs.gen_cfg, expected.gen_cfg
+    );
+    assert_eq!(
+        obs.rendered_prompt.as_deref(),
+        expected.rendered_prompt,
+        "rendered_prompt mismatch: observed {:?}, expected {:?}",
+        obs.rendered_prompt,
+        expected.rendered_prompt
+    );
+    let expected_messages: Option<Vec<(String, String)>> = expected.messages.map(|m| {
+        m.iter()
+            .map(|(r, c)| (r.to_string(), c.to_string()))
+            .collect()
+    });
+    assert_eq!(
+        obs.messages, expected_messages,
+        "messages mismatch: observed {:?}, expected {:?}",
+        obs.messages, expected_messages
+    );
+    assert_eq!(
+        obs.prompt_tokens, expected.prompt_tokens,
+        "prompt_tokens mismatch: observed {}, expected {}",
+        obs.prompt_tokens, expected.prompt_tokens
+    );
+    assert_eq!(
+        obs.stopped, expected.stopped,
+        "stopped (terminal outcome) mismatch: observed {}, expected {}",
+        obs.stopped, expected.stopped
+    );
 }
 
 /// Shared fixture table for both binaries' `/v1/chat/completions` HTTP
@@ -322,8 +842,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         body: CaseBody::Fixed(
             r#"{"model":"test-model","messages":[{"role":"moderator","content":"hi"},{"role":"user","content":"hi"}]}"#,
         ),
-        lattice: (400, "invalid_role"),
-        lattice_serve: (400, "invalid_role"),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_role",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_role",
+        },
         divergence_reason: None,
     },
     ParityCase {
@@ -334,8 +860,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         body: CaseBody::Fixed(
             r#"{"model":"test-model","messages":[{"role":"developer","content":"hi"},{"role":"user","content":"hi"}]}"#,
         ),
-        lattice: (400, "unsupported_feature"),
-        lattice_serve: (400, "unsupported_feature"),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "unsupported_feature",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "unsupported_feature",
+        },
         divergence_reason: None,
     },
     ParityCase {
@@ -343,8 +875,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         method: "POST",
         path: "/v1/chat/completions",
         body: CaseBody::Fixed(r#"{"model":"test-model","messages":[]}"#),
-        lattice: (400, "invalid_messages"),
-        lattice_serve: (400, "invalid_messages"),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_messages",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_messages",
+        },
         divergence_reason: None,
     },
     ParityCase {
@@ -354,8 +892,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         body: CaseBody::Fixed(
             r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#,
         ),
-        lattice: (400, "invalid_max_tokens"),
-        lattice_serve: (400, "invalid_max_tokens"),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_max_tokens",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_max_tokens",
+        },
         divergence_reason: None,
     },
     ParityCase {
@@ -365,8 +909,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         body: CaseBody::Fixed(
             r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":20}"#,
         ),
-        lattice: (400, "invalid_request"),
-        lattice_serve: (400, "invalid_request"),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_request",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_request",
+        },
         divergence_reason: None,
     },
     ParityCase {
@@ -376,8 +926,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         body: CaseBody::Fixed(
             r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f"}}]}"#,
         ),
-        lattice: (400, "unsupported_feature"),
-        lattice_serve: (400, "unsupported_feature"),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "unsupported_feature",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "unsupported_feature",
+        },
         divergence_reason: None,
     },
     ParityCase {
@@ -385,8 +941,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         method: "POST",
         path: "/v1/chat/completions",
         body: CaseBody::Fixed(r#"{"model":"test-model","messages":"#),
-        lattice: (400, "invalid_request_body"),
-        lattice_serve: (400, "invalid_request_body"),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_request_body",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_request_body",
+        },
         divergence_reason: None,
     },
     ParityCase {
@@ -412,8 +974,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         body: CaseBody::Fixed(
             r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":999999}"#,
         ),
-        lattice: (400, "max_tokens_exceeds_limit"),
-        lattice_serve: (500, "internal_error"),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "max_tokens_exceeds_limit",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 500,
+            code: "internal_error",
+        },
         divergence_reason: Some(
             "lattice.rs rejects max_tokens above its server cap at validation time; \
              lattice_serve.rs clamps the resolved value to the model's context \
@@ -436,8 +1004,14 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         method: "GET",
         path: "/",
         body: CaseBody::Fixed(""),
-        lattice: (200, ""),
-        lattice_serve: (200, ""),
+        lattice: ExpectedResponse::Json {
+            status: 200,
+            fields: &[],
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: &[],
+        },
         divergence_reason: None,
     },
     ParityCase {
@@ -453,11 +1027,300 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         method: "POST",
         path: "/v1/chat/completions",
         body: CaseBody::Oversized,
-        lattice: (413, "request_body_too_large"),
-        lattice_serve: (413, "request_body_too_large"),
+        lattice: ExpectedResponse::Error {
+            status: 413,
+            code: "request_body_too_large",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 413,
+            code: "request_body_too_large",
+        },
         divergence_reason: None,
     },
+    // -------------------------------------------------------------------
+    // Field-level rows (issue #828): every case above only ever asserted
+    // `(status, error_code)`, so a successful response's actual JSON/SSE
+    // shape -- `object`, `model`, assistant role/content, `finish_reason`,
+    // usage counts, SSE chunk ordering -- was never checked at all. Every
+    // binary that runs this table drives these through a deterministic
+    // test-only generation seam (canned content/token counts), never the
+    // real request-parse/normalize/`build_cfg`-equivalent/handler path,
+    // which stays exactly as exercised by every case above.
+    // -------------------------------------------------------------------
+    ParityCase {
+        name: "baseline_non_streaming_200",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        lattice: ExpectedResponse::Json {
+            status: 200,
+            fields: &[
+                FieldExpectation::StringPrefix {
+                    json_pointer: "/id",
+                    prefix: "chatcmpl-",
+                },
+                FieldExpectation::UnsignedInt {
+                    json_pointer: "/created",
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/object",
+                    scalar: Scalar::Str("chat.completion"),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/model",
+                    scalar: Scalar::Str("test-model"),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/choices/0/message/role",
+                    scalar: Scalar::Str("assistant"),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/choices/0/message/content",
+                    scalar: Scalar::Str(BASELINE_CANNED_TEXT),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/choices/0/finish_reason",
+                    scalar: Scalar::Str("stop"),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/usage/prompt_tokens",
+                    scalar: Scalar::U64(BASELINE_CANNED_PROMPT_TOKENS),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/usage/completion_tokens",
+                    scalar: Scalar::U64(BASELINE_CANNED_COMPLETION_TOKENS),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/usage/total_tokens",
+                    scalar: Scalar::U64(
+                        BASELINE_CANNED_PROMPT_TOKENS + BASELINE_CANNED_COMPLETION_TOKENS,
+                    ),
+                },
+            ],
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: &[
+                FieldExpectation::StringPrefix {
+                    json_pointer: "/id",
+                    prefix: "chatcmpl-",
+                },
+                FieldExpectation::UnsignedInt {
+                    json_pointer: "/created",
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/object",
+                    scalar: Scalar::Str("chat.completion"),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/model",
+                    scalar: Scalar::Str("test-model"),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/choices/0/message/role",
+                    scalar: Scalar::Str("assistant"),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/choices/0/message/content",
+                    scalar: Scalar::Str(BASELINE_CANNED_TEXT),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/choices/0/finish_reason",
+                    scalar: Scalar::Str("stop"),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/usage/prompt_tokens",
+                    scalar: Scalar::U64(BASELINE_CANNED_PROMPT_TOKENS),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/usage/completion_tokens",
+                    scalar: Scalar::U64(BASELINE_CANNED_COMPLETION_TOKENS),
+                },
+                FieldExpectation::Eq {
+                    json_pointer: "/usage/total_tokens",
+                    scalar: Scalar::U64(
+                        BASELINE_CANNED_PROMPT_TOKENS + BASELINE_CANNED_COMPLETION_TOKENS,
+                    ),
+                },
+            ],
+        },
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "baseline_streaming_200",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        ),
+        lattice: ExpectedResponse::Sse {
+            status: 200,
+            events: BASELINE_SSE_EVENTS,
+        },
+        lattice_serve: ExpectedResponse::Sse {
+            status: 200,
+            events: BASELINE_SSE_EVENTS,
+        },
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "temperature_boundary_zero_accepted",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"temperature":0.0}"#,
+        ),
+        lattice: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "temperature_boundary_two_accepted",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"temperature":2.0}"#,
+        ),
+        lattice: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "temperature_out_of_range_rejected",
+        // `lattice.rs`'s `validate_temperature` enforces `[0.0, 2.0]`
+        // (`crates/inference/src/bin/lattice.rs`); `lattice_serve.rs`'s
+        // `build_cfg` has NO temperature range check at all -- a
+        // caller-supplied value flows straight into `GenerateConfig`
+        // unclamped. This is a genuine, pre-existing divergence (not
+        // introduced by #828), pinned here the same way
+        // `max_tokens_over_cap_reject_vs_clamp` pins its own divergence.
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"temperature":2.5}"#,
+        ),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_temperature",
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        divergence_reason: Some(
+            "lattice.rs's validate_temperature rejects outside [0.0, 2.0]; \
+             lattice_serve.rs's build_cfg has no temperature range check at \
+             all and passes any client-supplied value straight into \
+             GenerateConfig -- a pre-existing gap, not introduced by #828.",
+        ),
+    },
+    ParityCase {
+        name: "top_p_boundary_one_accepted",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"top_p":1.0}"#,
+        ),
+        lattice: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "top_p_zero_rejected",
+        // Same divergence shape as `temperature_out_of_range_rejected`:
+        // `lattice.rs`'s `validate_top_p` enforces `(0.0, 1.0]`;
+        // `lattice_serve.rs` has no top_p range check at all.
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"top_p":0.0}"#,
+        ),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_top_p",
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        divergence_reason: Some(
+            "lattice.rs's validate_top_p rejects a top_p of 0.0 ((0.0, 1.0] \
+             is half-open at zero); lattice_serve.rs's build_cfg has no \
+             top_p range check at all -- a pre-existing gap, not introduced \
+             by #828.",
+        ),
+    },
+    ParityCase {
+        name: "top_p_above_one_rejected",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"top_p":1.5}"#,
+        ),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_top_p",
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        divergence_reason: Some(
+            "lattice.rs's validate_top_p rejects anything above 1.0; \
+             lattice_serve.rs's build_cfg has no top_p range check at all \
+             -- a pre-existing gap, not introduced by #828.",
+        ),
+    },
 ];
+
+/// Canned non-streaming completion text/token counts every binary's
+/// deterministic test-only generation seam returns for
+/// `baseline_non_streaming_200` (issue #828). Arbitrary but fixed, so the
+/// row's `Eq` field checks are exact-match, not shape-only.
+pub const BASELINE_CANNED_TEXT: &str = "hello world";
+pub const BASELINE_CANNED_PROMPT_TOKENS: u64 = 7;
+pub const BASELINE_CANNED_COMPLETION_TOKENS: u64 = 2;
+
+/// Ordered SSE phases every binary's deterministic streaming seam must
+/// produce for `baseline_streaming_200`: role opener, one-or-more content
+/// deltas, the finish chunk (canned `stopped: true` -> `"stop"`), then
+/// `[DONE]`.
+pub const BASELINE_SSE_EVENTS: &[EventExpectation] = &[
+    EventExpectation::RoleOpener,
+    EventExpectation::ContentDelta,
+    EventExpectation::Finish {
+        finish_reason: "stop",
+    },
+    EventExpectation::Done,
+];
+
+/// Minimal field list for a boundary row that only needs to prove
+/// "request was accepted and a real chat-completion object came back", not
+/// pin every field the way `baseline_non_streaming_200` does.
+const ACCEPTED_MINIMAL_FIELDS: &[FieldExpectation] = &[FieldExpectation::Eq {
+    json_pointer: "/object",
+    scalar: Scalar::Str("chat.completion"),
+}];
 
 #[cfg(test)]
 mod tests {
@@ -562,5 +1425,219 @@ mod tests {
         // Guard still in scope -- receiver must not have flipped yet.
         assert!(!*rx.borrow());
         drop(guard);
+    }
+
+    // -------------------------------------------------------------------
+    // FieldExpectation / ExpectedResponse / check_sse_events (issue #828)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn field_expectation_eq_matches_and_reports_mismatch() {
+        let body = serde_json::json!({"object": "chat.completion", "usage": {"total_tokens": 9}});
+        assert!(
+            FieldExpectation::Eq {
+                json_pointer: "/object",
+                scalar: Scalar::Str("chat.completion"),
+            }
+            .check(&body)
+            .is_ok()
+        );
+        assert!(
+            FieldExpectation::Eq {
+                json_pointer: "/usage/total_tokens",
+                scalar: Scalar::U64(9),
+            }
+            .check(&body)
+            .is_ok()
+        );
+        let err = FieldExpectation::Eq {
+            json_pointer: "/object",
+            scalar: Scalar::Str("chat.completion.chunk"),
+        }
+        .check(&body)
+        .unwrap_err();
+        assert!(err.contains("/object"), "error must name the field: {err}");
+    }
+
+    #[test]
+    fn field_expectation_eq_missing_field_is_an_error() {
+        let body = serde_json::json!({});
+        let err = FieldExpectation::Eq {
+            json_pointer: "/model",
+            scalar: Scalar::Str("x"),
+        }
+        .check(&body)
+        .unwrap_err();
+        assert!(err.contains("absent"));
+    }
+
+    #[test]
+    fn field_expectation_absent_passes_when_missing_fails_when_present() {
+        let body = serde_json::json!({"logprobs": null});
+        assert!(
+            FieldExpectation::Absent {
+                json_pointer: "/choices"
+            }
+            .check(&body)
+            .is_ok()
+        );
+        // `Value::pointer` finds `null` -- present-but-null is still
+        // "present" for this check (matches `#[serde(skip_serializing_if =
+        // "Option::is_none")]`'s OMITTED contract, not a `null` literal).
+        let err = FieldExpectation::Absent {
+            json_pointer: "/logprobs",
+        }
+        .check(&body)
+        .unwrap_err();
+        assert!(err.contains("expected absent"));
+    }
+
+    #[test]
+    fn field_expectation_array_len_checks_exact_length() {
+        let body = serde_json::json!({"choices": [{"index": 0}]});
+        assert!(
+            FieldExpectation::ArrayLen {
+                json_pointer: "/choices",
+                len: 1,
+            }
+            .check(&body)
+            .is_ok()
+        );
+        assert!(
+            FieldExpectation::ArrayLen {
+                json_pointer: "/choices",
+                len: 2,
+            }
+            .check(&body)
+            .is_err()
+        );
+    }
+
+    fn sse_body(lines: &[&str]) -> String {
+        lines.iter().map(|l| format!("data: {l}\n\n")).collect()
+    }
+
+    #[test]
+    fn check_sse_events_accepts_well_formed_baseline_stream() {
+        let body = sse_body(&[
+            r#"{"id":"chatcmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"hel"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
+        check_sse_events(&body, BASELINE_SSE_EVENTS).expect("well-formed stream must pass");
+    }
+
+    #[test]
+    fn check_sse_events_requires_at_least_one_content_delta() {
+        let body = sse_body(&[
+            r#"{"id":"chatcmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
+        let err = check_sse_events(&body, BASELINE_SSE_EVENTS).unwrap_err();
+        assert!(err.contains("ContentDelta"), "error: {err}");
+    }
+
+    #[test]
+    fn check_sse_events_rejects_wrong_finish_reason() {
+        let body = sse_body(&[
+            r#"{"id":"chatcmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+            "[DONE]",
+        ]);
+        assert!(check_sse_events(&body, BASELINE_SSE_EVENTS).is_err());
+    }
+
+    #[test]
+    fn check_sse_events_rejects_missing_done_sentinel() {
+        let body = sse_body(&[
+            r#"{"id":"chatcmpl-1","created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let err = check_sse_events(&body, BASELINE_SSE_EVENTS).unwrap_err();
+        assert!(
+            err.contains("Done") || err.contains("stream ended"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_sse_events_rejects_role_opener_missing_id_or_created() {
+        let missing_id = sse_body(&[
+            r#"{"created":1,"choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        ]);
+        let err = check_sse_events(&missing_id, &[EventExpectation::RoleOpener]).unwrap_err();
+        assert!(err.contains("/id"), "error: {err}");
+
+        let missing_created = sse_body(&[
+            r#"{"id":"chatcmpl-1","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        ]);
+        let err = check_sse_events(&missing_created, &[EventExpectation::RoleOpener]).unwrap_err();
+        assert!(err.contains("/created"), "error: {err}");
+    }
+
+    #[test]
+    fn generate_config_snapshot_captures_every_field() {
+        let cfg = GenerateConfig {
+            max_new_tokens: 42,
+            temperature: 1.3,
+            top_k: 7,
+            top_p: 0.55,
+            repetition_penalty: 1.05,
+            seed: Some(9),
+            stop_token_ids: vec![100],
+            enable_thinking: false,
+            enable_mtp: Some(true),
+            grammar: None,
+            stop_strings: vec!["STOP".to_string()],
+            reasoning_budget: Some(3),
+            logprobs: Some(2),
+        };
+        let snapshot = GenerateConfigSnapshot::from(&cfg);
+        assert_eq!(snapshot.max_new_tokens, 42);
+        assert_eq!(snapshot.temperature, 1.3);
+        assert_eq!(snapshot.top_k, 7);
+        assert_eq!(snapshot.top_p, 0.55);
+        assert_eq!(snapshot.repetition_penalty, 1.05);
+        assert_eq!(snapshot.seed, Some(9));
+        assert_eq!(snapshot.stop_token_ids, vec![100]);
+        assert!(!snapshot.enable_thinking);
+        assert_eq!(snapshot.enable_mtp, Some(true));
+        assert!(!snapshot.has_grammar);
+        assert_eq!(snapshot.stop_strings, vec!["STOP".to_string()]);
+        assert_eq!(snapshot.reasoning_budget, Some(3));
+        assert_eq!(snapshot.logprobs, Some(2));
+    }
+
+    #[test]
+    fn chat_completions_parity_cases_expected_status_matches_variant() {
+        // Every case's declared status must agree with its own variant --
+        // a cheap sanity check that catches a copy-paste status/variant
+        // mismatch in the const table itself, independent of any HTTP call.
+        for case in CHAT_COMPLETIONS_PARITY_CASES {
+            for binary in [Binary::Lattice, Binary::LatticeServe] {
+                let expected = case.expected(binary);
+                match expected {
+                    ExpectedResponse::Error { status, .. } => assert!(
+                        !(200..300).contains(&status),
+                        "case '{}': Error variant must not carry a 2xx status",
+                        case.name
+                    ),
+                    ExpectedResponse::Json { status, .. }
+                    | ExpectedResponse::Sse { status, .. } => {
+                        assert_eq!(
+                            expected.status(),
+                            status,
+                            "case '{}': status() must match the variant's own status",
+                            case.name
+                        );
+                    }
+                }
+            }
+        }
     }
 }
