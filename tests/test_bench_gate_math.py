@@ -485,34 +485,32 @@ class EvaluateFamilyGateTest(unittest.TestCase):
         self.assertNotEqual(results[0].verdict, "FAIL")
         self.assertNotEqual(results[1].verdict, "FAIL")
 
-    def test_holm_naive_mutation_flips_a_real_verdict(self):
-        """Adversarial-review finding: the prior fixture only proved
-        `holm_reject`'s internal flag was mutation-sensitive, not the
-        actual verdict -- every cell's lower bound was fixed at the
-        strictest step-0 Bonferroni tail regardless of Holm's per-cell
-        step-down assignment, so Holm's reject flag was never the thing
-        separating FAIL from non-FAIL.
+    def test_holm_naive_mutation_cannot_flip_a_coherent_verdict(self):
+        """Superseded by the round-4 percentile-duality fix (see
+        `evaluate_family_gate`'s docstring). Rounds 1-3 of this fixture
+        proved a naive uncorrected `p <= alpha` check could flip a cell's
+        ACTUAL verdict from non-FAIL to FAIL relative to real Holm, because
+        `corrected_lower_bound` was drawn from a resample INDEPENDENT of the
+        p-value -- so a tested-but-not-rejected cell's bound could still,
+        by resampling noise alone, clear the fail threshold, and only the
+        reject-decision function stood between that latent bound and a
+        FAIL verdict.
 
-        Follow-up adversarial-review finding: an intermediate fix made
-        every rank's bound track its Holm-assigned tail (`alpha / (m -
-        rank)`) unconditionally, but the step-down procedure actually
-        STOPS at its first failed comparison -- ranks after that stop are
-        never evaluated at their less-stringent tail, so exposing a bound
-        there was a bound for a hypothesis Holm never tested. This
-        fixture is tuned (base
-        offset/spread/seed) so the family's rank-0 cell (`b`, always
-        tested -- the step-down evaluates it before any stop can occur)
-        sits in the gap between its own strict Holm tail (alpha/2=0.025)
-        and the naive uncorrected `alpha=0.05` check: `b`'s real p-value
-        clears 0.05 but not 0.025, and `b`'s real (always-computed,
-        tested-rank) bound independently clears the fail threshold. That
-        makes `b` -- not the untested rank-1 cell `a` -- the cell whose
-        verdict is decision-sensitive to Holm's real per-cell tail:
-        swapping `holm_reject` for naive `p <= alpha` flips only `b` to
-        FAIL, and `a` remains unable to reach FAIL in either run because
-        the real step-down never tests rank 1 here (its bound is `None`
-        regardless of which reject-decision function is plugged in --
-        see `test_stopped_holm_rank_never_exposes_a_bound`)."""
+        Round 4 closed that gap by extracting the p-value and the bound
+        from the SAME retained sample: for any TESTED rank, `p <=
+        corrected_alpha` (reject) and `bound > tau` are now the same
+        percentile fact about the same sample, so they can no longer
+        disagree. Since `corrected_alpha = alpha_familywise / (m - rank) <=
+        alpha_familywise` for every tested rank, a real-Holm-reject is
+        always also a naive `p <= alpha_familywise` reject -- and by the
+        same duality, any cell the naive check additionally flags (but real
+        Holm did not) was already proven to have `bound <= tau`, so it can
+        never reach FAIL either way. This fixture (same base
+        offset/spread/seed that produced a flip pre-fix) now demonstrates
+        the INVARIANT the fix establishes: swapping the reject-decision
+        function still changes the internal `holm_reject` flags (confirmed
+        below), but the shipped verdict cannot move, because the bound and
+        the decision are the SAME test on the SAME sample."""
         tau = math.log(1.07)
 
         def cell(cid):
@@ -552,16 +550,20 @@ class EvaluateFamilyGateTest(unittest.TestCase):
                 [cell_a, cell_b], self._bands(), bootstrap_replicates=2000, rng=random.Random(15)
             )
 
-        # The mutation must change at least one cell's ACTUAL verdict
-        # (not merely its internal holm_reject flag) from non-FAIL to
-        # FAIL -- proof that the shipped evaluator's FAIL rule depends on
-        # the real Holm step-down, not just on crossing a fixed bound.
-        flips = [
-            (real.cell_id, real.verdict, mutated.verdict)
-            for real, mutated in zip(real_results, mutated_results)
-            if real.verdict != "FAIL" and mutated.verdict == "FAIL"
-        ]
-        self.assertTrue(flips, f"expected at least one non-FAIL->FAIL flip, got {flips!r}")
+        # The mutation DOES change the internal flag for `b` (real
+        # corrected_alpha=0.025 is stricter than the naive 0.05 -- `b`'s
+        # p-value clears naive but not the real per-cell tail), proving
+        # this fixture still exercises a genuine reject-function
+        # disagreement, not a vacuous no-op mutation.
+        self.assertFalse(real_results[1].holm_reject)
+        self.assertTrue(mutated_results[1].holm_reject)
+        # No cell's ACTUAL verdict changes despite that flag disagreement --
+        # the coherent bound/decision pairing makes the shipped verdict
+        # robust to which reject-decision function is plugged in.
+        for real, mutated in zip(real_results, mutated_results):
+            self.assertEqual(
+                real.verdict, mutated.verdict, f"cell {real.cell_id!r} verdict changed under mutation"
+            )
         # The untested rank (a) must stay un-FAIL-able even under the
         # naive mutation -- its bound is a property of the real step-down
         # order, not of whichever reject function is plugged in, so a
@@ -644,6 +646,95 @@ class EvaluateFamilyGateTest(unittest.TestCase):
                     f"non-rejected cell {r.cell_id!r} exposed a threshold-clearing bound "
                     f"{r.corrected_lower_bound!r} > tau_fail={tau!r}",
                 )
+
+    def test_shared_sample_pvalue_bound_duality_at_production_replicates(self):
+        """Round-4 adversarial-review finding (`scripts/bench_gate_math.py:601`
+        and `:620`, pre-fix): `evaluate_family_gate` drew the p-value's
+        bootstrap distribution and the lower bound's bootstrap distribution
+        from two INDEPENDENT resamples, so percentile duality was not
+        guaranteed even for a rank the step-down actually tested. Exact
+        reproduction from the round-4 review: a single (hence necessarily
+        tested, rank-0) cell with this seven-value near-boundary shape, at
+        the production default of `bootstrap_replicates=2000` and
+        `random.Random(108)`, reported `p_value=0.051` (correctly not
+        rejected -- 0.051 > alpha_familywise=0.05) yet a SEPARATELY-drawn
+        `corrected_lower_bound=0.0680872199023863`, which cleared the 7%
+        fail threshold `log(1.07)=0.06765864847381486` anyway -- a tested,
+        non-rejected cell exposing FAIL-level bound evidence, contradicting
+        the module's "SAME test, SAME per-cell alpha" claim.
+
+        Post-fix, the p-value and the bound are extracted from ONE shared
+        retained bootstrap-mean sample, so `not holm_reject` (this cell's
+        rank IS tested -- m=1 always tests rank 0) must imply the bound is
+        `None` or sits at or below tau, never a threshold-clearing float."""
+        tau = math.log(1.07)
+        base = tau + 0.005
+        spread = 0.02
+        values = (
+            base - spread, base + spread, base - spread * 0.5, base + spread * 0.5,
+            base - spread * 0.2, base + spread * 0.2, base,
+        )
+        order_ab = (True, False, True, False, True, False, True)
+        cell = gm.CellGateInput(
+            cell_id="decode:boundary", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        results = gm.evaluate_family_gate(
+            [cell], self._bands(), bootstrap_replicates=2000, rng=random.Random(108)
+        )
+        result = results[0]
+        # The cell is tested (m=1 always tests rank 0) and not rejected.
+        self.assertIsNotNone(result.corrected_lower_bound)
+        self.assertFalse(result.holm_reject)
+        self.assertTrue(
+            result.corrected_lower_bound <= tau,
+            f"tested, non-rejected cell exposed a threshold-clearing bound "
+            f"{result.corrected_lower_bound!r} > tau_fail={tau!r}",
+        )
+        self.assertNotEqual(result.verdict, "FAIL")
+
+    def test_insufficient_replicates_for_floor_coherence_rejected(self):
+        """Round-4 fix, part 2 (replicate-floor coherence): the p-value
+        floor `max(p, 1/b)` (module docstring correction 2) exists so a
+        genuinely-zero empirical bootstrap count never trivially always-
+        rejects Holm -- but if `bootstrap_replicates` is too small relative
+        to the family size, that floor can itself sit ABOVE the tightest
+        tail Holm's step-down will ever test (`alpha_familywise /
+        len(cells)`, at rank 0). A cell whose true (unfloored) bootstrap
+        count at that tail is genuinely zero -- every one of its bootstrap
+        means already past tau -- would then be floored to a p-value that
+        reports not-rejected, while that SAME shared sample's bound (all
+        means above tau) still clears the fail threshold: the exact
+        p-value/bound incoherence the shared-sample fix otherwise
+        eliminates, reintroduced by an under-resolved floor instead of a
+        second independent draw. `evaluate_family_gate` fails closed before
+        any resampling when `bootstrap_replicates` cannot guarantee the
+        floor stays at or below that tightest tail."""
+        order_ab = (True, False, True, False, True, False, True)
+        values = tuple([math.log(1.10)] * 7)  # deterministic 10% slowdown, single cell
+        cell = gm.CellGateInput(
+            cell_id="decode:low-b", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        # A single cell's tightest (only) tail is alpha_familywise/1=0.05;
+        # the floor needs bootstrap_replicates >= 1/0.05=20 to never exceed
+        # it. 10 replicates is short of that.
+        with self.assertRaises(gm.GateMathError):
+            gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=10, rng=random.Random(1))
+        # A family of cells lowers the tightest tail further (rank 0 of an
+        # m-cell family tests alpha_familywise/m), raising the floor
+        # requirement proportionally -- 2000 replicates (the production
+        # default) is enough for up to 100 cells at alpha_familywise=0.05,
+        # but not for 200.
+        cells = [
+            gm.CellGateInput(
+                cell_id=f"decode:{i}", values=values, order_ab=order_ab,
+                measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+            )
+            for i in range(200)
+        ]
+        with self.assertRaises(gm.GateMathError):
+            gm.evaluate_family_gate(cells, self._bands(), bootstrap_replicates=2000, rng=random.Random(1))
 
     def test_undersampled_cell_rejected_before_resampling(self):
         """Major 3: a cell reporting fewer raw pairs than its own

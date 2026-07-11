@@ -149,6 +149,20 @@ def order_stratified_bootstrap_means(
     return means
 
 
+def _pvalue_from_boot_means(boot_means: Sequence[float], tau_log: float, b: int) -> float:
+    """Extraction-only half of `one_sided_bootstrap_pvalue`: turns an
+    ALREADY-GENERATED bootstrap-mean sample into the one-sided p-value,
+    without drawing any new resamples. Factored out so `evaluate_family_gate`
+    can derive the p-value and (later, at Holm's assigned tail) the lower
+    bound from the SAME retained sample instead of two independent bootstrap
+    draws — see `_lower_bound_from_sorted_boot_means` and the round-4
+    adversarial-review finding at `evaluate_family_gate`'s call sites for why
+    two independent draws break the percentile duality the module claims.
+    """
+    p = sum(1 for m in boot_means if m <= tau_log) / len(boot_means)
+    return max(p, 1.0 / b)
+
+
 def one_sided_bootstrap_pvalue(
     values: Sequence[float],
     order_ab: Sequence[bool],
@@ -162,8 +176,7 @@ def one_sided_bootstrap_pvalue(
     trivially always-reject.
     """
     boot_means = order_stratified_bootstrap_means(values, order_ab, b, rng)
-    p = sum(1 for m in boot_means if m <= tau_log) / len(boot_means)
-    return max(p, 1.0 / b)
+    return _pvalue_from_boot_means(boot_means, tau_log, b)
 
 
 def bootstrap_upper_bound(
@@ -194,6 +207,21 @@ def bootstrap_upper_bound(
     return boot_means[idx]
 
 
+def _lower_bound_from_sorted_boot_means(
+    sorted_boot_means: Sequence[float], *, corrected_alpha: float
+) -> float:
+    """Extraction-only half of `bootstrap_lower_bound`: turns an
+    ALREADY-GENERATED, ALREADY-SORTED bootstrap-mean sample into the
+    `corrected_alpha`-percentile lower bound, without drawing any new
+    resamples. See `_pvalue_from_boot_means` for why this split exists.
+    """
+    if not (0.0 < corrected_alpha < 1.0):
+        raise GateMathError(f"corrected_alpha must be in (0, 1), got {corrected_alpha!r}")
+    idx = min(len(sorted_boot_means) - 1, math.ceil(corrected_alpha * len(sorted_boot_means)) - 1)
+    idx = max(idx, 0)
+    return sorted_boot_means[idx]
+
+
 def bootstrap_lower_bound(
     values: Sequence[float],
     order_ab: Sequence[bool],
@@ -213,17 +241,18 @@ def bootstrap_lower_bound(
     sits at the alpha percentile, not `1 - alpha`
     (https://tsapps.nist.gov/publication/get_pdf.cfm?pub_id=917303).
 
-    This is the function `evaluate_family_gate` calls to populate
-    `CellGateResult.corrected_lower_bound`, which is in turn what a
-    validator must require to exceed the (margin-scaled) fail threshold
-    before confirming FAIL.
+    This is a standalone-resample convenience wrapper; `evaluate_family_gate`
+    does NOT call this function (it would draw a second, independent
+    bootstrap distribution from the one `one_sided_bootstrap_pvalue` already
+    drew for the same cell, breaking percentile duality between the p-value
+    and the bound — the round-4 adversarial-review finding). Instead it
+    calls `_lower_bound_from_sorted_boot_means` directly on the SAME sample
+    it already generated for the p-value.
     """
     if not (0.0 < corrected_alpha < 1.0):
         raise GateMathError(f"corrected_alpha must be in (0, 1), got {corrected_alpha!r}")
     boot_means = sorted(order_stratified_bootstrap_means(values, order_ab, b, rng))
-    idx = min(len(boot_means) - 1, math.ceil(corrected_alpha * len(boot_means)) - 1)
-    idx = max(idx, 0)
-    return boot_means[idx]
+    return _lower_bound_from_sorted_boot_means(boot_means, corrected_alpha=corrected_alpha)
 
 
 # --------------------------------------------------------------------------
@@ -574,13 +603,62 @@ def evaluate_family_gate(
 
     Order-preserving: `results[i]` corresponds to `cells[i]`, matching
     `holm_reject`'s own input-order-preserving contract.
+
+    Percentile duality (round-4 adversarial-review fix): the p-value and the
+    lower bound for a given cell are extracted from ONE retained
+    bootstrap-mean sample (`order_stratified_bootstrap_means` is called
+    exactly once per cell, up front), never from two independent bootstrap
+    draws. Drawing the bound from a second, independent resample -- the
+    prior shape of this function -- does not preserve the docstring's "SAME
+    test, evaluated at the SAME per-cell alpha" claim: a tested-but-not-
+    rejected cell could still expose a threshold-clearing bound purely from
+    resampling noise between the two draws (round-4 finding: single cell,
+    `base=log(1.07)+0.005`, `spread=0.02`, `bootstrap_replicates=2000`,
+    `random.Random(108)` gave `p_value=0.051` (correctly not rejected) but
+    an independently-drawn `corrected_lower_bound=0.0680872...`, above the
+    7% threshold `log(1.07)=0.06765864847381486`). With one shared sample,
+    `p_final > corrected_alpha` (not rejected) algebraically forces the
+    `corrected_alpha`-percentile bound to sit at or below tau: not-rejected
+    means `p_final = max(count(<=tau)/b, 1/b) > corrected_alpha`, so
+    (assuming the floor did not fire, guaranteed below) MORE than
+    `corrected_alpha * b` of the shared sample's means are already `<= tau`
+    -- at least as many as the bound's own rank `ceil(corrected_alpha *
+    b)`, so the bound (that rank's order statistic) is itself `<= tau`.
+
+    This duality only holds if the p-value floor (`max(p, 1/b)`, module
+    docstring correction 2) never sits ABOVE the tightest tail Holm will
+    actually test (`alpha_familywise / len(cells)`, at step-down rank 0):
+    a floored p-value that exceeds that tail could report not-rejected for
+    a cell whose true (unfloored, zero-count) bootstrap distribution is
+    entirely past tau -- which the shared sample would then also report as
+    a bound above tau. Rather than let that reintroduce the same class of
+    incoherence, this function fails closed (before any resampling) when
+    `bootstrap_replicates` is too small for the family size at
+    `alpha_familywise` to guarantee the floor can never sit above that
+    tightest tail.
     """
     if not cells:
         raise GateMathError("evaluate_family_gate requires at least one cell")
     if rng is None:
         rng = random.Random()
 
-    prelim: list[tuple[CellGateInput, int, float, float, float, float]] = []
+    smallest_tail = alpha_familywise / len(cells)
+    if bootstrap_replicates * smallest_tail < 1.0:
+        min_replicates = math.ceil(1.0 / smallest_tail)
+        raise GateMathError(
+            f"bootstrap_replicates={bootstrap_replicates} is too low for a family of {len(cells)} "
+            f"cell(s) at alpha_familywise={alpha_familywise}: the smallest tail Holm's step-down "
+            f"will ever test is alpha_familywise/{len(cells)}={smallest_tail!r}, and the p-value "
+            "floor `max(p, 1/b)` can only resolve tails of size >= 1/bootstrap_replicates. Fewer "
+            f"than {min_replicates} replicates lets the floor sit ABOVE that tightest tail, so a "
+            "cell whose true (unfloored) bootstrap count at that tail is genuinely zero -- every "
+            "bootstrap mean already past tau -- would be floored to a p-value that reports "
+            "not-rejected while its own shared-sample bound still clears the fail threshold, "
+            "reintroducing the exact p-value/bound incoherence this function otherwise fixes for "
+            "every executed rank. Increase bootstrap_replicates, or evaluate fewer cells per family."
+        )
+
+    prelim: list[tuple[CellGateInput, int, float, float, float, float, list[float]]] = []
     for cell in cells:
         if len(cell.values) != len(cell.order_ab):
             raise GateMathError(f"cell {cell.cell_id!r}: values and order_ab must be the same length")
@@ -598,10 +676,19 @@ def evaluate_family_gate(
             )
         tau_fail = math.log(1.0 + cell.fail_pct * margin)
         point_estimate = statistics.fmean(cell.values)
-        p = one_sided_bootstrap_pvalue(cell.values, cell.order_ab, tau_fail, bootstrap_replicates, rng)
-        prelim.append((cell, req_n, margin, tau_fail, point_estimate, p))
+        # ONE retained bootstrap-mean sample per cell -- both the p-value
+        # (now) and, if this rank is tested by the real step-down (below),
+        # the lower bound (later) are extracted from THIS SAME sample. Never
+        # call `one_sided_bootstrap_pvalue`/`bootstrap_lower_bound` here:
+        # each draws its own independent sample from `rng`, which is exactly
+        # the percentile-duality bug this restructure fixes.
+        boot_means = order_stratified_bootstrap_means(
+            cell.values, cell.order_ab, bootstrap_replicates, rng
+        )
+        p = _pvalue_from_boot_means(boot_means, tau_fail, bootstrap_replicates)
+        prelim.append((cell, req_n, margin, tau_fail, point_estimate, p, sorted(boot_means)))
 
-    pvalues = [p for *_rest, p in prelim]
+    pvalues = [p for *_rest, p, _boot in prelim]
     rejects = holm_reject(pvalues, alpha=alpha_familywise)
     # The exact step-down tail each cell was ACTUALLY TESTED at in the real
     # Holm procedure -- `tested[i]` is False for any rank strictly after the
@@ -612,13 +699,22 @@ def evaluate_family_gate(
     tested, cell_alpha = _holm_tested_tails(pvalues, alpha_familywise)
 
     results: list[CellGateResult] = []
-    for (cell, req_n, margin, tau_fail, point_estimate, p), reject, corrected_alpha, was_tested in zip(
-        prelim, rejects, cell_alpha, tested
-    ):
+    for (
+        cell,
+        req_n,
+        margin,
+        tau_fail,
+        point_estimate,
+        p,
+        sorted_boot_means,
+    ), reject, corrected_alpha, was_tested in zip(prelim, rejects, cell_alpha, tested):
         lower_bound: float | None = None
         if was_tested:
-            lower_bound = bootstrap_lower_bound(
-                cell.values, cell.order_ab, bootstrap_replicates, rng, corrected_alpha=corrected_alpha
+            # Same retained sample as the p-value above -- NOT a fresh
+            # `bootstrap_lower_bound` draw (see the docstring's percentile-
+            # duality note and that function's own docstring).
+            lower_bound = _lower_bound_from_sorted_boot_means(
+                sorted_boot_means, corrected_alpha=corrected_alpha
             )
         tau_warn = math.log(1.0 + cell.warn_pct)
         if reject and lower_bound is not None and lower_bound > tau_fail:
