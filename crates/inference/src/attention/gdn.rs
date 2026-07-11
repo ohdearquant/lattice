@@ -400,10 +400,27 @@ fn apply_causal_conv1d(
 /// **Unstable**: scalar L2 normalisation; may be replaced by SIMD path from gdn_fused.
 ///
 /// L2-normalize a vector in-place. Matches FLA library: x / sqrt(sum(x^2) + eps).
+///
+/// ADR-080 C1 fail-closed (#850): a non-finite input (NaN/Inf lane) makes `norm_sq`
+/// non-finite too (squaring any non-finite value yields +inf or NaN, and summing any
+/// non-finite term keeps the sum non-finite), so checking `norm_sq.is_finite()` alone
+/// detects the whole-vector invalid case. GDN state persists across tokens, so letting
+/// a poisoned vector through here would contaminate every subsequent token; the whole
+/// vector is assigned the literal `0.0` directly rather than multiplied through a
+/// zeroed reciprocal (`NaN * 0.0 == NaN` under IEEE-754, so a plain guarded-reciprocal
+/// multiply cannot recover a poisoned lane). A zero-input vector stays the CPU's
+/// original epsilon-regularized graceful case (`norm_sq == 0.0` is finite, so it flows
+/// through the normal path and yields an all-zero output via the numerator).
 #[inline]
 pub fn l2_normalize_vec(x: &mut [f32]) {
     let eps = 1e-6f32;
     let norm_sq: f32 = x.iter().map(|v| v * v).sum();
+    if !norm_sq.is_finite() {
+        for v in x.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
     let inv_norm = 1.0 / (norm_sq + eps).sqrt();
     for v in x.iter_mut() {
         *v *= inv_norm;
@@ -501,6 +518,56 @@ mod tests {
         for &x in &v {
             assert!(x == 0.0, "zero vector should remain zero after L2 norm");
         }
+    }
+
+    /// ADR-080 C1 fail-closed (#850) table test: every non-finite input class must
+    /// zero the WHOLE vector by direct assignment, never leave a poisoned lane by
+    /// multiplying it through a guarded-but-zeroed reciprocal (`NaN * 0.0 == NaN` /
+    /// `inf * 0.0 == NaN` under IEEE-754). Finite classes (all-zero, very-small,
+    /// ordinary) must be numerically unchanged from the pre-#850 behavior.
+    ///
+    /// Mutation-sensitive: reverting the `!norm_sq.is_finite()` early-return in
+    /// `l2_normalize_vec` makes the NaN/+inf/-inf cases below fail (the corrupted
+    /// lane stays non-finite in the output instead of being zeroed).
+    #[test]
+    fn test_l2_normalize_vec_fail_closed_table() {
+        // (label, input, expect_all_zero)
+        let cases: &[(&str, &[f32], bool)] = &[
+            ("nan_lane", &[f32::NAN, 1.0, 2.0, 3.0], true),
+            ("pos_inf_lane", &[f32::INFINITY, 1.0, 2.0, 3.0], true),
+            ("neg_inf_lane", &[f32::NEG_INFINITY, 1.0, 2.0, 3.0], true),
+            ("all_zero", &[0.0, 0.0, 0.0, 0.0], true),
+        ];
+        for (label, input, expect_all_zero) in cases {
+            let mut v = input.to_vec();
+            l2_normalize_vec(&mut v);
+            let all_finite = v.iter().all(|x| x.is_finite());
+            assert!(
+                all_finite,
+                "case {label}: l2_normalize_vec output must be fully finite, got {v:?}"
+            );
+            if *expect_all_zero {
+                assert!(
+                    v.iter().all(|x| *x == 0.0),
+                    "case {label}: expected the whole vector zeroed, got {v:?}"
+                );
+            }
+        }
+
+        // very-small finite: norm_sq is finite and > 0, must NOT hit the fail-closed
+        // branch -- output should be the ordinary (non-zero) epsilon-regularized result.
+        let mut small = vec![1e-20f32, 0.0, 0.0];
+        l2_normalize_vec(&mut small);
+        assert!(
+            small[0] > 0.0 && small[0].is_finite(),
+            "very-small finite input must take the ordinary normalize path, got {small:?}"
+        );
+
+        // ordinary finite: numerically unchanged from the pre-#850 formula.
+        let mut ordinary = vec![3.0f32, 4.0];
+        l2_normalize_vec(&mut ordinary);
+        assert!((ordinary[0] - 0.6).abs() < 1e-6);
+        assert!((ordinary[1] - 0.8).abs() < 1e-6);
     }
 
     #[test]
@@ -800,6 +867,157 @@ mod tests {
             assert!(
                 v.abs() < 1e-6,
                 "output[{i}] should be ~0 with zero weights, got {v}"
+            );
+        }
+    }
+
+    /// ADR-080 C1 fail-closed (#850): GDN state persists across tokens, so a NaN Q
+    /// lane at token 0 must not leak into token 1/2's state or output. This test
+    /// zeroes head 0's ENTIRE Q input-projection weight rows in both a "poisoned"
+    /// and a "reference" build, then additionally sets ONE weight entry inside
+    /// those rows to NaN in the poisoned build only. Both builds therefore compute
+    /// head 0's Q vector as mathematically all-zero: the reference reaches it by
+    /// ordinary finite arithmetic (all weights are exactly `0.0`), the poisoned
+    /// build reaches it only via the `l2_normalize_vec` fail-closed guard (one NaN
+    /// lane makes `norm_sq` non-finite, so the whole vector is assigned `0.0`
+    /// directly). If the guard's zeroing is bit-exact with true zero weights, three
+    /// full steps (poisoned token 0, then two ordinary tokens) must be BIT-IDENTICAL
+    /// to the reference run at every step -- any deviation means either NaN leaked
+    /// past step 0 (not fail-closed) or the guard takes a numerically different path
+    /// than a genuinely-never-poisoned run.
+    ///
+    /// Mutation-sensitive: reverting the `!norm_sq.is_finite()` guard in
+    /// `l2_normalize_vec` back to the plain `1.0 / (norm_sq + eps).sqrt()` computation
+    /// makes the poisoned run's step-0 output/state NaN (`NaN` propagates through
+    /// `apply_causal_conv1d`'s state update on step 1 too, corrupting every
+    /// subsequent step), while the reference run stays unaffected -- so the
+    /// bit-identical assertions below fail immediately.
+    #[test]
+    fn test_l2_normalize_vec_state_isolation_poisoned_token_matches_never_poisoned_reference() {
+        let cfg = Qwen35Config::qwen35_2b();
+        let num_heads = cfg.linear_num_key_heads;
+        let value_heads = cfg.linear_num_value_heads();
+        assert_eq!(
+            num_heads, value_heads,
+            "this test assumes qwen35_2b's ratio=1 (num_key_heads == num_value_heads) \
+             so in_proj_b/in_proj_a can be sized by num_heads alone, matching the \
+             existing test_gated_delta_net_single_step_known_output fixture pattern"
+        );
+        let key_dim = cfg.linear_key_head_dim;
+        let value_dim = cfg.linear_value_head_dim;
+        let hidden = cfg.hidden_size;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let kernel_size = cfg.linear_conv_kernel_dim;
+
+        // Deterministic pseudo-random fill (no external `rand` dependency), matching
+        // the small-magnitude range other GDN tests in this file use.
+        fn make_lcg(seed: u64) -> impl FnMut() -> f32 {
+            let mut state = seed;
+            move || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (((state >> 32) as u32) as f32 / u32::MAX as f32 - 0.5) * 0.2
+            }
+        }
+
+        let build_weights = |poison: bool, seed: u64| -> GatedDeltaNetWeights {
+            let mut rng = make_lcg(seed);
+            let mut in_proj_qkv: Vec<f32> = (0..qkv_dim * hidden).map(|_| rng()).collect();
+            // Zero ALL of head 0's Q weight rows (rows [0, key_dim) of the Q block,
+            // which occupies rows [0, num_heads*key_dim); head 0 maps to k_head 0).
+            for row in in_proj_qkv.iter_mut().take(key_dim * hidden) {
+                *row = 0.0;
+            }
+            if poison {
+                // One NaN lane inside head 0's (all-zero) Q rows. `apply_causal_conv1d`
+                // and `silu` both propagate NaN, so this specific Q lane -- and, via
+                // the fail-closed guard, the WHOLE head-0 Q vector -- goes non-finite
+                // pre-guard, exactly like the reference's true-zero-weight Q vector
+                // post-guard.
+                in_proj_qkv[0] = f32::NAN;
+            }
+            GatedDeltaNetWeights {
+                in_proj_qkv,
+                in_proj_qkv_rows: qkv_dim,
+                in_proj_qkv_cols: hidden,
+                in_proj_z: (0..output_dim * hidden).map(|_| rng()).collect(),
+                in_proj_z_rows: output_dim,
+                in_proj_z_cols: hidden,
+                in_proj_b: (0..num_heads * hidden).map(|_| rng()).collect(),
+                in_proj_b_rows: num_heads,
+                in_proj_b_cols: hidden,
+                in_proj_a: (0..num_heads * hidden).map(|_| rng()).collect(),
+                in_proj_a_rows: num_heads,
+                in_proj_a_cols: hidden,
+                a_log: vec![-1.0; num_heads],
+                dt_bias: vec![0.0; num_heads],
+                conv1d_weight: vec![1.0 / kernel_size as f32; qkv_dim * kernel_size],
+                conv_dim: qkv_dim,
+                kernel_size,
+                norm_weight: vec![1.0; value_dim],
+                out_proj: (0..hidden * output_dim).map(|_| rng()).collect(),
+                out_proj_rows: hidden,
+                out_proj_cols: output_dim,
+            }
+        };
+
+        // Same seed for both builds so every non-corrupted weight is bit-identical.
+        let poisoned_weights = build_weights(true, 0xA5A5_1234_F00D_BEEF);
+        let reference_weights = build_weights(false, 0xA5A5_1234_F00D_BEEF);
+
+        let mut token_rng = make_lcg(0x0102_0304_0506_0708);
+        let tokens: Vec<Vec<f32>> = (0..3)
+            .map(|_| (0..hidden).map(|_| token_rng()).collect())
+            .collect();
+
+        let run = |weights: &GatedDeltaNetWeights| -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+            let mut state = GatedDeltaNetState::new(&cfg);
+            let mut scratch = GatedDeltaNetScratch::default();
+            let mut outputs = Vec::with_capacity(3);
+            let mut state_snapshots = Vec::with_capacity(3);
+            for tok in &tokens {
+                let mut output = vec![0.0f32; hidden];
+                gated_delta_net_step(tok, &mut state, weights, &cfg, &mut scratch, &mut output);
+                outputs.push(output);
+                state_snapshots.push(state.s_matrices.clone());
+            }
+            (outputs, state_snapshots)
+        };
+
+        let (poisoned_outputs, poisoned_states) = run(&poisoned_weights);
+        let (reference_outputs, reference_states) = run(&reference_weights);
+
+        for step in 0..3 {
+            let nan_count = poisoned_outputs[step]
+                .iter()
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                nan_count, 0,
+                "step {step}: poisoned run must fail closed (finite output), found \
+                 {nan_count} non-finite element(s) -- a NaN Q lane leaked past the \
+                 l2_normalize_vec guard"
+            );
+            let state_nan_count = poisoned_states[step]
+                .iter()
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                state_nan_count, 0,
+                "step {step}: poisoned run's recurrent state must stay finite \
+                 (GDN state persists across tokens; a non-finite S contaminates \
+                 every subsequent token), found {state_nan_count} non-finite element(s)"
+            );
+
+            assert_eq!(
+                poisoned_outputs[step], reference_outputs[step],
+                "step {step}: poisoned-then-fail-closed output must be BIT-IDENTICAL \
+                 to the never-poisoned (true-zero-weight) reference output"
+            );
+            assert_eq!(
+                poisoned_states[step], reference_states[step],
+                "step {step}: poisoned-then-fail-closed recurrent state must be \
+                 BIT-IDENTICAL to the never-poisoned (true-zero-weight) reference state"
             );
         }
     }

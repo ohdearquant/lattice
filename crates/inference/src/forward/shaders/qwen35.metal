@@ -1057,14 +1057,20 @@ kernel void gdn_recurrence_fused(
     float alpha_val = sg_buf[0];
 
     // L2 normalize Q
+    // ADR-080 C1 fail-closed (#850): NaN * 0.0f == NaN under IEEE-754, so a NaN lane in
+    // q_val survives a plain `q_val *= qs` even when qs is correctly 0.0f from the
+    // sg_buf[0] guard. Assign the literal 0.0f directly to the whole vector on an
+    // invalid (non-finite or near-zero) norm instead of multiplying a poisoned lane
+    // through a zeroed reciprocal.
     float q_val = (tid < kd) ? conv_out[k_head * kd + tid] : 0.0f;
     float q_sq = simd_sum(q_val * q_val);
     if (simd_lane == 0) sg_buf[sgitg] = q_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float qs = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
-    q_val *= qs;
+    bool q_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
+    float qs = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    q_val = q_valid ? (q_val * qs) : 0.0f;
     if (tid < kd) q_tg[tid] = q_val;
 
     // L2 normalize K
@@ -1074,8 +1080,9 @@ kernel void gdn_recurrence_fused(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float ks = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
-    k_val *= ks;
+    bool k_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
+    float ks = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    k_val = k_valid ? (k_val * ks) : 0.0f;
     if (tid < kd) k_tg[tid] = k_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1192,15 +1199,19 @@ kernel void gdn_recurrence_fused_q36(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float alpha_val = sg_buf[0];
 
-    // L2 normalize Q — kd=128 == thread_count, no ternary guard needed
+    // L2 normalize Q — kd=128 == thread_count, no ARRAY-BOUNDS ternary needed, but the
+    // norm-validity ternary below is still required (ADR-080 C1 fail-closed, #850): a
+    // plain `q_val * qs` lets a NaN lane survive a correctly-zeroed qs (NaN * 0.0f ==
+    // NaN under IEEE-754), so the whole vector is assigned 0.0f directly when invalid.
     float q_val = conv_out[k_head * kd + tid];
     float q_sq = simd_sum(q_val * q_val);
     if (simd_lane == 0) sg_buf[sgitg] = q_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float qs = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
-    q_tg[tid] = q_val * qs;
+    bool q_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
+    float qs = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    q_tg[tid] = q_valid ? (q_val * qs) : 0.0f;
 
     // L2 normalize K
     float k_val = conv_out[p.q_total + k_head * kd + tid];
@@ -1209,8 +1220,9 @@ kernel void gdn_recurrence_fused_q36(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float ks_inv = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
-    k_tg[tid] = k_val * ks_inv;
+    bool k_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
+    float ks_inv = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    k_tg[tid] = k_valid ? (k_val * ks_inv) : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Decay gate
@@ -1320,14 +1332,18 @@ kernel void gdn_precompute_keys(
     float alpha_val = sg_buf[0];
 
     // Q/K stay per KEY head (repeat_interleave: k_head = h / ratio)
+    // ADR-080 C1 fail-closed (#850): assign 0.0f to the whole vector directly on an
+    // invalid (non-finite or near-zero) norm, never `value * guarded_zero_reciprocal`
+    // (NaN * 0.0f == NaN under IEEE-754).
     float q_val = conv_out[k_head * kd + tid];
     float q_sq  = simd_sum(q_val * q_val);
     if (simd_lane == 0) sg_buf[sgitg] = q_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float qs          = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
-    float q_norm_val  = q_val * qs;
+    bool q_valid      = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
+    float qs          = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    float q_norm_val  = q_valid ? (q_val * qs) : 0.0f;
 
     float k_val = conv_out[p.q_total + k_head * kd + tid];
     float k_sq  = simd_sum(k_val * k_val);
@@ -1335,8 +1351,9 @@ kernel void gdn_precompute_keys(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float ks_inv      = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
-    float k_norm_val  = k_val * ks_inv;
+    bool k_valid      = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
+    float ks_inv      = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    float k_norm_val  = k_valid ? (k_val * ks_inv) : 0.0f;
 
     // Decay gate — per VALUE head
     float a  = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
@@ -2837,6 +2854,9 @@ kernel void gdn_chunk_materialize_c32(
         float v_silu = v_raw / (1.0f + exp(-v_raw));
 
         // L2 normalize Q (reduce over 128 dims, 4 simdgroups × 32 lanes)
+        // ADR-080 C1 fail-closed (#850): assign 0.0f to the whole vector directly on an
+        // invalid (non-finite or near-zero) norm, never `value * guarded_zero_reciprocal`
+        // (NaN * 0.0f == NaN under IEEE-754).
         float qsq = simd_sum(q_silu * q_silu);
         if (simd_lane == 0) sg_buf[sgitg] = qsq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2846,7 +2866,8 @@ kernel void gdn_chunk_materialize_c32(
             sg_buf[0] = s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float qs_inv = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
+        bool q_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
+        float qs_inv = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
         // WAR guard: all simdgroups must finish reading sg_buf[0] above before the
         // K-normalize reduction below overwrites sg_buf[sgitg]. Without this barrier a
         // lagging simdgroup reads the K-sum in place of the Q-sum (cross-simdgroup race).
@@ -2862,13 +2883,14 @@ kernel void gdn_chunk_materialize_c32(
             sg_buf[0] = s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float ks_inv = (sg_buf[0] > 1e-12f) ? rsqrt(sg_buf[0]) : 0.0f;
+        bool k_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
+        float ks_inv = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
         // WAR guard: same hazard as above — every simdgroup must read the K-sum from
         // sg_buf[0] before the beta reduction below overwrites sg_buf[sgitg].
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        out_q[head_row * kd + tid] = q_silu * qs_inv;
-        out_k[head_row * kd + tid] = k_silu * ks_inv;
+        out_q[head_row * kd + tid] = q_valid ? (q_silu * qs_inv) : 0.0f;
+        out_k[head_row * kd + tid] = k_valid ? (k_silu * ks_inv) : 0.0f;
         out_v[head_row * vd + tid] = v_silu;
 
         // Beta = sigmoid(hidden[j] @ in_proj_b[h])  — per value head

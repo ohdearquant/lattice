@@ -30,11 +30,20 @@ fn idx(row: usize, col: usize, cols: usize) -> usize {
 /// Row L2 normalization: `x / sqrt(sum(x^2, axis=1) + eps)`.
 ///
 /// `x` is `rows x cols` row-major. Returns a new `rows x cols` buffer.
+///
+/// ADR-080 C1 fail-closed (#850): a row with a non-finite lane makes `sum_sq`
+/// non-finite (mirrors `attention::gdn::l2_normalize_vec`); such a row is left at
+/// its zero-initialized default rather than divided through, matching the
+/// direct-assignment (never multiply/divide-through-a-poisoned-value) contract.
 pub fn l2_normalize_rows(x: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
     for r in 0..rows {
         let row = &x[r * cols..(r + 1) * cols];
         let sum_sq: f32 = row.iter().map(|v| v * v).sum();
+        if !sum_sq.is_finite() {
+            // out row already zero-initialized; leave it as the fail-closed zero row.
+            continue;
+        }
         let denom = (sum_sq + eps).sqrt();
         for c in 0..cols {
             out[idx(r, c, cols)] = row[c] / denom;
@@ -607,6 +616,59 @@ mod tests {
         assert!(
             (0.0f32 * gamma_inv).is_nan(),
             "expected the pre-fix decay factor 0*inf to be NaN"
+        );
+    }
+
+    /// ADR-080 C1 fail-closed (#850) table test for the chunkwise oracle's row
+    /// normalizer: a row with a non-finite lane must be left at its zero-
+    /// initialized default (whole-row zero by non-assignment, equivalent to
+    /// direct zero-assignment), never divided through a non-finite `denom`
+    /// (`NaN / x == NaN`, `x / inf == 0` only masks the corrupted row's OTHER
+    /// lanes while the corrupted lane itself stays non-finite). Finite rows
+    /// (all-zero, ordinary) must be numerically unchanged.
+    ///
+    /// Mutation-sensitive: reverting the `if !sum_sq.is_finite() { continue; }`
+    /// guard back to unconditional division makes the `nan_row`/`inf_row` cases
+    /// below fail (the output row keeps a non-finite lane).
+    #[test]
+    fn l2_normalize_rows_fail_closed_table() {
+        let cols = 3usize;
+        let cases: &[(&str, &[f32], bool)] = &[
+            ("nan_lane", &[f32::NAN, 1.0, 2.0], true),
+            ("pos_inf_lane", &[f32::INFINITY, 1.0, 2.0], true),
+            ("neg_inf_lane", &[f32::NEG_INFINITY, 1.0, 2.0], true),
+            ("all_zero", &[0.0, 0.0, 0.0], true),
+        ];
+        for (label, row, expect_all_zero) in cases {
+            let out = l2_normalize_rows(row, 1, cols, 1e-6);
+            assert!(
+                out.iter().all(|x| x.is_finite()),
+                "case {label}: l2_normalize_rows output must be fully finite, got {out:?}"
+            );
+            if *expect_all_zero {
+                assert!(
+                    out.iter().all(|x| *x == 0.0),
+                    "case {label}: expected the whole row zeroed, got {out:?}"
+                );
+            }
+        }
+
+        // ordinary finite row: numerically unchanged from the pre-#850 formula.
+        let ordinary = l2_normalize_rows(&[3.0f32, 4.0], 1, 2, 0.0);
+        assert!((ordinary[0] - 0.6).abs() < 1e-6);
+        assert!((ordinary[1] - 0.8).abs() < 1e-6);
+
+        // multi-row: a non-finite row must not contaminate an adjacent finite row.
+        let multi = l2_normalize_rows(&[f32::NAN, 0.0, 0.0, 3.0, 4.0, 0.0], 2, 3, 0.0);
+        assert!(
+            multi[0..3].iter().all(|x| *x == 0.0),
+            "row 0 (poisoned) must be all-zero, got {:?}",
+            &multi[0..3]
+        );
+        assert!(
+            (multi[3] - 0.6).abs() < 1e-6 && (multi[4] - 0.8).abs() < 1e-6,
+            "row 1 (clean) must be unaffected by row 0's poisoning, got {:?}",
+            &multi[3..6]
         );
     }
 }
