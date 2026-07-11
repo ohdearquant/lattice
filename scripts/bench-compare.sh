@@ -16,14 +16,15 @@
 #   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
 #
-# lattice#714: the lattice-embed `simd` bench target is entirely sub-microsecond
-# SIMD micro-benches, confirmed noise-dominated in --quick mode (two same-
-# toolchain A/A runs on identical refs flipped FAIL/WARN sign on dozens of its
-# entries, rotating across most of the file's groups run to run). In --quick
-# mode (the default), every group produced by that target is measured and
-# reported but excluded from the FAIL/WARN gate and exit code — see the
-# "informational" section of the report. --full mode gates it normally, so a
-# real embed SIMD regression is still caught there.
+# lattice#714: two of the lattice-embed `simd` bench target's groups
+# (simd_dot_product, simd_cosine_similarity) are confirmed noise-dominated in
+# --quick mode by a same-toolchain A/A reproduction on identical refs
+# (FAIL/WARN sign flipped across dozens of entries in those groups run to
+# run). In --quick mode (the default), only those two named groups are
+# measured and reported but excluded from the FAIL/WARN gate and exit code —
+# see the "informational" section of the report and INFO_GROUPS_ALLOWLIST
+# below. Every other group in the target, including any added later, gates
+# normally. --full mode gates every group normally regardless.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -114,18 +115,41 @@ fi
 )
 
 # --- Quick-mode informational-groups (lattice#714) ---
-# The embed `simd` target's groups are the confirmed noise-floor source; in
-# --quick mode, derive the exact group list from the already-built HEAD
-# binary (so it tracks the source file automatically) and mark them
-# informational-only for this run's gate. --full mode leaves this empty.
+# Fixed, reviewed allowlist of the issue-evidenced noisy groups only — NOT a
+# target-wide dump. lattice#714's quantitative reproduction (same-toolchain
+# A/A runs on identical refs, --quick mode) confined every flip-signed FAIL/
+# WARN to these two lattice-embed `simd` groups; no other group in that
+# target has issue-backed noise evidence, so no other group is exempted here.
+# This list is embed-`simd`-specific: names are matched against the Criterion
+# top-level group name only (scripts/perf-bench-gate.py), so it must never be
+# extended with a name that could collide with a `lattice-inference` group —
+# if that ever becomes a concern, namespace by target (e.g. "embed:<group>")
+# on both sides of the handoff instead of trusting name uniqueness. Adding a
+# group here requires the same kind of same-toolchain A/A quantitative
+# evidence that justified these two, reviewed in a PR — never derived
+# automatically from `--list`, which would silently exempt every future
+# group added to the target (see PR #872 review discussion).
+INFO_GROUPS_ALLOWLIST=(
+  "simd_dot_product"
+  "simd_cosine_similarity"
+)
 INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
 rm -f "$INFO_GROUPS_FILE"
 if [ -n "$QUICK_FLAGS" ] && [ "$BENCHES_EMBED" = "simd" ]; then
   (
     cd "$HEAD_DIR"
-    cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null \
+    # Intersect the fixed allowlist with the groups actually selected/listed
+    # for this run, so a stale or renamed allowlist entry never silently
+    # no-ops instead of gating (--list reflects both the built binary and any
+    # BENCH_GROUPS_EMBED filter already applied).
+    LISTED_GROUPS=$(cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null \
       | awk -F/ '/: benchmark$/{print $1}' \
-      | sort -u > "$INFO_GROUPS_FILE"
+      | sort -u)
+    for grp in "${INFO_GROUPS_ALLOWLIST[@]}"; do
+      if grep -qxF "$grp" <<< "$LISTED_GROUPS"; then
+        echo "$grp"
+      fi
+    done > "$INFO_GROUPS_FILE"
   )
 fi
 
