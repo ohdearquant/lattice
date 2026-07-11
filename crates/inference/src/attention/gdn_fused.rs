@@ -78,9 +78,21 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// ADR-080 C1 fail-closed (#850): a non-finite input lane makes `norm_sq` non-finite too
+/// (squaring any non-finite value yields +inf/NaN, and summing any non-finite term keeps
+/// the sum non-finite), so checking `norm_sq.is_finite()` alone detects the whole-vector
+/// invalid case. The whole vector is assigned the literal `0.0` directly rather than
+/// multiplied through a zeroed reciprocal (`NaN * 0.0 == NaN` under IEEE-754). Mirrors
+/// `attention::gdn::l2_normalize_vec` (the scalar reference helper).
 #[inline]
 fn scalar_l2_normalize(x: &mut [f32]) {
     let norm_sq: f32 = x.iter().map(|v| v * v).sum();
+    if !norm_sq.is_finite() {
+        for v in x.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
     let inv_norm = 1.0 / (norm_sq + 1e-6).sqrt();
     for v in x.iter_mut() {
         *v *= inv_norm;
@@ -563,6 +575,8 @@ pub fn gated_delta_net_step_fused(
 // AVX2 SIMD kernels
 // ---------------------------------------------------------------------------
 
+/// ADR-080 C1 fail-closed (#850): same whole-vector-zero-by-assignment contract as
+/// `scalar_l2_normalize` (see its doc comment for the IEEE-754 rationale).
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "avx2,fma")]
@@ -586,6 +600,13 @@ unsafe fn simd_l2_normalize_avx2(x: &mut [f32]) {
     while i < len {
         norm_sq += x[i] * x[i];
         i += 1;
+    }
+
+    if !norm_sq.is_finite() {
+        for v in x.iter_mut() {
+            *v = 0.0;
+        }
+        return;
     }
 
     let inv_norm = 1.0 / (norm_sq + 1e-6).sqrt();
@@ -724,6 +745,8 @@ unsafe fn simd_gated_rms_norm_avx2(x: &[f32], z: &[f32], gamma: &[f32], out: &mu
 // NEON SIMD kernels
 // ---------------------------------------------------------------------------
 
+/// ADR-080 C1 fail-closed (#850): same whole-vector-zero-by-assignment contract as
+/// `scalar_l2_normalize` (see its doc comment for the IEEE-754 rationale).
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
@@ -744,6 +767,13 @@ unsafe fn simd_l2_normalize_neon(x: &mut [f32]) {
     while i < len {
         norm_sq += x[i] * x[i];
         i += 1;
+    }
+
+    if !norm_sq.is_finite() {
+        for v in x.iter_mut() {
+            *v = 0.0;
+        }
+        return;
     }
 
     let inv_norm = 1.0 / (norm_sq + 1e-6).sqrt();
@@ -1711,5 +1741,277 @@ mod tests {
         let gamma: [f32; 0] = []; // must equal x.len()
         let mut out = [0.0f32; 8];
         simd_gated_rms_norm(&x, &z, &gamma, &mut out, 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // #850 blocker 2 follow-up: the SHIPPING scalar/AVX2/NEON l2-normalize
+    // paths must fail closed identically to the reference helper.
+    // -----------------------------------------------------------------------
+
+    /// Table test for `scalar_l2_normalize` and, on the architecture the test runs on,
+    /// the concrete SIMD backend it dispatches to (AVX2 on x86_64, NEON on aarch64) plus
+    /// the public `simd_l2_normalize` dispatcher — all three must agree.
+    #[test]
+    fn simd_l2_normalize_backends_fail_closed_table() {
+        struct Case {
+            name: &'static str,
+            input: [f32; 4],
+            expect_all_zero: bool,
+        }
+        let cases = [
+            Case {
+                name: "nan_lane",
+                input: [f32::NAN, 1.0, 0.0, 2.0],
+                expect_all_zero: true,
+            },
+            Case {
+                name: "pos_inf_lane",
+                input: [f32::INFINITY, 1.0, 0.0, 2.0],
+                expect_all_zero: true,
+            },
+            Case {
+                name: "neg_inf_lane",
+                input: [1.0, f32::NEG_INFINITY, 0.0, 2.0],
+                expect_all_zero: true,
+            },
+            Case {
+                name: "all_zero",
+                input: [0.0, 0.0, 0.0, 0.0],
+                expect_all_zero: true,
+            },
+            Case {
+                name: "very_small_finite",
+                input: [1e-7, 0.0, 0.0, 0.0],
+                expect_all_zero: false,
+            },
+            Case {
+                name: "ordinary_finite",
+                input: [3.0, 4.0, 0.0, 0.0],
+                expect_all_zero: false,
+            },
+        ];
+
+        for case in &cases {
+            let mut scalar_out = case.input;
+            scalar_l2_normalize(&mut scalar_out);
+            let mut dispatch_out = case.input;
+            simd_l2_normalize(&mut dispatch_out);
+
+            assert!(
+                scalar_out.iter().all(|v| v.is_finite()),
+                "case {}: scalar_l2_normalize output must be fully finite, got {:?}",
+                case.name,
+                scalar_out
+            );
+            assert!(
+                dispatch_out.iter().all(|v| v.is_finite()),
+                "case {}: simd_l2_normalize (dispatcher) output must be fully finite, got {:?}",
+                case.name,
+                dispatch_out
+            );
+            assert_close_slice(
+                &scalar_out,
+                &dispatch_out,
+                1e-6,
+                &format!("case {}: scalar vs dispatcher", case.name),
+            );
+
+            if case.expect_all_zero {
+                assert!(
+                    scalar_out.iter().all(|&v| v == 0.0),
+                    "case {}: scalar_l2_normalize must zero the whole vector, got {:?}",
+                    case.name,
+                    scalar_out
+                );
+                assert!(
+                    dispatch_out.iter().all(|&v| v == 0.0),
+                    "case {}: simd_l2_normalize must zero the whole vector, got {:?}",
+                    case.name,
+                    dispatch_out
+                );
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma")
+                {
+                    let mut avx2_out = case.input;
+                    // SAFETY: guarded by runtime feature detection above.
+                    unsafe { simd_l2_normalize_avx2(&mut avx2_out) };
+                    assert!(
+                        avx2_out.iter().all(|v| v.is_finite()),
+                        "case {}: simd_l2_normalize_avx2 output must be fully finite, got {:?}",
+                        case.name,
+                        avx2_out
+                    );
+                    assert_close_slice(
+                        &scalar_out,
+                        &avx2_out,
+                        1e-6,
+                        &format!("case {}: scalar vs avx2", case.name),
+                    );
+                    if case.expect_all_zero {
+                        assert!(
+                            avx2_out.iter().all(|&v| v == 0.0),
+                            "case {}: simd_l2_normalize_avx2 must zero the whole vector, got {:?}",
+                            case.name,
+                            avx2_out
+                        );
+                    }
+                }
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    let mut neon_out = case.input;
+                    // SAFETY: guarded by runtime feature detection above.
+                    unsafe { simd_l2_normalize_neon(&mut neon_out) };
+                    assert!(
+                        neon_out.iter().all(|v| v.is_finite()),
+                        "case {}: simd_l2_normalize_neon output must be fully finite, got {:?}",
+                        case.name,
+                        neon_out
+                    );
+                    assert_close_slice(
+                        &scalar_out,
+                        &neon_out,
+                        1e-6,
+                        &format!("case {}: scalar vs neon", case.name),
+                    );
+                    if case.expect_all_zero {
+                        assert!(
+                            neon_out.iter().all(|&v| v == 0.0),
+                            "case {}: simd_l2_normalize_neon must zero the whole vector, got {:?}",
+                            case.name,
+                            neon_out
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #850 blocker 3 follow-up: state-isolation proof through the SHIPPING fused path
+    /// (`gated_delta_net_step_fused`, the exact function blocker 2 found vulnerable),
+    /// poisoning K only at the FIRST of three steps — not via a permanently-poisoned
+    /// weight (which would poison every step, the flaw in the original scalar-only,
+    /// Q-only, weight-poisoned test) but via a per-call weight object used only for
+    /// step 1, with ordinary finite weights for steps 2-3 in both the poisoned and
+    /// reference runs.
+    ///
+    /// Poisoned-run step 1 weights: head-0's K projection rows are zeroed except one
+    /// entry, which is set to NaN, so head-0's K projection output is exactly one NaN
+    /// lane surrounded by zeros. Reference-run step 1 weights: the same rows, fully
+    /// zeroed (no NaN), so the K projection output is exactly all-zero.
+    ///
+    /// `isfinite(norm_sq) && norm_sq > 1e-12` rejects both a NaN norm (poisoned) and an
+    /// exact-zero norm (reference) via the identical branch, so both runs must produce
+    /// bit-identical output and recurrent state at every step, including the two clean
+    /// steps that follow — proving a poisoned K at step 1 does not leak into step 2/3.
+    ///
+    /// Uses a degenerate `linear_conv_kernel_dim = 1` config (pointwise conv1d, no
+    /// rolling history window) rather than the real Qwen3.5 kernel size (4). This is a
+    /// deliberate, disclosed test-design choice: with a real multi-tap kernel, a NaN
+    /// raw projection at step 1 also gets pushed into `state.conv_buffer`'s per-channel
+    /// history and re-enters the conv1d window at step 2/3 regardless of the L2-norm
+    /// guard — a real but *separate* propagation vector (causal-conv history carryover)
+    /// that #850 does not cover and this test does not claim to close. Collapsing the
+    /// kernel to one tap removes that confound so this test isolates exactly the
+    /// contract this PR fixes: the L2-normalize guard's fail-closed behavior. All other
+    /// per-head logic (projections, decay gate, state update, output gate) is exercised
+    /// unchanged through the real `gated_delta_net_step_fused` entry point.
+    #[test]
+    fn gated_delta_net_step_fused_k_poison_step1_state_isolation_through_shipping_path() {
+        let mut cfg = Qwen35Config::qwen35_2b();
+        cfg.linear_conv_kernel_dim = 1;
+        let (base_weights, cfg) = make_test_weights_for_cfg(cfg, 77);
+        let hidden = cfg.hidden_size;
+        let key_dim = cfg.linear_key_head_dim;
+        let num_heads = cfg.linear_num_key_heads;
+        let q_total = num_heads * key_dim;
+        let k0_row_start = q_total; // head-0 K rows begin right after all Q rows
+
+        let build_step1_weights = |poison: bool| -> GatedDeltaNetWeights {
+            let mut w = base_weights.clone();
+            for r in k0_row_start..k0_row_start + key_dim {
+                let row = &mut w.in_proj_qkv[r * hidden..(r + 1) * hidden];
+                row.fill(0.0);
+            }
+            if poison {
+                // One NaN lane in the first zeroed K row: input[0] * NaN = NaN
+                // regardless of input[0]'s value (0 * NaN = NaN under IEEE-754), and
+                // every other row stays exactly 0.0 * finite = 0.0.
+                w.in_proj_qkv[k0_row_start * hidden] = f32::NAN;
+            }
+            w
+        };
+        let weights_poison_step1 = build_step1_weights(true);
+        let weights_zero_step1 = build_step1_weights(false);
+        let (weights_clean, _) = make_test_weights_for_cfg(cfg.clone(), 78);
+
+        let mut rng = XorShift64::new(99);
+        let mut inputs: Vec<Vec<f32>> = Vec::new();
+        for _ in 0..3 {
+            let mut v = vec![0.0f32; hidden];
+            rng.fill_gaussian(&mut v, 0.1);
+            inputs.push(v);
+        }
+
+        let run = |step1_weights: &GatedDeltaNetWeights| -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+            let mut state = GatedDeltaNetState::new(&cfg);
+            let mut scratch = GatedDeltaNetFusedScratch::default();
+            let mut outputs = Vec::new();
+            let mut states = Vec::new();
+
+            let step_weights = [step1_weights, &weights_clean, &weights_clean];
+            for (step, w) in step_weights.iter().enumerate() {
+                let mut output = vec![0.0f32; hidden];
+                gated_delta_net_step_fused(
+                    &inputs[step],
+                    &mut state,
+                    w,
+                    &cfg,
+                    &mut scratch,
+                    &mut output,
+                    &crate::lora_hook::NoopLoraHook,
+                    0,
+                );
+                outputs.push(output);
+                states.push(state.s_matrices.clone());
+            }
+            (outputs, states)
+        };
+
+        let (poisoned_outputs, poisoned_states) = run(&weights_poison_step1);
+        let (reference_outputs, reference_states) = run(&weights_zero_step1);
+
+        for step in 0..3 {
+            let non_finite = poisoned_outputs[step]
+                .iter()
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                non_finite, 0,
+                "step {step}: poisoned run must fail closed (finite output), found {non_finite} non-finite element(s) -- a NaN K lane leaked past simd_l2_normalize"
+            );
+            let non_finite_state = poisoned_states[step]
+                .iter()
+                .filter(|v| !v.is_finite())
+                .count();
+            assert_eq!(
+                non_finite_state, 0,
+                "step {step}: poisoned run recurrent state must fail closed (finite), found {non_finite_state} non-finite element(s)"
+            );
+            assert_eq!(
+                poisoned_outputs[step], reference_outputs[step],
+                "step {step}: poisoned-K run output must be bit-identical to the explicit-zero-weight reference"
+            );
+            assert_eq!(
+                poisoned_states[step], reference_states[step],
+                "step {step}: poisoned-K run recurrent state must be bit-identical to the explicit-zero-weight reference"
+            );
+        }
     }
 }

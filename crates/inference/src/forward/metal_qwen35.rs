@@ -25014,31 +25014,45 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    let (out_p, s_p) = run_gdn_recurrence_fused(
-                        &device, &queue, &pipe, kd, vd, hd, &poisoned, &s_init, &hidden_in,
-                        &in_proj_b, &in_proj_a,
-                    );
-                    let (out_r, s_r) = run_gdn_recurrence_fused(
-                        &device, &queue, &pipe, kd, vd, hd, &reference, &s_init, &hidden_in,
-                        &in_proj_b, &in_proj_a,
-                    );
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix (Q->K threadgroup_barrier after every sg_buf[0] consumer):
+                    // a passing single dispatch does not prove the race is closed
+                    // (simdgroups are not required to advance in lockstep, so the
+                    // hazard window may or may not be hit on a given run), so this
+                    // repeats the dispatch to raise the chance of exposing it if the
+                    // barrier were ever removed again. Not a substitute for the
+                    // access-order argument the barrier itself is required by.
+                    for _ in 0..20 {
+                        let (out_p, s_p) = run_gdn_recurrence_fused(
+                            &device, &queue, &pipe, kd, vd, hd, &poisoned, &s_init, &hidden_in,
+                            &in_proj_b, &in_proj_a,
+                        );
+                        let (out_r, s_r) = run_gdn_recurrence_fused(
+                            &device, &queue, &pipe, kd, vd, hd, &reference, &s_init, &hidden_in,
+                            &in_proj_b, &in_proj_a,
+                        );
 
-                    assert_no_nonfinite(
-                        &format!("gdn_recurrence_fused[{label}]"),
-                        "output",
-                        &out_p,
-                    );
-                    assert_no_nonfinite(&format!("gdn_recurrence_fused[{label}]"), "S_all", &s_p);
-                    assert_eq!(
-                        out_p, out_r,
-                        "gdn_recurrence_fused[{label}-poisoned]: output must be bit-identical \
-                         to the never-poisoned (explicit-zero-{label}) reference"
-                    );
-                    assert_eq!(
-                        s_p, s_r,
-                        "gdn_recurrence_fused[{label}-poisoned]: updated S_all must be \
-                         bit-identical to the never-poisoned (explicit-zero-{label}) reference"
-                    );
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused[{label}]"),
+                            "output",
+                            &out_p,
+                        );
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused[{label}]"),
+                            "S_all",
+                            &s_p,
+                        );
+                        assert_eq!(
+                            out_p, out_r,
+                            "gdn_recurrence_fused[{label}-poisoned]: output must be bit-identical \
+                             to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                        assert_eq!(
+                            s_p, s_r,
+                            "gdn_recurrence_fused[{label}-poisoned]: updated S_all must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
                 }
             }
 
@@ -25149,35 +25163,40 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    let (out_p, s_p) = run_gdn_recurrence_fused_q36(
-                        &device, &queue, &pipe, &poisoned, &s_init, &hidden_in, &in_proj_b,
-                        &in_proj_a,
-                    );
-                    let (out_r, s_r) = run_gdn_recurrence_fused_q36(
-                        &device, &queue, &pipe, &reference, &s_init, &hidden_in, &in_proj_b,
-                        &in_proj_a,
-                    );
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix; see the identical comment in
+                    // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
+                    for _ in 0..20 {
+                        let (out_p, s_p) = run_gdn_recurrence_fused_q36(
+                            &device, &queue, &pipe, &poisoned, &s_init, &hidden_in, &in_proj_b,
+                            &in_proj_a,
+                        );
+                        let (out_r, s_r) = run_gdn_recurrence_fused_q36(
+                            &device, &queue, &pipe, &reference, &s_init, &hidden_in, &in_proj_b,
+                            &in_proj_a,
+                        );
 
-                    assert_no_nonfinite(
-                        &format!("gdn_recurrence_fused_q36[{label}]"),
-                        "output",
-                        &out_p,
-                    );
-                    assert_no_nonfinite(
-                        &format!("gdn_recurrence_fused_q36[{label}]"),
-                        "S_all",
-                        &s_p,
-                    );
-                    assert_eq!(
-                        out_p, out_r,
-                        "gdn_recurrence_fused_q36[{label}-poisoned]: output must be \
-                         bit-identical to the never-poisoned (explicit-zero-{label}) reference"
-                    );
-                    assert_eq!(
-                        s_p, s_r,
-                        "gdn_recurrence_fused_q36[{label}-poisoned]: updated S_all must be \
-                         bit-identical to the never-poisoned (explicit-zero-{label}) reference"
-                    );
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused_q36[{label}]"),
+                            "output",
+                            &out_p,
+                        );
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused_q36[{label}]"),
+                            "S_all",
+                            &s_p,
+                        );
+                        assert_eq!(
+                            out_p, out_r,
+                            "gdn_recurrence_fused_q36[{label}-poisoned]: output must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                        assert_eq!(
+                            s_p, s_r,
+                            "gdn_recurrence_fused_q36[{label}-poisoned]: updated S_all must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
                 }
             }
 
@@ -25258,13 +25277,15 @@ mod inner {
                 };
                 let _gpu = gpu_test_lock();
                 let lib = compile_msl(&device);
-                let Some(pipe_func) = lib.get_function("gdn_precompute_keys", None).ok() else {
-                    eprintln!(
-                        "skipping gdn_precompute_keys_fails_closed: kernel not present \
-                         (optional Qwen3.6 pipeline) -- explicitly allowed skip per #850"
-                    );
-                    return;
-                };
+                // `gdn_precompute_keys` is defined unconditionally in qwen35.metal (no
+                // #ifdef gate) -- it is not actually an optional/conditionally-compiled
+                // kernel, so a missing lookup here means MSL_SOURCE was compiled but the
+                // named kernel silently failed to link, which is itself a bug this test
+                // must catch, not skip past (#862 round 1, medium finding 4: only
+                // device-absence may remain a platform-level skip).
+                let pipe_func = lib
+                    .get_function("gdn_precompute_keys", None)
+                    .expect("gdn_precompute_keys must be present in MSL_SOURCE once compiled");
                 let pipe = device
                     .new_compute_pipeline_state_with_function(&pipe_func)
                     .expect("build gdn_precompute_keys pipeline");
@@ -25290,24 +25311,30 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    let scratch_p = run_gdn_precompute_keys(
-                        &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a,
-                    );
-                    let scratch_r = run_gdn_precompute_keys(
-                        &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
-                    );
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix (this kernel has TWO fixed handoffs: Q->K and K->k_dot_q);
+                    // see the identical comment in
+                    // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
+                    for _ in 0..20 {
+                        let scratch_p = run_gdn_precompute_keys(
+                            &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a,
+                        );
+                        let scratch_r = run_gdn_precompute_keys(
+                            &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
+                        );
 
-                    // scratch layout: [q_norm(128) | k_norm(128) | k_dot_q(1) | beta | g]
-                    assert_no_nonfinite(
-                        &format!("gdn_precompute_keys[{label}]"),
-                        "key_scratch",
-                        &scratch_p,
-                    );
-                    assert_eq!(
-                        scratch_p, scratch_r,
-                        "gdn_precompute_keys[{label}-poisoned]: key_scratch must be \
-                         bit-identical to the never-poisoned (explicit-zero-{label}) reference"
-                    );
+                        // scratch layout: [q_norm(128) | k_norm(128) | k_dot_q(1) | beta | g]
+                        assert_no_nonfinite(
+                            &format!("gdn_precompute_keys[{label}]"),
+                            "key_scratch",
+                            &scratch_p,
+                        );
+                        assert_eq!(
+                            scratch_p, scratch_r,
+                            "gdn_precompute_keys[{label}-poisoned]: key_scratch must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
                 }
             }
 

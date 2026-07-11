@@ -17,7 +17,7 @@ use crate::forward::cpu::matmul_bt;
 use crate::model::qwen35_config::Qwen35Config;
 
 /// **Unstable**: weight tensors for a GatedDeltaNet layer; field layout follows Qwen3.5 checkpoint format.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GatedDeltaNetWeights {
     /// QKV projection: [qkv_dim, hidden_size] where qkv_dim = Q_dim + K_dim + V_dim
     pub in_proj_qkv: Vec<f32>,
@@ -872,29 +872,53 @@ mod tests {
     }
 
     /// ADR-080 C1 fail-closed (#850): GDN state persists across tokens, so a NaN Q
-    /// lane at token 0 must not leak into token 1/2's state or output. This test
-    /// zeroes head 0's ENTIRE Q input-projection weight rows in both a "poisoned"
-    /// and a "reference" build, then additionally sets ONE weight entry inside
-    /// those rows to NaN in the poisoned build only. Both builds therefore compute
-    /// head 0's Q vector as mathematically all-zero: the reference reaches it by
-    /// ordinary finite arithmetic (all weights are exactly `0.0`), the poisoned
+    /// lane must not leak past the token it appears in. Unlike an earlier version of
+    /// this test (see #862 review round 1, major finding 3), the poison here is
+    /// applied via a weight object used ONLY for step 0 -- steps 1 and 2 run with
+    /// ordinary, never-zeroed, never-poisoned weights in BOTH the poisoned and
+    /// reference runs, so this actually proves "one poisoned token, then two clean
+    /// tokens," not "every token stays poisoned via a permanently-zeroed weight."
+    ///
+    /// Step-0 poisoned build: head 0's ENTIRE Q input-projection weight rows are
+    /// zeroed, then ONE weight entry inside those rows is additionally set to NaN.
+    /// Step-0 reference build: the same rows, zeroed only (no NaN). Both therefore
+    /// compute head 0's Q vector as mathematically all-zero -- the reference reaches
+    /// it by ordinary finite arithmetic (every weight is exactly `0.0`), the poisoned
     /// build reaches it only via the `l2_normalize_vec` fail-closed guard (one NaN
     /// lane makes `norm_sq` non-finite, so the whole vector is assigned `0.0`
-    /// directly). If the guard's zeroing is bit-exact with true zero weights, three
-    /// full steps (poisoned token 0, then two ordinary tokens) must be BIT-IDENTICAL
-    /// to the reference run at every step -- any deviation means either NaN leaked
-    /// past step 0 (not fail-closed) or the guard takes a numerically different path
-    /// than a genuinely-never-poisoned run.
+    /// directly, taking the same `isfinite(norm_sq) && norm_sq > eps`-rejects branch
+    /// as an exact-zero norm). If the guard's zeroing is bit-exact with true-zero
+    /// weights, all three steps must be BIT-IDENTICAL between the two runs -- any
+    /// deviation means either NaN leaked past step 0 (not fail-closed) or the guard
+    /// takes a numerically different path than a genuinely-never-poisoned run.
+    ///
+    /// Uses a degenerate `linear_conv_kernel_dim = 1` config (pointwise conv1d, no
+    /// rolling history window), the same disclosed test-design choice as
+    /// `gdn_fused::tests::gated_delta_net_step_fused_k_poison_step1_state_isolation_through_shipping_path`:
+    /// with a real multi-tap kernel, step 0's NaN raw projection also gets pushed
+    /// into `state.conv_buffer`'s per-channel history and re-enters the conv1d
+    /// window at step 1/2 regardless of the L2-norm guard -- a real but separate
+    /// causal-conv history-carryover propagation vector that #850 does not cover.
+    /// Collapsing the kernel to one tap isolates exactly the contract this PR fixes.
+    ///
+    /// A companion test, `gdn_fused::tests::gated_delta_net_step_fused_k_poison_step1_state_isolation_through_shipping_path`,
+    /// runs the same shape of proof (poison-only-step-0, two clean steps, explicit-zero
+    /// reference) for K instead of Q, through the SHIPPING `gated_delta_net_step_fused`
+    /// SIMD path instead of this scalar reference -- that is the production-shaped gap
+    /// #862 round 1 found (blocker 2: `simd_l2_normalize`'s scalar/AVX2/NEON backends
+    /// were fail-open even though this scalar reference and `l2_normalize_vec` were
+    /// already fixed). This test remains as the Q-side / scalar-reference-path proof;
+    /// it does not by itself cover K or the fused/SIMD path.
     ///
     /// Mutation-sensitive: reverting the `!norm_sq.is_finite()` guard in
     /// `l2_normalize_vec` back to the plain `1.0 / (norm_sq + eps).sqrt()` computation
-    /// makes the poisoned run's step-0 output/state NaN (`NaN` propagates through
-    /// `apply_causal_conv1d`'s state update on step 1 too, corrupting every
-    /// subsequent step), while the reference run stays unaffected -- so the
-    /// bit-identical assertions below fail immediately.
+    /// makes the poisoned run's step-0 output/state NaN, corrupting every subsequent
+    /// step once it enters `state.s_matrices` -- so the bit-identical assertions below
+    /// fail immediately.
     #[test]
     fn test_l2_normalize_vec_state_isolation_poisoned_token_matches_never_poisoned_reference() {
-        let cfg = Qwen35Config::qwen35_2b();
+        let mut cfg = Qwen35Config::qwen35_2b();
+        cfg.linear_conv_kernel_dim = 1;
         let num_heads = cfg.linear_num_key_heads;
         let value_heads = cfg.linear_num_value_heads();
         assert_eq!(
@@ -920,24 +944,10 @@ mod tests {
             }
         }
 
-        let build_weights = |poison: bool, seed: u64| -> GatedDeltaNetWeights {
+        let make_ordinary_weights = |seed: u64| -> GatedDeltaNetWeights {
             let mut rng = make_lcg(seed);
-            let mut in_proj_qkv: Vec<f32> = (0..qkv_dim * hidden).map(|_| rng()).collect();
-            // Zero ALL of head 0's Q weight rows (rows [0, key_dim) of the Q block,
-            // which occupies rows [0, num_heads*key_dim); head 0 maps to k_head 0).
-            for row in in_proj_qkv.iter_mut().take(key_dim * hidden) {
-                *row = 0.0;
-            }
-            if poison {
-                // One NaN lane inside head 0's (all-zero) Q rows. `apply_causal_conv1d`
-                // and `silu` both propagate NaN, so this specific Q lane -- and, via
-                // the fail-closed guard, the WHOLE head-0 Q vector -- goes non-finite
-                // pre-guard, exactly like the reference's true-zero-weight Q vector
-                // post-guard.
-                in_proj_qkv[0] = f32::NAN;
-            }
             GatedDeltaNetWeights {
-                in_proj_qkv,
+                in_proj_qkv: (0..qkv_dim * hidden).map(|_| rng()).collect(),
                 in_proj_qkv_rows: qkv_dim,
                 in_proj_qkv_cols: hidden,
                 in_proj_z: (0..output_dim * hidden).map(|_| rng()).collect(),
@@ -961,21 +971,41 @@ mod tests {
             }
         };
 
-        // Same seed for both builds so every non-corrupted weight is bit-identical.
-        let poisoned_weights = build_weights(true, 0xA5A5_1234_F00D_BEEF);
-        let reference_weights = build_weights(false, 0xA5A5_1234_F00D_BEEF);
+        // Step-0-only weights: same seed for poisoned/reference so every
+        // non-corrupted weight is bit-identical between the two builds.
+        let build_step0_weights = |poison: bool, seed: u64| -> GatedDeltaNetWeights {
+            let mut w = make_ordinary_weights(seed);
+            // Zero ALL of head 0's Q weight rows (rows [0, key_dim) of the Q block,
+            // which occupies rows [0, num_heads*key_dim); head 0 maps to k_head 0).
+            for row in w.in_proj_qkv.iter_mut().take(key_dim * hidden) {
+                *row = 0.0;
+            }
+            if poison {
+                // One NaN lane inside head 0's (all-zero) Q rows -- this specific Q
+                // lane, and via the fail-closed guard the WHOLE head-0 Q vector, goes
+                // non-finite pre-guard, exactly like the reference's true-zero-weight
+                // Q vector post-guard.
+                w.in_proj_qkv[0] = f32::NAN;
+            }
+            w
+        };
+        let step0_poisoned = build_step0_weights(true, 0xA5A5_1234_F00D_BEEF);
+        let step0_reference = build_step0_weights(false, 0xA5A5_1234_F00D_BEEF);
+        // Steps 1-2: identical ordinary weights (no zeroing, no NaN) in BOTH runs.
+        let clean_weights = make_ordinary_weights(0xC0FF_EE00_1357_9BDF);
 
         let mut token_rng = make_lcg(0x0102_0304_0506_0708);
         let tokens: Vec<Vec<f32>> = (0..3)
             .map(|_| (0..hidden).map(|_| token_rng()).collect())
             .collect();
 
-        let run = |weights: &GatedDeltaNetWeights| -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let run = |step0_weights: &GatedDeltaNetWeights| -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
             let mut state = GatedDeltaNetState::new(&cfg);
             let mut scratch = GatedDeltaNetScratch::default();
             let mut outputs = Vec::with_capacity(3);
             let mut state_snapshots = Vec::with_capacity(3);
-            for tok in &tokens {
+            let step_weights = [step0_weights, &clean_weights, &clean_weights];
+            for (tok, weights) in tokens.iter().zip(step_weights.iter()) {
                 let mut output = vec![0.0f32; hidden];
                 gated_delta_net_step(tok, &mut state, weights, &cfg, &mut scratch, &mut output);
                 outputs.push(output);
@@ -984,8 +1014,8 @@ mod tests {
             (outputs, state_snapshots)
         };
 
-        let (poisoned_outputs, poisoned_states) = run(&poisoned_weights);
-        let (reference_outputs, reference_states) = run(&reference_weights);
+        let (poisoned_outputs, poisoned_states) = run(&step0_poisoned);
+        let (reference_outputs, reference_states) = run(&step0_reference);
 
         for step in 0..3 {
             let nan_count = poisoned_outputs[step]

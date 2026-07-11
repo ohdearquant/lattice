@@ -1072,6 +1072,10 @@ kernel void gdn_recurrence_fused(
     float qs = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
     q_val = q_valid ? (q_val * qs) : 0.0f;
     if (tid < kd) q_tg[tid] = q_val;
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
+    // before the K-normalize reduction below overwrites sg_buf[sgitg]. Without this
+    // barrier a lagging simdgroup can read the K partial sum in place of the Q norm.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // L2 normalize K
     float k_val = (tid < kd) ? conv_out[p.q_total + k_head * kd + tid] : 0.0f;
@@ -1212,6 +1216,9 @@ kernel void gdn_recurrence_fused_q36(
     bool q_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
     float qs = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
     q_tg[tid] = q_valid ? (q_val * qs) : 0.0f;
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
+    // before the K-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // L2 normalize K
     float k_val = conv_out[p.q_total + k_head * kd + tid];
@@ -1344,6 +1351,9 @@ kernel void gdn_precompute_keys(
     bool q_valid      = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
     float qs          = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
     float q_norm_val  = q_valid ? (q_val * qs) : 0.0f;
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
+    // before the K-normalize reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float k_val = conv_out[p.q_total + k_head * kd + tid];
     float k_sq  = simd_sum(k_val * k_val);
@@ -1354,6 +1364,9 @@ kernel void gdn_precompute_keys(
     bool k_valid      = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
     float ks_inv      = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
     float k_norm_val  = k_valid ? (k_val * ks_inv) : 0.0f;
+    // WAR guard: all simdgroups must finish reading sg_buf[0] (the K norm) above
+    // before the k_dot_q reduction below overwrites sg_buf[sgitg].
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Decay gate — per VALUE head
     float a  = min(exp(a_log[h]), FLT_MAX);  // clamp +inf (parity w/ CPU gdn.rs): inf*0 = NaN poisons GDN state
