@@ -15474,9 +15474,8 @@ mod inner {
             use crate::error::InferenceError;
             use crate::kv_cache::PrefixReuseMode;
 
-            // The `logprobs` / `enable_mtp` config preflight checks (codex
-            // round-1 blocker #1, round-2 medium #3/#4, PR #787), and the
-            // suffix-content preflight below (#835), live in the public
+            // The `logprobs` / `enable_mtp` config preflight checks (PR #787),
+            // and the suffix-content preflight below (#835), live in the public
             // wrapper `generate_streaming_with_prefix_cache_and_cancel`, not
             // here: that wrapper's error-recovery path unconditionally
             // evicts the cache slot on any `Err` from this function, so a
