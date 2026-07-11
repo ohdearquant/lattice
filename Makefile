@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity
+.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
 
 check:
 	cargo check --workspace
@@ -69,12 +69,6 @@ bench-gate:
 e2e-parity:
 	cargo build --release --bin qwen35_generate -p lattice-inference --features f16
 	python3 scripts/e2e_parity_check.py
-
-# ADR-064: measure decode slope/intercept and output JSON.
-# Usage: make bench-decode                   (default 5 runs, ctx 64-1024)
-#        RUNS=3 make bench-decode            (faster)
-bench-decode:
-	./scripts/bench_decode_slope.sh
 
 # ADR-064 Phase-0: decode slope/intercept fit (Theil-Sen + bootstrap CI).
 # Usage: make bench-decode-slopefit                     (smoke grid {64,256,512})
