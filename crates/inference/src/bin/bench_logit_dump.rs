@@ -30,6 +30,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35::Qwen35Model;
+    use lattice_inference::model_format::{ModelFormat, detect_format};
 
     let home = std::env::var("HOME")?;
     let model_dir_str = std::env::var("LATTICE_MODEL_DIR")
@@ -55,20 +56,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[bench_logit_dump] loading {model_dir_str}");
     eprintln!("[bench_logit_dump] tokens: {} positions", tokens.len());
 
-    let is_q4_dir = !dir.join("model.safetensors").exists()
-        && std::fs::read_dir(dir)
-            .ok()
-            .and_then(|mut e| {
-                e.find(|e| {
-                    e.as_ref()
-                        .ok()
-                        .and_then(|e| e.file_name().to_str().map(|n| n.ends_with(".q4")))
-                        .unwrap_or(false)
-                })
-            })
-            .is_some();
+    // Unknown falls through to the safetensors branch below, matching this
+    // binary's pre-existing two-way (Q4 / not-Q4) dispatch, with one
+    // corrected exception: the old inline heuristic here only checked
+    // model.safetensors, never model.safetensors.index.json, so a directory
+    // with an index file *and* stray .q4 files used to route to the Q4
+    // loader; the canonical index-aware detector now routes it to
+    // safetensors instead (the precedence this binary inherits going
+    // forward).
+    let is_q4 = matches!(detect_format(dir), ModelFormat::Q4);
 
-    let (mut metal, cfg) = if is_q4_dir {
+    let (mut metal, cfg) = if is_q4 {
         let cfg = lattice_inference::model::qwen35_config::Qwen35Config::from_config_json(
             &dir.join("config.json"),
         )

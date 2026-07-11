@@ -1,9 +1,10 @@
 //! Reverse-mode backward (VJP) for a single GatedDeltaNet token sequence.
 //!
 //! Scope: computes grad_input (d_loss/d_input for each token) for a sequence
-//! processed through one GDN layer.  Parameter (weight) gradients are out of
-//! scope here — only input-gradients are needed for LoRA gradient flow through
-//! the 18 frozen GDN layers to reach lower GQA layers.
+//! processed through one GDN layer, AND (when LoRA is present) the LoRA weight
+//! gradients for each of the 5 GDN projections (qkv, z, b/beta, a/alpha, out).
+//! This is "surface-B" LoRA: mirrors the GQA surface-A implementation in
+//! backward/attention_gqa.rs, using the same lora_vjp primitive from ops.rs.
 //!
 //! # Forward recap (matches `gdn_fused.rs` hot path)
 //!
@@ -17,12 +18,15 @@
 //!
 //! c_t     = conv1d_silu(qkv_t)        (causal depthwise conv, then SiLU)
 //!
-//! For each value-head h  (key-head k_head = h / ratio):
-//!   q_hat = L2norm( c_t[q_start..] )
-//!   k_hat = L2norm( c_t[k_start..] )
+//! For each value-head h  (key-head k_head = h / ratio, used only for Q/K sharing):
+//!   q_hat = L2norm( c_t[q_start..] )   (q_start from k_head)
+//!   k_hat = L2norm( c_t[k_start..] )   (k_start from k_head)
 //!   v     = c_t[v_start..]
 //!
-//!   g   = exp(-exp(a_log) * softplus(alpha_t[k_head] + dt_bias[k_head]))
+//!   beta_t, alpha_t, a_log, dt_bias are all indexed by h directly — GDN's
+//!   decay gate and update rate are per VALUE head, not per key head. Only
+//!   Q/K projections are shared across a key-head's group of value-heads.
+//!   g   = exp(-exp(a_log[h]) * softplus(alpha_t[h] + dt_bias[h]))
 //!
 //!   kv_mem_t = S_{t-1}^T @ k_hat      (retrieval from *pre-decayed* state)
 //!   delta_t  = (v - kv_mem_t * g) * beta_t
@@ -65,7 +69,33 @@
 //! eliminate catastrophic cancellation at eps = 1e-3.
 
 use crate::attention::gdn::{sigmoid, softplus};
+use crate::backward::ops::lora_vjp;
 use crate::model::qwen35_config::Qwen35Config;
+
+/// Gradients of the GDN layer w.r.t. LoRA params for all 5 projections.
+///
+/// Naming and layout mirror AttnGrads in backward/attention_gqa.rs.
+/// grad_a_* shape: [rank * d_in], grad_b_* shape: [d_out * rank].
+/// Fields are zero-length Vec when LoRA is absent (no-LoRA forward).
+pub struct GdnGrads {
+    /// in_proj_qkv LoRA: d_in=hidden, d_out=qkv_dim
+    pub grad_a_qkv: Vec<f32>,
+    pub grad_b_qkv: Vec<f32>,
+    /// in_proj_z LoRA: d_in=hidden, d_out=output_dim
+    pub grad_a_z: Vec<f32>,
+    pub grad_b_z: Vec<f32>,
+    /// in_proj_b (beta sigmoid) LoRA: d_in=hidden, d_out=value_heads
+    pub grad_a_b: Vec<f32>,
+    pub grad_b_b: Vec<f32>,
+    /// in_proj_a (alpha decay) LoRA: d_in=hidden, d_out=value_heads
+    pub grad_a_a: Vec<f32>,
+    pub grad_b_a: Vec<f32>,
+    /// out_proj LoRA: d_in=output_dim, d_out=hidden
+    pub grad_a_out: Vec<f32>,
+    pub grad_b_out: Vec<f32>,
+    /// Input gradient (always present): [seq_len, hidden_size]
+    pub dx: Vec<f32>,
+}
 
 /// Saved activations for one forward pass over a sequence.
 ///
@@ -92,13 +122,13 @@ pub struct GdnSaved {
     pub qkv_proj: Vec<f32>,
     /// z projection: [seq_len, output_dim]
     pub z_proj: Vec<f32>,
-    /// raw beta pre-sigmoid: [seq_len, num_key_heads]
+    /// raw beta pre-sigmoid: [seq_len, value_heads] (per VALUE head, not key head)
     pub beta_raw: Vec<f32>,
-    /// alpha projection: [seq_len, num_key_heads]
+    /// alpha projection: [seq_len, value_heads] (per VALUE head, not key head)
     pub alpha_proj: Vec<f32>,
-    /// beta = sigmoid(beta_raw): [seq_len, num_key_heads]
+    /// beta = sigmoid(beta_raw): [seq_len, value_heads]
     pub beta: Vec<f32>,
-    /// decay gate g per key-head: [seq_len, num_key_heads]
+    /// decay gate g per value-head: [seq_len, value_heads]
     pub g: Vec<f32>,
 
     /// Conv1d SiLU output: [seq_len, qkv_dim]
@@ -140,6 +170,52 @@ pub struct GdnSaved {
     /// SiLU(z) per value-head: [seq_len, value_heads, value_dim]
     /// Stored because backward through gated_rms_norm needs it.
     pub silu_z: Vec<f32>,
+
+    // ---- LoRA caches (populated only when LoRA is present) ----
+    // h_* = A_proj @ x for each projection; shape [seq_len * lora_rank].
+    // Empty when LoRA absent.
+    /// LoRA rank used (0 = no LoRA)
+    pub lora_rank: usize,
+    /// LoRA scale factor
+    pub lora_scale: f32,
+
+    /// h_qkv = A_qkv @ x: [seq_len, lora_rank]
+    pub h_qkv: Vec<f32>,
+    /// h_z = A_z @ x: [seq_len, lora_rank]
+    pub h_z: Vec<f32>,
+    /// h_b = A_b @ x: [seq_len, lora_rank]  (beta sigmoid projection)
+    pub h_b: Vec<f32>,
+    /// h_a = A_a @ x: [seq_len, lora_rank]  (alpha decay projection)
+    pub h_a: Vec<f32>,
+    /// h_out = A_out @ gated_buf: [seq_len, lora_rank]  (output projection input)
+    pub h_out: Vec<f32>,
+    /// gated_buf (input to out_proj + LoRA_out): [seq_len, output_dim]
+    /// Needed for the out_proj LoRA backward (x side of that linear).
+    pub gated_buf: Vec<f32>,
+
+    // ---- LoRA weight matrices (cloned from forward params for backward) ----
+    // Storing these avoids threading 10 extra args through gdn_backward.
+    // Empty Vec when LoRA absent.
+    /// A_qkv: [rank, hidden]
+    pub lora_a_qkv: Vec<f32>,
+    /// B_qkv: [qkv_dim, rank]
+    pub lora_b_qkv: Vec<f32>,
+    /// A_z: [rank, hidden]
+    pub lora_a_z: Vec<f32>,
+    /// B_z: [output_dim, rank]
+    pub lora_b_z: Vec<f32>,
+    /// A_b: [rank, hidden]
+    pub lora_a_b: Vec<f32>,
+    /// B_b: [value_heads, rank]
+    pub lora_b_b: Vec<f32>,
+    /// A_a: [rank, hidden]
+    pub lora_a_a: Vec<f32>,
+    /// B_a: [value_heads, rank]
+    pub lora_b_a: Vec<f32>,
+    /// A_out: [rank, output_dim]
+    pub lora_a_out: Vec<f32>,
+    /// B_out: [hidden, rank]
+    pub lora_b_out: Vec<f32>,
 }
 
 impl GdnSaved {
@@ -179,10 +255,10 @@ impl GdnSaved {
             inputs: vec![0.0; seq_len * hidden_size],
             qkv_proj: vec![0.0; seq_len * qkv_dim],
             z_proj: vec![0.0; seq_len * output_dim],
-            beta_raw: vec![0.0; seq_len * num_key_heads],
-            alpha_proj: vec![0.0; seq_len * num_key_heads],
-            beta: vec![0.0; seq_len * num_key_heads],
-            g: vec![0.0; seq_len * num_key_heads],
+            beta_raw: vec![0.0; seq_len * value_heads],
+            alpha_proj: vec![0.0; seq_len * value_heads],
+            beta: vec![0.0; seq_len * value_heads],
+            g: vec![0.0; seq_len * value_heads],
             conv_out: vec![0.0; seq_len * qkv_dim],
             conv_buffers: vec![0.0; seq_len * qkv_dim * buf_len],
             q_hat: vec![0.0; seq_len * value_heads * key_dim],
@@ -197,6 +273,26 @@ impl GdnSaved {
             o_heads: vec![0.0; seq_len * value_heads * value_dim],
             rms_vals: vec![0.0; seq_len * value_heads],
             silu_z: vec![0.0; seq_len * value_heads * value_dim],
+            // LoRA caches: start empty; populated in gdn_forward_save when LoRA present.
+            lora_rank: 0,
+            lora_scale: 0.0,
+            h_qkv: Vec::new(),
+            h_z: Vec::new(),
+            h_b: Vec::new(),
+            h_a: Vec::new(),
+            h_out: Vec::new(),
+            gated_buf: Vec::new(),
+            // LoRA weight matrices: start empty; cloned from params in gdn_forward_save.
+            lora_a_qkv: Vec::new(),
+            lora_b_qkv: Vec::new(),
+            lora_a_z: Vec::new(),
+            lora_b_z: Vec::new(),
+            lora_a_b: Vec::new(),
+            lora_b_b: Vec::new(),
+            lora_a_a: Vec::new(),
+            lora_b_a: Vec::new(),
+            lora_a_out: Vec::new(),
+            lora_b_out: Vec::new(),
         }
     }
 }
@@ -211,15 +307,54 @@ impl GdnSaved {
 /// `inputs`:      [seq_len, hidden_size]
 /// `weights`:     frozen GDN layer weights
 /// `cfg`:         model config
-/// `norm_weight`: gamma for gated RMSNorm [value_dim]
 /// `saved`:       output struct, must be pre-allocated via `GdnSaved::new`
 /// `outputs`:     [seq_len, hidden_size] — written in-place
+///
+/// Optional LoRA parameters for the 5 GDN projections (qkv, z, b, a, out).
+/// When all five pairs are `Some`, the forward adds `scale * (x @ A^T) @ B^T`
+/// to each projection output and caches `h = A @ x` for the backward.
+/// When any pair is `None`, the forward is byte-identical to the no-LoRA path.
+#[allow(clippy::too_many_arguments)]
+/// The ten LoRA weight-matrix slices bound for one GDN forward, in fixed order:
+/// (a_qkv, b_qkv, a_z, b_z, a_b, b_b, a_a, b_a, a_out, b_out). Factored out to keep
+/// the `lora_bound` binding under clippy's type-complexity threshold (this module is
+/// `train-backward`-gated, so default clippy never lints it — see the app-bins gate).
+type LoraBound<'a> = (
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+    &'a [f32],
+);
+
 pub fn gdn_forward_save(
     inputs: &[f32],
     weights: &crate::attention::gdn::GatedDeltaNetWeights,
     _cfg: &Qwen35Config,
     saved: &mut GdnSaved,
     outputs: &mut [f32],
+    // LoRA params for in_proj_qkv: a=[rank,hidden], b=[qkv_dim,rank]
+    lora_a_qkv: Option<&[f32]>,
+    lora_b_qkv: Option<&[f32]>,
+    // LoRA params for in_proj_z: a=[rank,hidden], b=[output_dim,rank]
+    lora_a_z: Option<&[f32]>,
+    lora_b_z: Option<&[f32]>,
+    // LoRA params for in_proj_b (beta): a=[rank,hidden], b=[value_heads,rank]
+    lora_a_b: Option<&[f32]>,
+    lora_b_b: Option<&[f32]>,
+    // LoRA params for in_proj_a (alpha): a=[rank,hidden], b=[value_heads,rank]
+    lora_a_a: Option<&[f32]>,
+    lora_b_a: Option<&[f32]>,
+    // LoRA params for out_proj: a=[rank,output_dim], b=[hidden,rank]
+    lora_a_out: Option<&[f32]>,
+    lora_b_out: Option<&[f32]>,
+    lora_rank: usize,
+    lora_scale: f32,
 ) {
     use crate::forward::cpu::matmul_bt;
 
@@ -238,6 +373,80 @@ pub fn gdn_forward_save(
     let buf_len = kernel_size.saturating_sub(1);
     let q_total = num_kh * key_dim;
 
+    // Bind all ten LoRA slices at once.  If any pair is None or rank==0 the entire
+    // LoRA path is skipped and the forward is byte-identical to the no-LoRA path.
+    // Option<&[f32]> is Copy, so destructuring copies the refs — no heap allocation.
+    let lora_bound: Option<LoraBound> = if lora_rank > 0 {
+        match (
+            lora_a_qkv, lora_b_qkv, lora_a_z, lora_b_z, lora_a_b, lora_b_b, lora_a_a, lora_b_a,
+            lora_a_out, lora_b_out,
+        ) {
+            (
+                Some(a_qkv),
+                Some(b_qkv),
+                Some(a_z),
+                Some(b_z),
+                Some(a_b),
+                Some(b_b),
+                Some(a_a),
+                Some(b_a),
+                Some(a_out),
+                Some(b_out),
+            ) => Some((a_qkv, b_qkv, a_z, b_z, a_b, b_b, a_a, b_a, a_out, b_out)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Reset LoRA cache state unconditionally. `saved` is a reusable buffer; a
+    // prior LoRA-bound call would otherwise leave stale rank/matrices/h_* here.
+    // gdn_backward gates its LoRA-gradient path on saved.lora_rank, so a leftover
+    // nonzero rank after a no-LoRA call computes phantom gradients. The Some branch
+    // below repopulates these; the None path now stays truly LoRA-free.
+    saved.lora_rank = 0;
+    saved.lora_scale = 0.0;
+    saved.h_qkv.clear();
+    saved.h_z.clear();
+    saved.h_b.clear();
+    saved.h_a.clear();
+    saved.h_out.clear();
+    saved.gated_buf.clear();
+    saved.lora_a_qkv.clear();
+    saved.lora_b_qkv.clear();
+    saved.lora_a_z.clear();
+    saved.lora_b_z.clear();
+    saved.lora_a_b.clear();
+    saved.lora_b_b.clear();
+    saved.lora_a_a.clear();
+    saved.lora_b_a.clear();
+    saved.lora_a_out.clear();
+    saved.lora_b_out.clear();
+
+    // Initialise LoRA cache buffers on the saved struct when LoRA is active.
+    // Also clone the weight matrices so gdn_backward doesn't need them threaded through.
+    if let Some((a_qkv, b_qkv, a_z, b_z, a_b, b_b, a_a, b_a, a_out, b_out)) = lora_bound {
+        saved.lora_rank = lora_rank;
+        saved.lora_scale = lora_scale;
+        saved.h_qkv = vec![0.0f32; seq_len * lora_rank];
+        saved.h_z = vec![0.0f32; seq_len * lora_rank];
+        saved.h_b = vec![0.0f32; seq_len * lora_rank];
+        saved.h_a = vec![0.0f32; seq_len * lora_rank];
+        saved.h_out = vec![0.0f32; seq_len * lora_rank];
+        saved.gated_buf = vec![0.0f32; seq_len * output_dim];
+        // Clone weight matrices for backward use.
+        saved.lora_a_qkv = a_qkv.to_vec();
+        saved.lora_b_qkv = b_qkv.to_vec();
+        saved.lora_a_z = a_z.to_vec();
+        saved.lora_b_z = b_z.to_vec();
+        saved.lora_a_b = a_b.to_vec();
+        saved.lora_b_b = b_b.to_vec();
+        saved.lora_a_a = a_a.to_vec();
+        saved.lora_b_a = b_a.to_vec();
+        saved.lora_a_out = a_out.to_vec();
+        saved.lora_b_out = b_out.to_vec();
+    }
+
     // Rolling conv buffer (shared across time, updated per step)
     let mut conv_buf_live = vec![0.0f32; qkv_dim * buf_len];
 
@@ -252,26 +461,120 @@ pub fn gdn_forward_save(
         let qkv_out = &mut saved.qkv_proj[t * qkv_dim..(t + 1) * qkv_dim];
         matmul_bt(x, &weights.in_proj_qkv, qkv_out, 1, hidden, qkv_dim);
 
+        // LoRA for in_proj_qkv: output += scale * (x @ A_qkv^T) @ B_qkv^T
+        // Cache h_qkv = A_qkv @ x for the backward.
+        if let Some((a_qkv, b_qkv, _, _, _, _, _, _, _, _)) = lora_bound {
+            let h = &mut saved.h_qkv[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h[r] = a_qkv[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let qkv_out = &mut saved.qkv_proj[t * qkv_dim..(t + 1) * qkv_dim];
+            for i in 0..qkv_dim {
+                let acc: f32 = lora_scale
+                    * b_qkv[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                qkv_out[i] += acc;
+            }
+        }
+
         let z_out = &mut saved.z_proj[t * output_dim..(t + 1) * output_dim];
         matmul_bt(x, &weights.in_proj_z, z_out, 1, hidden, output_dim);
 
-        let beta_out = &mut saved.beta_raw[t * num_kh..(t + 1) * num_kh];
-        matmul_bt(x, &weights.in_proj_b, beta_out, 1, hidden, num_kh);
-        let alpha_out = &mut saved.alpha_proj[t * num_kh..(t + 1) * num_kh];
-        matmul_bt(x, &weights.in_proj_a, alpha_out, 1, hidden, num_kh);
-
-        // sigmoid(beta)
-        for kh in 0..num_kh {
-            let raw = saved.beta_raw[t * num_kh + kh];
-            saved.beta[t * num_kh + kh] = sigmoid(raw);
+        // LoRA for in_proj_z
+        if let Some((_, _, a_z, b_z, _, _, _, _, _, _)) = lora_bound {
+            let h = &mut saved.h_z[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h[r] = a_z[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let z_out = &mut saved.z_proj[t * output_dim..(t + 1) * output_dim];
+            for i in 0..output_dim {
+                let acc: f32 = lora_scale
+                    * b_z[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                z_out[i] += acc;
+            }
         }
 
-        // decay gate g per key-head
-        for kh in 0..num_kh {
-            let alpha_h = saved.alpha_proj[t * num_kh + kh];
-            let a = weights.a_log[kh].exp();
-            let sp = softplus(alpha_h + weights.dt_bias[kh]);
-            saved.g[t * num_kh + kh] = (-a * sp).exp();
+        // beta/alpha are projected per VALUE head (in_proj_b/in_proj_a have
+        // value_heads rows, matching the shipping gdn_fused forward and the
+        // f16 weight loader) — NOT per key head. Only Q/K share a key-head's
+        // projection; beta/alpha/a_log/dt_bias never do.
+        let beta_out = &mut saved.beta_raw[t * value_heads..(t + 1) * value_heads];
+        matmul_bt(x, &weights.in_proj_b, beta_out, 1, hidden, value_heads);
+
+        // LoRA for in_proj_b (beta, pre-sigmoid linear output)
+        if let Some((_, _, _, _, a_b, b_b, _, _, _, _)) = lora_bound {
+            let h = &mut saved.h_b[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h[r] = a_b[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let beta_out = &mut saved.beta_raw[t * value_heads..(t + 1) * value_heads];
+            for i in 0..value_heads {
+                let acc: f32 = lora_scale
+                    * b_b[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                beta_out[i] += acc;
+            }
+        }
+
+        let alpha_out = &mut saved.alpha_proj[t * value_heads..(t + 1) * value_heads];
+        matmul_bt(x, &weights.in_proj_a, alpha_out, 1, hidden, value_heads);
+
+        // LoRA for in_proj_a (alpha, pre-softplus linear output)
+        if let Some((_, _, _, _, _, _, a_a, b_a, _, _)) = lora_bound {
+            let h = &mut saved.h_a[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h[r] = a_a[r * hidden..(r + 1) * hidden]
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let alpha_out = &mut saved.alpha_proj[t * value_heads..(t + 1) * value_heads];
+            for i in 0..value_heads {
+                let acc: f32 = lora_scale
+                    * b_a[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                alpha_out[i] += acc;
+            }
+        }
+
+        // sigmoid(beta), indexed per value-head
+        for vh in 0..value_heads {
+            let raw = saved.beta_raw[t * value_heads + vh];
+            saved.beta[t * value_heads + vh] = sigmoid(raw);
+        }
+
+        // decay gate g per value-head
+        for vh in 0..value_heads {
+            let alpha_h = saved.alpha_proj[t * value_heads + vh];
+            let a = weights.a_log[vh].exp();
+            let sp = softplus(alpha_h + weights.dt_bias[vh]);
+            saved.g[t * value_heads + vh] = (-a * sp).exp();
         }
 
         // --- Causal conv1d + SiLU ---
@@ -333,8 +636,8 @@ pub fn gdn_forward_save(
             saved.q_hat[q_off..q_off + key_dim].copy_from_slice(&q_raw);
             saved.k_hat[k_off..k_off + key_dim].copy_from_slice(&k_raw);
 
-            let g_h = saved.g[t * num_kh + kh];
-            let beta_h = saved.beta[t * num_kh + kh];
+            let g_h = saved.g[t * value_heads + h];
+            let beta_h = saved.beta[t * value_heads + h];
 
             // S_{t-1} for this head
             let s_off = h * key_dim * value_dim;
@@ -409,8 +712,37 @@ pub fn gdn_forward_save(
             }
         }
 
+        // Save gated_buf when LoRA is active (needed as the x-side input for out_proj LoRA backward).
+        if lora_bound.is_some() {
+            saved.gated_buf[t * output_dim..(t + 1) * output_dim].copy_from_slice(&gated_buf);
+        }
+
         let y_t = &mut outputs[t * hidden..(t + 1) * hidden];
         matmul_bt(&gated_buf, &weights.out_proj, y_t, 1, output_dim, hidden);
+
+        // LoRA for out_proj: y_t += scale * (gated_buf @ A_out^T) @ B_out^T
+        // out_proj is [hidden, output_dim], so d_out=hidden, d_in=output_dim.
+        // Cache h_out = A_out @ gated_buf for the backward.
+        if let Some((_, _, _, _, _, _, _, _, a_out, b_out)) = lora_bound {
+            let h_slot = &mut saved.h_out[t * lora_rank..(t + 1) * lora_rank];
+            for r in 0..lora_rank {
+                h_slot[r] = a_out[r * output_dim..(r + 1) * output_dim]
+                    .iter()
+                    .zip(gated_buf.iter())
+                    .map(|(a, xi)| a * xi)
+                    .sum();
+            }
+            let y_t = &mut outputs[t * hidden..(t + 1) * hidden];
+            for i in 0..hidden {
+                let acc: f32 = lora_scale
+                    * b_out[i * lora_rank..(i + 1) * lora_rank]
+                        .iter()
+                        .zip(h_slot.iter())
+                        .map(|(b, hi)| b * hi)
+                        .sum::<f32>();
+                y_t[i] += acc;
+            }
+        }
     }
 }
 
@@ -420,16 +752,19 @@ pub fn gdn_forward_save(
 
 /// VJP of the GDN sequence forward.
 ///
+/// Returns a `GdnGrads` containing the input gradient (dx, always populated)
+/// and — when the saved activations carry LoRA caches (i.e. `gdn_forward_save`
+/// was called with LoRA params) — the weight gradients for each of the 5
+/// projections. When LoRA is absent, the grad_a_*/grad_b_* Vecs are empty.
+///
 /// `grad_outputs`:  [seq_len, hidden_size] — upstream gradient of loss w.r.t. output
 /// `saved`:         activations from `gdn_forward_save`
 /// `weights`:       same frozen weights used in forward
-/// `grad_inputs`:   [seq_len, hidden_size] — output, grad of loss w.r.t. input
 pub fn gdn_backward(
     grad_outputs: &[f32],
     saved: &GdnSaved,
     weights: &crate::attention::gdn::GatedDeltaNetWeights,
-    grad_inputs: &mut [f32],
-) {
+) -> GdnGrads {
     let seq_len = saved.seq_len;
     let hidden = saved.hidden_size;
     let num_kh = saved.num_key_heads;
@@ -445,7 +780,63 @@ pub fn gdn_backward(
     let q_total = num_kh * key_dim;
     let gamma = &weights.norm_weight[..value_dim];
 
-    grad_inputs.fill(0.0);
+    let have_lora = saved.lora_rank > 0 && !saved.h_qkv.is_empty();
+    let lora_rank = saved.lora_rank;
+    let lora_scale = saved.lora_scale;
+
+    // Allocate LoRA weight grad accumulators (empty when no LoRA).
+    let mut grad_a_qkv = if have_lora {
+        vec![0.0f32; lora_rank * hidden]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_qkv = if have_lora {
+        vec![0.0f32; qkv_dim * lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut grad_a_z = if have_lora {
+        vec![0.0f32; lora_rank * hidden]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_z = if have_lora {
+        vec![0.0f32; output_dim * lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut grad_a_b = if have_lora {
+        vec![0.0f32; lora_rank * hidden]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_b = if have_lora {
+        vec![0.0f32; value_heads * lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut grad_a_a = if have_lora {
+        vec![0.0f32; lora_rank * hidden]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_a = if have_lora {
+        vec![0.0f32; value_heads * lora_rank]
+    } else {
+        Vec::new()
+    };
+    let mut grad_a_out = if have_lora {
+        vec![0.0f32; lora_rank * output_dim]
+    } else {
+        Vec::new()
+    };
+    let mut grad_b_out = if have_lora {
+        vec![0.0f32; hidden * lora_rank]
+    } else {
+        Vec::new()
+    };
+
+    let mut grad_inputs = vec![0.0f32; seq_len * hidden];
 
     // Adjoint state dS: accumulated across timesteps, flows backward.
     // dS[h] is dL/d(S_t) for head h, updated as t decreases.
@@ -464,10 +855,17 @@ pub fn gdn_backward(
 
     for t in (0..seq_len).rev() {
         let dy = &grad_outputs[t * hidden..(t + 1) * hidden];
+        let x_t = &saved.inputs[t * hidden..(t + 1) * hidden];
 
         // ---- 1. Backward through out_proj: d_gated_buf = W_out^T @ dy ----
         // W_out is [hidden, output_dim].  out = gated_buf @ W_out^T means
         // d_gated_buf[j] = sum_i W_out[i,j] * dy[i]
+        //
+        // When LoRA is present: y_t = base_out + scale*(gated_buf@A_out^T)@B_out^T
+        // The upstream gradient dy is w.r.t. the total y_t.
+        // lora_vjp(dy, gated_buf_t, h_out_t, a_out, b_out, rank, output_dim, hidden, scale)
+        // returns (grad_b_out delta, grad_a_out delta, d_gated_buf_lora_delta).
+        // d_gated_buf = W_out^T dy  +  lora_vjp dx contribution (d_gated_buf from LoRA path).
         let mut d_gated_buf = vec![0.0f32; output_dim];
         for j in 0..output_dim {
             let mut acc = 0.0f64;
@@ -475,6 +873,35 @@ pub fn gdn_backward(
                 acc += weights.out_proj[i * output_dim + j] as f64 * dy[i] as f64;
             }
             d_gated_buf[j] = acc as f32;
+        }
+
+        // LoRA weight grads for out_proj + dx contribution to d_gated_buf.
+        // out_proj layout: [hidden, output_dim] → d_in=output_dim, d_out=hidden.
+        // lora_vjp(g=dy, x=gated_buf_t, h=h_out_t, a=lora_a_out, b=lora_b_out,
+        //          rank, d_in=output_dim, d_out=hidden, scale)
+        if have_lora {
+            let gated_buf_t = &saved.gated_buf[t * output_dim..(t + 1) * output_dim];
+            let h_out_t = &saved.h_out[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                dy,
+                gated_buf_t,
+                h_out_t,
+                &saved.lora_a_out,
+                &saved.lora_b_out,
+                lora_rank,
+                output_dim,
+                hidden,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_out[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_out[k] += gb[k];
+            }
+            for j in 0..output_dim {
+                d_gated_buf[j] += dx_lora[j];
+            }
         }
 
         // ---- 2. Backward through gated RMSNorm for each value-head ----
@@ -525,8 +952,13 @@ pub fn gdn_backward(
             }
         }
 
-        // ---- 3. Accumulate d_z_proj → d_x via W_z^T ----
-        // z_proj = W_z @ x,  d_x += W_z^T @ d_z_proj
+        // ---- 3. Accumulate d_z_proj → d_x via W_z^T, then LoRA weight grads ----
+        // z_proj = W_z @ x  (+LoRA when present),  d_x += W_z^T @ d_z_proj
+        //
+        // d_z_proj IS the pre-nonlinearity linear-projection-output gradient for z.
+        // (z goes through SiLU in the gated RMSNorm; d_z_proj is the gradient
+        // w.r.t. the linear output of in_proj_z, BEFORE SiLU — that is what step 2
+        // computes via the SiLU backward inside the RMSNorm loop.)
         let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
         for j in 0..output_dim {
             let dz_j = d_z_proj[j];
@@ -537,12 +969,43 @@ pub fn gdn_backward(
                 dx_t[i] += weights.in_proj_z[j * hidden + i] * dz_j;
             }
         }
+        // LoRA weight grads for in_proj_z.
+        // g = d_z_proj, x = x_t, h = h_z_t, d_in=hidden, d_out=output_dim
+        if have_lora {
+            let h_z_t = &saved.h_z[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                &d_z_proj,
+                x_t,
+                h_z_t,
+                &saved.lora_a_z,
+                &saved.lora_b_z,
+                lora_rank,
+                hidden,
+                output_dim,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_z[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_z[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+        }
 
         // ---- 4. Per value-head recurrence backward ----
         // We process heads in REVERSE order (arbitrary — no inter-head deps).
         // We work with the per-head adjoint dS[h] which carries across time.
 
         let mut d_conv_out = vec![0.0f32; qkv_dim];
+        // Per value-head accumulators for alpha and beta scalar grads. Unlike
+        // Q/K (shared across a key-head's group of value-heads), alpha/beta/
+        // a_log/dt_bias are genuinely one-per-value-head — no reduction across
+        // heads is needed or correct here.
+        let mut d_alpha_vh = vec![0.0f32; value_heads]; // d_loss / d(alpha_proj[t, h])
+        let mut d_beta_raw_vh = vec![0.0f32; value_heads]; // d_loss / d(beta_raw[t, h])
 
         for h in 0..value_heads {
             let kh = h / ratio;
@@ -550,8 +1013,8 @@ pub fn gdn_backward(
             let k_start = q_total + kh * key_dim;
             let v_start = q_total * 2 + h * value_dim;
 
-            let g_h = saved.g[t * num_kh + kh];
-            let beta_h = saved.beta[t * num_kh + kh];
+            let g_h = saved.g[t * value_heads + h];
+            let beta_h = saved.beta[t * value_heads + h];
 
             let q_off = (t * value_heads + h) * key_dim;
             let k_off = (t * value_heads + h) * key_dim;
@@ -668,9 +1131,9 @@ pub fn gdn_backward(
             // dg/d_alpha = g * (-exp(a_log)) * sigmoid(alpha + dt_bias)
             //            = g * (-exp(a_log)) * softplus'(alpha + dt_bias)
             // where softplus'(x) = sigmoid(x)
-            let alpha_h = saved.alpha_proj[t * num_kh + kh];
-            let a_val = weights.a_log[kh].exp();
-            let sp_arg = alpha_h + weights.dt_bias[kh];
+            let alpha_h = saved.alpha_proj[t * value_heads + h];
+            let a_val = weights.a_log[h].exp();
+            let sp_arg = alpha_h + weights.dt_bias[h];
             let sp_deriv = sigmoid(sp_arg); // d/dx softplus(x) = sigmoid(x)
             // dg/d_alpha = g * (-a_val) * sp_deriv
             let d_alpha_from_g = d_g_h * g_h * (-a_val) * sp_deriv;
@@ -705,23 +1168,82 @@ pub fn gdn_backward(
             // ---- 4h. Backward through sigmoid(beta_raw) → d_beta_raw ----
             // beta = sigmoid(beta_raw)
             // d_beta_raw = d_beta * beta * (1 - beta)
-            let beta_raw_h = saved.beta_raw[t * num_kh + kh];
+            let beta_raw_h = saved.beta_raw[t * value_heads + h];
             let sig = sigmoid(beta_raw_h);
             let d_beta_raw_h = d_beta_h * sig * (1.0 - sig);
 
-            // ---- 4i. Accumulate scalar grads into per-head gradient arrays ----
-            // We accumulate per-head d_alpha and d_beta_raw into d_alpha_proj / d_beta_proj
-            // arrays.  Since multiple value-heads share the same key-head, we sum.
-            // We'll accumulate directly into d_x via W_a^T and W_b^T below.
-            // Store in temporary scalars indexed by kh (accumulate across h sharing kh).
-            // Use a local accumulator since the inner-most scope is per-h.
-            // We immediately push to d_x to avoid extra allocations.
-            let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
-            for i in 0..hidden {
-                dx_t[i] += weights.in_proj_a[kh * hidden + i] * d_alpha_from_g;
-                dx_t[i] += weights.in_proj_b[kh * hidden + i] * d_beta_raw_h;
-            }
+            // ---- 4i. Store per value-head scalar grads ----
+            // No reduction across heads: alpha/beta are one-per-value-head.
+            // These will be fed to W_a^T/W_b^T and lora_vjp after this loop.
+            d_alpha_vh[h] += d_alpha_from_g;
+            d_beta_raw_vh[h] += d_beta_raw_h;
         } // end per-head loop
+
+        // ---- Apply per value-head alpha/beta grads → d_x and LoRA weight grads ----
+        // d_alpha_proj[t, h] = d_alpha_vh[h]  (scalar per value-head)
+        // d_beta_raw[t, h]   = d_beta_raw_vh[h]
+        //
+        // For lora_vjp on the beta and alpha projections, we need the full
+        // d_proj_output vector of shape [value_heads]. We built those above.
+        //
+        // g for in_proj_b  = d_beta_raw_vh   (pre-sigmoid linear-output gradient)
+        // g for in_proj_a  = d_alpha_vh      (pre-softplus linear-output gradient)
+        let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
+        for vh in 0..value_heads {
+            let d_a = d_alpha_vh[vh];
+            let d_b = d_beta_raw_vh[vh];
+            for i in 0..hidden {
+                dx_t[i] += weights.in_proj_a[vh * hidden + i] * d_a;
+                dx_t[i] += weights.in_proj_b[vh * hidden + i] * d_b;
+            }
+        }
+        // LoRA weight grads for in_proj_a and in_proj_b.
+        // g = d_alpha_vh (full [value_heads] vector), x = x_t, h_a_t, d_in=hidden, d_out=value_heads
+        if have_lora {
+            let h_b_t = &saved.h_b[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                &d_beta_raw_vh,
+                x_t,
+                h_b_t,
+                &saved.lora_a_b,
+                &saved.lora_b_b,
+                lora_rank,
+                hidden,
+                value_heads,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_b[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_b[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+
+            let h_a_t = &saved.h_a[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                &d_alpha_vh,
+                x_t,
+                h_a_t,
+                &saved.lora_a_a,
+                &saved.lora_b_a,
+                lora_rank,
+                hidden,
+                value_heads,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_a[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_a[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+        }
 
         // ---- 5. Backward through conv1d + SiLU ----
         //
@@ -778,6 +1300,9 @@ pub fn gdn_backward(
         // d_qkv_proj_all[t] now contains the complete gradient for token t because:
         //   - future-timestep conv contributions were written when t' > t was processed
         //   - current-timestep conv contribution was written in step 5 above
+        //
+        // g for in_proj_qkv = d_qkv_proj_all[t]  (pre-conv-SiLU linear-output gradient
+        // summed over time, complete only after all future-t conv contributions land).
         let dx_t = &mut grad_inputs[t * hidden..(t + 1) * hidden];
         for j in 0..qkv_dim {
             let dq = d_qkv_proj_all[t * qkv_dim + j];
@@ -788,7 +1313,51 @@ pub fn gdn_backward(
                 dx_t[i] += weights.in_proj_qkv[j * hidden + i] * dq;
             }
         }
+        // LoRA weight grads for in_proj_qkv.
+        // The LoRA forward added scale*(x@A_qkv^T)@B_qkv^T to qkv_proj[t].
+        // That delta passed through conv1d+SiLU, whose backward already produced
+        // d_qkv_proj_all[t] as the full gradient w.r.t. qkv_proj[t] (both base
+        // and LoRA delta). So d_qkv_proj_all[t] is exactly the g for lora_vjp.
+        // x = x_t (the original input), h = h_qkv_t.
+        if have_lora {
+            let d_qkv_g = &d_qkv_proj_all[t * qkv_dim..(t + 1) * qkv_dim];
+            let h_qkv_t = &saved.h_qkv[t * lora_rank..(t + 1) * lora_rank];
+            let (gb, ga, dx_lora) = lora_vjp(
+                d_qkv_g,
+                x_t,
+                h_qkv_t,
+                &saved.lora_a_qkv,
+                &saved.lora_b_qkv,
+                lora_rank,
+                hidden,
+                qkv_dim,
+                lora_scale,
+            );
+            for k in 0..ga.len() {
+                grad_a_qkv[k] += ga[k];
+            }
+            for k in 0..gb.len() {
+                grad_b_qkv[k] += gb[k];
+            }
+            for j in 0..hidden {
+                dx_t[j] += dx_lora[j];
+            }
+        }
     } // end reverse time loop
+
+    GdnGrads {
+        grad_a_qkv,
+        grad_b_qkv,
+        grad_a_z,
+        grad_b_z,
+        grad_a_b,
+        grad_b_b,
+        grad_a_a,
+        grad_b_a,
+        grad_a_out,
+        grad_b_out,
+        dx: grad_inputs,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -898,13 +1467,16 @@ mod tests {
 
         let mut in_proj_qkv = vec![0.0f32; qkv_dim * hidden];
         let mut in_proj_z = vec![0.0f32; output_dim * hidden];
-        let mut in_proj_b = vec![0.0f32; num_kh * hidden];
-        let mut in_proj_a = vec![0.0f32; num_kh * hidden];
+        // in_proj_b/in_proj_a/a_log/dt_bias are dimensioned by VALUE heads
+        // (num_vh), matching the shipping f16 weight loader and gdn_fused —
+        // not by key heads. Only Q/K share a key-head's projection.
+        let mut in_proj_b = vec![0.0f32; num_vh * hidden];
+        let mut in_proj_a = vec![0.0f32; num_vh * hidden];
         let mut conv1d_weight = vec![0.0f32; qkv_dim * kernel_size];
         let mut out_proj = vec![0.0f32; hidden * output_dim];
         let mut norm_weight = vec![0.0f32; value_dim];
-        let mut a_log = vec![0.0f32; num_kh];
-        let mut dt_bias = vec![0.0f32; num_kh];
+        let mut a_log = vec![0.0f32; num_vh];
+        let mut dt_bias = vec![0.0f32; num_vh];
 
         rng.fill(&mut in_proj_qkv, -scale, scale);
         rng.fill(&mut in_proj_z, -scale, scale);
@@ -915,8 +1487,13 @@ mod tests {
         for g in &mut norm_weight {
             *g = rng.f32_range(0.9, 1.1);
         }
+        // Wider than the original (-2.0, -0.5): a steeper a_log range makes
+        // the decay gate g more sensitive to alpha (dg/d_alpha scales with
+        // exp(a_log)), which is one of the two levers (with lora_scale/seq_len
+        // in the gradcheck fixtures below) needed to lift the alpha/beta LoRA
+        // gradient signal above the finite-difference noise floor.
         for a in &mut a_log {
-            *a = rng.f32_range(-2.0, -0.5);
+            *a = rng.f32_range(-0.3, 2.0);
         }
         for dt in &mut dt_bias {
             *dt = rng.f32_range(-0.1, 0.1);
@@ -930,10 +1507,10 @@ mod tests {
             in_proj_z_rows: output_dim,
             in_proj_z_cols: hidden,
             in_proj_b,
-            in_proj_b_rows: num_kh,
+            in_proj_b_rows: num_vh,
             in_proj_b_cols: hidden,
             in_proj_a,
-            in_proj_a_rows: num_kh,
+            in_proj_a_rows: num_vh,
             in_proj_a_cols: hidden,
             a_log,
             dt_bias,
@@ -1036,8 +1613,44 @@ mod tests {
             let mut out_p = vec![0.0f32; seq_len * hidden];
             let mut out_m = vec![0.0f32; seq_len * hidden];
 
-            gdn_forward_save(&inp_p_f32, weights, cfg, &mut saved_p, &mut out_p);
-            gdn_forward_save(&inp_m_f32, weights, cfg, &mut saved_m, &mut out_m);
+            gdn_forward_save(
+                &inp_p_f32,
+                weights,
+                cfg,
+                &mut saved_p,
+                &mut out_p,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0.0,
+            );
+            gdn_forward_save(
+                &inp_m_f32,
+                weights,
+                cfg,
+                &mut saved_m,
+                &mut out_m,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                0.0,
+            );
 
             let lp = linear_loss(&out_p, coeffs);
             let lm = linear_loss(&out_m, coeffs);
@@ -1099,9 +1712,27 @@ mod tests {
             cfg.rms_norm_eps,
         );
         let mut outputs = vec![0.0f32; seq_len * hidden];
-        gdn_forward_save(&inputs, &weights, &cfg, &mut saved, &mut outputs);
-        let mut analytic = vec![0.0f32; seq_len * hidden];
-        gdn_backward(&coeffs, &saved, &weights, &mut analytic);
+        gdn_forward_save(
+            &inputs,
+            &weights,
+            &cfg,
+            &mut saved,
+            &mut outputs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0.0,
+        );
+        let gdn_grads = gdn_backward(&coeffs, &saved, &weights);
+        let analytic = gdn_grads.dx;
 
         // FD
         let fd = fd_grad_inputs_linear(&inputs, &weights, &cfg, seq_len, hidden, eps, &coeffs);
@@ -1212,11 +1843,29 @@ mod tests {
             cfg.rms_norm_eps,
         );
         let mut outputs = vec![0.0f32; seq_len * hidden];
-        gdn_forward_save(&inputs, &weights, &cfg, &mut saved, &mut outputs);
+        gdn_forward_save(
+            &inputs,
+            &weights,
+            &cfg,
+            &mut saved,
+            &mut outputs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0.0,
+        );
 
         let grad_out = vec![0.0f32; seq_len * hidden];
-        let mut analytic = vec![0.0f32; seq_len * hidden];
-        gdn_backward(&grad_out, &saved, &weights, &mut analytic);
+        let gdn_grads = gdn_backward(&grad_out, &saved, &weights);
+        let analytic = gdn_grads.dx;
 
         for (i, &v) in analytic.iter().enumerate() {
             assert!(
@@ -1224,5 +1873,552 @@ mod tests {
                 "zero upstream grad should give zero input grad at [{i}], got {v}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // LoRA weight-grad gradcheck
+    // ---------------------------------------------------------------------------
+    //
+    // Finite-difference check for the 10 LoRA weight gradients (grad_a_*/grad_b_*).
+    // The existing gradcheck_gdn_backward tests only cover dx with LoRA OFF.
+    // This test runs gdn_forward_save with LoRA ON and checks that the weight grads
+    // returned by gdn_backward agree with central-difference estimates.
+    //
+    // DO NOT RUN this test manually until the AM gradcheck pass is scheduled.
+    // (Compile-gate only — verifies the test compiles under --all-targets.)
+
+    /// Helper: run one forward + backward with the given LoRA arrays and return the
+    /// full GdnGrads.  All ten LoRA slices must be Some.
+    #[allow(clippy::too_many_arguments)]
+    fn run_lora_forward_backward(
+        inputs: &[f32],
+        weights: &GatedDeltaNetWeights,
+        cfg: &Qwen35Config,
+        seq_len: usize,
+        coeffs: &[f32],
+        lora_rank: usize,
+        lora_scale: f32,
+        a_qkv: &[f32],
+        b_qkv: &[f32],
+        a_z: &[f32],
+        b_z: &[f32],
+        a_b: &[f32],
+        b_b: &[f32],
+        a_a: &[f32],
+        b_a: &[f32],
+        a_out: &[f32],
+        b_out: &[f32],
+    ) -> GdnGrads {
+        let hidden = cfg.hidden_size;
+        let num_kh = cfg.linear_num_key_heads;
+        let num_vh = cfg.linear_num_value_heads();
+        let key_dim = cfg.linear_key_head_dim;
+        let value_dim = cfg.linear_value_head_dim;
+        let kernel_size = cfg.linear_conv_kernel_dim;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let scale = 1.0 / (key_dim as f32).sqrt();
+
+        let mut saved = GdnSaved::new(
+            seq_len,
+            num_kh,
+            num_vh,
+            key_dim,
+            value_dim,
+            hidden,
+            qkv_dim,
+            output_dim,
+            kernel_size,
+            scale,
+            cfg.rms_norm_eps,
+        );
+        let mut outputs = vec![0.0f32; seq_len * hidden];
+        gdn_forward_save(
+            inputs,
+            weights,
+            cfg,
+            &mut saved,
+            &mut outputs,
+            Some(a_qkv),
+            Some(b_qkv),
+            Some(a_z),
+            Some(b_z),
+            Some(a_b),
+            Some(b_b),
+            Some(a_a),
+            Some(b_a),
+            Some(a_out),
+            Some(b_out),
+            lora_rank,
+            lora_scale,
+        );
+        gdn_backward(coeffs, &saved, weights)
+    }
+
+    /// Central-difference estimate of d(loss)/d(param[idx]) for a single entry.
+    #[allow(clippy::too_many_arguments)]
+    fn fd_lora_weight_entry(
+        inputs: &[f32],
+        weights: &GatedDeltaNetWeights,
+        cfg: &Qwen35Config,
+        seq_len: usize,
+        coeffs: &[f32],
+        lora_rank: usize,
+        lora_scale: f32,
+        a_qkv: &[f32],
+        b_qkv: &[f32],
+        a_z: &[f32],
+        b_z: &[f32],
+        a_b: &[f32],
+        b_b: &[f32],
+        a_a: &[f32],
+        b_a: &[f32],
+        a_out: &[f32],
+        b_out: &[f32],
+        // Which of the 10 arrays to perturb, and which entry:
+        which: usize, // 0=a_qkv 1=b_qkv 2=a_z 3=b_z 4=a_b 5=b_b 6=a_a 7=b_a 8=a_out 9=b_out
+        idx: usize,
+        eps: f32,
+    ) -> f32 {
+        // Helper: clone an array, perturb entry [idx] by delta, re-run, return loss.
+        // Loss accumulates in f64 (forward stays f32, matching production) to avoid
+        // catastrophic cancellation in (lp - lm) when lora_scale/seq_len are large
+        // enough to push output magnitudes up — the same precision discipline as
+        // fd_grad_inputs_linear's f64 accumulation above.
+        let perturbed_loss = |delta: f32| -> f64 {
+            let mut aq = a_qkv.to_vec();
+            let mut bq = b_qkv.to_vec();
+            let mut az = a_z.to_vec();
+            let mut bz = b_z.to_vec();
+            let mut ab = a_b.to_vec();
+            let mut bb = b_b.to_vec();
+            let mut aa = a_a.to_vec();
+            let mut ba = b_a.to_vec();
+            let mut ao = a_out.to_vec();
+            let mut bo = b_out.to_vec();
+            let arr: &mut Vec<f32> = match which {
+                0 => &mut aq,
+                1 => &mut bq,
+                2 => &mut az,
+                3 => &mut bz,
+                4 => &mut ab,
+                5 => &mut bb,
+                6 => &mut aa,
+                7 => &mut ba,
+                8 => &mut ao,
+                _ => &mut bo,
+            };
+            arr[idx] += delta;
+            let hidden = cfg.hidden_size;
+            let num_kh = cfg.linear_num_key_heads;
+            let num_vh = cfg.linear_num_value_heads();
+            let key_dim = cfg.linear_key_head_dim;
+            let value_dim = cfg.linear_value_head_dim;
+            let kernel_size = cfg.linear_conv_kernel_dim;
+            let qkv_dim = cfg.linear_qkv_dim();
+            let output_dim = cfg.linear_output_dim();
+            let scale = 1.0 / (key_dim as f32).sqrt();
+            let mut saved = GdnSaved::new(
+                seq_len,
+                num_kh,
+                num_vh,
+                key_dim,
+                value_dim,
+                hidden,
+                qkv_dim,
+                output_dim,
+                kernel_size,
+                scale,
+                cfg.rms_norm_eps,
+            );
+            let mut outputs = vec![0.0f32; seq_len * hidden];
+            gdn_forward_save(
+                inputs,
+                weights,
+                cfg,
+                &mut saved,
+                &mut outputs,
+                Some(&aq),
+                Some(&bq),
+                Some(&az),
+                Some(&bz),
+                Some(&ab),
+                Some(&bb),
+                Some(&aa),
+                Some(&ba),
+                Some(&ao),
+                Some(&bo),
+                lora_rank,
+                lora_scale,
+            );
+            outputs
+                .iter()
+                .zip(coeffs.iter())
+                .map(|(&y, &c)| (y as f64) * (c as f64))
+                .sum()
+        };
+        let lp = perturbed_loss(eps);
+        let lm = perturbed_loss(-eps);
+        ((lp - lm) / (2.0 * eps as f64)) as f32
+    }
+
+    /// Names of the 10 GDN LoRA weight-gradient arrays, in `which` order.
+    const LORA_ARRAY_NAMES: [&str; 10] = [
+        "grad_a_qkv",
+        "grad_b_qkv",
+        "grad_a_z",
+        "grad_b_z",
+        "grad_a_b",
+        "grad_b_b",
+        "grad_a_a",
+        "grad_b_a",
+        "grad_a_out",
+        "grad_b_out",
+    ];
+
+    /// Per-array gradcheck coverage: (n_tested, max_rel) for each of the 10 arrays.
+    struct PerArrayCoverage {
+        /// (n_tested, max_rel) per array, in `LORA_ARRAY_NAMES` order.
+        per_array: [(usize, f32); 10],
+        overall_max_rel: f32,
+        overall_n_tested: usize,
+    }
+
+    // Core helper that exercises weight-grad gradcheck for any fixture.
+    // Returns per-array AND aggregate coverage — the aggregate alone hid the
+    // fact that whole arrays (alpha/beta) went completely untested (codex
+    // review round 1, PR #792).
+    #[allow(clippy::too_many_arguments)]
+    fn run_lora_weight_gradcheck(
+        hidden: usize,
+        num_kh: usize,
+        num_vh: usize,
+        key_dim: usize,
+        value_dim: usize,
+        kernel_size: usize,
+        seq_len: usize,
+        lora_rank: usize,
+        lora_scale: f32,
+        weight_seed: u64,
+        input_seed: u64,
+        lora_seed: u64,
+        coeff_seed: u64,
+        eps: f32,
+    ) -> PerArrayCoverage {
+        let cfg = tiny_cfg(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size);
+        let weights = make_tiny_weights(
+            hidden,
+            num_kh,
+            num_vh,
+            key_dim,
+            value_dim,
+            kernel_size,
+            weight_seed,
+        );
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+
+        // Inputs
+        let mut rng_in = Rng::new(input_seed);
+        let mut inputs = vec![0.0f32; seq_len * hidden];
+        rng_in.fill(&mut inputs, -0.5, 0.5);
+
+        // Upstream coeffs (linear loss)
+        let mut rng_c = Rng::new(coeff_seed);
+        let mut coeffs = vec![0.0f32; seq_len * hidden];
+        rng_c.fill(&mut coeffs, -1.0, 1.0);
+
+        // LoRA matrices — small random values so grad_A and grad_B are non-vacuous.
+        // Shapes: A=[rank, d_in], B=[d_out, rank] for each projection.
+        let mut rng_l = Rng::new(lora_seed);
+        let mut a_qkv = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
+        let mut b_qkv = vec![0.0f32; qkv_dim * lora_rank]; // [qkv_dim, rank]
+        let mut a_z = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
+        let mut b_z = vec![0.0f32; output_dim * lora_rank]; // [output_dim, rank]
+        let mut a_b = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
+        let mut b_b = vec![0.0f32; num_vh * lora_rank]; // [value_heads, rank]
+        let mut a_a = vec![0.0f32; lora_rank * hidden]; // [rank, hidden]
+        let mut b_a = vec![0.0f32; num_vh * lora_rank]; // [value_heads, rank]
+        let mut a_out = vec![0.0f32; lora_rank * output_dim]; // [rank, output_dim]
+        let mut b_out = vec![0.0f32; hidden * lora_rank]; // [hidden, rank]
+        for arr in [
+            &mut a_qkv, &mut b_qkv, &mut a_z, &mut b_z, &mut a_b, &mut b_b, &mut a_a, &mut b_a,
+            &mut a_out, &mut b_out,
+        ]
+        .iter_mut()
+        {
+            rng_l.fill(arr, -0.05, 0.05);
+        }
+
+        // Analytic weight grads via forward+backward.
+        let grads = run_lora_forward_backward(
+            &inputs, &weights, &cfg, seq_len, &coeffs, lora_rank, lora_scale, &a_qkv, &b_qkv, &a_z,
+            &b_z, &a_b, &b_b, &a_a, &b_a, &a_out, &b_out,
+        );
+        // Collect (which_array, analytic_grad_slice, array_len) triples.
+        let analytic_arrays: [(&[f32], usize); 10] = [
+            (&grads.grad_a_qkv, a_qkv.len()),
+            (&grads.grad_b_qkv, b_qkv.len()),
+            (&grads.grad_a_z, a_z.len()),
+            (&grads.grad_b_z, b_z.len()),
+            (&grads.grad_a_b, a_b.len()),
+            (&grads.grad_b_b, b_b.len()),
+            (&grads.grad_a_a, a_a.len()),
+            (&grads.grad_b_a, b_a.len()),
+            (&grads.grad_a_out, a_out.len()),
+            (&grads.grad_b_out, b_out.len()),
+        ];
+
+        let mut overall_max_rel = 0.0f32;
+        let mut overall_n_tested = 0usize;
+        let mut per_array = [(0usize, 0.0f32); 10];
+
+        for (which, (analytic_slice, arr_len)) in analytic_arrays.iter().enumerate() {
+            // Sample up to 6 entries spread across each array.
+            let step = (arr_len / 6).max(1);
+            let mut idx = 0usize;
+            let mut arr_n_tested = 0usize;
+            let mut arr_max_rel = 0.0f32;
+            while idx < *arr_len {
+                let analytic_v = analytic_slice[idx];
+                let fd_v = fd_lora_weight_entry(
+                    &inputs, &weights, &cfg, seq_len, &coeffs, lora_rank, lora_scale, &a_qkv,
+                    &b_qkv, &a_z, &b_z, &a_b, &b_b, &a_a, &b_a, &a_out, &b_out, which, idx, eps,
+                );
+                let mag = fd_v.abs().max(analytic_v.abs());
+                if mag >= 1e-4 {
+                    arr_n_tested += 1;
+                    overall_n_tested += 1;
+                    let rel = (fd_v - analytic_v).abs() / mag;
+                    if rel > arr_max_rel {
+                        arr_max_rel = rel;
+                    }
+                    if rel > overall_max_rel {
+                        overall_max_rel = rel;
+                    }
+                }
+                idx += step;
+            }
+            per_array[which] = (arr_n_tested, arr_max_rel);
+        }
+
+        PerArrayCoverage {
+            per_array,
+            overall_max_rel,
+            overall_n_tested,
+        }
+    }
+
+    #[test]
+    fn gradcheck_gdn_lora_weight_grads() {
+        // Tiny GDN: hidden=32, num_kh=1, value_heads=1, key_dim=8, value_dim=8,
+        // kernel_size=3, seq=14; rank=2; lora_scale=16.0.
+        //
+        // Per-array coverage (codex review round 1, PR #792): the PREVIOUS
+        // fixture (seq=6, scale=2.0) hit the overall n_tested>=10 aggregate
+        // gate while grad_a_b/grad_b_b/grad_a_a/grad_b_a (the alpha/beta
+        // arrays) had ZERO entries above the 1e-4 floor in EITHER fixture —
+        // the aggregate threshold hid four completely unverified arrays.
+        // alpha/beta only reach the output through a SCALAR decay gate/update
+        // rate feeding a recurrent state (an indirect path), unlike
+        // qkv/z/out which sit directly in the per-token output computation —
+        // their gradient magnitude is intrinsically much smaller for the same
+        // input/weight scale. Fix: seq_len 6->14 (more recurrent steps to
+        // accumulate signal) + lora_scale 2.0->16.0 (amplifies the LoRA
+        // delta feeding alpha/beta) lifts all 10 arrays' gradients above the
+        // floor; run_lora_weight_gradcheck now tracks and gates per-array
+        // coverage (below), not just an aggregate count, so this can't
+        // silently regress. fd_lora_weight_entry's loss also switched to f64
+        // accumulation (was f32) to keep the larger scale's finite-difference
+        // estimate accurate rather than just louder.
+        let cov = run_lora_weight_gradcheck(
+            32, 1, 1, 8, 8, 3, 14,   // hidden, num_kh, num_vh, key_dim, value_dim, kernel, seq
+            2,    // lora_rank
+            16.0, // lora_scale
+            42,   // weight_seed
+            1337, // input_seed
+            777,  // lora_seed
+            999,  // coeff_seed
+            1e-3, // eps
+        );
+        for (name, (n, rel)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
+            println!("  {name:<12}: n_tested={n}  max_rel={rel:.3e}");
+        }
+        for (name, (n, _)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
+            assert!(
+                *n >= 1,
+                "lora weight gradcheck: array {name} has ZERO testable entries \
+                 above the 1e-4 floor — this array is not actually being verified"
+            );
+        }
+        assert!(
+            cov.overall_n_tested >= 10,
+            "lora weight gradcheck: too few testable entries ({}); \
+             increase array sizes or tighten threshold",
+            cov.overall_n_tested
+        );
+        assert!(
+            cov.overall_max_rel < 1e-2,
+            "gdn lora weight gradcheck failed: max_rel={:.3e} (n_tested={})",
+            cov.overall_max_rel,
+            cov.overall_n_tested
+        );
+    }
+
+    #[test]
+    fn gradcheck_gdn_lora_weight_grads_multi_head() {
+        // Asymmetric-head variant: num_kh=2, value_heads=4 — exercises the
+        // real value-head-scoped alpha/beta projection (in_proj_a/in_proj_b
+        // have 4 rows, not 2; Q/K still share via kh=h/ratio=h/2).
+        let cov = run_lora_weight_gradcheck(
+            32, 2, 4, 8, 8, 3,
+            20,   // hidden, num_kh=2, num_vh=4, key_dim=8, value_dim=8, kernel, seq
+            2,    // lora_rank
+            12.0, // lora_scale
+            99,   // weight_seed
+            2024, // input_seed
+            555,  // lora_seed
+            111,  // coeff_seed
+            1e-3, // eps
+        );
+        for (name, (n, rel)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
+            println!("  {name:<12}: n_tested={n}  max_rel={rel:.3e}");
+        }
+        for (name, (n, _)) in LORA_ARRAY_NAMES.iter().zip(cov.per_array.iter()) {
+            assert!(
+                *n >= 1,
+                "lora weight gradcheck (multi-head): array {name} has ZERO testable \
+                 entries above the 1e-4 floor — this array is not actually being verified"
+            );
+        }
+        assert!(
+            cov.overall_n_tested >= 10,
+            "lora weight gradcheck (multi-head): too few testable entries ({})",
+            cov.overall_n_tested
+        );
+        assert!(
+            cov.overall_max_rel < 1e-2,
+            "gdn lora weight gradcheck (multi-head) failed: max_rel={:.3e} (n_tested={})",
+            cov.overall_max_rel,
+            cov.overall_n_tested
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Source-parity: gdn_forward_save (training path) vs gdn_fused (shipping
+    // inference path), LoRA off, on an ASYMMETRIC-head fixture.
+    // ---------------------------------------------------------------------------
+    //
+    // Codex review round 1 (PR #792) blocker: gdn_forward_save/gdn_backward
+    // originally sized in_proj_a/in_proj_b/a_log/dt_bias (and everything
+    // downstream: gates, LoRA B factors, PEFT export, validate_against) by
+    // KEY heads instead of VALUE heads. Every prior gradcheck used a fixture
+    // where the weights fed to BOTH the analytic and finite-difference paths
+    // shared the same (buggy) shape, so the two sides agreed with each other
+    // on the wrong graph — self-consistency, not correctness. The only way
+    // to catch this class of bug is to compare against an INDEPENDENT
+    // implementation that has the right shape baked in: the shipping
+    // `gated_delta_net_step_fused` path, which the f16 weight loader and
+    // production inference actually use. This test builds a fixture where
+    // num_key_heads (2) != num_value_heads (4) and asserts the two forwards
+    // agree, LoRA off.
+    #[test]
+    fn source_parity_forward_save_vs_fused_asymmetric_heads() {
+        use crate::attention::gdn::GatedDeltaNetState;
+        use crate::attention::gdn_fused::{GatedDeltaNetFusedScratch, gated_delta_net_step_fused};
+        use crate::lora_hook::NoopLoraHook;
+
+        let hidden = 32;
+        let num_kh = 2;
+        let num_vh = 4; // asymmetric: ratio = 2, matches the 4B/27B shape class
+        let key_dim = 8;
+        let value_dim = 8;
+        let kernel_size = 3;
+        let seq_len = 6;
+
+        let cfg = tiny_cfg(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size);
+        let weights =
+            make_tiny_weights(hidden, num_kh, num_vh, key_dim, value_dim, kernel_size, 321);
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let scale = 1.0 / (key_dim as f32).sqrt();
+
+        let mut rng = Rng::new(654);
+        let mut inputs = vec![0.0f32; seq_len * hidden];
+        rng.fill(&mut inputs, -0.5, 0.5);
+
+        // --- Path A: gdn_forward_save (training path), LoRA off ---
+        let mut saved = GdnSaved::new(
+            seq_len,
+            num_kh,
+            num_vh,
+            key_dim,
+            value_dim,
+            hidden,
+            qkv_dim,
+            output_dim,
+            kernel_size,
+            scale,
+            cfg.rms_norm_eps,
+        );
+        let mut outputs_a = vec![0.0f32; seq_len * hidden];
+        gdn_forward_save(
+            &inputs,
+            &weights,
+            &cfg,
+            &mut saved,
+            &mut outputs_a,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0.0,
+        );
+
+        // --- Path B: gated_delta_net_step_fused (shipping inference path), per token ---
+        let mut state = GatedDeltaNetState::new(&cfg);
+        let mut scratch = GatedDeltaNetFusedScratch::default();
+        let hook = NoopLoraHook;
+        let mut outputs_b = vec![0.0f32; seq_len * hidden];
+        for t in 0..seq_len {
+            let x_t = &inputs[t * hidden..(t + 1) * hidden];
+            let y_t = &mut outputs_b[t * hidden..(t + 1) * hidden];
+            gated_delta_net_step_fused(
+                x_t,
+                &mut state,
+                &weights,
+                &cfg,
+                &mut scratch,
+                y_t,
+                &hook,
+                0,
+            );
+        }
+
+        let mut max_abs_diff = 0.0f32;
+        let mut worst = 0;
+        for i in 0..outputs_a.len() {
+            let d = (outputs_a[i] - outputs_b[i]).abs();
+            if d > max_abs_diff {
+                max_abs_diff = d;
+                worst = i;
+            }
+        }
+        assert!(
+            max_abs_diff < 1e-4,
+            "gdn_forward_save diverges from the shipping gated_delta_net_step_fused \
+             on an asymmetric-head fixture (num_kh={num_kh}, num_vh={num_vh}): \
+             max_abs_diff={max_abs_diff:.3e} at flat index {worst} \
+             (a={}, b={})",
+            outputs_a[worst],
+            outputs_b[worst],
+        );
     }
 }

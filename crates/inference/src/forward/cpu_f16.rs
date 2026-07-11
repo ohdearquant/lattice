@@ -891,6 +891,10 @@ pub fn generate_f16(
     // Same rationale for logprobs capture, which is also not wired into this
     // generate loop (#585).
     crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+    // Same rationale for stop_strings matching and reasoning-budget forcing,
+    // neither of which is wired into this generate loop (ADR-080 C3, #783).
+    crate::model::qwen35::check_stop_strings_not_set(gen_cfg)?;
+    crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
 
     // Context preflight. The RoPE cos/sin tables are indexed unchecked in
     // forward_step_f16 (`rope.cos_at(base + i)`), so a position at or past the
@@ -1884,6 +1888,90 @@ mod tests {
             matches!(result, Err(InferenceError::InvalidInput(_))),
             "generate_f16 must fail closed with InvalidInput when grammar is set (#397/#398); \
              got {result:?}"
+        );
+    }
+
+    /// `generate_f16` must reject a `GenerateConfig` that sets `stop_strings` with a
+    /// typed `InvalidInput` error before sampling any token (ADR-080 C3, #783).
+    ///
+    /// Mutation sensitivity: removing the `check_stop_strings_not_set` call makes the
+    /// function proceed past the guard and attempt to forward with empty weights,
+    /// producing a panic or a non-`InvalidInput` error — this assert fails either way.
+    #[test]
+    fn generate_f16_rejects_stop_strings_config_before_sampling() {
+        use crate::error::InferenceError;
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let weights = F16ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+
+        let gen_cfg = GenerateConfig {
+            stop_strings: vec!["</s>".to_string()],
+            ..Default::default()
+        };
+
+        let result = generate_f16(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generate_f16 must fail closed with InvalidInput when stop_strings is set \
+             (ADR-080 C3, #783); got {result:?}"
+        );
+    }
+
+    /// `generate_f16` must reject a `GenerateConfig` that sets `reasoning_budget` with
+    /// a typed `InvalidInput` error before sampling any token (ADR-080 C3, #783).
+    ///
+    /// Mutation sensitivity: removing the `check_reasoning_budget_not_set` call makes
+    /// the function proceed past the guard and attempt to forward with empty weights,
+    /// producing a panic or a non-`InvalidInput` error — this assert fails either way.
+    #[test]
+    fn generate_f16_rejects_reasoning_budget_config_before_sampling() {
+        use crate::error::InferenceError;
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let weights = F16ModelWeights {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            layers: vec![],
+        };
+
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(16),
+            ..Default::default()
+        };
+
+        let result = generate_f16(&weights, &cfg, &tokenizer, &rope, "hello", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generate_f16 must fail closed with InvalidInput when reasoning_budget is set \
+             (ADR-080 C3, #783); got {result:?}"
         );
     }
 

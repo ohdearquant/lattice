@@ -30,7 +30,8 @@
 //!
 //! # GPU Training
 //!
-//! With the `gpu` feature enabled, GPU-accelerated training is available:
+//! With the `gpu` feature enabled, GPU-accelerated forward/backward passes
+//! and validation are available:
 //!
 //! ```ignore
 //! use lattice_tune::train::{GpuTrainer, GpuTrainerBuilder, TrainingConfig};
@@ -48,6 +49,19 @@
 //!     let loss = trainer.train_batch(&batch)?;
 //! }
 //! ```
+//!
+//! # Current limitation (GPU weight updates)
+//!
+//! `GpuTrainer::train_batch` above will return `Err(TuneError::Training(_))`
+//! for **every** optimizer choice (Adam, AdamW, SGD-momentum, plain SGD,
+//! RMSprop): the GPU-shader optimizer dispatch has no buffer bindings wired
+//! to the network's weight/gradient buffers, and the CPU-side plain-SGD arm
+//! has neither real gradient plumbing nor a mutable weight write-back path.
+//! Forward pass and loss computation work correctly — `GpuTrainer::validate`
+//! is a forward-only, GPU-accelerated path that does not touch the
+//! optimizer. Only the weight-update step is unimplemented. See
+//! <https://github.com/ohdearquant/lattice/issues/797>. This note will be
+//! removed once that wiring lands.
 
 mod config;
 mod jit;

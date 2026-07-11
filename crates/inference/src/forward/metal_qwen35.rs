@@ -558,6 +558,28 @@ mod mtp_resolve_tests {
 /// `gen_cfg.stop_strings.is_empty()` is load-bearing: MTP's draft/verify loop
 /// has no string-stop awareness, so any non-empty `stop_strings` must route
 /// around it to the plain loop (which does check stops after every token).
+///
+/// `gen_cfg.reasoning_budget.is_none()` is the same kind of load-bearing
+/// route-around (ADR-080 C3, #783): MTP's draft/verify loop has no
+/// budget-forcing awareness (no `decode_cap` / `force_close_think` wiring),
+/// so any set `reasoning_budget` must route around it to the plain loop,
+/// which either applies budget forcing or rejects the config via
+/// `check_reasoning_budget_not_set`.
+///
+/// `gen_cfg.repetition_penalty == 1.0` is likewise load-bearing (codex round-1
+/// blocker #2, PR #787): both the MTP draft (`mtp_forward_one`) and verify
+/// steps select tokens via raw `argmax_f32_first_wins` over logits, never
+/// through `sample_token`, so a non-identity penalty configured by the caller
+/// would be silently ignored -- a set penalty can change which token is
+/// greedy-argmax-optimal, so this is an output-correctness issue, not only a
+/// performance one. Any non-1.0 penalty must route around MTP to the plain
+/// loop, which samples via `sample_token` and applies it.
+///
+/// `gen_cfg.logprobs.is_none()` is likewise load-bearing (codex round-2
+/// blocker #1, PR #787): `generate_greedy_mtp` unconditionally returns
+/// `token_logprobs: vec![]`, so a set `logprobs` request must route around
+/// MTP to the plain loop, which either captures logprobs or rejects the
+/// config via `check_logprobs_not_set`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn mtp_route_active(
     mtp_present: bool,
@@ -572,12 +594,20 @@ fn mtp_route_active(
         && !use_compact
         && gen_cfg.grammar.is_none()
         && gen_cfg.stop_strings.is_empty()
+        && gen_cfg.reasoning_budget.is_none()
+        && gen_cfg.repetition_penalty == 1.0
+        && gen_cfg.logprobs.is_none()
 }
 
 /// Whether `generate()` should take the GDN-first self-speculative greedy
 /// branch. Mirrors the `use_self_spec` computation inline in
-/// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()`
-/// route-around rationale as [`mtp_route_active`].
+/// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()` /
+/// `reasoning_budget.is_none()` / `repetition_penalty == 1.0` route-around
+/// rationale as [`mtp_route_active`] (codex round-1 blocker #2, PR #787):
+/// self-spec's verify step also selects via raw argmax, never `sample_token`.
+/// `gen_cfg.logprobs.is_none()` is the same round-2 blocker #1 route-around
+/// as [`mtp_route_active`]: `generate_greedy_self_spec` also unconditionally
+/// returns `token_logprobs: vec![]`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn self_spec_route_active(
     gdn_checkpoints_present: bool,
@@ -593,6 +623,9 @@ fn self_spec_route_active(
         && !use_compact
         && gen_cfg.grammar.is_none()
         && gen_cfg.stop_strings.is_empty()
+        && gen_cfg.reasoning_budget.is_none()
+        && gen_cfg.repetition_penalty == 1.0
+        && gen_cfg.logprobs.is_none()
         && num_active_linear_attention_layers > 0
 }
 
@@ -663,6 +696,177 @@ mod route_predicate_tests {
              same string-stop-unaware draft/verify loop as MTP"
         );
     }
+
+    /// ADR-080 C3 (#783): a set `reasoning_budget` must route around MTP even
+    /// though every other MTP precondition is satisfied -- MTP's draft/verify
+    /// loop has no budget-forcing (`decode_cap` / `force_close_think`)
+    /// awareness, mirroring the `stop_strings` route-around above.
+    ///
+    /// Mutation sensitivity: removing the `reasoning_budget.is_none()` clause
+    /// from `mtp_route_active` makes this assertion fail (the route stays
+    /// active), which would silently drop the caller's reasoning budget once
+    /// MTP takes over decoding.
+    #[test]
+    fn mtp_route_blocked_by_set_reasoning_budget() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(64),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when reasoning_budget is set -- its \
+             draft/verify loop has no budget-forcing awareness"
+        );
+    }
+
+    /// Sibling to `mtp_route_blocked_by_set_reasoning_budget` for the
+    /// self-speculative route (ADR-080 C3, #783).
+    #[test]
+    fn self_spec_route_blocked_by_set_reasoning_budget() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(64),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when reasoning_budget is set -- same \
+             budget-forcing-unaware draft/verify loop as MTP"
+        );
+    }
+
+    /// Codex round-1 blocker #2 (PR #787): a non-identity `repetition_penalty`
+    /// must route around MTP even though every other MTP precondition
+    /// (present, enabled, greedy, non-compact, no grammar, no stop strings,
+    /// no reasoning budget) is satisfied. MTP's draft/verify loop selects via
+    /// raw `argmax_f32_first_wins`, never `sample_token`, so a caller-supplied
+    /// penalty would otherwise be silently ignored.
+    ///
+    /// Mutation sensitivity: removing the `repetition_penalty == 1.0` clause
+    /// from `mtp_route_active` makes this assertion fail (the route stays
+    /// active), reproducing codex's reported failure mode exactly.
+    #[test]
+    fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when repetition_penalty is not 1.0 -- its \
+             draft/verify loop selects via raw argmax and has no \
+             repetition-penalty awareness"
+        );
+    }
+
+    /// Sibling to `mtp_route_blocked_by_nonidentity_repetition_penalty` for
+    /// the self-speculative route (codex round-1 blocker #2, PR #787).
+    #[test]
+    fn self_spec_route_blocked_by_nonidentity_repetition_penalty() {
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when repetition_penalty is not 1.0 \
+             -- same raw-argmax-selecting, penalty-unaware draft/verify loop \
+             as MTP"
+        );
+    }
+
+    /// Output-level discriminating case (codex round-1 blocker #2, PR #787):
+    /// proves the route-around above is not merely cosmetic. With
+    /// `repetition_penalty = 1.0` the raw dense argmax MTP/self-spec use
+    /// (`argmax_f32_first_wins`) agrees with the canonical
+    /// repetition-penalty-aware `sample_token` path. Once a previously-seen
+    /// token depresses the raw argmax below the runner-up (same mechanism as
+    /// `test_repetition_penalty_can_flip_greedy_argmax_when_seen_in_history`
+    /// in `model::qwen35::sampling`), the two paths disagree -- exactly the
+    /// silent-divergence scenario the new predicate clause closes.
+    #[test]
+    fn nonidentity_repetition_penalty_flips_winner_vs_raw_argmax() {
+        use crate::sampling::{argmax_f32_first_wins, sample_full_logits as sample_token};
+
+        // Token 0 has the highest raw logit; token 1 is a close second, chosen
+        // so 5.0 / 1.1 falls below token 1's unpenalized 4.6.
+        let logits = [5.0_f32, 4.6, 0.1];
+        let previous_ids = [0_u32, 0, 0];
+
+        // Raw dense argmax (what MTP/self-spec actually call): always token 0,
+        // with no notion of `previous_ids` or `repetition_penalty` at all.
+        assert_eq!(
+            argmax_f32_first_wins(&logits),
+            0,
+            "raw argmax is penalty-blind by construction"
+        );
+
+        // Canonical path with the caller's non-identity penalty and the
+        // argmax token already in history: the penalized pick flips to the
+        // runner-up.
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        let mut rng = 7u64;
+        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng);
+        assert_eq!(
+            canonical, 1,
+            "sample_token must penalize the previously-seen argmax enough to \
+             flip greedy selection to the runner-up"
+        );
+
+        assert_ne!(
+            argmax_f32_first_wins(&logits),
+            canonical,
+            "raw argmax and the canonical repetition-aware pick must disagree \
+             here -- this is exactly the output-correctness gap that routing \
+             MTP/self-spec around non-identity repetition_penalty closes"
+        );
+    }
+
+    /// Codex round-2 blocker #1 (PR #787): a set `logprobs` must route
+    /// around MTP even though every other MTP precondition (present,
+    /// enabled, greedy, non-compact, no grammar, no stop strings, no
+    /// reasoning budget, identity repetition penalty) is satisfied.
+    /// `generate_greedy_mtp` unconditionally returns `token_logprobs: vec![]`,
+    /// so a caller requesting logprobs would otherwise get `Ok` with the
+    /// requested output silently absent.
+    ///
+    /// Codex's exact falsification recipe: add `logprobs: Some(0)` to the
+    /// otherwise-active predicate fixture and assert the route is inactive.
+    ///
+    /// Mutation sensitivity: removing the `logprobs.is_none()` clause from
+    /// `mtp_route_active` makes this assertion fail (the route stays
+    /// active), reproducing codex's reported failure mode exactly.
+    #[test]
+    fn mtp_route_blocked_by_set_logprobs() {
+        let gen_cfg = GenerateConfig {
+            logprobs: Some(0),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when logprobs is set -- its output path \
+             unconditionally returns an empty token_logprobs vector"
+        );
+    }
+
+    /// Sibling to `mtp_route_blocked_by_set_logprobs` for the
+    /// self-speculative route (codex round-2 blocker #1, PR #787):
+    /// `generate_greedy_self_spec` has the same unconditional empty-vector
+    /// return.
+    #[test]
+    fn self_spec_route_blocked_by_set_logprobs() {
+        let gen_cfg = GenerateConfig {
+            logprobs: Some(0),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when logprobs is set -- same \
+             unconditional empty-token_logprobs output path as MTP"
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -686,10 +890,7 @@ mod inner {
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
-    use crate::model::qwen35_config::{
-        GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob, decode_cap, force_close_think,
-    };
-    use crate::sampling::record_logprob;
+    use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob};
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
@@ -5362,14 +5563,16 @@ mod inner {
             cmd2.wait_until_completed();
 
             // ---- Phase 3: CPU ----
+            // Codex round-1 medium #4 (PR #787): this was the one surviving
+            // production last-wins `max_by` argmax after the #280 fix -- the
+            // MTP draft-token pick, called from `generate_greedy_mtp`. Swapped
+            // for the shared first-wins `argmax_f32_first_wins` helper so a
+            // tie at the draft boundary resolves the same way as every other
+            // greedy pick in the crate (a differing draft tie can only reduce
+            // speculative acceptance, never change final target output, but
+            // the duplicate last-wins contract itself is the defect).
             let logits = unsafe { read_buffer(&*buf_logits, cfg.vocab_size) };
-            let draft_token = logits
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            let draft_token = crate::sampling::argmax_f32_first_wins(&logits);
 
             // Advance MTP KV cache.
             if let Some(ref mut mtp) = self.session.mtp {
@@ -7855,14 +8058,11 @@ mod inner {
                 };
             }
 
-            // Greedy argmax from prefill logits.
-            let pending_first = prefill_logits
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            // Greedy argmax from prefill logits. Shared first-wins helper
+            // (ADR-080 C3, #783) rather than a hand-rolled `max_by`, which
+            // keeps the LAST tied maximum instead of the engine-wide-contract
+            // first tied maximum.
+            let pending_first = crate::sampling::argmax_f32_first_wins(prefill_logits);
 
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
@@ -8100,15 +8300,10 @@ mod inner {
                 };
             }
 
-            let argmax_logits = |logits: &[f32]| -> u32 {
-                logits
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i as u32)
-                    .unwrap_or(0)
-            };
+            // Shared first-wins argmax helper (ADR-080 C3, #783) rather than a
+            // hand-rolled `max_by` closure, which kept the LAST tied maximum
+            // instead of the engine-wide-contract first tied maximum.
+            let argmax_logits = crate::sampling::argmax_f32_first_wins;
 
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
@@ -8453,6 +8648,25 @@ mod inner {
                     token_logprobs: vec![],
                 });
             }
+
+            // Reject reasoning_budget before any prefill/state work (ADR-080 C3,
+            // #783): budget-forcing (`decode_cap` / `force_close_think`) is not
+            // wired into this decode loop, unlike `generate_streaming` /
+            // `generate_streaming_with_cancel` below, which do apply it. Without
+            // this guard the field would be silently ignored, producing
+            // unbudgeted output despite a reasoning budget being requested.
+            // `stop_strings` does not need an equivalent guard here: this loop
+            // already applies it via `stop_text_state` further down.
+            crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
+
+            // Reject logprobs before any prefill/state work (codex round-2
+            // blocker #1, PR #787): this entry point unconditionally returns
+            // `token_logprobs: vec![]` on every return path below (including
+            // the MTP and self-spec fast-path delegations), so a caller
+            // requesting `gen_cfg.logprobs` would otherwise get `Ok` with the
+            // requested output silently absent -- the same apply-or-fail-closed
+            // defect as `check_reasoning_budget_not_set` above guards against.
+            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
 
             // Fail-closed: a prompt longer than the KV cache would trip the
             // forward_prefill length assertion (n <= max_cache_len) and panic the
@@ -12822,8 +13036,9 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
             // Per-token log-probabilities (#585): empty and untouched unless
-            // gen_cfg.logprobs is Some — record_logprob() below is a no-op in that
-            // case, so the default (no logprobs requested) path pays no extra cost.
+            // gen_cfg.logprobs is Some — DecodePolicy::init / transition's
+            // internal record_logprob call is a no-op in that case, so the
+            // default (no logprobs requested) path pays no extra cost.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
             // Issue #171: try the block-top-k route first — far fewer threadgroups
@@ -12874,7 +13089,6 @@ mod inner {
             } else {
                 None
             };
-            let mut thinking_closed = false;
 
             // Checked independently of `on_token`: a client that disconnected
             // between dequeue and here must not pay for the (potentially large,
@@ -12980,108 +13194,88 @@ mod inner {
                 });
             }
 
-            // Track whether the thinking block has been closed after prefill sampling.
-            // Enables budget=1 to behave sanely (prefill token counts against budget).
-            if Some(next_id) == think_close_id {
-                thinking_closed = true;
-            }
-
             // Incremental detokenization: stream only complete-UTF-8 deltas. A
             // byte-level BPE codepoint (CJK/emoji) can span several tokens, so
             // per-token lossy decode would emit U+FFFD mojibake the caller cannot
             // retract. Mirrors the non-Metal path (model::qwen35::generation).
             let mut detok = IncrementalDetokenizer::new();
-            // Tracks the generated_ids length at the moment </think> was emitted;
-            // used by the answer-budget break below.
-            let mut reasoning_end_len: Option<usize> = None;
             generated_ids.push(next_id);
             all_ids.push(next_id);
-            // #585: record the prefill token's logprob (no-op unless requested).
-            // prefill_logits is untouched since forward_prefill() populated it above,
-            // and reflects the same distribution next_id was sampled from.
-            record_logprob(
+            // Backend-neutral reasoning-budget + logprobs policy (ADR-080 C3):
+            // constructed here (post-prefill-push) so its `thinking_closed` /
+            // `reasoning_end_len` seed covers the budget=1 edge case exactly as
+            // the pre-extraction inline bookkeeping did. Shared with the CPU
+            // `model::qwen35::generation` loops -- see `DecodePolicy`'s doc comment.
+            // `DecodePolicy::init` (codex round-2 major #2, PR #787) records
+            // the prefill token's logprob (#585, no-op unless requested) in
+            // the same call that constructs the policy -- replaces the
+            // freestanding `record_logprob(...)` call this site used to make
+            // independently. `prefill_logits` is untouched since
+            // `forward_prefill()` populated it above, and reflects the same
+            // distribution `next_id` was sampled from.
+            // `streaming: true` selects `StopMode::Streaming`'s incremental
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
+            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // now owns the `StopStringMatcher` this call site used to
+            // construct and drive by hand.
+            let mut policy = crate::model::qwen35::DecodePolicy::init(
+                gen_cfg,
+                think_close_id,
                 &mut token_logprobs,
-                &prefill_logits,
                 next_id,
+                &prefill_logits,
                 gen_cfg.temperature,
-                gen_cfg.logprobs,
+                generated_ids.len(),
+                true,
             );
-            // Capture close-point after the prefill push (covers budget=1 edge case).
-            if thinking_closed && reasoning_end_len.is_none() {
-                reasoning_end_len = Some(generated_ids.len());
-            }
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
-            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
-            // Holds back a partial suffix that could still become a stop match, so
-            // `text`/`on_token` never see a stop string that spans a token boundary.
-            let mut stop_matcher = if gen_cfg.stop_strings.is_empty() {
-                None
-            } else {
-                Some(StopStringMatcher::new(&gen_cfg.stop_strings))
-            };
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
             let delta = detok.push(tokenizer, next_id);
-            if !delta.is_empty() {
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let mut caller_interrupted = false;
-                    let stop_matched = matcher.push(&delta, &mut |emit| {
-                        if !caller_interrupted && !emit.is_empty() {
-                            text.push_str(emit);
-                            if !on_token(emit, next_id) {
-                                caller_interrupted = true;
-                            }
-                        }
-                    });
-                    if caller_interrupted {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: false, // caller interrupted the stream, not a stop condition
-                            stop_reason: Some(StopReason::Interrupt),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
-                    if stop_matched {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: true,
-                            stop_reason: Some(StopReason::Eos),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
-                } else {
-                    text.push_str(&delta);
-                    if !on_token(&delta, next_id) {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: false, // caller interrupted the stream, not a stop condition
-                            stop_reason: Some(StopReason::Interrupt),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
+            let initial_outcome = policy.check_initial_stop(
+                &mut token_logprobs,
+                &mut text,
+                &mut throwaway_offsets,
+                &delta,
+                |s| on_token(s, next_id),
+            );
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Interrupted
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
+                return Ok(GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: false, // caller interrupted the stream, not a stop condition
+                    stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs: token_logprobs.clone(),
+                });
+            }
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Stopped
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                return Ok(GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: true,
+                    stop_reason: Some(StopReason::Eos),
+                    token_logprobs: token_logprobs.clone(),
+                });
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
@@ -13089,7 +13283,7 @@ mod inner {
 
             // Autoregressive decode with streaming.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
-            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            let cap = policy.cap();
             for _ in 1..cap {
                 // Checked before any per-step GPU work, independent of whether this
                 // iteration's delta ends up non-empty -- closes the gap where a run
@@ -13136,97 +13330,76 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                // Budget forcing: override sampled token with </think> when the
-                // reasoning budget is exhausted and the block is still open.
-                let next_id = force_close_think(
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    thinking_closed,
-                    generated_ids.len(),
-                    think_close_id,
-                )
-                .unwrap_or(sampled_id);
-
-                // Advance grammar state after sampling (or forced token).
+                // One atomic per-step transition (ADR-080 C3 / codex round-1
+                // major #3, PR #787) -- see `DecodePolicy::transition`.
                 // Interaction note: if reasoning_budget AND grammar are both active and the
                 // grammar disallows </think> at this position, advance returns false → break.
                 // This is fail-closed (no grammar-illegal output emitted) but silent. The
                 // combination of grammar + reasoning_budget is unusual; document, don't change.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                // Track when the thinking block closes (natural or forced).
-                if Some(next_id) == think_close_id {
-                    thinking_closed = true;
-                }
-
-                if is_stop(next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-                // #585: record this step's logprob (no-op unless requested). next_id
-                // here is the final, post-force_close_think token — step_logits is
-                // the distribution it was actually sampled/forced from.
-                record_logprob(
+                //
+                // `policy.stop_mode` (fixed to `StopMode::Streaming` or
+                // `Disabled` at construction) now owns this path's byte-
+                // holdback stop check itself (codex round-3 major #1, PR
+                // #787 / Leo's ruling) -- this call site supplies only
+                // `decode_delta` (this loop's own detokenizer) and the
+                // shared `text`/`throwaway_offsets` buffers.
+                let generated_len_before = generated_ids.len();
+                let outcome = policy.transition(
                     &mut token_logprobs,
+                    sampled_id,
                     &step_logits,
-                    next_id,
                     gen_cfg.temperature,
-                    gen_cfg.logprobs,
+                    generated_len_before,
+                    |next_id| {
+                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                            engine.advance(gs, next_id)
+                        } else {
+                            true
+                        }
+                    },
+                    &is_stop,
+                    |next_id| {
+                        generated_ids.push(next_id);
+                        all_ids.push(next_id);
+                    },
+                    |next_id| detok.push(tokenizer, next_id),
+                    &mut text,
+                    &mut throwaway_offsets,
+                    |s, next_id| on_token(s, next_id),
                 );
-                // Capture the close-point after the push so </think> is the
-                // last reasoning token (not the first answer token).
-                if thinking_closed && reasoning_end_len.is_none() {
-                    reasoning_end_len = Some(generated_ids.len());
-                }
-                last_pushed_id = next_id;
-                let delta = detok.push(tokenizer, next_id);
-                if !delta.is_empty() {
-                    if let Some(matcher) = stop_matcher.as_mut() {
-                        let mut caller_interrupted = false;
-                        let stop_matched = matcher.push(&delta, &mut |emit| {
-                            if !caller_interrupted && !emit.is_empty() {
-                                text.push_str(emit);
-                                if !on_token(emit, next_id) {
-                                    caller_interrupted = true;
-                                }
-                            }
-                        });
-                        if caller_interrupted {
-                            stopped_by_caller = true;
-                            stop_reason = StopReason::Interrupt;
-                            break;
-                        }
-                        if stop_matched {
-                            stopped = true;
-                            stop_reason = StopReason::Eos;
-                            break;
-                        }
-                    } else {
-                        text.push_str(&delta);
-                        if !on_token(&delta, next_id) {
-                            stopped_by_caller = true;
-                            stop_reason = StopReason::Interrupt;
-                            break;
-                        }
+
+                let (next_id, answer_budget_exhausted) = match outcome {
+                    crate::model::qwen35::StepOutcome::GrammarStop => {
+                        stop_reason = StopReason::Grammar;
+                        break;
                     }
-                }
+                    crate::model::qwen35::StepOutcome::Eos => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Stopped => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Interrupted => {
+                        stopped_by_caller = true;
+                        stop_reason = StopReason::Interrupt;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Emitted {
+                        token_id,
+                        answer_budget_exhausted,
+                    } => (token_id, answer_budget_exhausted),
+                };
+                last_pushed_id = next_id;
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
                 }
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if let Some(end) = reasoning_end_len
-                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-                {
+                if answer_budget_exhausted {
                     break;
                 }
             }
@@ -13240,30 +13413,18 @@ mod inner {
             // so streamed deltas concatenate to exactly the returned text. Skip when
             // the caller asked to stop — it is no longer consuming the stream.
             if !stopped_by_caller {
+                // This flush emits the residual incomplete-UTF-8 bytes of the
+                // already-generated final token, not a new generation step —
+                // generation has already terminated for the stop_reason decided
+                // above. A late cancel here (return value intentionally unused)
+                // does not change why generation stopped, so treating it as
+                // Interrupt would misattribute the stop cause to this flush.
                 let tail = detok.finish();
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    // No-op if a stop already matched inside the loop; otherwise a
-                    // stop string can still complete in the final detokenizer tail.
-                    let already_stopped = matcher.stopped();
-                    matcher.finish(&tail, &mut |emit| {
-                        if !emit.is_empty() {
-                            text.push_str(emit);
-                            on_token(emit, last_pushed_id);
-                        }
-                    });
-                    if !already_stopped && matcher.stopped() {
-                        stopped = true;
-                        stop_reason = StopReason::Eos;
-                    }
-                } else if !tail.is_empty() {
-                    // This flush emits the residual incomplete-UTF-8 bytes of the
-                    // already-generated final token, not a new generation step —
-                    // generation has already terminated for the stop_reason decided
-                    // above. A late cancel here (return value intentionally unused)
-                    // does not change why generation stopped, so treating it as
-                    // Interrupt would misattribute the stop cause to this flush.
-                    text.push_str(&tail);
-                    on_token(&tail, last_pushed_id);
+                let tail_stopped =
+                    policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id));
+                if tail_stopped && !stopped {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
                 }
             }
             Ok(GenerateOutput {
@@ -14799,6 +14960,58 @@ mod inner {
             )
         }
 
+        /// Pure preflight over the suffix a [`crate::kv_cache::PrefixRestorePlan`]
+        /// selects — every suffix token id within `vocab_size`, the suffix
+        /// non-empty, and `plan.suffix_start + suffix.len()` within
+        /// `max_cache_len`. Must run BEFORE `restore_cross_turn_prefix`/
+        /// `reset_state` in `generate_streaming_with_prefix_cache_and_cancel_inner`
+        /// (#835): those calls `take()` the cache slot's entry (ExactAppend /
+        /// ReplayFromCheckpoint) or clear live state (FullRefill), and the
+        /// public wrapper's error-recovery arm additionally evicts the slot's
+        /// cache entry outright on ANY `Err` from `_inner`. Rejecting an
+        /// invalid suffix here, before any of that runs, leaves a warmed slot
+        /// untouched instead of destroying it for a request that never
+        /// touched live KV/GDN state.
+        ///
+        /// Mirrors `forward_prefill_from`'s own checks byte-for-byte — same
+        /// `InferenceError` variant and message shape — so this is
+        /// observationally a pure timing fix, not a new error taxonomy.
+        /// `forward_prefill_from`'s checks are left in place unchanged
+        /// (defense in depth for its other, non-prefix-cache callers).
+        fn plan_prefix_request(
+            &self,
+            prompt_ids: &[u32],
+            plan: &crate::kv_cache::PrefixRestorePlan,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            let vocab = self.engine.config.vocab_size;
+            let suffix = &prompt_ids[plan.suffix_start..];
+            for (t, &id) in suffix.iter().enumerate() {
+                if (id as usize) >= vocab {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "forward_prefill_from: token_ids[{t}]={id} out of range: vocab_size is {vocab}"
+                    )));
+                }
+            }
+            if suffix.is_empty() {
+                return Err(InferenceError::PrefixCache(
+                    "forward_prefill_from: cannot prefill an empty suffix without a saved \
+                     logits source"
+                        .into(),
+                ));
+            }
+            if plan.suffix_start + suffix.len() > self.session.kv_cache.max_cache_len {
+                return Err(InferenceError::InvalidInput(format!(
+                    "forward_prefill_from: start_pos {} + len {} exceeds max_cache_len {}",
+                    plan.suffix_start,
+                    suffix.len(),
+                    self.session.kv_cache.max_cache_len
+                )));
+            }
+            Ok(())
+        }
+
         /// Restore live state to the plan's reusable boundary.
         ///
         /// `ExactAppend` and `ReplayFromCheckpoint` (#590) both consume the
@@ -15179,9 +15392,55 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            // Config preflight checks live here, in the public wrapper, and
+            // must return BEFORE the `match` below (codex round-2 medium #3,
+            // PR #787): the error-recovery arm of that `match` unconditionally
+            // calls `reset_state()` and removes the cache slot on ANY `Err`
+            // from `_inner`, including a not-yet-attempted preflight
+            // rejection. A caller passing an unsupported config (e.g.
+            // `logprobs` or an active `enable_mtp`) never touches cache/session
+            // state in the first place, so routing that rejection through the
+            // destructive recovery path would evict a valid pre-existing
+            // cross-turn entry the call never mutated. Returning here, before
+            // `_inner` is even called, leaves any existing entry untouched.
+            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+            crate::model::qwen35::check_mtp_not_requested(gen_cfg)?;
+
+            let input = tokenizer.tokenize(prompt);
+            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+
+            // #835: validate the suffix a reuse plan would select for this
+            // slot BEFORE calling `_inner` at all -- same reasoning as the
+            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
+            // above (PR #787): the `match` below unconditionally calls
+            // `reset_state()` and evicts the cache slot on ANY `Err` from
+            // `_inner`, so a suffix-validation-only rejection (out-of-vocab
+            // token, empty suffix, or a suffix overflowing `max_cache_len`)
+            // must return here, before `_inner` runs `restore_cross_turn_prefix`
+            // (or `_inner`'s own destructive-on-`Err` recovery is even
+            // reachable), or a valid pre-existing cross-turn entry this call
+            // never touched would be destroyed alongside it.
+            //
+            // Skipped for the same three trivial-request shapes `_inner`
+            // itself special-cases with an early `Ok` (empty prompt, zero
+            // `max_new_tokens`, prompt longer than the cache): none of those
+            // reach `_inner`'s mutating match either, so validating a plan
+            // for them here would reject requests `_inner` legitimately
+            // accepts (e.g. an empty prompt always plans an empty "suffix",
+            // which is exactly the shape `plan_prefix_request` rejects for a
+            // real request).
+            if !prompt_ids.is_empty()
+                && gen_cfg.max_new_tokens > 0
+                && prompt_ids.len() <= self.max_context()
+            {
+                let metadata = self.cross_turn_metadata(tokenizer);
+                let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+                self.plan_prefix_request(&prompt_ids, &plan)?;
+            }
+
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
-                prompt,
+                prompt_ids,
                 tokenizer,
                 gen_cfg,
                 on_token,
@@ -15202,7 +15461,7 @@ mod inner {
         fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
-            prompt: &str,
+            prompt_ids: Vec<u32>,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut on_token: F,
@@ -15214,6 +15473,21 @@ mod inner {
         {
             use crate::error::InferenceError;
             use crate::kv_cache::PrefixReuseMode;
+
+            // The `logprobs` / `enable_mtp` config preflight checks (PR #787),
+            // and the suffix-content preflight below (#835), live in the public
+            // wrapper `generate_streaming_with_prefix_cache_and_cancel`, not
+            // here: that wrapper's error-recovery path unconditionally
+            // evicts the cache slot on any `Err` from this function, so a
+            // preflight-only rejection must never reach `_inner` in the first
+            // place, or a valid pre-existing cross-turn entry this call never
+            // touched would be destroyed alongside it. `prompt_ids` arrives
+            // already tokenized by the wrapper (which needs them to run that
+            // preflight) so this function never re-tokenizes `prompt`.
+            // `plan_cross_turn_reuse`/`plan_prefix_request` are still run
+            // again below, cheaply, as defense in depth (this function's own
+            // safety invariant should not depend solely on its one caller
+            // getting the guard conditions right).
 
             let cfg = self.engine.config.clone();
 
@@ -15235,8 +15509,6 @@ mod inner {
                 }
             };
 
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
             let prompt_len = prompt_ids.len();
 
             // These three guards are byte-for-byte the same as
@@ -15305,6 +15577,21 @@ mod inner {
 
             let metadata = self.cross_turn_metadata(tokenizer);
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+
+            // #835: validate the suffix the plan selected BEFORE the match
+            // below runs `restore_cross_turn_prefix` (which `take()`s the
+            // cache slot's entry) or `reset_state()`. An out-of-vocab token,
+            // empty suffix, or start+len overflow is rejected here, before
+            // any live state or cache entry is touched, instead of after
+            // `restore_cross_turn_prefix` has already consumed the slot.
+            // Defense in depth: the public wrapper above already ran this
+            // exact check (on the identical `prompt_ids`/`plan` inputs,
+            // since nothing mutates `self.cross_turn_prefix_cache` between
+            // the two calls) so a rejection here should never actually
+            // trigger via that entry point -- this call exists so `_inner`'s
+            // own ordering invariant does not depend solely on its one
+            // caller getting the wrapper's guard conditions right.
+            self.plan_prefix_request(&prompt_ids, &plan)?;
 
             // The consumed entry (ExactAppend / ReplayFromCheckpoint) is
             // carried to the end-of-generation save so its checkpoint ring
@@ -15396,7 +15683,6 @@ mod inner {
             } else {
                 None
             };
-            let mut thinking_closed = false;
 
             // The one line that differs structurally from `generate_streaming`:
             // prefill only the divergent suffix, at its true absolute position.
@@ -15521,114 +15807,109 @@ mod inner {
                 });
             }
 
-            if Some(next_id) == think_close_id {
-                thinking_closed = true;
-            }
-
             let mut detok = IncrementalDetokenizer::new();
-            let mut reasoning_end_len: Option<usize> = None;
             generated_ids.push(next_id);
             all_ids.push(next_id);
-            if thinking_closed && reasoning_end_len.is_none() {
-                reasoning_end_len = Some(generated_ids.len());
-            }
+            // Backend-neutral reasoning-budget policy (ADR-080 C3), shared with
+            // `generate_streaming` above and the CPU `model::qwen35::generation`
+            // loops, driven through the one atomic `DecodePolicy::transition`
+            // (codex round-1 major #3, PR #787). `token_logprobs` below is a
+            // throwaway sink: this path does not wire per-token logprobs
+            // capture, and the `check_logprobs_not_set` guard above already
+            // rejects any request that would need it, so `gen_cfg.logprobs`
+            // is always `None` here and `DecodePolicy::init` / `transition`'s
+            // logprob recording is always a no-op (codex round-1 blocker #1,
+            // PR #787) -- passed through uniformly rather than special-cased,
+            // so this site is structurally indistinguishable from the other
+            // five at the `DecodePolicy::init` / `transition` call sites.
+            let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
+            // `streaming: true` selects `StopMode::Streaming`'s incremental
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
+            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // now owns the `StopStringMatcher` this call site used to
+            // construct and drive by hand.
+            let mut policy = crate::model::qwen35::DecodePolicy::init(
+                gen_cfg,
+                think_close_id,
+                &mut token_logprobs,
+                next_id,
+                &prefill_logits,
+                gen_cfg.temperature,
+                generated_ids.len(),
+                true,
+            );
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
-            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
-            let mut stop_matcher = if gen_cfg.stop_strings.is_empty() {
-                None
-            } else {
-                Some(StopStringMatcher::new(&gen_cfg.stop_strings))
-            };
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
             // Set when a stop string matches: CPU-identical semantics can retain
             // token ids whose text was truncated, so the tokens behind a
             // string-stop match must never be saved into the cross-turn cache —
             // that would represent text the caller never received.
             let mut stopped_by_stop_string = false;
             let delta = detok.push(tokenizer, next_id);
-            if !delta.is_empty() {
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let mut caller_interrupted = false;
-                    let stop_matched = matcher.push(&delta, &mut |emit| {
-                        if !caller_interrupted && !emit.is_empty() {
-                            text.push_str(emit);
-                            if !on_token(emit, next_id) {
-                                caller_interrupted = true;
-                            }
-                        }
-                    });
-                    if caller_interrupted {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: false,
-                                stop_reason: Some(StopReason::Interrupt),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
-                    if stop_matched {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        self.cross_turn_prefix_cache.remove(slot_id);
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: true,
-                                stop_reason: Some(StopReason::Eos),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
-                } else {
-                    text.push_str(&delta);
-                    if !on_token(&delta, next_id) {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        // The caller cut the stream after exactly one forwarded
-                        // token (the prefill sample) — state represents prompt +
-                        // that one token already (forward happens on the *next*
-                        // iteration in the loop below, which never runs here).
-                        // Nothing further was forwarded, so do not save a cache
-                        // entry claiming more than live state represents.
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: false,
-                                stop_reason: Some(StopReason::Interrupt),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
+            let initial_outcome = policy.check_initial_stop(
+                &mut token_logprobs,
+                &mut text,
+                &mut throwaway_offsets,
+                &delta,
+                |s| on_token(s, next_id),
+            );
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Interrupted
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
+                // The caller cut the stream after exactly one forwarded
+                // token (the prefill sample) — state represents prompt +
+                // that one token already (forward happens on the *next*
+                // iteration in the loop below, which never runs here).
+                // Nothing further was forwarded, so do not save a cache
+                // entry claiming more than live state represents.
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: false,
+                        stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs: vec![],
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
+            }
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Stopped
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                self.cross_turn_prefix_cache.remove(slot_id);
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: true,
+                        stop_reason: Some(StopReason::Eos),
+                        token_logprobs: vec![],
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
 
-            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            let cap = policy.cap();
             for _ in 1..cap {
                 // Checked before any per-step GPU work, independent of whether
                 // this iteration's delta ends up non-empty — mirrors
@@ -15677,77 +15958,69 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                let next_id = force_close_think(
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    thinking_closed,
-                    generated_ids.len(),
-                    think_close_id,
-                )
-                .unwrap_or(sampled_id);
-
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                if Some(next_id) == think_close_id {
-                    thinking_closed = true;
-                }
-
-                if is_stop(next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-                if thinking_closed && reasoning_end_len.is_none() {
-                    reasoning_end_len = Some(generated_ids.len());
-                }
-                last_pushed_id = next_id;
-                let delta = detok.push(tokenizer, next_id);
-                if !delta.is_empty() {
-                    if let Some(matcher) = stop_matcher.as_mut() {
-                        let mut caller_interrupted = false;
-                        let stop_matched = matcher.push(&delta, &mut |emit| {
-                            if !caller_interrupted && !emit.is_empty() {
-                                text.push_str(emit);
-                                if !on_token(emit, next_id) {
-                                    caller_interrupted = true;
-                                }
-                            }
-                        });
-                        if caller_interrupted {
-                            stopped_by_caller = true;
-                            stop_reason = StopReason::Interrupt;
-                            break;
+                // `policy.stop_mode` (fixed to `StopMode::Streaming` or
+                // `Disabled` at construction) now owns this path's byte-
+                // holdback stop check itself (codex round-3 major #1, PR
+                // #787 / Leo's ruling) -- this call site supplies only
+                // `decode_delta` (this loop's own detokenizer) and the
+                // shared `text`/`throwaway_offsets` buffers.
+                let generated_len_before = generated_ids.len();
+                let outcome = policy.transition(
+                    &mut token_logprobs,
+                    sampled_id,
+                    &step_logits,
+                    gen_cfg.temperature,
+                    generated_len_before,
+                    |next_id| {
+                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                            engine.advance(gs, next_id)
+                        } else {
+                            true
                         }
-                        if stop_matched {
-                            stopped = true;
-                            stopped_by_stop_string = true;
-                            stop_reason = StopReason::Eos;
-                            break;
-                        }
-                    } else {
-                        text.push_str(&delta);
-                        if !on_token(&delta, next_id) {
-                            stopped_by_caller = true;
-                            stop_reason = StopReason::Interrupt;
-                            break;
-                        }
+                    },
+                    &is_stop,
+                    |next_id| {
+                        generated_ids.push(next_id);
+                        all_ids.push(next_id);
+                    },
+                    |next_id| detok.push(tokenizer, next_id),
+                    &mut text,
+                    &mut throwaway_offsets,
+                    |s, next_id| on_token(s, next_id),
+                );
+
+                let (next_id, answer_budget_exhausted) = match outcome {
+                    crate::model::qwen35::StepOutcome::GrammarStop => {
+                        stop_reason = StopReason::Grammar;
+                        break;
                     }
-                }
+                    crate::model::qwen35::StepOutcome::Eos => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Stopped => {
+                        stopped = true;
+                        stopped_by_stop_string = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Interrupted => {
+                        stopped_by_caller = true;
+                        stop_reason = StopReason::Interrupt;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Emitted {
+                        token_id,
+                        answer_budget_exhausted,
+                    } => (token_id, answer_budget_exhausted),
+                };
+                last_pushed_id = next_id;
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
                 }
-                if let Some(end) = reasoning_end_len
-                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-                {
+                if answer_budget_exhausted {
                     break;
                 }
             }
@@ -15762,22 +16035,12 @@ mod inner {
             // must also suppress caching the truncated generation (see below).
             if !stopped_by_caller {
                 let tail = detok.finish();
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let already_stopped = matcher.stopped();
-                    matcher.finish(&tail, &mut |emit| {
-                        if !emit.is_empty() {
-                            text.push_str(emit);
-                            on_token(emit, last_pushed_id);
-                        }
-                    });
-                    if !already_stopped && matcher.stopped() {
-                        stopped = true;
-                        stopped_by_stop_string = true;
-                        stop_reason = StopReason::Eos;
-                    }
-                } else if !tail.is_empty() {
-                    text.push_str(&tail);
-                    on_token(&tail, last_pushed_id);
+                let tail_stopped =
+                    policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id));
+                if tail_stopped && !stopped {
+                    stopped = true;
+                    stopped_by_stop_string = true;
+                    stop_reason = StopReason::Eos;
                 }
             }
 
@@ -22779,6 +23042,101 @@ mod inner {
             );
         }
 
+        /// `MetalQwen35State::generate` (the plain/direct entry point) must
+        /// reject a `GenerateConfig` with `reasoning_budget` set, with a typed
+        /// `InvalidInput` error, rather than silently ignoring the budget and
+        /// generating unbudgeted output (ADR-080 C3, #783).
+        ///
+        /// This is the production-seam test for the guard added to `generate`
+        /// itself, proving the call site is real — `route_predicate_tests`
+        /// and `multimodal_preflight_tests` already cover the pure guard
+        /// logic without a GPU device.
+        ///
+        /// Mutation sensitivity: removing the `check_reasoning_budget_not_set`
+        /// call from `generate` lets this request proceed through prefill and
+        /// sampling instead of erroring, so `result.is_err()` fails.
+        #[test]
+        fn metal_generate_plain_rejects_reasoning_budget_config() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: Some(2),
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
+                "MetalQwen35State::generate must fail closed with InvalidInput when \
+                 reasoning_budget is set (ADR-080 C3, #783); got {result:?}"
+            );
+        }
+
+        /// Sibling to `metal_generate_plain_rejects_reasoning_budget_config`
+        /// (codex round-2 blocker #1, PR #787): `MetalQwen35State::generate`
+        /// (the plain/direct entry point) unconditionally returns
+        /// `token_logprobs: vec![]` on every return path, including the MTP
+        /// and self-spec fast-path delegations, and had no
+        /// `check_logprobs_not_set` preflight at all -- routing a `logprobs`
+        /// request around the MTP/self-spec predicates alone would not have
+        /// closed this, since the plain fallback path is exactly as silent.
+        ///
+        /// Mutation sensitivity: removing the `check_logprobs_not_set` call
+        /// from `generate` lets this request proceed through prefill and
+        /// sampling instead of erroring, so `result.is_err()` fails.
+        #[test]
+        fn metal_generate_plain_rejects_logprobs_config() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: Some(0),
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
+                "MetalQwen35State::generate must fail closed with InvalidInput when \
+                 logprobs is set (codex round-2 blocker #1, PR #787); got {result:?}"
+            );
+        }
+
         /// `generate_streaming`'s `max_new_tokens == 0` guard must return before the
         /// prefill token is sampled, pushed, or streamed, matching the CPU
         /// `generate_streaming()` contract (model::qwen35::generation): zero tokens,
@@ -24550,6 +24908,973 @@ mod inner {
                 "RACE-LOCALIZATION: chunked-vs-serial state max_abs_diff = {:.6}",
                 max_diff(&chunked_a, &serial_a)
             );
+        }
+
+        // =====================================================================
+        // #850: GDN Q/K L2-normalization fail-closed — direct Metal kernel
+        // dispatch regression tests. No model checkpoint dependency; the only
+        // permitted skip is "no Metal device" (per #850's gate text: "no
+        // silent skip on a missing device or optional Qwen3.6 pipeline" —
+        // these tests build their own pipelines directly from MSL_SOURCE, so
+        // there is no optional-pipeline skip path at all).
+        //
+        // Methodology: for each of the 8 sites (4 kernels x Q/K), dispatch the
+        // SAME kernel twice with otherwise-identical inputs: once with one NaN
+        // lane injected into the Q (or K) input, once with that entire Q (or
+        // K) sub-vector explicitly zeroed instead. Per ADR-080 C1 + the #850
+        // contract (an invalid Q/K vector is assigned literal 0.0, matching
+        // ordinary zero-weight arithmetic), both runs take the SAME
+        // `!(sum_sq > 1e-12f) -> assign 0.0` branch server-side (a poisoned
+        // sum_sq is non-finite, an all-zero sum_sq is exactly 0.0 <= 1e-12f),
+        // so a correct kernel produces BIT-IDENTICAL output between the two
+        // runs. This is a Metal-vs-Metal (poisoned-vs-explicit-zero-reference)
+        // differential, not a cross-language CPU-vs-Metal one; see the PR body
+        // for why that scope was chosen. Mutation-sensitive: the pre-fix
+        // `value * guarded_zero_reciprocal` code lets the poisoned lane itself
+        // stay NaN while every OTHER lane goes to `finite * 0.0 = 0.0`, so the
+        // poisoned run diverges from the all-zero reference at exactly that
+        // lane -- the bit-identical assertion below fails under the reverted
+        // code (see the reverse-mutation proof in the PR body).
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        mod gdn_850_failclosed {
+            use super::*;
+
+            /// Matches the MSL `GdnRecurParams` struct used by
+            /// `gdn_recurrence_fused`, `gdn_recurrence_fused_q36`, and
+            /// `gdn_precompute_keys` (field-for-field, see qwen35.metal:996-1005).
+            #[repr(C)]
+            struct TestGdnRecurParams {
+                key_dim: u32,
+                value_dim: u32,
+                num_key_heads: u32,
+                num_value_heads: u32,
+                hidden_size: u32,
+                q_total: u32,
+                v_offset: u32,
+                scale: f32,
+                eps: f32,
+            }
+
+            fn compile_msl(device: &Device) -> Library {
+                let opts = CompileOptions::new();
+                device
+                    .new_library_with_source(MSL_SOURCE, &opts)
+                    .expect("MSL_SOURCE must compile")
+            }
+
+            fn pipeline_for(device: &Device, lib: &Library, name: &str) -> ComputePipelineState {
+                let func = lib
+                    .get_function(name, None)
+                    .unwrap_or_else(|e| panic!("kernel {name} not found in MSL_SOURCE: {e}"));
+                device
+                    .new_compute_pipeline_state_with_function(&func)
+                    .unwrap_or_else(|e| panic!("failed to build pipeline for {name}: {e}"))
+            }
+
+            fn f32_buf(device: &Device, data: &[f32], label: &str) -> Buffer {
+                let buf = device.new_buffer_with_data(
+                    data.as_ptr() as *const _,
+                    std::mem::size_of_val(data) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                buf.set_label(label);
+                buf
+            }
+
+            fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
+                // SAFETY: buffer is StorageModeShared, previously written by a
+                // completed command buffer, and sized for `len` f32 elements.
+                unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len).to_vec() }
+            }
+
+            fn lcg_vec(seed: u64, n: usize) -> Vec<f32> {
+                let mut state = seed;
+                (0..n)
+                    .map(|_| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        (((state >> 32) as u32) as f32 / u32::MAX as f32 - 0.5) * 0.2
+                    })
+                    .collect()
+            }
+
+            fn assert_no_nonfinite(label: &str, buf_name: &str, data: &[f32]) {
+                let bad = data.iter().filter(|v| !v.is_finite()).count();
+                assert_eq!(
+                    bad,
+                    0,
+                    "{label}: {buf_name} must fail closed (finite), got {bad} non-finite \
+                     element(s) out of {}: {data:?}",
+                    data.len()
+                );
+            }
+
+            // --------------------------------------------------------------
+            // Kernel 1: gdn_recurrence_fused. Small synthetic dims (kd=vd=8,
+            // hd=16, 1 key head, 1 value head) -- this kernel takes kd/vd/hd
+            // as runtime params (bounds-checked via `tid < kd`/`tid < vd`), so
+            // shrinking them is safe and keeps buffers tiny.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_recurrence_fused(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                kd: u32,
+                vd: u32,
+                hd: u32,
+                conv_out: &[f32],
+                s_init: &[f32],
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+            ) -> (Vec<f32>, Vec<f32>) {
+                let q_total = kd;
+                let v_offset = q_total * 2;
+                let output_dim = vd;
+
+                let s_buf = f32_buf(device, s_init, "S_all");
+                let conv_buf = f32_buf(device, conv_out, "conv_out");
+                let z_buf = f32_buf(device, &vec![0.0f32; output_dim as usize], "z_proj");
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let normw_buf = f32_buf(device, &vec![1.0f32; vd as usize], "norm_w");
+                let out_buf = make_zero_buffer(device, output_dim as usize, "output");
+
+                let params = TestGdnRecurParams {
+                    key_dim: kd,
+                    value_dim: vd,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: hd,
+                    q_total,
+                    v_offset,
+                    scale: 1.0 / (kd as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&s_buf), 0);
+                enc.set_buffer(1, Some(&conv_buf), 0);
+                enc.set_buffer(2, Some(&z_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&normw_buf), 0);
+                enc.set_buffer(9, Some(&out_buf), 0);
+                enc.set_bytes(
+                    10,
+                    std::mem::size_of::<TestGdnRecurParams>() as u64,
+                    &params as *const TestGdnRecurParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_buf, output_dim as usize),
+                    read_f32(&s_buf, (kd * vd) as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping gdn_recurrence_fused_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_recurrence_fused");
+                let queue = device.new_command_queue();
+
+                let kd = 8u32;
+                let vd = 8u32;
+                let hd = 16u32;
+                let hidden_in = lcg_vec(1, hd as usize);
+                let in_proj_b = lcg_vec(2, hd as usize);
+                let in_proj_a = lcg_vec(3, hd as usize);
+                let s_init = lcg_vec(4, (kd * vd) as usize);
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(5, (3 * kd) as usize); // [Q(kd) | K(kd) | V(kd)]
+                    let mut poisoned = base.clone();
+                    let mut reference = base.clone();
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, kd as usize)
+                    } else {
+                        (kd as usize, 2 * kd as usize)
+                    };
+                    poisoned[lo] = f32::NAN;
+                    for v in reference[lo..hi].iter_mut() {
+                        *v = 0.0;
+                    }
+
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix (Q->K threadgroup_barrier after every sg_buf[0] consumer):
+                    // a passing single dispatch does not prove the race is closed
+                    // (simdgroups are not required to advance in lockstep, so the
+                    // hazard window may or may not be hit on a given run), so this
+                    // repeats the dispatch to raise the chance of exposing it if the
+                    // barrier were ever removed again. Not a substitute for the
+                    // access-order argument the barrier itself is required by.
+                    for _ in 0..20 {
+                        let (out_p, s_p) = run_gdn_recurrence_fused(
+                            &device, &queue, &pipe, kd, vd, hd, &poisoned, &s_init, &hidden_in,
+                            &in_proj_b, &in_proj_a,
+                        );
+                        let (out_r, s_r) = run_gdn_recurrence_fused(
+                            &device, &queue, &pipe, kd, vd, hd, &reference, &s_init, &hidden_in,
+                            &in_proj_b, &in_proj_a,
+                        );
+
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused[{label}]"),
+                            "output",
+                            &out_p,
+                        );
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused[{label}]"),
+                            "S_all",
+                            &s_p,
+                        );
+                        assert_eq!(
+                            out_p, out_r,
+                            "gdn_recurrence_fused[{label}-poisoned]: output must be bit-identical \
+                             to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                        assert_eq!(
+                            s_p, s_r,
+                            "gdn_recurrence_fused[{label}-poisoned]: updated S_all must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
+                }
+            }
+
+            // --------------------------------------------------------------
+            // Kernel 2: gdn_recurrence_fused_q36. kd=vd=128, hd=5120 are
+            // Metal `constexpr` in this kernel (not runtime params), so they
+            // are NOT shrinkable; num_value_heads=1 keeps the rest of the
+            // dispatch small (k_head = h/3u still resolves to 0 for h=0).
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_recurrence_fused_q36(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                conv_out: &[f32],
+                s_init: &[f32],
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+            ) -> (Vec<f32>, Vec<f32>) {
+                const KD: u32 = 128;
+                const VD: u32 = 128;
+                const HD: u32 = 5120;
+                let q_total = KD;
+                let v_offset = q_total * 2;
+
+                let s_buf = f32_buf(device, s_init, "S_all");
+                let conv_buf = f32_buf(device, conv_out, "conv_out");
+                let z_buf = f32_buf(device, &vec![0.0f32; VD as usize], "z_proj");
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let normw_buf = f32_buf(device, &vec![1.0f32; VD as usize], "norm_w");
+                let out_buf = make_zero_buffer(device, VD as usize, "output");
+
+                let params = TestGdnRecurParams {
+                    key_dim: KD,
+                    value_dim: VD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&s_buf), 0);
+                enc.set_buffer(1, Some(&conv_buf), 0);
+                enc.set_buffer(2, Some(&z_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&normw_buf), 0);
+                enc.set_buffer(9, Some(&out_buf), 0);
+                enc.set_bytes(
+                    10,
+                    std::mem::size_of::<TestGdnRecurParams>() as u64,
+                    &params as *const TestGdnRecurParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_buf, VD as usize),
+                    read_f32(&s_buf, (KD * VD) as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_recurrence_fused_q36_fails_closed_on_nan_q_and_k_lane() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping gdn_recurrence_fused_q36_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_recurrence_fused_q36");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 5120;
+                let hidden_in = lcg_vec(11, HD as usize);
+                let in_proj_b = lcg_vec(12, HD as usize);
+                let in_proj_a = lcg_vec(13, HD as usize);
+                let s_init = lcg_vec(14, (KD * KD) as usize);
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(15, (3 * KD) as usize); // [Q(128) | K(128) | V(128)]
+                    let mut poisoned = base.clone();
+                    let mut reference = base.clone();
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, KD as usize)
+                    } else {
+                        (KD as usize, 2 * KD as usize)
+                    };
+                    poisoned[lo] = f32::NAN;
+                    for v in reference[lo..hi].iter_mut() {
+                        *v = 0.0;
+                    }
+
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix; see the identical comment in
+                    // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
+                    for _ in 0..20 {
+                        let (out_p, s_p) = run_gdn_recurrence_fused_q36(
+                            &device, &queue, &pipe, &poisoned, &s_init, &hidden_in, &in_proj_b,
+                            &in_proj_a,
+                        );
+                        let (out_r, s_r) = run_gdn_recurrence_fused_q36(
+                            &device, &queue, &pipe, &reference, &s_init, &hidden_in, &in_proj_b,
+                            &in_proj_a,
+                        );
+
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused_q36[{label}]"),
+                            "output",
+                            &out_p,
+                        );
+                        assert_no_nonfinite(
+                            &format!("gdn_recurrence_fused_q36[{label}]"),
+                            "S_all",
+                            &s_p,
+                        );
+                        assert_eq!(
+                            out_p, out_r,
+                            "gdn_recurrence_fused_q36[{label}-poisoned]: output must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                        assert_eq!(
+                            s_p, s_r,
+                            "gdn_recurrence_fused_q36[{label}-poisoned]: updated S_all must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
+                }
+            }
+
+            // --------------------------------------------------------------
+            // Kernel 3: gdn_precompute_keys. kd=128, hd=5120 are Metal
+            // `constexpr` (not shrinkable). Writes into a split key_scratch
+            // buffer: [q_norm(128) | k_norm(128) | k_dot_q(1)] per key head,
+            // then [beta | g] per value head.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_precompute_keys(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                conv_out: &[f32],
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+            ) -> Vec<f32> {
+                const KD: u32 = 128;
+                const HD: u32 = 5120;
+                let q_total = KD;
+                let key_stride = 2 * KD + 1;
+                let scratch_len = key_stride + 2; // 1 key head + 1 value head
+
+                let conv_buf = f32_buf(device, conv_out, "conv_out");
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let scratch_buf = make_zero_buffer(device, scratch_len as usize, "key_scratch");
+
+                let params = TestGdnRecurParams {
+                    key_dim: KD,
+                    value_dim: KD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset: q_total * 2,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&conv_buf), 0);
+                enc.set_buffer(1, Some(&hidden_buf), 0);
+                enc.set_buffer(2, Some(&inb_buf), 0);
+                enc.set_buffer(3, Some(&ina_buf), 0);
+                enc.set_buffer(4, Some(&alog_buf), 0);
+                enc.set_buffer(5, Some(&dtb_buf), 0);
+                enc.set_buffer(6, Some(&scratch_buf), 0);
+                enc.set_bytes(
+                    7,
+                    std::mem::size_of::<TestGdnRecurParams>() as u64,
+                    &params as *const TestGdnRecurParams as *const _,
+                );
+                // Production dispatch shape for gdn_precompute_keys (matches
+                // encode_gdn_layer's H3 dispatch); thread_index_in_threadgroup is
+                // linear regardless of the 3D shape, so this is a fidelity match,
+                // not a correctness requirement.
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(128, 1, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                read_f32(&scratch_buf, scratch_len as usize)
+            }
+
+            #[test]
+            fn gdn_precompute_keys_fails_closed_on_nan_q_and_k_lane() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping gdn_precompute_keys_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                // `gdn_precompute_keys` is defined unconditionally in qwen35.metal (no
+                // #ifdef gate) -- it is not actually an optional/conditionally-compiled
+                // kernel, so a missing lookup here means MSL_SOURCE was compiled but the
+                // named kernel silently failed to link, which is itself a bug this test
+                // must catch, not skip past (#862 round 1, medium finding 4: only
+                // device-absence may remain a platform-level skip).
+                let pipe_func = lib
+                    .get_function("gdn_precompute_keys", None)
+                    .expect("gdn_precompute_keys must be present in MSL_SOURCE once compiled");
+                let pipe = device
+                    .new_compute_pipeline_state_with_function(&pipe_func)
+                    .expect("build gdn_precompute_keys pipeline");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 5120;
+                let hidden_in = lcg_vec(21, HD as usize);
+                let in_proj_b = lcg_vec(22, HD as usize);
+                let in_proj_a = lcg_vec(23, HD as usize);
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(24, (2 * KD) as usize); // [Q(128) | K(128)]
+                    let mut poisoned = base.clone();
+                    let mut reference = base.clone();
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, KD as usize)
+                    } else {
+                        (KD as usize, 2 * KD as usize)
+                    };
+                    poisoned[lo] = f32::NAN;
+                    for v in reference[lo..hi].iter_mut() {
+                        *v = 0.0;
+                    }
+
+                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // fix (this kernel has TWO fixed handoffs: Q->K and K->k_dot_q);
+                    // see the identical comment in
+                    // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
+                    for _ in 0..20 {
+                        let scratch_p = run_gdn_precompute_keys(
+                            &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a,
+                        );
+                        let scratch_r = run_gdn_precompute_keys(
+                            &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
+                        );
+
+                        // scratch layout: [q_norm(128) | k_norm(128) | k_dot_q(1) | beta | g]
+                        assert_no_nonfinite(
+                            &format!("gdn_precompute_keys[{label}]"),
+                            "key_scratch",
+                            &scratch_p,
+                        );
+                        assert_eq!(
+                            scratch_p, scratch_r,
+                            "gdn_precompute_keys[{label}-poisoned]: key_scratch must be \
+                             bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                        );
+                    }
+                }
+            }
+
+            // --------------------------------------------------------------
+            // Kernel 4: gdn_chunk_materialize_c32. Implicitly requires
+            // kd=vd=128 (the kernel indexes `kh*kd+tid` across all 128
+            // dispatched threads with no `tid < kd` bound, unlike kernel 1).
+            // Single token, single chunk (n_tokens=1, chunk_size=1,
+            // num_chunks=1) to keep the dispatch minimal; conv1d kernel_size
+            // (`ks`) is a Metal `constexpr 4u` in this kernel, independent of
+            // GdnChunkParams.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_chunk_materialize_c32(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                gdn_qkv: &[f32],
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+            ) -> (Vec<f32>, Vec<f32>) {
+                const KD: u32 = 128;
+                const VD: u32 = 128;
+                const HD: u32 = 16;
+                const BUF_LEN: u32 = 3; // ks - 1
+                let q_total = KD;
+                let v_offset = q_total * 2;
+                let qkv_dim = v_offset + VD;
+
+                let conv_buf_state =
+                    make_zero_buffer(device, (qkv_dim * BUF_LEN) as usize, "conv_buf");
+                let gdn_qkv_buf = f32_buf(device, gdn_qkv, "gdn_qkv");
+                let conv_weight_buf = f32_buf(
+                    device,
+                    &vec![0.25f32; (qkv_dim * 4) as usize],
+                    "conv_weight",
+                );
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let out_q_buf = make_zero_buffer(device, KD as usize, "out_q");
+                let out_k_buf = make_zero_buffer(device, KD as usize, "out_k");
+                let out_v_buf = make_zero_buffer(device, VD as usize, "out_v");
+                let out_bla_buf = make_zero_buffer(device, 2, "out_bla");
+
+                let params = GdnChunkParams {
+                    key_dim: KD,
+                    value_dim: VD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset,
+                    qkv_dim,
+                    output_dim: VD,
+                    chunk_size: 1,
+                    n_tokens: 1,
+                    num_chunks: 1,
+                    active_chunk: 0,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&conv_buf_state), 0);
+                enc.set_buffer(1, Some(&gdn_qkv_buf), 0);
+                enc.set_buffer(2, Some(&conv_weight_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&out_q_buf), 0);
+                enc.set_buffer(9, Some(&out_k_buf), 0);
+                enc.set_buffer(10, Some(&out_v_buf), 0);
+                enc.set_buffer(11, Some(&out_bla_buf), 0);
+                enc.set_bytes(
+                    12,
+                    std::mem::size_of::<GdnChunkParams>() as u64,
+                    &params as *const GdnChunkParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_q_buf, KD as usize),
+                    read_f32(&out_k_buf, KD as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_chunk_materialize_c32_fails_closed_on_nan_q_and_k_lane() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping gdn_chunk_materialize_c32_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_chunk_materialize_c32");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 16;
+                let hidden_in = lcg_vec(31, HD as usize);
+                let in_proj_b = lcg_vec(32, HD as usize);
+                let in_proj_a = lcg_vec(33, HD as usize);
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(34, (3 * KD) as usize); // [Q(128) | K(128) | V(128)]
+                    let mut poisoned = base.clone();
+                    let mut reference = base.clone();
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, KD as usize)
+                    } else {
+                        (KD as usize, 2 * KD as usize)
+                    };
+                    poisoned[lo] = f32::NAN;
+                    for v in reference[lo..hi].iter_mut() {
+                        *v = 0.0;
+                    }
+
+                    let (outq_p, outk_p) = run_gdn_chunk_materialize_c32(
+                        &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a,
+                    );
+                    let (outq_r, outk_r) = run_gdn_chunk_materialize_c32(
+                        &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
+                    );
+
+                    assert_no_nonfinite(
+                        &format!("gdn_chunk_materialize_c32[{label}]"),
+                        "out_q",
+                        &outq_p,
+                    );
+                    assert_no_nonfinite(
+                        &format!("gdn_chunk_materialize_c32[{label}]"),
+                        "out_k",
+                        &outk_p,
+                    );
+                    assert_eq!(
+                        outq_p, outq_r,
+                        "gdn_chunk_materialize_c32[{label}-poisoned]: out_q must be \
+                         bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                    );
+                    assert_eq!(
+                        outk_p, outk_r,
+                        "gdn_chunk_materialize_c32[{label}-poisoned]: out_k must be \
+                         bit-identical to the never-poisoned (explicit-zero-{label}) reference"
+                    );
+                }
+            }
+
+            // --------------------------------------------------------------
+            // #862 round-2 major-2 follow-up: multi-token gdn_chunk_materialize_c32
+            // dispatch (the CHUNKED PREFILL path #850's integration ask names) exercising
+            // REAL within-chunk conv-window carryover, not a single n_tokens=1 dispatch.
+            //
+            // `gdn_chunk_materialize_c32`'s per-token loop (`for (uint j=0u;j<ci;j++)`)
+            // reads each tap directly from the flat `gdn_qkv` input array by absolute
+            // token index (`src = global_row+tap-buf_len`; `src<0` reads pre-chunk
+            // `conv_buf` history, `src>=0` reads `gdn_qkv[src*qkv_dim+ch]`), so a NaN raw
+            // value written at token 0's channel contaminates every token whose tap
+            // window includes token 0 -- tokens 0,1,2,3 for `ks=4` (this kernel's
+            // `constexpr ks=4u`, i.e. `buf_len=3`) -- and is naturally absent (no register
+            // carryover needed, it is pure array indexing) for token 4 onward. This is the
+            // dispatch-time analog of the decode-path `apply_causal_conv1d` rolling buffer
+            // proven in `gdn_fused::tests::gated_delta_net_step_fused_k_poison_window_state_isolation_production_kernel`.
+            //
+            // Reference construction (same reasoning as the decode-path test above): BOTH
+            // poisoned and reference runs hold the target head's whole channel-span
+            // exactly zero for tokens 0..ks (the full contamination window), differing
+            // only by the single NaN scalar at [token 0, poisoned_channel]. Tokens ks..N-1
+            // ("at least 4 subsequent clean tokens") use ordinary ORDINARY per-token
+            // random data identically in both runs. Whole-vector zero-by-assignment on a
+            // non-finite reduced norm is bit-identical to true-zero-weight arithmetic for
+            // as long as the corruption sits in the window, and the two runs are governed
+            // by the SAME per-token raw array for every clean token, so they are proven
+            // bit-identical, and finite, at every token, with no further guard dependency
+            // once the window closes.
+            // --------------------------------------------------------------
+            #[allow(clippy::too_many_arguments)]
+            fn run_gdn_chunk_materialize_c32_multi_token(
+                device: &Device,
+                queue: &CommandQueue,
+                pipe: &ComputePipelineState,
+                gdn_qkv: &[f32], // [n_tokens, qkv_dim] flat, qkv_dim = 3*KD
+                hidden_in: &[f32],
+                in_proj_b: &[f32],
+                in_proj_a: &[f32],
+                n_tokens: u32,
+            ) -> (Vec<f32>, Vec<f32>) {
+                const KD: u32 = 128;
+                const VD: u32 = 128;
+                const HD: u32 = 16;
+                const BUF_LEN: u32 = 3; // ks - 1
+                let q_total = KD;
+                let v_offset = q_total * 2;
+                let qkv_dim = v_offset + VD;
+
+                let conv_buf_state =
+                    make_zero_buffer(device, (qkv_dim * BUF_LEN) as usize, "conv_buf");
+                let gdn_qkv_buf = f32_buf(device, gdn_qkv, "gdn_qkv");
+                let conv_weight_buf = f32_buf(
+                    device,
+                    &vec![0.25f32; (qkv_dim * 4) as usize],
+                    "conv_weight",
+                );
+                let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
+                let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
+                let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
+                let alog_buf = f32_buf(device, &[-1.0f32], "a_log");
+                let dtb_buf = f32_buf(device, &[0.0f32], "dt_bias");
+                let out_q_buf = make_zero_buffer(device, (KD * n_tokens) as usize, "out_q");
+                let out_k_buf = make_zero_buffer(device, (KD * n_tokens) as usize, "out_k");
+                let out_v_buf = make_zero_buffer(device, (VD * n_tokens) as usize, "out_v");
+                let out_bla_buf = make_zero_buffer(device, (2 * n_tokens) as usize, "out_bla");
+
+                let params = GdnChunkParams {
+                    key_dim: KD,
+                    value_dim: VD,
+                    num_key_heads: 1,
+                    num_value_heads: 1,
+                    hidden_size: HD,
+                    q_total,
+                    v_offset,
+                    qkv_dim,
+                    output_dim: VD,
+                    chunk_size: n_tokens,
+                    n_tokens,
+                    num_chunks: 1,
+                    active_chunk: 0,
+                    scale: 1.0 / (KD as f32).sqrt(),
+                    eps: 1e-6,
+                };
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&conv_buf_state), 0);
+                enc.set_buffer(1, Some(&gdn_qkv_buf), 0);
+                enc.set_buffer(2, Some(&conv_weight_buf), 0);
+                enc.set_buffer(3, Some(&hidden_buf), 0);
+                enc.set_buffer(4, Some(&inb_buf), 0);
+                enc.set_buffer(5, Some(&ina_buf), 0);
+                enc.set_buffer(6, Some(&alog_buf), 0);
+                enc.set_buffer(7, Some(&dtb_buf), 0);
+                enc.set_buffer(8, Some(&out_q_buf), 0);
+                enc.set_buffer(9, Some(&out_k_buf), 0);
+                enc.set_buffer(10, Some(&out_v_buf), 0);
+                enc.set_buffer(11, Some(&out_bla_buf), 0);
+                enc.set_bytes(
+                    12,
+                    std::mem::size_of::<GdnChunkParams>() as u64,
+                    &params as *const GdnChunkParams as *const _,
+                );
+                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(32, 4, 1));
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                (
+                    read_f32(&out_q_buf, (KD * n_tokens) as usize),
+                    read_f32(&out_k_buf, (KD * n_tokens) as usize),
+                )
+            }
+
+            #[test]
+            fn gdn_chunk_materialize_c32_multi_token_k_poison_window_state_isolation() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!(
+                        "skipping gdn_chunk_materialize_c32_multi_token_k_poison_window_state_isolation: no Metal device"
+                    );
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_chunk_materialize_c32");
+                let queue = device.new_command_queue();
+
+                const KD: u32 = 128;
+                const HD: u32 = 16;
+                const WINDOW: u32 = 4; // ks (kernel_size), matches the kernel's constexpr ks=4u
+                const CLEAN_TAIL: u32 = 4; // #862 round-2 major-2: "at least 4 subsequent clean tokens"
+                const N_TOKENS: u32 = WINDOW + CLEAN_TAIL;
+                let qkv_dim = 3 * KD; // [Q(128) | K(128) | V(128)] per token
+                let hidden_in = lcg_vec(41, HD as usize);
+                let in_proj_b = lcg_vec(42, HD as usize);
+                let in_proj_a = lcg_vec(43, HD as usize);
+
+                // K channel span (label fixed to K: the shipping-path production gap
+                // #862 round 1 found; the sibling single-token test above already
+                // covers both Q and K for a single dispatch).
+                let (lo, hi) = (KD as usize, 2 * KD as usize);
+
+                let base = lcg_vec(44, (qkv_dim * N_TOKENS) as usize);
+                let mut poisoned = base.clone();
+                let mut reference = base.clone();
+                // Zero the K channel span for every token in the window (0..WINDOW) in
+                // BOTH runs -- the only reference construction for which "bit-identical
+                // to the poisoned run" is achievable (see module doc comment above).
+                for t in 0..WINDOW {
+                    let row = (t * qkv_dim) as usize;
+                    for v in poisoned[row + lo..row + hi].iter_mut() {
+                        *v = 0.0;
+                    }
+                    for v in reference[row + lo..row + hi].iter_mut() {
+                        *v = 0.0;
+                    }
+                }
+                // Poison exactly one lane, only at token 0.
+                poisoned[lo] = f32::NAN;
+
+                let (outq_p, outk_p) = run_gdn_chunk_materialize_c32_multi_token(
+                    &device, &queue, &pipe, &poisoned, &hidden_in, &in_proj_b, &in_proj_a, N_TOKENS,
+                );
+                let (outq_r, outk_r) = run_gdn_chunk_materialize_c32_multi_token(
+                    &device, &queue, &pipe, &reference, &hidden_in, &in_proj_b, &in_proj_a,
+                    N_TOKENS,
+                );
+
+                assert_no_nonfinite(
+                    "gdn_chunk_materialize_c32[multi-token-K]",
+                    "out_q (all tokens)",
+                    &outq_p,
+                );
+                assert_no_nonfinite(
+                    "gdn_chunk_materialize_c32[multi-token-K]",
+                    "out_k (all tokens)",
+                    &outk_p,
+                );
+                assert_eq!(
+                    outq_p, outq_r,
+                    "gdn_chunk_materialize_c32[multi-token-K-poisoned]: out_q must be \
+                     bit-identical to the never-poisoned (explicit-zero-window) reference \
+                     at every token (Q was never touched by the K poison; this also \
+                     confirms the poison doesn't cross-contaminate the other head channel)"
+                );
+                for t in 0..N_TOKENS as usize {
+                    let row = t * KD as usize;
+                    assert_eq!(
+                        outk_p[row..row + KD as usize],
+                        outk_r[row..row + KD as usize],
+                        "gdn_chunk_materialize_c32[multi-token-K-poisoned]: token {t}'s \
+                         out_k must be bit-identical to the never-poisoned \
+                         (explicit-zero-window) reference -- token {t} is {} the ks={WINDOW} \
+                         contamination window",
+                        if (t as u32) < WINDOW {
+                            "inside"
+                        } else {
+                            "past (fully recovered from)"
+                        }
+                    );
+                }
+            }
+
+            // --------------------------------------------------------------
+            // decode_reference.metal oracle hardening: this kernel is a
+            // frozen test-only correctness oracle (used by the flash-decode
+            // parity suite above), not a live production kernel, but per
+            // #850's checklist it must not itself reproduce the
+            // multiply-through-zero bug class it exists to catch.
+            // --------------------------------------------------------------
+            #[test]
+            fn decode_attention_reference_fails_closed_on_nan_q() {
+                let Some(device) = Device::system_default() else {
+                    eprintln!("skipping decode_attention_reference_fails_closed: no Metal device");
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let opts = CompileOptions::new();
+                let lib = device
+                    .new_library_with_source(MSL_DECODE_REFERENCE, &opts)
+                    .expect("MSL_DECODE_REFERENCE must compile");
+                let pipe = pipeline_for(&device, &lib, "decode_attention_reference");
+                let queue = device.new_command_queue();
+
+                const HEAD_DIM: u32 = 8;
+                const NUM_Q_HEADS: u32 = 1;
+                const NUM_KV_HEADS: u32 = 1;
+                const CACHE_LEN: u32 = 4;
+                let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+                let mut q = lcg_vec(41, HEAD_DIM as usize);
+                q[0] = f32::NAN; // poison one Q lane -> every dot product for this head is NaN
+                let k = lcg_vec(42, (CACHE_LEN * HEAD_DIM) as usize);
+                let v = lcg_vec(43, (CACHE_LEN * HEAD_DIM) as usize);
+
+                let q_buf = f32_buf(&device, &q, "q");
+                let k_buf = f32_buf(&device, &k, "k_cache");
+                let v_buf = f32_buf(&device, &v, "v_cache");
+                let out_buf = make_zero_buffer(&device, HEAD_DIM as usize, "out");
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(&q_buf), 0);
+                enc.set_buffer(1, Some(&k_buf), 0);
+                enc.set_buffer(2, Some(&v_buf), 0);
+                enc.set_buffer(3, Some(&out_buf), 0);
+                enc.set_bytes(4, 4, &CACHE_LEN as *const u32 as *const _);
+                enc.set_bytes(5, 4, &HEAD_DIM as *const u32 as *const _);
+                enc.set_bytes(6, 4, &NUM_Q_HEADS as *const u32 as *const _);
+                enc.set_bytes(7, 4, &NUM_KV_HEADS as *const u32 as *const _);
+                enc.set_bytes(8, 4, &HEAD_DIM as *const u32 as *const _);
+                enc.set_bytes(9, 4, &HEAD_DIM as *const u32 as *const _);
+                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(NUM_Q_HEADS as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                let out = read_f32(&out_buf, HEAD_DIM as usize);
+                let nan_count = out.iter().filter(|v| !v.is_finite()).count();
+                assert_eq!(
+                    nan_count,
+                    0,
+                    "decode_attention_reference must fail closed (zero output) on a \
+                     NaN-poisoned Q lane instead of propagating NaN through the \
+                     `acc * inv_sum` finalize multiply (ADR-080 C1, #850); got \
+                     {nan_count}/{} non-finite elements: {out:?}",
+                    out.len()
+                );
+                assert!(
+                    out.iter().all(|v| *v == 0.0),
+                    "decode_attention_reference must assign the literal 0.0 row on an \
+                     invalid (non-finite) sum_exp, got {out:?}"
+                );
+            }
         }
 
         // -------------------------------------------------------------------
@@ -26449,6 +27774,549 @@ mod inner {
             );
         }
 
+        /// Codex round-1 blocker #1 (PR #787):
+        /// `generate_streaming_with_prefix_cache` never wires per-token
+        /// logprobs capture into its decode loop. Before the fix, a caller
+        /// requesting `gen_cfg.logprobs` got `Ok` back with silently empty
+        /// `token_logprobs` -- the exact silent-omission defect ADR-080 C3's
+        /// apply-or-fail-closed contract exists to close. The guard must
+        /// reject the request before any cache/state mutation, so no cache
+        /// entry is created (or consumed) for the rejected call.
+        ///
+        /// Mutation sensitivity: removing the `check_logprobs_not_set` call
+        /// at the top of `generate_streaming_with_prefix_cache_and_cancel_inner`
+        /// makes this assertion fail (the call returns `Ok` with empty
+        /// `token_logprobs` instead of `Err`).
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_logprobs_request() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: Some(5),
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a logprobs request must fail closed via \
+                 generate_streaming_with_prefix_cache() instead of silently \
+                 returning empty token_logprobs; got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "a logprobs-rejected call must not create or leave a cache \
+                 entry behind -- the guard runs before any state mutation"
+            );
+        }
+
+        /// Codex round-2 medium #3 (PR #787): the round-1 fix guarded the
+        /// NO-entry case, but not the case where a valid entry already
+        /// exists. The public wrapper
+        /// `generate_streaming_with_prefix_cache_and_cancel` used to catch
+        /// EVERY `Err` from `_inner` -- including a preflight-only rejection
+        /// that never attempted cache/state mutation -- and unconditionally
+        /// call `reset_state()` + remove the slot. A caller who warms a live
+        /// cross-turn entry and then makes one invalid (`logprobs`-set)
+        /// call would have that valid entry destroyed even though the
+        /// rejected call touched nothing.
+        ///
+        /// Mutation sensitivity: hoisting the preflight checks in
+        /// `generate_streaming_with_prefix_cache_and_cancel` back below the
+        /// `match` (i.e. routing them through `_inner` again) makes this
+        /// test fail: the wrapper's `Err` arm evicts the warm entry.
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_logprobs_request_preserves_warm_entry() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let warm_cfg = cross_turn_test_gen_cfg(9, 2);
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &warm_cfg,
+                    |_, _| true,
+                )
+                .expect("warm-up call must succeed");
+            let warm_entry = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .expect("precondition: the warm-up call must retain a cache entry")
+                .generic
+                .token_ids
+                .clone();
+
+            let rejected_cfg = GenerateConfig {
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(9, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "ab",
+                &tokenizer,
+                &rejected_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "the logprobs-set call must still fail closed; got {result:?}"
+            );
+
+            let entry_after = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .map(|e| e.generic.token_ids.clone());
+            assert_eq!(
+                entry_after,
+                Some(warm_entry),
+                "a preflight-only rejection must not evict a pre-existing \
+                 cache entry it never touched -- the public wrapper must \
+                 return before its destructive Err-recovery block runs"
+            );
+        }
+
+        /// Codex round-2 medium #4 (PR #787): the prefix-cache path accepts
+        /// `GenerateConfig` but never reads `enable_mtp`, unlike the direct
+        /// Metal `generate()` entry point, which resolves it and delegates
+        /// to `generate_greedy_mtp`. An active MTP request (explicit
+        /// `Some(true)` or `LATTICE_MTP` set with `enable_mtp: None`) must
+        /// be rejected before any cache/state mutation rather than silently
+        /// falling back to plain per-token decode with no MTP applied and
+        /// no indication the request was ignored.
+        ///
+        /// Mutation sensitivity: removing the `check_mtp_not_requested` call
+        /// in `generate_streaming_with_prefix_cache_and_cancel` makes this
+        /// assertion fail (the call returns `Ok` instead of `Err`).
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_active_mtp_request() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+                enable_mtp: Some(true),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "an explicit enable_mtp: Some(true) request must fail closed \
+                 via generate_streaming_with_prefix_cache() instead of \
+                 silently falling back to plain decode; got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "an MTP-rejected call must not create or leave a cache \
+                 entry behind -- the guard runs before any state mutation"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // #835: suffix-content preflight -- `plan_prefix_request` must run
+        // BEFORE `restore_cross_turn_prefix`/`reset_state`, both in the pure
+        // planner (unit tests below) and end-to-end through the public
+        // `generate_streaming_with_prefix_cache` entry point (integration
+        // test below).
+        //
+        // `single_char_vocab_tokenizer`'s vocab exactly matches
+        // `tiny_hybrid_fixture`'s `vocab_size` (32) and has no `<unk>`
+        // fallback, so `tokenize()` can only ever emit ids in `0..32` (any
+        // other character is silently dropped, never mapped to an
+        // out-of-range id -- see `BpeTokenizer::encode_piece_to_ids`). The
+        // out-of-vocab and empty-suffix branches are therefore not directly
+        // reachable through this test fixture's public API, exactly like
+        // `forward_prefill_from`'s own equivalent checks, which
+        // `plan_prefix_request` mirrors byte-for-byte; they are exercised
+        // here as direct (white-box) unit tests of the pure planner
+        // instead. The overflow branch is likewise unreachable through
+        // `generate_streaming_with_prefix_cache` for the SAME reason
+        // `forward_prefill_from`'s original overflow check was for the
+        // prefix-cache caller: `plan.suffix_start + suffix.len()` always
+        // equals `prompt_len` (arithmetic identity over
+        // `&prompt_ids[plan.suffix_start..]`), and `prompt_len >
+        // max_context()` (== `max_cache_len`) is already rejected earlier,
+        // with an `Ok`/`KvFull` result, before a plan is ever computed.
+        // -----------------------------------------------------------------------
+
+        /// Direct (white-box) unit test: an out-of-vocab suffix token id
+        /// must be rejected with the same `InferenceError::InvalidInput`
+        /// shape `forward_prefill_from` uses.
+        #[test]
+        fn plan_prefix_request_rejects_out_of_vocab_suffix_token() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::error::InferenceError;
+            use crate::kv_cache::{PrefixRestorePlan, PrefixReuseMode};
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // cfg.vocab_size == 32 (tiny_hybrid_fixture), so id 32 is out of range.
+            let prompt_ids: Vec<u32> = vec![0, 1, 32];
+            let plan = PrefixRestorePlan {
+                mode: PrefixReuseMode::FullRefill,
+                shared_token_prefix_len: 0,
+                reusable_len: 0,
+                suffix_start: 0,
+                suffix_len: prompt_ids.len(),
+                old_represented_len: 0,
+            };
+
+            let result = state.plan_prefix_request(&prompt_ids, &plan);
+            match result {
+                Err(InferenceError::InvalidInput(msg)) => {
+                    assert!(
+                        msg.contains("out of range"),
+                        "expected an out-of-range message, got: {msg}"
+                    );
+                }
+                other => {
+                    panic!("expected InvalidInput for an out-of-vocab suffix token; got {other:?}")
+                }
+            }
+        }
+
+        /// Direct (white-box) unit test: an empty suffix must be rejected
+        /// with the same `InferenceError::PrefixCache` shape
+        /// `forward_prefill_from` uses.
+        #[test]
+        fn plan_prefix_request_rejects_empty_suffix() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::error::InferenceError;
+            use crate::kv_cache::{PrefixRestorePlan, PrefixReuseMode};
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let prompt_ids: Vec<u32> = vec![0, 1, 2];
+            // suffix_start == prompt_ids.len() -> the selected suffix is empty.
+            let plan = PrefixRestorePlan {
+                mode: PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len: 3 },
+                shared_token_prefix_len: 3,
+                reusable_len: 3,
+                suffix_start: 3,
+                suffix_len: 0,
+                old_represented_len: 3,
+            };
+
+            let result = state.plan_prefix_request(&prompt_ids, &plan);
+            match result {
+                Err(InferenceError::PrefixCache(msg)) => {
+                    assert!(
+                        msg.contains("empty suffix"),
+                        "expected an empty-suffix message, got: {msg}"
+                    );
+                }
+                other => panic!("expected PrefixCache for an empty suffix; got {other:?}"),
+            }
+        }
+
+        /// Direct (white-box) unit test: a suffix whose
+        /// `suffix_start + len` overflows `max_cache_len` must be rejected
+        /// with the same `InferenceError::InvalidInput` shape
+        /// `forward_prefill_from` uses.
+        #[test]
+        fn plan_prefix_request_rejects_suffix_overflowing_max_cache_len() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::error::InferenceError;
+            use crate::kv_cache::{PrefixRestorePlan, PrefixReuseMode};
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            // max_cache_len = 32.
+            let state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // 40 valid ids (all < vocab_size=32 by value % 26), total length
+            // 40 > max_cache_len 32.
+            let prompt_ids: Vec<u32> = (0..40u32).map(|i| i % 26).collect();
+            let plan = PrefixRestorePlan {
+                mode: PrefixReuseMode::FullRefill,
+                shared_token_prefix_len: 0,
+                reusable_len: 0,
+                suffix_start: 0,
+                suffix_len: prompt_ids.len(),
+                old_represented_len: 0,
+            };
+
+            let result = state.plan_prefix_request(&prompt_ids, &plan);
+            match result {
+                Err(InferenceError::InvalidInput(msg)) => {
+                    assert!(
+                        msg.contains("exceeds max_cache_len"),
+                        "expected an exceeds-max_cache_len message, got: {msg}"
+                    );
+                }
+                other => panic!(
+                    "expected InvalidInput for a suffix overflowing max_cache_len; got {other:?}"
+                ),
+            }
+        }
+
+        /// Mutation-sensitive end-to-end regression test (#835): a warmed
+        /// cross-turn slot, followed by a request whose planner-selected
+        /// suffix is empty, must fail closed via
+        /// `generate_streaming_with_prefix_cache` WITHOUT consuming the
+        /// warm entry or touching live KV/GDN state.
+        ///
+        /// The empty-suffix shape is reached here through
+        /// `ReplayFromCheckpoint`: the warm-up call retains a real entry
+        /// for `"abcdef"` (`represented_len == 6`); a synthetic checkpoint
+        /// is then injected at `len == 2` (same boundary a real earlier
+        /// turn's `save_cross_turn_prefix` could have retained -- its
+        /// snapshot content is never read because validation now rejects
+        /// the request before `restore_cross_turn_prefix` would apply it).
+        /// A follow-up request for `"ab"` shares its entire (2-token)
+        /// length with both the entry and the checkpoint, so
+        /// `plan_cross_turn_reuse` selects `ReplayFromCheckpoint { checkpoint_len: 2 }`
+        /// with `suffix_start == 2 == new_prompt_ids.len()` -- an empty
+        /// suffix, exactly the shape `forward_prefill_from` has always
+        /// rejected, but which (pre-#835) only failed *after*
+        /// `restore_cross_turn_prefix` had already `take()`n the entry out
+        /// of the slot.
+        ///
+        /// Mutation sensitivity: reverting the hoist (moving the
+        /// `plan_prefix_request` calls in both the public wrapper and
+        /// `_inner` to after their respective destructive
+        /// match/`restore_cross_turn_prefix` calls) turns this test red --
+        /// the warm entry is destroyed by the rejected call instead of
+        /// preserved. Verified by hand for this PR (see PR description).
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_empty_replay_suffix_preserves_warm_entry() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            // Warm up with "abcdef" (6 valid, distinct single-char tokens).
+            let warm_cfg = cross_turn_test_gen_cfg(11, 1);
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "abcdef",
+                    &tokenizer,
+                    &warm_cfg,
+                    |_, _| true,
+                )
+                .expect("warm-up call must succeed");
+
+            // Inject a synthetic checkpoint at len=2 on the live warm entry,
+            // simulating a retained earlier-turn boundary. Its snapshot
+            // content is irrelevant: the request this checkpoint would
+            // otherwise serve is rejected before the snapshot is ever read.
+            {
+                let entry = state
+                    .cross_turn_prefix_cache
+                    .entry
+                    .as_mut()
+                    .expect("precondition: warm-up call must retain a cache entry");
+                let dummy_snapshot = entry.gdn_snapshot.clone();
+                entry.checkpoints.push(MetalGdnCheckpoint {
+                    len: 2,
+                    snapshot: dummy_snapshot,
+                });
+            }
+
+            let warm_token_ids_before = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .unwrap()
+                .generic
+                .token_ids
+                .clone();
+            let kv_seq_len_before = state.session.kv_cache.seq_len;
+            let position_before = state.session.position;
+
+            // Follow-up "ab": shares its full (2-token) length with the
+            // entry AND the injected checkpoint at len=2 -> empty suffix.
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "ab",
+                &tokenizer,
+                &cross_turn_test_gen_cfg(12, 1),
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::PrefixCache(_))),
+                "an empty-suffix request must fail closed via \
+                 generate_streaming_with_prefix_cache(); got {result:?}"
+            );
+
+            let entry_after = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .map(|e| e.generic.token_ids.clone());
+            assert_eq!(
+                entry_after,
+                Some(warm_token_ids_before.clone()),
+                "an empty-suffix rejection must not evict or consume the \
+                 warm entry -- validation must run before \
+                 restore_cross_turn_prefix's take()"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len, kv_seq_len_before,
+                "live KV length must be unchanged by a rejected request"
+            );
+            assert_eq!(
+                state.session.position, position_before,
+                "live GDN position must be unchanged by a rejected request"
+            );
+
+            // Second gate requirement: a subsequent VALID suffix on the
+            // same slot must still select the same (ExactAppend) reuse mode
+            // and produce output identical to a full-refill baseline --
+            // proving the preserved entry is genuinely intact, not just
+            // present-but-stale. The warm-up call's `max_new_tokens: 1`
+            // means the entry the natural end-of-generation save path
+            // retains is `"abcdef"` PLUS whatever single token was sampled
+            // (`crates/inference/src/forward/metal_qwen35.rs`'s
+            // `represented_token_ids = prompt_ids + generated_ids[..]`), not
+            // `"abcdef"` alone -- so the follow-up prompt is built from the
+            // entry's OWN persisted token ids (round-tripped back through
+            // `single_char_vocab_tokenizer`'s bijective single-char vocab)
+            // plus two more valid characters, guaranteeing an exact-prefix
+            // extension regardless of which token was actually sampled.
+            fn id_to_char(id: u32) -> char {
+                if id < 26 {
+                    (b'a' + id as u8) as char
+                } else {
+                    (b'A' + (id - 26) as u8) as char
+                }
+            }
+            let mut follow_up_prompt: String = warm_token_ids_before
+                .iter()
+                .map(|&id| id_to_char(id))
+                .collect();
+            follow_up_prompt.push_str("xy");
+
+            let follow_up = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &follow_up_prompt,
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(13, 2),
+                    |_, _| true,
+                )
+                .expect("a valid follow-up on the preserved slot must succeed");
+            assert_eq!(
+                follow_up.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "the preserved entry must still be reusable via ExactAppend"
+            );
+
+            let mut baseline_state =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let baseline = baseline_state
+                .generate_streaming_with_cancel(
+                    &follow_up_prompt,
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(13, 2),
+                    |_, _| true,
+                    || false,
+                )
+                .expect("full-refill baseline must succeed");
+            assert_eq!(
+                follow_up.output.token_ids, baseline.token_ids,
+                "output after the preserved-entry reuse must match a \
+                 full-refill baseline bit-for-bit (token-identity invariant)"
+            );
+        }
+
         // -----------------------------------------------------------------------
         // Grammar fail-closed DECODE-LOOP integration tests (#611
         // finding, medium)
@@ -27601,6 +29469,12 @@ mod topk_boundary_tie_tests {
 /// wired into this path either, so `gen_cfg.logprobs` is rejected the same
 /// way rather than silently returning an empty `token_logprobs`.
 ///
+/// Reasoning-budget forcing (ADR-080 C3, #783) is not wired into this path
+/// either (no `decode_cap` / `force_close_think`), so `gen_cfg.reasoning_budget`
+/// is rejected the same way. `gen_cfg.stop_strings` does NOT need an
+/// equivalent guard here: `generate_multimodal` already applies it via its own
+/// `stop_text_state` / `StopStringMatcher` wiring further down.
+///
 /// Compiled when Metal-GPU is enabled (the production caller lives inside
 /// `mod inner`) or during test builds so that the module-level test can
 /// exercise the guard logic on any platform without GPU hardware.
@@ -27609,7 +29483,8 @@ pub(crate) fn multimodal_generate_preflight(
     gen_cfg: &crate::model::qwen35_config::GenerateConfig,
 ) -> Result<(), crate::error::InferenceError> {
     crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
-    crate::model::qwen35::check_logprobs_not_set(gen_cfg)
+    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+    crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)
 }
 
 #[cfg(test)]
@@ -27682,6 +29557,39 @@ mod multimodal_preflight_tests {
         assert!(
             multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
             "logprobs = None must not trigger the preflight guard"
+        );
+    }
+
+    /// Reasoning-budget forcing (ADR-080 C3, #783) is not wired into the
+    /// multimodal path; the preflight must reject a config with
+    /// `reasoning_budget` set rather than silently returning an unbudgeted
+    /// output.
+    ///
+    /// Mutation sensitivity: change `multimodal_generate_preflight` to always
+    /// return `Ok(())` (or drop the new `check_reasoning_budget_not_set` call)
+    /// → `result.is_err()` below fails, catching the regression.
+    #[test]
+    fn generate_multimodal_reasoning_budget_guard_rejects_budget_config() {
+        let cfg_with_budget = GenerateConfig {
+            reasoning_budget: Some(32),
+            ..Default::default()
+        };
+
+        let result = multimodal_generate_preflight(&cfg_with_budget);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "multimodal preflight must return InvalidInput when reasoning_budget is set; \
+             got {result:?}"
+        );
+    }
+
+    /// A config with `reasoning_budget` unset must pass through the preflight
+    /// without error.
+    #[test]
+    fn generate_multimodal_reasoning_budget_guard_allows_no_budget() {
+        assert!(
+            multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
+            "reasoning_budget = None must not trigger the preflight guard"
         );
     }
 }
@@ -28425,7 +30333,7 @@ mod mtp_greedy_round_tests {
     fn plain_greedy_oracle(logit_rows: &[Vec<f32>], max_len: usize) -> Vec<u32> {
         let mut out = Vec::new();
         for row in logit_rows.iter().take(max_len) {
-            let token = argmax(row);
+            let token = crate::speculative::argmax(row) as u32;
             if is_stop(token) {
                 break;
             }
@@ -28434,14 +30342,19 @@ mod mtp_greedy_round_tests {
         out
     }
 
-    fn argmax(logits: &[f32]) -> u32 {
-        logits
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0)
+    // Regression test (#806): the oracle's argmax must be first-wins, matching
+    // `crate::speculative::argmax`'s documented tie-break contract. A last-wins
+    // oracle would silently mask a first-wins regression in the production
+    // Metal decode path whenever two logits tie exactly.
+    #[test]
+    fn plain_greedy_oracle_argmax_is_first_wins_on_ties() {
+        let logit_rows = vec![vec![1.0, 1.0, 0.0]];
+        let out = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(
+            out,
+            vec![0],
+            "tie must resolve to the first index, not the last"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -28478,7 +30391,7 @@ mod mtp_greedy_round_tests {
             if out.len() >= max_len {
                 break;
             }
-            let pending_token = argmax(&logit_rows[pos]);
+            let pending_token = crate::speculative::argmax(&logit_rows[pos]) as u32;
 
             // Case A: pending is a stop token. Stop-token contract (#613):
             // excluded from the output. For subsequent rounds,
@@ -28504,15 +30417,15 @@ mod mtp_greedy_round_tests {
             draft_idx += 1;
 
             let target_logits_0 = &logit_rows[pos + 1];
-            let accepted = draft_token == argmax(target_logits_0);
+            let accepted = draft_token == crate::speculative::argmax(target_logits_0) as u32;
             let bonus_token = if accepted {
                 if pos + 2 < logit_rows.len() {
-                    argmax(&logit_rows[pos + 2])
+                    crate::speculative::argmax(&logit_rows[pos + 2]) as u32
                 } else {
                     0 // no further prediction available; use 0 (non-stop)
                 }
             } else {
-                argmax(target_logits_0)
+                crate::speculative::argmax(target_logits_0) as u32
             };
 
             match mtp_greedy_round(pending_token, draft_token, accepted, bonus_token, is_stop) {
@@ -28954,7 +30867,10 @@ mod mtp_greedy_round_tests {
                 oracle,
                 mtp,
                 "trial {trial}: oracle != mtp\n  logit_winners={:?}\n  draft_seq={:?}\n  oracle={:?}\n  mtp={:?}",
-                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                logit_rows
+                    .iter()
+                    .map(|r| crate::speculative::argmax(r) as u32)
+                    .collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
                 mtp
@@ -29000,7 +30916,10 @@ mod mtp_greedy_round_tests {
                 oracle,
                 mtp,
                 "trial {trial} (max_len={max_len}): oracle != mtp\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  mtp={:?}",
-                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                logit_rows
+                    .iter()
+                    .map(|r| crate::speculative::argmax(r) as u32)
+                    .collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
                 mtp
@@ -29090,7 +31009,7 @@ mod mtp_greedy_round_tests {
             if out.len() >= max_len {
                 break;
             }
-            let pending_token = argmax(&logit_rows[pos]);
+            let pending_token = crate::speculative::argmax(&logit_rows[pos]) as u32;
             if is_stop(pending_token) {
                 // Stop-token contract (#613): excluded from `out`. The
                 // loop-top guard already confirmed out.len() < max_len, so
@@ -29111,15 +31030,15 @@ mod mtp_greedy_round_tests {
             draft_idx += 1;
 
             let target_logits_0 = &logit_rows[pos + 1];
-            let accepted = draft_token == argmax(target_logits_0);
+            let accepted = draft_token == crate::speculative::argmax(target_logits_0) as u32;
             let bonus_token = if accepted {
                 if pos + 2 < logit_rows.len() {
-                    argmax(&logit_rows[pos + 2])
+                    crate::speculative::argmax(&logit_rows[pos + 2]) as u32
                 } else {
                     0
                 }
             } else {
-                argmax(target_logits_0)
+                crate::speculative::argmax(target_logits_0) as u32
             };
 
             match mtp_greedy_round(pending_token, draft_token, accepted, bonus_token, is_stop) {
@@ -29330,16 +31249,6 @@ mod self_spec_eos_tests {
         id == EOS
     }
 
-    fn argmax(logits: &[f32]) -> u32 {
-        logits
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0)
-    }
-
     // -----------------------------------------------------------------------
     // Plain-greedy oracle: check is_stop, then push, bounded by max_len.
     // Stop-token contract (#613): the stop token is never in the output — it
@@ -29349,13 +31258,28 @@ mod self_spec_eos_tests {
     fn plain_greedy_oracle(logit_rows: &[Vec<f32>], max_len: usize) -> Vec<u32> {
         let mut out = Vec::new();
         for row in logit_rows.iter().take(max_len) {
-            let token = argmax(row);
+            let token = crate::speculative::argmax(row) as u32;
             if is_stop(token) {
                 break;
             }
             out.push(token);
         }
         out
+    }
+
+    // Regression test (#806): the oracle's argmax must be first-wins, matching
+    // `crate::speculative::argmax`'s documented tie-break contract. A last-wins
+    // oracle would silently mask a first-wins regression in the production
+    // Metal decode path whenever two logits tie exactly.
+    #[test]
+    fn plain_greedy_oracle_argmax_is_first_wins_on_ties() {
+        let logit_rows = vec![vec![1.0, 1.0, 0.0]];
+        let out = plain_greedy_oracle(&logit_rows, 1);
+        assert_eq!(
+            out,
+            vec![0],
+            "tie must resolve to the first index, not the last"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -29398,7 +31322,7 @@ mod self_spec_eos_tests {
         // max_new_tokens==0 guard already returns separately (Length)
         // before this check ever runs, so budget is never the reason this
         // branch produces an empty output.
-        let pending_first = argmax(&logit_rows[pos]);
+        let pending_first = crate::speculative::argmax(&logit_rows[pos]) as u32;
         if is_stop(pending_first) {
             return out;
         }
@@ -29418,7 +31342,7 @@ mod self_spec_eos_tests {
                 if out.len() >= max_len || pos + 1 >= logit_rows.len() {
                     break;
                 }
-                let next = argmax(&logit_rows[pos + 1]);
+                let next = crate::speculative::argmax(&logit_rows[pos + 1]) as u32;
                 // Stop-token contract (#613): never push the terminating token.
                 if is_stop(next) {
                     break;
@@ -29436,7 +31360,7 @@ mod self_spec_eos_tests {
             round += 1;
 
             // Verify: target agrees with draft if argmax(logit_rows[pos+1]) == draft.
-            let target_at_pos1 = argmax(&logit_rows[pos + 1]);
+            let target_at_pos1 = crate::speculative::argmax(&logit_rows[pos + 1]) as u32;
             let accepted = target_at_pos1 == draft;
 
             if accepted {
@@ -29459,7 +31383,7 @@ mod self_spec_eos_tests {
                 if next_pending_pos >= logit_rows.len() {
                     break;
                 }
-                let next_pending = argmax(&logit_rows[next_pending_pos]);
+                let next_pending = crate::speculative::argmax(&logit_rows[next_pending_pos]) as u32;
                 // Stop-token contract (#613): never push next_pending when
                 // it is itself the stop.
                 if is_stop(next_pending) {
@@ -29747,7 +31671,10 @@ mod self_spec_eos_tests {
                 oracle,
                 sim,
                 "trial {trial} (fallback={fallback}): oracle != sim\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  sim={:?}",
-                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                logit_rows
+                    .iter()
+                    .map(|r| crate::speculative::argmax(r) as u32)
+                    .collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
                 sim,
@@ -29792,7 +31719,10 @@ mod self_spec_eos_tests {
                 oracle,
                 sim,
                 "trial {trial} (max_len={max_len}, fallback={fallback}): oracle != sim\n  winners={:?}\n  draft={:?}\n  oracle={:?}\n  sim={:?}",
-                logit_rows.iter().map(|r| argmax(r)).collect::<Vec<_>>(),
+                logit_rows
+                    .iter()
+                    .map(|r| crate::speculative::argmax(r) as u32)
+                    .collect::<Vec<_>>(),
                 draft_seq,
                 oracle,
                 sim,
@@ -29861,7 +31791,7 @@ mod self_spec_eos_tests {
         let mut stopped = false;
         let mut pos = 0usize;
 
-        let pending_first = argmax(&logit_rows[pos]);
+        let pending_first = crate::speculative::argmax(&logit_rows[pos]) as u32;
         if is_stop(pending_first) {
             // Stop-token contract (#613): excluded from `out` regardless of
             // budget. `stopped` still reflects whether budget was available
@@ -29888,7 +31818,7 @@ mod self_spec_eos_tests {
                 // simulation mutation-sensitive for FIX 2: when budget is exactly full
                 // after pushing pending, the stop token is clipped → stopped stays false.
                 if pos + 1 < logit_rows.len() {
-                    let next = argmax(&logit_rows[pos + 1]);
+                    let next = crate::speculative::argmax(&logit_rows[pos + 1]) as u32;
                     if is_stop(next) {
                         // Stop-token contract (#613): never push `next`.
                         // FIX 2: stopped=true only when budget allowed
@@ -29912,7 +31842,7 @@ mod self_spec_eos_tests {
             let draft = draft_seq[round];
             round += 1;
 
-            let target_at_pos1 = argmax(&logit_rows[pos + 1]);
+            let target_at_pos1 = crate::speculative::argmax(&logit_rows[pos + 1]) as u32;
             let accepted = target_at_pos1 == draft;
 
             if accepted {
@@ -29937,7 +31867,7 @@ mod self_spec_eos_tests {
                 if next_pending_pos >= logit_rows.len() {
                     break;
                 }
-                let next_pending = argmax(&logit_rows[next_pending_pos]);
+                let next_pending = crate::speculative::argmax(&logit_rows[next_pending_pos]) as u32;
                 if is_stop(next_pending) {
                     // Stop-token contract (#613): never push next_pending.
                     // FIX 2 (full-accept path): stopped only when budget

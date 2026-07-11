@@ -33,28 +33,20 @@
 //        [--steps 25] [--lr 1e-3] [--rank 8] [--alpha 16] [--max-train 3]
 //        [--seq-len 64] [--gradcheck]
 
-use std::io::BufRead;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use lattice_inference::model::qwen35::Qwen35Model;
 use lattice_inference::tokenizer::Tokenizer;
 use lattice_tune::lora::AdamState;
 use lattice_tune::lora::train_core::{
-    Dims, GdnDims, Head, LayerW, LoraParams, MixerKind, SeqCtx, TOP_LAYER, apply_adam_updates,
+    AdamConfig, Dims, GdnDims, GdnLoraParams, Head, LayerW, LoraParams, MixerKind, SeqCtx,
+    SlotLayout, TOP_LAYER, TapeGeometry, TrainCtx, apply_adam_updates, apply_gdn_adam_updates,
     eval_chain_nll, forward_full, nll_and_grads, rand_fill, shifted,
 };
 
-fn parse_arg(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-}
-
-fn parse_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|a| a == flag)
-}
+mod train_common;
+use train_common::{ArgView, load_jsonl, verify_tbv};
 
 fn usage() {
     eprintln!(
@@ -75,68 +67,9 @@ Options:
   --save        <PATH>   Save trained adapter as a PEFT safetensors file (requires --features safetensors)
   --gradcheck            Run finite-difference gradcheck instead of training
   --probe       <N>      Gradcheck entries probed per array per layer (default: 6)
+  --fd-eps      <F>      Gradcheck central-difference step (default: 4e-3)
   -h, --help             Print this help"
     );
-}
-
-fn default_model_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".lattice")
-        .join("models")
-        .join("qwen3.5-0.8b")
-}
-
-struct Sample {
-    tokens: Vec<u32>,
-    completion_start: usize,
-}
-
-fn load_jsonl(
-    path: &Path,
-    tokenizer: &dyn Tokenizer,
-    seq_len: usize,
-    max_samples: usize,
-) -> Result<Vec<Sample>, Box<dyn std::error::Error>> {
-    let file = std::fs::File::open(path)?;
-    let reader = std::io::BufReader::new(file);
-    let mut out = Vec::new();
-    for line in reader.lines() {
-        if out.len() >= max_samples {
-            break;
-        }
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = serde_json::from_str(line)?;
-        let prompt = v["prompt"].as_str().unwrap_or("").to_string();
-        let completion = v["completion"].as_str().unwrap_or("").to_string();
-        if prompt.is_empty() || completion.is_empty() {
-            continue;
-        }
-        let mut full = prompt.clone();
-        full.push_str(&completion);
-        let prompt_tok = tokenizer.tokenize(&prompt);
-        let full_tok = tokenizer.tokenize(&full);
-        let prompt_ids: Vec<u32> = prompt_tok.input_ids[..prompt_tok.real_length].to_vec();
-        let full_ids: Vec<u32> = full_tok.input_ids[..full_tok.real_length].to_vec();
-        let total = full_ids.len();
-        if total < 2 || total > seq_len {
-            continue;
-        }
-        let completion_start = prompt_ids.len();
-        if completion_start == 0 || completion_start >= total {
-            continue;
-        }
-        out.push(Sample {
-            tokens: full_ids,
-            completion_start,
-        });
-    }
-    Ok(out)
 }
 
 /// Capture the frozen-prefix output (h_in entering `first_layer`) and RoPE
@@ -144,7 +77,7 @@ fn load_jsonl(
 /// Returns the caches plus the total number of masked completion positions.
 fn build_caches(
     model: &Qwen35Model,
-    samples: &[Sample],
+    samples: &[train_common::Sample],
     first_layer: usize,
 ) -> Result<(Vec<SeqCtx>, usize), Box<dyn std::error::Error>> {
     let mut caches = Vec::with_capacity(samples.len());
@@ -194,60 +127,193 @@ fn strided_probes(len: usize, count: usize, seed: u64) -> Vec<usize> {
     out
 }
 
+/// Gradcheck-mode GDN LoRA initialization: every array (A and B) filled with
+/// small non-zero random noise, so both `grad_A` and the gate path are
+/// non-vacuous for the finite-difference probe.
+///
+/// Extracted into a standalone, testable function per #792 codex round-2:
+/// this is the exact constructor that had drifted to `gdn_dims.num_kh` for
+/// `b_b`/`b_a` while `GdnLoraParams::zeros` (fixed in round-1) used the
+/// correct `value_heads`. Now routes through `GdnLoraParams::shaped`, the
+/// single shape source of truth.
+fn gradcheck_gdn_loras(
+    num_gdn_slots: usize,
+    rank: usize,
+    hidden: usize,
+    gdn_dims: &GdnDims,
+    seed: u64,
+) -> Vec<GdnLoraParams> {
+    // rand_fill takes `&mut u64`; two closures can't each hold that mutable
+    // borrow as separate `shaped` arguments, so thread it through a `Cell`
+    // (each closure captures `&rng_cell`, a shared reference, so both can
+    // coexist as separate arguments).
+    let rng_cell = std::cell::Cell::new(seed);
+    (0..num_gdn_slots)
+        .map(|_| {
+            GdnLoraParams::shaped(
+                rank,
+                hidden,
+                gdn_dims,
+                |n| {
+                    let mut r = rng_cell.get();
+                    let v = rand_fill(&mut r, n, 0.05);
+                    rng_cell.set(r);
+                    v
+                },
+                |n| {
+                    let mut r = rng_cell.get();
+                    let v = rand_fill(&mut r, n, 0.05);
+                    rng_cell.set(r);
+                    v
+                },
+            )
+            .expect("gdn lora gradcheck-mode shapes should not overflow")
+        })
+        .collect()
+}
+
+/// Training-mode GDN LoRA initialization: A ~ U(-init_amp, +init_amp), B
+/// zero (delta=0 at init reproduces the base; grad_B != 0 so B moves first).
+///
+/// Extracted into a standalone, testable function per #792 codex round-2:
+/// see [`gradcheck_gdn_loras`] for why this must route through
+/// `GdnLoraParams::shaped` rather than re-deriving `b_b`/`b_a`'s length
+/// inline (the same drift existed at this call site independently).
+fn zero_b_gdn_loras(
+    num_gdn_slots: usize,
+    rank: usize,
+    hidden: usize,
+    gdn_dims: &GdnDims,
+    seed: u64,
+    init_amp: f32,
+) -> Vec<GdnLoraParams> {
+    let mut rng = seed;
+    (0..num_gdn_slots)
+        .map(|_| {
+            GdnLoraParams::shaped(
+                rank,
+                hidden,
+                gdn_dims,
+                |n| rand_fill(&mut rng, n, init_amp),
+                |n| vec![0.0; n],
+            )
+            .expect("gdn lora training-mode shapes should not overflow")
+        })
+        .collect()
+}
+
+/// Typed CLI config for `train_grad_full`. Field defaults are the documented
+/// contract in `usage()` and issue #845's flag table — the snapshot tests
+/// below pin them. `--fd-eps` is undocumented-but-live (issue #845): kept
+/// exactly as before, now also documented in `usage()`.
+#[derive(Debug)]
+struct Config {
+    model_dir: PathBuf,
+    data_dir: PathBuf,
+    first_layer: usize,
+    steps: usize,
+    lr: f32,
+    rank: usize,
+    alpha: f32,
+    seq_len_cap: usize,
+    max_train: usize,
+    max_valid: usize,
+    log_every: usize,
+    gradcheck: bool,
+    probe: usize,
+    fd_eps: f32,
+    save_path: Option<String>,
+}
+
+fn parse_config(argv: &ArgView) -> Result<Config, String> {
+    let log_every: usize = argv
+        .arg("--log-every")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    if log_every == 0 {
+        return Err("--log-every must be >= 1".to_string());
+    }
+    Ok(Config {
+        model_dir: argv
+            .arg("--model-dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(train_common::default_model_dir),
+        data_dir: argv
+            .arg("--data-dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(train_common::default_data_dir),
+        first_layer: argv
+            .arg("--first-layer")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(19),
+        steps: argv
+            .arg("--steps")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(25),
+        lr: argv
+            .arg("--lr")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1e-3),
+        rank: argv.arg("--rank").and_then(|s| s.parse().ok()).unwrap_or(8),
+        alpha: argv
+            .arg("--alpha")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16.0),
+        seq_len_cap: argv
+            .arg("--seq-len")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64),
+        max_train: argv
+            .arg("--max-train")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3),
+        max_valid: argv
+            .arg("--max-valid")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(16),
+        log_every,
+        gradcheck: argv.flag("--gradcheck"),
+        probe: argv
+            .arg("--probe")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6),
+        // Central-difference step. On the real f32 model (hidden 1024, vocab
+        // 248320, multi-layer GDN recurrence) the NLL carries ~1e-6 roundoff,
+        // so too-small a step is roundoff-dominated. Optimal central-FD step
+        // ≈ cbrt(roundoff) ≈ 4e-3.
+        fd_eps: argv
+            .arg("--fd-eps")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4e-3),
+        save_path: argv.arg("--save"),
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if parse_flag(&args, "-h") || parse_flag(&args, "--help") {
+    let argv = ArgView::new(&args);
+    if argv.flag("-h") || argv.flag("--help") {
         usage();
         return Ok(());
     }
 
-    let model_dir = parse_arg(&args, "--model-dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_model_dir);
-    let data_dir = parse_arg(&args, "--data-dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("data/lora-train"));
-    let first_layer: usize = parse_arg(&args, "--first-layer")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(19);
-    let steps: usize = parse_arg(&args, "--steps")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(25);
-    let lr: f32 = parse_arg(&args, "--lr")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-3);
-    let rank: usize = parse_arg(&args, "--rank")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8);
-    let alpha: f32 = parse_arg(&args, "--alpha")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16.0);
-    let seq_len_cap: usize = parse_arg(&args, "--seq-len")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
-    let max_train: usize = parse_arg(&args, "--max-train")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
-    let max_valid: usize = parse_arg(&args, "--max-valid")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
-    let log_every: usize = parse_arg(&args, "--log-every")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
-    if log_every == 0 {
-        return Err("--log-every must be >= 1".into());
-    }
-    let gradcheck = parse_flag(&args, "--gradcheck");
-    let probe: usize = parse_arg(&args, "--probe")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(6);
-    // Central-difference step. On the real f32 model (hidden 1024, vocab 248320,
-    // multi-layer GDN recurrence) the NLL carries ~1e-6 roundoff, so too-small a
-    // step is roundoff-dominated. Optimal central-FD step ≈ cbrt(roundoff) ≈ 4e-3.
-    let fd_eps: f32 = parse_arg(&args, "--fd-eps")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(4e-3);
-    let save_path = parse_arg(&args, "--save");
+    let Config {
+        model_dir,
+        data_dir,
+        first_layer,
+        steps,
+        lr,
+        rank,
+        alpha,
+        seq_len_cap,
+        max_train,
+        max_valid,
+        log_every,
+        gradcheck,
+        probe,
+        fd_eps,
+        save_path,
+    } = parse_config(&argv)?;
 
     if first_layer > TOP_LAYER {
         return Err(format!("--first-layer {first_layer} must be <= {TOP_LAYER}").into());
@@ -285,7 +351,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eps: cfg.rms_norm_eps,
     };
     let gdn_dims = GdnDims::from_cfg(&cfg);
-    let scale = alpha / rank as f32;
     println!(
         "  hidden={}  vocab={}  q_dim={}  kv_dim={}  inter={}",
         dims.hidden, dims.vocab, dims.q_dim, dims.kv_dim, dims.inter
@@ -300,9 +365,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Build the materialised layer stack [first_layer ..= 23], assigning a LoRA
-    // slot to each GQA layer. All weight slices are borrowed from `model`.
+    // slot to every layer: GQA layers get a slot into `loras` (surface-A,
+    // q_proj/v_proj), GDN layers get a slot into `gdn_loras` (surface-B, the
+    // 5 GDN projections — ported from lattice PR #202). All weight slices are
+    // borrowed from `model`.
     let mut layers: Vec<LayerW> = Vec::new();
-    let mut slot_layers: Vec<usize> = Vec::new(); // global layer index per slot
+    let mut slot_layers: Vec<usize> = Vec::new(); // global layer index per GQA slot
+    let mut gdn_slot_layers: Vec<usize> = Vec::new(); // global layer index per GDN slot
     for layer_idx in first_layer..=TOP_LAYER {
         if let Some((w_q, w_k, w_v, w_o, q_norm, k_norm, pre, post, gate, up, down)) =
             model.gqa_layer_weights(layer_idx)
@@ -326,6 +395,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 lora_slot: Some(slot),
             });
         } else if let Some((gdn, pre, post, gate, up, down)) = model.gdn_layer_weights(layer_idx) {
+            let slot = gdn_slot_layers.len();
+            gdn_slot_layers.push(layer_idx);
             layers.push(LayerW {
                 kind: MixerKind::Gdn,
                 w_q: &[],
@@ -340,7 +411,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 w_gate: gate,
                 w_up: up,
                 w_down: down,
-                lora_slot: None,
+                lora_slot: Some(slot),
             });
         } else {
             return Err(
@@ -349,6 +420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let num_slots = slot_layers.len();
+    let num_gdn_slots = gdn_slot_layers.len();
     let kinds: String = layers
         .iter()
         .map(|l| match l.kind {
@@ -357,18 +429,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     println!(
-        "  materialised {} layers [{}]: {kinds}  ({} GQA LoRA slots at layers {:?})",
+        "  materialised {} layers [{}]: {kinds}  ({} GQA LoRA slots at layers {:?}, \
+         {num_gdn_slots} GDN LoRA slots at layers {:?})",
         layers.len(),
         (first_layer..=TOP_LAYER)
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(","),
         num_slots,
-        slot_layers
+        slot_layers,
+        gdn_slot_layers,
     );
-    if num_slots == 0 {
-        return Err("no GQA layers in range — nothing to train".into());
+    if num_slots == 0 && num_gdn_slots == 0 {
+        return Err("no GQA or GDN layers in range — nothing to train".into());
     }
+
+    let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
+    let train_ctx = TrainCtx::try_new(
+        TapeGeometry::new(&dims, &gdn_dims, &cfg),
+        rank,
+        alpha,
+        SlotLayout::new(&slot_layers, &gdn_slot_layers),
+        AdamConfig::new(lr, beta1, beta2, eps_adam),
+    )?;
 
     let tokenizer = model.tokenizer().clone();
     println!("\nLoading dataset from {}...", data_dir.display());
@@ -439,6 +522,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let zero_loras: Vec<LoraParams> = (0..num_slots)
         .map(|_| LoraParams::zeros(rank, &dims))
         .collect::<Result<Vec<_>, _>>()?;
+    let zero_gdn_loras: Vec<GdnLoraParams> = (0..num_gdn_slots)
+        .map(|_| GdnLoraParams::zeros(rank, dims.hidden, &gdn_dims))
+        .collect::<Result<Vec<_>, _>>()?;
     {
         let s0 = &train_samples[0];
         let model_nlls = model.compute_token_nlls(&s0.tokens)?;
@@ -449,23 +535,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &caches[..1],
             &layers,
             &zero_loras,
+            &zero_gdn_loras,
             &head,
-            &dims,
-            &gdn_dims,
-            &cfg,
-            rank,
-            scale,
+            &train_ctx,
         )?;
-        let diff = (model_masked - chain_masked).abs();
+        let observation = verify_tbv(
+            "train_grad_full assembled chain check (sample 0)",
+            model_masked,
+            chain_masked,
+        )?;
         println!(
-            "\n  TBV (sample 0): model={model_masked:.5}  chain={chain_masked:.5}  diff={diff:.2e}"
+            "\n  TBV (sample 0): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}",
+            observation.diff
         );
-        if diff > 1e-2 {
-            return Err(format!(
-                "TBV failed: assembled chain NLL diverges from real model by {diff:.3e} (>1e-2)"
-            )
-            .into());
-        }
     }
 
     // ---- Gradcheck mode: finite-difference the assembled tape's LoRA grads ----
@@ -481,12 +563,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 b_v: rand_fill(&mut rng, dims.kv_dim * rank, 0.05),
             })
             .collect();
+        let mut gdn_loras: Vec<GdnLoraParams> =
+            gradcheck_gdn_loras(num_gdn_slots, rank, dims.hidden, &gdn_dims, rng);
 
-        let fwd = forward_full(
-            &caches[0], &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-        )?;
-        let (_, _, analytic) =
-            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale)?;
+        let fwd = forward_full(&caches[0], &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+        let (_, _, analytic, gdn_analytic) =
+            nll_and_grads(&fwd, &layers, &loras, &head, &train_ctx)?;
 
         println!("  fd-eps center {fd_eps:.0e}  (per-entry min over 0.25/0.5/1/2x)");
         let mut worst = 0.0f64;
@@ -557,24 +639,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &caches[..1],
                             &layers,
                             &loras,
+                            &gdn_loras,
                             &head,
-                            &dims,
-                            &gdn_dims,
-                            &cfg,
-                            rank,
-                            scale,
+                            &train_ctx,
                         )?;
                         bump(&mut loras, save - e);
                         let lm = eval_chain_nll(
                             &caches[..1],
                             &layers,
                             &loras,
+                            &gdn_loras,
                             &head,
-                            &dims,
-                            &gdn_dims,
-                            &cfg,
-                            rank,
-                            scale,
+                            &train_ctx,
                         )?;
                         let fd = (lp - lm) / (2.0 * e);
                         let rel = (a - fd).abs() as f64 / (a.abs().max(fd.abs()).max(1e-6)) as f64;
@@ -594,6 +670,116 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+        // ---- GDN LoRA slots (surface-B, ported from lattice PR #202) ----
+        for slot in 0..num_gdn_slots {
+            let layer_idx = gdn_slot_layers[slot];
+            for (name, alen) in [
+                ("a_qkv", gdn_analytic[slot].a_qkv.len()),
+                ("b_qkv", gdn_analytic[slot].b_qkv.len()),
+                ("a_z", gdn_analytic[slot].a_z.len()),
+                ("b_z", gdn_analytic[slot].b_z.len()),
+                ("a_b", gdn_analytic[slot].a_b.len()),
+                ("b_b", gdn_analytic[slot].b_b.len()),
+                ("a_a", gdn_analytic[slot].a_a.len()),
+                ("b_a", gdn_analytic[slot].b_a.len()),
+                ("a_out", gdn_analytic[slot].a_out.len()),
+                ("b_out", gdn_analytic[slot].b_out.len()),
+            ] {
+                fn field<'a>(g: &'a GdnLoraParams, name: &str) -> &'a [f32] {
+                    match name {
+                        "a_qkv" => &g.a_qkv,
+                        "b_qkv" => &g.b_qkv,
+                        "a_z" => &g.a_z,
+                        "b_z" => &g.b_z,
+                        "a_b" => &g.a_b,
+                        "b_b" => &g.b_b,
+                        "a_a" => &g.a_a,
+                        "b_a" => &g.b_a,
+                        "a_out" => &g.a_out,
+                        _ => &g.b_out,
+                    }
+                }
+                fn field_mut<'a>(g: &'a mut GdnLoraParams, name: &str) -> &'a mut [f32] {
+                    match name {
+                        "a_qkv" => &mut g.a_qkv,
+                        "b_qkv" => &mut g.b_qkv,
+                        "a_z" => &mut g.a_z,
+                        "b_z" => &mut g.b_z,
+                        "a_b" => &mut g.a_b,
+                        "b_b" => &mut g.b_b,
+                        "a_a" => &mut g.a_a,
+                        "b_a" => &mut g.b_a,
+                        "a_out" => &mut g.a_out,
+                        _ => &mut g.b_out,
+                    }
+                }
+                let agrad = field(&gdn_analytic[slot], name);
+                let mut idxs = top_k_indices(agrad, probe.min(alen));
+                let seed = (100
+                    + slot as u64 * 10
+                    + match name {
+                        "a_qkv" => 0,
+                        "b_qkv" => 1,
+                        "a_z" => 2,
+                        "b_z" => 3,
+                        "a_b" => 4,
+                        "b_b" => 5,
+                        "a_a" => 6,
+                        "b_a" => 7,
+                        "a_out" => 8,
+                        _ => 9,
+                    })
+                    ^ 0xBEEF;
+                for p in strided_probes(alen, probe.min(alen), seed) {
+                    if !idxs.contains(&p) {
+                        idxs.push(p);
+                    }
+                }
+                let mut max_rel = 0.0f64;
+                let mut sum_rel = 0.0f64;
+                for &k in &idxs {
+                    let a = field(&gdn_analytic[slot], name)[k];
+                    let save = field(&gdn_loras[slot], name)[k];
+                    let eps_set = [fd_eps * 0.25, fd_eps * 0.5, fd_eps, fd_eps * 2.0];
+                    let mut best = f64::INFINITY;
+                    for &e in &eps_set {
+                        field_mut(&mut gdn_loras[slot], name)[k] = save + e;
+                        let lp = eval_chain_nll(
+                            &caches[..1],
+                            &layers,
+                            &loras,
+                            &gdn_loras,
+                            &head,
+                            &train_ctx,
+                        )?;
+                        field_mut(&mut gdn_loras[slot], name)[k] = save - e;
+                        let lm = eval_chain_nll(
+                            &caches[..1],
+                            &layers,
+                            &loras,
+                            &gdn_loras,
+                            &head,
+                            &train_ctx,
+                        )?;
+                        let fd = (lp - lm) / (2.0 * e);
+                        let rel = (a - fd).abs() as f64 / (a.abs().max(fd.abs()).max(1e-6)) as f64;
+                        best = best.min(rel);
+                    }
+                    field_mut(&mut gdn_loras[slot], name)[k] = save;
+                    max_rel = max_rel.max(best);
+                    sum_rel += best;
+                }
+                let mean_rel = sum_rel / idxs.len().max(1) as f64;
+                worst = worst.max(max_rel);
+                let ok = max_rel < 2e-2;
+                all_pass &= ok;
+                println!(
+                    "  layer {layer_idx:2} gdn-slot {slot} {name:<5}: mean {mean_rel:.2e}  max {max_rel:.2e}  {}",
+                    if ok { "ok" } else { "FAIL" }
+                );
+            }
+        }
+
         println!("\n  worst rel-err across all probed entries: {worst:.2e}");
         if all_pass {
             println!(
@@ -622,11 +808,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             b_v: vec![0.0; dims.kv_dim * rank],
         })
         .collect();
+    // Reuses `rng`'s current stream position as the seed (matches the prior
+    // inline behavior of drawing from the same generator as `loras` above).
+    let mut gdn_loras: Vec<GdnLoraParams> =
+        zero_b_gdn_loras(num_gdn_slots, rank, dims.hidden, &gdn_dims, rng, init_amp);
 
     let mut adam = AdamState::new();
-    let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
 
-    let eval_valid = |loras: &[LoraParams]| -> Result<Option<f32>, Box<dyn std::error::Error>> {
+    let eval_valid = |loras: &[LoraParams],
+                      gdn_loras: &[GdnLoraParams]|
+     -> Result<Option<f32>, Box<dyn std::error::Error>> {
         if valid_caches.is_empty() {
             return Ok(None);
         }
@@ -634,19 +825,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &valid_caches,
             &layers,
             loras,
+            gdn_loras,
             &head,
-            &dims,
-            &gdn_dims,
-            &cfg,
-            rank,
-            scale,
+            &train_ctx,
         )?))
     };
 
-    let base_nll = eval_chain_nll(
-        &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-    )?;
-    let base_valid = eval_valid(&loras)?;
+    let base_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+    let base_valid = eval_valid(&loras, &gdn_loras)?;
     match base_valid {
         Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
         None => println!("\n  step    0  train NLL: {base_nll:.4}"),
@@ -655,28 +841,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tstep = Instant::now();
     for step in 1..=steps {
         let ctx = &caches[(step - 1) % caches.len()];
-        let fwd = forward_full(
-            ctx, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-        )?;
-        let (_nll, _n, grads) =
-            nll_and_grads(&fwd, &layers, &loras, &head, &dims, num_slots, rank, scale)?;
+        let fwd = forward_full(ctx, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+        let (_nll, _n, grads, gdn_grads) = nll_and_grads(&fwd, &layers, &loras, &head, &train_ctx)?;
 
-        apply_adam_updates(
-            &mut adam,
-            &mut loras,
-            &grads,
-            &slot_layers,
-            lr,
-            beta1,
-            beta2,
-            eps_adam,
-        );
+        apply_adam_updates(&mut adam, &mut loras, &grads, &train_ctx);
+        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train_ctx);
 
         if step % log_every == 0 || step == steps {
-            let mean_nll = eval_chain_nll(
-                &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-            )?;
-            match eval_valid(&loras)? {
+            let mean_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+            match eval_valid(&loras, &gdn_loras)? {
                 Some(v) => println!(
                     "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
                     mean_nll - base_nll
@@ -689,11 +862,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let final_nll = eval_chain_nll(
-        &caches, &layers, &loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-    )?;
+    let final_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
     let secs = tstep.elapsed().as_secs_f64();
-    match (base_valid, eval_valid(&loras)?) {
+    match (base_valid, eval_valid(&loras, &gdn_loras)?) {
         (Some(b), Some(f)) => println!(
             "\n=== done: train {base_nll:.4}→{final_nll:.4} ({:+.4})  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
             final_nll - base_nll,
@@ -733,16 +904,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     },
                 );
             }
+            let mut target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
+            if num_gdn_slots > 0 {
+                target_modules.extend([
+                    "in_proj_qkv".to_string(),
+                    "in_proj_z".to_string(),
+                    "in_proj_b".to_string(),
+                    "in_proj_a".to_string(),
+                    "out_proj".to_string(),
+                ]);
+                // GDN LoRA (surface-B, ported from lattice PR #202). All five
+                // module names are recognised by `LoraAdapter::validate_against`
+                // (crates/tune/src/lora/mod.rs, inference-hook feature).
+                for (slot, &li) in gdn_slot_layers.iter().enumerate() {
+                    let g = &gdn_loras[slot];
+                    adapter_layers.insert(
+                        (li, "in_proj_qkv".to_string()),
+                        LoraLayer {
+                            a: g.a_qkv.clone(),
+                            b: g.b_qkv.clone(),
+                            d_in: dims.hidden,
+                            d_out: gdn_dims.qkv_dim,
+                            rank,
+                        },
+                    );
+                    adapter_layers.insert(
+                        (li, "in_proj_z".to_string()),
+                        LoraLayer {
+                            a: g.a_z.clone(),
+                            b: g.b_z.clone(),
+                            d_in: dims.hidden,
+                            d_out: gdn_dims.output_dim,
+                            rank,
+                        },
+                    );
+                    adapter_layers.insert(
+                        (li, "in_proj_b".to_string()),
+                        LoraLayer {
+                            a: g.a_b.clone(),
+                            b: g.b_b.clone(),
+                            d_in: dims.hidden,
+                            // beta is projected per VALUE head (matches the
+                            // shipping gdn_fused forward and the f16 weight
+                            // loader), not per key head (#792 codex blocker).
+                            d_out: gdn_dims.value_heads,
+                            rank,
+                        },
+                    );
+                    adapter_layers.insert(
+                        (li, "in_proj_a".to_string()),
+                        LoraLayer {
+                            a: g.a_a.clone(),
+                            b: g.b_a.clone(),
+                            d_in: dims.hidden,
+                            // alpha is likewise projected per VALUE head.
+                            d_out: gdn_dims.value_heads,
+                            rank,
+                        },
+                    );
+                    adapter_layers.insert(
+                        (li, "out_proj".to_string()),
+                        LoraLayer {
+                            a: g.a_out.clone(),
+                            b: g.b_out.clone(),
+                            d_in: gdn_dims.output_dim,
+                            d_out: dims.hidden,
+                            rank,
+                        },
+                    );
+                }
+            }
             let config = LoraConfig {
                 rank,
                 alpha,
-                target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+                target_modules,
             };
             let adapter = LoraAdapter::new(config, adapter_layers);
             adapter
                 .save_safetensors(std::path::Path::new(path), None)
                 .map_err(|e| format!("save adapter: {e}"))?;
-            println!("saved adapter ({num_slots} GQA slots, rank {rank}) → {path}");
+            println!(
+                "saved adapter ({num_slots} GQA slots, {num_gdn_slots} GDN slots, rank {rank}) → {path}"
+            );
         }
         #[cfg(not(feature = "safetensors"))]
         {
@@ -752,4 +995,191 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_contract_tests {
+    use super::*;
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        let mut v = vec!["train_grad_full".to_string()];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    #[test]
+    fn defaults_match_documented_table() {
+        let a = args(&[]);
+        let cfg = parse_config(&ArgView::new(&a)).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from("data/lora-train"));
+        assert_eq!(cfg.first_layer, 19);
+        assert_eq!(cfg.steps, 25);
+        assert_eq!(cfg.lr, 1e-3);
+        assert_eq!(cfg.rank, 8);
+        assert_eq!(cfg.alpha, 16.0);
+        assert_eq!(cfg.seq_len_cap, 64);
+        assert_eq!(cfg.max_train, 3);
+        assert_eq!(cfg.max_valid, 16);
+        assert_eq!(cfg.log_every, 5);
+        assert!(!cfg.gradcheck);
+        assert_eq!(cfg.probe, 6);
+        assert_eq!(cfg.fd_eps, 4e-3);
+        assert_eq!(cfg.save_path, None);
+        assert_eq!(cfg.model_dir, train_common::default_model_dir());
+    }
+
+    #[test]
+    fn explicit_flags_override_defaults() {
+        let a = args(&[
+            "--model-dir",
+            "/tmp/m",
+            "--data-dir",
+            "/tmp/d",
+            "--first-layer",
+            "20",
+            "--steps",
+            "9",
+            "--lr",
+            "5e-4",
+            "--rank",
+            "16",
+            "--alpha",
+            "32",
+            "--seq-len",
+            "48",
+            "--max-train",
+            "1",
+            "--max-valid",
+            "0",
+            "--log-every",
+            "3",
+            "--gradcheck",
+            "--probe",
+            "2",
+            "--fd-eps",
+            "1e-3",
+            "--save",
+            "/tmp/out.safetensors",
+        ]);
+        let cfg = parse_config(&ArgView::new(&a)).unwrap();
+        assert_eq!(cfg.model_dir, PathBuf::from("/tmp/m"));
+        assert_eq!(cfg.data_dir, PathBuf::from("/tmp/d"));
+        assert_eq!(cfg.first_layer, 20);
+        assert_eq!(cfg.steps, 9);
+        assert_eq!(cfg.lr, 5e-4);
+        assert_eq!(cfg.rank, 16);
+        assert_eq!(cfg.alpha, 32.0);
+        assert_eq!(cfg.seq_len_cap, 48);
+        assert_eq!(cfg.max_train, 1);
+        assert_eq!(cfg.max_valid, 0);
+        assert_eq!(cfg.log_every, 3);
+        assert!(cfg.gradcheck);
+        assert_eq!(cfg.probe, 2);
+        assert_eq!(cfg.fd_eps, 1e-3);
+        assert_eq!(cfg.save_path, Some("/tmp/out.safetensors".to_string()));
+    }
+
+    #[test]
+    fn log_every_zero_is_rejected() {
+        let a = args(&["--log-every", "0"]);
+        let err = parse_config(&ArgView::new(&a)).unwrap_err();
+        assert!(err.contains("--log-every must be >= 1"));
+    }
+
+    #[test]
+    fn help_flags_detected_via_arg_view() {
+        let a = args(&["-h"]);
+        assert!(ArgView::new(&a).flag("-h"));
+        let a = args(&["--help"]);
+        assert!(ArgView::new(&a).flag("--help"));
+    }
+}
+
+#[cfg(test)]
+mod gdn_lora_ctor_tests {
+    use super::*;
+
+    /// Asymmetric fixture (num_kh=2, value_heads=4) — the only shape that can
+    /// distinguish "sized by key heads" from "sized by value heads"; a
+    /// symmetric config (e.g. num_kh == value_heads) would pass either way.
+    /// #792 codex round-2 blocker: `gradcheck_gdn_loras`/`zero_b_gdn_loras`
+    /// (this binary's two GDN LoRA initializers) had independently
+    /// re-derived `b_b`/`b_a` as `num_kh * rank` instead of
+    /// `value_heads * rank`, breaking on exactly this shape class.
+    fn asymmetric_gdn_dims() -> GdnDims {
+        let key_dim = 8;
+        let value_dim = 8;
+        let num_kh = 2;
+        let value_heads = 4;
+        GdnDims {
+            num_kh,
+            value_heads,
+            key_dim,
+            value_dim,
+            qkv_dim: 2 * key_dim * num_kh + value_heads * value_dim,
+            output_dim: value_heads * value_dim,
+            kernel_size: 3,
+            scale: 1.0 / (key_dim as f32).sqrt(),
+        }
+    }
+
+    #[test]
+    fn gradcheck_gdn_loras_sizes_b_b_and_b_a_by_value_heads() {
+        let gd = asymmetric_gdn_dims();
+        let hidden = 16;
+        let rank = 3;
+        let loras = gradcheck_gdn_loras(2, rank, hidden, &gd, 0x1234_5678);
+        assert_eq!(loras.len(), 2);
+        for lora in &loras {
+            assert_eq!(
+                lora.b_b.len(),
+                gd.value_heads * rank,
+                "b_b must be sized by value_heads ({}), not num_kh ({})",
+                gd.value_heads,
+                gd.num_kh
+            );
+            assert_eq!(
+                lora.b_a.len(),
+                gd.value_heads * rank,
+                "b_a must be sized by value_heads ({}), not num_kh ({})",
+                gd.value_heads,
+                gd.num_kh
+            );
+            // Non-zero: gradcheck mode fills both A and B with random noise.
+            assert!(lora.b_b.iter().any(|&v| v != 0.0));
+            assert!(lora.b_a.iter().any(|&v| v != 0.0));
+        }
+    }
+
+    #[test]
+    fn zero_b_gdn_loras_sizes_b_b_and_b_a_by_value_heads() {
+        let gd = asymmetric_gdn_dims();
+        let hidden = 16;
+        let rank = 3;
+        let init_amp = 1.0 / (hidden as f32).sqrt();
+        let loras = zero_b_gdn_loras(2, rank, hidden, &gd, 0xFEED_FACE, init_amp);
+        assert_eq!(loras.len(), 2);
+        for lora in &loras {
+            assert_eq!(
+                lora.b_b.len(),
+                gd.value_heads * rank,
+                "b_b must be sized by value_heads ({}), not num_kh ({})",
+                gd.value_heads,
+                gd.num_kh
+            );
+            assert_eq!(
+                lora.b_a.len(),
+                gd.value_heads * rank,
+                "b_a must be sized by value_heads ({}), not num_kh ({})",
+                gd.value_heads,
+                gd.num_kh
+            );
+            // Training-mode: B is zero at init (delta=0 reproduces the base).
+            assert!(lora.b_b.iter().all(|&v| v == 0.0));
+            assert!(lora.b_a.iter().all(|&v| v == 0.0));
+            // A is non-zero random.
+            assert!(lora.a_b.iter().any(|&v| v != 0.0));
+            assert!(lora.a_a.iter().any(|&v| v != 0.0));
+        }
+    }
 }

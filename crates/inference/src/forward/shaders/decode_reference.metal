@@ -53,7 +53,14 @@ kernel void decode_attention_reference(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float sum_exp = shared[0];
-    float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+    // ADR-080 C1 fail-closed (#850): this kernel is a frozen test-only correctness
+    // oracle (decode_attention_reference) for the live flash-decode parity test, so it
+    // must not itself reproduce the multiply-through-zero bug class it exists to catch.
+    // A non-positive or non-finite sum_exp (e.g. a NaN Q lane poisoning every dot
+    // product) is assigned the literal 0.0f directly, never `acc * guarded_zero_inv_sum`
+    // (NaN * 0.0f == NaN under IEEE-754).
+    bool valid = isfinite(sum_exp) && sum_exp > 0.0f;
+    float inv_sum = valid ? (1.0f / sum_exp) : 0.0f;
 
     device float* out_head = out + qh * head_dim;
     for (uint d = lid; d < head_dim; d += tgs) {
@@ -65,6 +72,6 @@ kernel void decode_attention_reference(
             acc += exp(dot * scale - max_val) * inv_sum
                  * v_cache[t * kv_dim + kvh * head_dim + d];
         }
-        out_head[d] = acc;
+        out_head[d] = valid ? acc : 0.0f;
     }
 }
