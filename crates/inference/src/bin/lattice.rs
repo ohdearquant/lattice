@@ -3882,26 +3882,36 @@ mod serve {
                             message: "inference failed".to_string(),
                         }
                     })?,
-                // Non-streaming isn't the round-2 medium finding #3 probe's
-                // concern -- only the streaming arm's `generate` override
-                // matters for that -- so this delegates to the real tiny
-                // model exactly like `ModelBackend::Cpu` above.
+                // ADR-080 C2 round 2 (codex round-2 medium finding #3) added
+                // this variant for the streaming arm's cancellation probe
+                // only, so non-streaming used to bypass the injected
+                // `generate` closure entirely and delegate straight to the
+                // real tiny model. Issue #828's field-level parity rows need
+                // a NON-streaming seam too (deterministic content/usage
+                // counts for `FieldExpectation::Eq` checks), so this now
+                // goes through the exact same injected closure the
+                // streaming arm uses -- `on_token`/`should_cancel` are
+                // no-ops here (this arm is never the cancellation probe's
+                // concern), matching how `model.generate()` itself has no
+                // early-stop/cancel hooks either.
                 #[cfg(all(feature = "test-utils", test))]
-                ModelBackend::CpuFakeGenerate { model, .. } => {
-                    tokio::task::spawn_blocking(move || model.generate(&prompt, &gen_cfg))
-                        .await
-                        .map_err(|e| {
-                            eprintln!("task join error: {e}");
-                            ApiError::Internal {
-                                message: "inference failed".to_string(),
-                            }
-                        })?
-                        .map_err(|e| {
-                            eprintln!("generation error: {e}");
-                            ApiError::Internal {
-                                message: "inference failed".to_string(),
-                            }
-                        })?
+                ModelBackend::CpuFakeGenerate { generate, .. } => {
+                    tokio::task::spawn_blocking(move || {
+                        generate(&prompt, &gen_cfg, &mut |_delta: &str| true, &mut || false)
+                    })
+                    .await
+                    .map_err(|e| {
+                        eprintln!("task join error: {e}");
+                        ApiError::Internal {
+                            message: "inference failed".to_string(),
+                        }
+                    })?
+                    .map_err(|e| {
+                        eprintln!("generation error: {e}");
+                        ApiError::Internal {
+                            message: "inference failed".to_string(),
+                        }
+                    })?
                 }
             };
 
@@ -5900,7 +5910,12 @@ mod serve {
         #[cfg(feature = "test-utils")]
         mod parity_table {
             use super::*;
-            use lattice_inference::serve::{Binary, CHAT_COMPLETIONS_PARITY_CASES};
+            use lattice_inference::StopReason;
+            use lattice_inference::serve::{
+                BASELINE_CANNED_COMPLETION_TOKENS, BASELINE_CANNED_PROMPT_TOKENS,
+                BASELINE_CANNED_TEXT, Binary, CHAT_COMPLETIONS_PARITY_CASES, ExpectedResponse,
+                check_sse_events,
+            };
             use tower::ServiceExt as _;
 
             /// Small enough that `max_tokens_over_cap_reject_vs_clamp`'s
@@ -5908,12 +5923,71 @@ mod serve {
             /// `max_tokens_cap`.
             const CAP: usize = 64;
 
+            /// Deterministic CPU generation seam for every `Json`/`Sse`
+            /// row (issue #828): the real request-parse/normalize/
+            /// `GenerateConfig`-build/handler/serialization path all still
+            /// runs unmodified -- only the actual model forward pass is
+            /// replaced, via the SAME `ModelBackend::CpuFakeGenerate`
+            /// injection seam the disconnect-cancellation probe uses.
+            /// Content deltas are pushed through `on_token` (what the
+            /// streaming arm reads) AND the returned `GenerateOutput.text`
+            /// carries the identical concatenated text (what the
+            /// non-streaming arm reads) so one closure serves both shapes.
+            fn baseline_fake_state(max_tokens_cap: usize) -> AppState {
+                let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
+                #[allow(clippy::type_complexity)]
+                let generate: Arc<
+                    dyn Fn(
+                            &str,
+                            &lattice_inference::model::qwen35_config::GenerateConfig,
+                            &mut dyn FnMut(&str) -> bool,
+                            &mut dyn FnMut() -> bool,
+                        )
+                            -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                        + Send
+                        + Sync,
+                > = Arc::new(|_prompt, _cfg, on_token, _should_cancel| {
+                    for chunk in ["hello", " world"] {
+                        if !on_token(chunk) {
+                            break;
+                        }
+                    }
+                    Ok(GenerateOutput {
+                        text: BASELINE_CANNED_TEXT.to_string(),
+                        token_ids: vec![1, 2],
+                        prompt_tokens: BASELINE_CANNED_PROMPT_TOKENS as usize,
+                        generated_tokens: BASELINE_CANNED_COMPLETION_TOKENS as usize,
+                        stopped: true,
+                        stop_reason: Some(StopReason::Eos),
+                        token_logprobs: vec![],
+                    })
+                });
+                AppState {
+                    model: ModelBackend::CpuFakeGenerate {
+                        model: Arc::new(model),
+                        generate,
+                    },
+                    default_max_tokens: max_tokens_cap,
+                    max_tokens_cap,
+                    model_id: "test-model".to_string(),
+                    request_counter: Arc::new(AtomicU64::new(0)),
+                }
+            }
+
             #[tokio::test]
             async fn chat_completions_matches_shared_parity_table() {
                 for case in CHAT_COMPLETIONS_PARITY_CASES {
-                    let (expected_status, expected_code) = case.expected(Binary::Lattice);
-
-                    let app = router(tiny_state(CAP));
+                    let expected = case.expected(Binary::Lattice);
+                    // Error-shaped rows never reach generation (rejected at
+                    // validation), so they keep using the plain real tiny
+                    // model exactly as before #828; only the new `Json`/
+                    // `Sse` rows need the deterministic generation seam.
+                    let app = match expected {
+                        ExpectedResponse::Error { .. } => router(tiny_state(CAP)),
+                        ExpectedResponse::Json { .. } | ExpectedResponse::Sse { .. } => {
+                            router(baseline_fake_state(CAP))
+                        }
+                    };
                     let request = axum::http::Request::builder()
                         .method(case.method)
                         .uri(case.path)
@@ -5929,40 +6003,254 @@ mod serve {
                     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                         .await
                         .expect("response body reads");
+                    let text = String::from_utf8_lossy(&body);
 
                     assert_eq!(
                         status,
-                        expected_status,
-                        "case '{}': expected status {expected_status}, got {status} \
-                         (body: {})",
+                        expected.status(),
+                        "case '{}': expected status {}, got {status} (body: {text})",
                         case.name,
-                        String::from_utf8_lossy(&body)
+                        expected.status(),
                     );
 
-                    // A non-2xx status must carry the expected shared error
-                    // code; a 2xx status has no error envelope to check
-                    // (the `max_tokens_over_cap_reject_vs_clamp` divergence
-                    // case is the only non-error entry today, and even its
-                    // "success" side is a harness-artifact 500 -- see the
-                    // case's own doc comment in `serve/mod.rs`).
-                    if !(200..300).contains(&status) {
-                        let value: serde_json::Value = serde_json::from_slice(&body)
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "case '{}': non-2xx response body must be the shared \
-                                     error envelope JSON: {e} (body: {})",
-                                    case.name,
-                                    String::from_utf8_lossy(&body)
-                                )
+                    match expected {
+                        ExpectedResponse::Error { code, .. } => {
+                            let value: serde_json::Value = serde_json::from_slice(&body)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "case '{}': non-2xx response body must be the shared \
+                                         error envelope JSON: {e} (body: {text})",
+                                        case.name,
+                                    )
+                                });
+                            assert_eq!(
+                                value["error"]["code"], code,
+                                "case '{}': expected error code '{code}', got {} \
+                                 (full body: {value})",
+                                case.name, value["error"]["code"]
+                            );
+                        }
+                        ExpectedResponse::Json { fields, .. } => {
+                            let value: serde_json::Value = serde_json::from_slice(&body)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "case '{}': 2xx response body must be JSON: {e} \
+                                         (body: {text})",
+                                        case.name,
+                                    )
+                                });
+                            for field in fields {
+                                field.check(&value).unwrap_or_else(|e| {
+                                    panic!("case '{}': field check failed: {e}", case.name)
+                                });
+                            }
+                        }
+                        ExpectedResponse::Sse { events, .. } => {
+                            check_sse_events(&text, events).unwrap_or_else(|e| {
+                                panic!("case '{}': SSE check failed: {e}", case.name)
                             });
-                        assert_eq!(
-                            value["error"]["code"], expected_code,
-                            "case '{}': expected error code '{expected_code}', got {} \
-                             (full body: {value})",
-                            case.name, value["error"]["code"]
-                        );
+                        }
                     }
                 }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Production-adapter observation (issue #828): proves the shared
+        // `ProductionAdapterObservation`/`GenerateConfigSnapshot` types
+        // actually capture what THIS binary's real `chat_completions` ->
+        // `prepare_chat_request` -> `GenerateConfig` construction produces,
+        // not a value the test independently reconstructs. The injected
+        // `CpuFakeGenerate` closure below runs strictly BELOW that real
+        // path -- it records the `&GenerateConfig`/`&str` prompt it was
+        // actually called with, then returns a canned result; it never
+        // recomputes `build_cfg`/`validate_temperature`/etc. itself.
+        //
+        // DISPUTED (issue #828 fix-round 3, codex round-2 medium finding #1):
+        // this observation captures `rendered_prompt`, not `messages`, and
+        // that is the real shape of this seam, not an omission. `chat_completions`
+        // computes `to_chat_messages(&req.messages)` (the normalized message
+        // list) unconditionally whenever `feature = "metal-gpu"` is compiled
+        // in, but that value is consumed ONLY by the `ModelBackend::Metal`
+        // match arm (`handle.generate_streaming[_with_cancel](chat_messages,
+        // ...)`); the `ModelBackend::Cpu`/`CpuFakeGenerate` arms this test
+        // seam exercises never receive it -- their real `generate`/
+        // `generate_streaming_with_cancel` calls take only `(&prompt,
+        // &gen_cfg, ...)`. This mirrors `ProductionAdapterObservation`'s own
+        // documented contract in `serve/mod.rs` ("exactly one of
+        // `rendered_prompt`/`messages` is `Some` per capture, reflecting
+        // which shape that binary's real adapter actually receives, not a
+        // missing capture").
+        //
+        // Observing `messages` at the CPU seam authentically (not by
+        // re-deriving `to_chat_messages` independently in the test, which
+        // would be tautological -- exactly the round-1 major finding this
+        // module was written to fix) would require a `MetalFakeGenerate`
+        // test double for `ModelBackend::Metal`. `MetalHandle::spawn`
+        // hard-requires loading a real Q4 model directory onto a real Metal
+        // GPU worker thread (`MetalQwen35State::from_q4_dir`) -- there is no
+        // model-agnostic seam there the way `CpuFakeGenerate` mirrors
+        // `ModelBackend::Cpu`. Building one would mean adding a new
+        // production `ModelBackend` variant and mocking the async engine
+        // handle's job-channel protocol: real production-code surface
+        // expansion, not a test-only capture. That is out of scope for this
+        // fix round; tracked as a follow-up if a Metal-path observation is
+        // wanted (would need its own issue -- #828's fixture data and CI
+        // environment target the CPU/tiny-tokenizer seam only).
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod production_adapter_observation {
+            use super::*;
+            use lattice_inference::serve::{
+                ExpectedObservation, GenerateConfigSnapshot,
+                OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, ProductionAdapterObservation,
+                assert_observation_matches,
+            };
+            use std::sync::Mutex;
+            use tower::ServiceExt as _;
+
+            /// Builds the fixture state + fires the fixed `{"messages":[{"role":
+            /// "user","content":"hi there"}],"temperature":1.3,"top_p":0.55,
+            /// "seed":7,"max_tokens":9}` request against a real router, with the
+            /// injected `CpuFakeGenerate` closure recording a
+            /// `ProductionAdapterObservation` -- strictly below the real
+            /// request-parse/`render_prompt`/`GenerateConfig`-construction path
+            /// (issue #828). `stopped` is threaded through a single local
+            /// variable into both the recorded observation and the returned
+            /// `GenerateOutput`, so a caller of this helper can vary it and prove
+            /// the observation genuinely mirrors what the seam returned rather
+            /// than an independent hardcoded literal (round 2 major finding).
+            async fn run_observed(stopped: bool) -> ProductionAdapterObservation {
+                let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
+                let tokenizer = model.tokenizer().clone();
+                let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> =
+                    Arc::new(Mutex::new(None));
+                let observed_for_closure = Arc::clone(&observed);
+                #[allow(clippy::type_complexity)]
+                let generate: Arc<
+                    dyn Fn(
+                            &str,
+                            &lattice_inference::model::qwen35_config::GenerateConfig,
+                            &mut dyn FnMut(&str) -> bool,
+                            &mut dyn FnMut() -> bool,
+                        )
+                            -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                        + Send
+                        + Sync,
+                > = Arc::new(move |prompt, cfg, _on_token, _should_cancel| {
+                    let prompt_tokens = tokenizer.tokenize(prompt).real_length;
+                    *observed_for_closure
+                        .lock()
+                        .expect("observation mutex poisoned") =
+                        Some(ProductionAdapterObservation {
+                            rendered_prompt: Some(prompt.to_string()),
+                            messages: None,
+                            gen_cfg: GenerateConfigSnapshot::from(cfg),
+                            prompt_tokens,
+                            stopped,
+                        });
+                    Ok(GenerateOutput {
+                        text: "ok".to_string(),
+                        token_ids: vec![1],
+                        prompt_tokens,
+                        generated_tokens: 1,
+                        stopped,
+                        stop_reason: if stopped {
+                            Some(lattice_inference::StopReason::Eos)
+                        } else {
+                            None
+                        },
+                        token_logprobs: vec![],
+                    })
+                });
+                let state = AppState {
+                    model: ModelBackend::CpuFakeGenerate {
+                        model: Arc::new(model),
+                        generate,
+                    },
+                    default_max_tokens: 64,
+                    max_tokens_cap: 64,
+                    model_id: "test-model".to_string(),
+                    request_counter: Arc::new(AtomicU64::new(0)),
+                };
+                let body = r#"{"model":"test-model","messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#;
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("fixture request must build");
+                let response = router(state)
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(response.status(), StatusCode::OK);
+
+                observed
+                    .lock()
+                    .expect("observation mutex poisoned")
+                    .clone()
+                    .expect("the injected generate closure must have recorded an observation")
+            }
+
+            /// The `GenerateConfig` `lattice.rs`'s real `chat_completions` ->
+            /// `prepare_chat_request`/`build_cfg`-equivalent construction (see
+            /// its `let gen_cfg = ...` literal in this file) must produce for the
+            /// fixed request body `run_observed` sends: every explicitly-set
+            /// field mirrors the request, every other field is
+            /// `GenerateConfig::default()` -- exactly like production's own
+            /// `..Default::default()` tail.
+            fn expected_gen_cfg() -> GenerateConfigSnapshot {
+                GenerateConfigSnapshot::from(
+                    &lattice_inference::model::qwen35_config::GenerateConfig {
+                        max_new_tokens: 9,
+                        temperature: 1.3,
+                        top_p: 0.55,
+                        seed: Some(7),
+                        stop_strings: vec![],
+                        logprobs: None,
+                        ..Default::default()
+                    },
+                )
+            }
+
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_config_and_prompt() {
+                let obs = run_observed(true).await;
+                let expected_prompt_tokens = {
+                    let tokenizer =
+                        lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                            .tokenizer()
+                            .clone();
+                    tokenizer
+                        .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+                        .real_length
+                };
+                assert_observation_matches(
+                    &obs,
+                    &ExpectedObservation {
+                        gen_cfg: expected_gen_cfg(),
+                        rendered_prompt: Some(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML),
+                        messages: None,
+                        prompt_tokens: expected_prompt_tokens,
+                        stopped: true,
+                    },
+                );
+            }
+
+            /// Proves `ProductionAdapterObservation::stopped` is genuinely
+            /// derived from what the generation seam returned, not an
+            /// independent hardcoded literal (round 2 major finding: the
+            /// pre-fix `lattice_serve.rs` observation stored `stopped: true`
+            /// unconditionally). Running the exact same request through
+            /// `run_observed(false)` must observe `stopped == false`.
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_stopped_false() {
+                let obs = run_observed(false).await;
+                assert!(
+                    !obs.stopped,
+                    "observation must report the seam's actual stopped=false, not a hardcoded true"
+                );
             }
         }
     }

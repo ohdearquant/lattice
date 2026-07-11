@@ -3351,17 +3351,89 @@ mod imp {
         // the `lattice`-side expectation -- together the two prove
         // same-input parity (or a documented, intentional divergence) at
         // the real HTTP layer.
+        //
+        // Issue #828's `Json`/`Sse` rows need a REAL tiny tokenizer (via
+        // `test_support::tiny_zero_model`, gated behind the `test-utils`
+        // feature -- see that module's own doc comment) to drive
+        // `enforce_prompt_window` for real, so this whole module now
+        // requires `test-utils`, matching `lattice.rs`'s own
+        // `parity_table` module gating. CI's "serve-surface capability-
+        // matrix fixtures" step adds `test-utils` alongside `f16,metal-gpu`
+        // for this binary to keep running it (see `.github/workflows/ci.yml`).
+        #[cfg(feature = "test-utils")]
         mod parity_table {
             use super::*;
-            use lattice_inference::serve::{Binary, CHAT_COMPLETIONS_PARITY_CASES};
+            use lattice_inference::serve::{
+                BASELINE_CANNED_COMPLETION_TOKENS, BASELINE_CANNED_PROMPT_TOKENS, Binary,
+                CHAT_COMPLETIONS_PARITY_CASES, ExpectedResponse, check_sse_events,
+            };
             use tower::ServiceExt as _;
+
+            /// Deterministic worker-thread generation seam for every
+            /// `Json`/`Sse` row (issue #828): a REAL background thread runs
+            /// the actual `run_worker_loop` + `enforce_prompt_window`
+            /// production code (real tiny tokenizer, no Metal engine) --
+            /// only the terminal generation call itself is replaced with a
+            /// canned deterministic completion. Content deltas are pushed
+            /// through `on_token` (what both the streaming and
+            /// non-streaming arms of `chat_completions` read content from
+            /// on this binary -- see its `Ev::Delta` accumulation), so one
+            /// seam serves both response shapes.
+            fn baseline_fake_worker_state(model_max_context: usize) -> AppState {
+                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone();
+                let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
+                std::thread::spawn(move || {
+                    run_worker_loop(jobs_rx, move |messages, cfg, on_token, _should_cancel| {
+                        // Real production check (mutation-sensitive to
+                        // `enforce_prompt_window`/`check_prompt_fits_window`
+                        // exactly like `real_router_overflow_parity` above);
+                        // its measured length is intentionally NOT what
+                        // gets reported below -- the returned usage counts
+                        // are the fixed canned figures both binaries' field
+                        // checks assert against (`BASELINE_CANNED_*`).
+                        enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
+                        for (chunk, id) in [("hello", 1u32), (" world", 2u32)] {
+                            on_token(chunk, id);
+                        }
+                        Ok((
+                            BASELINE_CANNED_PROMPT_TOKENS as usize,
+                            BASELINE_CANNED_COMPLETION_TOKENS as usize,
+                            true,
+                        ))
+                    });
+                });
+                AppState {
+                    jobs,
+                    model_id: Arc::from("test-model"),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
+                    model_max_context,
+                }
+            }
 
             #[tokio::test]
             async fn chat_completions_matches_shared_parity_table() {
                 for case in CHAT_COMPLETIONS_PARITY_CASES {
-                    let (expected_status, expected_code) = case.expected(Binary::LatticeServe);
-
-                    let app = router(test_app_state());
+                    let expected = case.expected(Binary::LatticeServe);
+                    // Error-shaped rows never reach the job queue (rejected
+                    // at validation) or, for `max_tokens_over_cap_reject_vs_clamp`,
+                    // rely on the no-worker harness artifact its own
+                    // doc comment describes -- both keep using the plain
+                    // no-worker state exactly as before #828.
+                    let app = match expected {
+                        ExpectedResponse::Error { .. } => router(test_app_state()),
+                        ExpectedResponse::Json { .. } | ExpectedResponse::Sse { .. } => {
+                            router(baseline_fake_worker_state(4096))
+                        }
+                    };
                     let request = axum::http::Request::builder()
                         .method(case.method)
                         .uri(case.path)
@@ -3377,36 +3449,220 @@ mod imp {
                     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                         .await
                         .expect("response body reads");
+                    let text = String::from_utf8_lossy(&body);
 
                     assert_eq!(
                         status,
-                        expected_status,
-                        "case '{}': expected status {expected_status}, got {status} \
-                         (body: {})",
+                        expected.status(),
+                        "case '{}': expected status {}, got {status} (body: {text})",
                         case.name,
-                        String::from_utf8_lossy(&body)
+                        expected.status(),
                     );
 
-                    // See `lattice.rs`'s mirror of this test for why 2xx
-                    // responses skip the error-code check.
-                    if !(200..300).contains(&status) {
-                        let value: serde_json::Value = serde_json::from_slice(&body)
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "case '{}': non-2xx response body must be the shared \
-                                     error envelope JSON: {e} (body: {})",
-                                    case.name,
-                                    String::from_utf8_lossy(&body)
-                                )
+                    match expected {
+                        ExpectedResponse::Error { code, .. } => {
+                            let value: serde_json::Value = serde_json::from_slice(&body)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "case '{}': non-2xx response body must be the shared \
+                                         error envelope JSON: {e} (body: {text})",
+                                        case.name,
+                                    )
+                                });
+                            assert_eq!(
+                                value["error"]["code"], code,
+                                "case '{}': expected error code '{code}', got {} \
+                                 (full body: {value})",
+                                case.name, value["error"]["code"]
+                            );
+                        }
+                        ExpectedResponse::Json { fields, .. } => {
+                            let value: serde_json::Value = serde_json::from_slice(&body)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "case '{}': 2xx response body must be JSON: {e} \
+                                         (body: {text})",
+                                        case.name,
+                                    )
+                                });
+                            for field in fields {
+                                field.check(&value).unwrap_or_else(|e| {
+                                    panic!("case '{}': field check failed: {e}", case.name)
+                                });
+                            }
+                        }
+                        ExpectedResponse::Sse { events, .. } => {
+                            check_sse_events(&text, events).unwrap_or_else(|e| {
+                                panic!("case '{}': SSE check failed: {e}", case.name)
                             });
-                        assert_eq!(
-                            value["error"]["code"], expected_code,
-                            "case '{}': expected error code '{expected_code}', got {} \
-                             (full body: {value})",
-                            case.name, value["error"]["code"]
-                        );
+                        }
                     }
                 }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Production-adapter observation (issue #828): proves the shared
+        // `ProductionAdapterObservation`/`GenerateConfigSnapshot` types
+        // capture what THIS binary's real `chat_completions` -> `build_cfg`
+        // construction produces, not a value the test independently
+        // reconstructs. The injected worker-loop `generate` closure below
+        // runs strictly BELOW that real path -- it records the actual
+        // `&[ChatMessage]`/`&GenerateConfig` it was called with, then
+        // returns a canned result; it never recomputes `build_cfg` itself.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod production_adapter_observation {
+            use super::*;
+            use lattice_inference::serve::{
+                ExpectedObservation, GenerateConfigSnapshot,
+                OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, ProductionAdapterObservation,
+                assert_observation_matches,
+            };
+            use std::sync::Mutex;
+
+            /// Mirrors `lattice.rs`'s equivalent helper (issue #828 round 2):
+            /// fires the fixed `{"messages":[{"role":"user","content":"hi
+            /// there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}`
+            /// request through a REAL background thread running the actual
+            /// `run_worker_loop` + `enforce_prompt_window` production code (real
+            /// tiny tokenizer, no Metal engine) -- only the terminal generation
+            /// call is replaced with a canned completion. `stopped` is threaded
+            /// through a single local variable into both the recorded
+            /// observation and the returned tuple's third element, and the
+            /// real `enforce_prompt_window` return value is the ONLY source for
+            /// `prompt_tokens` -- round 2 major finding fixed the prior
+            /// `prompt_tokens: 3` / `stopped: true` independent literals.
+            async fn run_observed(
+                model_max_context: usize,
+                stopped: bool,
+            ) -> ProductionAdapterObservation {
+                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone();
+                let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> =
+                    Arc::new(Mutex::new(None));
+                let observed_for_worker = Arc::clone(&observed);
+                let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
+                std::thread::spawn(move || {
+                    run_worker_loop(jobs_rx, move |messages, cfg, on_token, _should_cancel| {
+                        let normalized: Vec<(String, String)> = messages
+                            .iter()
+                            .map(|m| {
+                                let role = match m.role {
+                                    lattice_inference::forward::metal_qwen35::ChatRole::System => {
+                                        "system"
+                                    }
+                                    lattice_inference::forward::metal_qwen35::ChatRole::User => {
+                                        "user"
+                                    }
+                                    lattice_inference::forward::metal_qwen35::ChatRole::Assistant => {
+                                        "assistant"
+                                    }
+                                };
+                                (role.to_string(), m.content.clone())
+                            })
+                            .collect();
+                        // Real production check (mutation-sensitive to
+                        // `enforce_prompt_window`/`check_prompt_fits_window`
+                        // exactly like `real_router_overflow_parity`/
+                        // `baseline_fake_worker_state` above); its measured
+                        // length IS what gets reported below.
+                        let prompt_tokens =
+                            enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
+                        *observed_for_worker
+                            .lock()
+                            .expect("observation mutex poisoned") =
+                            Some(ProductionAdapterObservation {
+                                rendered_prompt: None,
+                                messages: Some(normalized),
+                                gen_cfg: GenerateConfigSnapshot::from(cfg),
+                                prompt_tokens,
+                                stopped,
+                            });
+                        on_token("ok", 1);
+                        Ok((prompt_tokens, 1, stopped))
+                    });
+                });
+                let state = AppState {
+                    jobs,
+                    model_id: Arc::from("test-model"),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
+                    model_max_context,
+                };
+                let body = Body::from(
+                    r#"{"messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#
+                        .to_string(),
+                );
+                let response = chat_completions(State(state), body).await;
+                assert_eq!(response.status(), StatusCode::OK);
+
+                observed
+                    .lock()
+                    .expect("observation mutex poisoned")
+                    .clone()
+                    .expect("the injected worker-loop generate closure must have recorded an observation")
+            }
+
+            /// The `GenerateConfig` `lattice_serve.rs`'s real `build_cfg` must
+            /// produce for the fixed request `run_observed` sends, given
+            /// `run_observed`'s `Defaults` above: every explicitly-set field
+            /// mirrors the request; `build_cfg` always sets the remaining
+            /// fields (`stop_token_ids`, `enable_thinking`, `enable_mtp`,
+            /// `grammar`, `reasoning_budget`, `logprobs`, `stop_strings`) to
+            /// the exact same values `GenerateConfig::default()` carries.
+            fn expected_gen_cfg() -> GenerateConfigSnapshot {
+                GenerateConfigSnapshot::from(
+                    &lattice_inference::model::qwen35_config::GenerateConfig {
+                        max_new_tokens: 9,
+                        temperature: 1.3,
+                        top_p: 0.55,
+                        seed: Some(7),
+                        ..Default::default()
+                    },
+                )
+            }
+
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_config_and_messages()
+            {
+                let obs = run_observed(4096, true).await;
+                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone();
+                let expected_prompt_tokens = tokenizer
+                    .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+                    .real_length;
+                assert_observation_matches(
+                    &obs,
+                    &ExpectedObservation {
+                        gen_cfg: expected_gen_cfg(),
+                        rendered_prompt: None,
+                        messages: Some(&[("user", "hi there")]),
+                        prompt_tokens: expected_prompt_tokens,
+                        stopped: true,
+                    },
+                );
+            }
+
+            /// Proves `stopped` is genuinely derived from what the worker's
+            /// generation closure returned, not an independent hardcoded
+            /// literal (round 2 major finding: this was previously
+            /// `stopped: true` regardless of the closure's actual return).
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_stopped_false() {
+                let obs = run_observed(4096, false).await;
+                assert!(
+                    !obs.stopped,
+                    "observation must report the worker's actual stopped=false, not a hardcoded true"
+                );
             }
         }
     }
