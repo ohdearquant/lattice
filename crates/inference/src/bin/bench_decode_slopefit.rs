@@ -114,7 +114,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Detect Q4 dir via the canonical detector (same dispatch as bench_decode_ab).
     // Unknown falls through to the safetensors branch below, matching this
-    // binary's pre-existing two-way (Q4 / not-Q4) behavior exactly.
+    // binary's pre-existing two-way (Q4 / not-Q4) dispatch, with one
+    // corrected exception: the old inline heuristic here only checked
+    // model.safetensors, never model.safetensors.index.json, so a directory
+    // with an index file *and* stray .q4 files used to route to the Q4
+    // loader; the canonical index-aware detector now routes it to
+    // safetensors instead (the precedence this binary inherits going
+    // forward).
     let is_q4 = matches!(detect_format(dir), ModelFormat::Q4);
 
     let tokenizer_dir_str =

@@ -273,7 +273,8 @@ establish.
 
 **Extraction plan.** `ModelFormat`, `detect_format`, and the two format-specific error-message
 helpers (`metal_gpu_required_message`, `unrecognized_format_message`) moved, unmodified in
-behavior, into a new `crates/inference/src/model_format.rs` — a `pub mod` of the library crate
+behavior for `lattice.rs`, `lattice_serve.rs`, and `chat_metal.rs` (their own detectors were
+already index-aware), into a new `crates/inference/src/model_format.rs` — a `pub mod` of the library crate
 rather than a `pub(crate)` module of one binary, because separate Cargo `[[bin]]` targets
 (`lattice`, `lattice_serve`, `chat_metal`) cannot see one another's `pub(crate)` items; only a
 library module is visible to all three. The module is a plain `pub mod` (externally nameable,
@@ -289,8 +290,20 @@ closing a real behavior gap (`lattice_serve.rs` previously had no explicit `Unkn
 all — an unrecognized directory fell through to a generic "safetensors load failed" error from
 the CPU loader instead of a clear "not a recognized model directory" message).
 
+The three benchmark binaries (`bench_decode_ab.rs`, `bench_decode_slopefit.rs`,
+`bench_logit_dump.rs`) were migrated onto the same `detect_format` in a follow-up commit,
+closing the repository-wide sibling gate. That migration is not behavior-unmodified: each
+bench binary's removed inline heuristic checked only `model.safetensors`, never
+`model.safetensors.index.json`, before falling through to a `.q4` scan. A directory containing
+both an index file and stray `.q4` files therefore used to route those three binaries to the Q4
+loader; the canonical detector's index-aware precedence now routes the same directory to
+`Safetensors`. Ordinary safetensors-only, ordinary Q4-only, and Unknown/no-sentinel directories
+are unaffected. See `detect_format_prefers_safetensors_index_over_q4_files` in
+`model_format.rs` for the regression test covering this case.
+
 **Resolves**: #829 — one canonical model-format detector, zero remaining local
-re-implementations in `lattice.rs`, `lattice_serve.rs`, or `chat_metal.rs`.
+re-implementations in `lattice.rs`, `lattice_serve.rs`, `chat_metal.rs`, or the three
+benchmark binaries.
 
 ## What we are NOT doing
 

@@ -1,11 +1,13 @@
 //! Canonical model-directory format detector (ADR-080 amendment, #829).
 //!
-//! **Stability**: unstable, internal-binaries-only. This module exists solely
-//! so the three serving/chat binaries in `src/bin/` (`lattice`, `lattice_serve`,
-//! `chat_metal`) -- which are separate Cargo binary targets and therefore
-//! cannot see one another's `pub(crate)` items -- can share a single
-//! model-directory format decision instead of each carrying its own copy. It
-//! is public but unstable and internal-use: `pub mod model_format` is
+//! **Stability**: unstable, internal-binaries-only. This module exists so
+//! internal binaries in `src/bin/` -- including the three serving/chat
+//! binaries (`lattice`, `lattice_serve`, `chat_metal`) and the three
+//! benchmark binaries (`bench_decode_ab`, `bench_decode_slopefit`,
+//! `bench_logit_dump`) -- which are separate Cargo binary targets and
+//! therefore cannot see one another's `pub(crate)` items -- can share a
+//! single model-directory format decision instead of each carrying its own
+//! copy. It is public but unstable and internal-use: `pub mod model_format` is
 //! externally nameable, but its compatibility follows the crate's
 //! Experimental stability policy rather than semver-relevant deprecation
 //! cycles, and it may change shape at any time; downstream consumers of this
@@ -144,6 +146,23 @@ mod tests {
         // loader path is untouched and takes priority.
         let dir = tempdir("mixed");
         fs::write(dir.join("model.safetensors"), b"stub").unwrap();
+        fs::write(dir.join("leftover.q4"), b"stub").unwrap();
+        assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_format_prefers_safetensors_index_over_q4_files() {
+        // A directory that has an index.json (sharded safetensors) and a
+        // stray .q4 file must also resolve as Safetensors. This is the
+        // precedence the three benchmark binaries' old inline heuristic got
+        // wrong: `!model.safetensors.exists() && has_q4_file` never checked
+        // index.json, so a directory with an index file plus .q4 files used
+        // to route those binaries to the Q4 loader. The canonical detector
+        // checks both sentinel files before falling through to .q4, so this
+        // case now resolves to Safetensors everywhere.
+        let dir = tempdir("mixed-index");
+        fs::write(dir.join("model.safetensors.index.json"), b"{}").unwrap();
         fs::write(dir.join("leftover.q4"), b"stub").unwrap();
         assert_eq!(detect_format(&dir), ModelFormat::Safetensors);
         fs::remove_dir_all(&dir).ok();
