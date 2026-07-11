@@ -14960,6 +14960,58 @@ mod inner {
             )
         }
 
+        /// Pure preflight over the suffix a [`crate::kv_cache::PrefixRestorePlan`]
+        /// selects — every suffix token id within `vocab_size`, the suffix
+        /// non-empty, and `plan.suffix_start + suffix.len()` within
+        /// `max_cache_len`. Must run BEFORE `restore_cross_turn_prefix`/
+        /// `reset_state` in `generate_streaming_with_prefix_cache_and_cancel_inner`
+        /// (#835): those calls `take()` the cache slot's entry (ExactAppend /
+        /// ReplayFromCheckpoint) or clear live state (FullRefill), and the
+        /// public wrapper's error-recovery arm additionally evicts the slot's
+        /// cache entry outright on ANY `Err` from `_inner`. Rejecting an
+        /// invalid suffix here, before any of that runs, leaves a warmed slot
+        /// untouched instead of destroying it for a request that never
+        /// touched live KV/GDN state.
+        ///
+        /// Mirrors `forward_prefill_from`'s own checks byte-for-byte — same
+        /// `InferenceError` variant and message shape — so this is
+        /// observationally a pure timing fix, not a new error taxonomy.
+        /// `forward_prefill_from`'s checks are left in place unchanged
+        /// (defense in depth for its other, non-prefix-cache callers).
+        fn plan_prefix_request(
+            &self,
+            prompt_ids: &[u32],
+            plan: &crate::kv_cache::PrefixRestorePlan,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            let vocab = self.engine.config.vocab_size;
+            let suffix = &prompt_ids[plan.suffix_start..];
+            for (t, &id) in suffix.iter().enumerate() {
+                if (id as usize) >= vocab {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "forward_prefill_from: token_ids[{t}]={id} out of range: vocab_size is {vocab}"
+                    )));
+                }
+            }
+            if suffix.is_empty() {
+                return Err(InferenceError::PrefixCache(
+                    "forward_prefill_from: cannot prefill an empty suffix without a saved \
+                     logits source"
+                        .into(),
+                ));
+            }
+            if plan.suffix_start + suffix.len() > self.session.kv_cache.max_cache_len {
+                return Err(InferenceError::InvalidInput(format!(
+                    "forward_prefill_from: start_pos {} + len {} exceeds max_cache_len {}",
+                    plan.suffix_start,
+                    suffix.len(),
+                    self.session.kv_cache.max_cache_len
+                )));
+            }
+            Ok(())
+        }
+
         /// Restore live state to the plan's reusable boundary.
         ///
         /// `ExactAppend` and `ReplayFromCheckpoint` (#590) both consume the
@@ -15354,9 +15406,41 @@ mod inner {
             crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
             crate::model::qwen35::check_mtp_not_requested(gen_cfg)?;
 
+            let input = tokenizer.tokenize(prompt);
+            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+
+            // #835: validate the suffix a reuse plan would select for this
+            // slot BEFORE calling `_inner` at all -- same reasoning as the
+            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
+            // above (PR #787): the `match` below unconditionally calls
+            // `reset_state()` and evicts the cache slot on ANY `Err` from
+            // `_inner`, so a suffix-validation-only rejection (out-of-vocab
+            // token, empty suffix, or a suffix overflowing `max_cache_len`)
+            // must return here, before `_inner` runs `restore_cross_turn_prefix`
+            // (or `_inner`'s own destructive-on-`Err` recovery is even
+            // reachable), or a valid pre-existing cross-turn entry this call
+            // never touched would be destroyed alongside it.
+            //
+            // Skipped for the same three trivial-request shapes `_inner`
+            // itself special-cases with an early `Ok` (empty prompt, zero
+            // `max_new_tokens`, prompt longer than the cache): none of those
+            // reach `_inner`'s mutating match either, so validating a plan
+            // for them here would reject requests `_inner` legitimately
+            // accepts (e.g. an empty prompt always plans an empty "suffix",
+            // which is exactly the shape `plan_prefix_request` rejects for a
+            // real request).
+            if !prompt_ids.is_empty()
+                && gen_cfg.max_new_tokens > 0
+                && prompt_ids.len() <= self.max_context()
+            {
+                let metadata = self.cross_turn_metadata(tokenizer);
+                let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+                self.plan_prefix_request(&prompt_ids, &plan)?;
+            }
+
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
-                prompt,
+                prompt_ids,
                 tokenizer,
                 gen_cfg,
                 on_token,
@@ -15377,7 +15461,7 @@ mod inner {
         fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
-            prompt: &str,
+            prompt_ids: Vec<u32>,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut on_token: F,
@@ -15391,13 +15475,20 @@ mod inner {
             use crate::kv_cache::PrefixReuseMode;
 
             // The `logprobs` / `enable_mtp` config preflight checks (codex
-            // round-1 blocker #1, round-2 medium #3/#4, PR #787) live in the
-            // public wrapper `generate_streaming_with_prefix_cache_and_cancel`,
-            // not here: that wrapper's error-recovery path unconditionally
+            // round-1 blocker #1, round-2 medium #3/#4, PR #787), and the
+            // suffix-content preflight below (#835), live in the public
+            // wrapper `generate_streaming_with_prefix_cache_and_cancel`, not
+            // here: that wrapper's error-recovery path unconditionally
             // evicts the cache slot on any `Err` from this function, so a
             // preflight-only rejection must never reach `_inner` in the first
             // place, or a valid pre-existing cross-turn entry this call never
-            // touched would be destroyed alongside it.
+            // touched would be destroyed alongside it. `prompt_ids` arrives
+            // already tokenized by the wrapper (which needs them to run that
+            // preflight) so this function never re-tokenizes `prompt`.
+            // `plan_cross_turn_reuse`/`plan_prefix_request` are still run
+            // again below, cheaply, as defense in depth (this function's own
+            // safety invariant should not depend solely on its one caller
+            // getting the guard conditions right).
 
             let cfg = self.engine.config.clone();
 
@@ -15419,8 +15510,6 @@ mod inner {
                 }
             };
 
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
             let prompt_len = prompt_ids.len();
 
             // These three guards are byte-for-byte the same as
@@ -15489,6 +15578,21 @@ mod inner {
 
             let metadata = self.cross_turn_metadata(tokenizer);
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+
+            // #835: validate the suffix the plan selected BEFORE the match
+            // below runs `restore_cross_turn_prefix` (which `take()`s the
+            // cache slot's entry) or `reset_state()`. An out-of-vocab token,
+            // empty suffix, or start+len overflow is rejected here, before
+            // any live state or cache entry is touched, instead of after
+            // `restore_cross_turn_prefix` has already consumed the slot.
+            // Defense in depth: the public wrapper above already ran this
+            // exact check (on the identical `prompt_ids`/`plan` inputs,
+            // since nothing mutates `self.cross_turn_prefix_cache` between
+            // the two calls) so a rejection here should never actually
+            // trigger via that entry point -- this call exists so `_inner`'s
+            // own ordering invariant does not depend solely on its one
+            // caller getting the wrapper's guard conditions right.
+            self.plan_prefix_request(&prompt_ids, &plan)?;
 
             // The consumed entry (ExactAppend / ReplayFromCheckpoint) is
             // carried to the end-of-generation save so its checkpoint ring
@@ -27879,6 +27983,338 @@ mod inner {
                 state.cross_turn_prefix_cache.entry.is_none(),
                 "an MTP-rejected call must not create or leave a cache \
                  entry behind -- the guard runs before any state mutation"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // #835: suffix-content preflight -- `plan_prefix_request` must run
+        // BEFORE `restore_cross_turn_prefix`/`reset_state`, both in the pure
+        // planner (unit tests below) and end-to-end through the public
+        // `generate_streaming_with_prefix_cache` entry point (integration
+        // test below).
+        //
+        // `single_char_vocab_tokenizer`'s vocab exactly matches
+        // `tiny_hybrid_fixture`'s `vocab_size` (32) and has no `<unk>`
+        // fallback, so `tokenize()` can only ever emit ids in `0..32` (any
+        // other character is silently dropped, never mapped to an
+        // out-of-range id -- see `BpeTokenizer::encode_piece_to_ids`). The
+        // out-of-vocab and empty-suffix branches are therefore not directly
+        // reachable through this test fixture's public API, exactly like
+        // `forward_prefill_from`'s own equivalent checks, which
+        // `plan_prefix_request` mirrors byte-for-byte; they are exercised
+        // here as direct (white-box) unit tests of the pure planner
+        // instead. The overflow branch is likewise unreachable through
+        // `generate_streaming_with_prefix_cache` for the SAME reason
+        // `forward_prefill_from`'s original overflow check was for the
+        // prefix-cache caller: `plan.suffix_start + suffix.len()` always
+        // equals `prompt_len` (arithmetic identity over
+        // `&prompt_ids[plan.suffix_start..]`), and `prompt_len >
+        // max_context()` (== `max_cache_len`) is already rejected earlier,
+        // with an `Ok`/`KvFull` result, before a plan is ever computed.
+        // -----------------------------------------------------------------------
+
+        /// Direct (white-box) unit test: an out-of-vocab suffix token id
+        /// must be rejected with the same `InferenceError::InvalidInput`
+        /// shape `forward_prefill_from` uses.
+        #[test]
+        fn plan_prefix_request_rejects_out_of_vocab_suffix_token() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::error::InferenceError;
+            use crate::kv_cache::{PrefixRestorePlan, PrefixReuseMode};
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // cfg.vocab_size == 32 (tiny_hybrid_fixture), so id 32 is out of range.
+            let prompt_ids: Vec<u32> = vec![0, 1, 32];
+            let plan = PrefixRestorePlan {
+                mode: PrefixReuseMode::FullRefill,
+                shared_token_prefix_len: 0,
+                reusable_len: 0,
+                suffix_start: 0,
+                suffix_len: prompt_ids.len(),
+                old_represented_len: 0,
+            };
+
+            let result = state.plan_prefix_request(&prompt_ids, &plan);
+            match result {
+                Err(InferenceError::InvalidInput(msg)) => {
+                    assert!(
+                        msg.contains("out of range"),
+                        "expected an out-of-range message, got: {msg}"
+                    );
+                }
+                other => {
+                    panic!("expected InvalidInput for an out-of-vocab suffix token; got {other:?}")
+                }
+            }
+        }
+
+        /// Direct (white-box) unit test: an empty suffix must be rejected
+        /// with the same `InferenceError::PrefixCache` shape
+        /// `forward_prefill_from` uses.
+        #[test]
+        fn plan_prefix_request_rejects_empty_suffix() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::error::InferenceError;
+            use crate::kv_cache::{PrefixRestorePlan, PrefixReuseMode};
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let prompt_ids: Vec<u32> = vec![0, 1, 2];
+            // suffix_start == prompt_ids.len() -> the selected suffix is empty.
+            let plan = PrefixRestorePlan {
+                mode: PrefixReuseMode::ReplayFromCheckpoint { checkpoint_len: 3 },
+                shared_token_prefix_len: 3,
+                reusable_len: 3,
+                suffix_start: 3,
+                suffix_len: 0,
+                old_represented_len: 3,
+            };
+
+            let result = state.plan_prefix_request(&prompt_ids, &plan);
+            match result {
+                Err(InferenceError::PrefixCache(msg)) => {
+                    assert!(
+                        msg.contains("empty suffix"),
+                        "expected an empty-suffix message, got: {msg}"
+                    );
+                }
+                other => panic!("expected PrefixCache for an empty suffix; got {other:?}"),
+            }
+        }
+
+        /// Direct (white-box) unit test: a suffix whose
+        /// `suffix_start + len` overflows `max_cache_len` must be rejected
+        /// with the same `InferenceError::InvalidInput` shape
+        /// `forward_prefill_from` uses.
+        #[test]
+        fn plan_prefix_request_rejects_suffix_overflowing_max_cache_len() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::error::InferenceError;
+            use crate::kv_cache::{PrefixRestorePlan, PrefixReuseMode};
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            // max_cache_len = 32.
+            let state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // 40 valid ids (all < vocab_size=32 by value % 26), total length
+            // 40 > max_cache_len 32.
+            let prompt_ids: Vec<u32> = (0..40u32).map(|i| i % 26).collect();
+            let plan = PrefixRestorePlan {
+                mode: PrefixReuseMode::FullRefill,
+                shared_token_prefix_len: 0,
+                reusable_len: 0,
+                suffix_start: 0,
+                suffix_len: prompt_ids.len(),
+                old_represented_len: 0,
+            };
+
+            let result = state.plan_prefix_request(&prompt_ids, &plan);
+            match result {
+                Err(InferenceError::InvalidInput(msg)) => {
+                    assert!(
+                        msg.contains("exceeds max_cache_len"),
+                        "expected an exceeds-max_cache_len message, got: {msg}"
+                    );
+                }
+                other => panic!(
+                    "expected InvalidInput for a suffix overflowing max_cache_len; got {other:?}"
+                ),
+            }
+        }
+
+        /// Mutation-sensitive end-to-end regression test (#835): a warmed
+        /// cross-turn slot, followed by a request whose planner-selected
+        /// suffix is empty, must fail closed via
+        /// `generate_streaming_with_prefix_cache` WITHOUT consuming the
+        /// warm entry or touching live KV/GDN state.
+        ///
+        /// The empty-suffix shape is reached here through
+        /// `ReplayFromCheckpoint`: the warm-up call retains a real entry
+        /// for `"abcdef"` (`represented_len == 6`); a synthetic checkpoint
+        /// is then injected at `len == 2` (same boundary a real earlier
+        /// turn's `save_cross_turn_prefix` could have retained -- its
+        /// snapshot content is never read because validation now rejects
+        /// the request before `restore_cross_turn_prefix` would apply it).
+        /// A follow-up request for `"ab"` shares its entire (2-token)
+        /// length with both the entry and the checkpoint, so
+        /// `plan_cross_turn_reuse` selects `ReplayFromCheckpoint { checkpoint_len: 2 }`
+        /// with `suffix_start == 2 == new_prompt_ids.len()` -- an empty
+        /// suffix, exactly the shape `forward_prefill_from` has always
+        /// rejected, but which (pre-#835) only failed *after*
+        /// `restore_cross_turn_prefix` had already `take()`n the entry out
+        /// of the slot.
+        ///
+        /// Mutation sensitivity: reverting the hoist (moving the
+        /// `plan_prefix_request` calls in both the public wrapper and
+        /// `_inner` to after their respective destructive
+        /// match/`restore_cross_turn_prefix` calls) turns this test red --
+        /// the warm entry is destroyed by the rejected call instead of
+        /// preserved. Verified by hand for this PR (see PR description).
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_empty_replay_suffix_preserves_warm_entry() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            // Warm up with "abcdef" (6 valid, distinct single-char tokens).
+            let warm_cfg = cross_turn_test_gen_cfg(11, 1);
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "abcdef",
+                    &tokenizer,
+                    &warm_cfg,
+                    |_, _| true,
+                )
+                .expect("warm-up call must succeed");
+
+            // Inject a synthetic checkpoint at len=2 on the live warm entry,
+            // simulating a retained earlier-turn boundary. Its snapshot
+            // content is irrelevant: the request this checkpoint would
+            // otherwise serve is rejected before the snapshot is ever read.
+            {
+                let entry = state
+                    .cross_turn_prefix_cache
+                    .entry
+                    .as_mut()
+                    .expect("precondition: warm-up call must retain a cache entry");
+                let dummy_snapshot = entry.gdn_snapshot.clone();
+                entry.checkpoints.push(MetalGdnCheckpoint {
+                    len: 2,
+                    snapshot: dummy_snapshot,
+                });
+            }
+
+            let warm_token_ids_before = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .unwrap()
+                .generic
+                .token_ids
+                .clone();
+            let kv_seq_len_before = state.session.kv_cache.seq_len;
+            let position_before = state.session.position;
+
+            // Follow-up "ab": shares its full (2-token) length with the
+            // entry AND the injected checkpoint at len=2 -> empty suffix.
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "ab",
+                &tokenizer,
+                &cross_turn_test_gen_cfg(12, 1),
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::PrefixCache(_))),
+                "an empty-suffix request must fail closed via \
+                 generate_streaming_with_prefix_cache(); got {result:?}"
+            );
+
+            let entry_after = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .map(|e| e.generic.token_ids.clone());
+            assert_eq!(
+                entry_after,
+                Some(warm_token_ids_before.clone()),
+                "an empty-suffix rejection must not evict or consume the \
+                 warm entry -- validation must run before \
+                 restore_cross_turn_prefix's take()"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len, kv_seq_len_before,
+                "live KV length must be unchanged by a rejected request"
+            );
+            assert_eq!(
+                state.session.position, position_before,
+                "live GDN position must be unchanged by a rejected request"
+            );
+
+            // Second gate requirement: a subsequent VALID suffix on the
+            // same slot must still select the same (ExactAppend) reuse mode
+            // and produce output identical to a full-refill baseline --
+            // proving the preserved entry is genuinely intact, not just
+            // present-but-stale. The warm-up call's `max_new_tokens: 1`
+            // means the entry the natural end-of-generation save path
+            // retains is `"abcdef"` PLUS whatever single token was sampled
+            // (`crates/inference/src/forward/metal_qwen35.rs`'s
+            // `represented_token_ids = prompt_ids + generated_ids[..]`), not
+            // `"abcdef"` alone -- so the follow-up prompt is built from the
+            // entry's OWN persisted token ids (round-tripped back through
+            // `single_char_vocab_tokenizer`'s bijective single-char vocab)
+            // plus two more valid characters, guaranteeing an exact-prefix
+            // extension regardless of which token was actually sampled.
+            fn id_to_char(id: u32) -> char {
+                if id < 26 {
+                    (b'a' + id as u8) as char
+                } else {
+                    (b'A' + (id - 26) as u8) as char
+                }
+            }
+            let mut follow_up_prompt: String = warm_token_ids_before
+                .iter()
+                .map(|&id| id_to_char(id))
+                .collect();
+            follow_up_prompt.push_str("xy");
+
+            let follow_up = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &follow_up_prompt,
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(13, 2),
+                    |_, _| true,
+                )
+                .expect("a valid follow-up on the preserved slot must succeed");
+            assert_eq!(
+                follow_up.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "the preserved entry must still be reusable via ExactAppend"
+            );
+
+            let mut baseline_state =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let baseline = baseline_state
+                .generate_streaming_with_cancel(
+                    &follow_up_prompt,
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(13, 2),
+                    |_, _| true,
+                    || false,
+                )
+                .expect("full-refill baseline must succeed");
+            assert_eq!(
+                follow_up.output.token_ids, baseline.token_ids,
+                "output after the preserved-entry reuse must match a \
+                 full-refill baseline bit-for-bit (token-identity invariant)"
             );
         }
 
