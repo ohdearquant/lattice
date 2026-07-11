@@ -131,15 +131,18 @@ struct ParsedEntry {
 /// Strictness note: the official `safetensors` Rust crate rejects
 /// unknown/invalid dtype metadata outright, and this reader follows
 /// that strict contract. Lattice's runtime weights parser
-/// ([`crate::weights::f32_weights::SafetensorsFile`]'s
-/// `parse_tensor_meta` at `f32_weights.rs:1685`) is more permissive —
-/// it maps unknown unsupported dtypes to `Ok(None)` and skips the
-/// entry. The converter is intentionally stricter than the current
-/// runtime parser: a future-dtype string indicates either a format
-/// version this reader has not been updated for or a corrupted
-/// header, and silently rotating around it would be wrong. Aligning
-/// the runtime parser's strictness is a separate concern outside
-/// step 3b's scope.
+/// ([`crate::weights::f32_weights::SafetensorsFile`]'s `parse_tensor_meta`)
+/// was more permissive prior to lattice#800 — it mapped unknown dtypes to
+/// `Ok(None)` and silently skipped the entry. As of lattice#800 it also
+/// rejects a genuinely unrecognized dtype string at parse time and tracks
+/// known-but-unsupported whole-byte dtypes (I64, BOOL, ...) structurally
+/// instead of dropping them, matching this reader's strictness for those
+/// cases. The two parsers still diverge on sub-byte dtypes (`F4`,
+/// `F6_E2M3`, `F6_E3M2`): this reader's bit-size table represents them
+/// exactly, while the runtime parser's whole-byte extent model treats them
+/// as unrecognized. Unifying the two parsers (not just their strictness) is
+/// a separate concern, tracked by the native Q4/KHF1 validation-unification
+/// and QuaRot/offline-quantizer routing issues in the lattice#800 cluster.
 ///
 /// Table mirrors `Dtype::bitsize()` in the official `safetensors` Rust
 /// crate. Kept inline rather than depending on `safetensors` to match

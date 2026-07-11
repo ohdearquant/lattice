@@ -12,6 +12,15 @@ enum DType {
     F32,
     F16,
     BF16,
+    /// A dtype safetensors defines but this crate does not materialize as
+    /// f32 (I64, U8, BOOL, F64, ...). Tracked structurally (not silently
+    /// dropped from `SafetensorsFile::tensors`) so extent validation still
+    /// runs at open time; only a *requested* tensor of this dtype fails,
+    /// via `get_f32_tensor` (lattice#800).
+    Other {
+        label: &'static str,
+        size_bytes: usize,
+    },
 }
 
 impl DType {
@@ -19,6 +28,7 @@ impl DType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
+            Self::Other { size_bytes, .. } => size_bytes,
         }
     }
 
@@ -27,8 +37,86 @@ impl DType {
             Self::F32 => "F32",
             Self::F16 => "F16",
             Self::BF16 => "BF16",
+            Self::Other { label, .. } => label,
         }
     }
+}
+
+/// Resolve a safetensors header `dtype` string to a [`DType`], including
+/// non-float dtypes (tracked via `DType::Other` so extent validation still
+/// covers them). Returns `None` only for a string this crate has never
+/// heard of — the caller treats that as a hard parse error, since an
+/// unrecognized dtype's byte width is unknowable and extent validation
+/// cannot proceed (lattice#800).
+fn dtype_from_str(s: &str) -> Option<DType> {
+    Some(match s {
+        "F32" => DType::F32,
+        "F16" => DType::F16,
+        "BF16" => DType::BF16,
+        "F64" => DType::Other {
+            label: "F64",
+            size_bytes: 8,
+        },
+        "I64" => DType::Other {
+            label: "I64",
+            size_bytes: 8,
+        },
+        "U64" => DType::Other {
+            label: "U64",
+            size_bytes: 8,
+        },
+        "I32" => DType::Other {
+            label: "I32",
+            size_bytes: 4,
+        },
+        "U32" => DType::Other {
+            label: "U32",
+            size_bytes: 4,
+        },
+        "I16" => DType::Other {
+            label: "I16",
+            size_bytes: 2,
+        },
+        "U16" => DType::Other {
+            label: "U16",
+            size_bytes: 2,
+        },
+        "I8" => DType::Other {
+            label: "I8",
+            size_bytes: 1,
+        },
+        "U8" => DType::Other {
+            label: "U8",
+            size_bytes: 1,
+        },
+        "BOOL" => DType::Other {
+            label: "BOOL",
+            size_bytes: 1,
+        },
+        "F8_E4M3" => DType::Other {
+            label: "F8_E4M3",
+            size_bytes: 1,
+        },
+        "F8_E5M2" => DType::Other {
+            label: "F8_E5M2",
+            size_bytes: 1,
+        },
+        "F8_E8M0" => DType::Other {
+            label: "F8_E8M0",
+            size_bytes: 1,
+        },
+        "C64" => DType::Other {
+            label: "C64",
+            size_bytes: 8,
+        },
+        // Sub-byte dtypes (F4: 4 bits/elem, F6_E2M3 / F6_E3M2: 6 bits/elem)
+        // do not fit this crate's whole-byte-per-element extent model and
+        // are treated as unrecognized here; see
+        // `crate::quant::quarot::io::safetensors_bits_per_elem` for the
+        // bit-level table used by the QuaRot converter, which does support
+        // sub-byte dtypes.
+        _ => return None,
+    })
 }
 
 #[derive(Debug)]
@@ -38,6 +126,11 @@ struct TensorMeta {
     start: usize,
     end: usize,
     converted_f32: OnceLock<Box<[f32]>>,
+    /// Set once this tensor's decoded f32 values have passed
+    /// `ingress::validate_ingested_tensor`, so repeated access to the same
+    /// zero-copy F32 tensor does not rescan already-validated pages
+    /// (lattice#800 step 4).
+    validated: OnceLock<()>,
 }
 
 /// **Unstable**: 2D tensor view over memory-mapped safetensors data; field layout may change.
@@ -163,6 +256,10 @@ pub struct SafetensorsFile {
     data_offset: usize,
     /// Parsed tensor metadata.
     tensors: HashMap<String, TensorMeta>,
+    /// Human-readable provenance for this file, used only in error messages
+    /// raised by the ingress validation seam (lattice#800) — the source
+    /// path for `open()`, or a fixed label for `from_bytes()`.
+    source: String,
 }
 
 impl SafetensorsFile {
@@ -180,7 +277,7 @@ impl SafetensorsFile {
             InferenceError::InvalidSafetensors(format!("failed to mmap {}: {e}", path.display()))
         })?;
 
-        Self::from_backing(SafetensorsBacking::Mapped(mmap))
+        Self::from_backing(SafetensorsBacking::Mapped(mmap), path.display().to_string())
     }
 
     /// **Unstable**: parse a safetensors file already resident in memory.
@@ -190,10 +287,13 @@ impl SafetensorsFile {
     /// and for callers that already have the model bytes in hand (e.g. bytes
     /// handed in from JavaScript across a wasm boundary).
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, InferenceError> {
-        Self::from_backing(SafetensorsBacking::Owned(bytes))
+        Self::from_backing(
+            SafetensorsBacking::Owned(bytes),
+            "<in-memory bytes>".to_string(),
+        )
     }
 
-    fn from_backing(data: SafetensorsBacking) -> Result<Self, InferenceError> {
+    fn from_backing(data: SafetensorsBacking, source: String) -> Result<Self, InferenceError> {
         let bytes = data.as_slice();
 
         if bytes.len() < 8 {
@@ -266,6 +366,7 @@ impl SafetensorsFile {
             data,
             data_offset,
             tensors,
+            source,
         })
     }
 
@@ -358,7 +459,27 @@ impl SafetensorsFile {
                     )));
                 }
             }
+            DType::Other { label, .. } => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "tensor {name} has unsupported dtype {label} (source: {}); only F32, F16, \
+                     and BF16 tensors can be materialized as f32",
+                    self.source
+                )));
+            }
         };
+
+        if meta.validated.get().is_none() {
+            crate::weights::ingress::validate_ingested_tensor(
+                crate::weights::ingress::IngestedTensor::decoded_f32(
+                    &self.source,
+                    name,
+                    meta.shape.as_slice(),
+                    meta.dtype.name(),
+                    slice,
+                ),
+            )?;
+            let _ = meta.validated.set(());
+        }
 
         Ok((slice, meta.shape.as_slice()))
     }
@@ -1355,7 +1476,8 @@ fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, I
 
         if key == "__metadata__" {
             parser.skip_value()?;
-        } else if let Some(meta) = parser.parse_tensor_meta()? {
+        } else {
+            let meta = parser.parse_tensor_meta(&key)?;
             tensors.insert(key, meta);
         }
 
@@ -1667,10 +1789,21 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_tensor_meta(&mut self) -> Result<Option<TensorMeta>, InferenceError> {
+    /// Parse one tensor's header entry. `tensor_name` is the key this entry
+    /// was found under, threaded through purely for error messages.
+    ///
+    /// Every entry with a shape and data_offsets is preserved — including
+    /// dtypes this crate doesn't materialize as f32 — so extent validation
+    /// covers them and a later *request* for such a tensor fails with a
+    /// clear dtype/format error instead of looking like a missing tensor
+    /// (lattice#800). Only a dtype string this crate has never heard of is
+    /// rejected here, at parse time, since its byte width is unknowable and
+    /// extent validation cannot proceed without it.
+    fn parse_tensor_meta(&mut self, tensor_name: &str) -> Result<TensorMeta, InferenceError> {
         self.expect(b'{')?;
         self.skip_ws();
-        let mut dtype = None;
+        let mut dtype: Option<DType> = None;
+        let mut dtype_str: Option<String> = None;
         let mut shape = None;
         let mut data_offsets = None;
 
@@ -1686,13 +1819,9 @@ impl<'a> JsonParser<'a> {
 
                 match key.as_str() {
                     "dtype" => {
-                        let dtype_str = self.parse_string()?;
-                        dtype = match dtype_str.as_str() {
-                            "F32" => Some(DType::F32),
-                            "F16" => Some(DType::F16),
-                            "BF16" => Some(DType::BF16),
-                            _ => None, // Non-float tensor (I64, I32, etc.) — skip
-                        };
+                        let s = self.parse_string()?;
+                        dtype = dtype_from_str(&s);
+                        dtype_str = Some(s);
                     }
                     "shape" => shape = Some(self.parse_usize_array()?),
                     "data_offsets" => {
@@ -1731,23 +1860,37 @@ impl<'a> JsonParser<'a> {
             }
         }
 
-        let Some(dtype) = dtype else {
-            return Ok(None); // Non-float tensor (I64, I32, etc.) — skip
+        let dtype = match (dtype, dtype_str) {
+            (Some(dtype), _) => dtype,
+            (None, Some(s)) => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "tensor {tensor_name} has unrecognized dtype {s:?}; its byte width is \
+                     unknowable so extent validation cannot proceed"
+                )));
+            }
+            (None, None) => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "tensor {tensor_name} entry missing dtype"
+                )));
+            }
         };
         let shape = shape.ok_or_else(|| {
-            InferenceError::InvalidSafetensors("tensor entry missing shape".into())
+            InferenceError::InvalidSafetensors(format!("tensor {tensor_name} entry missing shape"))
         })?;
         let (start, end) = data_offsets.ok_or_else(|| {
-            InferenceError::InvalidSafetensors("tensor entry missing data_offsets".into())
+            InferenceError::InvalidSafetensors(format!(
+                "tensor {tensor_name} entry missing data_offsets"
+            ))
         })?;
 
-        Ok(Some(TensorMeta {
+        Ok(TensorMeta {
             dtype,
             shape,
             start,
             end,
             converted_f32: OnceLock::new(),
-        }))
+            validated: OnceLock::new(),
+        })
     }
 }
 
@@ -1833,6 +1976,322 @@ mod tests {
             .expect_err("shape byte length mismatch should be rejected at open");
         assert!(
             err.to_string().contains("byte length mismatch"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_rejects_one_byte_extra_payload() {
+        // shape [2] f32 wants exactly 8 bytes; data_offsets declares 9.
+        let path = temp_path("lattice_weights_extra_byte");
+        let header = r#"{
+            "extra": {"dtype": "F32", "shape": [2], "data_offsets": [0, 9]}
+        }"#
+        .replace(['\n', ' '], "");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        for value in [1.0f32, 2.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(0); // one extra byte so the declared 9-byte span exists in the file
+
+        let mut file = File::create(&path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+        drop(file);
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("one-byte-extra payload should be rejected at open");
+        assert!(
+            err.to_string().contains("byte length mismatch"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// Write a single raw tensor entry (arbitrary dtype/bytes) to a fresh
+    /// safetensors file, for fixtures that need control over the exact
+    /// on-disk bit pattern (NaN/Inf bit patterns, non-float dtypes, ...).
+    fn write_raw_tensor(
+        path: &std::path::Path,
+        name: &str,
+        dtype: &str,
+        shape: &[usize],
+        raw: &[u8],
+    ) {
+        let shape_str = format!(
+            "[{}]",
+            shape
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let header = format!(
+            r#"{{"{name}":{{"dtype":"{dtype}","shape":{shape_str},"data_offsets":[0,{}]}}}}"#,
+            raw.len()
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(raw);
+        let mut file = File::create(path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+    }
+
+    #[test]
+    fn test_open_mapped_f32_rejects_nan() {
+        let path = temp_path("lattice_weights_f32_nan_mapped");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1.0f32.to_le_bytes());
+        raw.extend_from_slice(&f32::NAN.to_le_bytes());
+        write_raw_tensor(&path, "t", "F32", &[2], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("NaN in mapped F32 data must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_open_mapped_f32_rejects_positive_infinity() {
+        let path = temp_path("lattice_weights_f32_posinf_mapped");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&f32::INFINITY.to_le_bytes());
+        raw.extend_from_slice(&2.0f32.to_le_bytes());
+        write_raw_tensor(&path, "t", "F32", &[2], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("+inf in mapped F32 data must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_open_mapped_f32_rejects_negative_infinity() {
+        let path = temp_path("lattice_weights_f32_neginf_mapped");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1.0f32.to_le_bytes());
+        raw.extend_from_slice(&f32::NEG_INFINITY.to_le_bytes());
+        write_raw_tensor(&path, "t", "F32", &[2], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("-inf in mapped F32 data must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_from_bytes_owned_f32_rejects_non_finite() {
+        let header = r#"{"t":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&f32::NAN.to_le_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let sf = SafetensorsFile::from_bytes(bytes).expect("from_bytes: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("NaN via from_bytes (owned backing) must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_get_f32_tensor_caches_validation_after_first_call() {
+        let path = temp_path("lattice_weights_validation_cache");
+        write_single_f32_tensor(&path, "t", &[1.0, 2.0, 3.0]);
+
+        let sf = SafetensorsFile::open(&path).expect("open: valid file");
+        let meta = sf.tensors.get("t").expect("tensor tracked");
+        assert!(
+            meta.validated.get().is_none(),
+            "must not be marked validated before first access"
+        );
+
+        sf.get_f32_tensor("t").expect("first access validates");
+        assert!(
+            meta.validated.get().is_some(),
+            "must be marked validated after first access"
+        );
+
+        // Second access must not panic or error — it should skip re-scanning.
+        sf.get_f32_tensor("t")
+            .expect("second access reuses cached validation");
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_unsupported_dtype_tensor_fails_as_format_error_not_missing_tensor() {
+        let path = temp_path("lattice_weights_unsupported_dtype");
+        // I64 is a real safetensors dtype this crate does not materialize as
+        // f32 — it must stay structurally tracked, not disappear.
+        write_raw_tensor(&path, "counts", "I64", &[2], &8i64.to_le_bytes().repeat(2));
+
+        let sf = SafetensorsFile::open(&path).expect("open: known dtype, valid extent");
+        assert!(
+            sf.has_tensor("counts"),
+            "unsupported-dtype tensor must remain structurally tracked"
+        );
+        assert_eq!(sf.tensor_shape("counts"), Some(&[2usize][..]));
+
+        let err = sf
+            .get_f32_tensor("counts")
+            .expect_err("requesting an I64 tensor as f32 must fail");
+        assert!(
+            matches!(err, InferenceError::InvalidSafetensors(_)),
+            "must fail as a dtype/format error, not MissingTensor: {err:?}"
+        );
+        assert!(
+            !matches!(err, InferenceError::MissingTensor(_)),
+            "must not be reported as a missing tensor: {err:?}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_unrecognized_dtype_string_rejected_at_parse_time() {
+        let path = temp_path("lattice_weights_bogus_dtype");
+        let header = r#"{"t":{"dtype":"BANANA","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let mut file = File::create(&path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+        drop(file);
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("an unrecognized dtype string must fail at open/parse time");
+        assert!(
+            err.to_string().contains("unrecognized dtype"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f16_tensor_rejects_nan_bit_pattern_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f16_nan");
+        // f16 quiet NaN: sign=0, exponent=0x1F, non-zero fraction.
+        let nan_bits: u16 = 0x7E00;
+        let one_bits: u16 = 0x3C00; // f16 1.0
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&nan_bits.to_le_bytes());
+        raw.extend_from_slice(&one_bits.to_le_bytes());
+        write_raw_tensor(&path, "t", "F16", &[2], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("F16 NaN bit pattern must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f16_tensor_rejects_infinity_bit_pattern_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f16_inf");
+        // f16 +infinity: sign=0, exponent=0x1F, fraction=0.
+        let inf_bits: u16 = 0x7C00;
+        let one_bits: u16 = 0x3C00;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&inf_bits.to_le_bytes());
+        raw.extend_from_slice(&one_bits.to_le_bytes());
+        write_raw_tensor(&path, "t", "F16", &[2], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("F16 +inf bit pattern must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_bf16_tensor_rejects_nan_bit_pattern_through_safetensors_path() {
+        let path = temp_path("lattice_weights_bf16_nan");
+        // bf16 quiet NaN: top 16 bits of the f32 QNaN 0x7FC0_0000.
+        let nan_bits: u16 = 0x7FC0;
+        let one_bits: u16 = 0x3F80; // bf16 1.0
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&nan_bits.to_le_bytes());
+        raw.extend_from_slice(&one_bits.to_le_bytes());
+        write_raw_tensor(&path, "t", "BF16", &[2], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("BF16 NaN bit pattern must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_bf16_tensor_rejects_infinity_bit_pattern_through_safetensors_path() {
+        let path = temp_path("lattice_weights_bf16_inf");
+        // bf16 +infinity: top 16 bits of f32 +inf, 0x7F80_0000.
+        let inf_bits: u16 = 0x7F80;
+        let one_bits: u16 = 0x3F80;
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&inf_bits.to_le_bytes());
+        raw.extend_from_slice(&one_bits.to_le_bytes());
+        write_raw_tensor(&path, "t", "BF16", &[2], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("BF16 +inf bit pattern must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
 
