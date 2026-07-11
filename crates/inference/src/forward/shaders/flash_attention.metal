@@ -120,134 +120,6 @@ kernel void rope(
     x[base + half_dim + pair] = x0 * sin_val + x1 * cos_val;
 }
 
-// ===== Attention scores: Q @ K^T per head with GQA =====
-// Q: [seq, q_dim], K: [seq, kv_dim]
-// out: [num_heads, seq, seq]
-// Applies scale and causal mask in-place.
-kernel void attn_scores(
-    device const float* Q    [[buffer(0)]],
-    device const float* K    [[buffer(1)]],
-    device float* out        [[buffer(2)]],
-    constant uint& seq_len   [[buffer(3)]],
-    constant uint& head_dim  [[buffer(4)]],
-    constant uint& num_heads [[buffer(5)]],
-    constant uint& num_kv_heads [[buffer(6)]],
-    constant uint& q_dim     [[buffer(7)]],
-    constant uint& kv_dim    [[buffer(8)]],
-    constant float& scale    [[buffer(9)]],
-    uint gid [[thread_position_in_grid]])
-{
-    uint total = num_heads * seq_len * seq_len;
-    if (gid >= total) return;
-
-    uint kj = gid % seq_len;
-    uint tmp = gid / seq_len;
-    uint qi = tmp % seq_len;
-    uint h = tmp / seq_len;
-
-    // Causal mask: future positions get -inf.
-    if (kj > qi) {
-        out[gid] = -1e9f;
-        return;
-    }
-
-    uint groups = num_heads / num_kv_heads;
-    uint kv_h = h / groups;
-
-    float dot = 0.0f;
-    uint q_base = qi * q_dim + h * head_dim;
-    uint k_base = kj * kv_dim + kv_h * head_dim;
-    for (uint d = 0; d < head_dim; d++) {
-        dot += Q[q_base + d] * K[k_base + d];
-    }
-
-    out[gid] = dot * scale;
-}
-
-// ===== Softmax over last dimension =====
-// in/out: [num_rows, row_len]
-// One threadgroup per row.
-kernel void attn_softmax(
-    device float* data       [[buffer(0)]],
-    constant uint& row_len   [[buffer(1)]],
-    constant uint& num_rows  [[buffer(2)]],
-    uint gid  [[threadgroup_position_in_grid]],
-    uint lid  [[thread_position_in_threadgroup]],
-    uint tgs  [[threads_per_threadgroup]])
-{
-    if (gid >= num_rows) return;
-    constexpr uint SOFTMAX_WG = 256;
-    uint base = gid * row_len;
-
-    // Find max.
-    threadgroup float shared[SOFTMAX_WG];
-    float local_max = -1e30f;
-    for (uint i = lid; i < row_len; i += tgs) {
-        local_max = max(local_max, data[base + i]);
-    }
-    shared[lid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] = max(shared[lid], shared[lid + s]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float max_val = shared[0];
-
-    // Exp and sum.
-    float local_sum = 0.0f;
-    for (uint i = lid; i < row_len; i += tgs) {
-        float e = exp(data[base + i] - max_val);
-        data[base + i] = e;
-        local_sum += e;
-    }
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] += shared[lid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float sum_val = shared[0];
-
-    // Normalize.
-    float inv_sum = (sum_val > 0.0f) ? (1.0f / sum_val) : 0.0f;
-    for (uint i = lid; i < row_len; i += tgs) {
-        data[base + i] *= inv_sum;
-    }
-}
-
-// ===== Attention context: scores @ V per head =====
-// scores: [num_heads, seq, seq], V: [seq, kv_dim]
-// out: [seq, q_dim]
-kernel void attn_context(
-    device const float* scores  [[buffer(0)]],
-    device const float* V       [[buffer(1)]],
-    device float* out           [[buffer(2)]],
-    constant uint& seq_len      [[buffer(3)]],
-    constant uint& head_dim     [[buffer(4)]],
-    constant uint& num_heads    [[buffer(5)]],
-    constant uint& num_kv_heads [[buffer(6)]],
-    constant uint& q_dim        [[buffer(7)]],
-    constant uint& kv_dim       [[buffer(8)]],
-    uint gid [[thread_position_in_grid]])
-{
-    uint total = num_heads * seq_len * head_dim;
-    if (gid >= total) return;
-
-    uint d = gid % head_dim;
-    uint tmp = gid / head_dim;
-    uint pos = tmp % seq_len;
-    uint h = tmp / seq_len;
-
-    uint groups = num_heads / num_kv_heads;
-    uint kv_h = h / groups;
-
-    float sum = 0.0f;
-    uint score_base = h * seq_len * seq_len + pos * seq_len;
-    for (uint j = 0; j < seq_len; j++) {
-        sum += scores[score_base + j] * V[j * kv_dim + kv_h * head_dim + d];
-    }
-
-    out[pos * q_dim + h * head_dim + d] = sum;
 }
 
 // ===== Fused Attention: Q@K^T + causal softmax + scores@V in one kernel =====
@@ -369,9 +241,21 @@ kernel void fused_attention(
     }
 
     if (row_active) {
-        const float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
         const uint out_base4 = qi * p.q_dim4 + q_head * FA_HEAD_DIM4 + lane;
-        O4[out_base4] = o_frag * inv_l;
+        // ADR-080 C1 fail-closed row contract, ported from
+        // attention::softmax_row::finalize_row: a non-positive or non-finite
+        // denominator zeroes the row by direct ASSIGNMENT of the literal
+        // 0.0f, never by multiplying `o_frag` through a zeroed reciprocal.
+        // `o_frag` can itself already be NaN by this point (a NaN score
+        // poisons the running numerator via `exp(NaN - m_new) * V`, not just
+        // the denominator `l_i`), and IEEE-754 defines `NaN * 0.0f == NaN`,
+        // not `0.0f` -- so `o_frag * inv_l` cannot recover a poisoned row
+        // even when `inv_l` itself is correctly computed as `0.0f` (#789).
+        if (isfinite(l_i) && l_i > 0.0f) {
+            O4[out_base4] = o_frag * (1.0f / l_i);
+        } else {
+            O4[out_base4] = float4(0.0f);
+        }
     }
 }
 

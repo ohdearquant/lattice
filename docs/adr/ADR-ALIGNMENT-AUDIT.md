@@ -4,6 +4,8 @@
 **Date**: 2026-06-30
 **Scope**: `docs/adr/` (65 numbered ADRs + `INDEX.md`)
 
+This audit's classification is frozen at 2026-06-30 and covers ADR-001 through ADR-065 only; ADR-066 onward (including the ADR-070 numbering collision resolved by ADR-081) postdate it and are not classified here.
+
 Source ref: `origin/main` at `4772d5b`.
 
 Inventory basis: `../explorer/adr-inventory.md` listed 65 markdown files under `docs/adr/` on `origin/main`: 64 numbered ADRs plus `INDEX.md`. This change adds ADR-065 (the companion methodology ADR), bringing committed HEAD to 65 numbered ADRs plus `INDEX.md`. Statuses below are classified from source evidence or concrete source gaps, not ADR prose alone. If an ADR makes no current code-checkable claim beyond an implemented path, it is marked `current` with the relevant source path.

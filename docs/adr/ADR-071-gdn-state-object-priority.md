@@ -133,7 +133,7 @@ additionally needs KV page-table integration; its scope is decided once the obje
 The B=128 device-scratch + `simdgroup_matrix` variant is the *sole* untried chunk-scan sub-lever,
 and it is **low priority**: decode profiling (S10) makes GDN the cheapest mixer, so the chunk scan
 is a prefill-only concern already meeting ≥5×@4K (S8). Revisit only if prefill attention becomes
-the top prefill lever (tied to ADR-070's deferred FA2 track).
+the top prefill lever (tied to ADR-081's deferred FA2 track).
 
 ## Consequences
 

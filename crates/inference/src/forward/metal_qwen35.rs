@@ -558,6 +558,28 @@ mod mtp_resolve_tests {
 /// `gen_cfg.stop_strings.is_empty()` is load-bearing: MTP's draft/verify loop
 /// has no string-stop awareness, so any non-empty `stop_strings` must route
 /// around it to the plain loop (which does check stops after every token).
+///
+/// `gen_cfg.reasoning_budget.is_none()` is the same kind of load-bearing
+/// route-around (ADR-080 C3, #783): MTP's draft/verify loop has no
+/// budget-forcing awareness (no `decode_cap` / `force_close_think` wiring),
+/// so any set `reasoning_budget` must route around it to the plain loop,
+/// which either applies budget forcing or rejects the config via
+/// `check_reasoning_budget_not_set`.
+///
+/// `gen_cfg.repetition_penalty == 1.0` is likewise load-bearing (codex round-1
+/// blocker #2, PR #787): both the MTP draft (`mtp_forward_one`) and verify
+/// steps select tokens via raw `argmax_f32_first_wins` over logits, never
+/// through `sample_token`, so a non-identity penalty configured by the caller
+/// would be silently ignored -- a set penalty can change which token is
+/// greedy-argmax-optimal, so this is an output-correctness issue, not only a
+/// performance one. Any non-1.0 penalty must route around MTP to the plain
+/// loop, which samples via `sample_token` and applies it.
+///
+/// `gen_cfg.logprobs.is_none()` is likewise load-bearing (codex round-2
+/// blocker #1, PR #787): `generate_greedy_mtp` unconditionally returns
+/// `token_logprobs: vec![]`, so a set `logprobs` request must route around
+/// MTP to the plain loop, which either captures logprobs or rejects the
+/// config via `check_logprobs_not_set`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn mtp_route_active(
     mtp_present: bool,
@@ -572,12 +594,20 @@ fn mtp_route_active(
         && !use_compact
         && gen_cfg.grammar.is_none()
         && gen_cfg.stop_strings.is_empty()
+        && gen_cfg.reasoning_budget.is_none()
+        && gen_cfg.repetition_penalty == 1.0
+        && gen_cfg.logprobs.is_none()
 }
 
 /// Whether `generate()` should take the GDN-first self-speculative greedy
 /// branch. Mirrors the `use_self_spec` computation inline in
-/// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()`
-/// route-around rationale as [`mtp_route_active`].
+/// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()` /
+/// `reasoning_budget.is_none()` / `repetition_penalty == 1.0` route-around
+/// rationale as [`mtp_route_active`] (codex round-1 blocker #2, PR #787):
+/// self-spec's verify step also selects via raw argmax, never `sample_token`.
+/// `gen_cfg.logprobs.is_none()` is the same round-2 blocker #1 route-around
+/// as [`mtp_route_active`]: `generate_greedy_self_spec` also unconditionally
+/// returns `token_logprobs: vec![]`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn self_spec_route_active(
     gdn_checkpoints_present: bool,
@@ -593,6 +623,9 @@ fn self_spec_route_active(
         && !use_compact
         && gen_cfg.grammar.is_none()
         && gen_cfg.stop_strings.is_empty()
+        && gen_cfg.reasoning_budget.is_none()
+        && gen_cfg.repetition_penalty == 1.0
+        && gen_cfg.logprobs.is_none()
         && num_active_linear_attention_layers > 0
 }
 
@@ -663,6 +696,177 @@ mod route_predicate_tests {
              same string-stop-unaware draft/verify loop as MTP"
         );
     }
+
+    /// ADR-080 C3 (#783): a set `reasoning_budget` must route around MTP even
+    /// though every other MTP precondition is satisfied -- MTP's draft/verify
+    /// loop has no budget-forcing (`decode_cap` / `force_close_think`)
+    /// awareness, mirroring the `stop_strings` route-around above.
+    ///
+    /// Mutation sensitivity: removing the `reasoning_budget.is_none()` clause
+    /// from `mtp_route_active` makes this assertion fail (the route stays
+    /// active), which would silently drop the caller's reasoning budget once
+    /// MTP takes over decoding.
+    #[test]
+    fn mtp_route_blocked_by_set_reasoning_budget() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(64),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when reasoning_budget is set -- its \
+             draft/verify loop has no budget-forcing awareness"
+        );
+    }
+
+    /// Sibling to `mtp_route_blocked_by_set_reasoning_budget` for the
+    /// self-speculative route (ADR-080 C3, #783).
+    #[test]
+    fn self_spec_route_blocked_by_set_reasoning_budget() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(64),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when reasoning_budget is set -- same \
+             budget-forcing-unaware draft/verify loop as MTP"
+        );
+    }
+
+    /// Codex round-1 blocker #2 (PR #787): a non-identity `repetition_penalty`
+    /// must route around MTP even though every other MTP precondition
+    /// (present, enabled, greedy, non-compact, no grammar, no stop strings,
+    /// no reasoning budget) is satisfied. MTP's draft/verify loop selects via
+    /// raw `argmax_f32_first_wins`, never `sample_token`, so a caller-supplied
+    /// penalty would otherwise be silently ignored.
+    ///
+    /// Mutation sensitivity: removing the `repetition_penalty == 1.0` clause
+    /// from `mtp_route_active` makes this assertion fail (the route stays
+    /// active), reproducing codex's reported failure mode exactly.
+    #[test]
+    fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when repetition_penalty is not 1.0 -- its \
+             draft/verify loop selects via raw argmax and has no \
+             repetition-penalty awareness"
+        );
+    }
+
+    /// Sibling to `mtp_route_blocked_by_nonidentity_repetition_penalty` for
+    /// the self-speculative route (codex round-1 blocker #2, PR #787).
+    #[test]
+    fn self_spec_route_blocked_by_nonidentity_repetition_penalty() {
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when repetition_penalty is not 1.0 \
+             -- same raw-argmax-selecting, penalty-unaware draft/verify loop \
+             as MTP"
+        );
+    }
+
+    /// Output-level discriminating case (codex round-1 blocker #2, PR #787):
+    /// proves the route-around above is not merely cosmetic. With
+    /// `repetition_penalty = 1.0` the raw dense argmax MTP/self-spec use
+    /// (`argmax_f32_first_wins`) agrees with the canonical
+    /// repetition-penalty-aware `sample_token` path. Once a previously-seen
+    /// token depresses the raw argmax below the runner-up (same mechanism as
+    /// `test_repetition_penalty_can_flip_greedy_argmax_when_seen_in_history`
+    /// in `model::qwen35::sampling`), the two paths disagree -- exactly the
+    /// silent-divergence scenario the new predicate clause closes.
+    #[test]
+    fn nonidentity_repetition_penalty_flips_winner_vs_raw_argmax() {
+        use crate::sampling::{argmax_f32_first_wins, sample_full_logits as sample_token};
+
+        // Token 0 has the highest raw logit; token 1 is a close second, chosen
+        // so 5.0 / 1.1 falls below token 1's unpenalized 4.6.
+        let logits = [5.0_f32, 4.6, 0.1];
+        let previous_ids = [0_u32, 0, 0];
+
+        // Raw dense argmax (what MTP/self-spec actually call): always token 0,
+        // with no notion of `previous_ids` or `repetition_penalty` at all.
+        assert_eq!(
+            argmax_f32_first_wins(&logits),
+            0,
+            "raw argmax is penalty-blind by construction"
+        );
+
+        // Canonical path with the caller's non-identity penalty and the
+        // argmax token already in history: the penalized pick flips to the
+        // runner-up.
+        let gen_cfg = GenerateConfig {
+            repetition_penalty: 1.1,
+            ..greedy_gen_cfg(vec![])
+        };
+        let mut rng = 7u64;
+        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng);
+        assert_eq!(
+            canonical, 1,
+            "sample_token must penalize the previously-seen argmax enough to \
+             flip greedy selection to the runner-up"
+        );
+
+        assert_ne!(
+            argmax_f32_first_wins(&logits),
+            canonical,
+            "raw argmax and the canonical repetition-aware pick must disagree \
+             here -- this is exactly the output-correctness gap that routing \
+             MTP/self-spec around non-identity repetition_penalty closes"
+        );
+    }
+
+    /// Codex round-2 blocker #1 (PR #787): a set `logprobs` must route
+    /// around MTP even though every other MTP precondition (present,
+    /// enabled, greedy, non-compact, no grammar, no stop strings, no
+    /// reasoning budget, identity repetition penalty) is satisfied.
+    /// `generate_greedy_mtp` unconditionally returns `token_logprobs: vec![]`,
+    /// so a caller requesting logprobs would otherwise get `Ok` with the
+    /// requested output silently absent.
+    ///
+    /// Codex's exact falsification recipe: add `logprobs: Some(0)` to the
+    /// otherwise-active predicate fixture and assert the route is inactive.
+    ///
+    /// Mutation sensitivity: removing the `logprobs.is_none()` clause from
+    /// `mtp_route_active` makes this assertion fail (the route stays
+    /// active), reproducing codex's reported failure mode exactly.
+    #[test]
+    fn mtp_route_blocked_by_set_logprobs() {
+        let gen_cfg = GenerateConfig {
+            logprobs: Some(0),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !mtp_route_active(true, true, &gen_cfg, false),
+            "MTP must not activate when logprobs is set -- its output path \
+             unconditionally returns an empty token_logprobs vector"
+        );
+    }
+
+    /// Sibling to `mtp_route_blocked_by_set_logprobs` for the
+    /// self-speculative route (codex round-2 blocker #1, PR #787):
+    /// `generate_greedy_self_spec` has the same unconditional empty-vector
+    /// return.
+    #[test]
+    fn self_spec_route_blocked_by_set_logprobs() {
+        let gen_cfg = GenerateConfig {
+            logprobs: Some(0),
+            ..greedy_gen_cfg(vec![])
+        };
+        assert!(
+            !self_spec_route_active(true, true, &gen_cfg, false, 1),
+            "self-spec must not activate when logprobs is set -- same \
+             unconditional empty-token_logprobs output path as MTP"
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -686,10 +890,7 @@ mod inner {
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
-    use crate::model::qwen35_config::{
-        GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob, decode_cap, force_close_think,
-    };
-    use crate::sampling::record_logprob;
+    use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob};
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
@@ -5362,14 +5563,16 @@ mod inner {
             cmd2.wait_until_completed();
 
             // ---- Phase 3: CPU ----
+            // Codex round-1 medium #4 (PR #787): this was the one surviving
+            // production last-wins `max_by` argmax after the #280 fix -- the
+            // MTP draft-token pick, called from `generate_greedy_mtp`. Swapped
+            // for the shared first-wins `argmax_f32_first_wins` helper so a
+            // tie at the draft boundary resolves the same way as every other
+            // greedy pick in the crate (a differing draft tie can only reduce
+            // speculative acceptance, never change final target output, but
+            // the duplicate last-wins contract itself is the defect).
             let logits = unsafe { read_buffer(&*buf_logits, cfg.vocab_size) };
-            let draft_token = logits
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            let draft_token = crate::sampling::argmax_f32_first_wins(&logits);
 
             // Advance MTP KV cache.
             if let Some(ref mut mtp) = self.session.mtp {
@@ -7855,14 +8058,11 @@ mod inner {
                 };
             }
 
-            // Greedy argmax from prefill logits.
-            let pending_first = prefill_logits
-                .iter()
-                .copied()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0);
+            // Greedy argmax from prefill logits. Shared first-wins helper
+            // (ADR-080 C3, #783) rather than a hand-rolled `max_by`, which
+            // keeps the LAST tied maximum instead of the engine-wide-contract
+            // first tied maximum.
+            let pending_first = crate::sampling::argmax_f32_first_wins(prefill_logits);
 
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
@@ -8100,15 +8300,10 @@ mod inner {
                 };
             }
 
-            let argmax_logits = |logits: &[f32]| -> u32 {
-                logits
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                    .map(|(i, _)| i as u32)
-                    .unwrap_or(0)
-            };
+            // Shared first-wins argmax helper (ADR-080 C3, #783) rather than a
+            // hand-rolled `max_by` closure, which kept the LAST tied maximum
+            // instead of the engine-wide-contract first tied maximum.
+            let argmax_logits = crate::sampling::argmax_f32_first_wins;
 
             let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
 
@@ -8453,6 +8648,25 @@ mod inner {
                     token_logprobs: vec![],
                 });
             }
+
+            // Reject reasoning_budget before any prefill/state work (ADR-080 C3,
+            // #783): budget-forcing (`decode_cap` / `force_close_think`) is not
+            // wired into this decode loop, unlike `generate_streaming` /
+            // `generate_streaming_with_cancel` below, which do apply it. Without
+            // this guard the field would be silently ignored, producing
+            // unbudgeted output despite a reasoning budget being requested.
+            // `stop_strings` does not need an equivalent guard here: this loop
+            // already applies it via `stop_text_state` further down.
+            crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
+
+            // Reject logprobs before any prefill/state work (codex round-2
+            // blocker #1, PR #787): this entry point unconditionally returns
+            // `token_logprobs: vec![]` on every return path below (including
+            // the MTP and self-spec fast-path delegations), so a caller
+            // requesting `gen_cfg.logprobs` would otherwise get `Ok` with the
+            // requested output silently absent -- the same apply-or-fail-closed
+            // defect as `check_reasoning_budget_not_set` above guards against.
+            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
 
             // Fail-closed: a prompt longer than the KV cache would trip the
             // forward_prefill length assertion (n <= max_cache_len) and panic the
@@ -12822,8 +13036,9 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
             // Per-token log-probabilities (#585): empty and untouched unless
-            // gen_cfg.logprobs is Some — record_logprob() below is a no-op in that
-            // case, so the default (no logprobs requested) path pays no extra cost.
+            // gen_cfg.logprobs is Some — DecodePolicy::init / transition's
+            // internal record_logprob call is a no-op in that case, so the
+            // default (no logprobs requested) path pays no extra cost.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
             // Issue #171: try the block-top-k route first — far fewer threadgroups
@@ -12874,7 +13089,6 @@ mod inner {
             } else {
                 None
             };
-            let mut thinking_closed = false;
 
             // Checked independently of `on_token`: a client that disconnected
             // between dequeue and here must not pay for the (potentially large,
@@ -12980,108 +13194,88 @@ mod inner {
                 });
             }
 
-            // Track whether the thinking block has been closed after prefill sampling.
-            // Enables budget=1 to behave sanely (prefill token counts against budget).
-            if Some(next_id) == think_close_id {
-                thinking_closed = true;
-            }
-
             // Incremental detokenization: stream only complete-UTF-8 deltas. A
             // byte-level BPE codepoint (CJK/emoji) can span several tokens, so
             // per-token lossy decode would emit U+FFFD mojibake the caller cannot
             // retract. Mirrors the non-Metal path (model::qwen35::generation).
             let mut detok = IncrementalDetokenizer::new();
-            // Tracks the generated_ids length at the moment </think> was emitted;
-            // used by the answer-budget break below.
-            let mut reasoning_end_len: Option<usize> = None;
             generated_ids.push(next_id);
             all_ids.push(next_id);
-            // #585: record the prefill token's logprob (no-op unless requested).
-            // prefill_logits is untouched since forward_prefill() populated it above,
-            // and reflects the same distribution next_id was sampled from.
-            record_logprob(
+            // Backend-neutral reasoning-budget + logprobs policy (ADR-080 C3):
+            // constructed here (post-prefill-push) so its `thinking_closed` /
+            // `reasoning_end_len` seed covers the budget=1 edge case exactly as
+            // the pre-extraction inline bookkeeping did. Shared with the CPU
+            // `model::qwen35::generation` loops -- see `DecodePolicy`'s doc comment.
+            // `DecodePolicy::init` (codex round-2 major #2, PR #787) records
+            // the prefill token's logprob (#585, no-op unless requested) in
+            // the same call that constructs the policy -- replaces the
+            // freestanding `record_logprob(...)` call this site used to make
+            // independently. `prefill_logits` is untouched since
+            // `forward_prefill()` populated it above, and reflects the same
+            // distribution `next_id` was sampled from.
+            // `streaming: true` selects `StopMode::Streaming`'s incremental
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
+            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // now owns the `StopStringMatcher` this call site used to
+            // construct and drive by hand.
+            let mut policy = crate::model::qwen35::DecodePolicy::init(
+                gen_cfg,
+                think_close_id,
                 &mut token_logprobs,
-                &prefill_logits,
                 next_id,
+                &prefill_logits,
                 gen_cfg.temperature,
-                gen_cfg.logprobs,
+                generated_ids.len(),
+                true,
             );
-            // Capture close-point after the prefill push (covers budget=1 edge case).
-            if thinking_closed && reasoning_end_len.is_none() {
-                reasoning_end_len = Some(generated_ids.len());
-            }
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
-            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
-            // Holds back a partial suffix that could still become a stop match, so
-            // `text`/`on_token` never see a stop string that spans a token boundary.
-            let mut stop_matcher = if gen_cfg.stop_strings.is_empty() {
-                None
-            } else {
-                Some(StopStringMatcher::new(&gen_cfg.stop_strings))
-            };
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
             let delta = detok.push(tokenizer, next_id);
-            if !delta.is_empty() {
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let mut caller_interrupted = false;
-                    let stop_matched = matcher.push(&delta, &mut |emit| {
-                        if !caller_interrupted && !emit.is_empty() {
-                            text.push_str(emit);
-                            if !on_token(emit, next_id) {
-                                caller_interrupted = true;
-                            }
-                        }
-                    });
-                    if caller_interrupted {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: false, // caller interrupted the stream, not a stop condition
-                            stop_reason: Some(StopReason::Interrupt),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
-                    if stop_matched {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: true,
-                            stop_reason: Some(StopReason::Eos),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
-                } else {
-                    text.push_str(&delta);
-                    if !on_token(&delta, next_id) {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(GenerateOutput {
-                            text,
-                            token_ids: generated_ids.clone(),
-                            prompt_tokens: prompt_len,
-                            generated_tokens: generated_ids.len(),
-                            stopped: false, // caller interrupted the stream, not a stop condition
-                            stop_reason: Some(StopReason::Interrupt),
-                            token_logprobs: token_logprobs.clone(),
-                        });
-                    }
+            let initial_outcome = policy.check_initial_stop(
+                &mut token_logprobs,
+                &mut text,
+                &mut throwaway_offsets,
+                &delta,
+                |s| on_token(s, next_id),
+            );
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Interrupted
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
+                return Ok(GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: false, // caller interrupted the stream, not a stop condition
+                    stop_reason: Some(StopReason::Interrupt),
+                    token_logprobs: token_logprobs.clone(),
+                });
+            }
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Stopped
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                return Ok(GenerateOutput {
+                    text,
+                    token_ids: generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: generated_ids.len(),
+                    stopped: true,
+                    stop_reason: Some(StopReason::Eos),
+                    token_logprobs: token_logprobs.clone(),
+                });
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
@@ -13089,7 +13283,7 @@ mod inner {
 
             // Autoregressive decode with streaming.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
-            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            let cap = policy.cap();
             for _ in 1..cap {
                 // Checked before any per-step GPU work, independent of whether this
                 // iteration's delta ends up non-empty -- closes the gap where a run
@@ -13136,97 +13330,76 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                // Budget forcing: override sampled token with </think> when the
-                // reasoning budget is exhausted and the block is still open.
-                let next_id = force_close_think(
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    thinking_closed,
-                    generated_ids.len(),
-                    think_close_id,
-                )
-                .unwrap_or(sampled_id);
-
-                // Advance grammar state after sampling (or forced token).
+                // One atomic per-step transition (ADR-080 C3 / codex round-1
+                // major #3, PR #787) -- see `DecodePolicy::transition`.
                 // Interaction note: if reasoning_budget AND grammar are both active and the
                 // grammar disallows </think> at this position, advance returns false → break.
                 // This is fail-closed (no grammar-illegal output emitted) but silent. The
                 // combination of grammar + reasoning_budget is unusual; document, don't change.
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                // Track when the thinking block closes (natural or forced).
-                if Some(next_id) == think_close_id {
-                    thinking_closed = true;
-                }
-
-                if is_stop(next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-                // #585: record this step's logprob (no-op unless requested). next_id
-                // here is the final, post-force_close_think token — step_logits is
-                // the distribution it was actually sampled/forced from.
-                record_logprob(
+                //
+                // `policy.stop_mode` (fixed to `StopMode::Streaming` or
+                // `Disabled` at construction) now owns this path's byte-
+                // holdback stop check itself (codex round-3 major #1, PR
+                // #787 / Leo's ruling) -- this call site supplies only
+                // `decode_delta` (this loop's own detokenizer) and the
+                // shared `text`/`throwaway_offsets` buffers.
+                let generated_len_before = generated_ids.len();
+                let outcome = policy.transition(
                     &mut token_logprobs,
+                    sampled_id,
                     &step_logits,
-                    next_id,
                     gen_cfg.temperature,
-                    gen_cfg.logprobs,
+                    generated_len_before,
+                    |next_id| {
+                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                            engine.advance(gs, next_id)
+                        } else {
+                            true
+                        }
+                    },
+                    &is_stop,
+                    |next_id| {
+                        generated_ids.push(next_id);
+                        all_ids.push(next_id);
+                    },
+                    |next_id| detok.push(tokenizer, next_id),
+                    &mut text,
+                    &mut throwaway_offsets,
+                    |s, next_id| on_token(s, next_id),
                 );
-                // Capture the close-point after the push so </think> is the
-                // last reasoning token (not the first answer token).
-                if thinking_closed && reasoning_end_len.is_none() {
-                    reasoning_end_len = Some(generated_ids.len());
-                }
-                last_pushed_id = next_id;
-                let delta = detok.push(tokenizer, next_id);
-                if !delta.is_empty() {
-                    if let Some(matcher) = stop_matcher.as_mut() {
-                        let mut caller_interrupted = false;
-                        let stop_matched = matcher.push(&delta, &mut |emit| {
-                            if !caller_interrupted && !emit.is_empty() {
-                                text.push_str(emit);
-                                if !on_token(emit, next_id) {
-                                    caller_interrupted = true;
-                                }
-                            }
-                        });
-                        if caller_interrupted {
-                            stopped_by_caller = true;
-                            stop_reason = StopReason::Interrupt;
-                            break;
-                        }
-                        if stop_matched {
-                            stopped = true;
-                            stop_reason = StopReason::Eos;
-                            break;
-                        }
-                    } else {
-                        text.push_str(&delta);
-                        if !on_token(&delta, next_id) {
-                            stopped_by_caller = true;
-                            stop_reason = StopReason::Interrupt;
-                            break;
-                        }
+
+                let (next_id, answer_budget_exhausted) = match outcome {
+                    crate::model::qwen35::StepOutcome::GrammarStop => {
+                        stop_reason = StopReason::Grammar;
+                        break;
                     }
-                }
+                    crate::model::qwen35::StepOutcome::Eos => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Stopped => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Interrupted => {
+                        stopped_by_caller = true;
+                        stop_reason = StopReason::Interrupt;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Emitted {
+                        token_id,
+                        answer_budget_exhausted,
+                    } => (token_id, answer_budget_exhausted),
+                };
+                last_pushed_id = next_id;
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
                 }
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
-                if let Some(end) = reasoning_end_len
-                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-                {
+                if answer_budget_exhausted {
                     break;
                 }
             }
@@ -13240,30 +13413,18 @@ mod inner {
             // so streamed deltas concatenate to exactly the returned text. Skip when
             // the caller asked to stop — it is no longer consuming the stream.
             if !stopped_by_caller {
+                // This flush emits the residual incomplete-UTF-8 bytes of the
+                // already-generated final token, not a new generation step —
+                // generation has already terminated for the stop_reason decided
+                // above. A late cancel here (return value intentionally unused)
+                // does not change why generation stopped, so treating it as
+                // Interrupt would misattribute the stop cause to this flush.
                 let tail = detok.finish();
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    // No-op if a stop already matched inside the loop; otherwise a
-                    // stop string can still complete in the final detokenizer tail.
-                    let already_stopped = matcher.stopped();
-                    matcher.finish(&tail, &mut |emit| {
-                        if !emit.is_empty() {
-                            text.push_str(emit);
-                            on_token(emit, last_pushed_id);
-                        }
-                    });
-                    if !already_stopped && matcher.stopped() {
-                        stopped = true;
-                        stop_reason = StopReason::Eos;
-                    }
-                } else if !tail.is_empty() {
-                    // This flush emits the residual incomplete-UTF-8 bytes of the
-                    // already-generated final token, not a new generation step —
-                    // generation has already terminated for the stop_reason decided
-                    // above. A late cancel here (return value intentionally unused)
-                    // does not change why generation stopped, so treating it as
-                    // Interrupt would misattribute the stop cause to this flush.
-                    text.push_str(&tail);
-                    on_token(&tail, last_pushed_id);
+                let tail_stopped =
+                    policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id));
+                if tail_stopped && !stopped {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
                 }
             }
             Ok(GenerateOutput {
@@ -15179,6 +15340,20 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            // Config preflight checks live here, in the public wrapper, and
+            // must return BEFORE the `match` below (codex round-2 medium #3,
+            // PR #787): the error-recovery arm of that `match` unconditionally
+            // calls `reset_state()` and removes the cache slot on ANY `Err`
+            // from `_inner`, including a not-yet-attempted preflight
+            // rejection. A caller passing an unsupported config (e.g.
+            // `logprobs` or an active `enable_mtp`) never touches cache/session
+            // state in the first place, so routing that rejection through the
+            // destructive recovery path would evict a valid pre-existing
+            // cross-turn entry the call never mutated. Returning here, before
+            // `_inner` is even called, leaves any existing entry untouched.
+            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+            crate::model::qwen35::check_mtp_not_requested(gen_cfg)?;
+
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
                 prompt,
@@ -15214,6 +15389,15 @@ mod inner {
         {
             use crate::error::InferenceError;
             use crate::kv_cache::PrefixReuseMode;
+
+            // The `logprobs` / `enable_mtp` config preflight checks (codex
+            // round-1 blocker #1, round-2 medium #3/#4, PR #787) live in the
+            // public wrapper `generate_streaming_with_prefix_cache_and_cancel`,
+            // not here: that wrapper's error-recovery path unconditionally
+            // evicts the cache slot on any `Err` from this function, so a
+            // preflight-only rejection must never reach `_inner` in the first
+            // place, or a valid pre-existing cross-turn entry this call never
+            // touched would be destroyed alongside it.
 
             let cfg = self.engine.config.clone();
 
@@ -15396,7 +15580,6 @@ mod inner {
             } else {
                 None
             };
-            let mut thinking_closed = false;
 
             // The one line that differs structurally from `generate_streaming`:
             // prefill only the divergent suffix, at its true absolute position.
@@ -15521,114 +15704,109 @@ mod inner {
                 });
             }
 
-            if Some(next_id) == think_close_id {
-                thinking_closed = true;
-            }
-
             let mut detok = IncrementalDetokenizer::new();
-            let mut reasoning_end_len: Option<usize> = None;
             generated_ids.push(next_id);
             all_ids.push(next_id);
-            if thinking_closed && reasoning_end_len.is_none() {
-                reasoning_end_len = Some(generated_ids.len());
-            }
+            // Backend-neutral reasoning-budget policy (ADR-080 C3), shared with
+            // `generate_streaming` above and the CPU `model::qwen35::generation`
+            // loops, driven through the one atomic `DecodePolicy::transition`
+            // (codex round-1 major #3, PR #787). `token_logprobs` below is a
+            // throwaway sink: this path does not wire per-token logprobs
+            // capture, and the `check_logprobs_not_set` guard above already
+            // rejects any request that would need it, so `gen_cfg.logprobs`
+            // is always `None` here and `DecodePolicy::init` / `transition`'s
+            // logprob recording is always a no-op (codex round-1 blocker #1,
+            // PR #787) -- passed through uniformly rather than special-cased,
+            // so this site is structurally indistinguishable from the other
+            // five at the `DecodePolicy::init` / `transition` call sites.
+            let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
+            // `streaming: true` selects `StopMode::Streaming`'s incremental
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
+            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // now owns the `StopStringMatcher` this call site used to
+            // construct and drive by hand.
+            let mut policy = crate::model::qwen35::DecodePolicy::init(
+                gen_cfg,
+                think_close_id,
+                &mut token_logprobs,
+                next_id,
+                &prefill_logits,
+                gen_cfg.temperature,
+                generated_ids.len(),
+                true,
+            );
             let mut last_pushed_id = next_id;
             // `text` is the caller-owned full output — the detokenizer itself only
             // retains a small undecided UTF-8 boundary tail (see IncrementalDetokenizer).
             let mut text = String::new();
-            // String-stop path: mirrors the CPU stop-string matcher exactly (#643).
-            let mut stop_matcher = if gen_cfg.stop_strings.is_empty() {
-                None
-            } else {
-                Some(StopStringMatcher::new(&gen_cfg.stop_strings))
-            };
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
             // Set when a stop string matches: CPU-identical semantics can retain
             // token ids whose text was truncated, so the tokens behind a
             // string-stop match must never be saved into the cross-turn cache —
             // that would represent text the caller never received.
             let mut stopped_by_stop_string = false;
             let delta = detok.push(tokenizer, next_id);
-            if !delta.is_empty() {
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let mut caller_interrupted = false;
-                    let stop_matched = matcher.push(&delta, &mut |emit| {
-                        if !caller_interrupted && !emit.is_empty() {
-                            text.push_str(emit);
-                            if !on_token(emit, next_id) {
-                                caller_interrupted = true;
-                            }
-                        }
-                    });
-                    if caller_interrupted {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: false,
-                                stop_reason: Some(StopReason::Interrupt),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
-                    if stop_matched {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        self.cross_turn_prefix_cache.remove(slot_id);
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: true,
-                                stop_reason: Some(StopReason::Eos),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
-                } else {
-                    text.push_str(&delta);
-                    if !on_token(&delta, next_id) {
-                        if use_compact {
-                            self.session.compact_topk = 0;
-                            self.session.compact_route = GpuTopkRoute::CpuFallback;
-                        }
-                        // The caller cut the stream after exactly one forwarded
-                        // token (the prefill sample) — state represents prompt +
-                        // that one token already (forward happens on the *next*
-                        // iteration in the loop below, which never runs here).
-                        // Nothing further was forwarded, so do not save a cache
-                        // entry claiming more than live state represents.
-                        return Ok(CachedGenerateOutput {
-                            output: GenerateOutput {
-                                text,
-                                token_ids: generated_ids.clone(),
-                                prompt_tokens: prompt_len,
-                                generated_tokens: generated_ids.len(),
-                                stopped: false,
-                                stop_reason: Some(StopReason::Interrupt),
-                                token_logprobs: vec![],
-                            },
-                            cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
-                        });
-                    }
+            let initial_outcome = policy.check_initial_stop(
+                &mut token_logprobs,
+                &mut text,
+                &mut throwaway_offsets,
+                &delta,
+                |s| on_token(s, next_id),
+            );
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Interrupted
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
+                // The caller cut the stream after exactly one forwarded
+                // token (the prefill sample) — state represents prompt +
+                // that one token already (forward happens on the *next*
+                // iteration in the loop below, which never runs here).
+                // Nothing further was forwarded, so do not save a cache
+                // entry claiming more than live state represents.
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: false,
+                        stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs: vec![],
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
+            }
+            if matches!(
+                initial_outcome,
+                crate::model::qwen35::StopCheckOutcome::Stopped
+            ) {
+                if use_compact {
+                    self.session.compact_topk = 0;
+                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                }
+                self.cross_turn_prefix_cache.remove(slot_id);
+                return Ok(CachedGenerateOutput {
+                    output: GenerateOutput {
+                        text,
+                        token_ids: generated_ids.clone(),
+                        prompt_tokens: prompt_len,
+                        generated_tokens: generated_ids.len(),
+                        stopped: true,
+                        stop_reason: Some(StopReason::Eos),
+                        token_logprobs: vec![],
+                    },
+                    cache: cache_stats(plan.mode, plan.reusable_len, plan.suffix_len),
+                });
             }
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
 
-            let cap = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+            let cap = policy.cap();
             for _ in 1..cap {
                 // Checked before any per-step GPU work, independent of whether
                 // this iteration's delta ends up non-empty — mirrors
@@ -15677,77 +15855,69 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                let next_id = force_close_think(
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.enable_thinking,
-                    thinking_closed,
-                    generated_ids.len(),
-                    think_close_id,
-                )
-                .unwrap_or(sampled_id);
-
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-                    && !engine.advance(gs, next_id)
-                {
-                    stop_reason = StopReason::Grammar;
-                    break;
-                }
-
-                if Some(next_id) == think_close_id {
-                    thinking_closed = true;
-                }
-
-                if is_stop(next_id) {
-                    stopped = true;
-                    stop_reason = StopReason::Eos;
-                    break;
-                }
-
-                generated_ids.push(next_id);
-                all_ids.push(next_id);
-                if thinking_closed && reasoning_end_len.is_none() {
-                    reasoning_end_len = Some(generated_ids.len());
-                }
-                last_pushed_id = next_id;
-                let delta = detok.push(tokenizer, next_id);
-                if !delta.is_empty() {
-                    if let Some(matcher) = stop_matcher.as_mut() {
-                        let mut caller_interrupted = false;
-                        let stop_matched = matcher.push(&delta, &mut |emit| {
-                            if !caller_interrupted && !emit.is_empty() {
-                                text.push_str(emit);
-                                if !on_token(emit, next_id) {
-                                    caller_interrupted = true;
-                                }
-                            }
-                        });
-                        if caller_interrupted {
-                            stopped_by_caller = true;
-                            stop_reason = StopReason::Interrupt;
-                            break;
+                // `policy.stop_mode` (fixed to `StopMode::Streaming` or
+                // `Disabled` at construction) now owns this path's byte-
+                // holdback stop check itself (codex round-3 major #1, PR
+                // #787 / Leo's ruling) -- this call site supplies only
+                // `decode_delta` (this loop's own detokenizer) and the
+                // shared `text`/`throwaway_offsets` buffers.
+                let generated_len_before = generated_ids.len();
+                let outcome = policy.transition(
+                    &mut token_logprobs,
+                    sampled_id,
+                    &step_logits,
+                    gen_cfg.temperature,
+                    generated_len_before,
+                    |next_id| {
+                        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                            engine.advance(gs, next_id)
+                        } else {
+                            true
                         }
-                        if stop_matched {
-                            stopped = true;
-                            stopped_by_stop_string = true;
-                            stop_reason = StopReason::Eos;
-                            break;
-                        }
-                    } else {
-                        text.push_str(&delta);
-                        if !on_token(&delta, next_id) {
-                            stopped_by_caller = true;
-                            stop_reason = StopReason::Interrupt;
-                            break;
-                        }
+                    },
+                    &is_stop,
+                    |next_id| {
+                        generated_ids.push(next_id);
+                        all_ids.push(next_id);
+                    },
+                    |next_id| detok.push(tokenizer, next_id),
+                    &mut text,
+                    &mut throwaway_offsets,
+                    |s, next_id| on_token(s, next_id),
+                );
+
+                let (next_id, answer_budget_exhausted) = match outcome {
+                    crate::model::qwen35::StepOutcome::GrammarStop => {
+                        stop_reason = StopReason::Grammar;
+                        break;
                     }
-                }
+                    crate::model::qwen35::StepOutcome::Eos => {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Stopped => {
+                        stopped = true;
+                        stopped_by_stop_string = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Interrupted => {
+                        stopped_by_caller = true;
+                        stop_reason = StopReason::Interrupt;
+                        break;
+                    }
+                    crate::model::qwen35::StepOutcome::Emitted {
+                        token_id,
+                        answer_budget_exhausted,
+                    } => (token_id, answer_budget_exhausted),
+                };
+                last_pushed_id = next_id;
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
                 }
-                if let Some(end) = reasoning_end_len
-                    && generated_ids.len().saturating_sub(end) >= gen_cfg.max_new_tokens
-                {
+                if answer_budget_exhausted {
                     break;
                 }
             }
@@ -15762,22 +15932,12 @@ mod inner {
             // must also suppress caching the truncated generation (see below).
             if !stopped_by_caller {
                 let tail = detok.finish();
-                if let Some(matcher) = stop_matcher.as_mut() {
-                    let already_stopped = matcher.stopped();
-                    matcher.finish(&tail, &mut |emit| {
-                        if !emit.is_empty() {
-                            text.push_str(emit);
-                            on_token(emit, last_pushed_id);
-                        }
-                    });
-                    if !already_stopped && matcher.stopped() {
-                        stopped = true;
-                        stopped_by_stop_string = true;
-                        stop_reason = StopReason::Eos;
-                    }
-                } else if !tail.is_empty() {
-                    text.push_str(&tail);
-                    on_token(&tail, last_pushed_id);
+                let tail_stopped =
+                    policy.finish_stop(&mut text, &tail, |s| on_token(s, last_pushed_id));
+                if tail_stopped && !stopped {
+                    stopped = true;
+                    stopped_by_stop_string = true;
+                    stop_reason = StopReason::Eos;
                 }
             }
 
@@ -22779,6 +22939,101 @@ mod inner {
             );
         }
 
+        /// `MetalQwen35State::generate` (the plain/direct entry point) must
+        /// reject a `GenerateConfig` with `reasoning_budget` set, with a typed
+        /// `InvalidInput` error, rather than silently ignoring the budget and
+        /// generating unbudgeted output (ADR-080 C3, #783).
+        ///
+        /// This is the production-seam test for the guard added to `generate`
+        /// itself, proving the call site is real — `route_predicate_tests`
+        /// and `multimodal_preflight_tests` already cover the pure guard
+        /// logic without a GPU device.
+        ///
+        /// Mutation sensitivity: removing the `check_reasoning_budget_not_set`
+        /// call from `generate` lets this request proceed through prefill and
+        /// sampling instead of erroring, so `result.is_err()` fails.
+        #[test]
+        fn metal_generate_plain_rejects_reasoning_budget_config() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: Some(2),
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
+                "MetalQwen35State::generate must fail closed with InvalidInput when \
+                 reasoning_budget is set (ADR-080 C3, #783); got {result:?}"
+            );
+        }
+
+        /// Sibling to `metal_generate_plain_rejects_reasoning_budget_config`
+        /// (codex round-2 blocker #1, PR #787): `MetalQwen35State::generate`
+        /// (the plain/direct entry point) unconditionally returns
+        /// `token_logprobs: vec![]` on every return path, including the MTP
+        /// and self-spec fast-path delegations, and had no
+        /// `check_logprobs_not_set` preflight at all -- routing a `logprobs`
+        /// request around the MTP/self-spec predicates alone would not have
+        /// closed this, since the plain fallback path is exactly as silent.
+        ///
+        /// Mutation sensitivity: removing the `check_logprobs_not_set` call
+        /// from `generate` lets this request proceed through prefill and
+        /// sampling instead of erroring, so `result.is_err()` fails.
+        #[test]
+        fn metal_generate_plain_rejects_logprobs_config() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: Some(0),
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
+                "MetalQwen35State::generate must fail closed with InvalidInput when \
+                 logprobs is set (codex round-2 blocker #1, PR #787); got {result:?}"
+            );
+        }
+
         /// `generate_streaming`'s `max_new_tokens == 0` guard must return before the
         /// prefill token is sampled, pushed, or streamed, matching the CPU
         /// `generate_streaming()` contract (model::qwen35::generation): zero tokens,
@@ -26449,6 +26704,217 @@ mod inner {
             );
         }
 
+        /// Codex round-1 blocker #1 (PR #787):
+        /// `generate_streaming_with_prefix_cache` never wires per-token
+        /// logprobs capture into its decode loop. Before the fix, a caller
+        /// requesting `gen_cfg.logprobs` got `Ok` back with silently empty
+        /// `token_logprobs` -- the exact silent-omission defect ADR-080 C3's
+        /// apply-or-fail-closed contract exists to close. The guard must
+        /// reject the request before any cache/state mutation, so no cache
+        /// entry is created (or consumed) for the rejected call.
+        ///
+        /// Mutation sensitivity: removing the `check_logprobs_not_set` call
+        /// at the top of `generate_streaming_with_prefix_cache_and_cancel_inner`
+        /// makes this assertion fail (the call returns `Ok` with empty
+        /// `token_logprobs` instead of `Err`).
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_logprobs_request() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: Some(5),
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "a logprobs request must fail closed via \
+                 generate_streaming_with_prefix_cache() instead of silently \
+                 returning empty token_logprobs; got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "a logprobs-rejected call must not create or leave a cache \
+                 entry behind -- the guard runs before any state mutation"
+            );
+        }
+
+        /// Codex round-2 medium #3 (PR #787): the round-1 fix guarded the
+        /// NO-entry case, but not the case where a valid entry already
+        /// exists. The public wrapper
+        /// `generate_streaming_with_prefix_cache_and_cancel` used to catch
+        /// EVERY `Err` from `_inner` -- including a preflight-only rejection
+        /// that never attempted cache/state mutation -- and unconditionally
+        /// call `reset_state()` + remove the slot. A caller who warms a live
+        /// cross-turn entry and then makes one invalid (`logprobs`-set)
+        /// call would have that valid entry destroyed even though the
+        /// rejected call touched nothing.
+        ///
+        /// Mutation sensitivity: hoisting the preflight checks in
+        /// `generate_streaming_with_prefix_cache_and_cancel` back below the
+        /// `match` (i.e. routing them through `_inner` again) makes this
+        /// test fail: the wrapper's `Err` arm evicts the warm entry.
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_logprobs_request_preserves_warm_entry() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let warm_cfg = cross_turn_test_gen_cfg(9, 2);
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &warm_cfg,
+                    |_, _| true,
+                )
+                .expect("warm-up call must succeed");
+            let warm_entry = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .expect("precondition: the warm-up call must retain a cache entry")
+                .generic
+                .token_ids
+                .clone();
+
+            let rejected_cfg = GenerateConfig {
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(9, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "ab",
+                &tokenizer,
+                &rejected_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "the logprobs-set call must still fail closed; got {result:?}"
+            );
+
+            let entry_after = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .map(|e| e.generic.token_ids.clone());
+            assert_eq!(
+                entry_after,
+                Some(warm_entry),
+                "a preflight-only rejection must not evict a pre-existing \
+                 cache entry it never touched -- the public wrapper must \
+                 return before its destructive Err-recovery block runs"
+            );
+        }
+
+        /// Codex round-2 medium #4 (PR #787): the prefix-cache path accepts
+        /// `GenerateConfig` but never reads `enable_mtp`, unlike the direct
+        /// Metal `generate()` entry point, which resolves it and delegates
+        /// to `generate_greedy_mtp`. An active MTP request (explicit
+        /// `Some(true)` or `LATTICE_MTP` set with `enable_mtp: None`) must
+        /// be rejected before any cache/state mutation rather than silently
+        /// falling back to plain per-token decode with no MTP applied and
+        /// no indication the request was ignored.
+        ///
+        /// Mutation sensitivity: removing the `check_mtp_not_requested` call
+        /// in `generate_streaming_with_prefix_cache_and_cancel` makes this
+        /// assertion fail (the call returns `Ok` instead of `Err`).
+        #[test]
+        fn generate_streaming_with_prefix_cache_rejects_active_mtp_request() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+                enable_mtp: Some(true),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "an explicit enable_mtp: Some(true) request must fail closed \
+                 via generate_streaming_with_prefix_cache() instead of \
+                 silently falling back to plain decode; got {result:?}"
+            );
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "an MTP-rejected call must not create or leave a cache \
+                 entry behind -- the guard runs before any state mutation"
+            );
+        }
+
         // -----------------------------------------------------------------------
         // Grammar fail-closed DECODE-LOOP integration tests (#611
         // finding, medium)
@@ -27601,6 +28067,12 @@ mod topk_boundary_tie_tests {
 /// wired into this path either, so `gen_cfg.logprobs` is rejected the same
 /// way rather than silently returning an empty `token_logprobs`.
 ///
+/// Reasoning-budget forcing (ADR-080 C3, #783) is not wired into this path
+/// either (no `decode_cap` / `force_close_think`), so `gen_cfg.reasoning_budget`
+/// is rejected the same way. `gen_cfg.stop_strings` does NOT need an
+/// equivalent guard here: `generate_multimodal` already applies it via its own
+/// `stop_text_state` / `StopStringMatcher` wiring further down.
+///
 /// Compiled when Metal-GPU is enabled (the production caller lives inside
 /// `mod inner`) or during test builds so that the module-level test can
 /// exercise the guard logic on any platform without GPU hardware.
@@ -27609,7 +28081,8 @@ pub(crate) fn multimodal_generate_preflight(
     gen_cfg: &crate::model::qwen35_config::GenerateConfig,
 ) -> Result<(), crate::error::InferenceError> {
     crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
-    crate::model::qwen35::check_logprobs_not_set(gen_cfg)
+    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+    crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)
 }
 
 #[cfg(test)]
@@ -27682,6 +28155,39 @@ mod multimodal_preflight_tests {
         assert!(
             multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
             "logprobs = None must not trigger the preflight guard"
+        );
+    }
+
+    /// Reasoning-budget forcing (ADR-080 C3, #783) is not wired into the
+    /// multimodal path; the preflight must reject a config with
+    /// `reasoning_budget` set rather than silently returning an unbudgeted
+    /// output.
+    ///
+    /// Mutation sensitivity: change `multimodal_generate_preflight` to always
+    /// return `Ok(())` (or drop the new `check_reasoning_budget_not_set` call)
+    /// → `result.is_err()` below fails, catching the regression.
+    #[test]
+    fn generate_multimodal_reasoning_budget_guard_rejects_budget_config() {
+        let cfg_with_budget = GenerateConfig {
+            reasoning_budget: Some(32),
+            ..Default::default()
+        };
+
+        let result = multimodal_generate_preflight(&cfg_with_budget);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "multimodal preflight must return InvalidInput when reasoning_budget is set; \
+             got {result:?}"
+        );
+    }
+
+    /// A config with `reasoning_budget` unset must pass through the preflight
+    /// without error.
+    #[test]
+    fn generate_multimodal_reasoning_budget_guard_allows_no_budget() {
+        assert!(
+            multimodal_generate_preflight(&GenerateConfig::default()).is_ok(),
+            "reasoning_budget = None must not trigger the preflight guard"
         );
     }
 }
