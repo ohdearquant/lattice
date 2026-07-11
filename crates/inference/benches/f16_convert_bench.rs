@@ -2,55 +2,34 @@
 //! lookup hot path (`forward_step_inner`, `forward_step_gdn_only`, prefill).
 //!
 //! Measures at N=1024 (the Qwen3.5-0.8B hidden size):
-//! - `scalar`: hand-written IEEE-754 bit-manipulation loop (~10 ops/element)
+//! - `scalar`: the crate's production scalar decoder
+//!   (`lattice_inference::weights::bench_support::f16_bits_to_f32`, which
+//!   `weights/mod.rs` re-exports behind `bench-internals` from the single
+//!   always-compiled `weights::half_bits` module every load/quant call site
+//!   delegates to — lattice#799). This bench previously carried its own
+//!   copied decoder rather than exercising that migrated path, so its
+//!   numbers said nothing about the consolidation. Requires `--features bench-internals`.
 //!
 //! A NEON fast path (`vcvt_f32_f16`, 4 lanes/instruction) was removed in #568: it
 //! required the nightly-only `stdarch_neon_f16` feature and broke stable-toolchain
 //! builds. `convert_f16_row` in `metal_qwen35.rs` is scalar-only for the same reason.
 //!
-//! Run: `cargo bench -p lattice-inference --bench f16_convert_bench`
+//! Run: `cargo bench -p lattice-inference --bench f16_convert_bench --features bench-internals`
 //!
 //! ADR-058: every perf PR must include before/after bench output.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use lattice_inference::weights::bench_support::f16_bits_to_f32;
 use std::time::Duration;
 
-// --------------------------------------------------------------------------
-// Scalar reference (mirrors the hand-written f16_to_f32 in metal_qwen35.rs)
-// --------------------------------------------------------------------------
-
-#[inline(always)]
-fn f16_to_f32_scalar(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 0x1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x03ff) as u32;
-
-    let f32_bits = match (exp, frac) {
-        (0, 0) => sign << 31,
-        (0, _) => {
-            let mut mant = frac;
-            let mut e = -14i32;
-            while (mant & 0x0400) == 0 {
-                mant <<= 1;
-                e -= 1;
-            }
-            mant &= 0x03ff;
-            (sign << 31) | (((e + 127) as u32) << 23) | (mant << 13)
-        }
-        (0x1f, 0) => (sign << 31) | 0x7f80_0000,
-        (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13),
-        _ => (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
-    };
-    f32::from_bits(f32_bits)
-}
-
-/// Convert n f16 values (as u16 bits) at `src` into f32 values at `dst`.
+/// Convert n f16 values (as u16 bits) at `src` into f32 values at `dst`,
+/// calling the production decoder for every element.
 ///
 /// # Safety
 /// `src` must point to at least `n` initialized u16 values; `dst` to at least `n` writable f32.
 unsafe fn convert_f16_row_scalar(src: *const u16, dst: *mut f32, n: usize) {
     for i in 0..n {
-        *dst.add(i) = f16_to_f32_scalar(*src.add(i));
+        *dst.add(i) = f16_bits_to_f32(*src.add(i));
     }
 }
 
