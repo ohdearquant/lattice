@@ -48,7 +48,11 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Bench list (same as ADR-058 Phase 1) ---
-BENCHES_INFERENCE="elementwise_cpu_bench"
+# BENCHES_INFERENCE / CARGO_FEATURES_INFERENCE are overridable so a PR can
+# point this script at a different inference bench target (e.g. one gated
+# behind `bench-internals`) without hand-rolling a separate A/B script.
+BENCHES_INFERENCE="${BENCHES_INFERENCE:-elementwise_cpu_bench}"
+CARGO_FEATURES_INFERENCE="${CARGO_FEATURES_INFERENCE:-}"
 BENCHES_EMBED="simd"
 BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
@@ -59,10 +63,10 @@ echo "--- Building + benching BASE ($BASE_SHA) ---"
 (
   cd "$WT"
   # Only bench what exists — some benches may not exist on older refs
-  if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
+  if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
+    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
   else
-    echo "  (elementwise_cpu_bench not present on $BASE_SHA — skipping)"
+    echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
   cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
 )
@@ -96,10 +100,10 @@ fi
 
 (
   cd "$HEAD_DIR"
-  if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
+  if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
+    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
   else
-    echo "  (elementwise_cpu_bench not present on $HEAD_SHA — skipping)"
+    echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
   cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
 )

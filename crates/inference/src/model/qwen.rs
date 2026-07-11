@@ -2382,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
+    #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
     fn test_qwen_long_text_bench() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
@@ -2404,7 +2404,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
+    #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
     fn test_qwen_multilingual() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
@@ -2448,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires model files: set LATTICE_INFERENCE_MODEL_DIR
+    #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
     fn test_qwen_encode_real_model() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
