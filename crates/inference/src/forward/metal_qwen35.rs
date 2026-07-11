@@ -649,6 +649,7 @@ mod route_predicate_tests {
             stop_strings,
             reasoning_budget: None,
             logprobs: None,
+            disable_eos: false,
         }
     }
 

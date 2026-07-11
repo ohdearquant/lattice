@@ -1917,6 +1917,13 @@ pub(crate) fn should_stop_token(
     gen_cfg: &GenerateConfig,
     token_id: u32,
 ) -> bool {
+    if gen_cfg.disable_eos {
+        // Benchmark determinism knob (`GenerateConfig::disable_eos`): force
+        // continuation past EOS / configured stop-token ids so every trial
+        // decodes the exact requested token count. Default `false` leaves
+        // this function byte-for-byte unchanged (parity-safe).
+        return false;
+    }
     token_id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&token_id)
 }
 
@@ -2658,6 +2665,79 @@ mod tests {
             Some(StopReason::Eos),
             "stop_token_ids match on first token must return StopReason::Eos; got {:?}",
             result.stop_reason
+        );
+    }
+
+    /// `disable_eos: true` (the flagship CPU/Metal benchmark determinism
+    /// knob -- `qwen35_generate --emit-phase-events`) must force
+    /// continuation past a token that would otherwise stop generation on
+    /// the very first step, so a benchmark trial always decodes the exact
+    /// requested `max_new_tokens` count.
+    ///
+    /// Same zero-weight-model / `stop_token_ids = [0]` setup as
+    /// `stop_reason_eos_on_first_stop_token` above (which proves the
+    /// baseline DOES stop early without this flag) -- the only difference
+    /// is `disable_eos: true`.
+    ///
+    /// Mutation sensitivity: removing the `if gen_cfg.disable_eos { return
+    /// false; }` short-circuit at the top of `should_stop_token` makes this
+    /// generation stop after 1 token instead of running to
+    /// `max_new_tokens = 5`, failing both assertions below.
+    #[test]
+    fn disable_eos_forces_continuation_past_matching_stop_token() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            stop_token_ids: vec![0], // would otherwise fire on the first greedy-sampled token
+            disable_eos: true,
+            ..Default::default()
+        };
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("disable_eos generate must succeed");
+        assert_eq!(
+            result.stop_reason,
+            Some(StopReason::Length),
+            "disable_eos must force the loop to run to max_new_tokens (StopReason::Length), \
+             not stop early on a matching stop_token_ids entry; got {:?}",
+            result.stop_reason
+        );
+        assert_eq!(
+            result.generated_tokens, 5,
+            "disable_eos must decode exactly max_new_tokens (5), got {}",
+            result.generated_tokens
+        );
+    }
+
+    /// Sibling of the test above, covering `should_stop_token`'s OTHER
+    /// branch (`cfg.eos_token_id`, not `stop_token_ids`): `disable_eos`
+    /// must also suppress a match against the model's own configured EOS
+    /// id. `build_tiny_zero_model` sets `eos_token_id = VOCAB - 1 = 96`;
+    /// the tiny tokenizer's `"a"` prompt plus all-zero logits normally
+    /// greedy-samples token 0, not 96, so this test instead drives
+    /// `should_stop_token` directly (the pure predicate `generate()`'s
+    /// decode loop calls every step) rather than threading a real decode
+    /// run through to a token-96 sample.
+    #[test]
+    fn disable_eos_suppresses_eos_token_id_match_in_should_stop_token() {
+        let model = build_tiny_zero_model();
+        let base_cfg = GenerateConfig {
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        assert!(
+            should_stop_token(&model.config, &base_cfg, model.config.eos_token_id),
+            "sanity: without disable_eos, the model's own eos_token_id must stop generation"
+        );
+        let disabled_cfg = GenerateConfig {
+            stop_token_ids: vec![],
+            disable_eos: true,
+            ..Default::default()
+        };
+        assert!(
+            !should_stop_token(&model.config, &disabled_cfg, model.config.eos_token_id),
+            "disable_eos: true must suppress a match against cfg.eos_token_id too"
         );
     }
 

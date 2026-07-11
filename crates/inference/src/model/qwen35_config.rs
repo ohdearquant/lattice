@@ -695,6 +695,13 @@ pub struct GenerateConfig {
     /// alternatives at every generated step (`n == 0` is valid: report only
     /// the sampled token's log-probability, no alternatives).
     pub logprobs: Option<usize>,
+    /// Force continuation past EOS / configured stop-token ids (benchmark
+    /// determinism knob: the flagship CPU/Metal measurement profile requires
+    /// "EOS disabled" so every trial decodes the exact same fixed token
+    /// count -- see `should_stop_token`, the single shared predicate every
+    /// CPU/Metal decode loop calls). `false` (default) is the ordinary
+    /// serving behaviour and is byte-for-byte unchanged (parity-safe).
+    pub disable_eos: bool,
 }
 
 impl std::fmt::Debug for GenerateConfig {
@@ -713,6 +720,7 @@ impl std::fmt::Debug for GenerateConfig {
             .field("stop_strings", &self.stop_strings)
             .field("reasoning_budget", &self.reasoning_budget)
             .field("logprobs", &self.logprobs)
+            .field("disable_eos", &self.disable_eos)
             .finish()
     }
 }
@@ -733,6 +741,7 @@ impl Default for GenerateConfig {
             stop_strings: vec![],
             reasoning_budget: None,
             logprobs: None,
+            disable_eos: false,
         }
     }
 }
