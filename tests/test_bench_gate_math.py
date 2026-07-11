@@ -15,6 +15,7 @@ import random
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bench_gate_math.py"
 _SPEC = importlib.util.spec_from_file_location("bench_gate_math", _SCRIPT)
@@ -484,6 +485,94 @@ class EvaluateFamilyGateTest(unittest.TestCase):
         self.assertNotEqual(results[0].verdict, "FAIL")
         self.assertNotEqual(results[1].verdict, "FAIL")
 
+    def test_holm_naive_mutation_flips_a_real_verdict(self):
+        """Adversarial-review finding: the prior fixture only proved
+        `holm_reject`'s internal flag was mutation-sensitive, not the
+        actual verdict -- every cell's lower bound was fixed at the
+        strictest step-0 Bonferroni tail regardless of Holm's per-cell
+        step-down assignment, so Holm's reject flag was never the thing
+        separating FAIL from non-FAIL. This fixture reuses the SAME
+        two-cell family as `test_holm_ordering_changes_the_verdict` and
+        directly swaps `holm_reject` for a naive uncorrected `p <= alpha`
+        check via `mock.patch.object`, re-running the evaluator with an
+        identically-seeded RNG so the bootstrap draws line up. Under the
+        real, coherent step-down evaluator neither cell reaches FAIL (the
+        family-level Holm step halts at the first cell); under the naive
+        mutation, the cell whose own rank-assigned tail already clears
+        its fail threshold DOES flip to FAIL -- the decision-effective
+        proof that Holm's step-down, not a fixed bound, drives the
+        verdict."""
+        tau = math.log(1.07)
+
+        def cell(cid):
+            base = tau + 0.005
+            spread = 0.02
+            values = (
+                base - spread, base + spread, base - spread * 0.5, base + spread * 0.5,
+                base - spread * 0.2, base + spread * 0.2, base,
+            )
+            order_ab = (True, False, True, False, True, False, True)
+            return gm.CellGateInput(
+                cell_id=cid, values=values, order_ab=order_ab,
+                measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+            )
+
+        cell_a, cell_b = cell("a"), cell("b")
+
+        real_results = gm.evaluate_family_gate(
+            [cell_a, cell_b], self._bands(), bootstrap_replicates=2000, rng=random.Random(0)
+        )
+        # Precondition matching test_holm_ordering_changes_the_verdict:
+        # the real, coherent evaluator confirms neither cell as FAIL.
+        self.assertFalse(real_results[0].holm_reject)
+        self.assertFalse(real_results[1].holm_reject)
+        self.assertNotEqual(real_results[0].verdict, "FAIL")
+        self.assertNotEqual(real_results[1].verdict, "FAIL")
+
+        def naive_reject(pvalues, alpha=0.05):
+            return [p <= alpha for p in pvalues]
+
+        with mock.patch.object(gm, "holm_reject", naive_reject):
+            mutated_results = gm.evaluate_family_gate(
+                [cell_a, cell_b], self._bands(), bootstrap_replicates=2000, rng=random.Random(0)
+            )
+
+        # The mutation must change at least one cell's ACTUAL verdict
+        # (not merely its internal holm_reject flag) from non-FAIL to
+        # FAIL -- proof that the shipped evaluator's FAIL rule depends on
+        # the real Holm step-down, not just on crossing a fixed bound.
+        flips = [
+            (real.cell_id, real.verdict, mutated.verdict)
+            for real, mutated in zip(real_results, mutated_results)
+            if real.verdict != "FAIL" and mutated.verdict == "FAIL"
+        ]
+        self.assertTrue(flips, f"expected at least one non-FAIL->FAIL flip, got {flips!r}")
+
+    def test_undersampled_cell_rejected_before_resampling(self):
+        """Major 3: a cell reporting fewer raw pairs than its own
+        policy-derived `required_n` must fail closed before any bootstrap
+        resampling, never reach a PASS/WARN/FAIL verdict on insufficient
+        evidence. One pair at measured_cv=0.01 (class A, required_n=7)."""
+        cell = gm.CellGateInput(
+            cell_id="undersampled", values=(math.log(1.10),), order_ab=(True,),
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        with self.assertRaisesRegex(gm.GateMathError, "requires >= 7"):
+            gm.evaluate_family_gate([cell], self._bands())
+
+    def test_non_finite_value_rejected_before_resampling(self):
+        """Major 3: seven raw pairs, one of them NaN, must fail closed
+        before any bootstrap resampling rather than propagate into a
+        NaN-bounded PASS verdict."""
+        values = (math.log(1.10),) * 6 + (float("nan"),)
+        order_ab = (True, False, True, False, True, False, True)
+        cell = gm.CellGateInput(
+            cell_id="nonfinite", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        with self.assertRaisesRegex(gm.GateMathError, "non-finite"):
+            gm.evaluate_family_gate([cell], self._bands())
+
     def test_high_cv_margin_flips_fail_to_non_fail(self):
         """Adversarial fixture: the SAME
         effect size (a deterministic 8% slowdown) is a confirmed FAIL at
@@ -492,15 +581,21 @@ class EvaluateFamilyGateTest(unittest.TestCase):
         registered `fail_margin_multiplier` (2.0) widens the threshold --
         proving `fail_margin_multiplier` is actually consumed by the
         gate decision, not just unit-tested in isolation."""
-        order_ab = (True, False, True, False, True, False, True)
-        values = tuple([math.log(1.08)] * 7)  # deterministic 8% slowdown
+        order_ab_7 = (True, False, True, False, True, False, True)
+        values_7 = tuple([math.log(1.08)] * 7)  # deterministic 8% slowdown
+        # measured_cv=0.08 falls in the third band (required_n_class_a=25,
+        # fail_margin_multiplier=2.0) -- must supply >= 25 raw pairs or the
+        # under-sampled-cell guard (major 3) rejects before any bound is
+        # even computed.
+        order_ab_25 = tuple(i % 2 == 0 for i in range(25))
+        values_25 = tuple([math.log(1.08)] * 25)
 
         low_cv_cell = gm.CellGateInput(
-            cell_id="lowcv", values=values, order_ab=order_ab,
+            cell_id="lowcv", values=values_7, order_ab=order_ab_7,
             measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
         )
         high_cv_cell = gm.CellGateInput(
-            cell_id="highcv", values=values, order_ab=order_ab,
+            cell_id="highcv", values=values_25, order_ab=order_ab_25,
             measured_cv=0.08, cell_class="A", warn_pct=0.03, fail_pct=0.07,
         )
 

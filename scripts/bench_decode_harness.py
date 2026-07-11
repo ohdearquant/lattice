@@ -2249,6 +2249,21 @@ def validate_promotion_record(
             "promotion policy: perf-policy.toml is missing or has a malformed [promotion] table"
         )
 
+
+    doc_policy_version = policy_doc.get("policy_version")
+    if isinstance(doc_policy_version, bool) or not isinstance(doc_policy_version, int):
+        raise RunRecordValidationError(
+            "promotion policy: perf-policy.toml policy_version must be a registered int -- "
+            "a promotion record cannot be bound to an unversioned policy"
+        )
+    if record.policy_version != doc_policy_version:
+        raise RunRecordValidationError(
+            f"promotion of cell {record.cell_id!r} declares policy_version={record.policy_version}, "
+            f"but the structurally validated policy in force is policy_version={doc_policy_version} -- "
+            "a promotion record must be evaluated under the exact policy version it claims to consume, "
+            "never a different version's thresholds"
+        )
+
     resolved_min_null = min_null_sessions if min_null_sessions is not None else promotion_policy.get("min_null_aa_sessions")
     resolved_min_mainline = (
         min_mainline_sessions if min_mainline_sessions is not None else promotion_policy.get("min_mainline_sessions")

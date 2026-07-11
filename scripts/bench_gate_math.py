@@ -497,13 +497,29 @@ def evaluate_family_gate(
     FAIL requires ALL of:
       - Holm rejects H0 for this cell at `alpha_familywise` across the
         family, AND
-      - the corrected one-sided LOWER bound itself exceeds
-        `fail_pct * fail_margin_multiplier` (the high-CV band widens the
-        margin instead of inflating `n` further -- correction 1).
+      - that SAME cell's own Holm-assigned step-down tail (`alpha /
+        (m - rank)`, the exact level `holm_reject` tested it at, never a
+        single alpha/m Bonferroni tail fixed across the whole family)
+        exceeds `fail_pct * fail_margin_multiplier` (the high-CV band
+        widens the margin instead of inflating `n` further -- correction
+        1). Fixing every cell's bound at the strictest step-0 tail would
+        make Holm decision-inert (its reject flag could never be the
+        thing separating FAIL from non-FAIL, since a fixed, uniformly
+        stricter bound already gates every cell); the bound and the
+        decision must be the SAME test, evaluated at the SAME per-cell
+        alpha.
     Anything short of both, but with a point estimate past `warn_pct` (or
     past `fail_pct` without confirmed statistical significance), is WARN
     -- DESIGN.md: "a point estimate crossing with an inconclusive bound
     is WARN, never PASS." Everything else is PASS.
+
+    Fails closed (raises `GateMathError`) before any resampling if a
+    cell's raw pair count is short of its own policy-derived `required_n`
+    or contains a non-finite value -- this mirrors
+    `bench_decode_harness.validate_run_record`'s INFRA-FAIL treatment of
+    the same two conditions on an already-aggregated record, so a cell
+    can never reach a PASS/WARN/FAIL verdict on malformed or
+    under-sampled raw evidence via either entry point.
 
     Order-preserving: `results[i]` corresponds to `cells[i]`, matching
     `holm_reject`'s own input-order-preserving contract.
@@ -518,16 +534,38 @@ def evaluate_family_gate(
         if len(cell.values) != len(cell.order_ab):
             raise GateMathError(f"cell {cell.cell_id!r}: values and order_ab must be the same length")
         req_n, margin = required_n(cell.measured_cv, cv_bands, cell.cell_class)
+        if len(cell.values) < req_n:
+            raise GateMathError(
+                f"cell {cell.cell_id!r}: only {len(cell.values)} raw pairs, requires >= {req_n} "
+                f"at measured_cv={cell.measured_cv!r} class {cell.cell_class!r} -- an under-sampled cell "
+                "fails closed before any resampling, never PASSes on insufficient evidence"
+            )
+        if any(not math.isfinite(v) for v in cell.values):
+            raise GateMathError(
+                f"cell {cell.cell_id!r}: raw values contain a non-finite entry -- a malformed cell "
+                "fails closed before any resampling, never reaches a PASS/WARN/FAIL verdict"
+            )
         tau_fail = math.log(1.0 + cell.fail_pct * margin)
         point_estimate = statistics.fmean(cell.values)
         p = one_sided_bootstrap_pvalue(cell.values, cell.order_ab, tau_fail, bootstrap_replicates, rng)
         prelim.append((cell, req_n, margin, tau_fail, point_estimate, p))
 
-    rejects = holm_reject([p for *_rest, p in prelim], alpha=alpha_familywise)
-    corrected_alpha = alpha_familywise / len(prelim)
+    pvalues = [p for *_rest, p in prelim]
+    m = len(prelim)
+    rejects = holm_reject(pvalues, alpha=alpha_familywise)
+    # The exact step-down tail each cell was tested at in `holm_reject`:
+    # ascending-p-value rank k (0-indexed) -> alpha/(m-k), matching that
+    # function's own `crit = alpha / (m - k)` at each step. Cell-specific,
+    # not the fixed alpha/m Bonferroni tail -- see the docstring above.
+    rank_order = sorted(range(m), key=lambda i: pvalues[i])
+    cell_alpha = [0.0] * m
+    for k, i in enumerate(rank_order):
+        cell_alpha[i] = alpha_familywise / (m - k)
 
     results: list[CellGateResult] = []
-    for (cell, req_n, margin, tau_fail, point_estimate, p), reject in zip(prelim, rejects):
+    for (cell, req_n, margin, tau_fail, point_estimate, p), reject, corrected_alpha in zip(
+        prelim, rejects, cell_alpha
+    ):
         lower_bound = bootstrap_lower_bound(
             cell.values, cell.order_ab, bootstrap_replicates, rng, corrected_alpha=corrected_alpha
         )

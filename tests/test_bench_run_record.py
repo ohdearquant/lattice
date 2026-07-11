@@ -646,6 +646,19 @@ class PromotionRecordTest(unittest.TestCase):
                 }
             )
 
+    def test_policy_version_mismatch_fails_closed(self):
+        # A record claiming policy_version=999 while all threshold values
+        # are actually v1-shaped must never be evaluated under v1's
+        # thresholds -- it must reject on the version binding itself,
+        # before any threshold comparison runs.
+        record = self._promotion(policy_version=999)
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "policy_version=999"):
+            harness.validate_promotion_record(record)
+
+    def test_policy_version_match_passes(self):
+        record = self._promotion(policy_version=1)
+        harness.validate_promotion_record(record)  # must not raise
+
     def test_missing_invalid_pair_replacements_rejected_at_parse(self):
         with self.assertRaisesRegex(harness.RunRecordValidationError, "missing required field"):
             harness.parse_promotion_record(
