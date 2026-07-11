@@ -6065,6 +6065,38 @@ mod serve {
         // path -- it records the `&GenerateConfig`/`&str` prompt it was
         // actually called with, then returns a canned result; it never
         // recomputes `build_cfg`/`validate_temperature`/etc. itself.
+        //
+        // DISPUTED (issue #828 fix-round 3, codex round-2 medium finding #1):
+        // this observation captures `rendered_prompt`, not `messages`, and
+        // that is the real shape of this seam, not an omission. `chat_completions`
+        // computes `to_chat_messages(&req.messages)` (the normalized message
+        // list) unconditionally whenever `feature = "metal-gpu"` is compiled
+        // in, but that value is consumed ONLY by the `ModelBackend::Metal`
+        // match arm (`handle.generate_streaming[_with_cancel](chat_messages,
+        // ...)`); the `ModelBackend::Cpu`/`CpuFakeGenerate` arms this test
+        // seam exercises never receive it -- their real `generate`/
+        // `generate_streaming_with_cancel` calls take only `(&prompt,
+        // &gen_cfg, ...)`. This mirrors `ProductionAdapterObservation`'s own
+        // documented contract in `serve/mod.rs` ("exactly one of
+        // `rendered_prompt`/`messages` is `Some` per capture, reflecting
+        // which shape that binary's real adapter actually receives, not a
+        // missing capture").
+        //
+        // Observing `messages` at the CPU seam authentically (not by
+        // re-deriving `to_chat_messages` independently in the test, which
+        // would be tautological -- exactly the round-1 major finding this
+        // module was written to fix) would require a `MetalFakeGenerate`
+        // test double for `ModelBackend::Metal`. `MetalHandle::spawn`
+        // hard-requires loading a real Q4 model directory onto a real Metal
+        // GPU worker thread (`MetalQwen35State::from_q4_dir`) -- there is no
+        // model-agnostic seam there the way `CpuFakeGenerate` mirrors
+        // `ModelBackend::Cpu`. Building one would mean adding a new
+        // production `ModelBackend` variant and mocking the async engine
+        // handle's job-channel protocol: real production-code surface
+        // expansion, not a test-only capture. That is out of scope for this
+        // fix round; tracked as a follow-up if a Metal-path observation is
+        // wanted (would need its own issue -- #828's fixture data and CI
+        // environment target the CPU/tiny-tokenizer seam only).
         // -----------------------------------------------------------------------
         #[cfg(feature = "test-utils")]
         mod production_adapter_observation {
