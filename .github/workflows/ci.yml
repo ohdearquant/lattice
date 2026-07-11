@@ -486,6 +486,21 @@ jobs:
         with:
           version: '1.7.12'
 
+  # Deterministic fake-adapter unit tests + raw-observation schema validation
+  # for the decode-benchmark harness core (issue #813 step 1). Stdlib-only,
+  # no engine binary or model weights required — cheap ubuntu-only, so it is
+  # ungated like typos/actionlint above rather than routed through ci-gate.
+  bench-decode-harness-tests:
+    name: bench-decode-harness-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: python3 tests/test_bench_decode_harness.py
+        run: python3 tests/test_bench_decode_harness.py -v
+
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is
   # flagged before it ships unversioned, the way #634 was not. Gated through
