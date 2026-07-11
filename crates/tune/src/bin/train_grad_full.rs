@@ -41,9 +41,9 @@ use lattice_inference::model::qwen35::Qwen35Model;
 use lattice_inference::tokenizer::Tokenizer;
 use lattice_tune::lora::AdamState;
 use lattice_tune::lora::train_core::{
-    Dims, GdnDims, GdnLoraParams, Head, LayerW, LoraParams, MixerKind, SeqCtx, TOP_LAYER,
-    apply_adam_updates, apply_gdn_adam_updates, eval_chain_nll, forward_full, nll_and_grads,
-    rand_fill, shifted,
+    AdamConfig, Dims, GdnDims, GdnLoraParams, Head, LayerW, LoraParams, MixerKind, SeqCtx,
+    SlotLayout, TOP_LAYER, TapeGeometry, TrainCtx, apply_adam_updates, apply_gdn_adam_updates,
+    eval_chain_nll, forward_full, nll_and_grads, rand_fill, shifted,
 };
 
 fn parse_arg(args: &[String], flag: &str) -> Option<String> {
@@ -361,7 +361,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eps: cfg.rms_norm_eps,
     };
     let gdn_dims = GdnDims::from_cfg(&cfg);
-    let scale = alpha / rank as f32;
     println!(
         "  hidden={}  vocab={}  q_dim={}  kv_dim={}  inter={}",
         dims.hidden, dims.vocab, dims.q_dim, dims.kv_dim, dims.inter
@@ -455,6 +454,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("no GQA or GDN layers in range — nothing to train".into());
     }
 
+    let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
+    let train_ctx = TrainCtx::try_new(
+        TapeGeometry::new(&dims, &gdn_dims, &cfg),
+        rank,
+        alpha,
+        SlotLayout::new(&slot_layers, &gdn_slot_layers),
+        AdamConfig::new(lr, beta1, beta2, eps_adam),
+    )?;
+
     let tokenizer = model.tokenizer().clone();
     println!("\nLoading dataset from {}...", data_dir.display());
     let train_samples = load_jsonl(
@@ -539,11 +547,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &zero_loras,
             &zero_gdn_loras,
             &head,
-            &dims,
-            &gdn_dims,
-            &cfg,
-            rank,
-            scale,
+            &train_ctx,
         )?;
         let diff = (model_masked - chain_masked).abs();
         println!(
@@ -573,21 +577,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut gdn_loras: Vec<GdnLoraParams> =
             gradcheck_gdn_loras(num_gdn_slots, rank, dims.hidden, &gdn_dims, rng);
 
-        let fwd = forward_full(
-            &caches[0], &layers, &loras, &gdn_loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-        )?;
-        let (_, _, analytic, gdn_analytic) = nll_and_grads(
-            &fwd,
-            &layers,
-            &loras,
-            &head,
-            &dims,
-            &gdn_dims,
-            num_slots,
-            num_gdn_slots,
-            rank,
-            scale,
-        )?;
+        let fwd = forward_full(&caches[0], &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+        let (_, _, analytic, gdn_analytic) =
+            nll_and_grads(&fwd, &layers, &loras, &head, &train_ctx)?;
 
         println!("  fd-eps center {fd_eps:.0e}  (per-entry min over 0.25/0.5/1/2x)");
         let mut worst = 0.0f64;
@@ -660,11 +652,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &loras,
                             &gdn_loras,
                             &head,
-                            &dims,
-                            &gdn_dims,
-                            &cfg,
-                            rank,
-                            scale,
+                            &train_ctx,
                         )?;
                         bump(&mut loras, save - e);
                         let lm = eval_chain_nll(
@@ -673,11 +661,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &loras,
                             &gdn_loras,
                             &head,
-                            &dims,
-                            &gdn_dims,
-                            &cfg,
-                            rank,
-                            scale,
+                            &train_ctx,
                         )?;
                         let fd = (lp - lm) / (2.0 * e);
                         let rel = (a - fd).abs() as f64 / (a.abs().max(fd.abs()).max(1e-6)) as f64;
@@ -777,11 +761,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &loras,
                             &gdn_loras,
                             &head,
-                            &dims,
-                            &gdn_dims,
-                            &cfg,
-                            rank,
-                            scale,
+                            &train_ctx,
                         )?;
                         field_mut(&mut gdn_loras[slot], name)[k] = save - e;
                         let lm = eval_chain_nll(
@@ -790,11 +770,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &loras,
                             &gdn_loras,
                             &head,
-                            &dims,
-                            &gdn_dims,
-                            &cfg,
-                            rank,
-                            scale,
+                            &train_ctx,
                         )?;
                         let fd = (lp - lm) / (2.0 * e);
                         let rel = (a - fd).abs() as f64 / (a.abs().max(fd.abs()).max(1e-6)) as f64;
@@ -849,7 +825,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         zero_b_gdn_loras(num_gdn_slots, rank, dims.hidden, &gdn_dims, rng, init_amp);
 
     let mut adam = AdamState::new();
-    let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
 
     let eval_valid = |loras: &[LoraParams],
                       gdn_loras: &[GdnLoraParams]|
@@ -863,17 +838,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loras,
             gdn_loras,
             &head,
-            &dims,
-            &gdn_dims,
-            &cfg,
-            rank,
-            scale,
+            &train_ctx,
         )?))
     };
 
-    let base_nll = eval_chain_nll(
-        &caches, &layers, &loras, &gdn_loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-    )?;
+    let base_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
     let base_valid = eval_valid(&loras, &gdn_loras)?;
     match base_valid {
         Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
@@ -883,47 +852,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tstep = Instant::now();
     for step in 1..=steps {
         let ctx = &caches[(step - 1) % caches.len()];
-        let fwd = forward_full(
-            ctx, &layers, &loras, &gdn_loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-        )?;
-        let (_nll, _n, grads, gdn_grads) = nll_and_grads(
-            &fwd,
-            &layers,
-            &loras,
-            &head,
-            &dims,
-            &gdn_dims,
-            num_slots,
-            num_gdn_slots,
-            rank,
-            scale,
-        )?;
+        let fwd = forward_full(ctx, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+        let (_nll, _n, grads, gdn_grads) = nll_and_grads(&fwd, &layers, &loras, &head, &train_ctx)?;
 
-        apply_adam_updates(
-            &mut adam,
-            &mut loras,
-            &grads,
-            &slot_layers,
-            lr,
-            beta1,
-            beta2,
-            eps_adam,
-        );
-        apply_gdn_adam_updates(
-            &mut adam,
-            &mut gdn_loras,
-            &gdn_grads,
-            &gdn_slot_layers,
-            lr,
-            beta1,
-            beta2,
-            eps_adam,
-        );
+        apply_adam_updates(&mut adam, &mut loras, &grads, &train_ctx);
+        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train_ctx);
 
         if step % log_every == 0 || step == steps {
-            let mean_nll = eval_chain_nll(
-                &caches, &layers, &loras, &gdn_loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-            )?;
+            let mean_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
             match eval_valid(&loras, &gdn_loras)? {
                 Some(v) => println!(
                     "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
@@ -937,9 +873,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let final_nll = eval_chain_nll(
-        &caches, &layers, &loras, &gdn_loras, &head, &dims, &gdn_dims, &cfg, rank, scale,
-    )?;
+    let final_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
     let secs = tstep.elapsed().as_secs_f64();
     match (base_valid, eval_valid(&loras, &gdn_loras)?) {
         (Some(b), Some(f)) => println!(
