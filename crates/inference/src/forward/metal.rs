@@ -823,6 +823,29 @@ mod inner {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::weights::{QwenLayerWeights, Tensor1D, Tensor2D};
+
+        /// ADR-066 D3.1 / ADR-080 C1 (PR #794): a capability-gated
+        /// Metal test must report a distinct skip or fail closed when
+        /// `LATTICE_METAL_TEST_ENFORCE=1` is set, never silently early-return `ok` —
+        /// otherwise a runner that loses its Metal device (or never had one) greens every
+        /// gate that depends on this module without ever executing the Metal path.
+        /// Mirrors the `forward::metal_qwen35` enforce convention already used by the Q4
+        /// and grammar fail-closed CI steps.
+        fn metal_test_device(context: &str) -> Option<Device> {
+            match Device::system_default() {
+                Some(device) => Some(device),
+                None => {
+                    let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present ({context})"
+                    );
+                    eprintln!("[METAL_TEST_SKIP] context={context} reason=no_metal_device");
+                    None
+                }
+            }
+        }
 
         /// Guards the `flash_attention.metal` extraction: the file loaded via
         /// `include_str!` and run through `msl_source_for`'s token substitution must
@@ -838,8 +861,9 @@ mod inner {
                 "unsubstituted placeholder token remains in assembled MSL"
             );
             // Compile the assembled shader and confirm every pipeline function resolves.
-            // Skips silently if the host exposes no Metal device (e.g. non-GPU CI).
-            let Some(device) = Device::system_default() else {
+            // Fails closed under LATTICE_METAL_TEST_ENFORCE=1 if no Metal device is present
+            // (see `metal_test_device`); otherwise reports a distinct skip.
+            let Some(device) = metal_test_device("msl_template_assembles_and_compiles") else {
                 return;
             };
             let opts = CompileOptions::new();
@@ -858,6 +882,341 @@ mod inner {
                 library
                     .get_function(name, None)
                     .unwrap_or_else(|e| panic!("kernel '{name}' missing from library: {e}"));
+            }
+            // ADR-080 C1 (#791): attn_scores/attn_softmax/attn_context were dead
+            // code (no `make_pipeline` call referenced them, and the dead
+            // `attn_softmax` carried the same multiply-through-zero fail-open
+            // defect as #789) and were deleted from the shader source. Guard
+            // against silently resurrecting them.
+            for dead_name in ["attn_scores", "attn_softmax", "attn_context"] {
+                assert!(
+                    library.get_function(dead_name, None).is_err(),
+                    "'{dead_name}' should have been deleted as dead code (ADR-080 C1, #791) \
+                     but is present in the assembled MSL"
+                );
+            }
+        }
+
+        /// ADR-080 C1 (#789) regression fixture: corrupts a single entry of
+        /// `q_proj_weight` with `corrupt_value` so one attention head's Q vector
+        /// carries that value at every query position (K/V/embeddings/residual stay
+        /// completely clean), then runs the live `MetalForwardPass::forward` boundary
+        /// and returns its output. Shared by the NaN and +inf invalid-row regressions
+        /// below (ADR-066 D2 invariant #1's non-finite-row classes) so both exercise
+        /// the identical construction and the identical finalize fix.
+        ///
+        /// Returns `None` only when there is no Metal device and
+        /// `LATTICE_METAL_TEST_ENFORCE` is unset (see `metal_test_device`); with the
+        /// enforce var set, a missing device or failed pass construction panics
+        /// instead of skipping.
+        fn run_fused_attention_with_corrupted_q_lane(
+            context: &str,
+            corrupt_value: f32,
+        ) -> Option<Vec<f32>> {
+            let _lock = gpu_test_lock();
+            let _device_probe = metal_test_device(context)?;
+
+            let config = QwenConfig {
+                vocab_size: 8,
+                hidden_size: 32,
+                num_hidden_layers: 1,
+                num_attention_heads: 4,
+                num_key_value_heads: 2,
+                head_dim: 8,
+                intermediate_size: 48,
+                max_position_embeddings: 32,
+                rms_norm_eps: 1e-6,
+                rope_theta: 1_000_000.0,
+            };
+            let hidden = config.hidden_size;
+            let q_dim = config.q_dim();
+            let kv_dim = config.kv_dim();
+            let intermediate = config.intermediate_size;
+
+            let mut rng = TestLcg::new(0x5EED_BAAD_F00Du64);
+            let embed_tokens_flat = test_random_vec(&mut rng, config.vocab_size * hidden);
+            let norm_weight_flat = test_random_positive_vec(&mut rng, hidden);
+
+            // Corrupt one entry of q_proj_weight so a single attention head's
+            // Q vector is NaN at every query position, while K/V/embeddings/
+            // residual stay completely clean -- isolates the softmax finalize
+            // as the only place the NaN could be cured.
+            let corrupt_head: usize = 1;
+            let corrupt_head_dim: usize = 3;
+            let corrupt_out_idx = corrupt_head * config.head_dim + corrupt_head_dim;
+            let corrupt_in_idx = 5usize;
+
+            let mut q_proj_flat = test_random_vec(&mut rng, q_dim * hidden);
+            q_proj_flat[corrupt_out_idx * hidden + corrupt_in_idx] = corrupt_value;
+            let k_proj_flat = test_random_vec(&mut rng, kv_dim * hidden);
+            let v_proj_flat = test_random_vec(&mut rng, kv_dim * hidden);
+            let o_proj_flat = test_random_vec(&mut rng, hidden * q_dim);
+            let q_norm_flat = test_random_positive_vec(&mut rng, config.head_dim);
+            let k_norm_flat = test_random_positive_vec(&mut rng, config.head_dim);
+            let input_ln_flat = test_random_positive_vec(&mut rng, hidden);
+            let gate_proj_flat = test_random_vec(&mut rng, intermediate * hidden);
+            let up_proj_flat = test_random_vec(&mut rng, intermediate * hidden);
+            let down_proj_flat = test_random_vec(&mut rng, hidden * intermediate);
+            let post_ln_flat = test_random_positive_vec(&mut rng, hidden);
+
+            let layer = QwenLayerWeights {
+                q_proj_weight: Tensor2D {
+                    data: &q_proj_flat,
+                    rows: q_dim,
+                    cols: hidden,
+                },
+                k_proj_weight: Tensor2D {
+                    data: &k_proj_flat,
+                    rows: kv_dim,
+                    cols: hidden,
+                },
+                v_proj_weight: Tensor2D {
+                    data: &v_proj_flat,
+                    rows: kv_dim,
+                    cols: hidden,
+                },
+                o_proj_weight: Tensor2D {
+                    data: &o_proj_flat,
+                    rows: hidden,
+                    cols: q_dim,
+                },
+                q_norm_weight: Tensor1D {
+                    data: &q_norm_flat,
+                    len: config.head_dim,
+                },
+                k_norm_weight: Tensor1D {
+                    data: &k_norm_flat,
+                    len: config.head_dim,
+                },
+                input_layernorm_weight: Tensor1D {
+                    data: &input_ln_flat,
+                    len: hidden,
+                },
+                gate_proj_weight: Tensor2D {
+                    data: &gate_proj_flat,
+                    rows: intermediate,
+                    cols: hidden,
+                },
+                up_proj_weight: Tensor2D {
+                    data: &up_proj_flat,
+                    rows: intermediate,
+                    cols: hidden,
+                },
+                down_proj_weight: Tensor2D {
+                    data: &down_proj_flat,
+                    rows: hidden,
+                    cols: intermediate,
+                },
+                post_attention_layernorm_weight: Tensor1D {
+                    data: &post_ln_flat,
+                    len: hidden,
+                },
+                fused_qkv: vec![0.0f32; (q_dim + 2 * kv_dim) * hidden],
+                qkv_out_dim: q_dim + 2 * kv_dim,
+                fused_gate_up: vec![0.0f32; (2 * intermediate) * hidden],
+                gate_up_out_dim: 2 * intermediate,
+            };
+            let weights = QwenWeights {
+                embed_tokens: Tensor2D {
+                    data: &embed_tokens_flat,
+                    rows: config.vocab_size,
+                    cols: hidden,
+                },
+                norm_weight: Tensor1D {
+                    data: &norm_weight_flat,
+                    len: hidden,
+                },
+                layers: vec![layer],
+            };
+
+            let input_ids: Vec<u32> = vec![1, 3, 2, 5, 6];
+            let seq_len = input_ids.len();
+
+            let mut hidden_input = vec![0.0f32; seq_len * hidden];
+            for (i, &tok) in input_ids.iter().enumerate() {
+                let tok = tok as usize;
+                hidden_input[i * hidden..(i + 1) * hidden]
+                    .copy_from_slice(&embed_tokens_flat[tok * hidden..(tok + 1) * hidden]);
+            }
+
+            let pass = MetalForwardPass::new(&config, &weights, 8);
+            let mut pass = match pass {
+                Ok(pass) => pass,
+                Err(err) => {
+                    let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but MetalForwardPass::new failed \
+                         ({context}): {err}"
+                    );
+                    eprintln!(
+                        "[METAL_TEST_SKIP] context={context} reason=forward_pass_construct_failed \
+                         error={err}"
+                    );
+                    return None;
+                }
+            };
+
+            let metal_out = pass
+                .forward(&hidden_input, seq_len)
+                .expect("Metal forward should not itself error");
+
+            Some(metal_out)
+        }
+
+        /// ADR-080 C1 (#789) regression, NaN class: the fused_attention finalize must
+        /// fail closed by ASSIGNMENT when the online-softmax denominator is
+        /// non-positive or non-finite (here: a NaN score from a corrupted Q lane), not
+        /// by multiplying the (possibly already-NaN) numerator through a zeroed
+        /// reciprocal -- `NaN * 0.0f == NaN` under IEEE-754, so a `* inv_l` finalize
+        /// cannot recover a poisoned row.
+        ///
+        /// Mutation-sensitive: reverting the fix in flash_attention.metal back to
+        /// `O4[out_base4] = o_frag * inv_l;` makes this test fail (160/160 NaN
+        /// elements instead of 0), confirmed at PR time (round 1) and reconfirmed
+        /// after the fix-round refactor (round 2).
+        #[test]
+        fn fused_attention_fails_closed_on_nan_q_lane() {
+            let Some(metal_out) = run_fused_attention_with_corrupted_q_lane(
+                "fused_attention_fails_closed_on_nan_q_lane",
+                f32::NAN,
+            ) else {
+                return;
+            };
+
+            let nan_count = metal_out.iter().filter(|v| v.is_nan()).count();
+            assert_eq!(
+                nan_count,
+                0,
+                "fused_attention must fail closed (zero output) on a NaN-poisoned \
+                 Q lane instead of propagating NaN through the finalize multiply \
+                 (ADR-080 C1, #789); got {nan_count}/{} NaN elements",
+                metal_out.len()
+            );
+        }
+
+        /// ADR-080 C1 / ADR-066 D2 invariant #1, +inf class: the same corrupted-Q-lane
+        /// construction as the NaN test above, but with the poisoned weight entry set
+        /// to `f32::INFINITY` instead of `f32::NAN`. Because only one weight entry is
+        /// corrupted and the rest of the accumulation over `hidden` dims is finite, the
+        /// resulting Q component for that head goes to +inf or -inf depending on the
+        /// sign of the corresponding hidden-input activation at each query position --
+        /// both are covered by the `!is_finite()` check below. This reaches the
+        /// finalize's non-finite-denominator branch through a distinct arithmetic path
+        /// from the NaN test (an infinite accumulator/denominator rather than a NaN
+        /// one), so it is not redundant with it.
+        ///
+        /// Mutation-sensitive by the same finalize revert as the NaN test above (same
+        /// shared shader guard).
+        #[test]
+        fn fused_attention_fails_closed_on_inf_q_lane() {
+            let Some(metal_out) = run_fused_attention_with_corrupted_q_lane(
+                "fused_attention_fails_closed_on_inf_q_lane",
+                f32::INFINITY,
+            ) else {
+                return;
+            };
+
+            let non_finite_count = metal_out.iter().filter(|v| !v.is_finite()).count();
+            assert_eq!(
+                non_finite_count,
+                0,
+                "fused_attention must fail closed (zero output) on an inf-poisoned \
+                 Q lane instead of propagating inf/NaN through the finalize multiply \
+                 (ADR-080 C1, #789; ADR-066 D2 invariant #1); got {non_finite_count}/{} \
+                 non-finite elements",
+                metal_out.len()
+            );
+        }
+
+        // ADR-066 D2 invariant #1, all-(-inf) class: NOT covered by a direct
+        // kernel-dispatch fixture here, by design, not oversight (PR #794 round-1
+        // review, PR #794). `fused_attention` takes no external mask buffer -- the
+        // only way a score row goes to all -inf is every Q.K dot product in that row
+        // underflowing to -inf, and the live kernel always includes the causal
+        // self-key (Q_i . K_i), which stays finite for any finite Q/K pair. Forcing a
+        // genuine all-(-inf) row would require injecting -inf directly into the score
+        // buffer, i.e. bypassing the live entry point this suite is scoped to (the
+        // corrupted-weight construction above always produces a *finite* Q/K pair
+        // whose dot product can go to NaN or +-inf, never a row of literal -inf by
+        // construction). The finalize guard's arithmetic is the same for this class as
+        // for the +inf class above (`l_i` non-positive or non-finite triggers the same
+        // zero-assignment branch), so the +inf regression already exercises the shared
+        // fail-closed code path; there is no code path reachable from a live forward
+        // call that this suite could exercise differently for all-(-inf) specifically.
+
+        struct TestLcg(u64);
+
+        impl TestLcg {
+            fn new(seed: u64) -> Self {
+                Self(seed)
+            }
+            fn next_u32(&mut self) -> u32 {
+                self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (self.0 >> 32) as u32
+            }
+            fn next_f32(&mut self) -> f32 {
+                let x = self.next_u32() as f32 / u32::MAX as f32;
+                (x - 0.5) * 0.2
+            }
+        }
+
+        fn test_random_vec(rng: &mut TestLcg, len: usize) -> Vec<f32> {
+            (0..len).map(|_| rng.next_f32()).collect()
+        }
+
+        fn test_random_positive_vec(rng: &mut TestLcg, len: usize) -> Vec<f32> {
+            (0..len).map(|_| 0.5 + rng.next_f32().abs()).collect()
+        }
+
+        /// Serializes GPU-driving tests onto the single shared Metal device,
+        /// in-process and machine-wide (mirrors `forward::metal_qwen35`'s
+        /// `gpu_test_lock`; the in-process `Mutex` here is a separate instance
+        /// but the machine-wide `flock` on the same fixed path still
+        /// serializes correctly across both, since `flock` mutual exclusion
+        /// is per-path, not per-`Mutex`-instance).
+        struct GpuTestGuard {
+            _process: std::sync::MutexGuard<'static, ()>,
+            _machine: std::fs::File,
+        }
+
+        fn gpu_test_lock() -> GpuTestGuard {
+            use std::sync::Mutex;
+            static GPU_LOCK: Mutex<()> = Mutex::new(());
+            let process = GPU_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            const LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
+            const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(LOCK_PATH)
+                .unwrap_or_else(|e| panic!("gpu_test_lock: cannot open {LOCK_PATH}: {e}"));
+            let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
+            loop {
+                match file.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        if std::time::Instant::now() >= deadline {
+                            panic!(
+                                "gpu_test_lock: another process has held {LOCK_PATH} for over \
+                                 {}s -- inspect `lsof {LOCK_PATH}`",
+                                LOCK_TIMEOUT.as_secs()
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(std::fs::TryLockError::Error(e)) => {
+                        panic!("gpu_test_lock: flock on {LOCK_PATH} failed: {e}")
+                    }
+                }
+            }
+            GpuTestGuard {
+                _process: process,
+                _machine: file,
             }
         }
     }
