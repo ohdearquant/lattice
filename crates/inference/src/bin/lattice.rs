@@ -957,6 +957,28 @@ mod doctor {
                 "requested context {requested} does not fit: max feasible is {max_ctx} tokens"
             ));
         }
+        // Fail closed on the doctor's own computed numbers even when no
+        // `--context` was requested (#875): a machine that cannot even fit
+        // the weights, or that fits weights but leaves zero room for a
+        // single token of KV cache, is not "ready to load" regardless of
+        // whether the caller asked about a specific context length.
+        if let Some(avail) = available_memory_bytes
+            && inventory.total_bytes > avail
+        {
+            blocking_reasons.push(format!(
+                "weight memory {} exceeds detected system memory {}: this model cannot be \
+                 loaded on this machine",
+                human_bytes(inventory.total_bytes),
+                human_bytes(avail)
+            ));
+        }
+        if max_context_len == Some(0) {
+            blocking_reasons.push(
+                "max feasible context length is 0 tokens: weights and/or KV cache do not fit \
+                 in available memory (not even a single token of context)"
+                    .to_string(),
+            );
+        }
 
         Ok(DoctorReport {
             model_dir: model_dir.to_path_buf(),
@@ -1825,6 +1847,81 @@ mod doctor {
                 assert_eq!(report.requested_fits, Some(false));
                 assert!(!report.is_ready());
             }
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_weights_exceed_ram_fails_without_explicit_context() {
+            // Issue #875: doctor's own numbers said weights (64.60 GiB)
+            // exceeded system memory (32.00 GiB) yet the verdict was still
+            // "OK" because no `--context` was passed. Reproduce with no
+            // requested context at all -- the fail-closed check must not
+            // depend on `requested_fits`.
+            let dir = tempdir("report-weights-exceed-ram-no-ctx");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+            let weight_bytes = required_tensor_fixture(&cfg).len() as u64 * 64;
+
+            let report = build_report(&dir, None, None, Some(weight_bytes - 1)).unwrap();
+            assert!(!report.is_ready());
+            assert_eq!(report.requested_context, None);
+            assert!(
+                report
+                    .blocking_reasons
+                    .iter()
+                    .any(|r| r.contains("exceeds detected system memory")),
+                "blocking reasons: {:?}",
+                report.blocking_reasons
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_zero_feasible_context_fails_without_explicit_context() {
+            // Weights alone fit, but leave less than one KV-cache token's
+            // worth of headroom -- max feasible context is 0. Must fail
+            // closed even though no `--context` was requested.
+            let dir = tempdir("report-zero-ctx-no-request");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+            let weight_bytes = required_tensor_fixture(&cfg).len() as u64 * 64;
+            let kv_bytes_per_token = cfg.kv_bytes_per_token(kv_cache_dtype_bytes()) as u64;
+            assert!(
+                kv_bytes_per_token > 1,
+                "fixture assumption: at least 2 bytes/token of KV cache"
+            );
+
+            let report = build_report(&dir, None, None, Some(weight_bytes + 1)).unwrap();
+            assert_eq!(report.max_context_len, Some(0));
+            assert!(!report.is_ready());
+            assert_eq!(report.requested_context, None);
+            assert!(
+                report
+                    .blocking_reasons
+                    .iter()
+                    .any(|r| r.contains("max feasible context length is 0 tokens")),
+                "blocking reasons: {:?}",
+                report.blocking_reasons
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_fits_within_ram_is_ready_without_explicit_context() {
+            // Existing passing configurations must still report OK when no
+            // `--context` is requested (acceptance criterion: no
+            // regression on the happy path).
+            let dir = tempdir("report-fits-no-ctx");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+
+            let report = build_report(&dir, None, None, Some(1u64 << 40)).unwrap();
+            assert!(
+                report.is_ready(),
+                "blocking reasons: {:?}",
+                report.blocking_reasons
+            );
+            assert!(report.max_context_len.unwrap_or(0) > 0);
             fs::remove_dir_all(&dir).ok();
         }
 
