@@ -1,0 +1,177 @@
+# perf-policy.toml — versioned regression-gate policy (bench-overhaul PR 1,
+# "canonical contract and policy, in days" — DESIGN.md section 4
+# "Regression-gating semantics" and its "Initial registered policy" table).
+#
+# Kill-points, not aspirational targets. Changing a threshold, a cv_bands
+# entry, or a family's noise class requires rationale and a new
+# `policy_version` (DESIGN.md: "versioned in perf-policy.toml before shadow
+# runs; changing one requires rationale and a new policy version"). A run
+# record pins the SHA-256 of this file's bytes at gate time
+# (`bench_gate_math.policy_sha`) so `bench_decode_harness.validate_run_record`
+# can fail closed on a post-run threshold change — the recorded gate must
+# have been evaluated against the policy content it claims, not a policy
+# that drifted underneath the same version number.
+#
+# Loaded by `scripts/bench_gate_math.load_policy` (structural validation)
+# and consumed by `scripts/bench_decode_harness.py`'s schema-v2 run-record
+# validator. Never hand-parsed elsewhere — this file is data, not a second
+# copy of the gate logic.
+
+schema_version = 1
+policy_version = 1
+
+# ---------------------------------------------------------------------------
+# Correction 1 (mandatory gate correction, see PR description / DESIGN.md
+# addendum): required `n` is derived from the MEASURED same-session
+# residual CV of the null A/A calibration sessions on the Metal lane, not
+# fixed at n=7. The first null A/A sessions measure this CV; n=7 stands
+# only if measured CV ~= 1%. Bands are ordered ascending by `max_cv`; the
+# FIRST band whose `max_cv >= measured_cv` applies (see
+# `bench_gate_math.required_n`). The last band's `max_cv` must be >= 1.0
+# (100%) so no measured CV can fall through uncovered — enforced by
+# `bench_gate_math.parse_cv_bands`.
+#
+# Evidence (Leo's math-verification pass, mathcheck sim.py /
+# sim2_power_curve.py — internal artifacts, summarized here so the policy
+# is self-explaining without them): at cv~=1% n=7 already has ~99% power
+# against a true 10% regression (class A, decode family, FAIL=7%). At
+# cv~=3%, n=7 only has ~47-63% power; n~=23-25 restores ~80-84%. At
+# cv>=8%, even n=30 caps out near ~31% power — inflating n further stops
+# being cost-effective, so that band widens the FAIL margin instead
+# (`fail_margin_multiplier`) rather than chasing an ever-larger n.
+[[cv_bands]]
+max_cv = 0.015
+required_n_class_a = 7
+required_n_class_b = 9
+fail_margin_multiplier = 1.0
+note = "measured CV ~1%: n=7/9 as originally registered; ~99% power vs a true 10% regression."
+
+[[cv_bands]]
+max_cv = 0.05
+required_n_class_a = 25
+required_n_class_b = 25
+fail_margin_multiplier = 1.0
+note = "measured CV ~3%: n=7 has only ~47-63% power vs a true 10% regression; n=25 restores ~80-84%."
+
+[[cv_bands]]
+max_cv = 1.0
+required_n_class_a = 25
+required_n_class_b = 25
+fail_margin_multiplier = 2.0
+note = "measured CV >=8%: even n=30 only reaches ~31% power vs a true 10% regression -- widen the FAIL margin for this band instead of chasing n. A cell with no measured_cv record can never be assumed to land in the cheapest band; the validator refuses promotion of any such cell (correction 1's fail-closed requirement)."
+
+# ---------------------------------------------------------------------------
+# Gate-math method (Correction 2, mandatory): bootstrap the MEAN of paired
+# log-slowdowns, never the median, at small n. The bootstrap distribution
+# of the MEDIAN at n=7 is discrete over at most 7 point masses (median of
+# an odd-n sample is always one of the original observations) and cannot
+# represent a Holm-corrected per-cell tail cut of alpha/5=0.01. See
+# `bench_gate_math.order_stratified_bootstrap_means`.
+[gate_math]
+alpha_familywise = 0.05
+holm_correction = true
+bootstrap_statistic = "mean"
+bootstrap_replicates = 2000
+order_stratified = true
+
+# ---------------------------------------------------------------------------
+# Correction 3 (mandatory gate correction): shadow-promotion honesty.
+# Promotion is gated on `min_null_aa_sessions` (>= 20) and on the
+# PromotionRecord reporting the ACHIEVED Clopper-Pearson bound computed
+# from its own (null_sessions, failures) -- never an asserted bound
+# tighter than that math allows. 20 clean A/A sessions with zero observed
+# failures bounds the true false-FAIL rate to only <=13.91% at 95%
+# confidence, nowhere near "<1%"; reaching a bound that itself proves <1%
+# at 95% confidence from zero observed failures needs ~298 sessions
+# (`theoretical_sessions_for_bound_lt_1pct_at_95conf`, informational only
+# -- promotion is NOT gated on reaching it up front). Null A/A sessions
+# keep accruing nightly after promotion so the reported bound tightens
+# over time; see `bench_decode_harness.PromotionRecord` /
+# `validate_promotion_record`.
+[promotion]
+min_null_aa_sessions = 20
+min_mainline_sessions = 10
+target_false_fail_rate = 0.01
+theoretical_sessions_for_bound_lt_1pct_at_95conf = 298
+
+# ---------------------------------------------------------------------------
+# Initial registered policy (DESIGN.md section 4 table). `noise_class` is
+# "A" or "B" and selects the cv_bands column via `bench_gate_math.required_n`;
+# "C" families are informational/trend-only and never gate a required cell.
+# `warn_pct`/`fail_pct` are fractions (0.03 == 3%) of the corrected
+# one-sided slowdown bound, per DESIGN.md: "FAIL: ... corrected one-sided
+# lower bound exceeds" the fail_pct threshold; a point estimate crossing
+# with an inconclusive bound is WARN, never PASS.
+[families.decode]
+metrics = ["decode_tok_s", "median_token_ms"]
+noise_class = "A"
+warn_pct = 0.03
+fail_pct = 0.07
+other_rule = "Any required context cell can fail; do not average contexts."
+
+[families.prefill_ttft.prefill_tok_s]
+noise_class = "A"
+warn_pct = 0.05
+fail_pct = 0.10
+other_rule = "1024 and 2048 are always required when prefill/shared code changes."
+
+[families.prefill_ttft.ttft]
+noise_class = "B"
+warn_pct = 0.05
+fail_pct = 0.10
+other_rule = "Gate each context; trend quadratic coefficient and 1024->2048 knee ratio, initially informational."
+
+[families.prefill_ttft.per_token_p95]
+noise_class = "B"
+warn_pct = 0.05
+fail_pct = 0.10
+other_rule = "Trial-level quantiles; no token-as-independent-sample statistics."
+
+[families.prefill_ttft.per_token_p99]
+noise_class = "B"
+warn_pct = 0.10
+fail_pct = 0.15
+other_rule = "Trial-level quantiles; no token-as-independent-sample statistics."
+
+[families.memory.warm_peak_phys_footprint]
+noise_class = "B"
+warn_pct = 0.03
+fail_abs_mib = 64
+fail_pct = 0.05
+other_rule = "FAIL requires both >5% AND >64 MiB. Cold footprint and load-phase footprint warn/trend until variance is calibrated."
+
+[families.memory.model_load_time]
+noise_class = "C"
+warn_pct = 0.15
+fail_pct = 0.0
+other_rule = "15% point estimate WARN only, no FAIL initially. Promote after cache-state protocol is stable; always label process-cold versus filesystem-cold."
+
+[families.embed.texts_s]
+noise_class = "A"
+warn_pct = 0.05
+fail_pct = 0.10
+other_rule = "Gate each batch x length; no cross-cell averaging."
+
+[families.embed.tokens_s]
+noise_class = "A"
+warn_pct = 0.05
+fail_pct = 0.10
+other_rule = "Gate each batch x length; no cross-cell averaging."
+
+[families.embed.batch_p95]
+noise_class = "B"
+warn_pct = 0.10
+fail_pct = 0.15
+other_rule = "Minimum nine pairs."
+
+[families.criterion_quickmode_embed_simd]
+noise_class = "C"
+warn_pct = 0.0
+fail_pct = 0.0
+other_rule = "PR #872 quick-mode embed SIMD groups: visible delta only, never FAIL in quick mode. Full Criterion mode remains eligible after null-A/A calibration."
+
+[families.unclassified]
+noise_class = "C"
+warn_pct = 0.0
+fail_pct = 0.0
+other_rule = "New/unclassified group: visible delta only. Cannot become required without a policy-registry change and shadow evidence."
