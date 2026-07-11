@@ -10,10 +10,18 @@
 #
 # Every engine gets its own `[[profiles.<name>.engines]]` table -- an
 # ordered array, not a flat name list -- because the legacy scripts this
-# harness consolidates give each engine its own warmup schedule (e.g. only
-# MLX warms up in `bench_apples_to_apples.sh`) and, for the Q4/Q8
-# comparison in `bench_q4_apples.sh`, a different quantization per engine
-# within one profile (Lattice Q4, MLX Q4, Ollama Q8 as reference only).
+# harness consolidates give each engine its own warmup shape (e.g. only
+# MLX warms up in `bench_apples_to_apples.sh`, once, at 8 tokens, before
+# the N1/N2 loop) and, for the Q4/Q8 comparison in `bench_q4_apples.sh`, a
+# different quantization per engine within one profile (Lattice Q4, MLX
+# Q4, Ollama Q8 as reference only). A warmup is an explicit pre-window
+# batch: `warmup_repeats` calls at `warmup_tokens` completion tokens run
+# ONCE per engine, entirely before that engine's measured windows -- never
+# once per window -- so `bench_apples_precise.sh`'s "warm twice at N2=512
+# before both windows" and `bench_context_scaling.sh`'s "warm once at 4
+# tokens before the baseline/comparison loop" are both exactly
+# representable, including `bench_compare_1k.py`'s distinct per-engine
+# warmup prompts via `warmup_prompt`.
 #
 # This file intentionally defines no profiles yet. The five live consumers
 # (`bench_apples_to_apples.sh`, `bench_apples_precise.sh`, `bench_q4_apples.sh`,
@@ -30,15 +38,20 @@
 #                            each table:
 #     name                     string, non-empty
 #     warmup_repeats           int, >= 0
+#     warmup_tokens            int, > 0; required iff warmup_repeats > 0
+#     warmup_prompt            string, non-empty, optional; defaults to the
+#                              profile's `prompt` when omitted; unused when
+#                              warmup_repeats == 0
 #     model                    string, non-empty
 #     quantization             string, non-empty
-#   prompt                   string, non-empty
+#   prompt                   string, non-empty (the MEASURED-window prompt)
 #   aggregation              "median" (default) or "trimmed_mean"
 #   trim                     int, >= 0; only valid when aggregation = "trimmed_mean"
 #   requested_prompt_tokens  int, optional
 #
 # Example (not a live profile -- illustrates the Q4/Q8-mixed shape from
-# bench_q4_apples.sh; uncomment and rename to activate):
+# bench_q4_apples.sh, with MLX's single pre-loop 8-token warmup from
+# bench_apples_to_apples.sh; uncomment and rename to activate):
 #
 # [profiles.example_q4_apples]
 # description = "example only, see bench_q4_apples.sh for the real profile"
@@ -56,6 +69,7 @@
 # [[profiles.example_q4_apples.engines]]
 # name = "mlx"
 # warmup_repeats = 1
+# warmup_tokens = 8
 # model = "qwen3.5-0.8b"
 # quantization = "q4"
 #

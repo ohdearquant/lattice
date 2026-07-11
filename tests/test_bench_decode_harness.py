@@ -95,9 +95,19 @@ class _FakeAdapter:
 
 
 def _engine(
-    name: str = "fake", warmup_repeats: int = 0, model: str = "qwen3.5-0.8b", quantization: str = "q8"
+    name: str = "fake",
+    warmup_repeats: int = 0,
+    warmup_tokens: int | None = None,
+    warmup_prompt: str | None = None,
+    model: str = "qwen3.5-0.8b",
+    quantization: str = "q8",
 ) -> dict:
-    return {"name": name, "warmup_repeats": warmup_repeats, "model": model, "quantization": quantization}
+    d = {"name": name, "warmup_repeats": warmup_repeats, "model": model, "quantization": quantization}
+    if warmup_tokens is not None:
+        d["warmup_tokens"] = warmup_tokens
+    if warmup_prompt is not None:
+        d["warmup_prompt"] = warmup_prompt
+    return d
 
 
 def _profile(**overrides) -> "harness.ProfileConfig":
@@ -224,6 +234,8 @@ class ProfileConfigTest(unittest.TestCase):
         self.assertEqual(profile.engines, ("fake",))
         self.assertEqual(len(profile.engine_groups), 1)
         self.assertEqual(profile.engine_groups[0].warmup_repeats, 0)
+        self.assertIsNone(profile.engine_groups[0].warmup_tokens)
+        self.assertIsNone(profile.engine_groups[0].warmup_prompt)
         self.assertEqual(profile.engine_groups[0].model, "qwen3.5-0.8b")
         self.assertEqual(profile.engine_groups[0].quantization, "q8")
 
@@ -265,6 +277,67 @@ class ProfileConfigTest(unittest.TestCase):
     def test_negative_engine_warmup_rejected(self):
         with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_repeats"):
             _profile(engines=[_engine(warmup_repeats=-1)])
+
+    # -- Warmup is an explicit pre-window batch (round-2 blocker fix):
+    # warmup_tokens is the completion-token budget for that batch, and is
+    # only meaningful together with a positive warmup_repeats. --
+
+    def test_warmup_tokens_required_when_warmup_repeats_positive(self):
+        with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_tokens.*required"):
+            _profile(engines=[_engine(warmup_repeats=1)])
+
+    def test_warmup_tokens_rejected_when_warmup_repeats_zero(self):
+        raw_engine = {"name": "fake", "warmup_repeats": 0, "warmup_tokens": 8, "model": "m", "quantization": "q8"}
+        with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_tokens.*only meaningful"):
+            _profile(engines=[raw_engine])
+
+    def test_warmup_tokens_must_be_positive(self):
+        raw_engine = {"name": "fake", "warmup_repeats": 1, "warmup_tokens": 0, "model": "m", "quantization": "q8"}
+        with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_tokens.*positive"):
+            _profile(engines=[raw_engine])
+
+    def test_warmup_tokens_wrong_type_rejected(self):
+        raw_engine = {
+            "name": "fake",
+            "warmup_repeats": 1,
+            "warmup_tokens": "eight",
+            "model": "m",
+            "quantization": "q8",
+        }
+        with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_tokens"):
+            _profile(engines=[raw_engine])
+
+    def test_warmup_prompt_optional_at_zero_warmup(self):
+        # warmup_prompt is simply unused when warmup_repeats == 0, so it is
+        # not rejected the way warmup_tokens is -- there is nothing
+        # ambiguous about specifying it (it would only matter if warmups
+        # were ever scheduled).
+        profile = _profile(engines=[_engine(warmup_repeats=0, warmup_prompt="unused prompt")])
+        self.assertEqual(profile.engine_groups[0].warmup_prompt, "unused prompt")
+
+    def test_warmup_prompt_must_be_non_empty_if_provided(self):
+        raw_engine = {
+            "name": "fake",
+            "warmup_repeats": 1,
+            "warmup_tokens": 8,
+            "warmup_prompt": "",
+            "model": "m",
+            "quantization": "q8",
+        }
+        with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_prompt"):
+            _profile(engines=[raw_engine])
+
+    def test_warmup_prompt_wrong_type_rejected(self):
+        raw_engine = {
+            "name": "fake",
+            "warmup_repeats": 1,
+            "warmup_tokens": 8,
+            "warmup_prompt": 123,
+            "model": "m",
+            "quantization": "q8",
+        }
+        with self.assertRaisesRegex(harness.ProfileConfigError, "warmup_prompt"):
+            _profile(engines=[raw_engine])
 
     def test_empty_engine_model_rejected(self):
         with self.assertRaisesRegex(harness.ProfileConfigError, "model must be non-empty"):
@@ -378,6 +451,7 @@ prompt = "hello world"
 [[profiles.smoke.engines]]
 name = "fake"
 warmup_repeats = 1
+warmup_tokens = 8
 model = "qwen3.5-0.8b"
 quantization = "q8"
 """,
@@ -388,6 +462,7 @@ quantization = "q8"
             self.assertEqual(profiles["smoke"].windows, (32, 256))
             self.assertEqual(profiles["smoke"].engines, ("fake",))
             self.assertEqual(profiles["smoke"].engine_groups[0].warmup_repeats, 1)
+            self.assertEqual(profiles["smoke"].engine_groups[0].warmup_tokens, 8)
 
     def test_heterogeneous_q4_q8_profile_round_trips(self):
         # Reproduces bench_q4_apples.sh's shape in one profile: Lattice and
@@ -413,6 +488,7 @@ quantization = "q4"
 [[profiles.q4_apples.engines]]
 name = "mlx"
 warmup_repeats = 1
+warmup_tokens = 8
 model = "qwen3.5-0.8b"
 quantization = "q4"
 
@@ -431,6 +507,7 @@ quantization = "q8"
             self.assertEqual(groups["lattice"].warmup_repeats, 0)
             self.assertEqual(groups["lattice"].quantization, "q4")
             self.assertEqual(groups["mlx"].warmup_repeats, 1)
+            self.assertEqual(groups["mlx"].warmup_tokens, 8)
             self.assertEqual(groups["mlx"].quantization, "q4")
             self.assertEqual(groups["ollama"].warmup_repeats, 0)
             self.assertEqual(groups["ollama"].quantization, "q8")
@@ -443,7 +520,9 @@ quantization = "q8"
 
 class RunProfileTest(unittest.TestCase):
     def test_produces_expected_observation_count(self):
-        profile = _profile(engines=[_engine(warmup_repeats=2)], measured_repeats=3, windows=[32, 256])
+        profile = _profile(
+            engines=[_engine(warmup_repeats=2, warmup_tokens=8)], measured_repeats=3, windows=[32, 256]
+        )
         adapter = _FakeAdapter()
         result = harness.run_profile(
             profile,
@@ -452,23 +531,44 @@ class RunProfileTest(unittest.TestCase):
             git_sha_value="deadbeef",
             hardware_id_value="test-host",
         )
-        # 1 engine * 2 windows * (2 warmup + 3 measured) = 10
-        self.assertEqual(len(result.observations), 10)
+        # 1 engine * (2 warmups, once, NOT per window) + 1 engine * 2 windows * 3 measured = 2 + 6 = 8
+        self.assertEqual(len(result.observations), 8)
         self.assertEqual(result.missing_engines, ())
 
-    def test_warmup_flag_and_run_index_reset_per_group(self):
-        profile = _profile(engines=[_engine(warmup_repeats=2)], measured_repeats=3, windows=[32, 256])
+    def test_warmup_executes_once_before_all_measured_windows(self):
+        # The round-2 blocker fix: warmup is a pre-window batch at its own
+        # token budget, not looped once per measured window.
+        profile = _profile(
+            engines=[_engine(warmup_repeats=2, warmup_tokens=8)], measured_repeats=3, windows=[32, 256]
+        )
         result = harness.run_profile(
             profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
         )
-        window_32 = [o for o in result.observations if o.requested_completion_tokens == 32]
-        warmups = [o for o in window_32 if o.warmup]
-        measured = [o for o in window_32 if not o.warmup]
+        warmups = [o for o in result.observations if o.warmup]
+        measured = [o for o in result.observations if not o.warmup]
+
+        # Exactly warmup_repeats warmup rows total (not per window), all at
+        # warmup_tokens, never at a measured window's token count.
+        self.assertEqual(len(warmups), 2)
+        self.assertEqual([o.requested_completion_tokens for o in warmups], [8, 8])
         self.assertEqual([o.run_index for o in warmups], [1, 2])
-        self.assertEqual([o.run_index for o in measured], [1, 2, 3])
+
+        # Every warmup observation's order_index precedes every measured
+        # observation's -- the warmup batch runs first, in full, before any
+        # measured window.
+        self.assertLess(max(o.order_index for o in warmups), min(o.order_index for o in measured))
+
+        # Measured run_index still resets per window (unaffected by the
+        # warmup-schedule fix).
+        measured_32 = [o for o in measured if o.requested_completion_tokens == 32]
+        measured_256 = [o for o in measured if o.requested_completion_tokens == 256]
+        self.assertEqual([o.run_index for o in measured_32], [1, 2, 3])
+        self.assertEqual([o.run_index for o in measured_256], [1, 2, 3])
 
     def test_order_index_strictly_increasing(self):
-        profile = _profile(engines=[_engine(warmup_repeats=1)], measured_repeats=2, windows=[32, 128, 256])
+        profile = _profile(
+            engines=[_engine(warmup_repeats=1, warmup_tokens=8)], measured_repeats=2, windows=[32, 128, 256]
+        )
         result = harness.run_profile(
             profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
         )
@@ -505,7 +605,9 @@ class RunProfileTest(unittest.TestCase):
             self.assertEqual(obs.actual_prompt_tokens, 7)
 
     def test_every_observation_is_schema_valid(self):
-        profile = _profile(engines=[_engine(warmup_repeats=1)], measured_repeats=2, windows=[32, 256])
+        profile = _profile(
+            engines=[_engine(warmup_repeats=1, warmup_tokens=8)], measured_repeats=2, windows=[32, 256]
+        )
         result = harness.run_profile(
             profile,
             {"fake": _FakeAdapter(native_ns_per_token=30_000)},
@@ -589,8 +691,12 @@ class RunProfileTest(unittest.TestCase):
 
     def test_heterogeneous_engine_schedule_exact_call_sequence_and_identities(self):
         """The blocker fix: reproduce bench_q4_apples.sh (Lattice Q4, MLX
-        Q4, Ollama Q8-reference) with bench_apples_to_apples.sh's MLX-only
-        warmup, all inside one profile."""
+        Q4, Ollama Q8-reference) with bench_apples_to_apples.sh's single
+        pre-loop 8-token MLX-only warmup, all inside one profile. MLX's
+        warmup is scheduled once, at its OWN 8-token budget -- distinct
+        from both measured windows (32, 256) -- entirely before its
+        measured runs, exactly reproducing the legacy script's call order.
+        """
         profile = harness._parse_profile(
             "q4_apples",
             {
@@ -599,7 +705,7 @@ class RunProfileTest(unittest.TestCase):
                 "prompt": "the quick brown fox",
                 "engines": [
                     _engine("lattice", warmup_repeats=0, model="qwen3.5-0.8b-q4", quantization="q4"),
-                    _engine("mlx", warmup_repeats=1, model="qwen3.5-0.8b", quantization="q4"),
+                    _engine("mlx", warmup_repeats=1, warmup_tokens=8, model="qwen3.5-0.8b", quantization="q4"),
                     _engine("ollama", warmup_repeats=0, model="qwen3.5:0.8b", quantization="q8"),
                 ],
             },
@@ -616,9 +722,10 @@ class RunProfileTest(unittest.TestCase):
         )
 
         # Exact call sequence per engine. lattice/ollama: 0 warmup + 2
-        # measured per window = 4 calls. mlx: 1 warmup + 2 measured per
-        # window = 6 calls -- the MLX-only-warmup mix bench_apples_to_apples.sh
-        # needs, now representable within a single profile.
+        # measured per window = 4 calls. mlx: ONE 8-token warmup call,
+        # then 2 measured per window = 5 calls -- exactly
+        # bench_apples_to_apples.sh's single pre-loop MLX warmup, not a
+        # warmup repeated at every measured window's token count.
         self.assertEqual(
             lattice.calls,
             [
@@ -631,10 +738,9 @@ class RunProfileTest(unittest.TestCase):
         self.assertEqual(
             mlx.calls,
             [
-                (32, True, "qwen3.5-0.8b", "q4"),
+                (8, True, "qwen3.5-0.8b", "q4"),
                 (32, False, "qwen3.5-0.8b", "q4"),
                 (32, False, "qwen3.5-0.8b", "q4"),
-                (256, True, "qwen3.5-0.8b", "q4"),
                 (256, False, "qwen3.5-0.8b", "q4"),
                 (256, False, "qwen3.5-0.8b", "q4"),
             ],
@@ -654,7 +760,7 @@ class RunProfileTest(unittest.TestCase):
         # of mlx's, then all of ollama's.
         self.assertEqual(
             [o.engine for o in result.observations],
-            ["lattice"] * 4 + ["mlx"] * 6 + ["ollama"] * 4,
+            ["lattice"] * 4 + ["mlx"] * 5 + ["ollama"] * 4,
         )
 
         # Per-row identity: each observation records ITS OWN engine's
@@ -669,6 +775,92 @@ class RunProfileTest(unittest.TestCase):
                 self.assertEqual((obs.model, obs.quantization), ("qwen3.5:0.8b", "q8"))
             else:  # pragma: no cover -- defensive, should be unreachable
                 self.fail(f"unexpected engine {obs.engine!r}")
+
+    def test_precise_style_warmup_twice_before_both_measured_windows(self):
+        """Reproduces bench_apples_precise.sh: every engine warms twice at
+        N2=512, once before both measured windows (N1=64, N2=512) --
+        never once per window (which would be 4 warmups: 2x64, 2x512)."""
+        profile = harness._parse_profile(
+            "precise",
+            {
+                "windows": [64, 512],
+                "measured_repeats": 13,
+                "prompt": "the quick brown fox",
+                "engines": [_engine("fake", warmup_repeats=2, warmup_tokens=512)],
+            },
+        )
+        adapter = _FakeAdapter()
+        harness.run_profile(
+            profile, {"fake": adapter}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+        )
+        expected = (
+            [(512, True, "qwen3.5-0.8b", "q8")] * 2
+            + [(64, False, "qwen3.5-0.8b", "q8")] * 13
+            + [(512, False, "qwen3.5-0.8b", "q8")] * 13
+        )
+        self.assertEqual(adapter.calls, expected)
+
+    def test_context_scaling_style_single_warmup_before_all_comparison_windows(self):
+        """Reproduces bench_context_scaling.sh: MLX warms once at 4 tokens
+        before the N1=8 baseline and every N2 comparison window
+        ({64, 128, 256}) -- one warmup total, not one per window."""
+        profile = harness._parse_profile(
+            "context_scaling",
+            {
+                "windows": [8, 64, 128, 256],
+                "measured_repeats": 5,
+                "prompt": "the quick brown fox",
+                "engines": [_engine("mlx", warmup_repeats=1, warmup_tokens=4)],
+            },
+        )
+        adapter = _FakeAdapter()
+        result = harness.run_profile(
+            profile, {"mlx": adapter}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+        )
+        expected = (
+            [(4, True, "qwen3.5-0.8b", "q8")]
+            + [(8, False, "qwen3.5-0.8b", "q8")] * 5
+            + [(64, False, "qwen3.5-0.8b", "q8")] * 5
+            + [(128, False, "qwen3.5-0.8b", "q8")] * 5
+            + [(256, False, "qwen3.5-0.8b", "q8")] * 5
+        )
+        self.assertEqual(adapter.calls, expected)
+        warmups = [o for o in result.observations if o.warmup]
+        self.assertEqual(len(warmups), 1)
+        self.assertEqual(warmups[0].requested_completion_tokens, 4)
+
+    def test_default_warmup_prompt_uses_profile_prompt(self):
+        profile = _profile(
+            engines=[_engine(warmup_repeats=1, warmup_tokens=8)],
+            measured_repeats=1,
+            windows=[32, 256],
+            prompt="the measured prompt",
+        )
+        result = harness.run_profile(
+            profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+        )
+        warmup_obs = [o for o in result.observations if o.warmup][0]
+        measured_obs = [o for o in result.observations if not o.warmup][0]
+        self.assertEqual(warmup_obs.prompt_hash, measured_obs.prompt_hash)
+        self.assertEqual(warmup_obs.prompt_hash, harness.prompt_hash("the measured prompt"))
+
+    def test_custom_warmup_prompt_overrides_profile_prompt(self):
+        """Reproduces bench_compare_1k.py's distinct per-engine warmup
+        prompt, separate from the measured prompt."""
+        profile = _profile(
+            engines=[_engine(warmup_repeats=1, warmup_tokens=4, warmup_prompt="a distinct warmup prompt")],
+            measured_repeats=1,
+            windows=[32, 256],
+            prompt="the measured prompt",
+        )
+        result = harness.run_profile(
+            profile, {"fake": _FakeAdapter()}, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+        )
+        warmup_obs = [o for o in result.observations if o.warmup][0]
+        measured_obs = [o for o in result.observations if not o.warmup][0]
+        self.assertEqual(warmup_obs.prompt_hash, harness.prompt_hash("a distinct warmup prompt"))
+        self.assertEqual(measured_obs.prompt_hash, harness.prompt_hash("the measured prompt"))
+        self.assertNotEqual(warmup_obs.prompt_hash, measured_obs.prompt_hash)
 
 
 # --------------------------------------------------------------------------

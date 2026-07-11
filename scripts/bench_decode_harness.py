@@ -24,15 +24,25 @@ then `bench_decode_profiles.toml` carries no profile definitions and the
 engine request always resolves as "missing" (see `--allow-missing-engine`).
 
 A profile's `engines` list is an ordered set of per-engine run groups, not
-a flat list of names: each entry carries its own `warmup_repeats`, `model`,
-and `quantization` (see `EngineRunGroup`), because the legacy scripts this
-harness consolidates give each engine its own warmup schedule and, for the
+a flat list of names: each entry carries its own warmup schedule
+(`warmup_repeats`, `warmup_tokens`, optional `warmup_prompt`), `model`, and
+`quantization` (see `EngineRunGroup`), because the legacy scripts this
+harness consolidates give each engine its own warmup shape and, for the
 Q4/Q8 comparison, a different quantization per engine within one profile.
-`windows`, `measured_repeats`, and `prompt` stay profile-wide because every
-legacy script keeps those uniform across engines. The requested
-model/quantization is passed into `EngineAdapter.run()`; an adapter that
-invokes a different artifact than requested (fallback, missing checkpoint,
-...) reports the actual identity back via `AdapterRunResult.actual_model`/
+A warmup is an explicit pre-window batch: `warmup_repeats` calls at
+`warmup_tokens` completion tokens execute ONCE per engine, entirely before
+that engine's measured windows -- never once per window -- so
+`bench_apples_to_apples.sh`'s single pre-loop 8-token MLX warmup,
+`bench_apples_precise.sh`'s twice-at-N2 warmup for every engine, and
+`bench_context_scaling.sh`'s single pre-loop 4-token MLX warmup are each
+exactly representable, including `bench_compare_1k.py`'s distinct
+per-engine warmup prompts via `warmup_prompt` (defaults to `profile.prompt`
+when omitted). `windows`, `measured_repeats`, and the measured `prompt`
+stay profile-wide because every legacy script keeps those uniform across
+engines; only the warmup differs per engine. The requested model/
+quantization is passed into `EngineAdapter.run()`; an adapter that invokes
+a different artifact than requested (fallback, missing checkpoint, ...)
+reports the actual identity back via `AdapterRunResult.actual_model`/
 `actual_quantization`, and raw observations always record the actual
 invoked identity, never a value merely assumed from the profile.
 
@@ -268,15 +278,27 @@ def write_jsonl(observations: list[Observation], path: Path) -> None:
 class EngineRunGroup:
     """One engine's schedule within a profile.
 
-    Every legacy script gives each engine its own warmup count and its own
-    model/quantization identity (`bench_apples_to_apples.sh`: only MLX gets
-    a warmup; `bench_q4_apples.sh`: Lattice and MLX run Q4, Ollama runs Q8 as
-    a reference). `measured_repeats`, `windows`, and `prompt` stay profile-
-    wide because every legacy script keeps those uniform across engines.
+    Every legacy script gives each engine its own warmup schedule and its
+    own model/quantization identity (`bench_apples_to_apples.sh`: only MLX
+    gets a warmup, once, at 8 tokens, before the N1/N2 loop;
+    `bench_apples_precise.sh`: every engine warms twice at N2=512, once
+    before both measured windows; `bench_context_scaling.sh`: MLX warms
+    once at 4 tokens before the baseline/comparison loop;
+    `bench_compare_1k.py`: Ollama and MLX each warm at 4 tokens with their
+    own warmup prompt, distinct from the measured prompt). A warmup is
+    therefore an explicit pre-window batch -- `warmup_repeats` calls at
+    `warmup_tokens` completion tokens, using `warmup_prompt` if given or
+    `profile.prompt` otherwise -- executed once per engine, entirely
+    before that engine's measured windows, never once per window.
+    `measured_repeats`, `windows`, and the measured `prompt` stay
+    profile-wide because every legacy script keeps those uniform across
+    engines; only the warmup differs per engine.
     """
 
     name: str
     warmup_repeats: int
+    warmup_tokens: int | None
+    warmup_prompt: str | None
     model: str
     quantization: str
 
@@ -312,7 +334,9 @@ _PROFILE_ALLOWED_KEYS = frozenset(
         "requested_prompt_tokens",
     }
 )
-_ENGINE_GROUP_ALLOWED_KEYS = frozenset({"name", "warmup_repeats", "model", "quantization"})
+_ENGINE_GROUP_ALLOWED_KEYS = frozenset(
+    {"name", "warmup_repeats", "warmup_tokens", "warmup_prompt", "model", "quantization"}
+)
 
 
 def load_profiles_file(path: Path) -> tuple[int, dict[str, ProfileConfig]]:
@@ -423,6 +447,40 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
         if eg_warmup < 0:
             raise ProfileConfigError(f"profile {name!r}: engines[{idx}] warmup_repeats must be >= 0")
 
+        # Warmup is an explicit pre-window batch: `warmup_tokens` is the
+        # completion-token budget for those `warmup_repeats` calls, and is
+        # only meaningful (and only required) when there is a warmup to
+        # schedule -- the same "only meaningful together" pattern as
+        # aggregation='trimmed_mean'/trim above.
+        eg_warmup_tokens_raw = eg_raw.get("warmup_tokens")
+        if eg_warmup_tokens_raw is not None:
+            if isinstance(eg_warmup_tokens_raw, bool) or not isinstance(eg_warmup_tokens_raw, int):
+                raise ProfileConfigError(f"profile {name!r}: engines[{idx}] warmup_tokens must be an int")
+            if eg_warmup_tokens_raw <= 0:
+                raise ProfileConfigError(f"profile {name!r}: engines[{idx}] warmup_tokens must be a positive int")
+        if eg_warmup > 0 and eg_warmup_tokens_raw is None:
+            raise ProfileConfigError(
+                f"profile {name!r}: engines[{idx}] warmup_tokens is required when warmup_repeats > 0"
+            )
+        if eg_warmup == 0 and eg_warmup_tokens_raw is not None:
+            raise ProfileConfigError(
+                f"profile {name!r}: engines[{idx}] warmup_tokens is only meaningful when warmup_repeats > 0"
+            )
+        eg_warmup_tokens = eg_warmup_tokens_raw
+
+        # warmup_prompt is optional at any warmup_repeats value (it is
+        # simply unused when warmup_repeats == 0); when omitted, the
+        # warmup uses `profile.prompt` (see `run_profile`).
+        eg_warmup_prompt_raw = eg_raw.get("warmup_prompt")
+        if eg_warmup_prompt_raw is not None:
+            if not isinstance(eg_warmup_prompt_raw, str):
+                raise ProfileConfigError(f"profile {name!r}: engines[{idx}] warmup_prompt must be a string")
+            if not eg_warmup_prompt_raw:
+                raise ProfileConfigError(
+                    f"profile {name!r}: engines[{idx}] warmup_prompt must be non-empty if provided"
+                )
+        eg_warmup_prompt = eg_warmup_prompt_raw
+
         eg_model = eg_require("model", str)
         if not eg_model:
             raise ProfileConfigError(f"profile {name!r}: engines[{idx}] model must be non-empty")
@@ -432,7 +490,14 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
             raise ProfileConfigError(f"profile {name!r}: engines[{idx}] quantization must be non-empty")
 
         engine_groups.append(
-            EngineRunGroup(name=eg_name, warmup_repeats=eg_warmup, model=eg_model, quantization=eg_quantization)
+            EngineRunGroup(
+                name=eg_name,
+                warmup_repeats=eg_warmup,
+                warmup_tokens=eg_warmup_tokens,
+                warmup_prompt=eg_warmup_prompt,
+                model=eg_model,
+                quantization=eg_quantization,
+            )
         )
 
     prompt = require("prompt", str)
@@ -582,17 +647,23 @@ def run_profile(
     """Execute `profile` against `adapters` and return every raw observation.
 
     Run order is the requested schedule in list order: for each engine run
-    group (in `profile.engine_groups` order), for each window (in
-    `profile.windows` order — `windows[0]` is the shared baseline, executed
-    once and reused for every comparison window that follows it), that
-    engine's own warmup runs first, then measured runs. `order_index` is a
-    single counter across the entire call, so a later statistical pass
-    (issue #714) can test for order/thermal bias without another schema
-    migration.
+    group (in `profile.engine_groups` order), that engine's warmup batch —
+    `warmup_repeats` calls at `warmup_tokens` completion tokens, using
+    `warmup_prompt` if given or `profile.prompt` otherwise — executes
+    ONCE, entirely before any of that engine's measured windows (never
+    once per window; this is what makes `bench_apples_to_apples.sh`'s
+    single pre-loop MLX warmup, `bench_apples_precise.sh`'s twice-at-N2
+    warmup, and `bench_context_scaling.sh`'s single pre-loop warmup all
+    exactly representable). Measured runs then execute for each window (in
+    `profile.windows` order — `windows[0]` is the shared baseline,
+    executed once and reused for every comparison window that follows it).
+    `order_index` is a single counter across the entire call, so a later
+    statistical pass (issue #714) can test for order/thermal bias without
+    another schema migration.
     """
     resolved_git_sha = git_sha_value if git_sha_value is not None else git_sha(repo_root)
     resolved_hardware_id = hardware_id_value if hardware_id_value is not None else hardware_id()
-    p_hash = prompt_hash(profile.prompt)
+    measured_prompt_hash = prompt_hash(profile.prompt)
 
     active: dict[str, EngineRunGroup] = {}
     missing: list[str] = []
@@ -609,50 +680,92 @@ def run_profile(
 
     observations: list[Observation] = []
     order_index = 0
+
+    def _record(
+        *,
+        adapter: EngineAdapter,
+        group: EngineRunGroup,
+        call_prompt: str,
+        call_prompt_hash: str,
+        n_tokens: int,
+        is_warmup: bool,
+        run_index: int,
+    ) -> None:
+        nonlocal order_index
+        t0 = clock()
+        result = adapter.run(
+            prompt=call_prompt,
+            n_tokens=n_tokens,
+            warmup=is_warmup,
+            model=group.model,
+            quantization=group.quantization,
+        )
+        t1 = clock()
+        actual_model = result.actual_model if result.actual_model is not None else group.model
+        actual_quantization = (
+            result.actual_quantization if result.actual_quantization is not None else group.quantization
+        )
+        obs = Observation(
+            schema_version=SCHEMA_VERSION,
+            git_sha=resolved_git_sha,
+            profile=profile.name,
+            engine=group.name,
+            engine_version=result.engine_version,
+            model=actual_model,
+            quantization=actual_quantization,
+            prompt_hash=call_prompt_hash,
+            requested_prompt_tokens=profile.requested_prompt_tokens,
+            actual_prompt_tokens=result.actual_prompt_tokens,
+            requested_completion_tokens=n_tokens,
+            actual_completion_tokens=result.actual_completion_tokens,
+            warmup=is_warmup,
+            run_index=run_index,
+            order_index=order_index,
+            elapsed_ns=t1 - t0,
+            engine_native_ns=result.native_ns,
+            hardware_id=resolved_hardware_id,
+            timestamp=timestamp_fn(),
+        )
+        validate_observation(obs.to_dict())
+        observations.append(obs)
+        order_index += 1
+
     for group in profile.engine_groups:
         if group.name not in active:
             continue
         adapter = adapters[group.name]
+
+        # Warmup batch: once, before any measured window, at the group's
+        # own token budget and prompt (default: profile.prompt).
+        if group.warmup_repeats > 0:
+            warmup_prompt = group.warmup_prompt if group.warmup_prompt is not None else profile.prompt
+            warmup_prompt_hash = (
+                measured_prompt_hash if group.warmup_prompt is None else prompt_hash(group.warmup_prompt)
+            )
+            for run_index in range(1, group.warmup_repeats + 1):
+                _record(
+                    adapter=adapter,
+                    group=group,
+                    call_prompt=warmup_prompt,
+                    call_prompt_hash=warmup_prompt_hash,
+                    n_tokens=group.warmup_tokens,
+                    is_warmup=True,
+                    run_index=run_index,
+                )
+
+        # Measured windows: run_index resets per window.
         for window in profile.windows:
-            for is_warmup, count in ((True, group.warmup_repeats), (False, profile.measured_repeats)):
-                for run_index in range(1, count + 1):
-                    t0 = clock()
-                    result = adapter.run(
-                        prompt=profile.prompt,
-                        n_tokens=window,
-                        warmup=is_warmup,
-                        model=group.model,
-                        quantization=group.quantization,
-                    )
-                    t1 = clock()
-                    actual_model = result.actual_model if result.actual_model is not None else group.model
-                    actual_quantization = (
-                        result.actual_quantization if result.actual_quantization is not None else group.quantization
-                    )
-                    obs = Observation(
-                        schema_version=SCHEMA_VERSION,
-                        git_sha=resolved_git_sha,
-                        profile=profile.name,
-                        engine=group.name,
-                        engine_version=result.engine_version,
-                        model=actual_model,
-                        quantization=actual_quantization,
-                        prompt_hash=p_hash,
-                        requested_prompt_tokens=profile.requested_prompt_tokens,
-                        actual_prompt_tokens=result.actual_prompt_tokens,
-                        requested_completion_tokens=window,
-                        actual_completion_tokens=result.actual_completion_tokens,
-                        warmup=is_warmup,
-                        run_index=run_index,
-                        order_index=order_index,
-                        elapsed_ns=t1 - t0,
-                        engine_native_ns=result.native_ns,
-                        hardware_id=resolved_hardware_id,
-                        timestamp=timestamp_fn(),
-                    )
-                    validate_observation(obs.to_dict())
-                    observations.append(obs)
-                    order_index += 1
+            for run_index in range(1, profile.measured_repeats + 1):
+                _record(
+                    adapter=adapter,
+                    group=group,
+                    call_prompt=profile.prompt,
+                    call_prompt_hash=measured_prompt_hash,
+                    n_tokens=window,
+                    is_warmup=False,
+                    run_index=run_index,
+                )
+
     return HarnessRunResult(
         profile=profile,
         observations=tuple(observations),
