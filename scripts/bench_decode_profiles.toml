@@ -1,0 +1,32 @@
+# Decode-benchmark harness profile definitions (issue #813).
+#
+# Each `[profiles.<name>]` table fully specifies one decode-benchmark
+# configuration for `scripts/bench_decode_harness.py run --profile <name>`:
+# the window schedule, warmup/measured repeat counts, engines, aggregation
+# method, and the fixed prompt. `windows[0]` is the shared baseline; every
+# later value in `windows` is compared against it to compute a marginal
+# decode-throughput slope (see `bench_decode_harness.py:aggregate`).
+#
+# This file intentionally defines no profiles yet. The five live consumers
+# (`bench_apples_to_apples.sh`, `bench_apples_precise.sh`, `bench_q4_apples.sh`,
+# `bench_context_scaling.sh`, `bench_compare_1k.py`) are migrated onto
+# profiles defined here one script per PR (issue #813 step 2), each PR
+# proving old-vs-new raw-observation equivalence under the legacy script's
+# exact parameters before it is added below.
+#
+# Schema (for reference; enforced by `bench_decode_harness.py:_parse_profile`):
+#   description             string, optional
+#   windows                 list[int], >= 2 entries, strictly increasing
+#   warmup_repeats           int, >= 0
+#   measured_repeats         int, >= 1
+#   engines                  list[string], non-empty, no duplicates
+#   prompt                   string, non-empty
+#   model                    string, non-empty
+#   quantization             string, non-empty
+#   aggregation              "median" (default) or "trimmed_mean"
+#   trim                     int, >= 0; only valid when aggregation = "trimmed_mean"
+#   requested_prompt_tokens  int, optional
+
+schema_version = 1
+
+[profiles]
