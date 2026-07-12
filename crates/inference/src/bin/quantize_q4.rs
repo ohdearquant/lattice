@@ -29,6 +29,20 @@ use std::time::Instant;
 /// Rule: quantize weight matrices for projections, MLP layers, embeddings, and lm_head.
 /// Keep scalars, norms, biases, conv1d weights, and Mamba-specific parameters in f16.
 fn should_quantize(name: &str) -> bool {
+    // MoE routed-expert tensors are stored as one fused array per layer,
+    // shape `[num_experts, out_features, in_features]`, WITHOUT a trailing
+    // `.weight` suffix (e.g. `model.language_model.layers.0.mlp.experts
+    // .gate_up_proj` / `.down_proj`, and the analogous `mtp.layers.N.mlp
+    // .experts.*` tensors). They fail the `.weight`-suffix gate below and
+    // were silently skipped, even though they hold the large majority of
+    // parameters in a MoE checkpoint (~92% for a 256-expert model). Match
+    // them explicitly before the suffix gate. The sibling `shared_expert.*`
+    // and `shared_expert_gate` tensors already carry a `.weight` suffix and
+    // are already covered by the rules below.
+    if name.ends_with(".experts.gate_up_proj") || name.ends_with(".experts.down_proj") {
+        return true;
+    }
+
     // Must be a weight tensor.
     if !name.ends_with(".weight") && !name.ends_with("lm_head.weight") {
         return false;
@@ -411,4 +425,134 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Total time:   {:.1}s", total_elapsed.as_secs_f64());
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::should_quantize;
+
+    // -----------------------------------------------------------------------
+    // MoE routed-expert tensors (issue #874 regression coverage).
+    //
+    // Mutation-sensitive: these tensor names have no `.weight` suffix, so the
+    // pre-fix gate (`if !name.ends_with(".weight") ... return false`) rejects
+    // them before reaching any of the quantize-candidate checks. Reverting
+    // the `.experts.gate_up_proj` / `.experts.down_proj` special-case added
+    // in this fix makes every assertion below fail.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_quantize_accepts_routed_expert_tensors_main_layers() {
+        assert!(should_quantize(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        ));
+        assert!(should_quantize(
+            "model.language_model.layers.0.mlp.experts.down_proj"
+        ));
+        assert!(should_quantize(
+            "model.language_model.layers.39.mlp.experts.gate_up_proj"
+        ));
+        assert!(should_quantize(
+            "model.language_model.layers.39.mlp.experts.down_proj"
+        ));
+    }
+
+    #[test]
+    fn should_quantize_accepts_routed_expert_tensors_mtp_layer() {
+        // The speculative-decode MTP head has its own MoE layer under a
+        // different name prefix; the suffix match must not be anchored to
+        // the `model.language_model.` prefix.
+        assert!(should_quantize("mtp.layers.0.mlp.experts.gate_up_proj"));
+        assert!(should_quantize("mtp.layers.0.mlp.experts.down_proj"));
+    }
+
+    #[test]
+    fn should_quantize_rejects_names_that_merely_contain_experts() {
+        // Precision check: the match is a name-suffix match, not a substring
+        // match, so a hypothetical `.experts.gate_up_proj_extra` (or any
+        // other name that merely contains "experts") does not get swept in
+        // by accident.
+        assert!(!should_quantize(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj_extra"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Dense / already-suffixed tensors — must be unaffected by the fix.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_quantize_accepts_dense_projection_weights() {
+        for name in [
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            "model.language_model.layers.0.self_attn.k_proj.weight",
+            "model.language_model.layers.0.self_attn.v_proj.weight",
+            "model.language_model.layers.0.self_attn.o_proj.weight",
+            "model.language_model.layers.0.mlp.gate_proj.weight",
+            "model.language_model.layers.0.mlp.up_proj.weight",
+            "model.language_model.layers.0.mlp.down_proj.weight",
+            "model.language_model.embed_tokens.weight",
+            "lm_head.weight",
+        ] {
+            assert!(should_quantize(name), "expected quantize=true for {name}");
+        }
+    }
+
+    #[test]
+    fn should_quantize_accepts_shared_expert_weights() {
+        // The shared (always-on) expert and its gate already carry a
+        // `.weight` suffix and were already quantized correctly pre-fix;
+        // this pins that they remain quantized post-fix.
+        for name in [
+            "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+            "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+        ] {
+            assert!(should_quantize(name), "expected quantize=true for {name}");
+        }
+    }
+
+    #[test]
+    fn should_quantize_accepts_router_gate_weight() {
+        // The per-layer MoE router (`mlp.gate.weight`, shape [num_experts,
+        // hidden]) is small relative to the routed experts but already
+        // falls through to the "quantize unknown weight matrices" default;
+        // this pins that unrelated behavior stays unchanged.
+        assert!(should_quantize(
+            "model.language_model.layers.0.mlp.gate.weight"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Norms / biases / Mamba-specific scalars — must stay excluded.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_quantize_rejects_norms_biases_and_mamba_scalars() {
+        for name in [
+            "model.language_model.layers.0.input_layernorm.weight",
+            "model.language_model.norm.weight",
+            "model.language_model.layers.0.self_attn.q_norm.weight",
+            "model.language_model.layers.0.self_attn.o_proj.bias",
+            "model.language_model.layers.0.mamba.A_log",
+            "model.language_model.layers.0.mamba.dt_bias",
+            "model.language_model.layers.0.mamba.conv1d.weight",
+        ] {
+            assert!(!should_quantize(name), "expected quantize=false for {name}");
+        }
+    }
+
+    #[test]
+    fn should_quantize_rejects_non_weight_non_expert_tensors() {
+        // Anything that isn't a `.weight` tensor and isn't a recognized
+        // suffix-less expert tensor must be rejected outright.
+        assert!(!should_quantize(
+            "model.language_model.layers.0.self_attn.rotary_emb.inv_freq"
+        ));
+    }
 }
