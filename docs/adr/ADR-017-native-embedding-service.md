@@ -118,6 +118,6 @@ multiplex through a higher-level router.
 
 ## References
 
-- [`crates/embed/src/service/native.rs`](/Users/lion/projects/lattice/crates/embed/src/service/native.rs) — full implementation
-- [`crates/embed/src/service/cached.rs`](/Users/lion/projects/lattice/crates/embed/src/service/cached.rs) — `CachedEmbeddingService` wrapper
-- [`crates/embed/src/service/mod.rs`](/Users/lion/projects/lattice/crates/embed/src/service/mod.rs) — `EmbeddingService` trait definition
+- [`crates/embed/src/service/native.rs`](../../crates/embed/src/service/native.rs) — full implementation
+- [`crates/embed/src/service/cached.rs`](../../crates/embed/src/service/cached.rs) — `CachedEmbeddingService` wrapper
+- [`crates/embed/src/service/mod.rs`](../../crates/embed/src/service/mod.rs) — `EmbeddingService` trait definition
