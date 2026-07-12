@@ -9,8 +9,7 @@
 All five lifecycle gaps described in §Context were closed. `save_peft_safetensors` is
 public at `crates/tune/src/lora/safetensors.rs:439`. `adapt_step` (online gradient step)
 ships at `crates/tune/src/lora/online.rs:38`. The BERT hook, consumer docs, and
-inference-hook feature gate shipped across D1–D5 (see KG entity `LoraConsumerAPI`).
-Status promoted from Draft to Accepted.
+inference-hook feature gate shipped across D1–D5. Status promoted from Draft to Accepted.
 
 ## Context
 
@@ -45,14 +44,14 @@ The FFN projections (`intermediate.dense`, `output.dense`) are already individua
 
 **BERT module names for LoraHook** (matching actual BERT safetensors weight keys, NOT Qwen/LLaMA convention):
 
-| Hook module name | BERT weight key | Struct field |
-|---|---|---|
-| `"query"` | `encoder.layer.{i}.attention.self.query.weight` | `query_weight` |
-| `"key"` | `encoder.layer.{i}.attention.self.key.weight` | `key_weight` |
-| `"value"` | `encoder.layer.{i}.attention.self.value.weight` | `value_weight` |
-| `"attn_output"` | `encoder.layer.{i}.attention.output.dense.weight` | `attn_output_weight` |
-| `"ffn_intermediate"` | `encoder.layer.{i}.intermediate.dense.weight` | `ffn_intermediate_weight` |
-| `"ffn_output"` | `encoder.layer.{i}.output.dense.weight` | `ffn_output_weight` |
+| Hook module name     | BERT weight key                                   | Struct field              |
+| -------------------- | ------------------------------------------------- | ------------------------- |
+| `"query"`            | `encoder.layer.{i}.attention.self.query.weight`   | `query_weight`            |
+| `"key"`              | `encoder.layer.{i}.attention.self.key.weight`     | `key_weight`              |
+| `"value"`            | `encoder.layer.{i}.attention.self.value.weight`   | `value_weight`            |
+| `"attn_output"`      | `encoder.layer.{i}.attention.output.dense.weight` | `attn_output_weight`      |
+| `"ffn_intermediate"` | `encoder.layer.{i}.intermediate.dense.weight`     | `ffn_intermediate_weight` |
+| `"ffn_output"`       | `encoder.layer.{i}.output.dense.weight`           | `ffn_output_weight`       |
 
 These differ from the Qwen path (`q_proj`, `k_proj`, etc.). PEFT adapters trained on BERT checkpoints use BERT-convention names; adapters trained on Qwen use Qwen-convention names. The `LoraHook` trait already dispatches by string — no conflict as long as consumers load the right adapter for the right model.
 
@@ -93,6 +92,7 @@ pub fn save_peft_safetensors(
 ```
 
 Semantics:
+
 - Writes PEFT-format keys: `base_model.model.model.layers.{i}.{block}.{module}.lora_{A|B}.weight`
 - Stores `rank`, `alpha`, `target_modules` in SafeTensors metadata fields for lossless round-trip
 - `block` inferred from module name: attention projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `in_proj_*`, `out_proj`) → `self_attn`; MLP projections (`gate_proj`, `up_proj`, `down_proj`) → `mlp`
@@ -132,6 +132,7 @@ pub fn adapt_step(
 ```
 
 Semantics:
+
 - One SGD step for a single `(layer_idx, module)` LoRA layer
 - `target_delta`: desired change to the base projection output (the error signal)
 - Computes `loss = ||current_delta - target_delta||²` where `current_delta = scale * B @ (A @ x)`
@@ -204,12 +205,12 @@ let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter);
 
 ### Alternatives Considered
 
-| Alternative | Pros | Cons | Why Not |
-|---|---|---|---|
-| Generic `CrossEncoderModel<H: LoraHook>` | Zero-cost monomorphization | Breaks all downstream type signatures; every consumer must parameterize on H | New method is additive and cheaper |
-| `LoraAdapter::set_optimizer(Adam)` in D3 | Full optimizer support from day one | Adds per-parameter momentum/variance state (~2x adapter memory); Adam is not needed for single-event updates | SGD first, Adam as follow-up when consumers demonstrate need |
-| Typed `ModuleName` enum in lattice-tune (D4) | Compile-time typo detection | Closed enum → new architectures require lattice release; violates ADR-008 design intent | Validation method gives opt-in safety without closing extensibility |
-| `serde` for SafeTensors metadata round-trip (D2) | Familiar Rust pattern | SafeTensors metadata is `HashMap<String, String>`, not structured — serde adds a parse layer | Direct string key/value is simpler and matches the safetensors spec |
+| Alternative                                      | Pros                                | Cons                                                                                                         | Why Not                                                             |
+| ------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| Generic `CrossEncoderModel<H: LoraHook>`         | Zero-cost monomorphization          | Breaks all downstream type signatures; every consumer must parameterize on H                                 | New method is additive and cheaper                                  |
+| `LoraAdapter::set_optimizer(Adam)` in D3         | Full optimizer support from day one | Adds per-parameter momentum/variance state (~2x adapter memory); Adam is not needed for single-event updates | SGD first, Adam as follow-up when consumers demonstrate need        |
+| Typed `ModuleName` enum in lattice-tune (D4)     | Compile-time typo detection         | Closed enum → new architectures require lattice release; violates ADR-008 design intent                      | Validation method gives opt-in safety without closing extensibility |
+| `serde` for SafeTensors metadata round-trip (D2) | Familiar Rust pattern               | SafeTensors metadata is `HashMap<String, String>`, not structured — serde adds a parse layer                 | Direct string key/value is simpler and matches the safetensors spec |
 
 ## Consequences
 
@@ -229,13 +230,13 @@ let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter);
 
 ### Implementation Order
 
-| Phase | Scope | Issues | Effort |
-|---|---|---|---|
-| 1 | D5: Consumer docs for inference-hook | #63 | ~30 min |
-| 2 | D2: SafeTensors save | #60 | ~2 hours |
-| 3 | D4: validate_modules | #62 | ~1 hour |
-| 4 | D1: LoraHook in BertModel + CrossEncoderModel (includes `multi_head_attention_in_place` refactor) | #59 | ~6 hours |
-| 5 | D3: Online adapt_step | #61 | ~4 hours |
+| Phase | Scope                                                                                             | Issues | Effort   |
+| ----- | ------------------------------------------------------------------------------------------------- | ------ | -------- |
+| 1     | D5: Consumer docs for inference-hook                                                              | #63    | ~30 min  |
+| 2     | D2: SafeTensors save                                                                              | #60    | ~2 hours |
+| 3     | D4: validate_modules                                                                              | #62    | ~1 hour  |
+| 4     | D1: LoraHook in BertModel + CrossEncoderModel (includes `multi_head_attention_in_place` refactor) | #59    | ~6 hours |
+| 5     | D3: Online adapt_step                                                                             | #61    | ~4 hours |
 
 Phases 1-3 are independent and can run in parallel. Phase 4 requires reading the BERT forward path. Phase 5 is independent of phase 4.
 

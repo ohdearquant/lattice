@@ -5,7 +5,7 @@
 **Crate**: lattice-inference
 **Amendment (2026-05-27)**: ADR-060 generalizes the rotation abstraction into an `OrthogonalBasis` trait with `BasisKind` enum (HadamardRandomSign, PcaCalibration, BlockHadamard, DenseOrthogonal). ADR-044's v0 `RandomizedHadamard` remains the shipped path and is the first `BasisKind` implementor. The v1 question of non-power-of-two dimension support is partially addressed by ADR-060's `BlockHadamard` variant. Composition order: SliceGPT PCA first → slice → QuaRot Hadamard second (ADR-060 D3).
 
-**Amendment (2026-07-06) — step-4 conclusion SUPERSEDED**: the measured result below (QuaRot Q4 *better* than unrotated Q4 by 1.61 PPL) no longer holds on the current forward path. That number was taken in May 2026 on a pre-RoPE-fix forward path where the Hadamard rotation was compensating for baseline bugs. On today's numerically-correct forward path, offline QuaRot v0 is a **net negative** versus unrotated asymmetric Q4. The original measurement is preserved below for history; the corrected conclusion and the controlled code-bisection that establishes it are in §"Conclusion superseded (2026-07-06)". The decision *to build QuaRot* stands; only the quality claim is superseded.
+**Amendment (2026-07-06) — step-4 conclusion SUPERSEDED**: the measured result below (QuaRot Q4 _better_ than unrotated Q4 by 1.61 PPL) no longer holds on the current forward path. That number was taken in May 2026 on a pre-RoPE-fix forward path where the Hadamard rotation was compensating for baseline bugs. On today's numerically-correct forward path, offline QuaRot v0 is a **net negative** versus unrotated asymmetric Q4. The original measurement is preserved below for history; the corrected conclusion and the controlled code-bisection that establishes it are in §"Conclusion superseded (2026-07-06)". The decision _to build QuaRot_ stands; only the quality claim is superseded.
 
 ## Context
 
@@ -117,7 +117,6 @@ These are consequences of accepting v0 as the design (across all 4 PRs), not of 
 - v0 fully landed (step 4, this PR): measured on our pipeline (WikiText-2 raw test, Qwen3.5-0.8B, 297,156 tokens, window 512 / stride 256), QuaRot Q4 PPL 23.958276 vs unrotated Q4 PPL 25.572589 — delta −1.614313, i.e. QuaRot Q4 is _better_ than naive Q4 by 1.61 PPL, well inside the < 0.5 acceptance gate. This is the rotated-Q4-vs-unrotated-Q4 delta the ADR gates on, NOT a vs-F32 number (the paper's headline is vs-F32; we have not measured vs-F32 on our pipeline and do not claim it). Qwen3-0.6B becomes a second step-4 target once [issue #21](https://github.com/ohdearquant/lattice/issues/21) lands.
 - Foundation for v1 INT4 activation+KV — the rotated activation distributions are quantizable; the un-rotated ones aren't.
 - Pure-Rust QuaRot implementation. Comprehensive ecosystem survey (2026-05-16, ~25 searches + direct repo fetches + GitHub code-search API): the reference [spcl/QuaRot](https://github.com/spcl/QuaRot) is ~85% Python / ~12% CUDA; every major Rust ML/inference framework checked (candle, mistral.rs, ratchet, burn, rustformers/llm) ships quantization but none do rotation-absorbed quant; no `quarot` crate on crates.io; GitHub Rust code search for `quarot` and `SpinQuant` returned only lattice itself and near-misses (no complete rotation-absorbed QuaRot outside this repo); llama.cpp QuaRot request (issue #6444) closed stale. Near-misses are distinct techniques, not QuaRot: TurboQuant (KV-cache vector quant), QuIP# (E8 codebooks, Python/CUDA), Avarok/atlas (KV-cache-only Hadamard, has CUDA), `konjoai/squish` (not QuaRot). **Verified claim to use externally** (do NOT state as unqualified absolute first — private/unindexed work cannot be ruled out): _"To the best of our knowledge, lattice is the first publicly available pure-Rust implementation of QuaRot (Ashkboos et al., NeurIPS 2024, arXiv:2404.00456) — Hadamard rotation absorbed into weight matrices, RMSNorm fusion, forward-equivalence validated."_ Falsification would most likely come from a private inference stack or an unmerged candle/mistral.rs branch.
-- Knowledge-graph node `QuaRot (Ashkboos 2024)` moved from `researched` → `implemented` via khive MCP (`mcp__khive__update`, entity `86ec6a4f`) when step 4 landed. The move is external metadata (khive entity store), not a tracked file in this repo.
 - Composes with future SpinQuant / learned rotations (same absorption infrastructure).
 
 ### Negative
@@ -153,18 +152,18 @@ The step-4 measurement recorded above — "QuaRot Q4 PPL 23.958276 vs unrotated 
 
 **Controlled code-bisection.** Same corpus (WikiText-2 raw test), same 32K-token slice, same window 512 / stride 256, same QuaRot seed `0xC0FFEE` — the only variable is the code version:
 
-| Code | Unrotated Q4 PPL | QuaRot Q4 PPL | Delta (quarot − unrotated) |
-|------|------------------|---------------|----------------------------|
-| ADR-044-era (`642d64305`, pre-RoPE-fix) | 20.72 | 19.91 | **−0.81** (QuaRot better) |
-| Current | 16.25 | 18.15 | **+1.90** (QuaRot worse) |
+| Code                                    | Unrotated Q4 PPL | QuaRot Q4 PPL | Delta (quarot − unrotated) |
+| --------------------------------------- | ---------------- | ------------- | -------------------------- |
+| ADR-044-era (`642d64305`, pre-RoPE-fix) | 20.72            | 19.91         | **−0.81** (QuaRot better)  |
+| Current                                 | 16.25            | 18.15         | **+1.90** (QuaRot worse)   |
 
 Full-corpus (310,033 tokens) on current code: unrotated 15.73 / QuaRot 17.63 / delta **+1.90**, consistent with the slice.
 
-The sign flip is entirely code, not corpus (the old binary reproduces "QuaRot better" on the identical file). The mechanism is visible in the numbers: the forward-path fixes improved the *unrotated* baseline by 4.47 PPL (20.72 → 16.25) but improved *QuaRot* by only 1.76 (19.91 → 18.15). QuaRot's May advantage was propping up a broken unrotated path; once that path was corrected, the baseline recovered most of the gap and passed it.
+The sign flip is entirely code, not corpus (the old binary reproduces "QuaRot better" on the identical file). The mechanism is visible in the numbers: the forward-path fixes improved the _unrotated_ baseline by 4.47 PPL (20.72 → 16.25) but improved _QuaRot_ by only 1.76 (19.91 → 18.15). QuaRot's May advantage was propping up a broken unrotated path; once that path was corrected, the baseline recovered most of the gap and passed it.
 
-**Root cause (why offline QuaRot v0 is net-negative by design).** The Hadamard rotation zero-centers weight distributions, which forces *symmetric* Q4 quantization. Symmetric Q4 has a worse per-block fidelity floor than the asymmetric Q4 that is now the default (measured relRMS ≈ 0.100 vs ≈ 0.080). Offline-only conversion (R1/R2 absorbed into weights) has no runtime rotation to recover that loss on a numerically-correct forward path.
+**Root cause (why offline QuaRot v0 is net-negative by design).** The Hadamard rotation zero-centers weight distributions, which forces _symmetric_ Q4 quantization. Symmetric Q4 has a worse per-block fidelity floor than the asymmetric Q4 that is now the default (measured relRMS ≈ 0.100 vs ≈ 0.080). Offline-only conversion (R1/R2 absorbed into weights) has no runtime rotation to recover that loss on a numerically-correct forward path.
 
-**Forward condition.** Offline QuaRot v0 stays net-negative until the QuaRot paper's *online* rotations (R3 in attention, R4 before the down-projection) are implemented — that is the mechanism that suppresses activation outliers at inference time and lets rotated low-bit quantization win, especially at larger scale. Tracked in issue #703. Until then, unrotated asymmetric Q4 is the shipping default, and the CI quality gate (#616) guards the unrotated path against a frozen baseline while reporting the QuaRot delta as informational.
+**Forward condition.** Offline QuaRot v0 stays net-negative until the QuaRot paper's _online_ rotations (R3 in attention, R4 before the down-projection) are implemented — that is the mechanism that suppresses activation outliers at inference time and lets rotated low-bit quantization win, especially at larger scale. Tracked in issue #703. Until then, unrotated asymmetric Q4 is the shipping default, and the CI quality gate (#616) guards the unrotated path against a frozen baseline while reporting the QuaRot delta as informational.
 
 ## References
 
@@ -174,5 +173,5 @@ The sign flip is entirely code, not corpus (the old binary reproduces "QuaRot be
   - Hadamard transforms in ML — Yu et al., _Orthogonal Random Features_, NeurIPS 2016 / _Structured Adaptive and Random Spinners_, AISTATS 2017, [arxiv:1610.06209](https://arxiv.org/abs/1610.06209) (cited by QuaRot for the spread-outlier-energy property of Hadamard projections).
 - HuggingFace model configs referenced in the coverage table: Qwen3-Embedding-0.6B <https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/blob/main/config.json>, Qwen3.5-0.8B <https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/config.json>, Qwen3-Embedding-4B <https://huggingface.co/Qwen/Qwen3-Embedding-4B/blob/main/config.json>, BERT-base <https://huggingface.co/google-bert/bert-base-uncased/blob/main/config.json>.
 - SafeTensors format reference (used by `quant::quarot::io`): official Rust crate source <https://docs.rs/safetensors/latest/src/safetensors/tensor.rs.html>; HF format docs <https://huggingface.co/docs/safetensors/index>.
-- KG entities: `QuaRot (Ashkboos 2024)` (86ec6a4f), `Rotation-Based Quantization` (d534ca51), `QuantizationRankFlipCondition` (224ef1a7), `HAWQ`, `BRECQ`, `AWQ`, `SmoothQuant`, `HQQ`
+- Related quantization techniques surveyed: HAWQ, BRECQ, AWQ, SmoothQuant, HQQ
 - Existing code: `crates/inference/src/weights/q4_weights.rs`, `crates/inference/src/bin/quantize_q4.rs`

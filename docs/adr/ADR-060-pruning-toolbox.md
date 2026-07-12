@@ -3,7 +3,6 @@
 **Status**: Proposed
 **Date**: 2026-05-27
 **Crate**: lattice-inference (calibration, scoring, transforms), lattice-tune (recovery, future)
-**Research**: RQ-2 (`workspaces/20260527/02.md`)
 **Depends on**: ADR-044 (QuaRot rotation infrastructure), ADR-059 (ResidualPolicy, AttentionTag), ADR-061 Phase 1 (CheapOnline metrics substrate — update_ratio and block_influence are the scoring signals ADR-060 consumes)
 
 ## Context
@@ -27,21 +26,21 @@ Lattice has one critical advantage: **QuaRot's rotation machinery** (ADR-044) sh
 
 ### Method Comparison (12 methods surveyed)
 
-| Method                                                                  | Pattern                        | Retraining?                      | Decision cost                    | Representative result                         | Lattice fit                                          |
-| ----------------------------------------------------------------------- | ------------------------------ | -------------------------------- | -------------------------------- | --------------------------------------------- | ---------------------------------------------------- |
-| **Lottery Ticket Hypothesis** (Frankle & Carlin 2019, arxiv:1803.03635) | Unstructured                   | Yes: iterative train-prune-reset | Very high                        | Sparse subnetworks at 10-20% of original      | KG entity only; not implementable for inference-only |
-| **SparseGPT** (Frantar & Alistarh 2023, arxiv:2301.00774)               | Unstructured, 2:4, 4:8         | No                               | Hessian inverse, cubic per layer | OPT-175B: 8.35->8.21 at 50%                   | Strong analysis baseline; no Metal speedup           |
-| **Wanda** (Sun et al. 2024, arxiv:2306.11695)                           | Unstructured, 2:4, N:M         | No                               | One forward pass                 | LLaMA-30B: 4.77->5.24 at 50%                  | Best first unstructured scorer                       |
-| **STADE** (2025, arxiv:2503.22451)                                      | Unstructured, N:M              | No                               | One forward pass                 | Qwen3-14B: 8.64->9.60 at 50%                  | Essential for Qwen/RMSNorm models                    |
-| **Wanda++** (2025, arxiv:2503.04992)                                    | Unstructured, N:M              | Regional gradients               | Lightweight                      | 32% PPL improvement over Wanda                | Future Wanda v2; needs gradient infra                |
-| **D2Prune** (2026, arxiv:2601.09176)                                    | Unstructured, semi-structured  | Weight update                    | Dual Taylor + attention matching | Improves over SparseGPT/Wanda on Qwen3        | Later research target                                |
-| **ShortGPT** (Men et al. 2024, ACL Findings 2025)                       | Layer removal                  | No                               | One forward pass for BI          | LLaMA-2-13B: remove 10/40 layers, MMLU 55->52 | **MVP structured pruner**                            |
-| **Gromov Layer Pruning** (2024, arxiv:2403.17887)                       | Contiguous layer blocks        | QLoRA healing                    | Similarity search + PEFT         | Large blocks removable with QLoRA             | After lattice-tune #88                               |
-| **Prune&Comp** (2025, arxiv:2507.18212)                                 | Layer removal                  | Training-free compensation       | Iterative pruning + compensation | Frames degradation as magnitude-gap           | Extension after ShortGPT                             |
-| **SliceGPT** (Ashkboos et al., ICLR 2024)                               | Residual width                 | No (optional recovery)           | PCA per block, 1024 cal seqs     | OPT-66B: 25% slicing, PPL 9.33->9.68          | **Highest-priority research** (reuses QuaRot)        |
-| **LLM-Pruner** (Ma et al. 2023, NeurIPS)                                | Coupled channels/heads/neurons | LoRA recovery                    | Gradient-based importance        | Structural pruning + LoRA in ~3h              | After training loop exists                           |
-| **FLAP** (An et al. 2024, AAAI)                                         | Channels/structured            | No                               | One forward pass, fluctuation    | Outperforms LLM-Pruner without retraining     | After activation-stat framework                      |
-| **CFSP** (2024, arxiv:2409.13199)                                       | Structured block/channel       | Optional IG-LoRA                 | One forward pass                 | Coarse-to-fine activation info                | Design reference; avoids GQA head pruning            |
+| Method                                                                  | Pattern                        | Retraining?                      | Decision cost                    | Representative result                         | Lattice fit                                                   |
+| ----------------------------------------------------------------------- | ------------------------------ | -------------------------------- | -------------------------------- | --------------------------------------------- | ------------------------------------------------------------- |
+| **Lottery Ticket Hypothesis** (Frankle & Carlin 2019, arxiv:1803.03635) | Unstructured                   | Yes: iterative train-prune-reset | Very high                        | Sparse subnetworks at 10-20% of original      | Research reference only; not implementable for inference-only |
+| **SparseGPT** (Frantar & Alistarh 2023, arxiv:2301.00774)               | Unstructured, 2:4, 4:8         | No                               | Hessian inverse, cubic per layer | OPT-175B: 8.35->8.21 at 50%                   | Strong analysis baseline; no Metal speedup                    |
+| **Wanda** (Sun et al. 2024, arxiv:2306.11695)                           | Unstructured, 2:4, N:M         | No                               | One forward pass                 | LLaMA-30B: 4.77->5.24 at 50%                  | Best first unstructured scorer                                |
+| **STADE** (2025, arxiv:2503.22451)                                      | Unstructured, N:M              | No                               | One forward pass                 | Qwen3-14B: 8.64->9.60 at 50%                  | Essential for Qwen/RMSNorm models                             |
+| **Wanda++** (2025, arxiv:2503.04992)                                    | Unstructured, N:M              | Regional gradients               | Lightweight                      | 32% PPL improvement over Wanda                | Future Wanda v2; needs gradient infra                         |
+| **D2Prune** (2026, arxiv:2601.09176)                                    | Unstructured, semi-structured  | Weight update                    | Dual Taylor + attention matching | Improves over SparseGPT/Wanda on Qwen3        | Later research target                                         |
+| **ShortGPT** (Men et al. 2024, ACL Findings 2025)                       | Layer removal                  | No                               | One forward pass for BI          | LLaMA-2-13B: remove 10/40 layers, MMLU 55->52 | **MVP structured pruner**                                     |
+| **Gromov Layer Pruning** (2024, arxiv:2403.17887)                       | Contiguous layer blocks        | QLoRA healing                    | Similarity search + PEFT         | Large blocks removable with QLoRA             | After lattice-tune #88                                        |
+| **Prune&Comp** (2025, arxiv:2507.18212)                                 | Layer removal                  | Training-free compensation       | Iterative pruning + compensation | Frames degradation as magnitude-gap           | Extension after ShortGPT                                      |
+| **SliceGPT** (Ashkboos et al., ICLR 2024)                               | Residual width                 | No (optional recovery)           | PCA per block, 1024 cal seqs     | OPT-66B: 25% slicing, PPL 9.33->9.68          | **Highest-priority research** (reuses QuaRot)                 |
+| **LLM-Pruner** (Ma et al. 2023, NeurIPS)                                | Coupled channels/heads/neurons | LoRA recovery                    | Gradient-based importance        | Structural pruning + LoRA in ~3h              | After training loop exists                                    |
+| **FLAP** (An et al. 2024, AAAI)                                         | Channels/structured            | No                               | One forward pass, fluctuation    | Outperforms LLM-Pruner without retraining     | After activation-stat framework                               |
+| **CFSP** (2024, arxiv:2409.13199)                                       | Structured block/channel       | Optional IG-LoRA                 | One forward pass                 | Coarse-to-fine activation info                | Design reference; avoids GQA head pruning                     |
 
 ## Decision
 
@@ -646,36 +645,6 @@ lattice_pruning.json        # method, sparsity stats
 - Qwen3.5 config: `crates/inference/src/model/qwen35_config.rs` (AttentionTag via ADR-059, layer_mask field)
 - PPL evaluator: `qwen35::eval::run_strided_perplexity` (ADR-044 step 4)
 - ResidualPolicy: ADR-059
-
-### KG Entities
-
-- Structured Pruning: `02a37d6f`
-- Unstructured Pruning: `fe89bb23`
-- SparseGPT: `cacd4896`
-- Wanda: `f2ccb670`
-- STADE: `0d6668a5`
-- SliceGPT: `95792865`
-- ShortGPT: `28584ee2`
-- Block Influence: `d6e7c165`
-- Gromov Layer Pruning: `4ada1f72`
-- LLM-Pruner: `74b3b6dc`
-- FLAP: `eea854d1`
-- CFSP: `b58504ec`
-- Wanda++: `27ffd2ee`
-- D2Prune: `71395373`
-- Prune and Comp: `8fd85ff6`
-- Calibration Loop: `e742ab58`
-- PPL Gate: `e975ea36`
-- PrunePlan: `37aab1d0`
-- OrthogonalBasis Trait: `f227231c`
-- PcaCalibration: `e09b5b6c`
-- SwiGLU FFN Pruning: `c820e507`
-- GQA Head Pruning: `261d69e2`
-- N:M Sparsity: `8b573a58`
-- 2:4 Sparsity: `5d764448`
-- Lottery Ticket Hypothesis: `6b08bfba`
-- QuaRot (existing): `e754741e`
-- lattice-inference (existing): `6c0a97df`
 
 ## Implementation status as of 2026-06-30
 
