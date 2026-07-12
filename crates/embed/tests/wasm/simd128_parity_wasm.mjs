@@ -13,13 +13,17 @@
 //     `RUSTFLAGS="-C target-feature=+simd128"` -- dispatch picks the new
 //     wasm32 SIMD128 kernels.
 //
-// Both builds expose the same four JS bindings (simdDotProduct,
-// simdSquaredEuclideanDistance, simdCosineSimilarity, simdNormalize; see
-// wasm.rs), so this is a same-process, same-language, wasm-vs-wasm
-// comparison: no cross-framework or cross-model tolerance is needed, just a
-// tight relative epsilon (see ASSERT below), which is the same discipline
-// this crate's native tests apply to AVX-512/AVX2/NEON vs scalar (see
-// crates/embed/src/simd/tests.rs).
+// Both builds expose the same five JS bindings (simdDotProduct,
+// simdSquaredEuclideanDistance, simdCosineSimilarity, simdNormalize,
+// simdSimd128Dispatch; see wasm.rs), so this is a same-process,
+// same-language, wasm-vs-wasm comparison: no cross-framework or cross-model
+// tolerance is needed, just a tight relative epsilon (see ASSERT below),
+// which is the same discipline this crate's native tests apply to
+// AVX-512/AVX2/NEON vs scalar (see crates/embed/src/simd/tests.rs).
+// `simdSimd128Dispatch` is checked first, before any numeric case, so a
+// stale or misconfigured build cannot pass the numeric comparisons by both
+// sides silently agreeing on the scalar answer (see the dispatch-state
+// assertion below).
 //
 // Run via `scripts/wasm-simd128-parity.sh` (builds both variants, then
 // invokes this script) or directly with LATTICE_WASM_JS_BASELINE /
@@ -30,7 +34,12 @@
 // (crates/embed/src/simd/dot_product.rs) -- dropping lane 3 from the 4-lane
 // reduction so only 3 of 4 SIMD128 lanes are summed -- then re-verified to
 // PASS after reverting. See this PR's description for the before/after run
-// transcript.
+// transcript. The dispatch-state assertion has an equivalent
+// mutation-sensitivity proof of its own: pointing both
+// LATTICE_WASM_JS_BASELINE and LATTICE_WASM_JS_SIMD128 at the same
+// SIMD128-enabled build makes `assertDispatchState(baseline, false, ...)`
+// fail, since a real baseline build would report `false` and this
+// substitution reports `true`.
 
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -54,7 +63,19 @@ function mulberry32(seed) {
 function randomVec(dim, seed) {
   const rng = mulberry32(seed);
   const v = new Float32Array(dim);
-  for (let i = 0; i < dim; i++) v[i] = rng() * 2 - 1; // [-1, 1)
+  for (let i = 0; i < dim; i++) {
+    const x = rng() * 2 - 1; // [-1, 1)
+    // Enforced, not just documented: the fixed epsilon below (see
+    // assertClose) is only a defensible bound for this declared domain. A
+    // future change to mulberry32/its scaling that silently widened the
+    // range would otherwise let out-of-domain values reach assertClose and
+    // fail there with a confusing tolerance mismatch instead of a clear
+    // domain violation here.
+    if (!(x >= -1 && x < 1)) {
+      throw new Error(`randomVec: generated value ${x} at index ${i} (dim=${dim}, seed=${seed}) is outside the declared [-1, 1) domain`);
+    }
+    v[i] = x;
+  }
   return v;
 }
 
@@ -113,6 +134,28 @@ const TYPICAL_DIMS = [384, 768, 1024, 4096];
 let failures = 0;
 let checks = 0;
 
+// Tolerance validity domain: `relTol`/`absTol` below are defensible ONLY for
+// the bounded, well-conditioned input domain this harness actually
+// generates -- `randomVec`'s values in [-1, 1) (enforced there, see its
+// comment), plus the small handcrafted fixtures nearby (zeros, denormals
+// down to 1e-40, the 1e6/1e-6 alternating-magnitude case, and lane-position
+// spikes bounded by a few units), none of which drive catastrophic
+// cancellation in a 4-lane f32 accumulator tree.
+//
+// Reassociated f32 reduction error is a function of the input's condition
+// number, not just its dimension: a SIMD kernel that splits a reduction
+// across N accumulator lanes and horizontally sums them at the end produces
+// a *different but equally valid* floating-point result than a strict
+// left-to-right scalar fold whenever the terms have widely different
+// magnitudes and opposite signs. An adversarial cancellation input such as
+// `a = [1e20, -1e20, 1e20, -1e20, 1, 0, ...]` with `b = [1; 16]` is
+// deliberately out of domain for this gate: the scalar left fold yields `1`
+// while a 4-lane split-then-reduce accumulator can drop the `1` entirely
+// when it lands in a lane already holding `+-1e20`, and reduce to `0` --
+// both are IEEE-754-correct given each kernel's own accumulation order, so
+// no epsilon bridges that gap. Dispatch parity for such ill-conditioned
+// inputs is not part of this gate's contract; only relative correctness
+// within the declared bounded domain is.
 function assertClose(actual, expected, label) {
   checks++;
   const relTol = 1e-5;
@@ -261,6 +304,39 @@ for (const [name, p] of [['LATTICE_WASM_JS_BASELINE', baselinePath], ['LATTICE_W
 
 const baseline = await import(path.resolve(baselinePath));
 const simd128 = await import(path.resolve(simd128Path));
+
+// Dispatch-state assertion, checked BEFORE any numeric case runs. The
+// numeric comparisons below only demonstrate what they claim to (SIMD128
+// kernel vs scalar reference) if the "simd128" module is actually
+// dispatching to the SIMD128 kernels and the "baseline" module is actually
+// falling back to scalar. `simdSimd128Dispatch()` reports the exact value
+// each build's kernel dispatch reads (`SimdConfig::simd128_enabled()`), not
+// a `cfg!` re-derived in this script -- so this is a machine-checkable proof
+// tied to the dispatched kernel itself, not just to the `RUSTFLAGS` the
+// driver script requested. Without this, a stale cached artifact, a build
+// that silently failed to pick up `RUSTFLAGS`, or a future dispatch-logic
+// regression could leave both modules serving scalar and every numeric
+// assertion below would still pass, proving nothing about SIMD128.
+function assertDispatchState(mod, expected, label) {
+  checks++;
+  const actual = mod.simdSimd128Dispatch();
+  if (actual !== expected) {
+    failures++;
+    console.error(`FAIL [dispatch-state ${label}] simdSimd128Dispatch()=${actual}, expected=${expected}`);
+  } else {
+    console.log(`[dispatch-state ${label}] simdSimd128Dispatch()=${actual} (expected)`);
+  }
+}
+
+assertDispatchState(baseline, false, 'baseline');
+assertDispatchState(simd128, true, 'simd128');
+
+if (failures > 0) {
+  console.error(
+    `\nwasm32 SIMD128 parity gate: dispatch-state assertion failed (${failures} failure(s)) -- aborting before numeric cases, since they would prove nothing.`,
+  );
+  process.exit(1);
+}
 
 // Sanity: the baseline build (no simd128 target feature) must be exercising
 // the scalar kernel, i.e. it must itself agree with the JS scalar reference
