@@ -15,6 +15,16 @@
 #   lattice-inference: elementwise_cpu_bench
 #   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
+#
+# lattice#714: two of the lattice-embed `simd` bench target's groups
+# (simd_dot_product, simd_cosine_similarity) are confirmed noise-dominated in
+# --quick mode by a same-toolchain A/A reproduction on identical refs
+# (FAIL/WARN sign flipped across dozens of entries in those groups run to
+# run). In --quick mode (the default), only those two named groups are
+# measured and reported but excluded from the FAIL/WARN gate and exit code —
+# see the "informational" section of the report and INFO_GROUPS_ALLOWLIST
+# below. Every other group in the target, including any added later, gates
+# normally. --full mode gates every group normally regardless.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -108,11 +118,49 @@ fi
   cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
 )
 
+# --- Quick-mode informational-groups (lattice#714) ---
+# Fixed, reviewed allowlist of the issue-evidenced noisy groups only — NOT a
+# target-wide dump. lattice#714's quantitative reproduction (same-toolchain
+# A/A runs on identical refs, --quick mode) confined every flip-signed FAIL/
+# WARN to two lattice-embed `simd` groups; no other group in that target has
+# issue-backed noise evidence, so no other group is exempted here. The
+# allowlist itself and the intersection-with-the-real-listing logic live in
+# scripts/lib/bench-informational-groups.sh, invoked below — kept in its own
+# file (rather than inline here) so scripts/perf-bench-gate.py --selftest can
+# run the exact same shell code against a controlled listing and catch a
+# shell-only regression, not just a Python-classifier one.
+# This list is embed-`simd`-specific: names are matched against the Criterion
+# top-level group name only (scripts/perf-bench-gate.py), so it must never be
+# extended with a name that could collide with a `lattice-inference` group —
+# if that ever becomes a concern, namespace by target (e.g. "embed:<group>")
+# on both sides of the handoff instead of trusting name uniqueness. Adding a
+# group requires the same kind of same-toolchain A/A quantitative evidence
+# that justified the current two, reviewed in a PR — never derived
+# automatically from `--list`, which would silently exempt every future
+# group added to the target.
+INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
+rm -f "$INFO_GROUPS_FILE"
+if [ -n "$QUICK_FLAGS" ] && [ "$BENCHES_EMBED" = "simd" ]; then
+  (
+    cd "$HEAD_DIR"
+    # --list reflects both the built binary and any BENCH_GROUPS_EMBED filter
+    # already applied; the helper intersects it against the fixed allowlist
+    # so a stale or renamed allowlist entry fails closed (never gates) rather
+    # than silently no-op'ing into "everything is informational."
+    cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null \
+      | "$REPO/scripts/lib/bench-informational-groups.sh" > "$INFO_GROUPS_FILE"
+  )
+fi
+
 # --- Report ---
 echo ""
 echo "=== Full gate report ==="
+GATE_ARGS=(--baseline-name compare-base)
+if [ -s "$INFO_GROUPS_FILE" ]; then
+  GATE_ARGS+=(--informational-groups-file "$INFO_GROUPS_FILE")
+fi
 if [ -d "$HEAD_DIR/target/criterion" ]; then
-  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" --baseline-name compare-base 2>&1 || true
+  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || true
 fi
 
 echo ""
