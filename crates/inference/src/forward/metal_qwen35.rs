@@ -28,10 +28,10 @@
 
 // -----------------------------------------------------------------------------
 // MTP Q4/F16 tensor resolution (#630, #636) -- pure, `Device`-free, compiled
-// unconditionally in test builds (round-2 fix: these previously lived inside
+// unconditionally in test builds (these previously lived inside
 // `mod inner`, gated on `metal-gpu`, so `cargo test -p lattice-inference --lib
 // resolve_mtp` with no features reported "running 0 tests" -- the exact
-// skip-pass class round 1 flagged, just one layer up. `mod inner` re-imports
+// skip-pass class described below, just one layer up. `mod inner` re-imports
 // these via `use super::{...}` below.)
 // -----------------------------------------------------------------------------
 
@@ -39,7 +39,7 @@
 /// mirroring `MetalQwen35State::q4_tensor_path` -- duplicated here (rather than
 /// called through `MetalQwen35State`, which only exists under `metal-gpu`) so
 /// this module compiles and is unit-testable without the Metal feature at all
-/// (#636 round-2).
+/// (#636).
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn mtp_tensor_path(dir: &std::path::Path, tensor_name: &str, ext: &str) -> std::path::PathBuf {
     let sanitized: String = tensor_name
@@ -55,7 +55,7 @@ fn mtp_tensor_path(dir: &std::path::Path, tensor_name: &str, ext: &str) -> std::
     dir.join(format!("{sanitized}.{ext}"))
 }
 
-/// Failure modes for resolving a single MTP tensor from disk (#636 round-1).
+/// Failure modes for resolving a single MTP tensor from disk (#636).
 ///
 /// `Missing` is the pre-existing graceful case: the caller (the MTP
 /// projection-load closure in [`load_mtp_q4_weights`]) turns it into a
@@ -87,7 +87,7 @@ impl From<std::path::PathBuf> for MtpLoadErr {
 
 /// One MTP tensor's values as read from disk, before Metal buffer
 /// creation — deliberately `Device`-free so flavor selection and shape
-/// validation are unit-testable without a GPU (#636 round-1 medium #3).
+/// validation are unit-testable without a GPU (#636).
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 #[derive(Debug)]
 enum MtpTensorSource {
@@ -141,12 +141,12 @@ impl MtpTensorSource {
 /// producing rotated-space `.q4` weights that the runtime's
 /// counter-rotation (keyed off the same directory's `quarot_seed`)
 /// would silently apply on top of, corrupting every MTP draft without
-/// any load failure to reveal it (#636 round-1 MAJOR). This is
+/// any load failure to reveal it (#636). This is
 /// rejected loudly instead of silently preferring `.f16`.
 ///
 /// Also validates the resolved tensor's on-disk shape against
 /// `expected_shape`: a same-numel transposed file loads and generates
-/// tokens but produces garbage MTP drafts (#636 round-1 medium #1), so
+/// tokens but produces garbage MTP drafts (#636), so
 /// shape mismatches are rejected the same way as an incompatible
 /// artifact rather than silently accepted.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
@@ -209,7 +209,7 @@ fn resolve_mtp_projection(
 /// checkpoint flavor; a `.q4` sibling under a norm's name is treated
 /// as an incompatible artifact rather than silently ignored (defense
 /// in depth — should never occur on a checkpoint from either
-/// quantizer). Also validates on-disk shape (#636 round-1 medium #1).
+/// quantizer). Also validates on-disk shape (#636).
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn resolve_mtp_norm(
     q4_dir: &std::path::Path,
@@ -252,7 +252,7 @@ mod mtp_resolve_tests {
     /// `tiny_metal_qwen35_fixture`, which lives inside `mod inner` and is
     /// gated on the `metal-gpu` feature -- these tests must not depend on
     /// it, or they'd silently disappear again on a Metal-less/no-feature
-    /// build, exactly the round-1/round-2 skip-pass class). Field values
+    /// build, exactly the skip-pass class described above). Field values
     /// mirror `tiny_metal_qwen35_fixture`'s config so the derived MTP
     /// projection/norm shapes match the same real-checkpoint-verified
     /// formulas.
@@ -300,11 +300,11 @@ mod mtp_resolve_tests {
     // (ADR-051 Phase 1: MTP counter-rotation needs unquantized weights).
     // `resolve_mtp_projection`/`resolve_mtp_norm` must accept both flavors,
     // reject a stale `.q4` MTP sibling under a QuaRot (`is_quarot=true`)
-    // directory (round-1 MAJOR), and reject a transposed/mismatched tensor
-    // shape (round-1 medium #1). These tests live at the file top level,
+    // directory, and reject a transposed/mismatched tensor
+    // shape. These tests live at the file top level,
     // compiled unconditionally in any test build -- not gated on `metal-gpu`
     // -- so this coverage never skip-passes on a Metal-less CI runner
-    // (round-1 medium #3, hardened further in round 2: see the module doc
+    // (see the module doc
     // comment above `mtp_tensor_path` for why this code moved out of
     // `mod inner` entirely).
 
@@ -425,7 +425,7 @@ mod mtp_resolve_tests {
     /// The 8 MTP projection tensor names paired with their expected
     /// on-disk shape, derived from the real qwen3.5-0.8b-q4 checkpoint
     /// (`~/.lattice/models/qwen3.5-0.8b-q4/mtp_*.q4` headers, verified by
-    /// hand during #636 round-1 remediation): on-disk shape is always
+    /// hand during #636 remediation): on-disk shape is always
     /// `[d_out, d_in]`, matching `expected_lora_shape`'s `(d_in, d_out)`
     /// convention reversed.
     pub(crate) fn mtp_proj_names_and_shapes(cfg: &Qwen35Config) -> [(&'static str, Vec<usize>); 8] {
@@ -494,7 +494,7 @@ mod mtp_resolve_tests {
     }
 
     // --- CPU-only, Device-free coverage of the flavor/shape logic itself ---
-    // (round-1 medium #3: these never skip on a Metal-less CI runner.)
+    // (these never skip on a Metal-less CI runner.)
 
     #[test]
     fn resolve_mtp_projection_prefers_q4_when_allowed() {
@@ -526,7 +526,7 @@ mod mtp_resolve_tests {
 
     #[test]
     fn resolve_mtp_projection_rejects_stale_q4_sibling_under_quarot() {
-        // Round-1 MAJOR: a QuaRot (rotated-space) checkpoint directory
+        // A QuaRot (rotated-space) checkpoint directory
         // must never load an MTP `.q4` sibling even if one exists —
         // that shape is reachable when `quantize_q4` is re-run into an
         // existing QuaRot output dir (the converter reuses a non-empty
@@ -557,7 +557,7 @@ mod mtp_resolve_tests {
 
     #[test]
     fn resolve_mtp_projection_rejects_transposed_q4_shape() {
-        // Round-1 medium #1: a same-numel transposed file must not
+        // A same-numel transposed file must not
         // silently load — it would generate tokens but produce garbage
         // MTP drafts (0% accept class).
         let cfg = tiny_mtp_test_config();
@@ -626,7 +626,7 @@ mod mtp_resolve_tests {
 }
 
 // -----------------------------------------------------------------------------
-// MTP / self-spec route-around predicates (codex round-1 medium #1, PR #657) --
+// MTP / self-spec route-around predicates (PR #657) --
 // pure, `Device`-free, compiled unconditionally in test builds (same pattern
 // as the `resolve_mtp_*` functions above: `mod inner` re-imports these via
 // `use super::{...}` so the two real dispatch sites in `generate()` stay
@@ -648,8 +648,8 @@ mod mtp_resolve_tests {
 /// which either applies budget forcing or rejects the config via
 /// `check_reasoning_budget_not_set`.
 ///
-/// `gen_cfg.repetition_penalty == 1.0` is likewise load-bearing (codex round-1
-/// blocker #2, PR #787): both the MTP draft (`mtp_forward_one`) and verify
+/// `gen_cfg.repetition_penalty == 1.0` is likewise load-bearing (PR #787):
+/// both the MTP draft (`mtp_forward_one`) and verify
 /// steps select tokens via raw `argmax_f32_first_wins` over logits, never
 /// through `sample_token`, so a non-identity penalty configured by the caller
 /// would be silently ignored -- a set penalty can change which token is
@@ -657,8 +657,8 @@ mod mtp_resolve_tests {
 /// performance one. Any non-1.0 penalty must route around MTP to the plain
 /// loop, which samples via `sample_token` and applies it.
 ///
-/// `gen_cfg.logprobs.is_none()` is likewise load-bearing (codex round-2
-/// blocker #1, PR #787): `generate_greedy_mtp` unconditionally returns
+/// `gen_cfg.logprobs.is_none()` is likewise load-bearing (PR #787):
+/// `generate_greedy_mtp` unconditionally returns
 /// `token_logprobs: vec![]`, so a set `logprobs` request must route around
 /// MTP to the plain loop, which either captures logprobs or rejects the
 /// config via `check_logprobs_not_set`.
@@ -685,9 +685,9 @@ fn mtp_route_active(
 /// branch. Mirrors the `use_self_spec` computation inline in
 /// `MetalQwen35State::generate` exactly -- same `stop_strings.is_empty()` /
 /// `reasoning_budget.is_none()` / `repetition_penalty == 1.0` route-around
-/// rationale as [`mtp_route_active`] (codex round-1 blocker #2, PR #787):
+/// rationale as [`mtp_route_active`] (PR #787):
 /// self-spec's verify step also selects via raw argmax, never `sample_token`.
-/// `gen_cfg.logprobs.is_none()` is the same round-2 blocker #1 route-around
+/// `gen_cfg.logprobs.is_none()` is the same route-around
 /// as [`mtp_route_active`]: `generate_greedy_self_spec` also unconditionally
 /// returns `token_logprobs: vec![]`.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
@@ -745,7 +745,7 @@ mod route_predicate_tests {
         assert!(mtp_route_active(true, true, &gen_cfg, false));
     }
 
-    /// Codex medium #1: non-empty `stop_strings` must route around MTP even
+    /// Non-empty `stop_strings` must route around MTP even
     /// though every other MTP precondition (present, enabled, greedy,
     /// non-compact, no grammar) is satisfied.
     #[test]
@@ -765,7 +765,7 @@ mod route_predicate_tests {
         assert!(self_spec_route_active(true, true, &gen_cfg, false, 1));
     }
 
-    /// Codex medium #1: non-empty `stop_strings` must route around
+    /// Non-empty `stop_strings` must route around
     /// self-speculative decode even though every other precondition
     /// (checkpoints present, env set, greedy, non-compact, no grammar, has
     /// linear-attention layers) is satisfied.
@@ -816,7 +816,7 @@ mod route_predicate_tests {
         );
     }
 
-    /// Codex round-1 blocker #2 (PR #787): a non-identity `repetition_penalty`
+    /// PR #787: a non-identity `repetition_penalty`
     /// must route around MTP even though every other MTP precondition
     /// (present, enabled, greedy, non-compact, no grammar, no stop strings,
     /// no reasoning budget) is satisfied. MTP's draft/verify loop selects via
@@ -825,7 +825,7 @@ mod route_predicate_tests {
     ///
     /// Mutation sensitivity: removing the `repetition_penalty == 1.0` clause
     /// from `mtp_route_active` makes this assertion fail (the route stays
-    /// active), reproducing codex's reported failure mode exactly.
+    /// active), reproducing the reported failure mode exactly.
     #[test]
     fn mtp_route_blocked_by_nonidentity_repetition_penalty() {
         let gen_cfg = GenerateConfig {
@@ -841,7 +841,7 @@ mod route_predicate_tests {
     }
 
     /// Sibling to `mtp_route_blocked_by_nonidentity_repetition_penalty` for
-    /// the self-speculative route (codex round-1 blocker #2, PR #787).
+    /// the self-speculative route (PR #787).
     #[test]
     fn self_spec_route_blocked_by_nonidentity_repetition_penalty() {
         let gen_cfg = GenerateConfig {
@@ -856,7 +856,7 @@ mod route_predicate_tests {
         );
     }
 
-    /// Output-level discriminating case (codex round-1 blocker #2, PR #787):
+    /// Output-level discriminating case (PR #787):
     /// proves the route-around above is not merely cosmetic. With
     /// `repetition_penalty = 1.0` the raw dense argmax MTP/self-spec use
     /// (`argmax_f32_first_wins`) agrees with the canonical
@@ -906,7 +906,7 @@ mod route_predicate_tests {
         );
     }
 
-    /// Codex round-2 blocker #1 (PR #787): a set `logprobs` must route
+    /// PR #787: a set `logprobs` must route
     /// around MTP even though every other MTP precondition (present,
     /// enabled, greedy, non-compact, no grammar, no stop strings, no
     /// reasoning budget, identity repetition penalty) is satisfied.
@@ -914,12 +914,12 @@ mod route_predicate_tests {
     /// so a caller requesting logprobs would otherwise get `Ok` with the
     /// requested output silently absent.
     ///
-    /// Codex's exact falsification recipe: add `logprobs: Some(0)` to the
+    /// Falsification recipe: add `logprobs: Some(0)` to the
     /// otherwise-active predicate fixture and assert the route is inactive.
     ///
     /// Mutation sensitivity: removing the `logprobs.is_none()` clause from
     /// `mtp_route_active` makes this assertion fail (the route stays
-    /// active), reproducing codex's reported failure mode exactly.
+    /// active), reproducing the reported failure mode exactly.
     #[test]
     fn mtp_route_blocked_by_set_logprobs() {
         let gen_cfg = GenerateConfig {
@@ -934,7 +934,7 @@ mod route_predicate_tests {
     }
 
     /// Sibling to `mtp_route_blocked_by_set_logprobs` for the
-    /// self-speculative route (codex round-2 blocker #1, PR #787):
+    /// self-speculative route (PR #787):
     /// `generate_greedy_self_spec` has the same unconditional empty-vector
     /// return.
     #[test]
@@ -956,7 +956,7 @@ mod inner {
     use super::GdnStateTrafficScope;
     // MTP Q4/F16 flavor + shape resolution (#630, #636) now lives at the file
     // top level (module-scope, above `mod inner`) so it compiles and is
-    // unit-testable without the `metal-gpu` feature at all (round-2 fix).
+    // unit-testable without the `metal-gpu` feature at all.
     #[cfg(feature = "gdn-state-counters")]
     use super::{
         GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficShape,
@@ -1613,7 +1613,7 @@ mod inner {
     /// full-vocab nucleus sampling once the tail is truncated, so exact mode is
     /// the default and the approximation is opt-in only.
     ///
-    /// Review round-1 finding 2: `top_k == 50` intentionally stays out of
+    /// `top_k == 50` intentionally stays out of
     /// `LM_HEAD_LOCAL_KS` and therefore falls through to `CpuFallback` here, so
     /// the caller re-resolves it via `choose_gpu_topk_route`'s `HierarchicalK50`
     /// path, which still does a full-logit GEMV before its compact dispatch.
@@ -2200,8 +2200,7 @@ mod inner {
         checkpoints: Vec<MetalGdnCheckpoint>,
     }
 
-    /// Worker-local, single-live-entry cross-turn prefix cache (#516 round-1
-    /// remediation, finding 1 + 5).
+    /// Worker-local, single-live-entry cross-turn prefix cache (#516).
     ///
     /// Ownership invariant: at most ONE `MetalCrossTurnPrefixEntry` is ever
     /// retained, bounded by design (never an unbounded per-slot map). The
@@ -3462,7 +3461,7 @@ mod inner {
                         raw_out: make_zero_buffer(device, bp * output_dim, "gdn_chunk_raw_out"),
                     }
                 },
-                // Review round-1 finding 3: this `[vocab_size]` buffer is allocated
+                // This `[vocab_size]` buffer is allocated
                 // once per session and reused for both the compact and exact
                 // routes, so a compact-only generation still carries it. Issue
                 // #171's threadgroup-reduction claim is about *dispatch*, not
@@ -3997,11 +3996,11 @@ mod inner {
                 intermediate,
                 max_rank,
             });
-            // #516 round-1 remediation D4: the cross-turn cache's adapter
+            // The cross-turn cache's adapter
             // identity (`cross_turn_metadata`'s `adapter_id`) is a shape-based
             // hash (max_rank/scale/projection count), not a content hash, so
             // two different adapters with the same shape can collide on the
-            // same `AdapterId` (finding 3). The metadata hash is
+            // same `AdapterId`. The metadata hash is
             // defense-in-depth; the unconditional clear here is the actual
             // correctness mechanism.
             self.cross_turn_prefix_cache.clear();
@@ -4012,7 +4011,7 @@ mod inner {
         /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
         pub fn unload_lora_adapter(&mut self) {
             self.lora = None;
-            // #516 round-1 remediation D4: see the matching comment in
+            // See the matching comment in
             // `load_lora_adapter` — any adapter identity change must
             // invalidate the retained cross-turn entry.
             self.cross_turn_prefix_cache.clear();
@@ -5528,7 +5527,7 @@ mod inner {
             cmd2.wait_until_completed();
 
             // ---- Phase 3: CPU ----
-            // Codex round-1 medium #4 (PR #787): this was the one surviving
+            // PR #787: this was the one surviving
             // production last-wins `max_by` argmax after the #280 fix -- the
             // MTP draft-token pick, called from `generate_greedy_mtp`. Swapped
             // for the shared first-wins `argmax_f32_first_wins` helper so a
@@ -6011,7 +6010,7 @@ mod inner {
         /// can only be reached by a library consumer calling the raw entry point with
         /// an out-of-vocabulary id.
         ///
-        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        /// # Cross-turn cache invalidation (#516)
         ///
         /// This is a public raw-forward entry point that advances live KV/GDN
         /// state outside the cache-aware generation family's ownership, so it
@@ -6153,7 +6152,7 @@ mod inner {
         /// generate path never triggers this; it can only be reached by a library
         /// consumer passing raw ids with an out-of-vocabulary value.
         ///
-        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
         /// comment for the invariant this enforces. `generate`/`generate_streaming`/
@@ -6178,7 +6177,7 @@ mod inner {
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
         ///
-        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
         /// comment for the invariant this enforces.
@@ -8624,8 +8623,8 @@ mod inner {
             // already applies it via `stop_text_state` further down.
             crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
 
-            // Reject logprobs before any prefill/state work (codex round-2
-            // blocker #1, PR #787): this entry point unconditionally returns
+            // Reject logprobs before any prefill/state work (PR #787): this
+            // entry point unconditionally returns
             // `token_logprobs: vec![]` on every return path below (including
             // the MTP and self-spec fast-path delegations), so a caller
             // requesting `gen_cfg.logprobs` would otherwise get `Ok` with the
@@ -8686,7 +8685,7 @@ mod inner {
                     _ => gen_cfg.top_k,
                 };
             } else {
-                // Issue #171 review round-1 finding 1: clear any compact request
+                // Issue #171: clear any compact request
                 // left over from a prior compact-eligible generation on this same
                 // state so the exact full-logit path isn't starved by stale state.
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -9009,7 +9008,7 @@ mod inner {
 
             // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
             // so we never emit a token the caller did not ask for. Mirrors the
-            // guard in generate() above (#612 sibling-path audit).
+            // guard in generate() above (#612).
             if gen_cfg.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -9291,16 +9290,16 @@ mod inner {
                 pool.active_base_seq_len = None;
             }
             self.session.last_pre_final_hidden = vec![0.0f32; self.engine.config.hidden_size];
-            // #516 round-1 remediation D3: every public path that resets live
+            // Every public path that resets live
             // KV/GDN state (plain `generate_streaming`, chat, the serve
             // worker, and the cache-aware path's own FullRefill/error legs)
             // routes through here, so this is the single place that must
             // invalidate any retained cross-turn entry. A retained entry
             // describes exactly the state this call just vacated; leaving it
             // alive would let a later cache-aware call restore GDN state for
-            // KV rows that no longer represent it (finding 2).
+            // KV rows that no longer represent it.
             self.cross_turn_prefix_cache.clear();
-            // Issue #171 review round-1 finding 1: a compact top-k request from a
+            // Issue #171: a compact top-k request from a
             // prior generation must not leak into the next one. Without this, a
             // caller that reuses one `MetalQwen35State` for a compact-eligible
             // generation followed by an exact-required generation (grammar,
@@ -13036,7 +13035,7 @@ mod inner {
                     _ => gen_cfg.top_k,
                 };
             } else {
-                // Issue #171 review round-1 finding 1: clear any compact request
+                // Issue #171: clear any compact request
                 // left over from a prior compact-eligible generation on this same
                 // state so the exact full-logit path isn't starved by stale state.
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -13171,7 +13170,7 @@ mod inner {
             // `reasoning_end_len` seed covers the budget=1 edge case exactly as
             // the pre-extraction inline bookkeeping did. Shared with the CPU
             // `model::qwen35::generation` loops -- see `DecodePolicy`'s doc comment.
-            // `DecodePolicy::init` (codex round-2 major #2, PR #787) records
+            // `DecodePolicy::init` (PR #787) records
             // the prefill token's logprob (#585, no-op unless requested) in
             // the same call that constructs the policy -- replaces the
             // freestanding `record_logprob(...)` call this site used to make
@@ -13179,8 +13178,7 @@ mod inner {
             // `forward_prefill()` populated it above, and reflects the same
             // distribution `next_id` was sampled from.
             // `streaming: true` selects `StopMode::Streaming`'s incremental
-            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
-            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` -- `policy.stop_mode`
             // now owns the `StopStringMatcher` this call site used to
             // construct and drive by hand.
             let mut policy = crate::model::qwen35::DecodePolicy::init(
@@ -13295,8 +13293,8 @@ mod inner {
                     sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
-                // One atomic per-step transition (ADR-080 C3 / codex round-1
-                // major #3, PR #787) -- see `DecodePolicy::transition`.
+                // One atomic per-step transition (ADR-080 C3, PR #787) --
+                // see `DecodePolicy::transition`.
                 // Interaction note: if reasoning_budget AND grammar are both active and the
                 // grammar disallows </think> at this position, advance returns false → break.
                 // This is fail-closed (no grammar-illegal output emitted) but silent. The
@@ -13304,8 +13302,7 @@ mod inner {
                 //
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` or
                 // `Disabled` at construction) now owns this path's byte-
-                // holdback stop check itself (codex round-3 major #1, PR
-                // #787 / Leo's ruling) -- this call site supplies only
+                // holdback stop check itself -- this call site supplies only
                 // `decode_delta` (this loop's own detokenizer) and the
                 // shared `text`/`throwaway_offsets` buffers.
                 let generated_len_before = generated_ids.len();
@@ -13520,8 +13517,8 @@ mod inner {
         /// of `[E, 2I, H]`) would otherwise pass, hand `encode_moe_ffn` a
         /// buffer smaller than — or laid out differently than — the
         /// `num_experts * ...` slice it forms from the raw pointer, and
-        /// violate that unsafe function's buffer-size invariant (round-1
-        /// blocker, mirrors the shape check `resolve_mtp_projection`/
+        /// violate that unsafe function's buffer-size invariant (mirrors the
+        /// shape check `resolve_mtp_projection`/
         /// `resolve_mtp_norm` already apply to MTP tensors above).
         fn load_q4_mmap_dequant_f16(
             device: &Device,
@@ -13593,7 +13590,7 @@ mod inner {
         /// f32` in `encode_moe_ffn`, so they must land as f32, not f16.
         ///
         /// `expected_shape` is validated the same way and at the same point as
-        /// in [`Self::load_q4_mmap_dequant_f16`] (round-1 blocker fix): before
+        /// in [`Self::load_q4_mmap_dequant_f16`]: before
         /// mmap/allocation, against the raw header only.
         fn load_q4_mmap_dequant_f32(
             device: &Device,
@@ -13807,8 +13804,8 @@ mod inner {
         /// checkpoint — determined by the caller from `quarot_seed` presence
         /// (`quantize_index.json` object manifest or the legacy `config.json`
         /// field) BEFORE calling this function, so flavor detection never
-        /// depends on which files happen to exist per-tensor (#636 round-1
-        /// MAJOR). Returns `Err` (hard load failure, not a gracefully-disabled
+        /// depends on which files happen to exist per-tensor (#636).
+        /// Returns `Err` (hard load failure, not a gracefully-disabled
         /// warning) when an MTP tensor is present but untrustworthy: an
         /// incompatible stale `.q4` sibling under `is_quarot`, or a
         /// shape/transpose mismatch against the tensor's expected dimensions.
@@ -14736,7 +14733,7 @@ mod inner {
             // Determine the QuaRot flavor BEFORE loading any MTP projection, so a
             // stale MTP `.q4` sibling in a rotated-space checkpoint fails closed
             // instead of silently loading rotated weights under counter-rotation
-            // (#636 round-1 MAJOR). ADR-051 contract: `quarot_seed` lives in
+            // (#636). ADR-051 contract: `quarot_seed` lives in
             // `quantize_index.json`. Fall back to the legacy `config.json` field
             // (`quarot_rotation_seed`) for backwards compatibility with artifacts
             // produced before the contract was formalized. #504 remaining slice 2:
@@ -15058,7 +15055,7 @@ mod inner {
         }
     }
 
-    // #516 round-2 D7: `MtpTargetVerifier` is a public trait and this impl's
+    // `MtpTargetVerifier` is a public trait and this impl's
     // mutating methods (`rollback_cache_to`, `verify_tokens`) advance live
     // KV/GDN state exactly like `forward_step`/`forward_prefill` — they are
     // not currently wired into any live Metal generate loop (Metal MTP decode
@@ -15321,8 +15318,8 @@ mod inner {
                     // the end of generation. Any early return between here
                     // and that save (error `?`, caller-interrupt) leaves
                     // the cache empty rather than retaining a stale entry
-                    // — fail-closed by construction (#516 round-1
-                    // remediation D2). This also removes a ~19MiB GDN
+                    // — fail-closed by construction (#516). This also
+                    // removes a ~19MiB GDN
                     // snapshot clone per restore.
                     let entry = self.cross_turn_prefix_cache.take(slot_id).ok_or_else(|| {
                         InferenceError::PrefixCache(
@@ -15665,7 +15662,7 @@ mod inner {
         /// cache (for `FullRefill`), so an early cancel-return never re-saves
         /// and the slot is left empty rather than holding a stale/partial
         /// entry — the same guarantee the existing error path documents
-        /// (#516 round-1 remediation D2).
+        /// (#516).
         pub fn generate_streaming_with_prefix_cache_and_cancel<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
@@ -15680,8 +15677,8 @@ mod inner {
             C: FnMut() -> bool,
         {
             // Config preflight checks live here, in the public wrapper, and
-            // must return BEFORE the `match` below (codex round-2 medium #3,
-            // PR #787): the error-recovery arm of that `match` unconditionally
+            // must return BEFORE the `match` below (PR #787): the
+            // error-recovery arm of that `match` unconditionally
             // calls `reset_state()` and removes the cache slot on ANY `Err`
             // from `_inner`, including a not-yet-attempted preflight
             // rejection. A caller passing an unsupported config (e.g.
@@ -15955,7 +15952,7 @@ mod inner {
                     _ => gen_cfg.top_k,
                 };
             } else {
-                // Issue #171 review round-1 finding 1: clear any compact request
+                // Issue #171: clear any compact request
                 // left over from a prior compact-eligible generation on this same
                 // state so the exact full-logit path isn't starved by stale state.
                 self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -16100,19 +16097,18 @@ mod inner {
             // Backend-neutral reasoning-budget policy (ADR-080 C3), shared with
             // `generate_streaming` above and the CPU `model::qwen35::generation`
             // loops, driven through the one atomic `DecodePolicy::transition`
-            // (codex round-1 major #3, PR #787). `token_logprobs` below is a
+            // (PR #787). `token_logprobs` below is a
             // throwaway sink: this path does not wire per-token logprobs
             // capture, and the `check_logprobs_not_set` guard above already
             // rejects any request that would need it, so `gen_cfg.logprobs`
             // is always `None` here and `DecodePolicy::init` / `transition`'s
-            // logprob recording is always a no-op (codex round-1 blocker #1,
-            // PR #787) -- passed through uniformly rather than special-cased,
+            // logprob recording is always a no-op -- passed through uniformly
+            // rather than special-cased,
             // so this site is structurally indistinguishable from the other
             // five at the `DecodePolicy::init` / `transition` call sites.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
             // `streaming: true` selects `StopMode::Streaming`'s incremental
-            // byte-holdback for a non-empty `gen_cfg.stop_strings` (codex
-            // round-3 major #1, PR #787 / Leo's ruling) -- `policy.stop_mode`
+            // byte-holdback for a non-empty `gen_cfg.stop_strings` -- `policy.stop_mode`
             // now owns the `StopStringMatcher` this call site used to
             // construct and drive by hand.
             let mut policy = crate::model::qwen35::DecodePolicy::init(
@@ -16247,8 +16243,7 @@ mod inner {
 
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` or
                 // `Disabled` at construction) now owns this path's byte-
-                // holdback stop check itself (codex round-3 major #1, PR
-                // #787 / Leo's ruling) -- this call site supplies only
+                // holdback stop check itself -- this call site supplies only
                 // `decode_delta` (this loop's own detokenizer) and the
                 // shared `text`/`throwaway_offsets` buffers.
                 let generated_len_before = generated_ids.len();
@@ -16477,7 +16472,7 @@ mod inner {
             topk_set_agreement_or_boundary_tie,
         };
         // Fixture helpers for the MTP Q4/F16 loader tests below now live in
-        // the top-level `mtp_resolve_tests` module (round-2: moved out of
+        // the top-level `mtp_resolve_tests` module (moved out of
         // `mod inner` so the pure resolver tests compile without
         // `metal-gpu` -- these Device-gated integration tests still share
         // the same fixture writers).
@@ -17251,7 +17246,7 @@ mod inner {
             );
         }
 
-        // --- Edge cases (from auditor static_analysis.md) ---
+        // --- Edge cases ---
 
         /// cache_len=1: first-token decode. The only cached token gets weight 1.0,
         /// so flash output must equal the old reference exactly (same f32 arithmetic).
@@ -18375,11 +18370,11 @@ mod inner {
         // Qwen3.6-35B-A3B Q4 run is tracked separately (issue body: "35B
         // verification dir ... in-flight") — this is the fast, CI-safe leg.
         //
-        // Round-1 review (codex, PR #883) MAJOR 1: the original fixture
+        // The original fixture
         // filled every Q4 tensor with the same `0.1` constant, so an expert
         // swap, wrong gate/up boundary, or an equal-length transpose left
         // the test numerically finite and effectively unchanged — it could
-        // not catch the layout-corruption class the blocker fix above
+        // not catch the layout-corruption class the from_q4_dir MoE-loading fix above
         // guards against. Rewritten to (a) give every expert/projection a
         // DISTINCT block-constant value, (b) directly read the loaded
         // `routed_gate_up`/`routed_down` Metal buffers at expert 0/1's
@@ -18389,7 +18384,7 @@ mod inner {
         // deterministically select a single nonzero expert (#2 of 4) and
         // assert decode output changes when that expert's on-disk weights
         // are corrupted to look like expert 0's (mutation-sensitive to
-        // exactly the "expert swap" bug class the blocker fix rejects at
+        // exactly the "expert swap" bug class the from_q4_dir MoE-loading fix rejects at
         // load time — here proven at the numerical-output level too, for a
         // malformed-but-shape-valid corruption the shape gate cannot catch
         // by itself, e.g. two experts' payload bytes swapped without
@@ -18647,7 +18642,8 @@ mod inner {
             // --- (b) direct buffer read: expert-major layout at expert 0/1 offsets ---
             // Read the loaded Metal buffers straight from the built state, before
             // any decode runs, to isolate loader correctness from generation
-            // numerics — this is the layout proof the round-1 review asked for.
+            // numerics — this is the layout proof for the expert-major layout
+            // invariant.
             {
                 use crate::weights::q4_weights::q4_f16_to_f32;
                 let (_, common) = &state.engine.layer_weights[0];
@@ -18724,14 +18720,14 @@ mod inner {
         // transposed-index bug in `load_moe_ffn_q4` would produce (expert 2's
         // *slot* ends up holding expert 0's weights). The router is
         // unchanged, so routing still deterministically selects expert 2
-        // (round-1 review's "make routing deterministically select a nonzero
-        // expert"). If the loader's expert-major offsets were wrong in a way
+        // (routing must deterministically select a nonzero expert). If the
+        // loader's expert-major offsets were wrong in a way
         // the shape gate above cannot catch (e.g. two experts' bytes
         // transposed without changing either header's shape), this
         // corruption would silently have NO effect on which weights actually
         // get used at expert 2's dispatch offset — so decode output
         // differing here is direct evidence the loaded weights, not just the
-        // headers, are wired to the offsets the review's audit derived.
+        // headers, are wired to the offsets this test expects.
         #[test]
         fn from_q4_dir_moe_decode_is_sensitive_to_expert_weight_corruption() {
             let Some(_) = Device::system_default() else {
@@ -18805,7 +18801,7 @@ mod inner {
         }
 
         // -------------------------------------------------------------------
-        // Round-1 review (codex, PR #883) BLOCKER: `load_q4_mmap_dequant_f16`/
+        // `load_q4_mmap_dequant_f16`/
         // `load_q4_mmap_dequant_f32` used to validate a MoE tensor's Q4
         // header only *self*-consistently (`validate_q4_header_payload_bounds`:
         // `product(shape) == original_len`, payload physically present) —
@@ -18813,7 +18809,7 @@ mod inner {
         // structurally valid but short or same-numel-transposed file would
         // silently load, then violate `encode_moe_ffn`'s unsafe
         // `num_experts * ...`-sized slice invariant. These two tests are
-        // the round-1-mandated regression coverage: a too-short router
+        // regression coverage: a too-short router
         // header, and a same-numel transposed routed-expert header, must
         // both make `from_q4_dir` return an `Err` before `forward_step`.
         // -------------------------------------------------------------------
@@ -18918,7 +18914,7 @@ mod inner {
         // itself (`resolve_mtp_projection`/`resolve_mtp_norm`) lives at the
         // file top level in `mod mtp_resolve_tests`, compiled unconditionally
         // in any test build (not gated on the `metal-gpu` feature), so it
-        // never skip-passes on a Metal-less CI runner (#636 round-2 -- these
+        // never skip-passes on a Metal-less CI runner (#636 -- these
         // tests used to live right here, inside this `metal-gpu`-gated
         // `mod inner`, and `cargo test --lib resolve_mtp` with no features
         // reported "running 0 tests"). The tests below instead exercise
@@ -19039,7 +19035,7 @@ mod inner {
 
         #[test]
         fn load_mtp_q4_weights_hard_errors_on_stale_q4_under_quarot() {
-            // Round-1 MAJOR integration coverage: a mixed/stale QuaRot
+            // Integration coverage: a mixed/stale QuaRot
             // directory (both .q4 and .f16 for a projection, is_quarot=true)
             // must be a hard `Err`, not a gracefully-disabled `None` — this
             // is the exact failure-open scenario this guard closes.
@@ -21509,7 +21505,7 @@ mod inner {
             }
         }
 
-        /// Regression (issue #171 review round-1 finding 1): a compact top-k
+        /// Regression (issue #171): a compact top-k
         /// request from one generation must not survive `reset_state()` into
         /// the next generation on the same `MetalQwen35State`. Production
         /// callers rely on this exact mechanism — every `generate_streaming`/
@@ -21701,7 +21697,7 @@ mod inner {
                     baseline.reset_state();
                     blocked.reset_state();
                     // `reset_state` clears `compact_route`/`compact_topk` (issue #171
-                    // review round-1 finding 1 — a prior generation's compact request
+                    // — a prior generation's compact request
                     // must not leak into the next one). This test drives `forward_step`
                     // directly rather than through `generate_streaming`'s route-decision
                     // block, so it must re-apply the compact-route configuration itself
@@ -21770,8 +21766,8 @@ mod inner {
 
         /// `generate_multimodal` with `max_new_tokens == 0` must return zero
         /// generated tokens without running prefill or sampling (#612 sibling-
-        /// invocation-path audit found this 4th guard site; #621 review round 1
-        /// flagged it as missing mutation-sensitive coverage).
+        /// invocation-path's 4th guard site; #621 tracks its
+        /// missing mutation-sensitive coverage).
         ///
         /// Unlike the CPU-side zero-budget tests (which use empty weight vecs
         /// to make mutation trivially observable via a panic), Metal GPU state
@@ -21885,8 +21881,8 @@ mod inner {
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
                     baseline.reset_state();
-                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
-                    // review round-1 finding 1). This test drives `forward_step`
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171).
+                    // This test drives `forward_step`
                     // directly rather than through `generate_streaming`'s
                     // route-decision block, so it must re-apply each state's
                     // compact-route configuration after every reset, exactly as a
@@ -22172,7 +22168,7 @@ mod inner {
         /// `Qwen35Model` path), so this leg uses a reduced default position
         /// count to keep runtime sane; override via
         /// `LATTICE_TEST_Q4_GREEDY_POSITIONS`. Same reset/re-apply-compact-route
-        /// discipline as the f16 leg (issue #171 review round-1 finding 1).
+        /// discipline as the f16 leg (issue #171).
         #[test]
         fn lm_head_q4_real_checkpoint_greedy_agreement() {
             let Some(_) = Device::system_default() else {
@@ -22208,8 +22204,8 @@ mod inner {
                 if pos_in_window >= reset_every {
                     baseline.reset_state();
                     blocked.reset_state();
-                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
-                    // review round-1 finding 1); re-apply after every reset exactly as
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171);
+                    // re-apply after every reset exactly as
                     // a real caller starting a fresh `generate_*` call would via the
                     // route-decision block.
                     blocked.session.compact_route = GpuTopkRoute::BlockArgmax;
@@ -22319,8 +22315,8 @@ mod inner {
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
                     baseline.reset_state();
-                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171
-                    // review round-1 finding 1); re-apply each state's compact-route
+                    // `reset_state` clears `compact_route`/`compact_topk` (issue #171);
+                    // re-apply each state's compact-route
                     // configuration after every reset, exactly as a real caller
                     // starting a fresh `generate_*` call would via the route-decision
                     // block.
@@ -22434,7 +22430,7 @@ mod inner {
         /// the serial reference clean run-to-run.
         ///
         /// Machine-level half (#628/#629 post-mortem): the in-process mutex cannot
-        /// stop `cargo test` runs launched from OTHER worktrees on the same
+        /// stop concurrent `cargo test` runs launched from another process on the
         /// machine, and concurrent Metal load provably corrupts real-checkpoint
         /// numerics (boundary-tie margins inflated ~3x during a confirmed
         /// contention window). So the guard also holds an exclusive advisory
@@ -22913,7 +22909,7 @@ mod inner {
         /// char-boundary clamp that `single_char_vocab_tokenizer` (all 1-byte
         /// tokens) cannot exercise on its own.
         ///
-        /// Codex round-1 medium #2 (PR #657): the previous version of this
+        /// PR #657: the previous version of this
         /// fixture inserted the literal chars `"世"`/`"界"` as BPE vocab
         /// *strings*. Qwen's real decode path reverses GPT-2 byte-level token
         /// strings through `byte_decoder` (`detokenize.rs::append_token_bytes`);
@@ -23665,7 +23661,7 @@ mod inner {
             );
         }
 
-        /// PR #606 review (Major finding): `on_token`-only cancellation cannot
+        /// PR #606: `on_token`-only cancellation cannot
         /// observe a disconnect that happens before or during prefill, since
         /// prefill has no callback point at all. `generate_streaming_with_cancel`
         /// must check `should_cancel` before paying for prefill, so a client
@@ -23722,7 +23718,7 @@ mod inner {
             // `on_token_calls == 0` alone doesn't prove *which* checkpoint fired --
             // the after-prefill check would produce the same on_token count if the
             // before-prefill one were missing, since prefill's own output never
-            // reaches on_token either way (round-2 review finding). Prefill is the
+            // reaches on_token either way. Prefill is the
             // only thing that advances kv_cache.seq_len (metal_qwen35_chunked_prefill*
             // tests assert seq_len == tokens.len() once it has run), so a still-zero
             // seq_len is direct evidence prefill itself never started.
@@ -23745,7 +23741,7 @@ mod inner {
             );
         }
 
-        /// PR #606 review (Major finding): the decode loop only called
+        /// PR #606: the decode loop only called
         /// `on_token` for non-empty deltas, so a client disconnect could be
         /// missed for however many iterations produced an empty delta (an
         /// incomplete UTF-8 tail mid-codepoint). This proves `should_cancel`
@@ -23931,7 +23927,7 @@ mod inner {
         }
 
         /// Sibling to `metal_generate_plain_rejects_reasoning_budget_config`
-        /// (codex round-2 blocker #1, PR #787): `MetalQwen35State::generate`
+        /// (PR #787): `MetalQwen35State::generate`
         /// (the plain/direct entry point) unconditionally returns
         /// `token_logprobs: vec![]` on every return path, including the MTP
         /// and self-spec fast-path delegations, and had no
@@ -23973,7 +23969,7 @@ mod inner {
             assert!(
                 matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
                 "MetalQwen35State::generate must fail closed with InvalidInput when \
-                 logprobs is set (codex round-2 blocker #1, PR #787); got {result:?}"
+                 logprobs is set (PR #787); got {result:?}"
             );
         }
 
@@ -24041,7 +24037,7 @@ mod inner {
             );
         }
 
-        /// Regression (review finding on the streaming-retention PR): the non-prefix
+        /// Regression guard for the streaming-retention decode loop: the non-prefix
         /// `generate_streaming` decode loop must append every non-empty delta to the
         /// returned `GenerateOutput.text`, not just hand it to `on_token`. A prior
         /// version of the loop body called `on_token(&delta, next_id)` without first
@@ -24531,7 +24527,7 @@ mod inner {
             // KNOWN ISSUE (2026-06-03): the chunked-batched prefill path exhibits a
             // nondeterministic, contention/occupancy-sensitive logit divergence vs the
             // token-by-token reference, observed up to ~0.94 in a tight back-to-back loop.
-            // A full static audit of `gdn_recurrence_fused` and `decode_attention` found
+            // Static analysis of `gdn_recurrence_fused` and `decode_attention` shows
             // both kernels barrier-correct with no uninitialized threadgroup reads, no
             // intra-dispatch cross-threadgroup device race, and no untracked buffers on the
             // path — the magnitude is too large for FP-reorder noise, so the hazard is a
@@ -25645,8 +25641,8 @@ mod inner {
             if any_d4_watch {
                 eprintln!(
                     "gdn175 S1b: one or more cells landed near (but under) the 1e-5 KILL \
-                     tolerance — see D4-WATCH lines above; report as a D4 f32-accumulator \
-                     finding."
+                     tolerance — see D4-WATCH lines above; this indicates a D4 f32-accumulator \
+                     issue."
                 );
             } else {
                 eprintln!("gdn175 S1b: no cells near the 1e-5 tolerance boundary.");
@@ -25957,7 +25953,7 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // Stress/repeat coverage for the #862 WAR-hazard
                     // fix (Q->K threadgroup_barrier after every sg_buf[0] consumer):
                     // a passing single dispatch does not prove the race is closed
                     // (simdgroups are not required to advance in lockstep, so the
@@ -26106,7 +26102,7 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // Stress/repeat coverage for the #862 WAR-hazard
                     // fix; see the identical comment in
                     // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
                     for _ in 0..20 {
@@ -26224,7 +26220,7 @@ mod inner {
                 // #ifdef gate) -- it is not actually an optional/conditionally-compiled
                 // kernel, so a missing lookup here means MSL_SOURCE was compiled but the
                 // named kernel silently failed to link, which is itself a bug this test
-                // must catch, not skip past (#862 round 1, medium finding 4: only
+                // must catch, not skip past (#862: only
                 // device-absence may remain a platform-level skip).
                 let pipe_func = lib
                     .get_function("gdn_precompute_keys", None)
@@ -26254,7 +26250,7 @@ mod inner {
                         *v = 0.0;
                     }
 
-                    // Stress/repeat coverage for the #862 round-1 blocker-1 WAR-hazard
+                    // Stress/repeat coverage for the #862 WAR-hazard
                     // fix (this kernel has TWO fixed handoffs: Q->K and K->k_dot_q);
                     // see the identical comment in
                     // gdn_recurrence_fused_fails_closed_on_nan_q_and_k_lane above.
@@ -26437,7 +26433,7 @@ mod inner {
             }
 
             // --------------------------------------------------------------
-            // #862 round-2 major-2 follow-up: multi-token gdn_chunk_materialize_c32
+            // #862 follow-up: multi-token gdn_chunk_materialize_c32
             // dispatch (the CHUNKED PREFILL path #850's integration ask names) exercising
             // REAL within-chunk conv-window carryover, not a single n_tokens=1 dispatch.
             //
@@ -26566,7 +26562,7 @@ mod inner {
                 const KD: u32 = 128;
                 const HD: u32 = 16;
                 const WINDOW: u32 = 4; // ks (kernel_size), matches the kernel's constexpr ks=4u
-                const CLEAN_TAIL: u32 = 4; // #862 round-2 major-2: "at least 4 subsequent clean tokens"
+                const CLEAN_TAIL: u32 = 4; // #862: "at least 4 subsequent clean tokens"
                 const N_TOKENS: u32 = WINDOW + CLEAN_TAIL;
                 let qkv_dim = 3 * KD; // [Q(128) | K(128) | V(128)] per token
                 let hidden_in = lcg_vec(41, HD as usize);
@@ -26574,7 +26570,7 @@ mod inner {
                 let in_proj_a = lcg_vec(43, HD as usize);
 
                 // K channel span (label fixed to K: the shipping-path production gap
-                // #862 round 1 found; the sibling single-token test above already
+                // #862 found; the sibling single-token test above already
                 // covers both Q and K for a single dispatch).
                 let (lo, hi) = (KD as usize, 2 * KD as usize);
 
@@ -26718,7 +26714,7 @@ mod inner {
         }
 
         // -------------------------------------------------------------------
-        // Q8_0 non-finite input guard — mutation-sensitive (Finding 1, PR #452)
+        // Q8_0 non-finite input guard — mutation-sensitive (PR #452)
         //
         // IEEE 754: `NaN > x` is always false, so a fold-max over a block
         // containing NaN leaves `amax` unchanged, and the NaN element is
@@ -27309,10 +27305,10 @@ mod inner {
 
         // -------------------------------------------------------------------
         // #516 remediation — regression coverage for
-        // findings 1/2/3/4.
+        // D1/D3/D4/D5.
         // -------------------------------------------------------------------
 
-        /// Finding 1 (slot isolation): a divergent-prompt call on a
+        /// D1 (slot isolation): a divergent-prompt call on a
         /// different slot must evict the single retained entry (D1's
         /// single-live-entry cache), so a later append to the ORIGINAL
         /// slot's prefix cannot silently restore GDN state left by a
@@ -27389,7 +27385,7 @@ mod inner {
             );
         }
 
-        /// Finding 2, plain-path leg (D3): interleaving a plain
+        /// D3 (plain-path leg): interleaving a plain
         /// `generate_streaming` call (which goes through `reset_state`)
         /// between two cache-aware calls must invalidate the retained
         /// entry — the plain path overwrites live KV/GDN state without
@@ -27465,7 +27461,7 @@ mod inner {
             );
         }
 
-        /// Finding 4 (D5): retrying the exact same prompt through the
+        /// D5: retrying the exact same prompt through the
         /// cache-aware path must not hit the empty-suffix invariant error
         /// in `forward_prefill_from` — the planner must fall back to
         /// `FullRefill` when the new prompt exactly equals the entry's
@@ -27539,7 +27535,7 @@ mod inner {
             );
         }
 
-        /// Finding 3 (D4): LoRA adapter load/unload must invalidate the
+        /// D4: LoRA adapter load/unload must invalidate the
         /// retained cross-turn entry. The adapter-identity hash in
         /// `CrossTurnPrefixMetadata` is shape-based (max_rank/scale/
         /// projection count), not content-based, so two different adapters
@@ -27617,8 +27613,8 @@ mod inner {
         /// D7: a public raw-forward call
         /// (`forward_step`) interleaved between two cache-aware calls on the
         /// SAME slot must invalidate the retained entry, exactly like
-        /// `generate_streaming`'s `reset_state()` does for finding 2's
-        /// plain-path leg (D3, `cross_turn_cache_interleaved_plain_path_invalidates`
+        /// `generate_streaming`'s `reset_state()` does for D3's
+        /// plain-path leg (`cross_turn_cache_interleaved_plain_path_invalidates`
         /// above) — `forward_step` mutates the same live KV/GDN buffers
         /// without ever routing through `reset_state` or the cache's own
         /// save path, so it is a second, independent way to leave a stale
@@ -27718,7 +27714,7 @@ mod inner {
             );
         }
 
-        /// #516 round-3 remediation: `set_gdn_chunked` swaps the GDN prefill
+        /// #516: `set_gdn_chunked` swaps the GDN prefill
         /// algorithm, and the two scans are not bit-exact (measured logit
         /// drift up to ~2e-1 at chunk boundaries). A cache entry saved under
         /// one mode must not seed a restore whose full-refill reference would
@@ -28310,7 +28306,7 @@ mod inner {
                         // Accept only the first generated token (the
                         // pre-decode-loop prefill sample); reject the second,
                         // which is produced inside the decode loop -- the
-                        // branch finding 1 patches.
+                        // rejected-token case the cache-boundary logic below accounts for.
                         n < 2
                     },
                     || false,
@@ -28346,7 +28342,7 @@ mod inner {
             // it must reuse through exactly `prompt_len + 1` tokens (the
             // prompt plus the one token the client actually received) and
             // never through `prompt_len + 2` (prompt plus the rejected
-            // token). Without the finding-1 fix, the persisted entry's
+            // token). Without excluding the rejected token, the persisted entry's
             // `represented_len` is `prompt_len + 2`, its trailing token is
             // `rejected_id` (not `diverging_char`'s id), so the shared
             // prefix against `followup_prompt`'s tokens stops at
@@ -28404,8 +28400,7 @@ mod inner {
         // of the three functions (`generate`, `generate_streaming_with_cancel`,
         // `generate_streaming_with_prefix_cache_inner`) — is reachable only
         // from step 2 onward and needs a grammar that allows exactly one
-        // token and then blocks everything. #611 (medium
-        // finding): that gap is covered separately by the
+        // token and then blocks everything. #611: that gap is covered separately by the
         // "DECODE-LOOP integration tests" block below this one, which builds
         // exactly that allow-then-block fixture.
         //
@@ -28614,8 +28609,7 @@ mod inner {
             );
         }
 
-        /// Codex round-1 blocker #1 (PR #787):
-        /// `generate_streaming_with_prefix_cache` never wires per-token
+        /// PR #787: `generate_streaming_with_prefix_cache` never wires per-token
         /// logprobs capture into its decode loop. Before the fix, a caller
         /// requesting `gen_cfg.logprobs` got `Ok` back with silently empty
         /// `token_logprobs` -- the exact silent-omission defect ADR-080 C3's
@@ -28684,7 +28678,7 @@ mod inner {
             );
         }
 
-        /// Codex round-2 medium #3 (PR #787): the round-1 fix guarded the
+        /// PR #787: an earlier fix guarded the
         /// NO-entry case, but not the case where a valid entry already
         /// exists. The public wrapper
         /// `generate_streaming_with_prefix_cache_and_cancel` used to catch
@@ -28768,7 +28762,7 @@ mod inner {
             );
         }
 
-        /// Codex round-2 medium #4 (PR #787): the prefix-cache path accepts
+        /// PR #787: the prefix-cache path accepts
         /// `GenerateConfig` but never reads `enable_mtp`, unlike the direct
         /// Metal `generate()` entry point, which resolves it and delegates
         /// to `generate_greedy_mtp`. An active MTP request (explicit
@@ -29158,8 +29152,7 @@ mod inner {
         }
 
         // -----------------------------------------------------------------------
-        // Grammar fail-closed DECODE-LOOP integration tests (#611
-        // finding, medium)
+        // Grammar fail-closed DECODE-LOOP integration tests (#611)
         //
         // The three tests above only reach the post-prefill masking site: their
         // fixture blocks every vocab entry from step 0, so `has_finite_logit`
@@ -29207,7 +29200,7 @@ mod inner {
                 .collect()
         }
 
-        /// #611 round-1: `generate`'s DECODE-LOOP grammar-masking site
+        /// #611: `generate`'s DECODE-LOOP grammar-masking site
         /// (:10502) must fail closed too, not just the post-prefill site.
         #[test]
         fn generate_decode_loop_fails_closed_on_grammar_blocking_second_token() {
@@ -29261,7 +29254,7 @@ mod inner {
             );
         }
 
-        /// #611 round-1: `generate_streaming`'s DECODE-LOOP grammar-masking
+        /// #611: `generate_streaming`'s DECODE-LOOP grammar-masking
         /// site (`generate_streaming_with_cancel` :14821) must fail closed
         /// too. Also asserts `on_token` is invoked at most once — the
         /// fail-open bug this closes would otherwise emit a bogus second
@@ -29327,7 +29320,7 @@ mod inner {
             );
         }
 
-        /// #611 round-1: `generate_streaming_with_prefix_cache`'s
+        /// #611: `generate_streaming_with_prefix_cache`'s
         /// DECODE-LOOP grammar-masking site (inside
         /// `generate_streaming_with_prefix_cache_inner` :16975) must fail
         /// closed too, AND the public wrapper's error path must not save a
@@ -29991,27 +29984,22 @@ const LM_HEAD_TOPK_TIE_EPSILON: f32 = 1.0e-3;
 // comparator-based code (i.e. no longer count-and-continue; each run panics
 // on its first non-tie mismatch) surfaced margins of 3.61e-2, 2.01e-2, and
 // 5.23e-2 — all 3 runs mismatched, and the new max (5.23e-2) is 4.2x
-// phase-1's. Timeline reconstruction from process-start timestamps confirms
-// this batch finished (~10:20pm) before any other worktree's Metal test
-// process became active on this machine (the next one started ~10:23pm), so
-// this is not explained by the cross-process GPU contention identified below
-// — it is the more likely true noise ceiling, phase-1's 5 samples having
-// under-covered it (consistent with issue #623: this kernel family's
-// reduction order is not run-to-run deterministic, so small samples
-// under-cover the tail).
+// phase-1's. This run was isolated (no concurrent Metal GPU process on the
+// machine, verified via the machine-wide GPU test lock), so it is not
+// explained by the cross-process GPU contention noted below — it is the
+// more likely true noise ceiling, phase-1's 5 samples having under-covered
+// it (consistent with issue #623: this kernel family's reduction order is
+// not run-to-run deterministic, so small samples under-cover the tail).
 //
 // A separate, later confirmation pass on lm_head_q4_real_checkpoint_topk_set_agreement
 // (4 more runs) produced a much larger outlier margin (0.167, k=8, step 3) that
-// this constant deliberately does NOT chase: `ps` timestamps confirmed a
-// concurrent process in a different worktree (`lattice-611`, PID 3395,
-// `cargo test ... forward::metal_qwen35:: --test-threads=4`, later a second
-// batch explicitly re-running these same 4 real-checkpoint tests) actively
-// executing Metal GPU tests on this same physical machine throughout that
-// window. Concurrent GPU load corrupting numerics (not just timing) for
-// these exact tests is an already-documented risk in this repo (see
-// AGENTS.md / CLAUDE.md "Triage Flaky vs Deterministic Before Filing"), so
-// that batch's data is reported (see PR/report history) but excluded from
-// this constant's derivation.
+// this constant deliberately does NOT chase: that run was contended by a
+// concurrent Metal GPU test process on the same machine (see the
+// machine-wide GPU test lock this repo now enforces for exactly this
+// reason). Concurrent GPU load corrupting numerics (not just timing) for
+// these exact tests is an already-documented risk in this repo -- exactly
+// what the machine-wide `gpu_test_lock()` advisory flock serializes against
+// -- so that batch's data is excluded from this constant's derivation.
 //
 // This constant is set to 1.0e-1: ~1.9x the phase-1+phase-2 combined greedy
 // max (5.23e-2, from data with no identified contention), inside the

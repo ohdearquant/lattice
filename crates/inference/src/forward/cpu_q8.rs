@@ -419,7 +419,7 @@ fn full_attention_step_q8(
         // real (unclamped) `.exp()` already reaches the shared row-finalizer's
         // full-row-zero outcome via that NaN-into-`sum_exp` propagation. Mirrors
         // generate.rs::compute_attention (#409) and cpu_f16 moe_ffn_step_f16 (#411).
-        // ADR-080 C1 (#785 round-1 medium 1): routed through `finalize_row` for
+        // ADR-080 C1 (#785): routed through `finalize_row` for
         // consolidation -- behavior-preserving, no output change.
         let mut sum_exp = 0.0f32;
         for t in 0..cur_seq_len {
@@ -1271,7 +1271,7 @@ mod tests {
         );
     }
 
-    /// ADR-080 C1 (#785 round-1 medium 1) clean-row parity check: after
+    /// ADR-080 C1 (#785) clean-row parity check: after
     /// routing this site's finalizer through the shared `finalize_row` helper,
     /// a well-formed (non-poisoned) single-position row must still normalize
     /// to exactly `1.0` (softmax of one score is always `1.0`), not be

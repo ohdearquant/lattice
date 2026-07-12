@@ -1183,7 +1183,7 @@ fn compute_attention(
                 l = l * alpha + (s - m_new).exp();
                 m = m_new;
             }
-            // ADR-080 C1 (#785 round-1 medium 1): route the final decision
+            // ADR-080 C1 (#785): route the final decision
             // through the shared row-finalizer. Behavior-preserving -- `l`
             // reaches the same `<= 0.0`/non-finite outcomes as the manual
             // `if l > 0.0 { .. } else { scores.fill(0.0) }` this replaces.
@@ -1239,7 +1239,7 @@ fn compute_attention(
                 }
             }
 
-            // Softmax. ADR-080 C1 (#785 round-1 medium 1): route the final
+            // Softmax. ADR-080 C1 (#785): route the final
             // decision through the shared row-finalizer -- behavior-preserving,
             // real (unclamped) `.exp()` already reaches the same full-row-zero
             // outcome via NaN-into-`sum` propagation that the manual
@@ -1369,7 +1369,7 @@ mod tests {
     fn test_compute_max_seq_overflow_is_error_not_panic() {
         // A pathological max_new_tokens near usize::MAX must surface a clean
         // InvalidInput error rather than wrapping the addition and panicking
-        // later inside prefill_layer's capacity assertion (finding #2).
+        // later inside prefill_layer's capacity assertion.
         let err = compute_max_seq(10, usize::MAX).unwrap_err();
         assert!(matches!(err, InferenceError::InvalidInput(_)));
         let err = compute_max_seq(usize::MAX, 1).unwrap_err();
@@ -1423,7 +1423,7 @@ mod tests {
     ///
     /// This composes the two real helpers the call site uses in sequence —
     /// `compute_effective_cap` then `check_context_window` — so it pins the
-    /// integration, not just the guard in isolation (review finding #2).
+    /// integration, not just the guard in isolation.
     ///
     /// Mutation check: making `compute_effective_cap` ignore its cap argument (so it
     /// returns `max_seq` — the pre-fix #467 behaviour of guarding the raw sum) makes
@@ -1500,8 +1500,8 @@ mod tests {
 
     /// check_alloc_capacity rejects a config whose num_attention_heads * head_dim
     /// overflows usize while kv_dim remains safe (num_key_value_heads = 1).
-    /// This closes the residual query-side gap found in the PR #449 cross-family review:
-    /// the existing kv_dim guard let this config through, then q_dim wrapped silently
+    /// This closes the residual query-side gap left by PR #449's kv_dim guard:
+    /// that guard let this config through, then q_dim wrapped silently
     /// in release mode, undersizing q_buf / attn_out / qkv_buf for the prefill write.
     ///
     /// Mutation-sensitivity contract:
@@ -1539,7 +1539,7 @@ mod tests {
         // PR #291 found that guarding only compute_max_seq's
         // addition leaves the downstream `max_seq_len * kv_dim` multiplication
         // unchecked: a huge-yet-non-overflowing effective_cap (here usize::MAX/1024,
-        // matching the reviewer's kv_dim=8*128 counterexample) wraps the cache/scratch
+        // matching a kv_dim=8*128 configuration) wraps the cache/scratch
         // element count and panics on the first write. The guard must reject it.
         let cfg = QwenConfig::qwen3_embedding_0_6b();
         let effective_cap = usize::MAX / 1024;
@@ -1621,7 +1621,7 @@ mod tests {
             output[0]
         );
         assert_eq!(output[0], 0.0, "failed-closed row must be zeroed");
-        // ADR-080 C1 (#785 round-1 medium 1) clean-row parity check: query 1's
+        // ADR-080 C1 (#785) clean-row parity check: query 1's
         // clean row must still normalize through `finalize_row` to the exact
         // weighted average, not merely stay finite. Both keys score equally
         // (q[1] == 0.0 dotted with either k), so softmax is a uniform 0.5/0.5

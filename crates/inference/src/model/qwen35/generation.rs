@@ -244,7 +244,7 @@ impl Qwen35Model {
         } else {
             None
         };
-        // `DecodePolicy::init` (codex round-2 major #2, PR #787) constructs
+        // `DecodePolicy::init` (PR #787) constructs
         // the policy AND records this prefill-derived first token's logprob
         // in the same call -- replaces the freestanding `record_logprob(...)`
         // call this site used to make independently of the policy.
@@ -301,8 +301,8 @@ impl Qwen35Model {
             // `truncate_token_logprobs_to_retained_text`.
             let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
-            // Check stop strings after the first token (codex round-3 major
-            // #1, PR #787 / Leo's ruling): routed through the policy's owned
+            // Check stop strings after the first token (PR #787): routed
+            // through the policy's owned
             // stop-mode adapter (`check_initial_stop`) instead of the free
             // `earliest_stop_match` call this site used to make directly --
             // `full`/`token_logprob_end_offsets` are populated by the adapter
@@ -682,7 +682,7 @@ impl Qwen35Model {
         } else {
             None
         };
-        // `DecodePolicy::init` (codex round-2 major #2, PR #787) constructs
+        // `DecodePolicy::init` (PR #787) constructs
         // the policy AND records this prefill-derived first token's logprob
         // in the same call -- replaces the freestanding `record_logprob(...)`
         // call this site used to make independently of the policy.
@@ -710,7 +710,7 @@ impl Qwen35Model {
             let mut text = String::new();
             let mut throwaway_offsets: Vec<usize> = Vec::new();
             let delta = detok.push(&self.tokenizer, next_id);
-            // Codex round-3 major #1, PR #787 / Leo's ruling: routed through
+            // PR #787: routed through
             // the policy's owned stop-mode adapter (always `Disabled` here,
             // since `gen_cfg.stop_strings` is empty) instead of a manual
             // `text.push_str` + `on_token` call.
@@ -784,16 +784,15 @@ impl Qwen35Model {
                     &mut rng_state,
                 );
 
-                // One atomic per-step transition (ADR-080 C3 / codex round-1
-                // major #3, PR #787) -- see `DecodePolicy::transition`. Set
+                // One atomic per-step transition (ADR-080 C3, PR #787) -- see
+                // `DecodePolicy::transition`. Set
                 // stopped=true on a grammar stop so the caller sees a
                 // grammar-terminal stop as stopped=true, matching
                 // decode_loop's `return Ok(true)`. `policy.stop_mode` is
                 // always `Disabled` on this path (`gen_cfg.stop_strings` is
                 // empty); the adapter still threads text through to
                 // `on_token` and reports `Interrupted` when the caller's sink
-                // can no longer consume output (codex round-3 major #1, PR
-                // #787 / Leo's ruling).
+                // can no longer consume output.
                 let generated_len_before = generated_ids.len();
                 let outcome = policy.transition(
                     &mut token_logprobs,
@@ -970,12 +969,11 @@ impl Qwen35Model {
                     &mut rng_state,
                 );
 
-                // One atomic per-step transition (ADR-080 C3 / codex round-1
-                // major #3, PR #787) -- see `DecodePolicy::transition`.
+                // One atomic per-step transition (ADR-080 C3, PR #787) -- see
+                // `DecodePolicy::transition`.
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` at
                 // construction) owns the incremental byte-holdback
-                // stop-string match itself now (codex round-3 major #1, PR
-                // #787 / Leo's ruling) -- this call site supplies only
+                // stop-string match itself now -- this call site supplies only
                 // `decode_delta` (this loop's own detokenizer) and the
                 // shared `text`/`throwaway_offsets` buffers, so it can no
                 // longer independently choose to skip the real stop check.
@@ -1146,7 +1144,7 @@ fn test_take_first_sample_saw_prefill_end() -> Option<bool> {
 }
 
 /// Outcome of [`DecodePolicy::transition`], the one per-step call every decode
-/// loop drives through (ADR-080 C3 / codex round-1 major #3, PR #787).
+/// loop drives through (ADR-080 C3, PR #787).
 pub(crate) enum StepOutcome {
     /// The (possibly budget-overridden) token was rejected by the backend's
     /// own grammar advance before ever being pushed. The loop must stop with
@@ -1157,7 +1155,7 @@ pub(crate) enum StepOutcome {
     /// `stop_reason = Eos`.
     Eos,
     /// [`DecodePolicy::stop_check`] — driven internally from `self.stop_mode`
-    /// (codex round-3 major #1, PR #787 / Leo's ruling; see [`StopMode`]) —
+    /// (PR #787; see [`StopMode`]) —
     /// reported that a configured stop string matched as of this token. The
     /// token was pushed (via `push`) and every other backend-neutral
     /// per-step control already applied before `stop_check` ran; the loop
@@ -1183,7 +1181,7 @@ pub(crate) enum StepOutcome {
 }
 
 /// Outcome of the mandatory per-step stop-check [`DecodePolicy::transition`]
-/// drives internally (codex round-3 major #1, PR #787: the round-2 mandatory
+/// drives internally (PR #787: a mandatory
 /// `stop_check` closure could still compile as a trivial
 /// `|_, _| StopCheckOutcome::Continue` for a configuration that actually had
 /// stop strings — an arbitrary outcome-producing closure cannot be forced to
@@ -1230,8 +1228,8 @@ pub(crate) enum StopCheckOutcome {
 /// originally exposed each of these as a separate method
 /// (`apply_override` / `note_emitted` / `record_logprob` /
 /// `capture_reasoning_end` / `answer_budget_exhausted`), which let a call
-/// site choreograph a subset of them and skip another — codex round-1
-/// blocker #1 was exactly that failure mode: the Metal prefix-cache loop
+/// site choreograph a subset of them and skip another — that was exactly the
+/// failure mode observed live: the Metal prefix-cache loop
 /// called four of the five and silently never called `record_logprob`.
 /// `transition` replaces all five with the one call above; the five
 /// constituent methods are now private to this module, so a caller in a
@@ -1240,14 +1238,13 @@ pub(crate) enum StopCheckOutcome {
 /// to skip a control, and doing so breaks every one of these behaviors at
 /// once rather than silently dropping just one.
 ///
-/// Stop-string matching (codex round-3 major #1, PR #787 / Leo's Option A
-/// ruling): the streaming vs non-streaming consumption shapes genuinely
+/// Stop-string matching (PR #787): the streaming vs non-streaming consumption shapes genuinely
 /// differ (incremental byte-holdback via [`StopStringMatcher`] vs full-text
 /// rescan via `earliest_stop_match_from`), but which one applies — and
 /// whether checking happens at all — is now [`StopMode`], a value chosen
 /// exactly once from the real `gen_cfg.stop_strings` at [`DecodePolicy::init`]
 /// time and stored privately on the policy. A caller can no longer supply a
-/// closure that *decides* the stop outcome (round 2's `stop_check` parameter,
+/// closure that *decides* the stop outcome (a prior `stop_check` parameter,
 /// which could compile as a trivial `|_, _| Continue` for any configuration
 /// regardless of what `stop_strings` actually held); it supplies only raw
 /// per-token I/O primitives — a decoded delta (`decode_delta`) and a
@@ -1267,8 +1264,7 @@ pub(crate) struct DecodePolicy {
     stop_mode: StopMode,
 }
 
-/// The stop-string check adapter a [`DecodePolicy`] owns (codex round-3
-/// major #1, PR #787 / Leo's Option A ruling). The only place a value of this
+/// The stop-string check adapter a [`DecodePolicy`] owns (PR #787). The only place a value of this
 /// type is ever produced is the private [`StopMode::for_config`], called once
 /// from [`DecodePolicy::init`] on the real `gen_cfg.stop_strings` — there is
 /// no public constructor, so a caller cannot independently choose (or swap
@@ -1315,8 +1311,7 @@ impl StopMode {
 }
 
 impl DecodePolicy {
-    /// The first-step transition (codex round-2 major #2, PR #787 / Leo's
-    /// ruling): constructs the policy AND atomically records the
+    /// The first-step transition (PR #787): constructs the policy AND atomically records the
     /// prefill-derived first token's logprob in the same call, so there is no
     /// longer any way to build a `DecodePolicy` without also recording its
     /// first token's logprob. Before this, `new()` only built the struct and
@@ -1324,7 +1319,7 @@ impl DecodePolicy {
     /// `crate::sampling::record_logprob` for that one token — three
     /// call sites (this module's `generate()` / `generate_streaming_with_cancel()`,
     /// and Metal's `generate_streaming`) duplicated that call independently,
-    /// the exact drift pattern codex's round-1 blocker #1 already proved live
+    /// the exact drift pattern already proved live
     /// once for the *other* four constituent methods (see the struct-level
     /// doc comment above).
     ///
@@ -1384,7 +1379,7 @@ impl DecodePolicy {
     /// otherwise. Call after sampling, before grammar-advance (the actually-emitted
     /// token, post-override, is what grammar must advance on).
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`], which owns the full per-step ordering.
     fn apply_override(&self, generated_len: usize, sampled_id: u32) -> u32 {
         force_close_think(
@@ -1402,7 +1397,7 @@ impl DecodePolicy {
     /// succeeds, before the EOS/stop-token check — mirrors the original inline
     /// ordering across all six sites.
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`], which owns the full per-step ordering.
     fn note_emitted(&mut self, next_id: u32) {
         if Some(next_id) == self.think_close_id {
@@ -1415,7 +1410,7 @@ impl DecodePolicy {
     /// `</think>` itself is the last reasoning token, not the first answer token).
     /// A no-op once already captured or while the block is still open.
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`], which owns the full per-step ordering.
     fn capture_reasoning_end(&mut self, generated_len_after_push: usize) {
         if self.thinking_closed && self.reasoning_end_len.is_none() {
@@ -1426,7 +1421,7 @@ impl DecodePolicy {
     /// True once `max_new_tokens` answer tokens have followed the `</think>` close
     /// point — the decode loop should break on this, in addition to its normal cap.
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`], which owns the full per-step ordering.
     fn answer_budget_exhausted(&self, generated_len: usize) -> bool {
         self.reasoning_end_len
@@ -1439,14 +1434,14 @@ impl DecodePolicy {
     /// vocabulary is paid only when logprobs were actually requested).
     ///
     /// This is the ONLY place in the crate that pushes onto a
-    /// `token_logprobs: &mut Vec<TokenLogprob>` accumulator (codex round-3
-    /// medium #2, PR #787 / Leo's ruling): `crate::sampling` exposes only
+    /// `token_logprobs: &mut Vec<TokenLogprob>` accumulator (PR #787):
+    /// `crate::sampling` exposes only
     /// the pure computation (`compute_step_logprobs`), not a freestanding
     /// "record" function a sibling decode call site could invoke directly
     /// to recreate the exact duplicate-choreography bug this method's
     /// privacy already closes for the other four constituent methods.
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`] / [`DecodePolicy::init`], which own the
     /// full per-step ordering.
     fn record_logprob(
@@ -1467,8 +1462,7 @@ impl DecodePolicy {
         });
     }
 
-    /// The stop-check adapter dispatch (codex round-3 major #1, PR #787 /
-    /// Leo's Option A ruling): drives whichever [`StopMode`] this policy was
+    /// The stop-check adapter dispatch (PR #787): drives whichever [`StopMode`] this policy was
     /// constructed with, given the caller's freshly decoded delta text for
     /// the current token. The caller supplies no decision logic at all — only
     /// the decoded text and a sink for whatever text is confirmed safe to
@@ -1482,7 +1476,7 @@ impl DecodePolicy {
     /// correctly from the first token onward, exactly as it did when each
     /// call site constructed and drove its own matcher by hand.
     ///
-    /// Private (codex round-1 major #3 / round-3 major #1, PR #787): only
+    /// Private (PR #787): only
     /// reachable through the two methods above.
     fn stop_check(
         &mut self,
@@ -1553,8 +1547,7 @@ impl DecodePolicy {
     }
 
     /// Checks the prefill-derived first token's already-decoded delta text
-    /// against this policy's stop-mode (codex round-3 major #1, PR #787 /
-    /// Leo's ruling), before the decode loop starts — the first token is
+    /// against this policy's stop-mode (PR #787), before the decode loop starts — the first token is
     /// pushed and its logprob recorded by [`DecodePolicy::init`] outside
     /// `transition`'s per-step scope (it has no preceding grammar-advance /
     /// EOS check of its own to run through `transition` for), so its
@@ -1580,7 +1573,7 @@ impl DecodePolicy {
         )
     }
 
-    /// The one per-step transition (ADR-080 C3 / codex round-1 major #3, PR
+    /// The one per-step transition (ADR-080 C3, PR
     /// #787): atomically applies, in the fixed order every decode loop
     /// requires, the reasoning-budget override, the backend's grammar-advance
     /// callback, the emitted-token bookkeeping, the backend's EOS/stop-token
@@ -1601,7 +1594,7 @@ impl DecodePolicy {
     /// `forward_step`) — the caller cannot hand that ownership to the policy.
     ///
     /// `decode_delta` / `text` / `token_logprob_end_offsets` / `emit_confirmed`
-    /// (codex round-3 major #1, PR #787 / Leo's ruling) replace round-2's
+    /// (PR #787) replace an earlier
     /// arbitrary outcome-producing `stop_check` closure: the caller supplies
     /// only raw I/O (decode a token to text; a buffer to accumulate into; an
     /// offset tracker only `StopMode::FullScan` consults; a sink for
@@ -1815,8 +1808,8 @@ fn decode_loop(
             rng_state,
         );
 
-        // One atomic per-step transition (ADR-080 C3 / codex round-1 major
-        // #3, PR #787): budget override, grammar-advance callback, emitted
+        // One atomic per-step transition (ADR-080 C3, PR #787): budget
+        // override, grammar-advance callback, emitted
         // bookkeeping, EOS callback, push callback, logprobs, reasoning-end
         // capture, the stop-check adapter, and the answer-budget check, all
         // in the fixed required order -- see `DecodePolicy::transition`. This
@@ -1827,8 +1820,8 @@ fn decode_loop(
         // at the very end by `decode_tokens`) -- `decode_delta`/`text`/
         // `token_logprob_end_offsets`/`emit_confirmed` are therefore
         // throwaway values the `Disabled` dispatch never populates
-        // meaningfully (codex round-3 major #1, PR #787 / Leo's ruling: this
-        // is honest, not an escape hatch -- the empty-stop_strings guarantee
+        // meaningfully (this is honest, not an escape hatch -- the
+        // empty-stop_strings guarantee
         // now lives in `policy.stop_mode`, derived from the real config at
         // `DecodePolicy::init`, not in a caller-chosen closure).
         let generated_len_before = generated_ids.len();
@@ -1936,9 +1929,9 @@ fn decode_loop_with_stops(
             rng_state,
         );
 
-        // One atomic per-step transition (ADR-080 C3 / codex round-1 major
-        // #3, PR #787) -- see `DecodePolicy::transition`. The stop-check
-        // adapter (codex round-3 major #1, PR #787 / Leo's ruling) now owns
+        // One atomic per-step transition (ADR-080 C3, PR #787) -- see
+        // `DecodePolicy::transition`. The stop-check
+        // adapter now owns
         // the rescan/truncate work this loop used to run itself in a
         // `stop_check` closure -- this call site supplies only `decode_delta`
         // (this loop's own detokenizer) and the shared `full`/
@@ -2044,7 +2037,7 @@ fn decode_loop_with_stops(
 /// one entry per whole token; a token whose text was only partially retained
 /// can't be represented as a partial entry, so it — and any token after it —
 /// is dropped rather than left describing text the caller never receives in
-/// `message.content` (#620 round-1 review finding).
+/// `message.content` (#620).
 ///
 /// `token_logprob_end_offsets[i]` must be the length of the accumulated
 /// output text immediately after token `i`'s delta was appended, and the two
@@ -2176,8 +2169,8 @@ pub(crate) fn check_reasoning_budget_not_set(
     Ok(())
 }
 
-/// Sibling guard to [`check_reasoning_budget_not_set`] (codex round-2 medium
-/// #4, PR #787): fails closed instead of silently ignoring an active MTP
+/// Sibling guard to [`check_reasoning_budget_not_set`] (PR #787): fails
+/// closed instead of silently ignoring an active MTP
 /// request on a generation path that never reads `gen_cfg.enable_mtp`.
 ///
 /// Resolves `enable_mtp` exactly like the Metal `generate()` entry point
@@ -3117,7 +3110,7 @@ mod tests {
     /// then the post-prefill checkpoint (call 2, immediately after prefill,
     /// before sampling) sees `true` and must stop before ANY token is
     /// sampled or emitted. This isolates the post-prefill checkpoint
-    /// specifically (ADR-080 C2 round 2, codex round-1 medium finding #3):
+    /// specifically (ADR-080 C2):
     /// the pre-prefill test above (`n == 1`) cannot tell the two checkpoints
     /// apart, since removing the post-prefill one entirely still leaves that
     /// test green (its cancellation already fires at checkpoint 1).
@@ -3555,7 +3548,7 @@ mod tests {
 
     /// Stop-string truncation must drop `token_logprobs` entries whose decoded
     /// text didn't fully survive the truncation, not leave them describing
-    /// bytes the caller never sees in `text` (#620 round-1 review finding:
+    /// bytes the caller never sees in `text` (#620:
     /// `build_choice_logprobs` in lattice.rs builds `logprobs.content` directly
     /// off `token_logprobs`, so a stale entry there silently corrupts the
     /// OpenAI-compatible response).
@@ -3608,7 +3601,7 @@ mod tests {
         );
     }
 
-    /// Codex round-3 medium #2 (PR #787 / Leo's ruling): with `gen_cfg.logprobs`
+    /// PR #787: with `gen_cfg.logprobs`
     /// left at its default (`None`), `DecodePolicy::record_logprob` (driven by
     /// both `init` for the prefill token and `transition` for every token
     /// after) must be a true no-op -- `token_logprobs` stays empty for the
@@ -3643,7 +3636,7 @@ mod tests {
         );
     }
 
-    /// Codex round-2 major #2 (PR #787 / Leo's ruling): isolates
+    /// PR #787: isolates
     /// `DecodePolicy::init`'s first-step logprob ownership from
     /// `transition`'s per-step logprob ownership, which
     /// `transition_records_one_logprob_per_generated_token` below already
@@ -3692,7 +3685,7 @@ mod tests {
         );
     }
 
-    /// Codex round-1 major #3 (PR #787): `DecodePolicy::transition` owns
+    /// PR #787: `DecodePolicy::transition` owns
     /// `record_logprob` internally now (the constituent method is private,
     /// only reachable through `transition`). This asserts the positive case
     /// the truncation test above does not: with no stop string to truncate
@@ -3743,7 +3736,7 @@ mod tests {
     // Public-prefill-delegation token parity (perf_hunt public-prefill
     // experiment). Requires a real dense Qwen3.5 checkpoint; set
     // LATTICE_INFERENCE_MODEL_DIR to a safetensors directory (e.g.
-    // /Users/lion/.lattice/models/qwen3.5-0.8b). Ignored by default so CI
+    // ~/.lattice/models/qwen3.5-0.8b). Ignored by default so CI
     // and plain `cargo test` runs never depend on local model files.
     // -------------------------------------------------------------------
 
