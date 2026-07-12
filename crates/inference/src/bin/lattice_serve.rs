@@ -975,7 +975,6 @@ mod imp {
             // minimal server has no logprobs implementation at all, so a
             // `logprobs: true` request never reaches here (see below).
             logprobs: None,
-            disable_eos: false,
         })
     }
 

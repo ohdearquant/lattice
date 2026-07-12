@@ -272,13 +272,14 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
         .unwrap_or(16);
 
     let model_dir = resolve_model_dir(args);
-    let model = match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(&model_dir) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("FAIL: could not load model from {model_dir:?}: {e}");
-            return 1;
-        }
-    };
+    let mut model =
+        match lattice_inference::model::qwen35::Qwen35Model::from_safetensors(&model_dir) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("FAIL: could not load model from {model_dir:?}: {e}");
+                return 1;
+            }
+        };
     emit_phase(t0, "backend_ready");
 
     let prompt = match build_prompt_of_exact_length(&model, context) {
@@ -297,6 +298,19 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
         return 1;
     }
 
+    // Force continuation past EOS / configured stop-token ids so this trial
+    // always decodes the exact requested token count. `GenerateConfig` is a
+    // plain public-literal struct with a `Default` impl -- a dedicated
+    // request-scoped field there would be `constructible_struct_adds_field`
+    // under `cargo-semver-checks` (a semver-major break); overriding the
+    // model's own post-load `eos_token_id` instead (via `config_mut`, the
+    // idiom this crate's own test suite already uses) plus
+    // `stop_token_ids: vec![]` below achieves the identical effect through
+    // `should_stop_token` (the single shared stop predicate every CPU/Metal
+    // decode loop calls) without adding any new public surface to
+    // `GenerateConfig`.
+    model.config_mut().eos_token_id = u32::MAX;
+
     // The deterministic profile (DESIGN.md section 2 "initial inference
     // profile"): greedy, EOS disabled (forced fixed-length decode),
     // temperature 0 / top-k 1 / top-p 1 / repetition_penalty 1, thinking and
@@ -311,7 +325,6 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
         stop_token_ids: vec![],
         enable_thinking: false,
         enable_mtp: Some(false),
-        disable_eos: true,
         ..Default::default()
     };
 

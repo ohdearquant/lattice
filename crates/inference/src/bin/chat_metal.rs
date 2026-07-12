@@ -811,7 +811,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         stop_strings: vec![],
         reasoning_budget,
         logprobs: None,
-        disable_eos: false,
     };
 
     // ── JSON modes (used by Lattice Studio app) ─────────────────────────────
@@ -901,7 +900,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     stop_strings: vec![],
                     reasoning_budget: parsed.reasoning_budget,
                     logprobs: None,
-                    disable_eos: false,
                 };
 
                 // Each request's full ChatML history is re-sent in `prompt` (the

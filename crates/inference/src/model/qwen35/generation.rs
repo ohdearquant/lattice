@@ -2070,13 +2070,6 @@ pub(crate) fn should_stop_token(
     gen_cfg: &GenerateConfig,
     token_id: u32,
 ) -> bool {
-    if gen_cfg.disable_eos {
-        // Benchmark determinism knob (`GenerateConfig::disable_eos`): force
-        // continuation past EOS / configured stop-token ids so every trial
-        // decodes the exact requested token count. Default `false` leaves
-        // this function byte-for-byte unchanged (parity-safe).
-        return false;
-    }
     token_id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&token_id)
 }
 
@@ -2821,76 +2814,111 @@ mod tests {
         );
     }
 
-    /// `disable_eos: true` (the flagship CPU/Metal benchmark determinism
-    /// knob -- `qwen35_generate --emit-phase-events`) must force
-    /// continuation past a token that would otherwise stop generation on
-    /// the very first step, so a benchmark trial always decodes the exact
-    /// requested `max_new_tokens` count.
+    /// `Qwen35Model::config_mut().eos_token_id = u32::MAX` combined with
+    /// `GenerateConfig::stop_token_ids: vec![]` (the flagship CPU/Metal
+    /// benchmark determinism knob -- `qwen35_generate --emit-phase-events`,
+    /// PR #882) must force continuation past a token that would otherwise
+    /// stop generation on the very first step, so a benchmark trial always
+    /// decodes the exact requested `max_new_tokens` count.
     ///
-    /// Same zero-weight-model / `stop_token_ids = [0]` setup as
-    /// `stop_reason_eos_on_first_stop_token` above (which proves the
-    /// baseline DOES stop early without this flag) -- the only difference
-    /// is `disable_eos: true`.
+    /// This is the established idiom (`cfg.eos_token_id = u32::MAX`) used
+    /// throughout this crate's own test suite to push EOS out of the
+    /// reachable vocab range, rather than a dedicated `GenerateConfig`
+    /// field: `GenerateConfig` is a plain public-literal struct with a
+    /// `Default` impl, so a new field there is
+    /// `constructible_struct_adds_field` under `cargo-semver-checks`, a
+    /// semver-major break `Qwen35Model.config` (private, `config_mut`
+    /// setter) does not incur.
     ///
-    /// Mutation sensitivity: removing the `if gen_cfg.disable_eos { return
-    /// false; }` short-circuit at the top of `should_stop_token` makes this
-    /// generation stop after 1 token instead of running to
-    /// `max_new_tokens = 5`, failing both assertions below.
+    /// Two-phase design (baseline, then override), both driven through
+    /// `config_mut()`: `build_tiny_zero_model` always greedy-samples token 0
+    /// from this all-zero-logit fixture (see the sibling comment on
+    /// `stop_reason_eos_on_first_stop_token`), so phase 1 first points the
+    /// model's own `eos_token_id` AT 0 via `config_mut()` and confirms that
+    /// alone stops generation immediately (`StopReason::Eos`, 0 tokens
+    /// emitted) -- this is itself mutation-sensitive to `config_mut()`
+    /// returning a real reference into
+    /// `Qwen35Model`'s private `config` field rather than, say, a detached
+    /// clone: a detached clone would leave the real `eos_token_id` at its
+    /// original `VOCAB - 1 = 96`, which the greedy-sampled token 0 never
+    /// matches, so phase 1's own assertions would fail first. Phase 2 then
+    /// re-points `eos_token_id` at the unreachable `u32::MAX` sentinel and
+    /// confirms the SAME config now runs to `max_new_tokens` instead.
     #[test]
-    fn disable_eos_forces_continuation_past_matching_stop_token() {
-        let model = build_tiny_zero_model();
+    fn eos_token_id_override_forces_continuation_past_matching_stop_token() {
+        let mut model = build_tiny_zero_model();
         let gen_cfg = GenerateConfig {
             max_new_tokens: 5,
             temperature: 0.0,
-            stop_token_ids: vec![0], // would otherwise fire on the first greedy-sampled token
-            disable_eos: true,
+            stop_token_ids: vec![], // benchmark profile: no configured stop tokens either
             ..Default::default()
         };
+
+        // Phase 1 (baseline): point eos_token_id at the always-sampled
+        // token 0 -- must stop after exactly 1 token.
+        model.config_mut().eos_token_id = 0;
+        let baseline = model
+            .generate("a", &gen_cfg)
+            .expect("baseline generate must succeed");
+        assert_eq!(
+            baseline.stop_reason,
+            Some(StopReason::Eos),
+            "sanity: eos_token_id = 0 must stop generation on the first greedy-sampled \
+             token (this fixture always samples token 0); got {:?} -- if this fails, \
+             config_mut() is not reaching the real config should_stop_token reads",
+            baseline.stop_reason
+        );
+        assert_eq!(
+            baseline.generated_tokens, 0,
+            "sanity: eos_token_id = 0 must stop before any token is emitted into the \
+             output (the matching token itself is excluded, per should_stop_token's \
+             stop-before-append semantics -- see stop_reason_eos_on_first_stop_token \
+             above), got {}",
+            baseline.generated_tokens
+        );
+
+        // Phase 2 (the benchmark override): push eos_token_id out of the
+        // reachable vocab range -- the same config now runs to max_new_tokens.
+        model.config_mut().eos_token_id = u32::MAX;
         let result = model
             .generate("a", &gen_cfg)
-            .expect("disable_eos generate must succeed");
+            .expect("eos-override generate must succeed");
         assert_eq!(
             result.stop_reason,
             Some(StopReason::Length),
-            "disable_eos must force the loop to run to max_new_tokens (StopReason::Length), \
-             not stop early on a matching stop_token_ids entry; got {:?}",
+            "overriding eos_token_id out of range must force the loop to run to \
+             max_new_tokens (StopReason::Length), not stop early; got {:?}",
             result.stop_reason
         );
         assert_eq!(
             result.generated_tokens, 5,
-            "disable_eos must decode exactly max_new_tokens (5), got {}",
+            "eos_token_id override must decode exactly max_new_tokens (5), got {}",
             result.generated_tokens
         );
     }
 
-    /// Sibling of the test above, covering `should_stop_token`'s OTHER
-    /// branch (`cfg.eos_token_id`, not `stop_token_ids`): `disable_eos`
-    /// must also suppress a match against the model's own configured EOS
-    /// id. `build_tiny_zero_model` sets `eos_token_id = VOCAB - 1 = 96`;
-    /// the tiny tokenizer's `"a"` prompt plus all-zero logits normally
-    /// greedy-samples token 0, not 96, so this test instead drives
-    /// `should_stop_token` directly (the pure predicate `generate()`'s
+    /// Sibling of the test above, covering `should_stop_token`'s
+    /// `cfg.eos_token_id` branch directly (the pure predicate `generate()`'s
     /// decode loop calls every step) rather than threading a real decode
-    /// run through to a token-96 sample.
+    /// run through to confirm the override takes effect.
     #[test]
-    fn disable_eos_suppresses_eos_token_id_match_in_should_stop_token() {
-        let model = build_tiny_zero_model();
+    fn eos_token_id_override_suppresses_match_in_should_stop_token() {
+        let mut model = build_tiny_zero_model();
         let base_cfg = GenerateConfig {
             stop_token_ids: vec![],
             ..Default::default()
         };
+        let original_eos_token_id = model.config.eos_token_id;
         assert!(
-            should_stop_token(&model.config, &base_cfg, model.config.eos_token_id),
-            "sanity: without disable_eos, the model's own eos_token_id must stop generation"
+            should_stop_token(&model.config, &base_cfg, original_eos_token_id),
+            "sanity: without the override, the model's own eos_token_id must stop generation"
         );
-        let disabled_cfg = GenerateConfig {
-            stop_token_ids: vec![],
-            disable_eos: true,
-            ..Default::default()
-        };
+        model.config_mut().eos_token_id = u32::MAX;
         assert!(
-            !should_stop_token(&model.config, &disabled_cfg, model.config.eos_token_id),
-            "disable_eos: true must suppress a match against cfg.eos_token_id too"
+            !should_stop_token(&model.config, &base_cfg, original_eos_token_id),
+            "eos_token_id override must suppress a match against the model's original \
+             (now-superseded) eos_token_id -- the sentinel u32::MAX itself trivially \
+             matches u32::MAX, so this must check the ORIGINAL id stays unmatched"
         );
     }
 

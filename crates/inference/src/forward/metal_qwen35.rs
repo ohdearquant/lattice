@@ -649,7 +649,6 @@ mod route_predicate_tests {
             stop_strings,
             reasoning_budget: None,
             logprobs: None,
-            disable_eos: false,
         }
     }
 
@@ -21633,7 +21632,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let out = state
@@ -21673,7 +21671,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let out = state
@@ -21705,7 +21702,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let out = with_self_spec_env(|| {
@@ -21751,7 +21747,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let mut deltas: Vec<String> = vec![];
@@ -21794,7 +21789,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let slot = crate::kv_cache::CrossTurnSlotId::new(1);
@@ -21849,7 +21843,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let out = state
@@ -21899,7 +21892,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let out = with_self_spec_env(|| {
@@ -22030,7 +22022,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -22107,7 +22098,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -22187,7 +22177,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -22266,7 +22255,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -22359,7 +22347,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -22453,7 +22440,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -22556,7 +22542,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let baseline = {
@@ -22627,7 +22612,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -22682,7 +22666,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -22751,7 +22734,6 @@ mod inner {
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
-                disable_eos: false,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -22833,7 +22815,6 @@ mod inner {
                 grammar: None,
                 stop_strings: vec![],
                 reasoning_budget: None,
-                disable_eos: false,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -22918,7 +22899,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -22980,7 +22960,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: Some(2),
                 logprobs: None,
-                disable_eos: false,
             };
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -23028,7 +23007,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: Some(0),
-                disable_eos: false,
             };
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -23072,7 +23050,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -23137,7 +23114,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let (mut cfg, weights) = tiny_hybrid_fixture();
@@ -23236,7 +23212,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let mut state = with_self_spec_env(|| {
@@ -25839,7 +25814,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             }
         }
 
@@ -27531,7 +27505,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -27589,7 +27562,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let mut on_token_calls = 0u32;
@@ -27661,7 +27633,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let result = state.generate_streaming_with_prefix_cache(
@@ -27730,7 +27701,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: Some(5),
-                disable_eos: false,
             };
 
             let result = state.generate_streaming_with_prefix_cache(
@@ -28320,7 +28290,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
@@ -28378,7 +28347,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let mut on_token_calls = 0u32;
@@ -28447,7 +28415,6 @@ mod inner {
                 stop_strings: vec![],
                 reasoning_budget: None,
                 logprobs: None,
-                disable_eos: false,
             };
 
             let result = state.generate_streaming_with_prefix_cache(

@@ -1596,7 +1596,6 @@ mod tests {
             stop_strings: vec!["STOP".to_string()],
             reasoning_budget: Some(3),
             logprobs: Some(2),
-            disable_eos: false,
         };
         let snapshot = GenerateConfigSnapshot::from(&cfg);
         assert_eq!(snapshot.max_new_tokens, 42);
