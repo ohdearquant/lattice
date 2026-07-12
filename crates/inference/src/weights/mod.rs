@@ -2,6 +2,7 @@
 pub mod f16_weights;
 pub mod f32_weights;
 pub(crate) mod half_bits;
+pub(crate) mod ingress;
 pub mod q4_weights;
 pub mod q8_weights;
 
