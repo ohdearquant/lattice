@@ -3683,6 +3683,26 @@ mod inner {
         FORCED_MOE_EXPERTS_FOR_TEST.with(|c| *c.borrow_mut() = experts);
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only override for `MetalQwen35State::encode_moe_ffn`'s
+        /// routed-expert prefetch fan-out (#682 Stage 2): `None` (the
+        /// production default) prefetches via rayon; `Some(false)` forces
+        /// the identical pre-assigned plan through a plain serial
+        /// iterator instead, so a test can assert the two fan-out
+        /// strategies produce byte-identical decode output from the same
+        /// checkpoint and token sequence. `Some(true)` forces rayon
+        /// explicitly (same as unset, provided for symmetry). Cleared
+        /// with `None` between tests by the caller.
+        static MOE_PREFETCH_PARALLEL_FOR_TEST: std::cell::RefCell<Option<bool>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_moe_prefetch_parallel_for_test(parallel: Option<bool>) {
+        MOE_PREFETCH_PARALLEL_FOR_TEST.with(|c| *c.borrow_mut() = parallel);
+    }
+
     impl MetalQwen35State {
         /// **Unstable**: create from CPU weights; weight layout and f16 conversion may change.
         pub fn new(
@@ -10736,6 +10756,37 @@ mod inner {
                 }
             }
 
+            // #682 Stage 2: issue every routed expert's cache load NOW —
+            // right after routing, before Step 2's shared-expert GEMVs are
+            // encoded — instead of one at a time inside the Step 3 loop
+            // below. Cold-expert mmap reads + CPU dequant then overlap
+            // with the shared-expert GEMV dispatches (and any
+            // already-cached routed experts cost nothing extra). This
+            // must run before `RoutedExpertStorage::Cached`'s
+            // `begin_token()` bookkeeping is otherwise consulted, and
+            // Step 3 below relies on every selected expert already being
+            // resident by the time its loop runs. `RoutedExpertStorage::
+            // Eager` (the safetensors-upload path) has no cache to
+            // prefetch into.
+            if let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed {
+                gate_up.borrow_mut().begin_token();
+                down.borrow_mut().begin_token();
+
+                let expert_ids: Vec<usize> = selected
+                    .iter()
+                    .filter(|&&(id, _)| id != usize::MAX)
+                    .map(|&(id, _)| id)
+                    .collect();
+
+                #[cfg(test)]
+                let parallel = MOE_PREFETCH_PARALLEL_FOR_TEST.with(|c| c.borrow().unwrap_or(true));
+                #[cfg(not(test))]
+                let parallel = true;
+
+                gate_up.borrow_mut().prefetch_experts(&expert_ids, parallel);
+                down.borrow_mut().prefetch_experts(&expert_ids, parallel);
+            }
+
             // ── Step 2: Shared expert (always active) ─────────────────────────────
             // Compute scalar sigmoid gate on CPU.
             let sg_ptr = moe.shared_expert_gate.contents() as *const f32;
@@ -10839,16 +10890,12 @@ mod inner {
             // ── Step 3: Routed experts ────────────────────────────────────────────
             let inter_u32 = inter as u32;
 
-            // #682 Stage 1: `RoutedExpertStorage::Cached` (the `.q4`-loaded
-            // path) needs its "touched this token" bookkeeping cleared
-            // before any `resolve()` call this token — see
-            // `moe_expert_cache`'s module doc comment for why that makes
-            // slot eviction safe. `RoutedExpertStorage::Eager` (the
-            // safetensors-upload path) has no cache to reset.
-            if let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed {
-                gate_up.borrow_mut().begin_token();
-                down.borrow_mut().begin_token();
-            }
+            // #682 Stage 2: `RoutedExpertStorage::Cached`'s "touched this
+            // token" bookkeeping was already cleared, and every selected
+            // expert already prefetched into its slot, right after
+            // routing (see above, before Step 2) — this loop now only
+            // looks resident slots up (`get_prefetched`), it never
+            // triggers a miss/dequant itself.
 
             for &(expert_id, router_weight) in selected.iter() {
                 if expert_id == usize::MAX {
@@ -10875,8 +10922,11 @@ mod inner {
                             (gate_up.clone(), gate_off, up_off, down.clone(), down_off)
                         }
                         RoutedExpertStorage::Cached { gate_up, down } => {
-                            let gate_up_buf = gate_up.borrow_mut().resolve(expert_id).clone();
-                            let down_buf = down.borrow_mut().resolve(expert_id).clone();
+                            // #682 Stage 2: already prefetched above, right
+                            // after routing — this is a pure lookup, no
+                            // hit/miss accounting or eviction here.
+                            let gate_up_buf = gate_up.borrow().get_prefetched(expert_id).clone();
+                            let down_buf = down.borrow().get_prefetched(expert_id).clone();
                             (gate_up_buf, 0u32, (inter * hidden) as u32, down_buf, 0u32)
                         }
                     };
@@ -16558,7 +16608,7 @@ mod inner {
     mod tests {
         use super::super::{
             LM_HEAD_TOPK_TIE_EPSILON, LM_HEAD_TOPK_TIE_EPSILON_Q4, TopkSetAgreement,
-            topk_set_agreement_or_boundary_tie,
+            mtp_tensor_path, topk_set_agreement_or_boundary_tie,
         };
         // Fixture helpers for the MTP Q4/F16 loader tests below now live in
         // the top-level `mtp_resolve_tests` module (moved out of
@@ -18509,7 +18559,16 @@ mod inner {
         /// each `row_const[e] * (non-negative scalar)`, preserving the
         /// `row_const` ordering across experts regardless of the exact
         /// hidden-state magnitude.
-        const MOE_FIXTURE_ROUTER_ROW_VALUES: [f32; 4] = [1.0, 2.0, 6.0, 3.0];
+        // First 4 entries are load-bearing for every `num_experts=4` fixture
+        // (expert 2 must deterministically win top-1 routing — see the doc
+        // comment above). Entries beyond index 3 exist only so a bigger
+        // `num_experts` fixture (e.g. the Stage 2 throughput benchmark,
+        // which always overrides routing via `FORCED_MOE_EXPERTS_FOR_TEST`
+        // and so never actually reads these logits) doesn't index out of
+        // bounds; their exact values are unused/don't-care.
+        const MOE_FIXTURE_ROUTER_ROW_VALUES: [f32; 16] = [
+            1.0, 2.0, 6.0, 3.0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+        ];
         const MOE_FIXTURE_TARGET_EXPERT: usize = 2;
 
         /// Write the full synthetic 1-layer MoE Q4 checkpoint used by both
@@ -19444,6 +19503,354 @@ mod inner {
                  mutating an already-loaded, already-decoded-against checkpoint in place rather \
                  than starting from two independently built checkpoints (unmutated={unmutated:?}, \
                  mutated={mutated:?})"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // #682 Stage 2: prefetch overlap (hide I/O behind compute). Every
+        // routed expert's cache load for a token is now planned and
+        // dequantized up front (`ExpertSlotCache::prefetch_experts`), right
+        // after CPU routing and before Step 2's shared-expert GEMVs are
+        // encoded, instead of one at a time inside the Step 3 dispatch loop
+        // Stage 1 used — see `moe_expert_cache`'s module doc comment for why
+        // the plan/dequant split keeps the within-token touched-slot
+        // invariant intact even when the dequant phase fans out across
+        // rayon threads.
+        // -------------------------------------------------------------------
+
+        /// Pure cache-bookkeeping test: constructs two real `ExpertSlotCache`s
+        /// (Metal buffer allocation needs a real `Device`, hence
+        /// `gpu_test_lock()` — this file's blanket "every Metal-touching
+        /// test serializes" convention) but never encodes or dispatches a
+        /// single GPU command, so there is no numerics/timing surface to
+        /// race here — this is `plan_prefetch`'s bookkeeping logic in
+        /// isolation, not a decode-path integration test.
+        ///
+        /// Builds two independently constructed `ExpertSlotCache`s over the
+        /// identical tiny synthetic tensor (same shape, same slot count),
+        /// replays the SAME sequence of `plan_prefetch` calls (simulating
+        /// three tokens' worth of routing decisions, engineered to force
+        /// both hits and an evicting miss) against both, and asserts:
+        /// (1) determinism — two independently built caches with identical
+        /// starting state produce the byte-identical sequence of
+        /// `(slot, expert_id)` prefetch tasks for the same inputs; (2)
+        /// non-overlap — within any single `plan_prefetch` call, every
+        /// returned task's slot is distinct, i.e. nothing is ever planned
+        /// to write into a slot another task from the same call also owns
+        /// (the invariant `prefetch_experts`'s parallel dequant phase
+        /// relies on to be race-free).
+        #[test]
+        fn moe_prefetch_plan_is_deterministic_and_non_overlapping() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            // 6 experts, a tiny per-expert-row tensor — shape
+            // [experts, mid, cols], `cols` a 32-multiple (block-aligned)
+            // like every other synthetic MoE fixture in this file.
+            let experts = 6usize;
+            let mid = 1usize;
+            let cols = 32usize;
+            let name = "prefetch_plan_test.experts.gate_up_proj";
+            write_tiny_q4_fixture_per_expert_row(dir, name, experts, mid, cols, |e, _m| {
+                0.01 * (e as f32 + 1.0)
+            });
+            let path = mtp_tensor_path(dir, name, "q4");
+
+            let build_cache = || {
+                crate::forward::moe_expert_cache::ExpertSlotCache::new(
+                    &device,
+                    &path,
+                    &[experts, mid, cols],
+                    3, // num_slots < num_experts: forces eviction below
+                    "prefetch_plan_test.cache",
+                )
+                .expect("ExpertSlotCache::new over the tiny fixture")
+            };
+            let mut cache_a = build_cache();
+            let mut cache_b = build_cache();
+
+            // Three "tokens" worth of top_k=3 selections: token 0 is
+            // all-miss (cold cache, fills all 3 slots); token 1 mixes hits
+            // (0, 1 still resident) with a miss (5) that must evict the one
+            // untouched slot (2's, since 0 and 1 are protected by this same
+            // call's hit-touch); token 2 is all-miss again after full
+            // turnover.
+            let token_selections: [&[usize]; 3] = [&[0, 1, 2], &[0, 1, 5], &[3, 4, 5]];
+
+            for selection in token_selections {
+                cache_a.begin_token();
+                cache_b.begin_token();
+                let tasks_a = cache_a.plan_prefetch(selection);
+                let tasks_b = cache_b.plan_prefetch(selection);
+
+                let as_pairs = |tasks: &[crate::forward::moe_expert_cache::PrefetchTask]| {
+                    tasks
+                        .iter()
+                        .map(|t| (t.slot, t.expert_id))
+                        .collect::<Vec<_>>()
+                };
+                let pairs_a = as_pairs(&tasks_a);
+                let pairs_b = as_pairs(&tasks_b);
+                assert_eq!(
+                    pairs_a, pairs_b,
+                    "plan_prefetch({selection:?}) must be deterministic: two independently \
+                     built caches with identical starting state produced different \
+                     (slot, expert_id) task lists"
+                );
+
+                let mut slots: Vec<usize> = pairs_a.iter().map(|&(slot, _)| slot).collect();
+                let before = slots.len();
+                slots.sort_unstable();
+                slots.dedup();
+                assert_eq!(
+                    slots.len(),
+                    before,
+                    "plan_prefetch({selection:?}) assigned the same slot to more than one miss \
+                     task within a single call — this is exactly the race the pre-assignment \
+                     step exists to prevent"
+                );
+            }
+        }
+
+        /// Integration parity test: the real `encode_moe_ffn` decode path,
+        /// under enough eviction pressure to force real hits/misses/
+        /// evictions across several tokens, must produce byte-identical
+        /// logits whether `ExpertSlotCache::prefetch_experts`'s dequant
+        /// phase fans out across rayon (the production default) or runs
+        /// the identical pre-assigned plan through a plain serial iterator
+        /// (`set_moe_prefetch_parallel_for_test(Some(false))`) — prefetch
+        /// must only change WHEN bytes are dequantized, never WHICH bytes
+        /// end up in which slot.
+        ///
+        /// Mutation check (manually verified, not compiled in): forcing
+        /// `plan_prefetch` to assign every miss task `slot: 0` (breaking
+        /// the pre-assignment step, simulating a lost race between
+        /// concurrent dequant writes into the same slot) was checked by
+        /// hand. `prefetch_experts` still runs the collect-then-apply
+        /// sequence single-threaded either way (the current design never
+        /// actually races a write even when the plan is broken — it only
+        /// ever applies one result per slot at a time, "last result wins"
+        /// under the broken plan), so this particular mutation does NOT
+        /// reliably fail this decode-parity test — it was observed to pass
+        /// unchanged. What DOES catch it, immediately and deterministically,
+        /// is the plan-determinism/non-overlap test above
+        /// (`moe_prefetch_plan_is_deterministic_and_non_overlapping`),
+        /// which asserts every task in one `plan_prefetch` call has a
+        /// distinct slot — it failed loudly against the broken
+        /// `plan_prefetch` (`assigned the same slot to more than one miss
+        /// task`). That test is therefore the one this module actually
+        /// relies on to guard the pre-assignment invariant; this
+        /// decode-parity test's job is proving prefetch changes nothing
+        /// about correct output, not proving the invariant itself. The
+        /// change was reverted after confirming this.
+        #[test]
+        fn moe_prefetch_parallel_and_serial_produce_identical_decode_output() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config_top_k2();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            let tokenizer_path = std::path::Path::new("/dev/null");
+
+            // ~50%-style miss pressure on a 4-expert, top_k=2 fixture: 2
+            // slots means every token's 2 selections can never both be
+            // resident from the previous token unless they're the exact
+            // same pair, so this selection cycle forces a genuine mix of
+            // hits and evicting misses across 5 decode steps.
+            let selections: [Vec<usize>; 5] =
+                [vec![0, 1], vec![1, 2], vec![2, 3], vec![3, 0], vec![0, 1]];
+            let tokens: [u32; 5] = [1, 2, 3, 4, 1];
+
+            let run = |parallel: bool| -> Vec<Vec<f32>> {
+                let mut state = {
+                    let _env = EnvVarGuard::set(
+                        crate::forward::moe_expert_cache::MOE_EXPERT_CACHE_SLOTS_ENV,
+                        "2",
+                    );
+                    MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                        .expect("from_q4_dir (top_k=2, forced-eviction N=2) must load")
+                };
+                set_moe_prefetch_parallel_for_test(Some(parallel));
+                let mut all_logits = Vec::new();
+                for (position, (&token, selection)) in
+                    tokens.iter().zip(selections.iter()).enumerate()
+                {
+                    let _forced = ForcedMoeExpertsGuard::set(selection.clone());
+                    let logits = state.forward_step(token, position);
+                    assert!(
+                        logits.iter().all(|v| v.is_finite()),
+                        "parallel={parallel} step {position} produced non-finite logits: \
+                         {logits:?}"
+                    );
+                    all_logits.push(logits);
+                }
+                set_moe_prefetch_parallel_for_test(None);
+                all_logits
+            };
+
+            let serial = run(false);
+            let parallel = run(true);
+
+            assert_eq!(
+                serial, parallel,
+                "prefetch must not change decode output, only timing: serial and rayon-\
+                 parallel dequant fan-out over the identical pre-assigned plan produced \
+                 different logits across a forced hit/miss/eviction decode sequence"
+            );
+        }
+
+        /// A bigger MoE fixture than [`synthetic_moe_test_config`]'s
+        /// (`moe_inter=32`, negligible per-expert bytes) purely for the
+        /// throughput measurement below — the tiny correctness fixture's
+        /// dequant cost is too small relative to GEMV dispatch/encode
+        /// overhead to show any prefetch-overlap effect at all. Still far
+        /// smaller than a real checkpoint's per-expert size (§Stage 2's
+        /// PLAN.md caveat applies): `num_experts=16`, `moe_inter=256`,
+        /// `hidden=256`, `top_k=8` — per-expert gate_up+down f16 payload is
+        /// `2*256*256*2 + 256*256*2 ≈ 384 KiB`, dequantized from a Q4 file
+        /// roughly `120 KiB`/expert.
+        fn synthetic_moe_test_config_throughput() -> Qwen35Config {
+            let mut cfg = synthetic_moe_test_config();
+            cfg.hidden_size = 256;
+            cfg.moe_intermediate_size = Some(256);
+            cfg.shared_expert_intermediate_size = Some(64);
+            cfg.num_experts = Some(16);
+            cfg.num_experts_per_tok = Some(8);
+            cfg
+        }
+
+        /// Latency-focused measurement from PLAN.md's Stage 2 test
+        /// strategy: decode tok/s with `ExpertSlotCache::prefetch_experts`
+        /// fanning its dequant phase out across rayon vs. running the
+        /// identical pre-assigned plan through a plain serial iterator, on
+        /// a synthetic checkpoint sized to force a controlled ~50% miss
+        /// rate per token.
+        ///
+        /// `#[ignore]`d: this is a manual/reproducibility measurement, not
+        /// a correctness gate — wall-clock timing on a synthetic fixture
+        /// this small is noisy and not something CI should assert bounds
+        /// on. Run explicitly with `cargo test --features metal-gpu --lib
+        /// -- --ignored moe_prefetch_throughput`.
+        ///
+        /// Miss-rate construction: `N=8` slots (`LATTICE_MOE_EXPERT_CACHE_SLOTS`),
+        /// exactly `top_k`, and the forced selection alternates between two
+        /// 8-expert sets overlapping by 4 (`{0..=7}` / `{4..=11}`) each
+        /// decode step. After the first step, every alternation is exactly
+        /// 4 hits (the overlapping 4, protected by this token's touch) and
+        /// 4 misses (forcing eviction of the other 4's untouched slots) —
+        /// a steady-state 50% per-token miss rate, matching the plan's
+        /// "N set so ~50% of each token's top-8 misses" spec.
+        #[test]
+        #[ignore = "manual throughput measurement, not a correctness gate"]
+        fn moe_prefetch_throughput_manual_benchmark() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config_throughput();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            let tokenizer_path = std::path::Path::new("/dev/null");
+
+            let set_a: Vec<usize> = (0..8).collect();
+            let set_b: Vec<usize> = (4..12).collect();
+
+            const WARMUP_STEPS: usize = 6;
+            const TIMED_STEPS: usize = 60;
+            const N_REPEATS: usize = 3;
+
+            let run_once = |parallel: bool| -> std::time::Duration {
+                let mut state = {
+                    let _env = EnvVarGuard::set(
+                        crate::forward::moe_expert_cache::MOE_EXPERT_CACHE_SLOTS_ENV,
+                        "8",
+                    );
+                    MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 96)
+                        .expect("from_q4_dir (throughput fixture, N=8) must load")
+                };
+                set_moe_prefetch_parallel_for_test(Some(parallel));
+
+                let mut position = 0usize;
+                let mut next_token = |position: &mut usize, selection: Vec<usize>| -> Vec<f32> {
+                    let _forced = ForcedMoeExpertsGuard::set(selection);
+                    let logits = state.forward_step(1, *position);
+                    *position += 1;
+                    logits
+                };
+
+                for step in 0..WARMUP_STEPS {
+                    let selection = if step.is_multiple_of(2) {
+                        set_a.clone()
+                    } else {
+                        set_b.clone()
+                    };
+                    let _ = next_token(&mut position, selection);
+                }
+
+                let t0 = std::time::Instant::now();
+                for step in 0..TIMED_STEPS {
+                    let selection = if step.is_multiple_of(2) {
+                        set_a.clone()
+                    } else {
+                        set_b.clone()
+                    };
+                    let logits = next_token(&mut position, selection);
+                    assert!(
+                        logits.iter().all(|v| v.is_finite()),
+                        "parallel={parallel} step {step} produced non-finite logits"
+                    );
+                }
+                let elapsed = t0.elapsed();
+
+                set_moe_prefetch_parallel_for_test(None);
+                elapsed
+            };
+
+            let mut serial_times = Vec::with_capacity(N_REPEATS);
+            let mut parallel_times = Vec::with_capacity(N_REPEATS);
+            for _ in 0..N_REPEATS {
+                serial_times.push(run_once(false));
+                parallel_times.push(run_once(true));
+            }
+
+            let median = |mut v: Vec<std::time::Duration>| -> std::time::Duration {
+                v.sort_unstable();
+                v[v.len() / 2]
+            };
+            let serial_median = median(serial_times.clone());
+            let parallel_median = median(parallel_times.clone());
+            let serial_tok_s = TIMED_STEPS as f64 / serial_median.as_secs_f64();
+            let parallel_tok_s = TIMED_STEPS as f64 / parallel_median.as_secs_f64();
+
+            eprintln!(
+                "#682 Stage 2 prefetch throughput (synthetic fixture, N_REPEATS={N_REPEATS}, \
+                 WARMUP_STEPS={WARMUP_STEPS}, TIMED_STEPS={TIMED_STEPS}, ~50% forced miss rate):\n\
+                 \x20 serial   median={serial_median:?}  ({serial_tok_s:.1} tok/s)  all={serial_times:?}\n\
+                 \x20 parallel median={parallel_median:?}  ({parallel_tok_s:.1} tok/s)  all={parallel_times:?}\n\
+                 \x20 speedup = {:.3}x",
+                serial_median.as_secs_f64() / parallel_median.as_secs_f64()
             );
         }
 
