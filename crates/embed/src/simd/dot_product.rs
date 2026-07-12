@@ -6,6 +6,9 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use std::arch::wasm32::*;
+
 use std::sync::OnceLock;
 
 use super::simd_config;
@@ -40,6 +43,13 @@ fn resolve_dot_product_kernel() -> DotKernel {
     {
         if config.neon_enabled {
             return dot_product_neon_kernel;
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        if config.simd128_enabled {
+            return dot_product_simd128_kernel;
         }
     }
 
@@ -158,6 +168,15 @@ fn dot_product_avx2_kernel(a: &[f32], b: &[f32]) -> f32 {
 fn dot_product_neon_kernel(a: &[f32], b: &[f32]) -> f32 {
     // SAFETY: only stored in DOT_PRODUCT_KERNEL when neon was detected at init time (always true on aarch64).
     unsafe { dot_product_neon_unrolled(a, b) }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+fn dot_product_simd128_kernel(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: only stored in DOT_PRODUCT_KERNEL when compiled with the wasm32
+    // `simd128` target feature (the `#[cfg(target_feature = "simd128")]` gate
+    // above is compile-time, not runtime -- see `SimdConfig::simd128_enabled`).
+    unsafe { dot_product_simd128_unrolled(a, b) }
 }
 
 /// Dot product over equal-length `f32` slices.
@@ -749,6 +768,126 @@ unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 pub(crate) unsafe fn horizontal_sum_neon(v: float32x4_t) -> f32 {
     vaddvq_f32(v)
+}
+
+/// wasm32 SIMD128-accelerated dot product with 4x unrolling and multiple accumulators.
+///
+/// Processes 16 floats per iteration (4 x 4 floats) with 4 independent accumulators,
+/// mirroring the NEON kernel's structure above. wasm SIMD128 has no fused
+/// multiply-add instruction (unlike AVX2/AVX-512/NEON), so each lane does a
+/// separate multiply then add (`f32x4_add(acc, f32x4_mul(...))`).
+///
+/// # Reassociation warning
+///
+/// Like every SIMD kernel in this module, lane-parallel accumulation reorders
+/// the summation relative to the scalar left-to-right reference (`a.iter().zip(b.iter())...sum()`),
+/// so results are NOT bit-identical to [`dot_product_scalar`] -- only equal within
+/// a tight relative epsilon (~1e-6). See the module-level docs and the parity
+/// tests in `simd/tests.rs`.
+///
+/// # Safety
+///
+/// Caller must ensure:
+/// - Compiled with the wasm32 `simd128` target feature (this function only
+///   exists under `#[cfg(target_feature = "simd128")]`; wasm has no runtime
+///   feature detection, so this is a compile-time, not runtime, precondition
+///   -- unlike the `is_x86_feature_detected!`/`is_aarch64_feature_detected!`
+///   guards above)
+/// - `a` and `b` have equal length (checked by caller)
+///
+/// Memory safety:
+/// - Uses `v128_load` for loads. wasm's alignment immediate is a performance
+///   hint only -- misaligned loads are always well-defined, so this is safe
+///   for any pointer alignment (matching `_mm256_loadu_ps`/`vld1q_f32` above,
+///   not the aligned `_mm256_load_ps` family).
+/// - Pointer arithmetic stays within slice bounds via chunk/remainder
+///   calculation: `chunks = n / CHUNK_SIZE` (floor), so `chunks * CHUNK_SIZE
+///   <= n`. `remaining_chunks = remaining / SIMD_WIDTH` (floor), so all
+///   SIMD128 loads stay in bounds.
+/// - Final scalar loop iterates `scalar_start..n` using safe `a[i]` / `b[i]`
+///   indexing and never reads past the end of the slice.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+unsafe fn dot_product_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
+    const SIMD_WIDTH: usize = 4;
+    const UNROLL: usize = 4;
+    const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL; // 16 floats per iteration
+
+    let n = a.len();
+    debug_assert_eq!(n, b.len());
+    let chunks = n / CHUNK_SIZE;
+
+    // 4 independent accumulators to break dependency chains
+    let mut sum0 = f32x4_splat(0.0);
+    let mut sum1 = f32x4_splat(0.0);
+    let mut sum2 = f32x4_splat(0.0);
+    let mut sum3 = f32x4_splat(0.0);
+
+    for i in 0..chunks {
+        let base = i * CHUNK_SIZE;
+
+        let a0 = v128_load(a.as_ptr().add(base) as *const v128);
+        let b0 = v128_load(b.as_ptr().add(base) as *const v128);
+        sum0 = f32x4_add(sum0, f32x4_mul(a0, b0));
+
+        let a1 = v128_load(a.as_ptr().add(base + SIMD_WIDTH) as *const v128);
+        let b1 = v128_load(b.as_ptr().add(base + SIMD_WIDTH) as *const v128);
+        sum1 = f32x4_add(sum1, f32x4_mul(a1, b1));
+
+        let a2 = v128_load(a.as_ptr().add(base + SIMD_WIDTH * 2) as *const v128);
+        let b2 = v128_load(b.as_ptr().add(base + SIMD_WIDTH * 2) as *const v128);
+        sum2 = f32x4_add(sum2, f32x4_mul(a2, b2));
+
+        let a3 = v128_load(a.as_ptr().add(base + SIMD_WIDTH * 3) as *const v128);
+        let b3 = v128_load(b.as_ptr().add(base + SIMD_WIDTH * 3) as *const v128);
+        sum3 = f32x4_add(sum3, f32x4_mul(a3, b3));
+    }
+
+    // Combine accumulators (dependencies are introduced only once at the end)
+    let sum01 = f32x4_add(sum0, sum1);
+    let sum23 = f32x4_add(sum2, sum3);
+    let sum_vec = f32x4_add(sum01, sum23);
+
+    let mut total = horizontal_sum_simd128(sum_vec);
+
+    // Handle remainder with single-vector loop
+    let main_processed = chunks * CHUNK_SIZE;
+    let remaining = n - main_processed;
+    let remaining_chunks = remaining / SIMD_WIDTH;
+
+    let mut remainder_sum = f32x4_splat(0.0);
+    for i in 0..remaining_chunks {
+        let offset = main_processed + i * SIMD_WIDTH;
+        let a_vec = v128_load(a.as_ptr().add(offset) as *const v128);
+        let b_vec = v128_load(b.as_ptr().add(offset) as *const v128);
+        remainder_sum = f32x4_add(remainder_sum, f32x4_mul(a_vec, b_vec));
+    }
+
+    total += horizontal_sum_simd128(remainder_sum);
+
+    // Final scalar remainder
+    let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
+    for i in scalar_start..n {
+        total += a[i] * b[i];
+    }
+
+    total
+}
+
+/// Horizontal sum of a wasm32 SIMD128 register (4 floats -> 1 float).
+///
+/// # Safety
+///
+/// Caller must ensure the crate was compiled with the wasm32 `simd128` target
+/// feature (this function only exists under `#[cfg(target_feature =
+/// "simd128")]`).
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+pub(crate) unsafe fn horizontal_sum_simd128(v: v128) -> f32 {
+    f32x4_extract_lane::<0>(v)
+        + f32x4_extract_lane::<1>(v)
+        + f32x4_extract_lane::<2>(v)
+        + f32x4_extract_lane::<3>(v)
 }
 
 /// NEON batch-4 dot product kernel wrapper.

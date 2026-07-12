@@ -6,6 +6,9 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use std::arch::wasm32::*;
+
 use super::simd_config;
 
 #[cfg(target_arch = "x86_64")]
@@ -13,6 +16,9 @@ use super::dot_product::{horizontal_sum_avx2, horizontal_sum_avx512};
 
 #[cfg(target_arch = "aarch64")]
 use super::dot_product::horizontal_sum_neon;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use super::dot_product::horizontal_sum_simd128;
 
 #[inline(always)]
 fn dispatch_squared(a: &[f32], b: &[f32]) -> f32 {
@@ -32,6 +38,13 @@ fn dispatch_squared(a: &[f32], b: &[f32]) -> f32 {
     {
         if config.neon_enabled {
             return unsafe { squared_euclidean_distance_neon_unrolled(a, b) };
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        if config.simd128_enabled {
+            return unsafe { squared_euclidean_distance_simd128_unrolled(a, b) };
         }
     }
 
@@ -298,6 +311,76 @@ unsafe fn squared_euclidean_distance_neon_unrolled(a: &[f32], b: &[f32]) -> f32 
 
     let sum_vec = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
     let mut sum = horizontal_sum_neon(sum_vec);
+
+    // Handle remainder
+    for i in (chunks * CHUNK_SIZE)..n {
+        let diff = a[i] - b[i];
+        sum += diff * diff;
+    }
+
+    sum
+}
+
+/// wasm32 SIMD128-accelerated squared Euclidean distance with 4x unrolling.
+///
+/// Mirrors `squared_euclidean_distance_neon_unrolled` above; see
+/// `dot_product::dot_product_simd128_unrolled` for the reassociation caveat
+/// (results are not bit-identical to the scalar reference) and the wasm
+/// safety notes (no runtime feature detection, alignment-free loads).
+///
+/// # Safety
+///
+/// Caller must ensure:
+/// - Compiled with the wasm32 `simd128` target feature (compile-time
+///   precondition; this function only exists under `#[cfg(target_feature =
+///   "simd128")]`)
+/// - `a` and `b` have equal length (checked by caller)
+///
+/// Memory safety:
+/// - Uses `v128_load` for loads (wasm loads are alignment-free by spec)
+/// - Pointer arithmetic stays within slice bounds via chunk calculation
+/// - Remainder loop uses safe indexing
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+unsafe fn squared_euclidean_distance_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
+    const SIMD_WIDTH: usize = 4;
+    const UNROLL: usize = 4;
+    const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
+    let n = a.len();
+    debug_assert_eq!(n, b.len());
+    let chunks = n / CHUNK_SIZE;
+
+    let mut sum0 = f32x4_splat(0.0);
+    let mut sum1 = f32x4_splat(0.0);
+    let mut sum2 = f32x4_splat(0.0);
+    let mut sum3 = f32x4_splat(0.0);
+
+    for i in 0..chunks {
+        let base = i * CHUNK_SIZE;
+
+        let a0 = v128_load(a.as_ptr().add(base) as *const v128);
+        let b0 = v128_load(b.as_ptr().add(base) as *const v128);
+        let diff0 = f32x4_sub(a0, b0);
+        sum0 = f32x4_add(sum0, f32x4_mul(diff0, diff0));
+
+        let a1 = v128_load(a.as_ptr().add(base + SIMD_WIDTH) as *const v128);
+        let b1 = v128_load(b.as_ptr().add(base + SIMD_WIDTH) as *const v128);
+        let diff1 = f32x4_sub(a1, b1);
+        sum1 = f32x4_add(sum1, f32x4_mul(diff1, diff1));
+
+        let a2 = v128_load(a.as_ptr().add(base + SIMD_WIDTH * 2) as *const v128);
+        let b2 = v128_load(b.as_ptr().add(base + SIMD_WIDTH * 2) as *const v128);
+        let diff2 = f32x4_sub(a2, b2);
+        sum2 = f32x4_add(sum2, f32x4_mul(diff2, diff2));
+
+        let a3 = v128_load(a.as_ptr().add(base + SIMD_WIDTH * 3) as *const v128);
+        let b3 = v128_load(b.as_ptr().add(base + SIMD_WIDTH * 3) as *const v128);
+        let diff3 = f32x4_sub(a3, b3);
+        sum3 = f32x4_add(sum3, f32x4_mul(diff3, diff3));
+    }
+
+    let sum_vec = f32x4_add(f32x4_add(sum0, sum1), f32x4_add(sum2, sum3));
+    let mut sum = horizontal_sum_simd128(sum_vec);
 
     // Handle remainder
     for i in (chunks * CHUNK_SIZE)..n {

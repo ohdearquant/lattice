@@ -93,3 +93,55 @@ impl LatticeEmbedder {
         self.model.dimensions()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Vector-op bindings: expose `simd::*` directly to JS/wasm callers.
+//
+// Unrelated to `LatticeEmbedder` above (which wraps the BERT-family forward
+// pass). These four are the `simd::*` khive ANN consumer contract
+// (`dot_product`, `squared_euclidean_distance`, `cosine_similarity`,
+// `normalize`; see `lib.rs`'s crate-level doc comment) made callable from JS,
+// so a wasm/JS consumer benefits from the same SIMD128 kernels a native
+// consumer gets, instead of falling back to a hand-rolled JS loop. Also the
+// entry points `scripts/bench_wasm_simd.mjs` calls for its A/B measurement.
+// ---------------------------------------------------------------------------
+
+/// Dot product of two equal-length vectors via `simd::dot_product`.
+///
+/// Dispatches to the wasm32 SIMD128 kernel when this crate is built with
+/// `-C target-feature=+simd128`, otherwise falls back to the scalar
+/// implementation. Returns `0.0` if `a` and `b` have different lengths.
+#[wasm_bindgen(js_name = simdDotProduct)]
+pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
+    crate::simd::dot_product(a, b)
+}
+
+/// Squared Euclidean (L2) distance between two equal-length vectors via
+/// `simd::squared_euclidean_distance`.
+///
+/// Skips the final square root (see the Rust docs on
+/// [`crate::simd::squared_euclidean_distance`] for the ordering invariant
+/// this preserves). Returns `f32::MAX` if `a` and `b` have different lengths.
+#[wasm_bindgen(js_name = simdSquaredEuclideanDistance)]
+pub fn simd_squared_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
+    crate::simd::squared_euclidean_distance(a, b)
+}
+
+/// Cosine similarity of two equal-length, non-empty vectors via
+/// `simd::cosine_similarity`.
+///
+/// Returns a value in `[-1.0, 1.0]`, or `0.0` for empty or mismatched-length
+/// inputs.
+#[wasm_bindgen(js_name = simdCosineSimilarity)]
+pub fn simd_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    crate::simd::cosine_similarity(a, b)
+}
+
+/// L2-normalize a vector in place via `simd::normalize`.
+///
+/// Leaves the vector unchanged if its norm is zero or NaN (matches the
+/// scalar reference; see `simd::normalize`'s doc comment).
+#[wasm_bindgen(js_name = simdNormalize)]
+pub fn simd_normalize(v: &mut [f32]) {
+    crate::simd::normalize(v)
+}

@@ -6,6 +6,9 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use std::arch::wasm32::*;
+
 use super::simd_config;
 
 #[cfg(target_arch = "x86_64")]
@@ -13,6 +16,9 @@ use super::dot_product::{horizontal_sum_avx2, horizontal_sum_avx512};
 
 #[cfg(target_arch = "aarch64")]
 use super::dot_product::horizontal_sum_neon;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use super::dot_product::horizontal_sum_simd128;
 
 /// **Unstable**: SIMD dispatch layer; use `lattice_embed::utils::normalize` for the stable wrapper.
 #[inline]
@@ -42,6 +48,17 @@ pub fn normalize(vector: &mut [f32]) {
             // for the call lifetime; the callee uses unaligned loads/stores and
             // bounded chunk/remainder loops that stay inside the slice.
             return unsafe { normalize_neon_unrolled(vector) };
+        }
+    }
+
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        if config.simd128_enabled {
+            // SAFETY: compiled with wasm32 simd128 (compile-time gate, see
+            // `SimdConfig::simd128_enabled`). The mutable slice is valid for
+            // the call lifetime; the callee uses alignment-free loads/stores
+            // and bounded chunk/remainder loops that stay inside the slice.
+            return unsafe { normalize_simd128_unrolled(vector) };
         }
     }
 
@@ -388,5 +405,109 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
     // Remainder for scaling
     for val in vector.iter_mut().skip(chunks * CHUNK_SIZE) {
         *val *= inv_norm;
+    }
+}
+
+/// wasm32 SIMD128-accelerated normalization with 4x unrolling.
+///
+/// Mirrors `normalize_avx2_unrolled` above (plain `sqrt` + scalar reciprocal,
+/// not the NEON kernel's `vrsqrteq_f32`+Newton-Raphson estimate -- wasm's
+/// `f32x4_sqrt` is already a single instruction, so there is no equivalent
+/// estimate-and-refine trick to apply here).
+///
+/// # Safety
+///
+/// Caller must ensure:
+/// - Compiled with the wasm32 `simd128` target feature (compile-time
+///   precondition; this function only exists under `#[cfg(target_feature =
+///   "simd128")]`)
+///
+/// Memory safety:
+/// - Uses `v128_load`/`v128_store` for loads/stores (wasm loads/stores are
+///   alignment-free by spec)
+/// - Pointer arithmetic stays within slice bounds via chunk calculation
+/// - Remainder loop uses safe indexing
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+unsafe fn normalize_simd128_unrolled(vector: &mut [f32]) {
+    const SIMD_WIDTH: usize = 4;
+    const UNROLL: usize = 4;
+    const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
+    let n = vector.len();
+    let chunks = n / CHUNK_SIZE;
+
+    // First pass: compute L2 norm with 4 accumulators
+    let mut norm0 = f32x4_splat(0.0);
+    let mut norm1 = f32x4_splat(0.0);
+    let mut norm2 = f32x4_splat(0.0);
+    let mut norm3 = f32x4_splat(0.0);
+
+    for i in 0..chunks {
+        let base = i * CHUNK_SIZE;
+
+        let v0 = v128_load(vector.as_ptr().add(base) as *const v128);
+        norm0 = f32x4_add(norm0, f32x4_mul(v0, v0));
+
+        let v1 = v128_load(vector.as_ptr().add(base + SIMD_WIDTH) as *const v128);
+        norm1 = f32x4_add(norm1, f32x4_mul(v1, v1));
+
+        let v2 = v128_load(vector.as_ptr().add(base + SIMD_WIDTH * 2) as *const v128);
+        norm2 = f32x4_add(norm2, f32x4_mul(v2, v2));
+
+        let v3 = v128_load(vector.as_ptr().add(base + SIMD_WIDTH * 3) as *const v128);
+        norm3 = f32x4_add(norm3, f32x4_mul(v3, v3));
+    }
+
+    let norm_vec = f32x4_add(f32x4_add(norm0, norm1), f32x4_add(norm2, norm3));
+    let mut norm_sq = horizontal_sum_simd128(norm_vec);
+
+    // Remainder for norm calculation
+    for i in (chunks * CHUNK_SIZE)..n {
+        norm_sq += vector[i] * vector[i];
+    }
+
+    let norm = norm_sq.sqrt();
+    // Match `normalize_scalar`: reject 0.0 and NaN alike so a NaN-containing
+    // vector is left unchanged rather than scaled by NaN. `is_nan() || <= 0.0`
+    // is the lint-clean equivalent of `!(norm > 0.0)`.
+    if norm.is_nan() || norm <= 0.0 {
+        return;
+    }
+
+    let inv_norm = 1.0 / norm;
+    let inv_norm_vec = f32x4_splat(inv_norm);
+
+    // Second pass: divide by norm with 4x unrolling
+    for i in 0..chunks {
+        let base = i * CHUNK_SIZE;
+
+        let v0 = v128_load(vector.as_ptr().add(base) as *const v128);
+        v128_store(
+            vector.as_mut_ptr().add(base) as *mut v128,
+            f32x4_mul(v0, inv_norm_vec),
+        );
+
+        let v1 = v128_load(vector.as_ptr().add(base + SIMD_WIDTH) as *const v128);
+        v128_store(
+            vector.as_mut_ptr().add(base + SIMD_WIDTH) as *mut v128,
+            f32x4_mul(v1, inv_norm_vec),
+        );
+
+        let v2 = v128_load(vector.as_ptr().add(base + SIMD_WIDTH * 2) as *const v128);
+        v128_store(
+            vector.as_mut_ptr().add(base + SIMD_WIDTH * 2) as *mut v128,
+            f32x4_mul(v2, inv_norm_vec),
+        );
+
+        let v3 = v128_load(vector.as_ptr().add(base + SIMD_WIDTH * 3) as *const v128);
+        v128_store(
+            vector.as_mut_ptr().add(base + SIMD_WIDTH * 3) as *mut v128,
+            f32x4_mul(v3, inv_norm_vec),
+        );
+    }
+
+    // Remainder for scaling
+    for i in (chunks * CHUNK_SIZE)..n {
+        vector[i] *= inv_norm;
     }
 }

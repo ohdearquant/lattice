@@ -4,6 +4,9 @@
 //! - **x86_64 (float32)**: AVX-512F > AVX2 + FMA > scalar
 //! - **x86_64 (int8)**: AVX-512 VNNI > AVX2 > scalar
 //! - **aarch64**: ARM NEON with multiple accumulators and loop unrolling
+//! - **wasm32**: SIMD128 with multiple accumulators and loop unrolling, gated at
+//!   compile time via `target-feature=+simd128` (wasm has no runtime feature
+//!   detection, unlike x86_64/aarch64 — see [`SimdConfig::simd128_enabled`])
 //! - **Other**: Scalar fallback
 //!
 //! ## Optimizations
@@ -75,6 +78,15 @@ pub struct SimdConfig {
     /// Mandatory on Armv8.4+; optional on Armv8.2/v8.3. Always false on non-aarch64.
     /// SDOT kernels must only be dispatched when this is `true`.
     pub dotprod_enabled: bool,
+    /// **Unstable**: wasm32 SIMD128 support available.
+    ///
+    /// Unlike the x86_64/aarch64 fields above, this is a **compile-time**, not
+    /// runtime, signal: wasm has no runtime CPU feature detection (a given
+    /// `.wasm` binary either was or wasn't compiled with `-C
+    /// target-feature=+simd128`; there is no dispatching between two
+    /// codepaths inside one binary). Mirrors `cfg!(target_feature =
+    /// "simd128")`. Always false on non-wasm32 targets.
+    pub simd128_enabled: bool,
 }
 
 impl Default for SimdConfig {
@@ -99,6 +111,7 @@ impl SimdConfig {
                     && is_x86_feature_detected!("avx512vnni"),
                 neon_enabled: false,
                 dotprod_enabled: false,
+                simd128_enabled: false,
             }
         }
         #[cfg(target_arch = "aarch64")]
@@ -113,9 +126,31 @@ impl SimdConfig {
                 avx512vnni_enabled: false,
                 neon_enabled: true,
                 dotprod_enabled: std::arch::is_aarch64_feature_detected!("dotprod"),
+                simd128_enabled: false,
             }
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        #[cfg(target_arch = "wasm32")]
+        {
+            // No runtime detection on wasm32: `simd128` is either compiled in
+            // for the whole module (via `-C target-feature=+simd128`) or not.
+            // `cfg!` reads the same compile-time flag the `#[cfg(...)]` gates
+            // on the SIMD kernel functions themselves key off, so this stays
+            // consistent with which kernels actually exist in the binary.
+            Self {
+                avx512f_enabled: false,
+                avx2_enabled: false,
+                fma_enabled: false,
+                avx512vnni_enabled: false,
+                neon_enabled: false,
+                dotprod_enabled: false,
+                simd128_enabled: cfg!(target_feature = "simd128"),
+            }
+        }
+        #[cfg(not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "wasm32"
+        )))]
         {
             Self {
                 avx512f_enabled: false,
@@ -124,6 +159,7 @@ impl SimdConfig {
                 avx512vnni_enabled: false,
                 neon_enabled: false,
                 dotprod_enabled: false,
+                simd128_enabled: false,
             }
         }
     }
@@ -131,7 +167,11 @@ impl SimdConfig {
     /// **Unstable**: check if any SIMD is available; logic may expand with new ISAs.
     #[inline]
     pub fn simd_available(&self) -> bool {
-        self.avx512f_enabled || self.avx512vnni_enabled || self.avx2_enabled || self.neon_enabled
+        self.avx512f_enabled
+            || self.avx512vnni_enabled
+            || self.avx2_enabled
+            || self.neon_enabled
+            || self.simd128_enabled
     }
 
     /// Force scalar-only mode (useful for testing).
@@ -144,6 +184,7 @@ impl SimdConfig {
             avx512vnni_enabled: false,
             neon_enabled: false,
             dotprod_enabled: false,
+            simd128_enabled: false,
         }
     }
 }

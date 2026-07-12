@@ -6,6 +6,9 @@ use std::arch::x86_64::*;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use std::arch::wasm32::*;
+
 use std::sync::OnceLock;
 
 use super::simd_config;
@@ -15,6 +18,9 @@ use super::dot_product::{horizontal_sum_avx2, horizontal_sum_avx512};
 
 #[cfg(target_arch = "aarch64")]
 use super::dot_product::horizontal_sum_neon;
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use super::dot_product::horizontal_sum_simd128;
 
 type CosineKernel = fn(&[f32], &[f32]) -> f32;
 static COSINE_KERNEL: OnceLock<CosineKernel> = OnceLock::new();
@@ -44,6 +50,13 @@ fn resolve_cosine_kernel() -> CosineKernel {
         }
     }
 
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        if config.simd128_enabled {
+            return cosine_simd128_kernel;
+        }
+    }
+
     cosine_similarity_scalar
 }
 
@@ -66,6 +79,14 @@ fn cosine_avx2_kernel(a: &[f32], b: &[f32]) -> f32 {
 fn cosine_neon_kernel(a: &[f32], b: &[f32]) -> f32 {
     // SAFETY: only stored in COSINE_KERNEL when neon was detected at init time (always true on aarch64).
     unsafe { cosine_similarity_neon_unrolled(a, b) }
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+fn cosine_simd128_kernel(a: &[f32], b: &[f32]) -> f32 {
+    // SAFETY: only stored in COSINE_KERNEL when compiled with the wasm32
+    // `simd128` target feature (compile-time gate, see `SimdConfig::simd128_enabled`).
+    unsafe { cosine_similarity_simd128_unrolled(a, b) }
 }
 
 /// Cosine similarity over equal-length, non-empty `f32` slices.
@@ -400,6 +421,109 @@ unsafe fn cosine_similarity_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = horizontal_sum_neon(dot_vec);
     let mut norm_a = horizontal_sum_neon(na_vec);
     let mut norm_b = horizontal_sum_neon(nb_vec);
+
+    // Handle remainder
+    let remainder_start = chunks * CHUNK_SIZE;
+    for i in remainder_start..n {
+        let av = a[i];
+        let bv = b[i];
+        dot += av * bv;
+        norm_a += av * av;
+        norm_b += bv * bv;
+    }
+
+    norm_a = norm_a.sqrt();
+    norm_b = norm_b.sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
+}
+
+/// wasm32 SIMD128-accelerated cosine similarity with 4x unrolling.
+///
+/// Computes dot(a,b) / (|a| * |b|) in a single pass with 4 accumulators each,
+/// mirroring the NEON kernel above. See `dot_product::dot_product_simd128_unrolled`
+/// for the reassociation caveat (not bit-identical to the scalar path) and the
+/// wasm safety notes (no runtime feature detection, alignment-free loads).
+///
+/// # Safety
+///
+/// Caller must ensure:
+/// - Compiled with the wasm32 `simd128` target feature (compile-time
+///   precondition; this function only exists under `#[cfg(target_feature =
+///   "simd128")]`)
+/// - `a` and `b` have equal, non-zero length (checked by caller)
+///
+/// Memory safety:
+/// - Uses `v128_load` for loads (wasm loads are alignment-free by spec)
+/// - Pointer arithmetic stays within slice bounds via chunk calculation
+/// - Remainder loop uses safe indexing
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+unsafe fn cosine_similarity_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
+    const SIMD_WIDTH: usize = 4;
+    const UNROLL: usize = 4;
+    const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
+    let n = a.len();
+    debug_assert_eq!(n, b.len());
+    debug_assert!(n > 0);
+    let chunks = n / CHUNK_SIZE;
+
+    // 4 accumulators for each of 3 sums (dot, norm_a, norm_b)
+    let mut dot0 = f32x4_splat(0.0);
+    let mut dot1 = f32x4_splat(0.0);
+    let mut dot2 = f32x4_splat(0.0);
+    let mut dot3 = f32x4_splat(0.0);
+
+    let mut na0 = f32x4_splat(0.0);
+    let mut na1 = f32x4_splat(0.0);
+    let mut na2 = f32x4_splat(0.0);
+    let mut na3 = f32x4_splat(0.0);
+
+    let mut nb0 = f32x4_splat(0.0);
+    let mut nb1 = f32x4_splat(0.0);
+    let mut nb2 = f32x4_splat(0.0);
+    let mut nb3 = f32x4_splat(0.0);
+
+    for i in 0..chunks {
+        let base = i * CHUNK_SIZE;
+
+        let a0 = v128_load(a.as_ptr().add(base) as *const v128);
+        let b0 = v128_load(b.as_ptr().add(base) as *const v128);
+        dot0 = f32x4_add(dot0, f32x4_mul(a0, b0));
+        na0 = f32x4_add(na0, f32x4_mul(a0, a0));
+        nb0 = f32x4_add(nb0, f32x4_mul(b0, b0));
+
+        let a1 = v128_load(a.as_ptr().add(base + SIMD_WIDTH) as *const v128);
+        let b1 = v128_load(b.as_ptr().add(base + SIMD_WIDTH) as *const v128);
+        dot1 = f32x4_add(dot1, f32x4_mul(a1, b1));
+        na1 = f32x4_add(na1, f32x4_mul(a1, a1));
+        nb1 = f32x4_add(nb1, f32x4_mul(b1, b1));
+
+        let a2 = v128_load(a.as_ptr().add(base + SIMD_WIDTH * 2) as *const v128);
+        let b2 = v128_load(b.as_ptr().add(base + SIMD_WIDTH * 2) as *const v128);
+        dot2 = f32x4_add(dot2, f32x4_mul(a2, b2));
+        na2 = f32x4_add(na2, f32x4_mul(a2, a2));
+        nb2 = f32x4_add(nb2, f32x4_mul(b2, b2));
+
+        let a3 = v128_load(a.as_ptr().add(base + SIMD_WIDTH * 3) as *const v128);
+        let b3 = v128_load(b.as_ptr().add(base + SIMD_WIDTH * 3) as *const v128);
+        dot3 = f32x4_add(dot3, f32x4_mul(a3, b3));
+        na3 = f32x4_add(na3, f32x4_mul(a3, a3));
+        nb3 = f32x4_add(nb3, f32x4_mul(b3, b3));
+    }
+
+    // Combine accumulators
+    let dot_vec = f32x4_add(f32x4_add(dot0, dot1), f32x4_add(dot2, dot3));
+    let na_vec = f32x4_add(f32x4_add(na0, na1), f32x4_add(na2, na3));
+    let nb_vec = f32x4_add(f32x4_add(nb0, nb1), f32x4_add(nb2, nb3));
+
+    let mut dot = horizontal_sum_simd128(dot_vec);
+    let mut norm_a = horizontal_sum_simd128(na_vec);
+    let mut norm_b = horizontal_sum_simd128(nb_vec);
 
     // Handle remainder
     let remainder_start = chunks * CHUNK_SIZE;
