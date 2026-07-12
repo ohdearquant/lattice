@@ -326,7 +326,7 @@ here; they are recorded for explicit maintainer judgment on whether each is CONT
    at `metal_qwen35.rs:9329-9336` ("every public path that resets live KV/GDN state...
    routes through here, so this is the single place that must invalidate any retained
    cross-turn entry"). This appears to be intentional invalidation (the comment cites
-   #516 round-1 remediation D3), but it means a caller alternating between
+   #516 remediation D3), but it means a caller alternating between
    `generate()`/`generate_streaming()` and `generate_streaming_with_prefix_cache_and_cancel()`
    on the same `MetalQwen35State` will silently lose all cross-turn cache entries the
    moment it calls the former. Worth an explicit maintainer confirmation that this is
