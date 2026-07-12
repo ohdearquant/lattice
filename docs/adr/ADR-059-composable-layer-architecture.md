@@ -3,8 +3,6 @@
 **Status**: Proposed
 **Date**: 2026-05-27
 **Crate**: lattice-inference
-**Research**: RQ-1 (`workspaces/20260527/01.md`, 1948 lines)
-**KG**: ADR-059 `a95ab2d6` | AttentionOp `1ce9672b` | AttentionKind `1f7f0fc3` | LayerOp `f9fb0508` | TransformerLayer `b35c4305` | ModelSpec `3e893c94` | ArchitectureEnv `6e8df9af`
 
 ---
 
@@ -74,18 +72,18 @@ None of these support per-layer heterogeneous attention + FFN + quantization + K
 
 ### Attention variants and their state requirements
 
-| Variant                           | State                                        | Scratch               | Category          |
-| --------------------------------- | -------------------------------------------- | --------------------- | ----------------- |
-| MHA `10998240`                    | None (scratch `AttentionBuffers`)            | Softmax buffers       | Softmax (encoder) |
-| GQA `36e42eb8`                    | KV cache                                     | Softmax + group batch | Softmax           |
-| Flash CPU                         | KV cache                                     | Tiled buffers         | Softmax           |
-| Flash Causal                      | KV cache                                     | Tiled buffers         | Softmax           |
-| GDN `82877a02`                    | Recurrent `[B, heads, state_rank, head_dim]` | Gate/delta buffers    | Linear            |
-| GDN Fused                         | Recurrent                                    | Gate/delta + fused    | Linear            |
-| Gated GQA                         | KV cache                                     | Gate + GQA scratch    | Softmax           |
-| Differential `ba18a56e`           | KV cache                                     | Split Q/K + lambda    | Softmax           |
-| NSA (Sparse Attention `44932c9a`) | KV cache + sparse state                      | Sparse selection      | Sparse            |
-| Decode                            | KV cache                                     | Minimal               | Softmax           |
+| Variant                | State                                        | Scratch               | Category          |
+| ---------------------- | -------------------------------------------- | --------------------- | ----------------- |
+| MHA                    | None (scratch `AttentionBuffers`)            | Softmax buffers       | Softmax (encoder) |
+| GQA                    | KV cache                                     | Softmax + group batch | Softmax           |
+| Flash CPU              | KV cache                                     | Tiled buffers         | Softmax           |
+| Flash Causal           | KV cache                                     | Tiled buffers         | Softmax           |
+| GDN                    | Recurrent `[B, heads, state_rank, head_dim]` | Gate/delta buffers    | Linear            |
+| GDN Fused              | Recurrent                                    | Gate/delta + fused    | Linear            |
+| Gated GQA              | KV cache                                     | Gate + GQA scratch    | Softmax           |
+| Differential           | KV cache                                     | Split Q/K + lambda    | Softmax           |
+| NSA (Sparse Attention) | KV cache + sparse state                      | Sparse selection      | Sparse            |
+| Decode                 | KV cache                                     | Minimal               | Softmax           |
 
 The three state categories (KV, Recurrent, Sparse hybrid) are the fundamental reason a single trait with one `State` associated type does not work for heterogeneous composition.
 
@@ -188,7 +186,7 @@ pub enum AttentionScratchKind {
 }
 ```
 
-The `AttentionKind` enum dispatches via hand-written match arms (or `enum_dispatch` `2d536fb5` if macro diagnostics prove acceptable):
+The `AttentionKind` enum dispatches via hand-written match arms (or the `enum_dispatch` crate if macro diagnostics prove acceptable):
 
 ```rust
 #[derive(Debug)]
@@ -289,9 +287,9 @@ impl AttentionOp for AttentionKind {
 
 **Why this works for GDN's recurrent state vs GQA's KV cache**: GDN's `GatedDeltaNetState` holds a persistent `recurrent: TensorBuf` of shape `[B, num_heads, state_rank, head_dim]` that accumulates across tokens via the delta rule update `S = alpha * (S - beta * k^T @ (S @ k)) + beta * k^T @ v`. This is fundamentally different from GQA's append-only KV cache. The `AttentionStateKind` enum makes this type-safe at the boundary: `alloc_state()` returns `Recurrent(...)` for GDN and `Kv(...)` for GQA. A misconfigured layer (GDN with KV cache spec) is caught at construction, not at runtime.
 
-**Why this works for NSA's hybrid state**: NSA (ADR-042, `44932c9a`) maintains both a KV cache (for the sliding-window branch) and sparse state (compression MLP outputs, block selection indices). The `Sparse { kv, sparse }` variant carries both. The `forward_sparse` trait method receives both references.
+**Why this works for NSA's hybrid state**: NSA (ADR-042) maintains both a KV cache (for the sliding-window branch) and sparse state (compression MLP outputs, block selection indices). The `Sparse { kv, sparse }` variant carries both. The `forward_sparse` trait method receives both references.
 
-**How QuaRot interacts**: QuaRot (`e754741e`) changes the tensor basis via Hadamard rotation absorbed into linear projections (ADR-044). This does not change the attention algorithm; it changes the `LinearKind` wrapping each projection. The `QuantPlan` passed to attention kernel constructors specifies which weight format each projection uses. QuaRot-Q4 projections use `LinearKind::QuaRotQ4(QuaRotQ4Linear)`.
+**How QuaRot interacts**: QuaRot changes the tensor basis via Hadamard rotation absorbed into linear projections (ADR-044). This does not change the attention algorithm; it changes the `LinearKind` wrapping each projection. The `QuantPlan` passed to attention kernel constructors specifies which weight format each projection uses. QuaRot-Q4 projections use `LinearKind::QuaRotQ4(QuaRotQ4Linear)`.
 
 ### D2: `LayerOp` trait + `TransformerLayer` struct (outer tier)
 
@@ -391,7 +389,7 @@ impl LayerOp for TransformerLayer {
 }
 ```
 
-**How LoRA hooks compose**: LoRA adapters (ADR-057, `0648de39`) wrap individual `LinearKind` projections. A LoRA-wrapped linear is `LinearKind::LoraWrapped { base: Box<LinearKind>, lora_a: TensorBuf, lora_b: TensorBuf, alpha: f32 }`. The `TransformerLayer` does not know about LoRA; it sees a `LinearKind` that happens to add a low-rank correction during `forward()`. For QuaRot + LoRA composition (ADR-045), the LoRA matrices are counter-rotated at load time: `A <- A * R^T`, `B <- R * B`.
+**How LoRA hooks compose**: LoRA adapters (ADR-057) wrap individual `LinearKind` projections. A LoRA-wrapped linear is `LinearKind::LoraWrapped { base: Box<LinearKind>, lora_a: TensorBuf, lora_b: TensorBuf, alpha: f32 }`. The `TransformerLayer` does not know about LoRA; it sees a `LinearKind` that happens to add a low-rank correction during `forward()`. For QuaRot + LoRA composition (ADR-045), the LoRA matrices are counter-rotated at load time: `A <- A * R^T`, `B <- R * B`.
 
 **How Metal dispatch differs from CPU dispatch**: Metal uses fused kernels (`fused_attention`, `fused_qk_norm_rope` in `forward/metal.rs`) that combine multiple sub-operations into single GPU dispatches. The `TransformerLayer` is the CPU path. The Metal path constructs a parallel `MetalTransformerLayer` that holds `MetalAttentionKind` (GPU buffer handles instead of CPU tensors) but implements the same `LayerOp` trait. The `AttentionKind` enum's `tag()` method determines which MSL kernel to compile at model init.
 
@@ -443,7 +441,7 @@ pub struct ForwardCtx<'a> {
 }
 ```
 
-The `metrics` field connects to ADR-061's architecture search loop. When `None` (production inference), zero overhead. When `Some`, kernels record attention entropy, activation RMS, and timing -- the gradient-free quality proxies that Training-Free NAS (`4d6a5c98`) and Zero-Cost NAS Proxies (`7e5b0314`) use to rank architecture candidates cheaply.
+The `metrics` field connects to ADR-061's architecture search loop. When `None` (production inference), zero overhead. When `Some`, kernels record attention entropy, activation RMS, and timing -- the gradient-free quality proxies that Training-Free NAS and Zero-Cost NAS Proxies use to rank architecture candidates cheaply.
 
 ### D4: `FfnKind` and `LinearKind` enums
 
@@ -790,15 +788,15 @@ pub enum ArchAction {
 
 Search space for 24 layers with 10 attention x 4 quantization = 40 choices per layer is 40^24 ~ 2.8 x 10^38. The `search` section constrains this with allowed sets and hardware constraints. Search algorithms (staged plan):
 
-| Algorithm                          | Fit for lattice | When to use                                       |
-| ---------------------------------- | --------------- | ------------------------------------------------- |
-| Random search + constraints        | Strong baseline | DSL validation, early exploration                 |
-| Evolutionary search                | Very good       | Discrete architecture strings, Pareto fronts      |
-| Bayesian optimization / TPE        | Very good       | Expensive evaluations, structured features        |
-| PPO `e59014dd` on discrete actions | Later           | Needs many evaluations; better with cheap proxies |
-| LLM-agent search                   | Orchestration   | Emit configs/actions, not source patches          |
+| Algorithm                   | Fit for lattice | When to use                                       |
+| --------------------------- | --------------- | ------------------------------------------------- |
+| Random search + constraints | Strong baseline | DSL validation, early exploration                 |
+| Evolutionary search         | Very good       | Discrete architecture strings, Pareto fronts      |
+| Bayesian optimization / TPE | Very good       | Expensive evaluations, structured features        |
+| PPO on discrete actions     | Later           | Needs many evaluations; better with cheap proxies |
+| LLM-agent search            | Orchestration   | Emit configs/actions, not source patches          |
 
-Prior work: NAS-RL (`7504a737`, Zoph & Le 2017, arxiv:1611.01578), HAT (`b8d7b2ff`, Wang et al. 2020, arxiv:2005.14187), DynaBERT (`aa3ffd4a`, Hou et al. 2020, arxiv:2004.04037), KVTuner (`6bf7f34d`, Liu et al. 2025, arxiv:2502.04420), Zero-Cost NAS Proxies (`7e5b0314`, Abdelfattah et al. 2021, arxiv:2101.08134).
+Prior work: NAS-RL (Zoph & Le 2017, arxiv:1611.01578), HAT (Wang et al. 2020, arxiv:2005.14187), DynaBERT (Hou et al. 2020, arxiv:2004.04037), KVTuner (Liu et al. 2025, arxiv:2502.04420), Zero-Cost NAS Proxies (Abdelfattah et al. 2021, arxiv:2101.08134).
 
 ---
 
@@ -884,7 +882,7 @@ See Decision section. Used as the **public runtime interface** (combined with Op
 - **Architecture experiments**: A YAML diff, not a code change. Agent-driven search emits config mutations, not source patches.
 - **Performance**: Zero-cost at steady state. Enum dispatch is a single branch per layer -- same cost as the current `match layer_type`. The `#[inline]` on `LinearKind::forward()` allows the compiler to see through the dispatch when the variant is known.
 - **Pruning**: `ResidualPolicy::Skip` enables ShortGPT-style layer removal without tensor surgery (ADR-060). The pruned config sets `residual: skip` on removed layers.
-- **Mixed quantization**: Per-layer `QuantPlanSpec` enables "F16 for early layers, QuaRot-Q4 for middle layers, Q8 for final layers" -- a capability KVTuner (`6bf7f34d`) showed is important for quality.
+- **Mixed quantization**: Per-layer `QuantPlanSpec` enables "F16 for early layers, QuaRot-Q4 for middle layers, Q8 for final layers" -- a capability KVTuner showed is important for quality.
 
 ### Negative
 
@@ -980,10 +978,10 @@ crates/inference/src/
 ## References
 
 - ADR-010: Attention Mechanisms (`docs/adr/ADR-010-attention-mechanisms.md`) -- current 4-variant design
-- ADR-042: Native Sparse Attention (`44932c9a`) -- NSA three-branch architecture
-- ADR-044: QuaRot Rotated Quantization (`e754741e`) -- Hadamard rotation + Q4
+- ADR-042: Native Sparse Attention -- NSA three-branch architecture
+- ADR-044: QuaRot Rotated Quantization -- Hadamard rotation + Q4
 - ADR-045: QuaRot + LoRA Composition -- counter-rotation for LoRA adapters
-- ADR-057: LoRA Lifecycle (`0648de39`) -- adapter loading/merging
+- ADR-057: LoRA Lifecycle -- adapter loading/merging
 - ADR-058: Regression Gate -- bench-compare CI requirement
 - `enum_dispatch` crate -- [docs.rs/enum_dispatch](https://docs.rs/enum_dispatch/latest/enum_dispatch/)
 - Rust Book Ch. 18.2 -- trait objects and dynamic dispatch -- [doc.rust-lang.org](https://doc.rust-lang.org/book/ch18-02-trait-objects.html)

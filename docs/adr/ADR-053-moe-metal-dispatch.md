@@ -23,10 +23,11 @@ to CPU for any `FeedForwardWeights::Moe` variant.
 
 ### The dispatch cost problem
 
-M2 Max measured Metal dispatch overhead: ~0.127 ms per `CommandBuffer` commit+wait cycle
-(KG entity `Metal MoE Dispatch Analysis`). Qwen3.6 has 40 layers, each with a MoE FFN.
+M2 Max measured Metal dispatch overhead: ~0.127 ms per `CommandBuffer` commit+wait cycle.
+Qwen3.6 has 40 layers, each with a MoE FFN.
 
 Naive per-expert dispatch:
+
 - 8 active routed experts × 3 matrix operations each (gate_up, silu_glu, down) = 24 dispatches
 - Plus 1 shared expert (3 dispatches)
 - Per layer total: 27 dispatches × 0.127 ms = ~3.4 ms
@@ -34,6 +35,7 @@ Naive per-expert dispatch:
   budget for a 42–50 tok/s target.
 
 Even a reduced framing of 1 command buffer per expert:
+
 - 9 experts × 40 layers = 360 dispatches × 0.127 ms = **45.7 ms/token** — still 2× the budget.
 
 The only viable path is 1 command buffer per layer encoding all expert work as multiple
@@ -46,6 +48,7 @@ compute-command encoders within a single commit. This reduces dispatch overhead 
 `shared_expert_intermediate_size: 512` with 256 routed experts across 40 layers.
 
 At Q4 with the current config dimensions:
+
 - `gate_up_proj`: 256 experts × 2 × 512 × 2048 × 0.5 bytes = ~256 MiB per layer
 - `down_proj`: 256 experts × 2048 × 512 × 0.5 bytes = ~128 MiB per layer
 - Total routed expert weights across 40 layers: ~384 MiB × 40 ≈ **15 GiB**
@@ -230,14 +233,14 @@ match &layer.common.ffn {
 
 ## Alternatives Considered
 
-| Alternative | Rationale for rejection |
-|---|---|
-| Per-expert command buffers (naive) | 360 dispatches × 0.127 ms = 45.7 ms/token. Mathematically excluded by measured dispatch overhead. |
-| MLX backend (call Apple's MPS via MLX Rust bindings) | MLX is 3× faster than llama.cpp on MoE on Apple Silicon (measured: Ollama/MLX 58→112 tok/s on Qwen3.5-35B-A3B). But adding MLX as a dependency contradicts the pure-Rust, no-ONNX constraint in AGENTS.md. Not an option in v1. Track as v2 option if native Metal gap persists. |
-| GPU router (move top-k softmax to Metal) | Eliminates the CPU→GPU branch for expert selection, but requires a GPU→CPU readback of `[num_experts]` logits before command encoding can start. At batch=1 the GEMV cost (~0.05 ms on NEON) does not justify the synchronization. Reconsider if batch>1 becomes the target. |
-| Pre-gated routing (predict expert activations one step ahead) | DeepSeek-V2/V3 uses this to prefetch expert weights. Effective at hiding memory latency for weight-swapping configurations. Unnecessary when all weights are resident in unified memory. Defer to v2 with expert swapping. |
-| Expert weight re-layout at load (token-major) | Would allow a single fused `[batch, top_k, inter, hidden]` GEMM. Requires a full re-layout of ~15 GiB of weights at load time and a different buffer structure. No benefit at batch=1 (decode). Defer to v2 prefill path. |
-| Shared expert caching with redundancy elimination | DeepSeek caches the shared expert output across consecutive tokens when input hasn't changed. Valid optimization but requires state tracking that doesn't exist in the current decode loop. Defer. |
+| Alternative                                                   | Rationale for rejection                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Per-expert command buffers (naive)                            | 360 dispatches × 0.127 ms = 45.7 ms/token. Mathematically excluded by measured dispatch overhead.                                                                                                                                                                                |
+| MLX backend (call Apple's MPS via MLX Rust bindings)          | MLX is 3× faster than llama.cpp on MoE on Apple Silicon (measured: Ollama/MLX 58→112 tok/s on Qwen3.5-35B-A3B). But adding MLX as a dependency contradicts the pure-Rust, no-ONNX constraint in AGENTS.md. Not an option in v1. Track as v2 option if native Metal gap persists. |
+| GPU router (move top-k softmax to Metal)                      | Eliminates the CPU→GPU branch for expert selection, but requires a GPU→CPU readback of `[num_experts]` logits before command encoding can start. At batch=1 the GEMV cost (~0.05 ms on NEON) does not justify the synchronization. Reconsider if batch>1 becomes the target.     |
+| Pre-gated routing (predict expert activations one step ahead) | DeepSeek-V2/V3 uses this to prefetch expert weights. Effective at hiding memory latency for weight-swapping configurations. Unnecessary when all weights are resident in unified memory. Defer to v2 with expert swapping.                                                       |
+| Expert weight re-layout at load (token-major)                 | Would allow a single fused `[batch, top_k, inter, hidden]` GEMM. Requires a full re-layout of ~15 GiB of weights at load time and a different buffer structure. No benefit at batch=1 (decode). Defer to v2 prefill path.                                                        |
+| Shared expert caching with redundancy elimination             | DeepSeek caches the shared expert output across consecutive tokens when input hasn't changed. Valid optimization but requires state tracking that doesn't exist in the current decode loop. Defer.                                                                               |
 
 ---
 
@@ -287,4 +290,3 @@ using `MTLStorageModeShared` — it is, per the existing weight buffer pattern i
 - Qwen3.6-35B-A3B HuggingFace config: <https://huggingface.co/Qwen/Qwen3.6-35B-A3B>
 - MLX MoE benchmark: Ollama 0.19 (MLX backend), 58→112 tok/s on Qwen3.5-35B-A3B on M3 Max
 - DeepSeek-V2 MoE architecture: <https://arxiv.org/abs/2405.04434> (shared expert + pre-gating)
-- KG entities: `Metal MoE Dispatch Analysis`, `Expert Coalescing Strategy`

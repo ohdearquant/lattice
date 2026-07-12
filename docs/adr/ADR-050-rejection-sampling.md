@@ -21,8 +21,8 @@ if model_choice != draft[i] { /* reject */ }
 Greedy argmax acceptance does NOT preserve the target model's output distribution. The output
 sequence at temperature > 0 is biased toward whichever tokens the draft model favors, violating
 the core guarantee that speculative decoding should produce samples indistinguishable from
-auto-regressive sampling from the target. The KG gap entity `ResidualRejectionSamplingVariants`
-(status="gap") explicitly flags this deficiency.
+auto-regressive sampling from the target. This is a known gap in residual rejection-sampling
+variants that greedy argmax acceptance does not close.
 
 **Strict speculative sampling** (Leviathan et al. 2022 / SpecTr, NeurIPS 2023) closes this gap.
 For each draft token `d_i` drawn from draft distribution `q`, the target model provides
@@ -44,11 +44,11 @@ distance. Expected accepted tokens per speculative step is `(1 - β^(K+1)) / (1 
 draft tokens (capped geometric, Leviathan et al. ICML 2023, Algorithm 1). Wallclock speedup
 depends on the draft/target cost ratio `c`: `speedup = E[accepted] / (1 + K·c)`.
 
-| β | K | E[accepted] | speedup (c=0.05) |
-|---|---|-------------|------------------|
-| 0.5 | 2 | 1.75 | 1.59 |
-| 0.8 | 5 | 3.69 | 2.95 |
-| 0.9 | 5 | 4.10 | 2.73 |
+| β   | K | E[accepted] | speedup (c=0.05) |
+| --- | - | ----------- | ---------------- |
+| 0.5 | 2 | 1.75        | 1.59             |
+| 0.8 | 5 | 3.69        | 2.95             |
+| 0.9 | 5 | 4.10        | 2.73             |
 
 **GDN complication.** Qwen3.5-2B's 18 GatedDeltaNet layers maintain a recurrent state matrix
 `S[key_dim × value_dim]` per head (see `GatedDeltaNetState::s_matrices`). Unlike KV cache,
@@ -61,9 +61,8 @@ S = g * S + outer(k, (v - S @ k) * beta)
 
 This update is not invertible. Rollback via `truncate_to` handles the KV path but has no
 counterpart for GDN state. A speculative rejection must restore the GDN state to the snapshot
-taken before the draft was generated. Under the nonexpansive decay bound from the KG entity
-`GDN Multi-Round Error Accumulation`, the error from processing N spurious tokens grows as
-`O(N * eps)` — silent corruption if rollback is skipped.
+taken before the draft was generated. Under the nonexpansive decay bound, the error from
+processing N spurious tokens grows as `O(N * eps)` — silent corruption if rollback is skipped.
 
 ---
 
@@ -236,5 +235,3 @@ This is mathematically correct, not a bug.
 - Du et al., "EAGLE-3: Scaling up Inference Acceleration of LLMs via Training-Time Test"
   (Mar 2025), arxiv:2503.01840. Tri-layer fusion for draft head; P-EAGLE single-pass variant.
 - ADR-006: Speculative Decoding (Accepted, 2026-05-13) — baseline implementation this ADR amends.
-- KG entities: `Speculative Decoding`, `SpecTr`, `Per-Token Acceptance Probability β(θ)`,
-  `ResidualRejectionSamplingVariants` (gap), `GDN Multi-Round Error Accumulation`.

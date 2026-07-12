@@ -100,6 +100,7 @@ Apply R^T to MTP inputs before the MTP forward pass and apply R to MTP outputs b
 weight modifications, no offline preprocessing, no new conversion artifacts.
 
 The two-FWHT approach is chosen over reparameterization (Strategy B) as Phase 1 because it:
+
 - Has a single, auditable insertion point per boundary
 - Requires zero changes to the quantize_quarot binary or stored artifacts
 - Is fully reversible (R^T · R = I) with no accumulated error beyond floating-point round-trip
@@ -113,6 +114,7 @@ deferred until Phase 1 acceptance rates are confirmed on hardware.
 ## Scope
 
 **In scope (this ADR)**:
+
 - Counter-rotation shim in `mtp_forward_one()` at `src/forward/metal_qwen35.rs`
 - Detection of QuaRot base (rotation seed metadata read from quantize index)
 - Rotation seed propagation into `MetalQwen35Engine` for runtime use
@@ -121,6 +123,7 @@ deferred until Phase 1 acceptance rates are confirmed on hardware.
 - `quantize_quarot` binary: store rotation seed in `quantize_index.json` (currently omitted)
 
 **Out of scope**:
+
 - Strategy B offline reparameterization of MTP weights
 - INT4 activation quantization of MTP inputs/outputs (ADR-044 v1 deferred)
 - N-gram speculator is unaffected (no hidden states)
@@ -235,12 +238,12 @@ unrotated `.q4` artifacts remain loadable without conversion.
 
 ## Alternatives Considered
 
-| Strategy | Mechanism | Runtime cost | Weight changes | lm_head correctness |
-|---|---|---|---|---|
-| **A: Counter-rotate (chosen)** | R^T before MTP, R after; 2×FWHT/step | ~84K ops/draft step | None | R cancels: (W·R^T)·(R·h) = W·h |
-| **B: Offline reparameterize** | W'=W·R for each of 15 MTP tensors, gamma'=R·gamma for 7 norms | Zero | 15 tensors rewritten offline | lm_head receives rotated output naturally |
-| **C: Rotation-aware MTP training** | Fine-tune MTP to handle rotated inputs | Zero (after training) | Full retraining required | Training learns invariance |
-| **D: Separate lm_head for MTP** | MTP uses its own unshared lm_head (unrotated) | Zero | New 1.2GB tensor per model | No shared lm_head conflict |
+| Strategy                           | Mechanism                                                     | Runtime cost          | Weight changes               | lm_head correctness                       |
+| ---------------------------------- | ------------------------------------------------------------- | --------------------- | ---------------------------- | ----------------------------------------- |
+| **A: Counter-rotate (chosen)**     | R^T before MTP, R after; 2×FWHT/step                          | ~84K ops/draft step   | None                         | R cancels: (W·R^T)·(R·h) = W·h            |
+| **B: Offline reparameterize**      | W'=W·R for each of 15 MTP tensors, gamma'=R·gamma for 7 norms | Zero                  | 15 tensors rewritten offline | lm_head receives rotated output naturally |
+| **C: Rotation-aware MTP training** | Fine-tune MTP to handle rotated inputs                        | Zero (after training) | Full retraining required     | Training learns invariance                |
+| **D: Separate lm_head for MTP**    | MTP uses its own unshared lm_head (unrotated)                 | Zero                  | New 1.2GB tensor per model   | No shared lm_head conflict                |
 
 **Why not B (reparameterize)**: Correct but requires non-trivial per-layer-type math to
 reparameterize fc (2d×d), q/k/v/o projections (d×d each), gate/up/down projections (FFN), and 7
@@ -291,4 +294,3 @@ not change the dtype or buffer layout; no GPU kernel changes are required for Ph
 - `src/quant/quarot/hadamard.rs` — `walsh_hadamard_orthonormal_in_place` (f32, self-inverse)
 - `src/quant/quarot/plan.rs` — `RotationPlan`, `RandomizedHadamard`
 - Ashkboos et al., _QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs_, NeurIPS 2024, arxiv:2404.00456
-- KG entity: `QuaRot-MTP Interaction Analysis`

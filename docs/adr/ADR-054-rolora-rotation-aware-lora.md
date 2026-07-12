@@ -9,24 +9,24 @@
 
 ## Context
 
-ADR-045 solved the *serving-side* coupling between QuaRot Q4 and LoRA adapters: adapters trained
+ADR-045 solved the _serving-side_ coupling between QuaRot Q4 and LoRA adapters: adapters trained
 on the unrotated basis are corrected at load time via counter-rotation (`A ← A·R^T` for input-side
 projections, `B ← R·B` for output-side). This is exact and zero-cost at inference time.
 
-The remaining problem is *training-time*. Standard LoRA fine-tuning trains adapters against the
+The remaining problem is _training-time_. Standard LoRA fine-tuning trains adapters against the
 original (un-rotated) weight basis. When the base model has had its residual stream rotated by R
 (the Hadamard transform from ADR-044), the quantization noise environment changes dramatically:
 
 - **At Q8**: quantization noise amplitude is ~2:1 relative to a typical LoRA delta. Adapters
   trained on unrotated weights, counter-rotated at load time (ADR-045), function acceptably.
-- **At Q4**: quantization noise amplitude can *exceed* the adapter delta. The adapter signal is
+- **At Q4**: quantization noise amplitude can _exceed_ the adapter delta. The adapter signal is
   in the wrong basis relative to the quantization error structure, and the counter-rotation at
   load time corrects the basis mismatch but does not improve the signal-to-noise ratio at training
   time. The adapter learns to compensate for the unrotated model's error surface, not the rotated
   model's error surface.
 
 **RoLoRA** (EMNLP 2024, arxiv:2407.08044) directly addresses this. It applies the same Hadamard
-rotation used for quantization *before* fine-tuning, training LoRA adapters natively in the rotated
+rotation used for quantization _before_ fine-tuning, training LoRA adapters natively in the rotated
 weight basis. Adapters trained this way require no post-hoc correction; they are already in the
 basis the served model operates in. Reported gain: +29.5 percentage points absolute on W4A4
 commonsense reasoning versus standard LoRA.
@@ -37,14 +37,14 @@ alignment problem reduces to a metadata handshake.
 
 ### What exists in Lattice today
 
-| Component | Location | Status |
-|-----------|----------|--------|
-| `LoraAdapter` / `LoraLayer` | `crates/tune/src/lora/mod.rs` | Active |
-| `LoraConfig` | `crates/tune/src/lora/mod.rs` | Active |
-| `RandomizedHadamard` | `crates/inference/src/quant/quarot/` | Active — deterministic from seed |
-| QuaRot rotation plan | `crates/inference/src/quant/quarot/plan.rs` | Active — per-projection side rules |
-| QuaRot seed in artifact | `config.json` of `quantize_quarot` output | **NOT YET PERSISTED** (see ADR-045 §Prerequisites) |
-| Serving-side counter-rotation | `crates/inference/src/…` | Active (ADR-045, PRs #35-#37) |
+| Component                     | Location                                    | Status                                             |
+| ----------------------------- | ------------------------------------------- | -------------------------------------------------- |
+| `LoraAdapter` / `LoraLayer`   | `crates/tune/src/lora/mod.rs`               | Active                                             |
+| `LoraConfig`                  | `crates/tune/src/lora/mod.rs`               | Active                                             |
+| `RandomizedHadamard`          | `crates/inference/src/quant/quarot/`        | Active — deterministic from seed                   |
+| QuaRot rotation plan          | `crates/inference/src/quant/quarot/plan.rs` | Active — per-projection side rules                 |
+| QuaRot seed in artifact       | `config.json` of `quantize_quarot` output   | **NOT YET PERSISTED** (see ADR-045 §Prerequisites) |
+| Serving-side counter-rotation | `crates/inference/src/…`                    | Active (ADR-045, PRs #35-#37)                      |
 
 ---
 
@@ -53,7 +53,7 @@ alignment problem reduces to a metadata handshake.
 ### The gauge alignment problem
 
 In the QuaRot residual stream, the model operates with rotated hidden states `h_rot = R·h`. A
-LoRA adapter `(B, A)` trained on the *unrotated* model learns to correct the unrotated error
+LoRA adapter `(B, A)` trained on the _unrotated_ model learns to correct the unrotated error
 surface. Serving via counter-rotation (ADR-045) fixes the basis mismatch exactly, but the adapter
 has been optimized against the wrong noise distribution.
 
@@ -186,7 +186,7 @@ artifact and adapter metadata is an error (fail-closed).
 - QA-LoRA 4-bit adapter merging — deferred, no current use case
 - Automatic seed detection from model artifact (requires ADR-045 §Prerequisites to ship first;
   until then, callers supply seed explicitly)
-- Multi-adapter / MoLoRA routing in the rotated basis (v2, KG entity `W2-Barycenter-Adapter-Blending`)
+- Multi-adapter / MoLoRA routing in the rotated basis (v2, W2-Barycenter-Adapter-Blending)
 
 ---
 
@@ -237,13 +237,13 @@ METAL FORWARD (per token, unchanged from ADR-045)
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Verdict |
-|-------------|------|------|---------|
-| **ADR-045 counter-rotation only (current)** | No training changes needed; works with existing PEFT adapters | Adapter trained against wrong noise distribution at Q4; SNR gap grows at lower bit-widths | Keep as legacy path; insufficient for new Q4 adapter training |
-| **RoLoRA (this ADR)** | Adapter trained in correct basis; +29.5pp reported on W4A4; zero serving-side overhead for rotation-aware adapters; seed already deterministic | Requires rotation-aware training infra; not compatible with generic PEFT export unless seed metadata added | **Accept** |
-| **QuAILoRA initialization** (arxiv:2410.14713) | Minimizes quantization error at LoRA init; composable with RoLoRA | Orthogonal concern (init strategy, not basis alignment); separate ADR | Defer to a future ADR; composable with this decision |
-| **Runtime rotation at each training step** | Avoids modifying frozen weights | Per-step `d×d` WHT overhead on all target projections during training; unnecessary given seed is fixed | Reject — one-time absorption is equivalent and free |
-| **Separate RoLoRA training crate** | Clean separation | Violates `Π_AEP` (FindExisting > Create); `LoraConfig` already has the right extension point | Reject |
+| Alternative                                    | Pros                                                                                                                                           | Cons                                                                                                       | Verdict                                                       |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| **ADR-045 counter-rotation only (current)**    | No training changes needed; works with existing PEFT adapters                                                                                  | Adapter trained against wrong noise distribution at Q4; SNR gap grows at lower bit-widths                  | Keep as legacy path; insufficient for new Q4 adapter training |
+| **RoLoRA (this ADR)**                          | Adapter trained in correct basis; +29.5pp reported on W4A4; zero serving-side overhead for rotation-aware adapters; seed already deterministic | Requires rotation-aware training infra; not compatible with generic PEFT export unless seed metadata added | **Accept**                                                    |
+| **QuAILoRA initialization** (arxiv:2410.14713) | Minimizes quantization error at LoRA init; composable with RoLoRA                                                                              | Orthogonal concern (init strategy, not basis alignment); separate ADR                                      | Defer to a future ADR; composable with this decision          |
+| **Runtime rotation at each training step**     | Avoids modifying frozen weights                                                                                                                | Per-step `d×d` WHT overhead on all target projections during training; unnecessary given seed is fixed     | Reject — one-time absorption is equivalent and free           |
+| **Separate RoLoRA training crate**             | Clean separation                                                                                                                               | Violates `Π_AEP` (FindExisting > Create); `LoraConfig` already has the right extension point               | Reject                                                        |
 
 ---
 
@@ -282,17 +282,5 @@ METAL FORWARD (per token, unchanged from ADR-045)
 - ADR-045: QuaRot + LoRA composition at inference time (serving-side counter-rotation)
 - ADR-043: LoRA serving verification (correctness framework, `LoraHook` trait)
 - ADR-031: LoRA management (adapter lifecycle)
-- KG: `LoRA SNR vs Base Quantization Noise`, `QuaRot (Ashkboos 2024)` (86ec6a4f),
-  `LoRA-Low-Rank-Adaptation` (e916fb8b), `W2-Barycenter-Adapter-Blending` (e6a40019)
 - Hu et al. 2021, "LoRA: Low-Rank Adaptation of Large Language Models", arxiv:2106.09685
 - Ashkboos et al. 2024, "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs", arxiv:2404.00456
-
----
-
-## Knowledge Graph
-
-- New entity on implementation PR: `RoLoRA` (kind: concept, type: technique, status: proposed)
-  - `extends` → `LoRA-Low-Rank-Adaptation`
-  - `composed_with` → `QuaRot (Ashkboos 2024)`
-  - `introduced_by` → `Zhu et al. EMNLP 2024`
-  - `competes_with` → `QuAILoRA` (alternative quantization-aware LoRA init approach)
