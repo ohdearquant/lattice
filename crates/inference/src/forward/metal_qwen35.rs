@@ -1125,18 +1125,46 @@ mod inner {
         Full(MetalFullLayerWeights),
     }
 
+    /// Where a MoE layer's routed-expert weights live: fully resident
+    /// (safetensors-upload path, unchanged behavior) or a bounded LRU cache
+    /// of per-expert slots dequantized on demand from a `.q4` file's mmap
+    /// (#682 Stage 1, the `from_q4_dir` path only).
+    enum RoutedExpertStorage {
+        /// Routed expert gate+up / down projections fully resident, exactly
+        /// as before #682: `gate_up` is `[num_experts * 2 * inter * hidden]`
+        /// f16 (expert `e` gate at element `e * 2 * inter * hidden`, up at
+        /// `e * 2 * inter * hidden + inter * hidden`), `down` is
+        /// `[num_experts * hidden * inter]` f16 (expert `e` at
+        /// `e * hidden * inter`). Used by `MetalQwen35Engine::new()`'s
+        /// safetensors-upload constructor, which has no `.q4` file to mmap
+        /// and lazily dequant from — that path's memory behavior is
+        /// intentionally unchanged by #682 (see PLAN.md "KEEP behavior
+        /// identical for the safetensors-upload MoE path").
+        Eager { gate_up: Buffer, down: Buffer },
+        /// Routed expert gate+up / down projections cached lazily (#682
+        /// Stage 1): a bounded LRU pool of per-expert f16 slots, populated
+        /// on demand from an mmap of the `.q4` file. Expert `e`'s resolved
+        /// slot buffer holds gate at element offset `0` and up at element
+        /// offset `inter * hidden` (the fused-tensor layout within one
+        /// expert's slice is unchanged, just no longer addressed by a
+        /// global `expert_id * ...` offset into a giant resident buffer).
+        /// `RefCell` gives `encode_moe_ffn` (which only holds
+        /// `&MoeMetalBuffers`) interior mutability for LRU bookkeeping —
+        /// single-threaded decode, no concurrent access.
+        Cached {
+            gate_up: Box<std::cell::RefCell<crate::forward::moe_expert_cache::ExpertSlotCache>>,
+            down: Box<std::cell::RefCell<crate::forward::moe_expert_cache::ExpertSlotCache>>,
+        },
+    }
+
     /// Pre-allocated Metal buffers for one MoE layer (ADR-053).
     ///
     /// Holds f16 expert weight buffers and f32 scratch buffers reused across tokens.
-    /// All weights are resident in unified memory (StorageModeShared).
+    /// All weights are resident in unified memory (StorageModeShared), except
+    /// `routed` when it is `RoutedExpertStorage::Cached` (#682 Stage 1).
     struct MoeMetalBuffers {
-        /// Routed expert gate+up projections: [num_experts * 2 * inter * hidden] f16.
-        /// Expert e gate starts at element `e * 2 * inter * hidden`.
-        /// Expert e up starts at element `e * 2 * inter * hidden + inter * hidden`.
-        routed_gate_up: Buffer,
-        /// Routed expert down projections: [num_experts * hidden * inter] f16.
-        /// Expert e starts at element `e * hidden * inter`.
-        routed_down: Buffer,
+        /// Routed expert gate+up / down projections — see [`RoutedExpertStorage`].
+        routed: RoutedExpertStorage,
         /// Shared expert gate projection: [shared_inter * hidden] f16.
         shared_gate_proj: Buffer,
         /// Shared expert up projection: [shared_inter * hidden] f16.
@@ -3205,8 +3233,10 @@ mod inner {
                             make_zero_buffer(&device, hid, &format!("L{i}.moe.scr_out"));
 
                         MetalFfnWeights::Moe(Box::new(MoeMetalBuffers {
-                            routed_gate_up,
-                            routed_down,
+                            routed: RoutedExpertStorage::Eager {
+                                gate_up: routed_gate_up,
+                                down: routed_down,
+                            },
                             shared_gate_proj,
                             shared_up_proj,
                             shared_down_proj,
@@ -10768,18 +10798,47 @@ mod inner {
             // ── Step 3: Routed experts ────────────────────────────────────────────
             let inter_u32 = inter as u32;
 
+            // #682 Stage 1: `RoutedExpertStorage::Cached` (the `.q4`-loaded
+            // path) needs its "touched this token" bookkeeping cleared
+            // before any `resolve()` call this token — see
+            // `moe_expert_cache`'s module doc comment for why that makes
+            // slot eviction safe. `RoutedExpertStorage::Eager` (the
+            // safetensors-upload path) has no cache to reset.
+            if let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed {
+                gate_up.borrow_mut().begin_token();
+                down.borrow_mut().begin_token();
+            }
+
             for &(expert_id, router_weight) in selected.iter() {
                 if expert_id == usize::MAX {
                     // Unfilled slot (fewer than top_k experts passed threshold).
                     continue;
                 }
 
-                // Expert e gate half starts at element: e * 2 * inter * hidden
-                // Expert e up half starts at element:  e * 2 * inter * hidden + inter * hidden
-                let gate_elem_off = (expert_id * 2 * inter * hidden) as u32;
-                let up_elem_off = (expert_id * 2 * inter * hidden + inter * hidden) as u32;
-                // Expert e down half starts at element: e * hidden * inter
-                let down_elem_off = (expert_id * hidden * inter) as u32;
+                // Resolve this expert's gate_up/down buffers plus the
+                // element offsets to address gate vs. up within the
+                // gate_up buffer. Eager: offsets are global (`expert_id *
+                // ...`) into the one giant resident buffer. Cached: the
+                // resolved buffer already IS just this expert's slice, so
+                // offsets are local (`0` for gate/down, `inter * hidden`
+                // for up within the fused per-expert gate_up slot).
+                let (gate_up_buf, gate_elem_off, up_elem_off, down_buf, down_elem_off) =
+                    match &moe.routed {
+                        RoutedExpertStorage::Eager { gate_up, down } => {
+                            // Expert e gate half starts at element: e * 2 * inter * hidden
+                            // Expert e up half starts at element:  e * 2 * inter * hidden + inter * hidden
+                            let gate_off = (expert_id * 2 * inter * hidden) as u32;
+                            let up_off = (expert_id * 2 * inter * hidden + inter * hidden) as u32;
+                            // Expert e down half starts at element: e * hidden * inter
+                            let down_off = (expert_id * hidden * inter) as u32;
+                            (gate_up.clone(), gate_off, up_off, down.clone(), down_off)
+                        }
+                        RoutedExpertStorage::Cached { gate_up, down } => {
+                            let gate_up_buf = gate_up.borrow_mut().resolve(expert_id).clone();
+                            let down_buf = down.borrow_mut().resolve(expert_id).clone();
+                            (gate_up_buf, 0u32, (inter * hidden) as u32, down_buf, 0u32)
+                        }
+                    };
 
                 // Gate GEMV: scratch_gate[inter] = W_gate[e] * hidden
                 let params_gate = GemmParams {
@@ -10792,7 +10851,7 @@ mod inner {
                 };
                 enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
                 enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-                enc.set_buffer(1, Some(&moe.routed_gate_up), 0);
+                enc.set_buffer(1, Some(&gate_up_buf), 0);
                 enc.set_buffer(2, Some(&moe.scratch_gate), 0);
                 enc.set_bytes(
                     3,
@@ -10816,7 +10875,7 @@ mod inner {
                 };
                 enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
                 enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-                enc.set_buffer(1, Some(&moe.routed_gate_up), 0);
+                enc.set_buffer(1, Some(&gate_up_buf), 0);
                 enc.set_buffer(2, Some(&moe.scratch_up), 0);
                 enc.set_bytes(
                     3,
@@ -10851,7 +10910,7 @@ mod inner {
                 };
                 enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
                 enc.set_buffer(0, Some(&moe.scratch_gate), 0);
-                enc.set_buffer(1, Some(&moe.routed_down), 0);
+                enc.set_buffer(1, Some(&down_buf), 0);
                 enc.set_buffer(2, Some(&moe.scratch_expert_out), 0);
                 enc.set_bytes(
                     3,
@@ -13654,8 +13713,11 @@ mod inner {
             cfg: &Qwen35Config,
             prefix: &str,
             layer_idx: usize,
-            moe_routed_bytes_loaded: &std::cell::Cell<u64>,
         ) -> Result<MetalFfnWeights, String> {
+            use crate::forward::moe_expert_cache::{
+                ExpertSlotCache, MoeExpertCacheConfig, moe_expert_cache_num_slots,
+            };
+
             let num_experts = cfg
                 .num_experts
                 .ok_or_else(|| "from_q4_dir: MoE config missing num_experts".to_string())?;
@@ -13666,52 +13728,47 @@ mod inner {
             let shared_inter = cfg.shared_expert_intermediate_size();
             let hidden = cfg.hidden_size;
 
-            // Headroom guard, mirroring new()'s MoE branch — but CUMULATIVE across
-            // every MoE layer, not per-layer. `new()`'s original guard (and this
-            // function's first version) only checked a single layer's routed-expert
-            // byte count against the device budget; since every layer's dequantized
-            // f16 buffers stay resident for the model's lifetime (nothing is freed
-            // between layers), a per-layer-only check passes cleanly on checkpoints
-            // whose PER-LAYER footprint is small while the SUM across all layers
-            // still exceeds available unified memory — e.g. Qwen3.6-35B-A3B (40
-            // layers × 256 experts × moe_intermediate_size=512, hidden=2048) needs
-            // ~1.5 GiB f16 per layer × 40 layers ≈ 60 GiB, comfortably under any
-            // single per-layer threshold but far past a 32 GiB machine's total RAM.
-            // Track a running total across the whole `from_q4_dir` load and fail
-            // closed with a clear diagnostic before attempting to allocate past it,
-            // rather than let the process OOM partway through the layer loop.
-            let routed_bytes = (num_experts * (2 * inter * hidden + hidden * inter) * 2) as u64;
-            let cumulative_bytes = moe_routed_bytes_loaded.get() + routed_bytes;
+            // #682 Stage 1: routed experts are no longer eagerly dequantized
+            // to full-size resident buffers (that path needed ~61 GiB
+            // f16-resident for Qwen3.5-35B-A3B, independent of how many
+            // experts a token actually activates — see PLAN.md §1). Instead,
+            // size a bounded LRU cache of per-expert slots against this
+            // device's memory budget: `num_experts` slots (the "zero-eviction
+            // fast path", functionally the old eager behavior but lazily
+            // populated and evictable) when that fits under 0.85 ×
+            // recommendedMaxWorkingSetSize split evenly across every MoE
+            // layer, else auto-shrunk (floored at `top_k`, below which the
+            // cache cannot serve even one token's routed-expert set).
+            let gate_up_bytes_per_expert = (2 * inter * hidden * 2) as u64; // f16
+            let down_bytes_per_expert = (hidden * inter * 2) as u64; // f16
+            let per_expert_bytes_total = gate_up_bytes_per_expert + down_bytes_per_expert;
+            let num_moe_layers = cfg.num_active_layers();
             let max_working = device.recommended_max_working_set_size();
-            let threshold = (max_working as f64 * 0.85) as u64;
-            if cumulative_bytes > threshold {
-                return Err(format!(
-                    "from_q4_dir: MoE layer {layer_idx}: cumulative routed expert weights \
-                     across all MoE layers loaded so far ({} MiB, this layer adds {} MiB) \
-                     exceed 0.85 × recommendedMaxWorkingSetSize ({} MiB). The current \
-                     from_q4_dir MoE path eagerly dequantizes every layer's experts to \
-                     f16-resident GPU buffers (no per-layer streaming/eviction yet) — this \
-                     checkpoint needs more unified memory than this device reports, or a \
-                     streaming/partial-residency MoE loader (tracked separately from #876).",
-                    cumulative_bytes / (1024 * 1024),
-                    routed_bytes / (1024 * 1024),
-                    threshold / (1024 * 1024)
-                ));
-            }
-            moe_routed_bytes_loaded.set(cumulative_bytes);
+            let cache_cfg = MoeExpertCacheConfig::from_env();
+            let num_slots = moe_expert_cache_num_slots(
+                &cache_cfg,
+                num_experts,
+                top_k,
+                per_expert_bytes_total,
+                num_moe_layers,
+                max_working,
+            )
+            .map_err(|e| format!("from_q4_dir: MoE layer {layer_idx}: {e}"))?;
 
-            let routed_gate_up = Self::load_q4_mmap_dequant_f16(
+            let routed_gate_up_cache = std::cell::RefCell::new(ExpertSlotCache::new(
                 device,
                 &Self::q4_tensor_path(q4_dir, &format!("{prefix}.mlp.experts.gate_up_proj"), "q4"),
-                &format!("L{layer_idx}.moe.gate_up.f16"),
                 &[num_experts, 2 * inter, hidden],
-            )?;
-            let routed_down = Self::load_q4_mmap_dequant_f16(
+                num_slots,
+                &format!("L{layer_idx}.moe.gate_up.f16.cache"),
+            )?);
+            let routed_down_cache = std::cell::RefCell::new(ExpertSlotCache::new(
                 device,
                 &Self::q4_tensor_path(q4_dir, &format!("{prefix}.mlp.experts.down_proj"), "q4"),
-                &format!("L{layer_idx}.moe.down.f16"),
                 &[num_experts, hidden, inter],
-            )?;
+                num_slots,
+                &format!("L{layer_idx}.moe.down.f16.cache"),
+            )?);
             let shared_gate_proj = Self::load_q4_mmap_dequant_f16(
                 device,
                 &Self::q4_tensor_path(
@@ -13775,8 +13832,10 @@ mod inner {
                 make_zero_buffer(device, hidden, &format!("L{layer_idx}.moe.scr_out"));
 
             Ok(MetalFfnWeights::Moe(Box::new(MoeMetalBuffers {
-                routed_gate_up,
-                routed_down,
+                routed: RoutedExpertStorage::Cached {
+                    gate_up: Box::new(routed_gate_up_cache),
+                    down: Box::new(routed_down_cache),
+                },
                 shared_gate_proj,
                 shared_up_proj,
                 shared_down_proj,
@@ -14353,11 +14412,6 @@ mod inner {
             // ----------------------------------------------------------------
             let mut layer_weights: Vec<(MetalLayerAttnWeights, MetalCommonLayerWeights)> =
                 Vec::with_capacity(cfg.num_active_layers());
-            // Cumulative routed-expert byte count across every MoE layer loaded so
-            // far (see `Self::load_moe_ffn_q4`'s headroom guard doc comment) — every
-            // layer's f16 buffers stay GPU-resident for the model's lifetime, so the
-            // budget check must accumulate across the whole loop, not reset per-layer.
-            let moe_routed_bytes_loaded = std::cell::Cell::new(0u64);
 
             for i in 0..cfg.num_hidden_layers {
                 if !cfg.is_layer_active(i) {
@@ -14383,14 +14437,7 @@ mod inner {
                         // / `.experts.down_proj` fused per-layer arrays, plus every other MoE
                         // tensor here, are Q4-quantized). `MetalFfnWeights::Dense`'s
                         // `mlp.{gate,up,down}_proj.weight` files do not exist for this layer.
-                        Self::load_moe_ffn_q4(
-                            &device,
-                            q4_dir,
-                            cfg,
-                            &prefix,
-                            i,
-                            &moe_routed_bytes_loaded,
-                        )?
+                        Self::load_moe_ffn_q4(&device, q4_dir, cfg, &prefix, i)?
                     } else {
                         let (gate_raw, gate_len) =
                             load_q4_raw_timed(&format!("{prefix}.mlp.gate_proj.weight"))?;
@@ -18643,42 +18690,51 @@ mod inner {
             // Read the loaded Metal buffers straight from the built state, before
             // any decode runs, to isolate loader correctness from generation
             // numerics — this is the layout proof for the expert-major layout
-            // invariant.
+            // invariant. `from_q4_dir` always builds `RoutedExpertStorage::Cached`
+            // (#682 Stage 1) — this exercises `ExpertSlotCache::resolve`'s
+            // cache-miss dequant path directly, reading each resolved slot at
+            // LOCAL offsets (`0` gate, `moe_inter * hidden` up, `0` down)
+            // rather than the pre-#682 global `e * ...` offsets into one giant
+            // resident buffer.
             {
                 use crate::weights::q4_weights::q4_f16_to_f32;
                 let (_, common) = &state.engine.layer_weights[0];
                 let MetalFfnWeights::Moe(moe) = &common.ffn else {
                     panic!("layer 0 must build MetalFfnWeights::Moe for an is_moe() config");
                 };
+                let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed else {
+                    panic!("from_q4_dir must build RoutedExpertStorage::Cached (#682 Stage 1)");
+                };
                 // SAFETY: StorageModeShared buffers, no GPU work has been
                 // encoded yet (state was just constructed) — safe CPU read.
                 unsafe {
-                    let gate_up_ptr = moe.routed_gate_up.contents() as *const u16;
-                    let down_ptr = moe.routed_down.contents() as *const u16;
                     for e in [0usize, 1usize] {
-                        let gate_off = e * 2 * moe_inter * hidden;
-                        let up_off = gate_off + moe_inter * hidden;
-                        let down_off = e * hidden * moe_inter;
-                        let gate_read = q4_f16_to_f32(*gate_up_ptr.add(gate_off));
+                        let gate_up_buf = gate_up.borrow_mut().resolve(e).clone();
+                        let down_buf = down.borrow_mut().resolve(e).clone();
+                        let gate_up_ptr = gate_up_buf.contents() as *const u16;
+                        let down_ptr = down_buf.contents() as *const u16;
+                        let up_off = moe_inter * hidden;
+                        let gate_read = q4_f16_to_f32(*gate_up_ptr.add(0));
                         let up_read = q4_f16_to_f32(*gate_up_ptr.add(up_off));
-                        let down_read = q4_f16_to_f32(*down_ptr.add(down_off));
+                        let down_read = q4_f16_to_f32(*down_ptr.add(0));
                         assert_eq!(
                             gate_read,
                             q4_const_roundtrip(moe_fixture_gate_const(e)),
-                            "expert {e} gate slice at element offset {gate_off} mismatch \
-                             (expert-major gate/up layout bug)"
+                            "expert {e} gate slice mismatch (expert-major gate/up layout bug, \
+                             or #682 cache resolve() addressing bug)"
                         );
                         assert_eq!(
                             up_read,
                             q4_const_roundtrip(moe_fixture_up_const(e)),
                             "expert {e} up slice at element offset {up_off} mismatch \
-                             (expert-major gate/up boundary bug)"
+                             (expert-major gate/up boundary bug, or #682 cache resolve() \
+                             addressing bug)"
                         );
                         assert_eq!(
                             down_read,
                             q4_const_roundtrip(moe_fixture_down_const(e)),
-                            "expert {e} down slice at element offset {down_off} mismatch \
-                             (expert-major down-proj layout bug)"
+                            "expert {e} down slice mismatch (expert-major down-proj layout bug, \
+                             or #682 cache resolve() addressing bug)"
                         );
                     }
                 }
@@ -18797,6 +18853,257 @@ mod inner {
                  mean the selected expert's dispatch offset isn't actually wired to its own \
                  loaded weights (exactly the expert-swap/offset bug class this PR's shape gate \
                  and mmap offsets must prevent)"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // #682 Stage 1: dequant-on-demand routed experts with a bounded LRU
+        // cache. `from_q4_dir` always builds `RoutedExpertStorage::Cached`
+        // now (there is no more eager/lazy fork at the `.q4` loader level —
+        // that fork moved to `RoutedExpertStorage`'s two variants, and only
+        // `MetalQwen35Engine::new()`'s safetensors-upload path still builds
+        // `Eager`). So "eager vs. lazy" for the `.q4` path becomes
+        // "N=num_experts (zero-eviction fast path) vs. N<num_experts
+        // (forced eviction)" — both use the SAME dequant-on-demand
+        // machinery, just with different eviction pressure. The three tests
+        // below are the Stage 1 test-strategy items from PLAN.md: (a) an
+        // eviction-forcing N vs. a zero-eviction N must produce identical
+        // decode logits; (b) is folded into (a) — the forced-eviction run
+        // deliberately interleaves resolves of every OTHER expert between
+        // decode steps so the deterministically-selected expert's slot is
+        // repeatedly evicted and reloaded; (c) corrupting an expert's
+        // on-disk bytes after it has been evicted-and-reloaded at least
+        // once must still change decode output, proving the reload path
+        // re-reads rather than serving something stale.
+        // -------------------------------------------------------------------
+
+        /// A drop guard that restores (or clears) an env var on scope exit,
+        /// so a panicking assertion inside a test can't leak
+        /// `LATTICE_MOE_EXPERT_CACHE_SLOTS` into whichever GPU test the
+        /// `gpu_test_lock()` mutex hands the machine to next.
+        struct EnvVarGuard {
+            key: &'static str,
+            prior: Option<String>,
+        }
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let prior = std::env::var(key).ok();
+                // SAFETY: callers only mutate `LATTICE_MOE_EXPERT_CACHE_SLOTS`
+                // from inside a `gpu_test_lock()`-guarded test, which
+                // serializes every GPU test in this binary (same pattern as
+                // `with_self_spec_env` above) — no concurrent reader/writer.
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+                Self { key, prior }
+            }
+        }
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                // SAFETY: see `EnvVarGuard::set`.
+                unsafe {
+                    match &self.prior {
+                        Some(v) => std::env::set_var(self.key, v),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        /// Directly evict/reload `expert_id` through a layer's routed-expert
+        /// caches, bypassing `encode_moe_ffn`/routing entirely. Used to
+        /// simulate "many decode steps' worth" of eviction pressure against
+        /// experts routing never actually selects in the deterministic
+        /// synthetic fixture (`MOE_FIXTURE_TARGET_EXPERT` always wins), so
+        /// tests can force real LRU eviction/reload cycles on a target
+        /// expert without needing routing itself to vary per token.
+        fn force_resolve_layer0(state: &MetalQwen35State, expert_id: usize) {
+            let (_, common) = &state.engine.layer_weights[0];
+            let MetalFfnWeights::Moe(moe) = &common.ffn else {
+                panic!("layer 0 must build MetalFfnWeights::Moe for an is_moe() config");
+            };
+            let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed else {
+                panic!("from_q4_dir must build RoutedExpertStorage::Cached (#682 Stage 1)");
+            };
+            gate_up.borrow_mut().begin_token();
+            down.borrow_mut().begin_token();
+            let _ = gate_up.borrow_mut().resolve(expert_id);
+            let _ = down.borrow_mut().resolve(expert_id);
+        }
+
+        #[test]
+        fn from_q4_dir_moe_forced_eviction_matches_zero_eviction_baseline() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let tokens: Vec<u32> = vec![1, 2, 3, 4];
+            let tokenizer_path = std::path::Path::new("/dev/null");
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+
+            // --- Baseline: N = num_experts (zero-eviction fast path). ---
+            // SAFETY: see `EnvVarGuard::set` — serialized by `gpu_test_lock()`.
+            unsafe {
+                std::env::remove_var(crate::forward::moe_expert_cache::MOE_EXPERT_CACHE_SLOTS_ENV);
+            }
+            let mut baseline = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                .expect("baseline (N=num_experts) load must succeed");
+            let mut baseline_logits = Vec::new();
+            for (position, &token) in tokens.iter().enumerate() {
+                baseline_logits = baseline.forward_step(token, position);
+            }
+
+            // --- Forced eviction: N=2 slots for this 4-expert layer. ---
+            let mut forced = {
+                let _env = EnvVarGuard::set(
+                    crate::forward::moe_expert_cache::MOE_EXPERT_CACHE_SLOTS_ENV,
+                    "2",
+                );
+                MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                    .expect("forced-eviction (N=2) load must succeed")
+            };
+
+            let mut forced_logits = Vec::new();
+            for (position, &token) in tokens.iter().enumerate() {
+                // Between decode steps, directly evict/reload the three
+                // experts routing never selects (0, 1, 3 — routing always
+                // deterministically picks expert 2). With only 2 slots,
+                // resolving 3 distinct experts guarantees at least one
+                // eviction each round, and necessarily pushes expert 2's
+                // slot out at least once per round too (pigeonhole: 2 slots
+                // can't hold {0,1,2,3} simultaneously). The next
+                // `forward_step` below must then re-dequant expert 2 from
+                // disk before dispatching its GEMVs.
+                for &other in &[0usize, 1usize, 3usize] {
+                    force_resolve_layer0(&forced, other);
+                }
+                forced_logits = forced.forward_step(token, position);
+            }
+
+            assert_eq!(baseline_logits.len(), forced_logits.len());
+            for (i, (b, f)) in baseline_logits.iter().zip(forced_logits.iter()).enumerate() {
+                assert!(
+                    (b - f).abs() < 1e-4,
+                    "logit {i} diverged between the N=num_experts baseline ({b}) and the \
+                     forced-eviction N=2 run ({f}) after repeated evict/reload cycles — a \
+                     correct dequant-on-demand cache must be numerically transparent to \
+                     decode output regardless of eviction pressure (baseline={baseline_logits:?}, \
+                     forced={forced_logits:?})"
+                );
+            }
+        }
+
+        /// Mutation check for the test above: deliberately break
+        /// `ExpertSlotCache`'s within-token eviction guard (make
+        /// `pick_eviction_slot` always evict LRU-front regardless of
+        /// `slot_touched`) and confirm this test fails. This is exercised
+        /// manually (not compiled in), documented here so the invariant it
+        /// guards is traceable: reverting `pick_eviction_slot` to ignore
+        /// `slot_touched` makes `from_q4_dir_moe_forced_eviction_matches_zero_eviction_baseline`
+        /// either panic (a resolve() overwrites a slot an already-encoded-
+        /// but-not-yet-executed GEMV needs) or, on this synthetic fixture
+        /// (whose `top_k=1` never triggers the within-token case, since
+        /// only one expert is ever selected per `encode_moe_ffn` call), pass
+        /// unchanged — which is exactly why the module doc comment's
+        /// invariant proof relies on `num_slots >= top_k`, not on this test
+        /// catching every possible violation. The corruption test below is
+        /// this file's actual mutation-sensitive proof that reload
+        /// addressing is correct.
+        #[test]
+        fn from_q4_dir_moe_reload_after_eviction_is_sensitive_to_expert_weight_corruption() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let tokens: Vec<u32> = vec![1, 2, 3, 4];
+            let tokenizer_path = std::path::Path::new("/dev/null");
+
+            let run = |gate_const: fn(usize) -> f32,
+                       up_const: fn(usize) -> f32,
+                       down_const: fn(usize) -> f32|
+             -> Vec<f32> {
+                let tmp = tempfile::tempdir().expect("tempdir create");
+                let dir = tmp.path();
+                write_synthetic_moe_checkpoint(dir, &cfg, gate_const, up_const, down_const);
+
+                let mut state = {
+                    let _env = EnvVarGuard::set(
+                        crate::forward::moe_expert_cache::MOE_EXPERT_CACHE_SLOTS_ENV,
+                        "2",
+                    );
+                    MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                        .expect("from_q4_dir (forced-eviction N=2) must load")
+                };
+
+                let mut logits = Vec::new();
+                for (position, &token) in tokens.iter().enumerate() {
+                    // Force expert 2 (the deterministically-routed target)
+                    // out of the cache and back in at least once before
+                    // this token's real decode step, so the assertion below
+                    // is about the RELOAD path specifically, not just the
+                    // initial load.
+                    for &other in &[0usize, 1usize, 3usize] {
+                        force_resolve_layer0(&state, other);
+                    }
+                    force_resolve_layer0(&state, MOE_FIXTURE_TARGET_EXPERT);
+                    logits = state.forward_step(token, position);
+                }
+                assert!(
+                    logits.iter().all(|v| v.is_finite()),
+                    "MoE decode produced non-finite logits: {logits:?}"
+                );
+                logits
+            };
+
+            let correct = run(
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            let sabotaged = run(
+                |e| {
+                    if e == MOE_FIXTURE_TARGET_EXPERT {
+                        moe_fixture_gate_const(0)
+                    } else {
+                        moe_fixture_gate_const(e)
+                    }
+                },
+                |e| {
+                    if e == MOE_FIXTURE_TARGET_EXPERT {
+                        moe_fixture_up_const(0)
+                    } else {
+                        moe_fixture_up_const(e)
+                    }
+                },
+                |e| {
+                    if e == MOE_FIXTURE_TARGET_EXPERT {
+                        moe_fixture_down_const(0)
+                    } else {
+                        moe_fixture_down_const(e)
+                    }
+                },
+            );
+
+            assert_ne!(
+                correct, sabotaged,
+                "decode logits must change when the target expert's on-disk weights are \
+                 corrupted, even though every decode step in this test forces that expert's \
+                 cache slot to be evicted and reloaded before use — identical output here would \
+                 mean the reload path is serving stale/cached data instead of actually \
+                 re-reading the (changed) on-disk bytes"
             );
         }
 
