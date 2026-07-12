@@ -103,10 +103,12 @@ PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.
 
 ### Merge Gate
 
-A PR merges once required checks are green **at the PR's own head**. Branch protection
-no longer requires the branch to be up to date with main first (`required_status_checks.strict
-= false` as of 2026-07-12) — required checks gate the PR's own commits, not the hypothetical
-merge of those commits onto current main.
+A PR merges once its required checks are green. Branch protection no longer requires the
+branch to be up to date with main first (`required_status_checks.strict = false` as of
+2026-07-12). Note the precise semantics: PR workflow checks still run on GitHub's synthetic
+merge ref (the PR merged into main as of when the run started), but with strict off a
+stale head may merge after main has since advanced, so a green run is not guaranteed to
+cover the eventual merge with current main.
 
 That gap is exactly what broke main for two hours after #634: it merged green-on-a-stale-base,
 but main had gained call sites of the API it changed, and the merged combination was never
