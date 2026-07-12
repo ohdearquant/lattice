@@ -120,19 +120,19 @@ class BootstrapMeanTest(unittest.TestCase):
         rng = random.Random(11)
         values = [0.1, 0.2, 0.15, 0.3, 0.05, 0.25, 0.18]
         order_ab = [True, False, True, False, True, False, True]
-        bound = gm.bootstrap_upper_bound(values, order_ab, 1000, rng, corrected_alpha=0.01)
+        bound = gm._diagnostic_bootstrap_upper_bound(values, order_ab, 1000, rng, corrected_alpha=0.01)
         self.assertGreaterEqual(bound, min(values) - 1e-6)
         self.assertLessEqual(bound, max(values) + 1e-6)
 
     def test_invalid_alpha_rejected(self):
         rng = random.Random(1)
         with self.assertRaises(gm.GateMathError):
-            gm.bootstrap_upper_bound([1.0], [True], 10, rng, corrected_alpha=1.5)
+            gm._diagnostic_bootstrap_upper_bound([1.0], [True], 10, rng, corrected_alpha=1.5)
 
 
 class BootstrapLowerBoundTest(unittest.TestCase):
     """The FAIL rule needs a one-sided LOWER bound, not
-    `bootstrap_upper_bound`'s `(1 - alpha)` upper tail. These fixtures
+    `_diagnostic_bootstrap_upper_bound`'s `(1 - alpha)` upper tail. These fixtures
     pin the orientation."""
 
     def test_near_null_lower_bound_at_or_below_threshold(self):
@@ -163,7 +163,7 @@ class BootstrapLowerBoundTest(unittest.TestCase):
         values = [0.1, 0.2, 0.15, 0.3, 0.05, 0.25, 0.18]
         order_ab = [True, False, True, False, True, False, True]
         lower = gm.bootstrap_lower_bound(values, order_ab, 1000, rng_lo, corrected_alpha=0.01)
-        upper = gm.bootstrap_upper_bound(values, order_ab, 1000, rng_hi, corrected_alpha=0.01)
+        upper = gm._diagnostic_bootstrap_upper_bound(values, order_ab, 1000, rng_hi, corrected_alpha=0.01)
         self.assertLessEqual(lower, upper)
 
     def test_invalid_alpha_rejected(self):
@@ -398,6 +398,27 @@ class ResolveMetricPolicyTest(unittest.TestCase):
         doc = gm.load_policy()
         table = gm.resolve_metric_policy(doc, "memory", "model_load_time")
         self.assertEqual(table["noise_class"], "C")
+
+    def test_memory_warm_peak_resolves_declared_fail_abs_mib(self):
+        # perf-policy.toml declares fail_abs_mib=64 for this metric --
+        # resolve_metric_policy must surface it unmodified so a caller can
+        # thread it into CellGateInput.fail_abs_mib (bench-gate math audit
+        # finding #2).
+        doc = gm.load_policy()
+        table = gm.resolve_metric_policy(doc, "memory", "warm_peak_phys_footprint")
+        self.assertEqual(table["fail_abs_mib"], 64)
+
+    def test_fail_abs_mib_must_be_positive_number(self):
+        doc = gm.load_policy()
+        doc["families"]["memory"]["warm_peak_phys_footprint"]["fail_abs_mib"] = -1
+        with self.assertRaises(gm.PolicyConfigError):
+            gm.resolve_metric_policy(doc, "memory", "warm_peak_phys_footprint")
+
+    def test_fail_abs_mib_must_be_a_number_not_a_bool(self):
+        doc = gm.load_policy()
+        doc["families"]["memory"]["warm_peak_phys_footprint"]["fail_abs_mib"] = True
+        with self.assertRaises(gm.PolicyConfigError):
+            gm.resolve_metric_policy(doc, "memory", "warm_peak_phys_footprint")
 
 
 # --------------------------------------------------------------------------
@@ -800,6 +821,110 @@ class EvaluateFamilyGateTest(unittest.TestCase):
         cell = gm.CellGateInput(
             cell_id="bad", values=(1.0, 2.0), order_ab=(True,),
             measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        with self.assertRaises(gm.GateMathError):
+            gm.evaluate_family_gate([cell], self._bands())
+
+    # ----------------------------------------------------------------
+    # fail_abs_mib AND-gate (bench-gate math audit finding #2): the
+    # policy's own declared rule for
+    # `families.memory.warm_peak_phys_footprint` is "FAIL requires both
+    # >5% AND >64 MiB." Counterexample from the audit: base=1000 MiB,
+    # candidate=1055 MiB -> relative delta 5.5% (clears fail_pct=0.05)
+    # but absolute delta 55 MiB (does NOT clear fail_abs_mib=64) -- the
+    # evaluator must not FAIL this cell even though the relative leg
+    # alone would confirm a FAIL.
+    # ----------------------------------------------------------------
+
+    def _memory_cell(self, cid, *, abs_delta_mib, fail_abs_mib=64.0, n=9):
+        # class B (memory family's registered noise_class): first band
+        # (max_cv=0.015) requires n=9 for class B.
+        slowdown = math.log(1055.0 / 1000.0)
+        values = tuple([slowdown] * n)
+        order_ab = tuple(i % 2 == 0 for i in range(n))
+        return gm.CellGateInput(
+            cell_id=cid, values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="B", warn_pct=0.03, fail_pct=0.05,
+            fail_abs_mib=fail_abs_mib, abs_delta_mib=abs_delta_mib,
+        )
+
+    def test_abs_mib_and_gate_crosses_pct_not_mib_is_not_fail(self):
+        """The audit's exact counterexample: 5.5% clears fail_pct=0.05 and
+        (pre-fix) would have been a confirmed FAIL via the relative bound
+        alone -- but 55 MiB does not clear the declared fail_abs_mib=64
+        floor, so the AND-gated verdict must not be FAIL."""
+        cell = self._memory_cell("memory:warm_peak", abs_delta_mib=55.0)
+        results = gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=2000, rng=random.Random(1))
+        result = results[0]
+        # Precondition: the relative leg alone WOULD have confirmed FAIL
+        # (Holm rejects and the lower bound clears tau_fail) -- proving
+        # this is a genuine AND-gate test, not a case where the relative
+        # leg was already non-FAIL for an unrelated reason.
+        self.assertTrue(result.holm_reject)
+        self.assertIsNotNone(result.corrected_lower_bound)
+        tau_fail = math.log(1.0 + 0.05 * 1.0)
+        self.assertGreater(result.corrected_lower_bound, tau_fail)
+        # But the AND-gated verdict is not FAIL -- the absolute leg (55
+        # MiB) does not clear the declared 64 MiB floor.
+        self.assertNotEqual(result.verdict, "FAIL")
+        self.assertEqual(result.verdict, "WARN")
+        self.assertEqual(result.fail_abs_mib, 64.0)
+        self.assertEqual(result.abs_delta_mib, 55.0)
+
+    def test_abs_mib_and_gate_crosses_both_is_fail(self):
+        """Same relative shape, but the absolute delta (70 MiB) clears
+        the declared 64 MiB floor too -- both legs of the AND now hold,
+        so the verdict is FAIL."""
+        cell = self._memory_cell("memory:warm_peak", abs_delta_mib=70.0)
+        results = gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=2000, rng=random.Random(1))
+        self.assertEqual(results[0].verdict, "FAIL")
+
+    def test_abs_mib_and_gate_exactly_at_floor_is_not_fail(self):
+        """`fail_abs_mib` is a strict '>' floor (perf-policy.toml: 'FAIL
+        requires both >5% AND >64 MiB') -- exactly 64 MiB does not clear
+        it."""
+        cell = self._memory_cell("memory:warm_peak", abs_delta_mib=64.0)
+        results = gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=2000, rng=random.Random(1))
+        self.assertNotEqual(results[0].verdict, "FAIL")
+
+    def test_families_without_fail_abs_mib_are_unaffected(self):
+        """A cell whose policy declares no absolute floor (fail_abs_mib
+        defaults to None, matching every non-memory family) must reach
+        FAIL on the relative bound alone -- the AND-gate must be a no-op
+        when the policy registers no absolute leg."""
+        order_ab = (True, False, True, False, True, False, True)
+        values = tuple([math.log(1.10)] * 7)
+        cell = gm.CellGateInput(
+            cell_id="decode:strong", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+        )
+        self.assertIsNone(cell.fail_abs_mib)
+        self.assertIsNone(cell.abs_delta_mib)
+        results = gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=500, rng=random.Random(1))
+        self.assertEqual(results[0].verdict, "FAIL")
+
+    def test_fail_abs_mib_without_abs_delta_mib_fails_closed(self):
+        """A cell that declares fail_abs_mib (an AND-gate floor) but
+        supplies no abs_delta_mib must fail closed rather than silently
+        evaluating only the relative leg of a declared two-condition AND
+        rule."""
+        order_ab = (True, False, True, False, True, False, True)
+        values = tuple([math.log(1.10)] * 7)
+        cell = gm.CellGateInput(
+            cell_id="decode:strong", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+            fail_abs_mib=64.0, abs_delta_mib=None,
+        )
+        with self.assertRaisesRegex(gm.GateMathError, "fail_abs_mib"):
+            gm.evaluate_family_gate([cell], self._bands())
+
+    def test_fail_abs_mib_must_be_positive(self):
+        order_ab = (True, False, True, False, True, False, True)
+        values = tuple([math.log(1.10)] * 7)
+        cell = gm.CellGateInput(
+            cell_id="decode:strong", values=values, order_ab=order_ab,
+            measured_cv=0.01, cell_class="A", warn_pct=0.03, fail_pct=0.07,
+            fail_abs_mib=-1.0, abs_delta_mib=5.0,
         )
         with self.assertRaises(gm.GateMathError):
             gm.evaluate_family_gate([cell], self._bands())

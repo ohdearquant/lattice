@@ -888,7 +888,20 @@ def build_decode_cell_aggregate(session: dict, policy: dict, rng_seed: int) -> t
         ci_low = _percentile(boot_means, 0.025) or point_estimate
         ci_high = _percentile(boot_means, 0.975) or point_estimate
         alpha_familywise = policy["gate_math"]["alpha_familywise"]
-        corrected_lower_bound = gate_math.bootstrap_upper_bound(
+        # bench-gate math audit finding #8: this previously called
+        # `bootstrap_upper_bound` (the wrong, two-sided-diagnostic UPPER
+        # tail) while assigning the result to `corrected_lower_bound` --
+        # exactly the wrong-tail mis-wiring round 1's original defect (see
+        # `bootstrap_lower_bound`'s docstring in bench_gate_math.py) warns
+        # against, and the same class of bug the rename to
+        # `_diagnostic_bootstrap_upper_bound` is meant to make harder to
+        # reproduce. This module is shadow-mode-only (PR 2's binding
+        # condition -- `verdict` here is downgraded to "unsupported" before
+        # any gated required cell consumes it), so no CI has ever gated on
+        # the wrong value, but the reported bound was still silently
+        # overstated (upper-tail > lower-tail). Fixed to the correct
+        # one-sided LOWER bound.
+        corrected_lower_bound = gate_math.bootstrap_lower_bound(
             log_slowdowns, order_ab_flags, b, random.Random(rng_seed + 1), corrected_alpha=alpha_familywise
         )
     else:

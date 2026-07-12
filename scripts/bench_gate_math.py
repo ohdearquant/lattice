@@ -179,7 +179,7 @@ def one_sided_bootstrap_pvalue(
     return _pvalue_from_boot_means(boot_means, tau_log, b)
 
 
-def bootstrap_upper_bound(
+def _diagnostic_bootstrap_upper_bound(
     values: Sequence[float],
     order_ab: Sequence[bool],
     b: int,
@@ -187,17 +187,27 @@ def bootstrap_upper_bound(
     *,
     corrected_alpha: float,
 ) -> float:
-    """The `(1 - corrected_alpha)` percentile of the bootstrap mean
-    distribution — a two-sided-diagnostic UPPER confidence bound, useful
-    for reporting/inspection only. This is NOT the bound the FAIL decision
-    consumes: `evaluate_family_gate`'s FAIL rule needs a one-sided LOWER
-    bound (a slowdown is positive and the claimed hypothesis is
-    `mean_slowdown > threshold`; confirming FAIL requires the LOWER bound
-    to itself exceed the threshold). Do not wire this function's result
-    into `CellAggregate.corrected_lower_bound` or any FAIL rule — use
-    `bootstrap_lower_bound` for that; an earlier revision of this module
-    conflated the two tails, which silently overstated regression
-    evidence.
+    """DIAGNOSTIC-ONLY. The `(1 - corrected_alpha)` percentile of the
+    bootstrap mean distribution — a two-sided-diagnostic UPPER confidence
+    bound, useful for reporting/inspection only. This is NOT the bound the
+    FAIL decision consumes: `evaluate_family_gate`'s FAIL rule needs a
+    one-sided LOWER bound (a slowdown is positive and the claimed
+    hypothesis is `mean_slowdown > threshold`; confirming FAIL requires the
+    LOWER bound to itself exceed the threshold).
+
+    NAMING IS THE GUARD (bench-gate math audit, finding #8): this function
+    used to be named `bootstrap_upper_bound`, public, with the same call
+    signature as `bootstrap_lower_bound` — a one-character-different name
+    that round 1's original defect (see `bootstrap_lower_bound`'s
+    docstring) and a live `bench_cpu_flagship_supervisor.py` call site
+    (fixed alongside this rename — it was assigning this function's result
+    to a variable literally named `corrected_lower_bound`) both independently
+    mis-wired into a FAIL/lower-bound role. The leading underscore plus the
+    `_DIAGNOSTIC` name are deliberate: this symbol must never look like a
+    drop-in replacement for `bootstrap_lower_bound` at a glance, and must
+    never be assigned to anything named `*lower_bound*` or wired into a FAIL
+    rule or `CellAggregate.corrected_lower_bound`. Use `bootstrap_lower_bound`
+    for that.
     """
     if not (0.0 < corrected_alpha < 1.0):
         raise GateMathError(f"corrected_alpha must be in (0, 1), got {corrected_alpha!r}")
@@ -236,8 +246,8 @@ def bootstrap_lower_bound(
     and corrected confidence bound cross its threshold"). A slowdown is
     positive and the claimed hypothesis is `mean_slowdown > threshold`; a
     confirmed FAIL needs a LOWER one-sided bound above the threshold, not
-    an upper one (`bootstrap_upper_bound` computes the wrong tail for this
-    purpose — see its docstring). The percentile-interval lower endpoint
+    an upper one (`_diagnostic_bootstrap_upper_bound` computes the wrong
+    tail for this purpose — see its docstring). The percentile-interval lower endpoint
     sits at the alpha percentile, not `1 - alpha`
     (https://tsapps.nist.gov/publication/get_pdf.cfm?pub_id=917303).
 
@@ -467,7 +477,13 @@ def resolve_metric_policy(policy_doc: dict, metric_family: str, metric_name: str
     Raises `PolicyConfigError` when the family or metric is not
     registered, or the resolved table has no valid `noise_class` -- an
     unregistered metric can never be assumed class A (the cheapest,
-    least-scrutinized band).
+    least-scrutinized band). Also validates that a table declaring
+    `fail_abs_mib` (the absolute-MiB AND-gate leg, e.g.
+    `families.memory.warm_peak_phys_footprint`) registers it as a positive
+    number -- structurally the same fail-closed treatment `parse_cv_bands`
+    gives every other numeric threshold field (bench-gate math audit
+    finding #2). `fail_abs_mib` is otherwise optional; its absence means
+    the metric has no absolute-floor leg at all.
     """
     families = policy_doc.get("families")
     if not isinstance(families, dict):
@@ -499,6 +515,13 @@ def resolve_metric_policy(policy_doc: dict, metric_family: str, metric_name: str
             f"perf-policy.toml: family {metric_family!r} metric {metric_name!r} has no valid "
             f"noise_class (must be one of {CELL_CLASSES}, got {noise_class!r})"
         )
+    if "fail_abs_mib" in table:
+        fail_abs_mib = table["fail_abs_mib"]
+        if isinstance(fail_abs_mib, bool) or not isinstance(fail_abs_mib, (int, float)) or fail_abs_mib <= 0:
+            raise PolicyConfigError(
+                f"perf-policy.toml: family {metric_family!r} metric {metric_name!r} declares "
+                f"fail_abs_mib={fail_abs_mib!r}, must be a positive number"
+            )
     return table
 
 
@@ -512,7 +535,23 @@ class CellGateInput:
     """One required cell's raw paired log-slowdown samples plus its
     registered family-policy thresholds (already resolved via
     `resolve_metric_policy`), the input `evaluate_family_gate` needs to
-    reach a PASS/WARN/FAIL verdict for that cell within its family."""
+    reach a PASS/WARN/FAIL verdict for that cell within its family.
+
+    `fail_abs_mib`/`abs_delta_mib` (bench-gate math audit finding #2):
+    some policy-registered metrics (e.g.
+    `families.memory.warm_peak_phys_footprint`) declare an explicit AND of
+    a relative threshold (`fail_pct`, evaluated via the paired log-slowdown
+    bootstrap below) and an absolute-MiB floor
+    (`perf-policy.toml`'s `fail_abs_mib`) -- "FAIL requires both >5% AND
+    >64 MiB." `values`/`order_ab` carry only the RELATIVE (log-ratio)
+    samples the bootstrap needs; they cannot express an absolute-MiB
+    delta, so a cell whose policy declares `fail_abs_mib` must also supply
+    the already-computed absolute delta (candidate-minus-base, in MiB) via
+    `abs_delta_mib`. Both default to `None` (no absolute-floor leg,
+    matching every family that does not declare one) -- `fail_abs_mib`
+    without a matching `abs_delta_mib` fails closed in
+    `evaluate_family_gate` rather than silently skipping the AND
+    condition."""
 
     cell_id: str
     values: tuple[float, ...]
@@ -521,6 +560,8 @@ class CellGateInput:
     cell_class: str  # "A" or "B" -- selects the cv_bands column
     warn_pct: float
     fail_pct: float
+    fail_abs_mib: float | None = None
+    abs_delta_mib: float | None = None
 
 
 @dataclass(frozen=True)
@@ -543,6 +584,8 @@ class CellGateResult:
     required_n: int
     fail_margin_multiplier: float
     verdict: str  # "PASS" | "WARN" | "FAIL"
+    fail_abs_mib: float | None = None
+    abs_delta_mib: float | None = None
 
 
 def evaluate_family_gate(
@@ -561,8 +604,11 @@ def evaluate_family_gate(
     required cells inflates the familywise false-FAIL rate to
     `1 - (1 - 0.05)**N`), and combines the Holm-reject decision with the
     corrected one-sided LOWER bound (`bootstrap_lower_bound`, never
-    `bootstrap_upper_bound` -- see that function's docstring) to reach a
-    verdict.
+    `_diagnostic_bootstrap_upper_bound` -- see that function's docstring)
+    to reach a verdict. FAIL additionally requires the cell's declared
+    absolute-delta floor (`fail_abs_mib`, when the policy registers one) to
+    clear, alongside the relative bound above -- see the `fail_abs_mib`/
+    `abs_delta_mib` handling below (bench-gate math audit finding #2).
 
     FAIL requires ALL of:
       - Holm rejects H0 for this cell at `alpha_familywise` across the
@@ -674,6 +720,23 @@ def evaluate_family_gate(
                 f"cell {cell.cell_id!r}: raw values contain a non-finite entry -- a malformed cell "
                 "fails closed before any resampling, never reaches a PASS/WARN/FAIL verdict"
             )
+        if cell.fail_abs_mib is not None:
+            if not math.isfinite(cell.fail_abs_mib) or cell.fail_abs_mib <= 0:
+                raise GateMathError(
+                    f"cell {cell.cell_id!r}: fail_abs_mib must be a positive finite number, "
+                    f"got {cell.fail_abs_mib!r}"
+                )
+            if cell.abs_delta_mib is None:
+                raise GateMathError(
+                    f"cell {cell.cell_id!r}: declares fail_abs_mib={cell.fail_abs_mib!r} (an AND-gate "
+                    "absolute-MiB floor) but supplies no abs_delta_mib -- fails closed rather than "
+                    "silently evaluating only the relative leg of a declared two-condition AND rule "
+                    "(bench-gate math audit finding #2)"
+                )
+            if not math.isfinite(cell.abs_delta_mib):
+                raise GateMathError(
+                    f"cell {cell.cell_id!r}: abs_delta_mib must be finite, got {cell.abs_delta_mib!r}"
+                )
         tau_fail = math.log(1.0 + cell.fail_pct * margin)
         point_estimate = statistics.fmean(cell.values)
         # ONE retained bootstrap-mean sample per cell -- both the p-value
@@ -717,7 +780,17 @@ def evaluate_family_gate(
                 sorted_boot_means, corrected_alpha=corrected_alpha
             )
         tau_warn = math.log(1.0 + cell.warn_pct)
-        if reject and lower_bound is not None and lower_bound > tau_fail:
+        # AND-gate (bench-gate math audit finding #2): a cell whose policy
+        # declares fail_abs_mib must ALSO clear the absolute-MiB floor to
+        # FAIL, matching perf-policy.toml's declared "FAIL requires both
+        # >X% AND >Y MiB" rule -- the relative bound crossing tau_fail is
+        # necessary but no longer sufficient when an absolute floor is
+        # registered. `abs_ok` is vacuously True when the cell's policy
+        # declares no absolute floor at all (fail_abs_mib is None).
+        abs_ok = cell.fail_abs_mib is None or (
+            cell.abs_delta_mib is not None and abs(cell.abs_delta_mib) > cell.fail_abs_mib
+        )
+        if reject and lower_bound is not None and lower_bound > tau_fail and abs_ok:
             verdict = "FAIL"
         elif point_estimate > tau_warn:
             verdict = "WARN"
@@ -734,6 +807,8 @@ def evaluate_family_gate(
                 required_n=req_n,
                 fail_margin_multiplier=margin,
                 verdict=verdict,
+                fail_abs_mib=cell.fail_abs_mib,
+                abs_delta_mib=cell.abs_delta_mib,
             )
         )
     return results
