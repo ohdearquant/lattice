@@ -9,7 +9,6 @@
 Partially shipped. The dedicated `lattice_serve` binary now exists as a Metal/f16 OpenAI-compatible HTTP daemon with `/v1/chat/completions`, `/v1/models`, and `/health` routes. It owns one resident Metal worker, loads the model once, and resets Metal/KV state for each job, so warm-serve keeps weights resident while requests remain stateless. Serve-side DoS hardening clamps `reasoning_budget` and `max_tokens` to `MODEL_MAX_CONTEXT` before constructing `GenerateConfig` and before generation allocates `generated_ids`; grammar compilation also has cardinality/depth/property/state caps in the grammar module.
 
 Still not shipped from this ADR: the full unified `lattice` CLI product surface, model acquisition/registry, Anthropic `/v1/messages`, continuous batching scheduler integration, GPU worker pool, `response_format` exposure in `lattice_serve`, embeddings route, auth, metrics, and prefix/radix cache product behavior.
-**Research**: RQ-5 (`workspaces/20260527/05.md`, 1583 lines)
 **Issues**: #91 (CLI), #92 (daemon), #93 (OpenAI API), #94 (Anthropic API)
 **Depends on**: ADR-048 (Continuous Batching), ADR-046 (XGrammar Structured Output), ADR-047 (Paged KV Cache)
 
@@ -49,7 +48,7 @@ Every competitor has `serve` as a first-class command:
 | **Candle**            | Rust           | Framework/library                                                                                        | CPU/CUDA/WASM       | Rust ML framework, safetensors, examples                                                                                       | More framework than polished LLM serving product                                                                                                                                                            |
 | **mistral.rs**        | Rust           | Strong: CLI run/serve, OpenAI API, quantization, Metal, multimodal, tool use, SDKs                       | Broad (CUDA+Metal)  | Nearest Rust competitor: zero-config HF loading, quantization breadth (GGUF/GPTQ/EXL2/HQQ), vision models, agent/tool features | Direct competitor; broader model+quant support. Lattice wedge: research-composable architecture (10 attn mechanisms, QuaRot, architecture search DSL), verified inference, Apple-Silicon-first optimization |
 | **Burn**              | Rust           | Framework (not LLM-serving product)                                                                      | CPU/CUDA/WASM/Metal | Type-safe Rust ML framework, auto-diff, training                                                                               | ML framework, not polished inference server; no LLM-specific serving features                                                                                                                               |
-| **lattice**           | Pure Rust      | Dedicated Metal/f16 HTTP daemon shipped; unified CLI/product surface still incomplete                                            | Apple Silicon first | 10 attention mechanisms, QuaRot Q4, speculative decoding, embeddings, formal verification path                                 | Complete CLI/model registry/Anthropic/concurrency/product surface after the shipped OpenAI-compatible daemon                                                                                                  |
+| **lattice**           | Pure Rust      | Dedicated Metal/f16 HTTP daemon shipped; unified CLI/product surface still incomplete                    | Apple Silicon first | 10 attention mechanisms, QuaRot Q4, speculative decoding, embeddings, formal verification path                                 | Complete CLI/model registry/Anthropic/concurrency/product surface after the shipped OpenAI-compatible daemon                                                                                                |
 
 ### Market validation for inference infrastructure
 
@@ -605,23 +604,23 @@ When `--spec ngram` or `--spec mtp` is set, the scheduler integrates with ADR-00
 
 #### Supported request fields (v1)
 
-| Field                                     | v1 behavior                                                                       |
-| ----------------------------------------- | --------------------------------------------------------------------------------- |
-| `model`                                   | Required unless server has one loaded default                                     |
-| `messages`                                | Required. `role`: system/user/assistant. `content`: string or content-parts array |
-| `stream`                                  | Support both `true` and `false`. Non-streaming accumulates tokens then returns    |
-| `temperature`                             | Implement. Default 0.7                                                            |
-| `top_p`                                   | Implement. Default 0.95                                                           |
-| `max_tokens`                              | Implement. Default 512                                                            |
-| `stop`                                    | Implement. String or array of strings                                             |
-| `seed`                                    | Implement. Deterministic sampling when set                                        |
-| `response_format: {"type":"text"}`        | Default. Normal decoding                                                          |
-| `response_format: {"type":"json_object"}` | Planned; grammar engine exists, but `lattice_serve` does not expose `response_format` as of 2026-06-30 |
+| Field                                     | v1 behavior                                                                                                            |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `model`                                   | Required unless server has one loaded default                                                                          |
+| `messages`                                | Required. `role`: system/user/assistant. `content`: string or content-parts array                                      |
+| `stream`                                  | Support both `true` and `false`. Non-streaming accumulates tokens then returns                                         |
+| `temperature`                             | Implement. Default 0.7                                                                                                 |
+| `top_p`                                   | Implement. Default 0.95                                                                                                |
+| `max_tokens`                              | Implement. Default 512                                                                                                 |
+| `stop`                                    | Implement. String or array of strings                                                                                  |
+| `seed`                                    | Implement. Deterministic sampling when set                                                                             |
+| `response_format: {"type":"text"}`        | Default. Normal decoding                                                                                               |
+| `response_format: {"type":"json_object"}` | Planned; grammar engine exists, but `lattice_serve` does not expose `response_format` as of 2026-06-30                 |
 | `response_format: {"type":"json_schema"}` | Planned; JSON Schema compiler exists with fail-closed caps, but the serve request shape does not yet expose this field |
-| `tools`, `tool_choice`                    | Parse; v1 rejects with clear error unless model/template supports it              |
-| `logprobs`                                | Do not fake. Return `400 unsupported_feature`                                     |
-| `n > 1`                                   | Return `400` for v1                                                               |
-| Unknown fields                            | Ignore unless strict mode enabled                                                 |
+| `tools`, `tool_choice`                    | Parse; v1 rejects with clear error unless model/template supports it                                                   |
+| `logprobs`                                | Do not fake. Return `400 unsupported_feature`                                                                          |
+| `n > 1`                                   | Return `400` for v1                                                                                                    |
+| Unknown fields                            | Ignore unless strict mode enabled                                                                                      |
 
 #### Streaming wire format
 
@@ -1004,7 +1003,6 @@ The first seed-round milestone: **a non-Rust developer can install lattice, pull
 
 ## References
 
-- RQ-5 research memo: `workspaces/20260527/05.md`
 - ADR-048: Continuous Batching with Disaggregated Prefill/Decode
 - ADR-046: XGrammar Structured Output Engine
 - ADR-047: Paged KV Cache with Prefix Reuse

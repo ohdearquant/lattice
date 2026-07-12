@@ -3,7 +3,6 @@
 **Status**: Proposed
 **Date**: 2026-05-27
 **Crate**: lattice-inference (metrics collection), lattice-tune or new `experiment` module (runner)
-**Research**: RQ-3 (`workspaces/20260527/03.md`)
 **Depends on**: ADR-059 (ModelSpec, ForwardCtx, LayerMetrics schema — **ADR-061 is the authoritative source for LayerMetrics**)
 **Consumed by**: ADR-060 (Structured Pruning uses CheapOnline metrics as scoring substrate)
 
@@ -412,14 +411,11 @@ Per-trial event streams stored as `runs/<run_id>/events.jsonl.zst` (zstd-compres
 {"type":"kernel","run_id":"...","op":"ffn_up","layer":6,"gpu_ns":82100,"bytes":7340032,"flops":7340032}
 ```
 
-#### khive KG (distilled findings and provenance)
+#### Interpreted findings (distilled from raw telemetry)
 
-Store interpreted results, not telemetry:
-
-- "For Qwen3.5-0.8B on M4 Max, FFN down GEMV is memory-bound at ~X GB/s"
-- "Layer 17 removal increased PPL by +0.04 after 20 LoRA-heal steps"
-
-Link experiment entity -> model entity -> finding entity with provenance edges.
+Runs should also produce a distilled, human-readable summary of interpreted results, not
+just raw telemetry -- e.g. "For Qwen3.5-0.8B on M4 Max, FFN down GEMV is memory-bound at
+~X GB/s" or "Layer 17 removal increased PPL by +0.04 after 20 LoRA-heal steps."
 
 ### D8: Reproducibility contract
 
