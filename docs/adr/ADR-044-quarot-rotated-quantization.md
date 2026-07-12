@@ -175,5 +175,4 @@ The sign flip is entirely code, not corpus (the old binary reproduces "QuaRot be
 - HuggingFace model configs referenced in the coverage table: Qwen3-Embedding-0.6B <https://huggingface.co/Qwen/Qwen3-Embedding-0.6B/blob/main/config.json>, Qwen3.5-0.8B <https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/config.json>, Qwen3-Embedding-4B <https://huggingface.co/Qwen/Qwen3-Embedding-4B/blob/main/config.json>, BERT-base <https://huggingface.co/google-bert/bert-base-uncased/blob/main/config.json>.
 - SafeTensors format reference (used by `quant::quarot::io`): official Rust crate source <https://docs.rs/safetensors/latest/src/safetensors/tensor.rs.html>; HF format docs <https://huggingface.co/docs/safetensors/index>.
 - KG entities: `QuaRot (Ashkboos 2024)` (86ec6a4f), `Rotation-Based Quantization` (d534ca51), `QuantizationRankFlipCondition` (224ef1a7), `HAWQ`, `BRECQ`, `AWQ`, `SmoothQuant`, `HQQ`
-- KG ontology: `.khive/taxonomy.md`
 - Existing code: `crates/inference/src/weights/q4_weights.rs`, `crates/inference/src/bin/quantize_q4.rs`
