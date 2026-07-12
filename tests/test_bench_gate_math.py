@@ -887,6 +887,29 @@ class EvaluateFamilyGateTest(unittest.TestCase):
         results = gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=2000, rng=random.Random(1))
         self.assertNotEqual(results[0].verdict, "FAIL")
 
+    def test_abs_mib_and_gate_large_negative_delta_never_fails(self):
+        """PR #898 review, round 1 finding #1: `abs_delta_mib` is a SIGNED
+        `candidate - base` (CellGateInput's own docstring), and
+        `fail_abs_mib` is a positive floor -- a large NEGATIVE delta means
+        memory usage DROPPED (an improvement), which must never contribute
+        to a FAIL verdict no matter how large its magnitude. Pre-fix, the
+        AND-gate wrapped the delta in `abs()`, so `abs_delta_mib=-70`
+        (memory improved by 70 MiB) satisfied `abs(-70) > 64` exactly like
+        a genuine 70 MiB regression would -- silently inverting the sign
+        contract. Same relative shape as `test_abs_mib_and_gate_crosses_both_is_fail`
+        (which confirms a POSITIVE 70 MiB delta over the same floor DOES
+        fail), but with the sign flipped: must NOT fail here."""
+        cell = self._memory_cell("memory:warm_peak", abs_delta_mib=-70.0)
+        results = gm.evaluate_family_gate([cell], self._bands(), bootstrap_replicates=2000, rng=random.Random(1))
+        result = results[0]
+        # Precondition: the relative leg alone still clears (same fixture
+        # shape as the crosses-both-is-fail test) -- this is a genuine
+        # AND-gate/sign test, not a case where the relative leg was
+        # already non-FAIL for an unrelated reason.
+        self.assertTrue(result.holm_reject)
+        self.assertIsNotNone(result.corrected_lower_bound)
+        self.assertNotEqual(result.verdict, "FAIL")
+
     def test_families_without_fail_abs_mib_are_unaffected(self):
         """A cell whose policy declares no absolute floor (fail_abs_mib
         defaults to None, matching every non-memory family) must reach

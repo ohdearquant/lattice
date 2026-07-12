@@ -787,8 +787,19 @@ def evaluate_family_gate(
         # necessary but no longer sufficient when an absolute floor is
         # registered. `abs_ok` is vacuously True when the cell's policy
         # declares no absolute floor at all (fail_abs_mib is None).
+        #
+        # SIGNED comparison, deliberately no abs() (PR #898 review, round 1
+        # finding #1): `abs_delta_mib` is documented (CellGateInput's
+        # docstring) as `candidate - base`, positive meaning growth/worse.
+        # `fail_abs_mib` is validated positive-only by `resolve_metric_policy`.
+        # Absolute-valuing the delta would let a large IMPROVEMENT (a
+        # strongly negative delta, e.g. -70 MiB -- memory usage DROPPED 70
+        # MiB) satisfy `abs(delta) > floor` and clear the absolute leg of a
+        # rule whose entire purpose is gating on GROWTH -- a memory
+        # improvement must never contribute to a FAIL verdict. Only a
+        # signed delta that itself exceeds the positive floor counts.
         abs_ok = cell.fail_abs_mib is None or (
-            cell.abs_delta_mib is not None and abs(cell.abs_delta_mib) > cell.fail_abs_mib
+            cell.abs_delta_mib is not None and cell.abs_delta_mib > cell.fail_abs_mib
         )
         if reject and lower_bound is not None and lower_bound > tau_fail and abs_ok:
             verdict = "FAIL"

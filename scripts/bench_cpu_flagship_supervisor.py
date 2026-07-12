@@ -66,6 +66,7 @@ import ctypes.util
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import platform
 import random
@@ -895,12 +896,16 @@ def build_decode_cell_aggregate(session: dict, policy: dict, rng_seed: int) -> t
         # `bootstrap_lower_bound`'s docstring in bench_gate_math.py) warns
         # against, and the same class of bug the rename to
         # `_diagnostic_bootstrap_upper_bound` is meant to make harder to
-        # reproduce. This module is shadow-mode-only (PR 2's binding
-        # condition -- `verdict` here is downgraded to "unsupported" before
-        # any gated required cell consumes it), so no CI has ever gated on
-        # the wrong value, but the reported bound was still silently
-        # overstated (upper-tail > lower-tail). Fixed to the correct
-        # one-sided LOWER bound.
+        # reproduce. This module is shadow-mode-only: even a sufficiently-
+        # powered session (`gate_eligible` below) can reach a real
+        # FAIL/WARN/PASS verdict -- shadow-mode protection is NOT "verdict
+        # is always unsupported," it is that no CI workflow or Makefile
+        # target invokes this script (or `evaluate_family_gate`, per #877
+        # binding condition 1) as a blocking check yet, so nothing has ever
+        # gated a build on the wrong value. The reported bound was still
+        # silently overstated (upper-tail > lower-tail) for any human/agent
+        # reading the emitted report. Fixed to the correct one-sided LOWER
+        # bound.
         corrected_lower_bound = gate_math.bootstrap_lower_bound(
             log_slowdowns, order_ab_flags, b, random.Random(rng_seed + 1), corrected_alpha=alpha_familywise
         )
@@ -1008,6 +1013,57 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def decode_verdict(
+    aggregate: "harness.CellAggregate",
+    diagnostics: dict,
+    *,
+    fail_pct: float,
+    warn_pct: float,
+) -> tuple[str, str | None]:
+    """Pure PASS/WARN/FAIL/unsupported verdict for one `build_decode_cell_
+    aggregate` result, extracted out of `main()` (PR #898 review, round 1
+    finding #2) so the units-correct comparison is independently unit-
+    testable without spawning a real trial session.
+
+    `aggregate.corrected_lower_bound` and `aggregate.point_estimate` are
+    both LOG-space (`bootstrap_lower_bound`/`statistics.fmean` were fed
+    `log_slowdowns` in `build_decode_cell_aggregate`), but `fail_pct`/
+    `warn_pct` are RAW fractions straight off `perf-policy.toml` (e.g.
+    0.07 == "7%"). Comparing a log-space bound to a raw fraction directly
+    under-reports every verdict: `bench_gate_math.py`'s own evaluator
+    never makes this mistake (`tau_fail = math.log(1.0 + fail_pct *
+    margin)`, `evaluate_family_gate`), and this function converts the
+    same way -- `math.log1p(x)` is the same `log(1+x)` threshold, just
+    numerically preferred for small x. A bound sitting in `(log1p(0.07),
+    0.07]` (~(0.0677, 0.07]) is a genuine policy FAIL that a raw-fraction
+    comparison would silently report as WARN or PASS.
+
+    A session whose paired `n` is smaller than its own measured-CV-derived
+    `required_n` (`diagnostics["required_n"]`, `bench_gate_math.required_n`
+    correction 1) is downgraded to "unsupported" -- this is the ONLY case
+    this module ever reports "unsupported"; a sufficiently-powered session
+    (`gate_eligible` below) always reaches a real FAIL/WARN/PASS verdict
+    from the comparisons above, it is never unconditionally suppressed.
+    """
+    n_valid = diagnostics["n_pairs"]
+    required_n = diagnostics["required_n"]
+    measured_cv = diagnostics["measured_cv"]
+    tau_fail = math.log1p(fail_pct)
+    tau_warn = math.log1p(warn_pct)
+    gate_eligible = measured_cv is not None and required_n is not None and n_valid >= required_n
+    if not gate_eligible:
+        return "unsupported", (
+            f"n_valid={n_valid} < required_n={required_n} for measured_cv={measured_cv} "
+            "(bench_gate_math.required_n, correction 1) -- shadow/demonstration run, not a gated cell"
+        )
+    cb = aggregate.corrected_lower_bound
+    if cb is not None and cb > tau_fail:
+        return "FAIL", None
+    if aggregate.point_estimate > tau_warn:
+        return "WARN", None
+    return "PASS", None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
@@ -1079,27 +1135,11 @@ def main(argv: list[str] | None = None) -> int:
         }
     )
 
-    n_valid = diagnostics["n_pairs"]
-    required_n = diagnostics["required_n"]
-    measured_cv = diagnostics["measured_cv"]
     fail_pct = policy["families"]["decode"]["fail_pct"]
     warn_pct = policy["families"]["decode"]["warn_pct"]
-    gate_eligible = measured_cv is not None and required_n is not None and n_valid >= required_n
-    if not gate_eligible:
-        verdict = "unsupported"
-        unsupported_reason = (
-            f"n_valid={n_valid} < required_n={required_n} for measured_cv={measured_cv} "
-            "(bench_gate_math.required_n, correction 1) -- shadow/demonstration run, not a gated cell"
-        )
-    else:
-        cb = aggregate.corrected_lower_bound
-        if cb is not None and cb > fail_pct:
-            verdict = "FAIL"
-        elif aggregate.point_estimate > warn_pct:
-            verdict = "WARN"
-        else:
-            verdict = "PASS"
-        unsupported_reason = None
+    verdict, unsupported_reason = decode_verdict(
+        aggregate, diagnostics, fail_pct=fail_pct, warn_pct=warn_pct
+    )
 
     # #877's _validate_phase_sequence requires every non-"unsupported"
     # CellRecord to carry a real, correctly-ordered load_start->
