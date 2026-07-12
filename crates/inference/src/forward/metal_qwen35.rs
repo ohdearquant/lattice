@@ -3703,6 +3703,47 @@ mod inner {
         MOE_PREFETCH_PARALLEL_FOR_TEST.with(|c| *c.borrow_mut() = parallel);
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only ordering-proof hook, paired with
+        /// `MOE_PREFETCH_STEP2_DONE_TX_FOR_TEST` below: when set, applies
+        /// ONLY to the gate_up cache's dequant spawn for the next
+        /// `encode_moe_ffn` call (down's is unaffected — proving overlap
+        /// for one cache is sufficient evidence of the mechanism). Moved
+        /// (via `.take()`) into `ExpertSlotCache::spawn_dequant` on the
+        /// calling thread, same reasoning as the panic-injection hook
+        /// above. Cleared to `None` after being taken.
+        static MOE_PREFETCH_ORDERING_GATE_FOR_TEST:
+            std::cell::RefCell<Option<crate::forward::moe_expert_cache::PrefetchOrderingGate>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_moe_prefetch_ordering_gate_for_test(
+        gate: Option<crate::forward::moe_expert_cache::PrefetchOrderingGate>,
+    ) {
+        MOE_PREFETCH_ORDERING_GATE_FOR_TEST.with(|c| *c.borrow_mut() = gate);
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only: when set, `encode_moe_ffn` sends on it immediately
+        /// after Step 2's shared-expert GEMVs are fully encoded (before
+        /// joining the routed-expert dequant spawn(s)), so a test can
+        /// prove Step 2 encoding completed while a still-gated dequant
+        /// spawn is deliberately blocked on
+        /// `MOE_PREFETCH_ORDERING_GATE_FOR_TEST`'s `release_rx`. Cleared
+        /// to `None` after being taken.
+        static MOE_PREFETCH_STEP2_DONE_TX_FOR_TEST:
+            std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_moe_prefetch_step2_done_tx_for_test(tx: Option<std::sync::mpsc::Sender<()>>) {
+        MOE_PREFETCH_STEP2_DONE_TX_FOR_TEST.with(|c| *c.borrow_mut() = tx);
+    }
+
     impl MetalQwen35State {
         /// **Unstable**: create from CPU weights; weight layout and f16 conversion may change.
         pub fn new(
@@ -10756,18 +10797,140 @@ mod inner {
                 }
             }
 
-            // #682 Stage 2: issue every routed expert's cache load NOW —
-            // right after routing, before Step 2's shared-expert GEMVs are
-            // encoded — instead of one at a time inside the Step 3 loop
-            // below. Cold-expert mmap reads + CPU dequant then overlap
-            // with the shared-expert GEMV dispatches (and any
-            // already-cached routed experts cost nothing extra). This
-            // must run before `RoutedExpertStorage::Cached`'s
-            // `begin_token()` bookkeeping is otherwise consulted, and
-            // Step 3 below relies on every selected expert already being
-            // resident by the time its loop runs. `RoutedExpertStorage::
-            // Eager` (the safetensors-upload path) has no cache to
-            // prefetch into.
+            // ── Step 2: Shared expert (always active) ─────────────────────────────
+            // Extracted into a closure (called exactly once, either inline
+            // below or from inside the prefetch scope's spawn/join window
+            // just after this) so its CPU encode time can overlap the
+            // routed-expert dequant phase without duplicating this body —
+            // see `moe_expert_cache`'s module doc comment.
+            let encode_step2 = || {
+                // Compute scalar sigmoid gate on CPU.
+                // SAFETY: `moe.shared_expert_gate` is a valid
+                // StorageModeShared buffer of at least `hidden` f32
+                // elements (same layout `MoeMetalBuffers` was constructed
+                // with) — same raw-pointer access pattern as this
+                // function's Step 1 above, just inside a nested closure
+                // (which does not inherit `encode_moe_ffn`'s
+                // `unsafe fn`-body allowance, so this needs its own block).
+                let sg_slice = unsafe {
+                    let sg_ptr = moe.shared_expert_gate.contents() as *const f32;
+                    std::slice::from_raw_parts(sg_ptr, hidden)
+                };
+                let gate_logit: f32 = hidden_slice
+                    .iter()
+                    .zip(sg_slice.iter())
+                    .map(|(x, g)| x * g)
+                    .sum();
+                let shared_gate_val = 1.0f32 / (1.0 + (-gate_logit).exp());
+
+                // Shared expert gate projection GEMV: scratch_gate[shared_inter] = W_gate * hidden
+                let shared_inter_u32 = shared_inter as u32;
+                let params_gate_up_sh = GemmParams {
+                    m: 1,
+                    n: shared_inter_u32,
+                    k: hidden_u32,
+                    lda: hidden_u32,
+                    ldb: hidden_u32,
+                    ldc: shared_inter_u32,
+                };
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
+                enc.set_buffer(1, Some(&moe.shared_gate_proj), 0);
+                enc.set_buffer(2, Some(&moe.scratch_gate), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<GemmParams>() as u64,
+                    &params_gate_up_sh as *const GemmParams as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(shared_inter as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+
+                // Shared expert up projection GEMV: scratch_up[shared_inter] = W_up * hidden
+                let params_up_sh = GemmParams {
+                    m: 1,
+                    n: shared_inter_u32,
+                    k: hidden_u32,
+                    lda: hidden_u32,
+                    ldb: hidden_u32,
+                    ldc: shared_inter_u32,
+                };
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
+                enc.set_buffer(1, Some(&moe.shared_up_proj), 0);
+                enc.set_buffer(2, Some(&moe.scratch_up), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<GemmParams>() as u64,
+                    &params_up_sh as *const GemmParams as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(shared_inter as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+
+                // SiLU-mul in-place on scratch_gate (gate[i] = silu(gate[i]) * up[i]).
+                let count_sh = shared_inter as u32;
+                enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul);
+                enc.set_buffer(0, Some(&moe.scratch_gate), 0);
+                enc.set_buffer(1, Some(&moe.scratch_up), 0);
+                enc.set_bytes(2, 4, &count_sh as *const u32 as *const _);
+                enc.dispatch_threads(
+                    MTLSize::new(div_ceil(shared_inter as u64, wg) * wg, 1, 1),
+                    MTLSize::new(wg, 1, 1),
+                );
+
+                // Shared expert down projection GEMV: scratch_expert_out[hidden] = W_down * scratch_gate
+                let params_down_sh = GemmParams {
+                    m: 1,
+                    n: hidden_u32,
+                    k: shared_inter_u32,
+                    lda: shared_inter_u32,
+                    ldb: shared_inter_u32,
+                    ldc: hidden_u32,
+                };
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
+                enc.set_buffer(0, Some(&moe.scratch_gate), 0);
+                enc.set_buffer(1, Some(&moe.shared_down_proj), 0);
+                enc.set_buffer(2, Some(&moe.scratch_expert_out), 0);
+                enc.set_bytes(
+                    3,
+                    std::mem::size_of::<GemmParams>() as u64,
+                    &params_down_sh as *const GemmParams as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(hidden as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+
+                // Accumulate: scratch_out += shared_gate_val * scratch_expert_out.
+                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_shared_gate_add);
+                enc.set_buffer(0, Some(&moe.scratch_out), 0);
+                enc.set_buffer(1, Some(&moe.scratch_expert_out), 0);
+                enc.set_bytes(2, 4, &shared_gate_val as *const f32 as *const _);
+                enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const _);
+                enc.dispatch_threads(
+                    MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
+                    MTLSize::new(wg, 1, 1),
+                );
+            };
+
+            // #682 Stage 2: plan every routed expert's cache load NOW —
+            // right after routing, before Step 2 is encoded — then spawn
+            // the dequant work for cache misses onto background thread(s)
+            // and encode Step 2 (above) while it runs, joining + applying
+            // results only after Step 2 is fully encoded. Cold-expert
+            // mmap reads + CPU dequant then genuinely overlap the
+            // shared-expert GEMV encoding instead of blocking in front of
+            // it (any already-cached routed experts cost nothing extra
+            // either way). This must run before `RoutedExpertStorage::
+            // Cached`'s `begin_token()` bookkeeping is otherwise
+            // consulted, and Step 3 below relies on every selected expert
+            // already being resident (`apply_prefetch_results` already
+            // run) by the time its loop runs. `RoutedExpertStorage::Eager`
+            // (the safetensors-upload path) has no cache to prefetch into
+            // — Step 2 just runs inline with nothing to overlap.
             if let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed {
                 gate_up.borrow_mut().begin_token();
                 down.borrow_mut().begin_token();
@@ -10783,109 +10946,87 @@ mod inner {
                 #[cfg(not(test))]
                 let parallel = true;
 
-                gate_up.borrow_mut().prefetch_experts(&expert_ids, parallel);
-                down.borrow_mut().prefetch_experts(&expert_ids, parallel);
+                // `spawn_dequant`'s fault-injection hook is exercised
+                // directly against `ExpertSlotCache` (see
+                // `moe_prefetch_dequant_panic_recovers_via_readiness_reload`)
+                // rather than through this real encode path: a panic that
+                // unwinds through a live, not-yet-`endEncoding`'d Metal
+                // command encoder is an unrecoverable process abort, not
+                // something any amount of `catch_unwind` here could make
+                // safe to test.
+                let panic_on_expert: Option<usize> = None;
+
+                #[cfg(test)]
+                let ordering_gate =
+                    MOE_PREFETCH_ORDERING_GATE_FOR_TEST.with(|c| c.borrow_mut().take());
+
+                let gate_up_tasks = gate_up.borrow_mut().plan_prefetch(&expert_ids);
+                let down_tasks = down.borrow_mut().plan_prefetch(&expert_ids);
+
+                let gate_up_ref = gate_up.borrow();
+                let down_ref = down.borrow();
+
+                let (gate_up_join, down_join) = std::thread::scope(|scope| {
+                    let gate_up_handle = gate_up_ref.spawn_dequant(
+                        gate_up_tasks,
+                        parallel,
+                        panic_on_expert,
+                        #[cfg(test)]
+                        ordering_gate,
+                        scope,
+                    );
+                    let down_handle = down_ref.spawn_dequant(
+                        down_tasks,
+                        parallel,
+                        panic_on_expert,
+                        #[cfg(test)]
+                        None,
+                        scope,
+                    );
+
+                    encode_step2();
+
+                    #[cfg(test)]
+                    MOE_PREFETCH_STEP2_DONE_TX_FOR_TEST.with(|c| {
+                        if let Some(tx) = c.borrow_mut().take() {
+                            let _ = tx.send(());
+                        }
+                    });
+
+                    (
+                        gate_up_handle.map(std::thread::ScopedJoinHandle::join),
+                        down_handle.map(std::thread::ScopedJoinHandle::join),
+                    )
+                });
+
+                drop(gate_up_ref);
+                drop(down_ref);
+
+                // Apply whichever side(s) succeeded BEFORE propagating any
+                // panic, so a failure on one cache never discards the
+                // other's already-completed dequant work (its slots are
+                // marked ready and become immediately usable; only the
+                // failed side's slots stay unready, to be reloaded by the
+                // next `plan_prefetch` that needs them).
+                let mut panic_payload = None;
+                match gate_up_join {
+                    Some(Ok(results)) => gate_up.borrow_mut().apply_prefetch_results(&results),
+                    Some(Err(e)) => panic_payload = Some(e),
+                    None => {}
+                }
+                match down_join {
+                    Some(Ok(results)) => down.borrow_mut().apply_prefetch_results(&results),
+                    Some(Err(e)) => {
+                        panic_payload.get_or_insert(e);
+                    }
+                    None => {}
+                }
+                if let Some(e) = panic_payload {
+                    std::panic::resume_unwind(e);
+                }
+            } else {
+                encode_step2();
             }
-
-            // ── Step 2: Shared expert (always active) ─────────────────────────────
-            // Compute scalar sigmoid gate on CPU.
-            let sg_ptr = moe.shared_expert_gate.contents() as *const f32;
-            let sg_slice = std::slice::from_raw_parts(sg_ptr, hidden);
-            let gate_logit: f32 = hidden_slice
-                .iter()
-                .zip(sg_slice.iter())
-                .map(|(x, g)| x * g)
-                .sum();
-            let shared_gate_val = 1.0f32 / (1.0 + (-gate_logit).exp());
-
-            // Shared expert gate projection GEMV: scratch_gate[shared_inter] = W_gate * hidden
-            let shared_inter_u32 = shared_inter as u32;
-            let params_gate_up_sh = GemmParams {
-                m: 1,
-                n: shared_inter_u32,
-                k: hidden_u32,
-                lda: hidden_u32,
-                ldb: hidden_u32,
-                ldc: shared_inter_u32,
-            };
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
-            enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-            enc.set_buffer(1, Some(&moe.shared_gate_proj), 0);
-            enc.set_buffer(2, Some(&moe.scratch_gate), 0);
-            enc.set_bytes(
-                3,
-                std::mem::size_of::<GemmParams>() as u64,
-                &params_gate_up_sh as *const GemmParams as *const _,
-            );
-            enc.dispatch_thread_groups(
-                MTLSize::new(shared_inter as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-
-            // Shared expert up projection GEMV: scratch_up[shared_inter] = W_up * hidden
-            let params_up_sh = GemmParams {
-                m: 1,
-                n: shared_inter_u32,
-                k: hidden_u32,
-                lda: hidden_u32,
-                ldb: hidden_u32,
-                ldc: shared_inter_u32,
-            };
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
-            enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-            enc.set_buffer(1, Some(&moe.shared_up_proj), 0);
-            enc.set_buffer(2, Some(&moe.scratch_up), 0);
-            enc.set_bytes(
-                3,
-                std::mem::size_of::<GemmParams>() as u64,
-                &params_up_sh as *const GemmParams as *const _,
-            );
-            enc.dispatch_thread_groups(
-                MTLSize::new(shared_inter as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-
-            // SiLU-mul in-place on scratch_gate (gate[i] = silu(gate[i]) * up[i]).
-            let count_sh = shared_inter as u32;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul);
-            enc.set_buffer(0, Some(&moe.scratch_gate), 0);
-            enc.set_buffer(1, Some(&moe.scratch_up), 0);
-            enc.set_bytes(2, 4, &count_sh as *const u32 as *const _);
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(shared_inter as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-
-            // Shared expert down projection GEMV: scratch_expert_out[hidden] = W_down * scratch_gate
-            let params_down_sh = GemmParams {
-                m: 1,
-                n: hidden_u32,
-                k: shared_inter_u32,
-                lda: shared_inter_u32,
-                ldb: shared_inter_u32,
-                ldc: hidden_u32,
-            };
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
-            enc.set_buffer(0, Some(&moe.scratch_gate), 0);
-            enc.set_buffer(1, Some(&moe.shared_down_proj), 0);
-            enc.set_buffer(2, Some(&moe.scratch_expert_out), 0);
-            enc.set_bytes(
-                3,
-                std::mem::size_of::<GemmParams>() as u64,
-                &params_down_sh as *const GemmParams as *const _,
-            );
-            enc.dispatch_thread_groups(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
-
-            // Accumulate: scratch_out += shared_gate_val * scratch_expert_out.
-            enc.set_compute_pipeline_state(&self.engine.pipelines.moe_shared_gate_add);
-            enc.set_buffer(0, Some(&moe.scratch_out), 0);
-            enc.set_buffer(1, Some(&moe.scratch_expert_out), 0);
-            enc.set_bytes(2, 4, &shared_gate_val as *const f32 as *const _);
-            enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const _);
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
 
             // ── Step 3: Routed experts ────────────────────────────────────────────
             let inter_u32 = inter as u32;
@@ -19852,6 +19993,355 @@ mod inner {
                  \x20 speedup = {:.3}x",
                 serial_median.as_secs_f64() / parallel_median.as_secs_f64()
             );
+        }
+
+        /// Ordering proof (adversarial-review Finding 1): `encode_moe_ffn`'s
+        /// routed-expert dequant work must genuinely overlap Step 2's
+        /// shared-expert GEMV encoding, not just fan out across rayon
+        /// before Step 2 starts and then block in front of it. Proven
+        /// deterministically — no sleeps — via a channel handshake
+        /// installed on gate_up's dequant spawn only (proving it for one
+        /// cache is sufficient evidence of the mechanism; down's spawn is
+        /// unaffected):
+        ///
+        /// `spawn_dequant`'s closure sends `started` and then blocks on
+        /// `release` before doing any real dequant work; `encode_moe_ffn`
+        /// sends `step2_done` immediately after Step 2 is fully encoded,
+        /// strictly before joining the dequant spawn(s). A controller
+        /// thread (owning only the channel endpoints — `MetalQwen35State`
+        /// cannot be moved across threads, Metal objects are not `Send`,
+        /// so `forward_step` itself runs on this test's own thread as
+        /// usual) waits for `started`, then waits for `step2_done`, and
+        /// only THEN sends `release`. If `step2_done` ever fires it can
+        /// only be because Step 2 encoding completed while the dequant
+        /// spawn was still blocked open (it cannot have returned before
+        /// `release` is sent) — i.e. genuine overlap, not
+        /// spawn-then-immediately-block-then-encode.
+        #[test]
+        fn moe_prefetch_step2_overlaps_dequant_deterministically() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config_top_k2();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            let tokenizer_path = std::path::Path::new("/dev/null");
+
+            let mut state = {
+                let _env = EnvVarGuard::set(
+                    crate::forward::moe_expert_cache::MOE_EXPERT_CACHE_SLOTS_ENV,
+                    "2",
+                );
+                MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                    .expect("from_q4_dir must load")
+            };
+
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (step2_tx, step2_rx) = std::sync::mpsc::channel();
+
+            set_moe_prefetch_ordering_gate_for_test(Some(
+                crate::forward::moe_expert_cache::PrefetchOrderingGate {
+                    started_tx,
+                    release_rx,
+                },
+            ));
+            set_moe_prefetch_step2_done_tx_for_test(Some(step2_tx));
+
+            let _forced = ForcedMoeExpertsGuard::set(vec![0, 1]);
+
+            let controller = std::thread::spawn(move || {
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect(
+                        "gate_up's dequant spawn never signaled `started` — spawn_dequant not \
+                         wired up, or the test-only ordering gate was not installed/consumed",
+                    );
+                step2_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect(
+                        "Step 2 never signaled `done` while the dequant spawn was still gated \
+                         open — Step 2 encoding is NOT overlapping the dequant phase (exactly \
+                         the regression this test guards against: a blocking join before Step \
+                         2 is encoded)",
+                    );
+                release_tx.send(()).expect(
+                    "release_rx should still be listening — forward_step has not returned yet",
+                );
+            });
+
+            let logits = state.forward_step(1, 0);
+            controller.join().expect("controller thread must not panic");
+
+            assert!(
+                logits.iter().all(|v| v.is_finite()),
+                "overlapped decode produced non-finite logits: {logits:?}"
+            );
+        }
+
+        /// Failure-isolation proof (adversarial-review Finding 2): a dequant
+        /// task panicking after `plan_prefetch` already committed its
+        /// slot's ownership bookkeeping must not let a later token read
+        /// stale/never-written bytes out of that slot.
+        ///
+        /// Deliberately does NOT drive this through `encode_moe_ffn`/
+        /// `forward_step`: a panic that unwinds through a live, not-yet-
+        /// `endEncoding`'d `ComputeCommandEncoderRef` is an unrecoverable
+        /// Metal-level process abort (`-[_MTLCommandEncoder dealloc]:
+        /// failed assertion 'Command encoder released without
+        /// endEncoding'`), verified by hand — Metal's own safety net, not
+        /// something any amount of Rust-level `catch_unwind` can paper
+        /// over. Production's `encode_moe_ffn` still applies whichever
+        /// cache succeeded and calls `std::panic::resume_unwind` for a
+        /// real panic (see its comment), which is the right thing to do
+        /// for the CPU-side bookkeeping even though a real dequant panic
+        /// during actual GPU encoding is fatal to the process either way.
+        /// This test instead exercises the exact same
+        /// `plan_prefetch`/`spawn_dequant`/`apply_prefetch_results`
+        /// primitives `encode_moe_ffn` calls, directly, with no
+        /// `ComputeCommandEncoderRef` anywhere in the loop — the panic is
+        /// caught at `ScopedJoinHandle::join()`, on a background thread,
+        /// same as inside `encode_moe_ffn`, but nothing here ever unwinds
+        /// past a live encoder, so it's safe to assert on.
+        ///
+        /// Sequence: token 0 loads experts `{0, 1}` cleanly (fills both of
+        /// a 2-slot cache). Token 1 plans `{2, 3}` (both misses, evicting
+        /// `{0, 1}`) and injects a dequant panic on expert 2; the join
+        /// must return `Err`, and — since rayon's `collect()` loses the
+        /// WHOLE batch's results on any one task's panic (see
+        /// `spawn_dequant`'s doc comment) — BOTH experts' slots (2's own
+        /// panic and 3's collateral loss) must stay `slot_ready == false`,
+        /// `get_prefetched` must refuse both. Token 2 re-plans `{2, 3}`
+        /// with no panic: `plan_prefetch` must treat both as reload-in-
+        /// place misses (same slots, `miss_count` up, no extra eviction),
+        /// and the recovered slot bytes must be BIT-IDENTICAL to an
+        /// independently built, never-panicked cache resolving the same
+        /// experts — proving the reload genuinely re-dequantized rather
+        /// than serving whatever was left behind.
+        #[test]
+        fn moe_prefetch_dequant_panic_recovers_via_readiness_reload() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            let experts = 4usize;
+            let mid = 1usize;
+            let cols = 32usize;
+            let name = "prefetch_panic_recovery_test.experts.gate_up_proj";
+            write_tiny_q4_fixture_per_expert_row(dir, name, experts, mid, cols, |e, _m| {
+                0.01 * (e as f32 + 1.0)
+            });
+            let path = mtp_tensor_path(dir, name, "q4");
+
+            let build_cache = || {
+                crate::forward::moe_expert_cache::ExpertSlotCache::new(
+                    &device,
+                    &path,
+                    &[experts, mid, cols],
+                    2, // num_slots < num_experts: {2,3} necessarily evicts {0,1}
+                    "prefetch_panic_recovery_test.cache",
+                )
+                .expect("ExpertSlotCache::new over the tiny fixture")
+            };
+
+            let mut cache = build_cache();
+
+            // Token 0: clean warm-up, fills both slots with {0, 1}.
+            cache.begin_token();
+            cache.prefetch_experts(&[0, 1], true);
+            assert!(
+                cache.debug_snapshot().slot_ready.iter().all(|&r| r),
+                "warm-up token must leave every touched slot ready"
+            );
+
+            // Token 1: plan {2, 3} (evicts {0, 1}), spawn with expert 2's
+            // dequant deliberately panicking.
+            cache.begin_token();
+            let tasks = cache.plan_prefetch(&[2, 3]);
+            assert_eq!(tasks.len(), 2, "both 2 and 3 must be misses this token");
+            let panicked_slots: Vec<usize> = tasks.iter().map(|t| t.slot).collect();
+
+            let join_result = std::thread::scope(|scope| {
+                let handle = cache.spawn_dequant(tasks, true, Some(2), None, scope);
+                handle.expect("tasks is non-empty").join()
+            });
+            assert!(
+                join_result.is_err(),
+                "test-injected dequant panic for expert 2 must propagate out of spawn_dequant's \
+                 join, not be silently swallowed"
+            );
+
+            let after_panic = cache.debug_snapshot();
+            for &slot in &panicked_slots {
+                assert!(
+                    !after_panic.slot_ready[slot],
+                    "slot {slot} must stay unready after its dequant task panicked (or was lost \
+                     to a sibling task's panic in the same rayon collect())"
+                );
+            }
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cache.get_prefetched(2)))
+                    .is_err(),
+                "get_prefetched must refuse an unready slot rather than hand back \
+                 uninitialized/stale bytes"
+            );
+
+            // Token 2: re-plan {2, 3} with no panic injected — must be
+            // treated as reload-in-place misses (same slots, no further
+            // eviction), not hits.
+            cache.begin_token();
+            let (_, miss_before, evict_before) = cache.hit_miss_eviction_counts();
+            let tasks2 = cache.plan_prefetch(&[2, 3]);
+            assert_eq!(
+                tasks2.len(),
+                2,
+                "an unready mapping must be replanned as a miss even though expert_to_slot \
+                 already contains it"
+            );
+            let reload_slots: Vec<usize> = tasks2.iter().map(|t| t.slot).collect();
+            assert_eq!(
+                {
+                    let mut a = reload_slots.clone();
+                    a.sort_unstable();
+                    let mut b = panicked_slots.clone();
+                    b.sort_unstable();
+                    a
+                },
+                {
+                    let mut b = panicked_slots.clone();
+                    b.sort_unstable();
+                    b
+                },
+                "reload must reuse the SAME slots the panicked experts already own, not evict \
+                 anything new"
+            );
+            let (_, miss_after, evict_after) = cache.hit_miss_eviction_counts();
+            assert_eq!(
+                miss_after - miss_before,
+                2,
+                "recovery replan must count as 2 misses"
+            );
+            assert_eq!(
+                evict_after, evict_before,
+                "recovery replan must not evict anything — both experts already own their slots"
+            );
+
+            let join_result2 = std::thread::scope(|scope| {
+                let handle = cache.spawn_dequant(tasks2, true, None, None, scope);
+                handle.expect("tasks2 is non-empty").join()
+            });
+            let results2 = join_result2.expect("recovery dequant must not panic this time");
+            cache.apply_prefetch_results(&results2);
+
+            assert!(
+                cache.debug_snapshot().slot_ready.iter().all(|&r| r),
+                "every slot must be ready again after the recovery apply"
+            );
+
+            // Independently built, never-panicked cache: resolve the same
+            // two experts directly and compare raw slot bytes.
+            let mut clean_cache = build_cache();
+            clean_cache.begin_token();
+            let _ = clean_cache.resolve(2);
+            let _ = clean_cache.resolve(3);
+
+            for (&recovered_slot, expert_id) in reload_slots.iter().zip([2usize, 3usize]) {
+                let clean_slot = *clean_cache
+                    .debug_snapshot()
+                    .expert_to_slot
+                    .iter()
+                    .find(|&&(e, _)| e == expert_id)
+                    .map(|(_, s)| s)
+                    .expect("clean_cache must have resolved this expert");
+                assert_eq!(
+                    cache.slot_bits(recovered_slot),
+                    clean_cache.slot_bits(clean_slot),
+                    "expert {expert_id}'s recovered slot bytes must be bit-identical to a \
+                     never-panicked cache's resolve() of the same expert — a mismatch would \
+                     mean the reload served stale/uninitialized data instead of genuinely \
+                     re-dequantizing"
+                );
+            }
+        }
+
+        /// Direct Stage-1-equivalence regression (adversarial-review
+        /// Finding 3): the `plan_prefetch` + dequant + `apply_prefetch_results`
+        /// path must leave a cache in EXACTLY the same bookkeeping state
+        /// (`slot_owner`, `expert_to_slot`, `slot_touched`, `slot_ready`,
+        /// LRU order, hit/miss/eviction counters) as calling `resolve()`
+        /// once per expert, in the same order, would have — the whole
+        /// premise `plan_prefetch`'s doc comment relies on ("identical
+        /// side effects to what calling `resolve` once per id ... would
+        /// produce"), checked here directly rather than only inferred
+        /// from decode-output parity.
+        ///
+        /// Drives two independently constructed caches over the identical
+        /// tiny fixture through the same multi-token sequence — including
+        /// a repeated id within one token (`5, 5, 4`: the second `5` is a
+        /// same-token hit against the first), a hit-then-miss token, and
+        /// eviction pressure (4 experts' worth of misses through 3
+        /// slots) — comparing `debug_snapshot()` after every token.
+        #[test]
+        fn moe_prefetch_plan_matches_resolve_bookkeeping_exactly() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            let experts = 6usize;
+            let mid = 1usize;
+            let cols = 32usize;
+            let name = "prefetch_equivalence_test.experts.gate_up_proj";
+            write_tiny_q4_fixture_per_expert_row(dir, name, experts, mid, cols, |e, _m| {
+                0.01 * (e as f32 + 1.0)
+            });
+            let path = mtp_tensor_path(dir, name, "q4");
+
+            let build_cache = || {
+                crate::forward::moe_expert_cache::ExpertSlotCache::new(
+                    &device,
+                    &path,
+                    &[experts, mid, cols],
+                    3, // num_slots < num_experts: forces eviction below
+                    "prefetch_equivalence_test.cache",
+                )
+                .expect("ExpertSlotCache::new over the tiny fixture")
+            };
+            let mut cache_resolve = build_cache();
+            let mut cache_prefetch = build_cache();
+
+            let token_selections: [&[usize]; 4] = [&[0, 1, 2], &[0, 1, 5], &[3, 4, 5], &[5, 5, 4]];
+
+            for selection in token_selections {
+                cache_resolve.begin_token();
+                cache_prefetch.begin_token();
+
+                for &expert_id in selection {
+                    let _ = cache_resolve.resolve(expert_id);
+                }
+                cache_prefetch.prefetch_experts(selection, true);
+
+                assert_eq!(
+                    cache_resolve.debug_snapshot(),
+                    cache_prefetch.debug_snapshot(),
+                    "after selection {selection:?}: plan_prefetch+dequant+apply diverged from \
+                     an equivalent sequence of resolve() calls"
+                );
+            }
         }
 
         // -------------------------------------------------------------------

@@ -66,20 +66,47 @@
 //!
 //! ## Stage 2: within-token prefetch overlap
 //!
-//! [`ExpertSlotCache::prefetch_experts`] issues every routed-expert load
-//! for the CURRENT token up front — right after CPU routing decides
-//! `selected`, before any GEMV is encoded — instead of one at a time
-//! inside the Step 3 dispatch loop. This stays inside the "within one
-//! token" case the invariant above already covers (not the cross-token
-//! case the paragraph above calls out of scope): planning (hit/miss
-//! classification and eviction-slot assignment) is single-threaded and
-//! runs to completion, committing every slot's bookkeeping (owner,
-//! `expert_to_slot`, `slot_touched`, LRU position) BEFORE any dequant
-//! work starts — see [`ExpertSlotCache::plan_prefetch`]. Only the actual
-//! I/O + dequant CPU work for cache misses (never the bookkeeping) may
-//! then run on a rayon thread pool, each task writing into a slot that
-//! `plan_prefetch` already assigned exclusively to it, with no other task
-//! or bookkeeping mutation touching that slot concurrently.
+//! `encode_moe_ffn` issues every routed-expert load for the CURRENT token
+//! right after CPU routing decides `selected`, splits into three phases
+//! ([`ExpertSlotCache::plan_prefetch`] → [`ExpertSlotCache::spawn_dequant`]
+//! → [`ExpertSlotCache::apply_prefetch_results`]) so the actual I/O +
+//! dequant work overlaps with encoding Step 2's shared-expert GEMVs
+//! instead of blocking in front of them:
+//!
+//! 1. **Plan** (single-threaded, cheap): classify every selected expert as
+//!    a hit or miss and commit every slot's ownership bookkeeping (owner,
+//!    `expert_to_slot`, `slot_touched`, LRU position) — see
+//!    `plan_prefetch`'s doc comment. A miss also clears the assigned
+//!    slot's [`ExpertSlotCache::slot_ready`] flag to `false` *before* any
+//!    dequant work starts.
+//! 2. **Spawn**: `spawn_dequant` hands the plan's misses to a
+//!    `std::thread::scope`-spawned thread (optionally rayon-parallel
+//!    across misses within that one thread), borrowing only the cache's
+//!    read-only mmap'd byte table — never its Metal buffers or
+//!    bookkeeping — and returns immediately with a join handle.
+//! 3. `encode_moe_ffn` encodes Step 2 on the calling thread while the
+//!    spawned dequant work runs concurrently, THEN joins the handle and
+//!    calls `apply_prefetch_results`, which copies each result into its
+//!    slot and only THEN flips `slot_ready` back to `true`. Step 3's
+//!    `get_prefetched` lookups (after the join) never race the copy.
+//!
+//! This stays inside the "within one token" case the invariant above
+//! already covers (not the cross-token case the paragraph above calls out
+//! of scope): every task from one `plan_prefetch` call owns a slot no
+//! other task or bookkeeping mutation touches concurrently, and Step 2's
+//! GEMV dispatches never reference a slot the same token's dequant phase
+//! is still writing (they read the shared-expert buffers, which
+//! `spawn_dequant`'s closure never touches).
+//!
+//! **Failure isolation** (`slot_ready`): if a dequant task never
+//! completes (panics, most likely), its slot's ownership is already
+//! committed but `slot_ready` stays `false` — `get_prefetched` refuses to
+//! serve it, and the NEXT `plan_prefetch` call for that expert sees an
+//! unready mapping and reloads into the same slot (no eviction, since
+//! this expert already owns it) rather than treating it as a hit. A
+//! sibling cache's (e.g. gate_up succeeding while down panics, or vice
+//! versa) already-joined results are still applied — only the failed
+//! side's slots stay unready — before the failure is propagated.
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use rayon::prelude::*;
@@ -382,6 +409,43 @@ pub(crate) struct PrefetchTask {
     pub(crate) expert_id: usize,
 }
 
+/// One dequantized expert's f16 data, tagged with the slot
+/// [`ExpertSlotCache::plan_prefetch`] pre-assigned it to — the output of
+/// [`ExpertSlotCache::spawn_dequant`]'s background phase and the input to
+/// [`ExpertSlotCache::apply_prefetch_results`]'s single-threaded finish
+/// phase.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+type PrefetchDequantResult = (usize, Vec<u16>);
+
+/// A `spawn_dequant` call's full batch of [`PrefetchDequantResult`]s.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+type PrefetchDequantResults = Vec<PrefetchDequantResult>;
+
+/// Test-only synchronization handles letting a test observe and control
+/// [`ExpertSlotCache::spawn_dequant`]'s background dequant work: the
+/// spawned closure sends on `started_tx` and then blocks on `release_rx`
+/// before doing any real dequant work, so a test can deterministically
+/// prove other code ran while the dequant phase was in flight (no sleeps —
+/// pure channel handshake). Owned handles, not a `Clone` type: a test
+/// builds one pair per token it wants to instrument and moves it in.
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+pub(crate) struct PrefetchOrderingGate {
+    pub(crate) started_tx: std::sync::mpsc::Sender<()>,
+    pub(crate) release_rx: std::sync::mpsc::Receiver<()>,
+}
+
+/// See [`ExpertSlotCache::debug_snapshot`].
+#[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExpertSlotCacheSnapshot {
+    pub(crate) slot_owner: Vec<Option<usize>>,
+    pub(crate) expert_to_slot: Vec<(usize, usize)>,
+    pub(crate) slot_touched: Vec<bool>,
+    pub(crate) slot_ready: Vec<bool>,
+    pub(crate) lru: Vec<usize>,
+    pub(crate) hit_miss_eviction: (usize, usize, usize),
+}
+
 /// Bounded pool of `N` pre-allocated per-expert f16 Metal buffer slots for
 /// ONE (layer, gate_up|down) MoE tensor, LRU-evicted, backed by an mmap of
 /// the tensor's `.q4` file. See the module doc comment for the GPU buffer
@@ -395,6 +459,20 @@ pub(crate) struct ExpertSlotCache {
     /// Set by `resolve()` for every slot it touches (hit or miss) since the
     /// last `begin_token()`; `pick_eviction_slot` only evicts `false` slots.
     slot_touched: Vec<bool>,
+    /// `true` once a slot's Metal buffer actually holds the bytes for its
+    /// current `slot_owner` — i.e. its dequant task ran to completion and
+    /// [`Self::apply_prefetch_results`] (or `load_into`) copied the result
+    /// in. `plan_prefetch`/`load_into` set a newly-assigned slot's flag to
+    /// `false` the instant ownership is committed (before any dequant I/O
+    /// runs); the apply step is the ONLY thing that flips it back to
+    /// `true`. This closes the failure mode where a dequant task panics
+    /// (or is otherwise never completed) after ownership bookkeeping is
+    /// already committed: `get_prefetched` refuses to hand back an unready
+    /// slot, and the next `plan_prefetch` call treats a still-unready
+    /// mapping as a fresh miss (reusing the same slot, no eviction) rather
+    /// than a hit — so a later token can never observe the stale/never-
+    /// written bytes left behind by the failed task.
+    slot_ready: Vec<bool>,
     /// Slot indices in LRU order, front = least-recently-used.
     lru: VecDeque<usize>,
     expert_to_slot: std::collections::HashMap<usize, usize>,
@@ -445,6 +523,7 @@ impl ExpertSlotCache {
             slots,
             slot_owner: vec![None; num_slots],
             slot_touched: vec![false; num_slots],
+            slot_ready: vec![false; num_slots],
             lru: (0..num_slots).collect(),
             expert_to_slot: std::collections::HashMap::with_capacity(num_slots),
             label: label.to_string(),
@@ -465,6 +544,47 @@ impl ExpertSlotCache {
     #[cfg(test)]
     pub(crate) fn num_slots(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Full bookkeeping snapshot for equivalence testing: does the
+    /// `plan_prefetch`/`spawn_dequant`/`apply_prefetch_results` path
+    /// produce EXACTLY the same ownership/touched/ready/LRU/counter state
+    /// as an equivalent sequence of `resolve()` calls? `expert_to_slot` is
+    /// captured as a sorted `Vec` (not the `HashMap` itself) so two
+    /// snapshots compare equal regardless of hashing/iteration order.
+    /// Test-only: compiled out entirely in non-test builds.
+    #[cfg(test)]
+    pub(crate) fn debug_snapshot(&self) -> ExpertSlotCacheSnapshot {
+        let mut expert_to_slot: Vec<(usize, usize)> =
+            self.expert_to_slot.iter().map(|(&e, &s)| (e, s)).collect();
+        expert_to_slot.sort_unstable();
+        ExpertSlotCacheSnapshot {
+            slot_owner: self.slot_owner.clone(),
+            expert_to_slot,
+            slot_touched: self.slot_touched.clone(),
+            slot_ready: self.slot_ready.clone(),
+            lru: self.lru.iter().copied().collect(),
+            hit_miss_eviction: (self.hit_count, self.miss_count, self.eviction_count),
+        }
+    }
+
+    /// Raw f16 bit-pattern contents of `slot`, read directly back off the
+    /// Metal `StorageModeShared` buffer — lets a test prove a recovered
+    /// slot's bytes genuinely came from a fresh dequant rather than
+    /// stale/uninitialized memory, by comparing against another cache's
+    /// (or a direct `ExpertByteTable` dequant's) output for the same
+    /// expert. Test-only: compiled out entirely in non-test builds.
+    #[cfg(test)]
+    pub(crate) fn slot_bits(&self, slot: usize) -> Vec<u16> {
+        // SAFETY: `slots[slot]` is a StorageModeShared buffer sized
+        // exactly `slot_elems * 2` bytes at construction, CPU-readable at
+        // any time via `contents()` (no separate GPU-side synchronization
+        // needed for StorageModeShared) — same buffer this cache's own
+        // `apply_prefetch_results`/`load_into` read/write through.
+        unsafe {
+            let ptr = self.slots[slot].contents() as *const u16;
+            std::slice::from_raw_parts(ptr, self.slot_elems).to_vec()
+        }
     }
 
     /// Cumulative `(hits, misses, evictions)` since construction. Test-only:
@@ -496,11 +616,22 @@ impl ExpertSlotCache {
     #[cfg(test)]
     pub(crate) fn resolve(&mut self, expert_id: usize) -> &metal::Buffer {
         if let Some(&slot) = self.expert_to_slot.get(&expert_id) {
+            if self.slot_ready[slot] {
+                #[cfg(test)]
+                {
+                    self.hit_count += 1;
+                }
+                self.touch(slot);
+                return &self.slots[slot];
+            }
+            // Same "committed but never populated" case `plan_prefetch`
+            // handles — reload into the slot this expert already owns
+            // rather than evicting anything.
             #[cfg(test)]
             {
-                self.hit_count += 1;
+                self.miss_count += 1;
             }
-            self.touch(slot);
+            self.load_into(slot, expert_id);
             return &self.slots[slot];
         }
         #[cfg(test)]
@@ -530,6 +661,16 @@ impl ExpertSlotCache {
                 self.label
             )
         });
+        assert!(
+            self.slot_ready[*slot],
+            "{}: get_prefetched({expert_id}) found slot {slot} assigned but not yet populated \
+             — its dequant task never completed (e.g. panicked) after plan_prefetch committed \
+             ownership. This must never be reached in production: a caller that prefetched \
+             every selected expert (and correctly propagated any dequant failure instead of \
+             swallowing it) always applies results, or fails the whole token, before reaching \
+             Step 3's lookups — a data/caller bug, not routine cache behavior",
+            self.label
+        );
         &self.slots[*slot]
     }
 
@@ -554,11 +695,29 @@ impl ExpertSlotCache {
         let mut tasks = Vec::new();
         for &expert_id in expert_ids {
             if let Some(&slot) = self.expert_to_slot.get(&expert_id) {
+                if self.slot_ready[slot] {
+                    #[cfg(test)]
+                    {
+                        self.hit_count += 1;
+                    }
+                    self.touch(slot);
+                    continue;
+                }
+                // Ownership is committed but the slot's previous dequant
+                // task never completed (see `slot_ready`'s doc comment —
+                // most likely it panicked). Treat this exactly like a
+                // miss EXCEPT no eviction is needed: this expert already
+                // owns the slot, so reload into the same slot rather than
+                // picking a new one. Still counts as a miss (the data
+                // genuinely is not resident) and still needs a fresh
+                // `PrefetchTask`.
                 #[cfg(test)]
                 {
-                    self.hit_count += 1;
+                    self.miss_count += 1;
                 }
+                self.slot_ready[slot] = false;
                 self.touch(slot);
+                tasks.push(PrefetchTask { slot, expert_id });
                 continue;
             }
             #[cfg(test)]
@@ -575,63 +734,97 @@ impl ExpertSlotCache {
             }
             self.slot_owner[slot] = Some(expert_id);
             self.expert_to_slot.insert(expert_id, slot);
+            self.slot_ready[slot] = false;
             self.touch(slot);
             tasks.push(PrefetchTask { slot, expert_id });
         }
         tasks
     }
 
-    /// Prefetch every expert in `expert_ids` for the current token: plan
-    /// (see [`Self::plan_prefetch`], single-threaded, cheap), then
-    /// dequantize every miss — in parallel via rayon when `parallel` is
-    /// true, via a plain serial iterator over the identical task list
-    /// otherwise (the toggle exists so tests can run the exact same plan
-    /// through both fan-out strategies and assert identical output; it
-    /// changes nothing about which bytes end up where) — then copy each
-    /// result into its pre-assigned slot, single-threaded. Must be called
-    /// once per token, after `begin_token()` and before any
-    /// `resolve()`/`get_prefetched()` call for that token.
+    /// Spawn the dequant phase for an already-planned `tasks` list onto
+    /// `scope`, so the caller can encode other GPU work on the calling
+    /// thread while it runs and only join it later — see the module doc
+    /// comment's Stage 2 section. Borrows nothing from `self` except its
+    /// (immutable, plain-data) byte table and label: no `slots`
+    /// (`metal::Buffer`s are not known to be safely shareable across
+    /// threads) and no bookkeeping field crosses the thread boundary, so
+    /// the returned handle's closure only ever performs read-only mmap
+    /// access plus CPU dequant math. Returns `None` when `tasks` is empty
+    /// (nothing to spawn, nothing to join).
     ///
-    /// Safe to fan the dequant phase out across threads specifically
-    /// because `plan_prefetch` already committed every task's slot
-    /// assignment (and evicted whatever used to own it) before this
-    /// method's parallel section starts: each task in the returned plan
-    /// owns a distinct slot, and no LRU/HashMap/ownership bookkeeping
-    /// mutation runs during the parallel phase — only per-slot Metal
-    /// buffer `contents()` writes, one per task, into disjoint slots.
-    pub(crate) fn prefetch_experts(&mut self, expert_ids: &[usize], parallel: bool) {
-        let tasks = self.plan_prefetch(expert_ids);
+    /// `parallel` controls only whether multiple tasks within THIS spawned
+    /// closure fan out across rayon's pool or run on a plain serial
+    /// iterator — it does not affect whether spawning itself happens,
+    /// which this method always does (real cross-thread overlap with
+    /// whatever the caller encodes next does not depend on how many
+    /// threads the dequant phase itself uses).
+    ///
+    /// `panic_on_expert`, when `Some(id)`, deliberately panics before
+    /// dequantizing expert `id` instead of doing the real work — test-only
+    /// fault-injection hook for exercising the `slot_ready` recovery path;
+    /// always `None` outside tests.
+    pub(crate) fn spawn_dequant<'scope, 'env>(
+        &'env self,
+        tasks: Vec<PrefetchTask>,
+        parallel: bool,
+        panic_on_expert: Option<usize>,
+        #[cfg(test)] ordering_gate: Option<PrefetchOrderingGate>,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+    ) -> Option<std::thread::ScopedJoinHandle<'scope, PrefetchDequantResults>> {
         if tasks.is_empty() {
-            return;
+            return None;
         }
         let table = &self.table;
         let label = self.label.as_str();
-        let dequant_one = |expert_id: usize| -> Vec<u16> {
-            table.dequant_expert_f16(expert_id).unwrap_or_else(|e| {
-                panic!(
-                    "{label}: failed to dequantize expert {expert_id} during prefetch (should \
-                     be unreachable — expert_id is always < num_experts and the byte table was \
-                     validated at construction): {e}"
-                )
-            })
-        };
-        let results: Vec<(usize, Vec<u16>)> = if parallel && tasks.len() > 1 {
-            tasks
-                .par_iter()
-                .map(|t| (t.slot, dequant_one(t.expert_id)))
-                .collect()
-        } else {
-            tasks
-                .iter()
-                .map(|t| (t.slot, dequant_one(t.expert_id)))
-                .collect()
-        };
-        for (slot, data) in &results {
+        Some(scope.spawn(move || {
+            #[cfg(test)]
+            if let Some(gate) = ordering_gate {
+                let _ = gate.started_tx.send(());
+                let _ = gate.release_rx.recv();
+            }
+            let dequant_one = |expert_id: usize| -> Vec<u16> {
+                if panic_on_expert == Some(expert_id) {
+                    panic!(
+                        "{label}: test-injected dequant panic for expert {expert_id} — this \
+                         message should never appear outside the readiness-recovery test that \
+                         deliberately triggers it"
+                    );
+                }
+                table.dequant_expert_f16(expert_id).unwrap_or_else(|e| {
+                    panic!(
+                        "{label}: failed to dequantize expert {expert_id} during prefetch \
+                         (should be unreachable — expert_id is always < num_experts and the \
+                         byte table was validated at construction): {e}"
+                    )
+                })
+            };
+            if parallel && tasks.len() > 1 {
+                tasks
+                    .par_iter()
+                    .map(|t| (t.slot, dequant_one(t.expert_id)))
+                    .collect()
+            } else {
+                tasks
+                    .iter()
+                    .map(|t| (t.slot, dequant_one(t.expert_id)))
+                    .collect()
+            }
+        }))
+    }
+
+    /// Copy every `(slot, data)` dequant result into its pre-assigned
+    /// slot's Metal buffer and mark that slot ready — the single-threaded
+    /// "finish" half of the spawn/finish split `spawn_dequant` begins. Must
+    /// be called with the results of a `spawn_dequant` join (or an
+    /// equivalent synchronous dequant) before any `get_prefetched` lookup
+    /// for the experts it covers.
+    pub(crate) fn apply_prefetch_results(&mut self, results: &[PrefetchDequantResult]) {
+        for (slot, data) in results {
             debug_assert_eq!(data.len(), self.slot_elems);
-            // SAFETY: same as `load_into` — `plan_prefetch` already
-            // committed this slot's ownership and touched it (protecting
-            // it from eviction by any other task in this same plan), and
-            // no GPU command referencing this slot's OLD contents can
+            // SAFETY: `plan_prefetch` already committed this slot's
+            // ownership and touched it (protecting it from eviction by any
+            // other task in this same plan) before `spawn_dequant` started,
+            // and no GPU command referencing this slot's OLD contents can
             // still be in flight (module doc comment's cross-/within-token
             // invariant). Each `slot` value here is unique within
             // `results` (one per distinct `PrefetchTask`), so these writes
@@ -640,7 +833,30 @@ impl ExpertSlotCache {
                 let dst = self.slots[*slot].contents() as *mut u16;
                 std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
             }
+            self.slot_ready[*slot] = true;
         }
+    }
+
+    /// Convenience wrapper composing plan + spawn + immediate join + apply
+    /// for callers that don't need real cross-phase overlap (test helpers,
+    /// and anything driving the cache outside a real `encode_moe_ffn` call).
+    /// `encode_moe_ffn` itself calls `plan_prefetch` + `spawn_dequant` +
+    /// `apply_prefetch_results` directly so it can encode other GPU work
+    /// between spawning and joining — see the module doc comment.
+    #[cfg(test)]
+    pub(crate) fn prefetch_experts(&mut self, expert_ids: &[usize], parallel: bool) {
+        let tasks = self.plan_prefetch(expert_ids);
+        if tasks.is_empty() {
+            return;
+        }
+        let results = std::thread::scope(|scope| {
+            let handle = self.spawn_dequant(tasks, parallel, None, None, scope);
+            handle
+                .expect("tasks is non-empty, spawn_dequant only returns None for empty tasks")
+                .join()
+                .unwrap_or_else(|e| std::panic::resume_unwind(e))
+        });
+        self.apply_prefetch_results(&results);
     }
 
     fn pick_eviction_slot(&mut self) -> usize {
@@ -677,10 +893,17 @@ impl ExpertSlotCache {
     #[cfg(test)]
     fn load_into(&mut self, slot: usize, expert_id: usize) {
         if let Some(old_owner) = self.slot_owner[slot].take() {
-            self.expert_to_slot.remove(&old_owner);
-            #[cfg(test)]
-            {
-                self.eviction_count += 1;
+            // A same-owner reload (the "committed but never populated"
+            // case `resolve`'s caller already detected) is not an
+            // eviction — nothing outside this expert's own data is being
+            // discarded, so only count it when the slot is genuinely
+            // changing hands.
+            if old_owner != expert_id {
+                self.expert_to_slot.remove(&old_owner);
+                #[cfg(test)]
+                {
+                    self.eviction_count += 1;
+                }
             }
         }
         let f16_data = self
@@ -708,6 +931,7 @@ impl ExpertSlotCache {
         }
         self.slot_owner[slot] = Some(expert_id);
         self.expert_to_slot.insert(expert_id, slot);
+        self.slot_ready[slot] = true;
         self.touch(slot);
     }
 
