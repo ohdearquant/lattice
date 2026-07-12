@@ -19,24 +19,39 @@ abs_max/7 symmetric scale with bias=-8*scale, same f32::round-half-away-
 from-zero nibble rounding order, same f16 round-to-nearest-even scale/bias
 storage) — generalized only by making the group size a parameter (32 or
 64), since no group-64 code path exists in the Rust source.
-The `self-test` subcommand is a MANDATORY gate: it re-derives one tensor's
-Q4 blocks in this Python arithmetic and diffs the result byte-for-byte
-against the real `quantize_q4`-produced `.q4` file already on disk, both at
-the per-block scale/bias level and the fully dequantized-value level. No
-arm may run before self-test passes (protocol requirement: "define the
-exact quantizer bit-for-bit, not a reimplementation").
+
+Invariants enforced by this script:
+
+- The `self-test` subcommand is a MANDATORY gate: it re-derives Q4 blocks
+  in this Python arithmetic and diffs the result byte-for-byte (scale,
+  bias, and the full 16-byte packed-nibble payload) against the real
+  `quantize_q4`-produced `.q4` file already on disk. `--all` sweeps every
+  tensor marked `quantized: true` in `quantize_index.json`, reproducing
+  the full-checkpoint coverage claim from the CLI.
+- `quantize` and `run-arm` both run the full self-test sweep before
+  writing any arm checkpoint and refuse to proceed on failure; the sweep
+  result is recorded in the arm's manifest.
+- Non-finite (NaN/Inf) source elements are rejected before padding or
+  reduction, matching the Rust quantizer's fail-closed behavior; `--self-
+  check` proves the guard is wired.
+- `run-arm` is the complete write -> eval -> delete loop: it writes the
+  arm checkpoint, evaluates perplexity under the machine-wide Metal GPU
+  advisory lock, records the parsed result in the manifest, then deletes
+  the arm's weights (keeping only the manifest and console log).
 
 Usage:
-    uv run python3 scripts/fake_quant_pilot.py self-test
-    uv run python3 scripts/fake_quant_pilot.py quantize --arm A --output-dir /private/tmp/fq_pilot/arm_A
-    uv run python3 scripts/fake_quant_pilot.py quantize --arm E --output-dir /private/tmp/fq_pilot/arm_E
+    uv run python3 scripts/fake_quant_pilot.py self-test --all
+    uv run python3 scripts/fake_quant_pilot.py self-check
+    uv run python3 scripts/fake_quant_pilot.py quantize --arm A \\
+        --output-dir /private/tmp/fq_pilot/arm_A
+    uv run python3 scripts/fake_quant_pilot.py run-arm --arm E
 """
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
-import os
 import shutil
 import struct
 import subprocess
@@ -54,6 +69,22 @@ from safetensors.numpy import save_file
 DEFAULT_MODEL_DIR = Path.home() / ".lattice/models/qwen3.5-0.8b"
 DEFAULT_Q4_DIR = Path.home() / ".lattice/models/qwen3.5-0.8b-q4"
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The real Rust quantizer (crates/inference/src/bin/quantize_q4.rs) only
+# ever produces group-32 affine blocks; that is what self-test diffs
+# against. Group-64 and symmetric are Python-only candidate schemes with no
+# on-disk Rust counterpart to bit-compare against.
+GROUP_SIZE_REAL = 32
+
+# Dedicated scratch root this script owns for `run-arm` output. Weights
+# written here are deleted after a successful eval; only manifest.json and
+# the console log persist.
+SCRATCH_ROOT = Path("/private/tmp/fq_pilot")
+
+# Machine-wide Metal GPU advisory lock (fleet convention). Any process
+# driving the GPU for measurements serializes through this flock.
+GPU_LOCK_PATH = "/tmp/lion-metal-gpu-test.lock"
+GPU_LOCK_TIMEOUT_S = 30 * 60
 
 # Arms per the registered protocol + pilot amendment (binding, do not alter
 # the semantics here without a corresponding amendment to PILOT_AMENDMENT.md).
@@ -125,16 +156,31 @@ def round_half_away_from_zero(x: np.ndarray) -> np.ndarray:
 
 
 def fake_quant_dequant(
-    flat: np.ndarray, group_size: int, symmetric: bool
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    flat: np.ndarray, group_size: int, symmetric: bool, name: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Quantize+dequantize a flattened f32 tensor in `group_size`-element
     blocks (contiguous over the FLATTENED array — NOT per matrix row; this
     matches `quantize_f32_to_q4`'s `data.chunks(group_size)` over the whole
     tensor, the function `quantize_q4.rs`'s single call site actually uses).
 
-    Returns (dequantized_flat_f32, scale_f16_as_f32_per_block, bias_f16_as_f32_per_block).
+    Rejects any non-finite element before padding/reduction, mirroring
+    `quantize_block_with_mode_len`'s finite check (q4_weights.rs:170-177):
+    a NaN silently leaves abs_max/min_val/max_val unchanged there too, so
+    Rust rejects up front rather than propagate a wrong-but-no-error block.
+
+    Returns (dequantized_flat_f32, scale_f16_as_f32_per_block,
+    bias_f16_as_f32_per_block, quantized_nibble_codes[n_blocks, group_size]
+    as uint8 in 0..15).
     """
     flat = flat.astype(np.float32, copy=False)
+    non_finite = np.flatnonzero(~np.isfinite(flat))
+    if non_finite.size:
+        bad_idx = int(non_finite[0])
+        raise ValueError(
+            f"tensor {name!r} element {bad_idx} contains a non-finite value "
+            f"({flat[bad_idx]!r}); source weights must be finite"
+        )
+
     n = flat.shape[0]
     n_blocks = -(-n // group_size)
     pad = n_blocks * group_size - n
@@ -175,7 +221,19 @@ def fake_quant_dequant(
 
     dequant_blocks = (q * scale_f16[:, None] + bias_f16[:, None]).astype(np.float32)
     dequant = dequant_blocks.reshape(-1)[:n]
-    return dequant, scale_f16, bias_f16
+    return dequant, scale_f16, bias_f16, q.astype(np.uint8)
+
+
+def pack_q4_nibbles(q: np.ndarray) -> np.ndarray:
+    """Pack per-block quantized nibble codes (n_blocks, group_size) uint8
+    0..15 into the on-disk byte layout used by `quantize_block_with_mode_len`
+    (q4_weights.rs:187-192): `packed[b] = (q1 << 4) | q0`, where
+    `weight[2b] = q0` (low nibble) and `weight[2b+1] = q1` (high nibble).
+    """
+    q = q.astype(np.uint8)
+    q0 = q[:, 0::2]
+    q1 = q[:, 1::2]
+    return ((q1 << 4) | (q0 & 0x0F)).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -218,9 +276,13 @@ def load_tensor_f32(path: Path, header: dict, data_start: int, name: str) -> np.
 # ---------------------------------------------------------------------------
 
 
+def load_quantize_index(q4_dir: Path) -> list[dict]:
+    with open(q4_dir / "quantize_index.json") as f:
+        return json.load(f)
+
+
 def load_quantized_tensor_set(q4_dir: Path) -> set[str]:
-    idx = json.load(open(q4_dir / "quantize_index.json"))
-    return {e["name"] for e in idx if e["quantized"]}
+    return {e["name"] for e in load_quantize_index(q4_dir) if e["quantized"]}
 
 
 def tensor_scheme_for_arm(name: str, arm: str) -> tuple[str, int]:
@@ -239,26 +301,15 @@ def tensor_scheme_for_arm(name: str, arm: str) -> tuple[str, int]:
 # ---------------------------------------------------------------------------
 
 
-def cmd_self_test(args: argparse.Namespace) -> int:
-    model_dir = Path(args.model_dir)
-    q4_dir = Path(args.q4_dir)
-    st_path = model_dir / "model.safetensors"
-    header, data_start = read_safetensors_header(st_path)
-
-    idx = json.load(open(q4_dir / "quantize_index.json"))
-    by_name = {e["name"]: e for e in idx}
-    entry = by_name.get(args.tensor)
-    if entry is None or not entry["quantized"]:
-        print(f"FAIL: {args.tensor} is not a quantized tensor in {q4_dir}")
-        return 1
-
-    q4_path = q4_dir / entry["file"]
+def read_real_q4_blocks(q4_path: Path) -> dict:
+    """Parse a Rust-produced `.q4` file: header (magic/version/shape/
+    original_len) plus the 20-byte-per-block payload (2B scale, 2B bias,
+    16B packed nibbles)."""
     with open(q4_path, "rb") as f:
         data = f.read()
     magic = data[0:4]
     if magic != b"KHQ4":
-        print(f"FAIL: {q4_path} bad magic {magic!r}")
-        return 1
+        raise ValueError(f"{q4_path}: bad magic {magic!r}")
     version = struct.unpack("<I", data[4:8])[0]
     ndim = struct.unpack("<I", data[8:12])[0]
     off = 12
@@ -271,69 +322,171 @@ def cmd_self_test(args: argparse.Namespace) -> int:
     block_bytes = data[off:]
     n_blocks = len(block_bytes) // 20
     if n_blocks * 20 != len(block_bytes):
-        print(f"FAIL: {q4_path} block payload not a multiple of 20 bytes")
-        return 1
-
-    # Parse real Rust-produced blocks: scale u16, bias u16, packed[16].
+        raise ValueError(f"{q4_path}: block payload not a multiple of 20 bytes")
     blk = np.frombuffer(block_bytes, dtype=np.uint8).reshape(n_blocks, 20)
-    real_scale_bits = blk[:, 0:2].copy().view(np.uint16).reshape(-1)
-    real_bias_bits = blk[:, 2:4].copy().view(np.uint16).reshape(-1)
-    real_scale_f32 = f16_bits_to_f32(real_scale_bits)
-    real_bias_f32 = f16_bits_to_f32(real_bias_bits)
-    packed = blk[:, 4:20]
-    lo = (packed & 0x0F).astype(np.float32)
-    hi = (packed >> 4).astype(np.float32)
-    # sequential-pairs layout: weight[2b] = lo, weight[2b+1] = hi
-    interleaved = np.empty((n_blocks, 32), dtype=np.float32)
+    scale_bits = blk[:, 0:2].copy().view(np.uint16).reshape(-1)
+    bias_bits = blk[:, 2:4].copy().view(np.uint16).reshape(-1)
+    packed = blk[:, 4:20].copy()
+    return {
+        "version": version,
+        "shape": shape,
+        "original_len": original_len,
+        "n_blocks": n_blocks,
+        "scale_bits": scale_bits,
+        "bias_bits": bias_bits,
+        "packed": packed,
+    }
+
+
+def verify_tensor_bit_exact(
+    tensor: str,
+    st_path: Path,
+    header: dict,
+    data_start: int,
+    q4_dir: Path,
+    entry: dict,
+) -> tuple[bool, str]:
+    """Diff the Python g32-affine port against the real Rust `.q4` output
+    for one tensor: per-block scale bits, bias bits, the complete 16-byte
+    packed-nibble payload (all 20 bytes/block together), and the fully
+    dequantized values recomputed independently from the on-disk bytes."""
+    q4_path = q4_dir / entry["file"]
+    real = read_real_q4_blocks(q4_path)
+
+    src_f32 = load_tensor_f32(st_path, header, data_start, tensor)
+    if src_f32.shape[0] != real["original_len"]:
+        return False, (
+            f"{tensor}: FAIL source numel {src_f32.shape[0]} != "
+            f"q4 original_len {real['original_len']}"
+        )
+
+    py_dequant, py_scale_f16, py_bias_f16, py_q = fake_quant_dequant(
+        src_f32, group_size=GROUP_SIZE_REAL, symmetric=False, name=tensor
+    )
+    if py_scale_f16.shape[0] != real["n_blocks"]:
+        return False, (
+            f"{tensor}: FAIL block count mismatch: "
+            f"python={py_scale_f16.shape[0]} rust={real['n_blocks']}"
+        )
+
+    py_scale_bits = f32_to_f16_bits(py_scale_f16)
+    py_bias_bits = f32_to_f16_bits(py_bias_f16)
+    py_packed = pack_q4_nibbles(py_q)
+
+    scale_match = np.array_equal(py_scale_bits, real["scale_bits"])
+    bias_match = np.array_equal(py_bias_bits, real["bias_bits"])
+    packed_match = np.array_equal(py_packed, real["packed"])
+
+    # Independent end-to-end check: dequantize straight from the REAL
+    # on-disk bytes and compare to the Python dequant, rather than only
+    # comparing scale/bias/packed equality pairwise.
+    lo = (real["packed"] & 0x0F).astype(np.float32)
+    hi = (real["packed"] >> 4).astype(np.float32)
+    interleaved = np.empty((real["n_blocks"], GROUP_SIZE_REAL), dtype=np.float32)
     interleaved[:, 0::2] = lo
     interleaved[:, 1::2] = hi
-    real_dequant_blocks = interleaved * real_scale_f32[:, None] + real_bias_f32[:, None]
-    real_dequant = real_dequant_blocks.reshape(-1)[:original_len]
+    real_scale_f32 = f16_bits_to_f32(real["scale_bits"])
+    real_bias_f32 = f16_bits_to_f32(real["bias_bits"])
+    real_dequant = (interleaved * real_scale_f32[:, None] + real_bias_f32[:, None]).reshape(-1)[
+        : real["original_len"]
+    ]
+    dequant_match = np.array_equal(py_dequant, real_dequant)
 
-    print(f"=== fake_quant_pilot self-test: {args.tensor} ===")
-    print(f"  real .q4 file:   {q4_path}")
-    print(f"  version={version} shape={shape} original_len={original_len} n_blocks={n_blocks}")
-
-    # Python arm-A path (g32 affine) on the same source tensor.
-    src_f32 = load_tensor_f32(st_path, header, data_start, args.tensor)
-    assert src_f32.shape[0] == original_len, (
-        f"source numel {src_f32.shape[0]} != q4 original_len {original_len}"
-    )
-    py_dequant, py_scale_f16, py_bias_f16 = fake_quant_dequant(
-        src_f32, group_size=32, symmetric=False
-    )
-    py_n_blocks = py_scale_f16.shape[0]
-
-    ok = True
-    if py_n_blocks != n_blocks:
-        print(f"  FAIL: block count mismatch: python={py_n_blocks} rust={n_blocks}")
-        ok = False
-    else:
-        py_scale_bits = f32_to_f16_bits(py_scale_f16)
-        py_bias_bits = f32_to_f16_bits(py_bias_f16)
-        scale_match = np.array_equal(py_scale_bits, real_scale_bits)
-        bias_match = np.array_equal(py_bias_bits, real_bias_bits)
-        print(f"  per-block scale bits exact match: {scale_match} ({n_blocks} blocks)")
-        print(f"  per-block bias  bits exact match: {bias_match} ({n_blocks} blocks)")
-        if not scale_match:
-            bad = np.where(py_scale_bits != real_scale_bits)[0][:5]
-            print(f"    first mismatches (block idx): {bad.tolist()}")
-            ok = False
-        if not bias_match:
-            bad = np.where(py_bias_bits != real_bias_bits)[0][:5]
-            print(f"    first mismatches (block idx): {bad.tolist()}")
-            ok = False
-
-        dequant_exact = np.array_equal(py_dequant, real_dequant)
-        max_abs_diff = float(np.max(np.abs(py_dequant - real_dequant))) if not dequant_exact else 0.0
-        print(f"  dequantized value exact match: {dequant_exact} (max_abs_diff={max_abs_diff:.3e})")
-        if not dequant_exact:
-            ok = False
-
+    ok = scale_match and bias_match and packed_match and dequant_match
     if ok:
-        print("SELF-TEST: PASS — python g32-affine quantizer is bit-exact vs the real Rust .q4 output.")
+        return True, f"{tensor}: PASS ({real['n_blocks']} blocks, byte-exact)"
+    return False, (
+        f"{tensor}: FAIL scale={scale_match} bias={bias_match} "
+        f"packed={packed_match} dequant={dequant_match}"
+    )
+
+
+def run_self_test_sweep(model_dir: Path, q4_dir: Path, tensor: str | None = None) -> dict:
+    """Run the bit-exactness self-test. `tensor=None` sweeps every tensor
+    marked `quantized: true` in `quantize_index.json` (the full
+    reproducibility mode this script's docstring claims); `tensor=<name>`
+    checks just that one tensor (fast smoke-check)."""
+    st_path = model_dir / "model.safetensors"
+    header, data_start = read_safetensors_header(st_path)
+    idx = load_quantize_index(q4_dir)
+    by_name = {e["name"]: e for e in idx}
+    targets = [e["name"] for e in idx if e["quantized"]] if tensor is None else [tensor]
+
+    n_pass = 0
+    failures: list[str] = []
+    for name in targets:
+        entry = by_name.get(name)
+        if entry is None or not entry["quantized"]:
+            print(f"  {name}: FAIL — not a quantized tensor in {q4_dir}")
+            failures.append(name)
+            continue
+        ok, detail = verify_tensor_bit_exact(name, st_path, header, data_start, q4_dir, entry)
+        print(f"  {detail}")
+        if ok:
+            n_pass += 1
+        else:
+            failures.append(name)
+
+    return {
+        "ok": len(failures) == 0,
+        "mode": "all" if tensor is None else "single",
+        "n_tensors_checked": len(targets),
+        "n_pass": n_pass,
+        "n_fail": len(failures),
+        "failures": failures,
+    }
+
+
+def cmd_self_test(args: argparse.Namespace) -> int:
+    model_dir = Path(args.model_dir)
+    q4_dir = Path(args.q4_dir)
+    scope = "all quantized tensors" if args.all else args.tensor
+    print(f"=== fake_quant_pilot self-test: {scope} ===")
+    result = run_self_test_sweep(model_dir, q4_dir, tensor=None if args.all else args.tensor)
+    print(f"{result['n_pass']}/{result['n_tensors_checked']} tensors bit-exact")
+    if result["ok"]:
+        print(
+            "SELF-TEST: PASS — python g32-affine quantizer is bit-exact vs the "
+            "real Rust .q4 output."
+        )
         return 0
-    print("SELF-TEST: FAIL — python quantizer diverges from the real Rust quantizer. DO NOT run arms.")
+    print(f"SELF-TEST: FAIL — {result['n_fail']} tensor(s) diverge: {result['failures'][:10]}")
+    print("DO NOT run arms.")
+    return 1
+
+
+def require_self_test_pass(model_dir: Path, q4_dir: Path) -> dict:
+    """Mandatory gate for `quantize` and `run-arm`: run the full self-test
+    sweep over every quantized tensor and refuse to proceed if any tensor
+    diverges from the real Rust `.q4` output. Returns the sweep result,
+    which callers record into the arm manifest."""
+    print("=== mandatory self-test gate: sweeping every quantized tensor ===")
+    result = run_self_test_sweep(model_dir, q4_dir, tensor=None)
+    print(f"self-test gate: {result['n_pass']}/{result['n_tensors_checked']} tensors bit-exact")
+    if not result["ok"]:
+        raise SystemExit(
+            f"SELF-TEST GATE FAILED — {result['n_fail']} tensor(s) diverge from the real "
+            f"Rust .q4 output: {result['failures'][:10]}. Refusing to write an arm checkpoint."
+        )
+    return result
+
+
+def cmd_self_check(_args: argparse.Namespace) -> int:
+    """Fail-closed non-finite guard check: a minimal, self-contained
+    assertion (no pytest dependency) proving `fake_quant_dequant` rejects
+    NaN/Inf input with an error naming the tensor and element index."""
+    flat = np.zeros(32, dtype=np.float32)
+    flat[5] = float("nan")
+    try:
+        fake_quant_dequant(flat, group_size=32, symmetric=False, name="self_check_tensor")
+    except ValueError as e:
+        msg = str(e)
+        if "self_check_tensor" in msg and "element 5" in msg:
+            print(f"SELF-CHECK: PASS — non-finite input raised with tensor+index detail: {e}")
+            return 0
+        print(f"SELF-CHECK: FAIL — raised but message missing tensor/index detail: {e}")
+        return 1
+    print("SELF-CHECK: FAIL — non-finite input did not raise; the fail-closed guard is not wired.")
     return 1
 
 
@@ -356,11 +509,16 @@ def git_commit_sha() -> str:
     ).strip()
 
 
-def cmd_quantize(args: argparse.Namespace) -> int:
-    arm = args.arm
-    model_dir = Path(args.model_dir)
-    q4_dir = Path(args.q4_dir)
-    output_dir = Path(args.output_dir)
+def write_arm_checkpoint(
+    arm: str,
+    model_dir: Path,
+    q4_dir: Path,
+    output_dir: Path,
+    self_test_result: dict,
+) -> dict:
+    """Write one arm's fake-quantized f16 checkpoint + manifest.json into
+    `output_dir`. Callers must have already run `require_self_test_pass`
+    and pass its result through so it lands in the manifest."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     st_path = model_dir / "model.safetensors"
@@ -378,8 +536,8 @@ def cmd_quantize(args: argparse.Namespace) -> int:
         src = load_tensor_f32(st_path, header, data_start, name)
         if arm != "full_precision" and name in quantized_set:
             mode, gs = tensor_scheme_for_arm(name, arm)
-            dequant, _, _ = fake_quant_dequant(
-                src, group_size=gs, symmetric=(mode == "symmetric")
+            dequant, _, _, _ = fake_quant_dequant(
+                src, group_size=gs, symmetric=(mode == "symmetric"), name=name
             )
             scheme_map[name] = f"{mode}-g{gs}"
             n_quantized += 1
@@ -416,6 +574,12 @@ def cmd_quantize(args: argparse.Namespace) -> int:
         "commit_sha": git_commit_sha(),
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "quantize_wall_seconds": elapsed,
+        "self_test": {
+            "ok": self_test_result["ok"],
+            "mode": self_test_result["mode"],
+            "n_tensors_checked": self_test_result["n_tensors_checked"],
+            "n_pass": self_test_result["n_pass"],
+        },
     }
     with open(output_dir / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -424,11 +588,122 @@ def cmd_quantize(args: argparse.Namespace) -> int:
         f"[{arm}] wrote {out_st_path} ({out_st_path.stat().st_size / 1e9:.2f} GB), "
         f"{n_quantized}/{len(tensor_names)} tensors fake-quantized, {elapsed:.1f}s"
     )
+    return manifest
+
+
+def cmd_quantize(args: argparse.Namespace) -> int:
+    arm = args.arm
+    model_dir = Path(args.model_dir)
+    q4_dir = Path(args.q4_dir)
+    output_dir = Path(args.output_dir)
+
+    self_test_result = require_self_test_pass(model_dir, q4_dir)
+    write_arm_checkpoint(arm, model_dir, q4_dir, output_dir, self_test_result)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# run-arm: the complete write -> eval -> delete loop
+# ---------------------------------------------------------------------------
+
+
+def run_eval_under_gpu_lock(cmd: list[str], cwd: Path) -> dict:
+    """Run `cmd` while holding the machine-wide Metal GPU advisory flock
+    (fleet convention: /tmp/lion-metal-gpu-test.lock — any process driving
+    the GPU for measurements serializes through it; concurrent GPU work
+    corrupts both timing and numerics). Blocks up to 30 minutes, then fails
+    loud rather than hanging. Parses the evaluator's stdout for the
+    `@@lattice {"ev":"perplexity",...}` structured event line and returns
+    it parsed."""
+    deadline = time.time() + GPU_LOCK_TIMEOUT_S
+    with open(GPU_LOCK_PATH, "w") as lock_fh:
+        while True:
+            try:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > deadline:
+                    raise SystemExit(
+                        f"timed out waiting for {GPU_LOCK_PATH}; "
+                        f"check holder with: lsof {GPU_LOCK_PATH}"
+                    ) from None
+                time.sleep(5)
+
+        try:
+            proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+        finally:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        raise SystemExit(f"evaluator failed with exit code {proc.returncode}")
+
+    for line in proc.stdout.splitlines():
+        if line.startswith("@@lattice "):
+            event = json.loads(line[len("@@lattice ") :])
+            if event.get("ev") == "perplexity":
+                return event
+    raise SystemExit("evaluator produced no @@lattice perplexity event; cannot record PPL")
+
+
+def cmd_run_arm(args: argparse.Namespace) -> int:
+    arm = args.arm
+    model_dir = Path(args.model_dir)
+    q4_dir = Path(args.q4_dir)
+    output_dir = Path(args.output_dir) if args.output_dir else SCRATCH_ROOT / f"arm_{arm}"
+
+    self_test_result = require_self_test_pass(model_dir, q4_dir)
+    manifest = write_arm_checkpoint(arm, model_dir, q4_dir, output_dir, self_test_result)
+
+    eval_cmd = [
+        "cargo",
+        "run",
+        "--release",
+        "--features",
+        "f16",
+        "--bin",
+        "eval_perplexity",
+        "--",
+        "--model-dir",
+        str(output_dir),
+        "--corpus-file",
+        str(REPO_ROOT / "docs/bench_results/wiki.test.raw"),
+        "--window",
+        str(args.window),
+        "--stride",
+        str(args.stride),
+        "--max-tokens",
+        str(args.max_tokens),
+        "--json",
+        "--label",
+        arm,
+    ]
+    print(f"=== running evaluator under GPU lock: {' '.join(eval_cmd)} ===")
+    ppl_event = run_eval_under_gpu_lock(eval_cmd, cwd=REPO_ROOT)
+
+    manifest["evaluator_invocation"] = " ".join(eval_cmd)
+    manifest["perplexity"] = ppl_event
+    manifest_path = output_dir / "manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    out_st_path = output_dir / "model.safetensors"
+    if out_st_path.exists():
+        out_st_path.unlink()
+        print(f"[{arm}] deleted {out_st_path} after successful eval (manifest + log retained)")
+
+    print(
+        f"[{arm}] run-arm complete: ppl={ppl_event.get('ppl')} nll={ppl_event.get('nll')} "
+        f"tokens={ppl_event.get('tokens')} windows={ppl_event.get('windows')}"
+    )
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     st = sub.add_parser("self-test", help="MANDATORY bit-exactness gate vs the real Rust quantizer")
@@ -439,7 +714,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="model.language_model.layers.0.mlp.down_proj.weight",
         help="tensor name to self-test (must be quantized=true in quantize_index.json)",
     )
+    st.add_argument(
+        "--all",
+        action="store_true",
+        help="sweep every tensor marked quantized=true in quantize_index.json",
+    )
     st.set_defaults(func=cmd_self_test)
+
+    sc = sub.add_parser("self-check", help="prove the non-finite (NaN/Inf) input guard is wired")
+    sc.set_defaults(func=cmd_self_check)
 
     q = sub.add_parser("quantize", help="produce one arm's derived fake-quant f16 checkpoint dir")
     q.add_argument("--arm", required=True, choices=["A", "B", "C", "D", "E", "full_precision"])
@@ -447,6 +730,24 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--q4-dir", default=str(DEFAULT_Q4_DIR))
     q.add_argument("--output-dir", required=True)
     q.set_defaults(func=cmd_quantize)
+
+    ra = sub.add_parser(
+        "run-arm",
+        help="self-test gate, write the arm checkpoint, evaluate PPL under the GPU lock, "
+        "record the result, then delete the arm's weights",
+    )
+    ra.add_argument("--arm", required=True, choices=["A", "B", "C", "D", "E", "full_precision"])
+    ra.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
+    ra.add_argument("--q4-dir", default=str(DEFAULT_Q4_DIR))
+    ra.add_argument(
+        "--output-dir",
+        default=None,
+        help=f"defaults to {SCRATCH_ROOT}/arm_<ARM>, a dedicated scratch dir this script owns",
+    )
+    ra.add_argument("--window", type=int, default=512)
+    ra.add_argument("--stride", type=int, default=256)
+    ra.add_argument("--max-tokens", type=int, default=2048)
+    ra.set_defaults(func=cmd_run_arm)
 
     return p
 
