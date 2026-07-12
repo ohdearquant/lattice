@@ -471,10 +471,29 @@ def require_self_test_pass(model_dir: Path, q4_dir: Path) -> dict:
     return result
 
 
+def resolve_scratch_output_dir(arm: str, output_dir_arg: str | None) -> Path:
+    """Resolve run-arm's output directory, confined to SCRATCH_ROOT.
+
+    run-arm deletes `model.safetensors` from its output directory after a
+    successful eval, so the directory must live inside the scratch tree this
+    script owns: an arbitrary --output-dir (or a symlink escaping the tree)
+    would let the post-eval cleanup unlink a file anywhere on disk."""
+    root = SCRATCH_ROOT.resolve()
+    candidate = Path(output_dir_arg) if output_dir_arg else SCRATCH_ROOT / f"arm_{arm}"
+    resolved = candidate.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise SystemExit(
+            f"run-arm --output-dir must resolve inside {root} (got {resolved}); "
+            "the post-eval cleanup deletes model.safetensors from this directory"
+        )
+    return resolved
+
+
 def cmd_self_check(_args: argparse.Namespace) -> int:
-    """Fail-closed non-finite guard check: a minimal, self-contained
-    assertion (no pytest dependency) proving `fake_quant_dequant` rejects
-    NaN/Inf input with an error naming the tensor and element index."""
+    """Fail-closed guard checks: minimal, self-contained assertions (no
+    pytest dependency) proving (1) `fake_quant_dequant` rejects NaN/Inf
+    input with an error naming the tensor and element index, and (2)
+    `resolve_scratch_output_dir` rejects directories outside SCRATCH_ROOT."""
     flat = np.zeros(32, dtype=np.float32)
     flat[5] = float("nan")
     try:
@@ -483,11 +502,28 @@ def cmd_self_check(_args: argparse.Namespace) -> int:
         msg = str(e)
         if "self_check_tensor" in msg and "element 5" in msg:
             print(f"SELF-CHECK: PASS — non-finite input raised with tensor+index detail: {e}")
-            return 0
-        print(f"SELF-CHECK: FAIL — raised but message missing tensor/index detail: {e}")
+        else:
+            print(f"SELF-CHECK: FAIL — raised but message missing tensor/index detail: {e}")
+            return 1
+    else:
+        print(
+            "SELF-CHECK: FAIL — non-finite input did not raise; the fail-closed guard is not wired."
+        )
         return 1
-    print("SELF-CHECK: FAIL — non-finite input did not raise; the fail-closed guard is not wired.")
-    return 1
+
+    inside = resolve_scratch_output_dir("A", None)
+    if inside != (SCRATCH_ROOT / "arm_A").resolve():
+        print(f"SELF-CHECK: FAIL — default output dir resolved unexpectedly: {inside}")
+        return 1
+    for outside in ("/tmp/fq-outside-scratch", str(SCRATCH_ROOT) + "-sibling", "/etc"):
+        try:
+            resolve_scratch_output_dir("A", outside)
+        except SystemExit:
+            continue
+        print(f"SELF-CHECK: FAIL — output dir outside scratch root was accepted: {outside}")
+        return 1
+    print(f"SELF-CHECK: PASS — output-dir boundary confined to {SCRATCH_ROOT}.")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +687,7 @@ def cmd_run_arm(args: argparse.Namespace) -> int:
     arm = args.arm
     model_dir = Path(args.model_dir)
     q4_dir = Path(args.q4_dir)
-    output_dir = Path(args.output_dir) if args.output_dir else SCRATCH_ROOT / f"arm_{arm}"
+    output_dir = resolve_scratch_output_dir(arm, args.output_dir)
 
     self_test_result = require_self_test_pass(model_dir, q4_dir)
     manifest = write_arm_checkpoint(arm, model_dir, q4_dir, output_dir, self_test_result)
@@ -742,7 +778,8 @@ def build_parser() -> argparse.ArgumentParser:
     ra.add_argument(
         "--output-dir",
         default=None,
-        help=f"defaults to {SCRATCH_ROOT}/arm_<ARM>, a dedicated scratch dir this script owns",
+        help=f"defaults to {SCRATCH_ROOT}/arm_<ARM>; must resolve inside {SCRATCH_ROOT} "
+        "(post-eval cleanup deletes model.safetensors from this directory)",
     )
     ra.add_argument("--window", type=int, default=512)
     ra.add_argument("--stride", type=int, default=256)
