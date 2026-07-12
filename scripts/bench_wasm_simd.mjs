@@ -26,8 +26,10 @@
 //     microbenchmark. Both variants pay the identical marshalling cost, so
 //     the A/B delta isolates the kernel change.
 //   - `normalize` mutates its argument in place; the input buffer is reset
-//     from a template array before each timed call, with the reset kept
-//     OUTSIDE the timed region.
+//     from a template array before each timed call via `timeCalls`' `prep`
+//     callback, which runs before `t0` on every rep (including warmup), so
+//     the reset copy is excluded from the timed region -- only the
+//     wasm-bindgen call + kernel are measured.
 //   - Timing uses `process.hrtime.bigint()` (nanosecond resolution). A
 //     warmup phase runs before the timed reps to let V8 JIT the call site.
 
@@ -146,10 +148,18 @@ function percentile(sortedNs, p) {
   return sortedNs[idx];
 }
 
-function timeCalls(fn, reps, warmup) {
-  for (let i = 0; i < warmup; i++) fn();
+// `prep`, when given, runs once per rep (warmup reps included) immediately
+// BEFORE `t0` -- for ops like `normalize` that mutate their input in place
+// and need a fresh copy each call, this keeps the reset out of the timed
+// region instead of folding it into the measured latency.
+function timeCalls(fn, reps, warmup, prep) {
+  for (let i = 0; i < warmup; i++) {
+    if (prep) prep();
+    fn();
+  }
   const samples = new Float64Array(reps);
   for (let i = 0; i < reps; i++) {
+    if (prep) prep();
     const t0 = process.hrtime.bigint();
     fn();
     const t1 = process.hrtime.bigint();
@@ -169,13 +179,9 @@ function benchPairOp(mod, opName, dim, seed, reps, warmup) {
 function benchNormalize(mod, dim, seed, reps, warmup) {
   const template = randomVec(dim, seed);
   const scratch = new Float32Array(dim);
-  const fn = () => {
-    scratch.set(template);
-    mod.simdNormalize(scratch);
-  };
-  // timeCalls' warmup calls fn() directly, which is fine here since each
-  // call resets scratch from template first.
-  return timeCalls(fn, reps, warmup);
+  const prep = () => scratch.set(template);
+  const fn = () => mod.simdNormalize(scratch);
+  return timeCalls(fn, reps, warmup, prep);
 }
 
 const OPS = [
