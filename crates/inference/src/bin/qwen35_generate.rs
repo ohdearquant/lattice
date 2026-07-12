@@ -348,8 +348,8 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
     // the ones the supervisor aggregates into the five mandated metrics.
     //
     // `prefill_end` and `token_available` are emitted from
-    // `generate_streaming_with_observer`'s raw-event observer (codex
-    // round-1 blocker #1), not from the text-delta callback below: the
+    // `generate_streaming_with_observer`'s raw-event observer, not from
+    // the text-delta callback below: the
     // incremental UTF-8 detokenizer deliberately buffers incomplete
     // multi-byte codepoints, so one text delta is not guaranteed to equal
     // one raw sampled token, and marking `prefill_end` off the first delta
@@ -391,7 +391,7 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
     // this count is expected to always equal `generated_tokens` by
     // construction; fail loud rather than silently trust it, since the
     // supervisor's phase-sequence validator depends on this invariant
-    // holding (codex round-1 blocker #1's adapter-side requirement).
+    // holding.
     if raw_token_count != output.generated_tokens {
         eprintln!(
             "FAIL: internal error -- raw phase-event token count ({raw_token_count}) \

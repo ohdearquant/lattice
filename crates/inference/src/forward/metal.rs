@@ -1130,8 +1130,8 @@ mod inner {
         }
 
         // ADR-066 D2 invariant #1, all-(-inf) class: NOT covered by a direct
-        // kernel-dispatch fixture here, by design, not oversight (PR #794 round-1
-        // review, PR #794). `fused_attention` takes no external mask buffer -- the
+        // kernel-dispatch fixture here, by design, not oversight.
+        // `fused_attention` takes no external mask buffer -- the
         // only way a score row goes to all -inf is every Q.K dot product in that row
         // underflowing to -inf, and the live kernel always includes the causal
         // self-key (Q_i . K_i), which stays finite for any finite Q/K pair. Forcing a

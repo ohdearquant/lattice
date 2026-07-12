@@ -116,7 +116,7 @@ pub fn longest_common_token_prefix(a: &[u32], b: &[u32]) -> usize {
 /// decline-beats-fabricate for the token-identity invariant.
 ///
 /// `ExactAppend` additionally requires a non-empty suffix
-/// (`new_prompt_ids.len() > shared`, #516 round-1 remediation D5): an
+/// (`new_prompt_ids.len() > shared`): an
 /// exact-equal retry of the represented prompt has no divergent suffix to
 /// prefill, and the Metal integration's `forward_prefill_from` treats an
 /// empty suffix as an internal invariant violation, not a valid no-op. That
@@ -319,16 +319,16 @@ mod tests {
         assert_eq!(plan.old_represented_len, 3);
     }
 
-    // #516 round-1 remediation D5 (finding 4): an exact-equal prompt retry
-    // has shared == represented_len but a zero-length suffix. Before D5 this
-    // produced `ExactAppend` with `suffix_len == 0`, which the Metal
+    // An exact-equal prompt retry has shared == represented_len but a
+    // zero-length suffix. Without the `new_prompt_ids.len() > shared` guard
+    // this produces `ExactAppend` with `suffix_len == 0`, which the Metal
     // integration's `forward_prefill_from` rejects as an empty-suffix error
     // instead of treating as a valid (degenerate) reuse. The planner must
     // fall back to `FullRefill` instead.
     //
     // Mutation sensitivity: dropping the `new_prompt_ids.len() > shared`
-    // conjunct (reverting to the pre-D5 condition) makes this test fail,
-    // because the plan would again be `ExactAppend` with `suffix_len == 0`.
+    // conjunct makes this test fail, because the plan would again be
+    // `ExactAppend` with `suffix_len == 0`.
     #[test]
     fn plan_exact_equal_prompt_is_full_refill() {
         let e = entry(vec![1, 2, 3], 3, 3);

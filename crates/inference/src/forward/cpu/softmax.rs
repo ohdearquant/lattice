@@ -137,7 +137,7 @@ unsafe fn softmax_attention_neon(x: &mut [f32], seq_len: usize, num_heads: usize
             let chunks = n / CHUNK;
 
             // --- Step 1: Find row max with 4x unrolling ---
-            // ADR-080 C1 (#785 round-1 perf): use the plain FMAX intrinsics
+            // ADR-080 C1: use the plain FMAX intrinsics
             // (vmaxq/vmaxvq), which PROPAGATE a NaN operand, instead of the
             // maxNum FMAXNM intrinsics (vmaxnmq/vmaxnmvq) paired with an
             // explicit `vceqq`/`vandq` NaN-tracking mask. The C1 contract

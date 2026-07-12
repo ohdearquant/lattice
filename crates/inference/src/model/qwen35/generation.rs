@@ -426,8 +426,7 @@ impl Qwen35Model {
     }
 
     /// [`Self::generate_streaming_with_cancel`] plus a raw generation-lifecycle
-    /// observer (benchmark-overhaul row 2, codex round-1 blocker #1): fires
-    /// [`RawGenEvent::PrefillEnd`] once, after the prefill forward pass has
+    /// observer: fires [`RawGenEvent::PrefillEnd`] once, after the prefill forward pass has
     /// produced logits and *before* the first token is sampled, and
     /// [`RawGenEvent::RawToken`] once per token that actually becomes part of
     /// `GenerateOutput` (both the prefill-derived first token and every
@@ -618,13 +617,13 @@ impl Qwen35Model {
         }
 
         // Prefill logits are ready and the first token has not been sampled
-        // yet -- the true prefill/decode boundary (codex round-1 blocker #1).
+        // yet -- the true prefill/decode boundary.
         // Fired unconditionally here (not gated on the eventual grammar/EOS
         // outcome below), since prefill itself always completed by this
         // point regardless of what the first sampled token turns out to be.
         on_raw_event(RawGenEvent::PrefillEnd);
 
-        // Test-only seam (codex round-2 medium, PR #882): stamp "first sample
+        // Test-only seam: stamp "first sample
         // entered" right at the point sampling actually begins, so a test can
         // assert PrefillEnd fired before this instant, not merely before the
         // RawToken callback further below. No-op outside `cfg(test)`.
@@ -813,8 +812,7 @@ impl Qwen35Model {
                         all_ids.push(next_id);
                         // Raw-token event fired from the same `push` point
                         // that increments `generated_ids` -- never reached on
-                        // a grammar-stop/EOS step that returns before `push`
-                        // (codex round-1 blocker #1).
+                        // a grammar-stop/EOS step that returns before `push`.
                         on_raw_event(RawGenEvent::RawToken {
                             index: generated_ids.len(),
                         });
@@ -997,8 +995,7 @@ impl Qwen35Model {
                         all_ids.push(next_id);
                         // Raw-token event fired from the same `push` point
                         // that increments `generated_ids` -- never reached on
-                        // a grammar-stop/EOS step that returns before `push`
-                        // (codex round-1 blocker #1).
+                        // a grammar-stop/EOS step that returns before `push`.
                         on_raw_event(RawGenEvent::RawToken {
                             index: generated_ids.len(),
                         });
@@ -1071,10 +1068,9 @@ impl Qwen35Model {
 /// Raw generation-lifecycle event fired by
 /// [`Qwen35Model::generate_streaming_with_observer`], independent of the
 /// caller's text-delta callback and unaffected by incremental UTF-8
-/// detokenizer buffering (benchmark-overhaul row 2, codex round-1 blocker
-/// #1: a text delta is not guaranteed to equal one raw sampled token, and
-/// measuring `prefill_end` off the first delta fires it after sampling
-/// instead of before).
+/// detokenizer buffering: a text delta is not guaranteed to equal one raw
+/// sampled token, and measuring `prefill_end` off the first delta fires it
+/// after sampling instead of before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawGenEvent {
     /// Fired exactly once, after the prefill forward pass has produced
@@ -1090,7 +1086,7 @@ pub enum RawGenEvent {
     RawToken { index: usize },
 }
 
-// Test-only seam (codex round-2 medium finding, PR #882): the existing
+// Test-only seam: the existing
 // mutation-sensitive test below only proves `PrefillEnd` fires before the
 // `RawToken` *callback*, not before `sample_token` itself. A `PrefillEnd`
 // moved to just after `generated_ids.push` (after sampling, before the
@@ -3309,7 +3305,6 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // generate_streaming_with_observer / RawGenEvent mutation-sensitive tests
-    // (benchmark-overhaul row 2, codex round-1 blocker #1, PR #882)
     // -----------------------------------------------------------------------
 
     /// `RawGenEvent::PrefillEnd` must fire exactly once, before the first
@@ -3374,25 +3369,22 @@ mod tests {
     }
 
     /// `RawGenEvent::PrefillEnd` must fire before `sample_token` is entered
-    /// for the first time, not merely before the `RawToken` *callback*
-    /// (codex round-2 medium finding, PR #882): the test above cannot
-    /// distinguish "PrefillEnd fired before sampling" from "PrefillEnd
-    /// fired after sampling but before the RawToken push", because both
-    /// orderings produce the same `[PrefillEnd, RawToken, RawToken,
-    /// RawToken]` event sequence. This test uses the `test_record_first_sample_entry`
-    /// seam, planted at the exact point `sample_token` is called for the
-    /// prefill-derived first token, to check the ordering codex's mutation
-    /// actually exercises.
+    /// for the first time, not merely before the `RawToken` *callback*: the
+    /// test above cannot distinguish "PrefillEnd fired before sampling" from
+    /// "PrefillEnd fired after sampling but before the RawToken push",
+    /// because both orderings produce the same `[PrefillEnd, RawToken,
+    /// RawToken, RawToken]` event sequence. This test uses the
+    /// `test_record_first_sample_entry` seam, planted at the exact point
+    /// `sample_token` is called for the prefill-derived first token, to
+    /// check that ordering directly.
     ///
     /// Mutation sensitivity: moving `on_raw_event(RawGenEvent::PrefillEnd)`
     /// to immediately after `generated_ids.push(next_id)` (still before the
-    /// `RawToken` callback -- the exact mutation codex applied in its round-2
-    /// review) leaves the event-order test above green, but makes this test's
-    /// `on_raw_event` closure observe `PrefillEnd` only *after*
-    /// `test_record_first_sample_entry` already ran, so
+    /// `RawToken` callback) leaves the event-order test above green, but
+    /// makes this test's `on_raw_event` closure observe `PrefillEnd` only
+    /// *after* `test_record_first_sample_entry` already ran, so
     /// `test_take_first_sample_saw_prefill_end()` returns `Some(false)`
-    /// instead of `Some(true)` and the assertion below fails. Verified by
-    /// reverting the fix (see PR body's mutation log for this test).
+    /// instead of `Some(true)` and the assertion below fails.
     #[test]
     fn raw_observer_prefill_end_precedes_first_sample_not_just_first_raw_token() {
         test_reset_sample_seam();
@@ -3430,10 +3422,10 @@ mod tests {
 
     /// One raw-token event fires per generated token even when the
     /// text-delta stream buffers an incomplete multi-byte UTF-8 sequence and
-    /// therefore does NOT call `on_token` for that step at all (codex
-    /// round-1 blocker #1's core claim: measuring prefill/decode boundaries
-    /// off text deltas is not equivalent to measuring off raw sampled
-    /// tokens, and can *lag* the true boundary by one or more tokens).
+    /// therefore does NOT call `on_token` for that step at all: measuring
+    /// prefill/decode boundaries off text deltas is not equivalent to
+    /// measuring off raw sampled tokens, and can *lag* the true boundary by
+    /// one or more tokens.
     ///
     /// Token id 0 is defined (via a custom tiny tokenizer vocab) to decode to
     /// the single raw byte `0xC2` -- the lead byte of a 2-byte UTF-8 sequence

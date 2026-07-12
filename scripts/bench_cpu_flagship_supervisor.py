@@ -303,7 +303,7 @@ class TrialFailure(RuntimeError):
 def _validate_trial_trace(phase_events: list[dict], summary: dict, trial_label: str) -> None:
     """Validates ONE trial's raw phase-event trace in the EXACT order the
     child printed it to stdout, before any aggregation, sorting, or
-    verdict-downgrade decision ever touches it (codex round-1 blocker #2).
+    verdict-downgrade decision ever touches it.
 
     The pre-fix supervisor accepted a malformed trace outright: it
     `sorted()`-ed `token_available` records by `token_index` before this
@@ -400,11 +400,11 @@ def _drain_stdout_lines(
     non-daemon-joined background thread is silently swallowed by the
     interpreter, so the main thread must observe failures through this
     list after joining, not via a try/except around the thread itself
-    (codex round-1 major #1: the old code did this inline on the MAIN
-    thread via a blocking `for raw_line in proc.stdout`, which is exactly
-    why a hung child with stdout still open could never reach the
-    `proc.wait(timeout=...)` below it -- moving it here, running
-    concurrently with `proc.wait`, is what makes the timeout enforceable).
+    (running this inline on the MAIN thread via a blocking
+    `for raw_line in proc.stdout` is exactly why a hung child with stdout
+    still open could never reach the `proc.wait(timeout=...)` below it --
+    moving it here, running concurrently with `proc.wait`, is what makes
+    the timeout enforceable).
     """
     try:
         assert proc.stdout is not None
@@ -443,8 +443,7 @@ def _drain_stderr_chunks(proc: subprocess.Popen, chunks: list[str]) -> None:
     Without this, a child that fills the OS pipe buffer writing to stderr
     (while the parent is busy blocked elsewhere) can deadlock: the child
     blocks on its own stderr write, the parent never reads it because it
-    is blocked on stdout/wait, and neither side makes progress
-    (codex round-1 major #1's "drain stderr concurrently" requirement)."""
+    is blocked on stdout/wait, and neither side makes progress."""
     try:
         assert proc.stderr is not None
         for chunk in proc.stderr:
@@ -481,8 +480,7 @@ def run_one_trial(
     starve the timeout the way a blocking `for raw_line in proc.stdout`
     (the pre-fix code) did. On timeout the child is killed and reaped
     (`proc.wait()` again, after `kill()`) before this function returns or
-    raises -- never left as a leaked/zombie process (codex round-1 major
-    #1).
+    raises -- never left as a leaked/zombie process.
     """
     cmd = [
         str(binary),
@@ -631,8 +629,8 @@ def compute_trial_metrics(trial: dict) -> dict:
     # already proven `token_index` is strictly contiguous in stdout arrival
     # order for every trial reaching this point, so re-sorting here would
     # only ever mask a bug in that guarantee rather than fix real data
-    # (codex round-1 blocker #2: sorting here previously accepted a
-    # reversed/out-of-order stream by silently repairing it).
+    # (sorting here would silently repair a reversed/out-of-order stream
+    # instead of surfacing the bug).
     token_events = [e for e in events if e["name"] == "token_available"]
     if not token_events:
         raise TrialFailure("no token_available events observed")

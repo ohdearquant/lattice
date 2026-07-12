@@ -1790,8 +1790,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // #850 blocker 2 follow-up: the SHIPPING scalar/AVX2/NEON l2-normalize
-    // paths must fail closed identically to the reference helper.
+    // The SHIPPING scalar/AVX2/NEON l2-normalize paths must fail closed
+    // identically to the reference helper.
     // -----------------------------------------------------------------------
 
     /// Table test for `scalar_l2_normalize` and, on the architecture the test runs on,
@@ -1939,14 +1939,14 @@ mod tests {
         }
     }
 
-    /// #850/#862 round-2 major-3 follow-up: state-isolation proof through the SHIPPING
-    /// fused path (`gated_delta_net_step_fused`) using the REAL Qwen3.5 conv kernel size
+    /// State-isolation proof through the SHIPPING fused path
+    /// (`gated_delta_net_step_fused`) using the REAL Qwen3.5 conv kernel size
     /// (`linear_conv_kernel_dim == 4`, i.e. `Qwen35Config::qwen35_2b()` unmodified — no
     /// `kernel_dim = 1` override), so `state.conv_buffer`'s rolling history is genuinely
     /// exercised, not sidestepped.
     ///
     /// ## Conv-window mechanics (read from `apply_causal_conv1d` in `attention/gdn.rs`
-    /// before writing this test, per the #862 round-2 mandate)
+    /// before writing this test)
     ///
     /// `apply_causal_conv1d` stores each step's RAW per-channel projection value in a
     /// rolling `buf_len = kernel_size - 1` (= 3) history *before* L2-normalization runs;
@@ -1961,9 +1961,9 @@ mod tests {
     ///
     /// Both runs use `weights_window` (head-0's entire K row block zeroed) for ALL FOUR
     /// window steps (0-3), not just step 0 — the poisoned run additionally sets exactly
-    /// one weight entry to NaN, ONLY at step 0. Steps 4-7 (four clean tokens, satisfying
-    /// #862 round-2's "at least 4 subsequent clean tokens" ask) use ordinary
-    /// `weights_clean`, identical in both runs.
+    /// one weight entry to NaN, ONLY at step 0. Steps 4-7 (four clean tokens, the number
+    /// needed to observe the poisoned value fully age out of the `kernel_size == 4`
+    /// conv window) use ordinary `weights_clean`, identical in both runs.
     ///
     /// This is a deliberate, disclosed choice, not a narrowing of the claim: holding the
     /// K row at true zero for the *whole* contamination window (not just step 0) is the
@@ -1981,7 +1981,7 @@ mod tests {
     /// Holding K at true zero through the full window on BOTH sides isolates exactly the
     /// contract this PR fixes (whole-vector zero-by-assignment on a non-finite reduced
     /// norm) from that separate, inherent, whole-vector-zero-granularity information
-    /// cost, and is the literal question #862 round-2 major-3 asks: does the guard's
+    /// cost, and is the literal question this test answers: does the guard's
     /// zeroing take the identical numerical path as true-zero weights, for as long as
     /// the corruption persists in the conv window, and does state fully re-converge
     /// (`state.snapshot()`: `s_matrices` AND `conv_buffer`) once the window closes?
@@ -1999,7 +1999,7 @@ mod tests {
     ///   conv window, and the complete `state.snapshot()` (both `s_matrices` and
     ///   `conv_buffer`) is finite and bit-identical to the reference unconditionally
     ///   (no guard involvement needed) -- the concrete "recovers to bit-identical once
-    ///   aged out of the conv window" proof #862 round-2 major-3 asked for.
+    ///   aged out of the conv window" proof this test exists to provide.
     ///
     /// Mutation-sensitive: reverting the `!norm_sq.is_finite()` guard in
     /// `simd_l2_normalize` (any backend) makes the poisoned run's step-0 output/state
@@ -2024,7 +2024,7 @@ mod tests {
         );
         let kernel_size = cfg.linear_conv_kernel_dim;
         let window = kernel_size; // # of dispatch steps a single poisoned raw value contaminates
-        let clean_tail = 4; // #862 round-2 major-3: "at least 4 subsequent clean tokens"
+        let clean_tail = 4; // number of clean tokens needed to fully evict the poisoned value from the kernel_size=4 conv window
         let total_steps = window + clean_tail;
 
         let (base_weights, cfg) = make_test_weights_for_cfg(cfg, 77);
@@ -2179,7 +2179,7 @@ mod tests {
             } else {
                 // Window fully closed: conv_buffer must now be completely finite and
                 // bit-identical -- the concrete "recovers to bit-identical once aged out
-                // of the conv window" proof #862 round-2 major-3 asked for.
+                // of the conv window" proof this test provides.
                 let poisoned_non_finite = poisoned_conv.iter().filter(|v| !v.is_finite()).count();
                 assert_eq!(
                     poisoned_non_finite,

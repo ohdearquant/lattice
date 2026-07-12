@@ -527,7 +527,7 @@ pub fn gqa_forward_with_cache(
                 probs_all[prob_start + s] = dot * scale;
             }
 
-            // ADR-080 C1 (#785 round-1 major 1): this forward-recompute builds
+            // ADR-080 C1: this forward-recompute builds
             // `softmax_probs` for the backward tape, not a vocabulary softmax and
             // not the `gqa.rs` test oracle -- a NaN/`+inf` score must zero the
             // whole probability row (and its context row), not poison the
@@ -822,7 +822,7 @@ mod tests {
         assert!(err_bv < 1e-2, "GQA grad_B_v rel_err {err_bv:.2e} >= 1e-2");
     }
 
-    /// ADR-080 C1 (#785 round-1 major 1): `gqa_forward_with_cache`'s
+    /// ADR-080 C1: `gqa_forward_with_cache`'s
     /// forward-recompute causal attention (used to build `softmax_probs` and
     /// `context` for the backward tape) is a production attention row, not the
     /// `gqa.rs` test oracle and not a vocabulary softmax. Poisoning ONE Q

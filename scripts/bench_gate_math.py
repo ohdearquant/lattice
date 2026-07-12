@@ -155,9 +155,9 @@ def _pvalue_from_boot_means(boot_means: Sequence[float], tau_log: float, b: int)
     without drawing any new resamples. Factored out so `evaluate_family_gate`
     can derive the p-value and (later, at Holm's assigned tail) the lower
     bound from the SAME retained sample instead of two independent bootstrap
-    draws — see `_lower_bound_from_sorted_boot_means` and the round-4
-    adversarial-review finding at `evaluate_family_gate`'s call sites for why
-    two independent draws break the percentile duality the module claims.
+    draws — see `_lower_bound_from_sorted_boot_means` and
+    `evaluate_family_gate`'s call sites for why two independent draws break
+    the percentile duality the module claims.
     """
     p = sum(1 for m in boot_means if m <= tau_log) / len(boot_means)
     return max(p, 1.0 / b)
@@ -255,7 +255,7 @@ def bootstrap_lower_bound(
     does NOT call this function (it would draw a second, independent
     bootstrap distribution from the one `one_sided_bootstrap_pvalue` already
     drew for the same cell, breaking percentile duality between the p-value
-    and the bound — the round-4 adversarial-review finding). Instead it
+    and the bound). Instead it
     calls `_lower_bound_from_sorted_boot_means` directly on the SAME sample
     it already generated for the p-value.
     """
@@ -650,7 +650,7 @@ def evaluate_family_gate(
     Order-preserving: `results[i]` corresponds to `cells[i]`, matching
     `holm_reject`'s own input-order-preserving contract.
 
-    Percentile duality (round-4 adversarial-review fix): the p-value and the
+    Percentile duality: the p-value and the
     lower bound for a given cell are extracted from ONE retained
     bootstrap-mean sample (`order_stratified_bootstrap_means` is called
     exactly once per cell, up front), never from two independent bootstrap
@@ -658,7 +658,7 @@ def evaluate_family_gate(
     prior shape of this function -- does not preserve the docstring's "SAME
     test, evaluated at the SAME per-cell alpha" claim: a tested-but-not-
     rejected cell could still expose a threshold-clearing bound purely from
-    resampling noise between the two draws (round-4 finding: single cell,
+    resampling noise between the two draws (concrete counterexample: single cell,
     `base=log(1.07)+0.005`, `spread=0.02`, `bootstrap_replicates=2000`,
     `random.Random(108)` gave `p_value=0.051` (correctly not rejected) but
     an independently-drawn `corrected_lower_bound=0.0680872...`, above the

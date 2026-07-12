@@ -706,7 +706,8 @@ fn test_batch_dot_product_same_query_matches_per_pair() {
 #[test]
 fn test_batch_dot_product_unit_vectors_equals_cosine() {
     // For unit-normalized vectors, dot product == cosine similarity.
-    // This validates the Round-3 fast path: normalized cosine routes through dot.
+    // This validates the fast path that routes normalized cosine similarity
+    // through a plain dot product.
     let mut q = generate_random_vector_seeded(384, 42);
     let mut c = generate_random_vector_seeded(384, 43);
     normalize(&mut q);
