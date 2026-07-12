@@ -2086,8 +2086,7 @@ mod tests {
 
     // Core helper that exercises weight-grad gradcheck for any fixture.
     // Returns per-array AND aggregate coverage — the aggregate alone hid the
-    // fact that whole arrays (alpha/beta) went completely untested (codex
-    // review round 1, PR #792).
+    // fact that whole arrays (alpha/beta) went completely untested (PR #792).
     #[allow(clippy::too_many_arguments)]
     fn run_lora_weight_gradcheck(
         hidden: usize,
@@ -2214,7 +2213,7 @@ mod tests {
         // Tiny GDN: hidden=32, num_kh=1, value_heads=1, key_dim=8, value_dim=8,
         // kernel_size=3, seq=14; rank=2; lora_scale=16.0.
         //
-        // Per-array coverage (codex review round 1, PR #792): the PREVIOUS
+        // Per-array coverage (PR #792): the PREVIOUS
         // fixture (seq=6, scale=2.0) hit the overall n_tested>=10 aggregate
         // gate while grad_a_b/grad_b_b/grad_a_a/grad_b_a (the alpha/beta
         // arrays) had ZERO entries above the 1e-4 floor in EITHER fixture —
@@ -2309,7 +2308,7 @@ mod tests {
     // inference path), LoRA off, on an ASYMMETRIC-head fixture.
     // ---------------------------------------------------------------------------
     //
-    // Codex review round 1 (PR #792) blocker: gdn_forward_save/gdn_backward
+    // #792: gdn_forward_save/gdn_backward
     // originally sized in_proj_a/in_proj_b/a_log/dt_bias (and everything
     // downstream: gates, LoRA B factors, PEFT export, validate_against) by
     // KEY heads instead of VALUE heads. Every prior gradcheck used a fixture
