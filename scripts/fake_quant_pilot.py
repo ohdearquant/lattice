@@ -52,7 +52,9 @@ import argparse
 import fcntl
 import hashlib
 import json
+import os
 import shutil
+import stat as stat_mod
 import struct
 import subprocess
 import sys
@@ -471,15 +473,18 @@ def require_self_test_pass(model_dir: Path, q4_dir: Path) -> dict:
     return result
 
 
-def resolve_scratch_output_dir(arm: str, output_dir_arg: str | None) -> Path:
-    """Resolve run-arm's output directory, confined to SCRATCH_ROOT.
+def resolve_scratch_output_dir(
+    arm: str, output_dir_arg: str | None, scratch_root: Path | None = None
+) -> Path:
+    """Resolve run-arm's output directory, confined to the scratch root.
 
     run-arm deletes `model.safetensors` from its output directory after a
     successful eval, so the directory must live inside the scratch tree this
     script owns: an arbitrary --output-dir (or a symlink escaping the tree)
     would let the post-eval cleanup unlink a file anywhere on disk."""
-    root = SCRATCH_ROOT.resolve()
-    candidate = Path(output_dir_arg) if output_dir_arg else SCRATCH_ROOT / f"arm_{arm}"
+    scratch_root = scratch_root if scratch_root is not None else SCRATCH_ROOT
+    root = scratch_root.resolve()
+    candidate = Path(output_dir_arg) if output_dir_arg else scratch_root / f"arm_{arm}"
     resolved = candidate.resolve()
     if resolved != root and root not in resolved.parents:
         raise SystemExit(
@@ -487,6 +492,58 @@ def resolve_scratch_output_dir(arm: str, output_dir_arg: str | None) -> Path:
             "the post-eval cleanup deletes model.safetensors from this directory"
         )
     return resolved
+
+
+def _require_secure_dir(p: Path) -> None:
+    """Require `p` to be a real directory (not a symlink), owned by the
+    current user, and not group/world-writable — the preconditions for
+    trusting later writes and deletions under it. lstat (no follow) so a
+    symlink planted at `p` is detected rather than traversed."""
+    st = os.lstat(p)
+    if stat_mod.S_ISLNK(st.st_mode):
+        raise SystemExit(f"scratch dir {p} is a symlink; refusing to use it")
+    if not stat_mod.S_ISDIR(st.st_mode):
+        raise SystemExit(f"scratch dir {p} is not a directory; refusing to use it")
+    if st.st_uid != os.geteuid():
+        raise SystemExit(f"scratch dir {p} is not owned by the current user; refusing to use it")
+    if st.st_mode & 0o022:
+        raise SystemExit(f"scratch dir {p} is group/world-writable; refusing to use it")
+
+
+def provision_scratch_dir(
+    arm: str, output_dir_arg: str | None, scratch_root: Path | None = None
+) -> tuple[Path, int]:
+    """Resolve, create, and validate the arm's output directory, returning it
+    with an O_NOFOLLOW directory handle.
+
+    The pathname containment check alone is a time-of-check/time-of-use
+    hazard: between the check and the later write/eval/delete sequence, a
+    component under a writable scratch root could be swapped for a symlink
+    pointing outside the tree. Provisioning therefore (1) validates the root
+    and the arm directory via lstat — real dir, current-user-owned, not
+    group/world-writable, (2) creates the arm directory BEFORE any
+    long-running step, and (3) opens and returns an O_NOFOLLOW|O_DIRECTORY
+    handle so cleanup can unlink via dir_fd and writers can revalidate the
+    handle still names the checked directory."""
+    scratch_root = scratch_root if scratch_root is not None else SCRATCH_ROOT
+    resolved = resolve_scratch_output_dir(arm, output_dir_arg, scratch_root)
+    os.makedirs(scratch_root, mode=0o700, exist_ok=True)
+    _require_secure_dir(scratch_root)
+    os.makedirs(resolved, mode=0o700, exist_ok=True)
+    _require_secure_dir(resolved)
+    dfd = os.open(str(resolved), os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0))
+    return resolved, dfd
+
+
+def _revalidate_dir_handle(dfd: int, path: Path) -> None:
+    """Abort if `path` no longer names the directory `dfd` was opened on
+    (i.e. it was swapped since provisioning)."""
+    held = os.fstat(dfd)
+    now = os.stat(path)
+    if (held.st_dev, held.st_ino) != (now.st_dev, now.st_ino):
+        raise SystemExit(
+            f"scratch dir {path} changed identity since provisioning; aborting before writing"
+        )
 
 
 def cmd_self_check(_args: argparse.Namespace) -> int:
@@ -523,6 +580,64 @@ def cmd_self_check(_args: argparse.Namespace) -> int:
         print(f"SELF-CHECK: FAIL — output dir outside scratch root was accepted: {outside}")
         return 1
     print(f"SELF-CHECK: PASS — output-dir boundary confined to {SCRATCH_ROOT}.")
+
+    # Provisioning guards: the pathname check alone is a TOCTOU hazard, so
+    # provision_scratch_dir must reject symlinked roots/arm dirs and hand back
+    # a directory handle whose identity revalidation detects a swap.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        outside_dir = base / "outside"
+        outside_dir.mkdir()
+
+        # root itself a symlink to elsewhere -> rejected
+        sym_root = base / "sym_root"
+        sym_root.symlink_to(outside_dir)
+        try:
+            provision_scratch_dir("A", None, scratch_root=sym_root)
+        except SystemExit:
+            pass
+        else:
+            print("SELF-CHECK: FAIL — symlinked scratch root was accepted.")
+            return 1
+
+        # arm dir pre-planted as a symlink escaping the root -> rejected
+        real_root = base / "real_root"
+        real_root.mkdir(mode=0o700)
+        (real_root / "arm_A").symlink_to(outside_dir)
+        try:
+            provision_scratch_dir("A", None, scratch_root=real_root)
+        except SystemExit:
+            pass
+        else:
+            print("SELF-CHECK: FAIL — symlinked arm dir was accepted.")
+            return 1
+
+        # happy path: handle held, unlink-via-dfd works, swap is detected
+        (real_root / "arm_A").unlink()
+        arm_dir, dfd = provision_scratch_dir("A", None, scratch_root=real_root)
+        (arm_dir / "model.safetensors").write_bytes(b"x")
+        _revalidate_dir_handle(dfd, arm_dir)
+        os.unlink("model.safetensors", dir_fd=dfd)
+        if (arm_dir / "model.safetensors").exists():
+            print("SELF-CHECK: FAIL — dir_fd unlink did not remove the file.")
+            return 1
+        # simulate the race: swap the checked directory, expect revalidation to abort
+        swapped = base / "swapped"
+        swapped.mkdir(mode=0o700)
+        arm_dir.rmdir()
+        swapped.rename(arm_dir)
+        try:
+            _revalidate_dir_handle(dfd, arm_dir)
+        except SystemExit:
+            pass
+        else:
+            print("SELF-CHECK: FAIL — directory swap was not detected by revalidation.")
+            os.close(dfd)
+            return 1
+        os.close(dfd)
+    print("SELF-CHECK: PASS — scratch provisioning rejects symlinks and detects dir swaps.")
     return 0
 
 
@@ -687,9 +802,10 @@ def cmd_run_arm(args: argparse.Namespace) -> int:
     arm = args.arm
     model_dir = Path(args.model_dir)
     q4_dir = Path(args.q4_dir)
-    output_dir = resolve_scratch_output_dir(arm, args.output_dir)
+    output_dir, dfd = provision_scratch_dir(arm, args.output_dir)
 
     self_test_result = require_self_test_pass(model_dir, q4_dir)
+    _revalidate_dir_handle(dfd, output_dir)
     manifest = write_arm_checkpoint(arm, model_dir, q4_dir, output_dir, self_test_result)
 
     eval_cmd = [
@@ -720,14 +836,21 @@ def cmd_run_arm(args: argparse.Namespace) -> int:
 
     manifest["evaluator_invocation"] = " ".join(eval_cmd)
     manifest["perplexity"] = ppl_event
+    _revalidate_dir_handle(dfd, output_dir)
     manifest_path = output_dir / "manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    out_st_path = output_dir / "model.safetensors"
-    if out_st_path.exists():
-        out_st_path.unlink()
-        print(f"[{arm}] deleted {out_st_path} after successful eval (manifest + log retained)")
+    try:
+        os.unlink("model.safetensors", dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    else:
+        print(
+            f"[{arm}] deleted {output_dir / 'model.safetensors'} after successful eval "
+            "(manifest + log retained)"
+        )
+    os.close(dfd)
 
     print(
         f"[{arm}] run-arm complete: ppl={ppl_event.get('ppl')} nll={ppl_event.get('nll')} "
