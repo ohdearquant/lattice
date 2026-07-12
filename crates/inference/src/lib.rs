@@ -73,6 +73,12 @@ pub mod metrics;
 /// Requires the `mixture` feature.
 #[cfg(feature = "mixture")]
 pub mod mixture;
+/// Offline MoE expert-cache admission-policy simulator (issue #682 Stage 3):
+/// replays a JSONL routing trace against [`forward::moe_expert_cache`]'s
+/// shipped LRU policy plus challenger policies (ARC, sequence-local
+/// frequency admission) to measure hit-rate deltas before any engine
+/// eviction-policy change. See [`moe_admission`]'s module doc comment.
+pub mod moe_admission;
 /// Embedding pooling helpers (mean, CLS, last-token) including [`BertPooling`]. Used by
 /// [`model::BertModel`] and [`model::QwenModel`].
 pub mod pool;
