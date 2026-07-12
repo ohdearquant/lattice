@@ -1,0 +1,187 @@
+name: cargo audit
+#
+# Dedicated vulnerability gate. `ci.yml`'s `cargo-deny` job already runs
+# `cargo deny check advisories`, but that step is deliberately INFORMATIONAL
+# (continue-on-error) so an unrelated upstream disclosure never wedges a
+# merge — see deny.toml's header comment. This workflow is the hard gate:
+# `cargo audit` FAILS the job on any vulnerability-severity RUSTSEC advisory.
+# Warnings (unmaintained / unsound-with-no-fix) are informational here too —
+# see .cargo/audit.toml for the documented, individually-justified ignore
+# list, and never add a vulnerability-severity advisory to that list.
+#
+# NOTE: no `paths` filter on the `pull_request` trigger below, matching the
+# reasoning in `ci.yml`'s header comment. `cargo-audit-gate` at the bottom of
+# this file is meant to become a *required* status check, and a required
+# check whose workflow never even runs leaves a PR stuck on "Expected,
+# waiting for status to be reported" forever. So this workflow always
+# triggers on every PR to main; dependency-irrelevant PRs are instead
+# handled by gating `audit` and `audit-native` on the `changes` job below,
+# exactly like `ci.yml` gates `ci`/`feature-matrix`/`bench-compile`/`msrv` on
+# its own `changes` job. `cargo-audit-gate` always runs and always reports,
+# so it is the safe context to require — mirroring `ci-gate` in ci.yml,
+# `parity-gate` in e2e-parity.yml, and `app-binaries-gate` in
+# app-binaries.yml. Flipping `cargo-audit-gate` into the branch ruleset's
+# required-checks list is a separate maintainer step (not done by this PR —
+# see the PR description).
+#
+# Two audit jobs cover the two independent Cargo dependency graphs this repo
+# ships: `audit` for the root workspace's tracked `Cargo.lock`, and
+# `audit-native` for `npm/lattice-embed-native`, which declares its own
+# single-crate `[workspace]` (see that manifest's header comment) and is
+# gitignored at the repo root's `Cargo.lock` pattern, so it has no tracked
+# lockfile to scan directly. `audit-native` generates one at CI time with
+# `cargo generate-lockfile` and audits that. cargo-audit's config discovery
+# walks up from the current directory the same way cargo's own config
+# discovery does, so running `cargo audit` from inside
+# npm/lattice-embed-native still picks up the root `.cargo/audit.toml`
+# ignore list — verified locally 2026-07-11 (only the documented lru
+# warning surfaces, exit 0).
+#
+# Also triggered weekly on a schedule (fresh advisory-db entries land with
+# no code change of ours) and on manual dispatch; both always run the full
+# audit regardless of `changes`, since there is no PR diff to gate on.
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Decide whether anything that can change either Cargo dependency graph
+  # was touched. A PR that touches neither manifest set cannot introduce or
+  # resolve an advisory, so it does not need either audit job below.
+  changes:
+    name: detect-dependency-changes
+    runs-on: ubuntu-latest
+    outputs:
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}" --depth=1 2>/dev/null || true
+            CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
+              || git diff --name-only "HEAD~1...HEAD")
+            echo "Changed files:"
+            echo "$CHANGED"
+            # Two single greps against a here-string, not a `grep | grep -q`
+            # pipe: a downstream `-q` can close its end of a pipe early and
+            # SIGPIPE the upstream producer, which under `pipefail` reports
+            # as the pipeline's exit code instead of the match result
+            # (fail-open on a large diff) — see the matching comment in
+            # ci.yml's `changes` job.
+            MATCH=$(grep -E '(^Cargo\.lock$|^Cargo\.toml$|^crates/.*/Cargo\.toml$|^npm/lattice-embed-native/Cargo\.toml$|^\.cargo/audit\.toml$|^\.github/workflows/cargo-audit\.yml$)' <<<"$CHANGED" || true)
+            if grep -q . <<<"$MATCH"; then
+              echo "deps=true" >> "$GITHUB_OUTPUT"
+              echo "→ dependency-relevant change: audit REQUIRED"
+            else
+              echo "deps=false" >> "$GITHUB_OUTPUT"
+              echo "→ no dependency-relevant change: audit work skipped"
+            fi
+          else
+            # schedule / workflow_dispatch: no PR diff to gate on, always audit.
+            echo "deps=true" >> "$GITHUB_OUTPUT"
+            echo "→ non-PR trigger (${{ github.event_name }}): audit REQUIRED"
+          fi
+
+  audit:
+    name: cargo audit (root workspace)
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - name: Cache cargo-audit binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-bin-${{ runner.os }}-v0.22.2
+      - name: Install cargo-audit
+        run: |
+          if [ ! -x ~/.cargo/bin/cargo-audit ]; then
+            cargo install cargo-audit --version 0.22.2 --locked
+          fi
+      - name: cargo audit (fails on vulnerabilities, warnings informational per .cargo/audit.toml)
+        run: cargo audit
+
+  audit-native:
+    name: cargo audit (lattice-embed-native)
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - name: Cache cargo-audit binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-bin-${{ runner.os }}-v0.22.2
+      - name: Install cargo-audit
+        run: |
+          if [ ! -x ~/.cargo/bin/cargo-audit ]; then
+            cargo install cargo-audit --version 0.22.2 --locked
+          fi
+      - name: Generate lockfile for the native N-API package
+        # This package is its own single-crate workspace (see
+        # npm/lattice-embed-native/Cargo.toml's header comment) and its
+        # Cargo.lock is gitignored, so there is nothing tracked to scan.
+        # Resolve one at CI time instead.
+        working-directory: npm/lattice-embed-native
+        run: cargo generate-lockfile
+      - name: cargo audit (fails on vulnerabilities, warnings informational per .cargo/audit.toml)
+        working-directory: npm/lattice-embed-native
+        run: cargo audit
+
+  # Always runs, always reports — the safe required-check context. `audit`
+  # and `audit-native` are gated on `changes`, so neither is individually
+  # safe to require: a skipped job still reports success, but only this job
+  # fails closed if `changes` itself blew up. Mirrors `ci-gate` in ci.yml.
+  cargo-audit-gate:
+    name: cargo-audit-gate
+    needs: [changes, audit, audit-native]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve gate
+        run: |
+          CHANGES_RESULT="${{ needs.changes.result }}"
+          DEPS="${{ needs.changes.outputs.deps }}"
+          AUDIT_RESULT="${{ needs.audit.result }}"
+          AUDIT_NATIVE_RESULT="${{ needs.audit-native.result }}"
+          echo "changes=$CHANGES_RESULT deps=$DEPS audit=$AUDIT_RESULT audit-native=$AUDIT_NATIVE_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::change-detection did not succeed, failing closed."
+            exit 1
+          fi
+          if [ "$DEPS" != "true" ]; then
+            echo "No dependency-relevant change, audit jobs not required. PASS."
+            exit 0
+          fi
+          if [ "$AUDIT_RESULT" != "success" ]; then
+            echo "::error::audit (root workspace) did not succeed (result=$AUDIT_RESULT)."
+            exit 1
+          fi
+          if [ "$AUDIT_NATIVE_RESULT" != "success" ]; then
+            echo "::error::audit-native (lattice-embed-native) did not succeed (result=$AUDIT_NATIVE_RESULT)."
+            exit 1
+          fi
+          echo "Dependency-relevant change; both audit jobs PASSED."
+          exit 0
