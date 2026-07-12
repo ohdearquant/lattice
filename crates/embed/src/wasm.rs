@@ -145,3 +145,21 @@ pub fn simd_cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 pub fn simd_normalize(v: &mut [f32]) {
     crate::simd::normalize(v)
 }
+
+/// Reports whether the four `simd*` bindings above are dispatching to the
+/// wasm32 SIMD128 kernels in *this* build.
+///
+/// Returns the exact same value the kernels themselves read to choose a
+/// codepath (`crate::simd::simd_config().simd128_enabled()`), not a fresh
+/// `cfg!(target_feature = "simd128")` re-derived here -- a binding-local
+/// re-check could drift from the real dispatch condition without anyone
+/// noticing. Exists so a two-build parity harness (one plain
+/// `wasm32-unknown-unknown` build, one built with
+/// `-C target-feature=+simd128`) can assert the SIMD128 build is actually
+/// exercising the SIMD128 kernels instead of a stale or misconfigured
+/// artifact silently falling back to scalar; see
+/// `crates/embed/tests/wasm/simd128_parity_wasm.mjs`.
+#[wasm_bindgen(js_name = simdSimd128Dispatch)]
+pub fn simd_simd128_dispatch() -> bool {
+    crate::simd::simd_config().simd128_enabled()
+}
