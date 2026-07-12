@@ -75,7 +75,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -402,6 +402,60 @@ jobs:
           LATTICE_WASM_PARITY_ENFORCE: '1'
         run: ./scripts/wasm-parity.sh
 
+  # wasm32 SIMD128 kernel dispatch-parity gate. Proves the wasm32 SIMD128
+  # dot/L2/cosine/normalize kernels (crates/embed/src/simd/*.rs) agree with
+  # the scalar reference by building `lattice-embed` for wasm32 twice (plain
+  # vs `-C target-feature=+simd128`) and comparing both against a JS scalar
+  # oracle, plus a dispatch-state assertion proving each build actually
+  # dispatched to the kernel tier it claims to. No model weights needed here
+  # (pure vector-op kernels, not the BERT forward pass), so provisioning is
+  # the same rust/wasm-bindgen setup as wasm-parity above minus the model
+  # caching steps. See scripts/wasm-simd128-parity.sh for the local driver
+  # and crates/embed/tests/wasm/simd128_parity_wasm.mjs for the harness.
+  wasm-simd128-parity:
+    name: wasm SIMD128 kernel parity gate
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm-simd128-parity
+
+      - name: Cache wasm-bindgen-cli
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-0.2.105-${{ runner.os }}
+
+      # Pinned exactly to match the `wasm-bindgen` crate dependency version in
+      # crates/embed/Cargo.toml (the CLI and crate embed a schema version that
+      # must match exactly). Skips the (slow) reinstall if the cached binary
+      # is already the right version.
+      - name: Install wasm-bindgen-cli
+        run: |
+          if command -v wasm-bindgen >/dev/null 2>&1 && [ "$(wasm-bindgen --version)" = "wasm-bindgen 0.2.105" ]; then
+            echo "wasm-bindgen 0.2.105 already present (cache hit)"
+          else
+            cargo install wasm-bindgen-cli --version 0.2.105
+          fi
+
+      - name: Run wasm SIMD128 parity gate
+        # LATTICE_WASM_SIMD128_ENFORCE=1 makes the driver fail closed if any
+        # prerequisite (node, wasm-bindgen, cargo, or the wasm32 target) is
+        # still missing at this point: a provisioning failure must not
+        # masquerade as a skipped, green job.
+        env:
+          LATTICE_WASM_SIMD128_ENFORCE: '1'
+        run: ./scripts/wasm-simd128-parity.sh
+
   # Composed rotated(QuaRot)+Q4 forward-path gate (issue #320). The converter's
   # own f64 forward-equivalence check (quant/quarot/forward_equivalence.rs) gates
   # the rotation-fusion math PRE-quantization; nothing previously exercised the
@@ -640,14 +694,24 @@ jobs:
 
   # REQUIRED status check. Always runs, always reports. Passes when the engine
   # did not change (nothing to verify); mirrors the parity, embed-drift,
-  # wasm-parity, q4-composed, ppl-gate-selftest, and q4-ppl-quality verdicts when
-  # it did. Fails closed if change-detection itself errored. metal-parity is
-  # deliberately excluded (informational — see its comment above). q4-ppl-quality
-  # is now armed (golden captured on run 28841919096) and gates the shipping Q4
-  # tier for regressions.
+  # wasm-parity, wasm-simd128-parity, q4-composed, ppl-gate-selftest, and
+  # q4-ppl-quality verdicts when it did. Fails closed if change-detection
+  # itself errored. metal-parity is deliberately excluded (informational — see
+  # its comment above). q4-ppl-quality is now armed (golden captured on run
+  # 28841919096) and gates the shipping Q4 tier for regressions.
   parity-gate:
     name: parity-gate
-    needs: [changes, parity, embed-drift, wasm-parity, q4-composed, ppl-gate-selftest, q4-ppl-quality]
+    needs:
+      [
+        changes,
+        parity,
+        embed-drift,
+        wasm-parity,
+        wasm-simd128-parity,
+        q4-composed,
+        ppl-gate-selftest,
+        q4-ppl-quality,
+      ]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -658,10 +722,11 @@ jobs:
           PARITY_RESULT="${{ needs.parity.result }}"
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
           WASM_RESULT="${{ needs.wasm-parity.result }}"
+          WASM_SIMD128_RESULT="${{ needs.wasm-simd128-parity.result }}"
           Q4_RESULT="${{ needs.q4-composed.result }}"
           PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
           Q4PPL_RESULT="${{ needs.q4-ppl-quality.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT q4-composed=$Q4_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -682,6 +747,10 @@ jobs:
             echo "::error::Engine changed and wasm-parity gate did not succeed (result=$WASM_RESULT)."
             exit 1
           fi
+          if [ "$WASM_SIMD128_RESULT" != "success" ]; then
+            echo "::error::Engine changed and wasm-simd128-parity gate did not succeed (result=$WASM_SIMD128_RESULT)."
+            exit 1
+          fi
           if [ "$Q4_RESULT" != "success" ]; then
             echo "::error::Engine changed and q4-composed golden did not succeed (result=$Q4_RESULT)."
             exit 1
@@ -694,5 +763,5 @@ jobs:
             echo "::error::Engine changed and q4-ppl-quality regression gate did not succeed (result=$Q4PPL_RESULT)."
             exit 1
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, q4-composed, ppl-gate-selftest, and q4-ppl-quality all PASSED."
+          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, q4-composed, ppl-gate-selftest, and q4-ppl-quality all PASSED."
           exit 0
