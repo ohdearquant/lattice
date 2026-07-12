@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Fake-quant PILOT harness for the projection-selective Q4 ablation.
 
-Pre-registered protocol: METHODOLOGY ff140ca8, amended by
-.khive/workspaces/20260712/proj-selective-quant/PILOT_AMENDMENT.md.
-Recon: .khive/workspaces/20260712/proj-selective-quant/PLAN.md.
+This is a pre-registered pilot: kill/keep bars were fixed before any arm
+ran, and dense-model results are directional, not confirmatory, for MoE
+targets (routing sensitivity is MoE-specific and stays unmeasured here).
 
-Mechanism (amendment, verbatim): "quantize each weight tensor with the
-candidate scheme, dequantize back to f16, evaluate through the existing f16
-path. Justified because the production `from_q4_dir` path already eagerly
-dequants to f16-resident buffers, so fake-quant reproduces the numerics the
-real container would produce without container/kernel changes."
+Mechanism: quantize each weight tensor with the candidate scheme,
+dequantize back to f16, evaluate through the existing f16 path. Justified
+because the production `from_q4_dir` path already eagerly dequants to
+f16-resident buffers, so fake-quant reproduces the numerics the real
+container would produce without container/kernel changes.
 
 This script does NOT reimplement the Rust Q4 quantizer as a fresh design —
 it replicates crates/inference/src/weights/q4_weights.rs's
@@ -18,7 +18,7 @@ the flattened tensor, same min/max-derived affine scale/bias, same
 abs_max/7 symmetric scale with bias=-8*scale, same f32::round-half-away-
 from-zero nibble rounding order, same f16 round-to-nearest-even scale/bias
 storage) — generalized only by making the group size a parameter (32 or
-64), since no group-64 code path exists in the Rust source (PLAN.md §1).
+64), since no group-64 code path exists in the Rust source.
 The `self-test` subcommand is a MANDATORY gate: it re-derives one tensor's
 Q4 blocks in this Python arithmetic and diffs the result byte-for-byte
 against the real `quantize_q4`-produced `.q4` file already on disk, both at
