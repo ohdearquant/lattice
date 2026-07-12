@@ -190,6 +190,7 @@ fn run_composed_gate(model_dir: &Path, q4_dir: &Path, golden: &Golden) {
         stop_strings: vec![],
         reasoning_budget: None,
         logprobs: None,
+        disable_eos: false,
     };
 
     let mut mismatches = 0;

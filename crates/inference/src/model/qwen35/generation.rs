@@ -624,6 +624,13 @@ impl Qwen35Model {
         // point regardless of what the first sampled token turns out to be.
         on_raw_event(RawGenEvent::PrefillEnd);
 
+        // Test-only seam (codex round-2 medium, PR #882): stamp "first sample
+        // entered" right at the point sampling actually begins, so a test can
+        // assert PrefillEnd fired before this instant, not merely before the
+        // RawToken callback further below. No-op outside `cfg(test)`.
+        #[cfg(test)]
+        test_record_first_sample_entry();
+
         let next_id = sample_token(
             &scratch.logits[..cfg.vocab_size],
             gen_cfg,
@@ -1083,6 +1090,59 @@ pub enum RawGenEvent {
     /// at the moment of firing -- so a caller counting these events always
     /// gets a count equal to `GenerateOutput.generated_tokens`.
     RawToken { index: usize },
+}
+
+// Test-only seam (codex round-2 medium finding, PR #882): the existing
+// mutation-sensitive test below only proves `PrefillEnd` fires before the
+// `RawToken` *callback*, not before `sample_token` itself. A `PrefillEnd`
+// moved to just after `generated_ids.push` (after sampling, before the
+// `RawToken` callback) would keep that test green while silently folding
+// sampling time into the reported prefill interval. `test_record_first_sample_entry`
+// is called from the exact point `sample_token` is about to run for the
+// prefill-derived first token; a test's `on_raw_event` closure calls
+// `test_mark_prefill_end_seen` when it observes `PrefillEnd`, and the two
+// are compared to answer "did PrefillEnd fire before the *first sample*",
+// not just "before the first raw-token callback". Zero production effect:
+// every item here is `#[cfg(test)]` and compiles to nothing outside tests.
+#[cfg(test)]
+thread_local! {
+    static TEST_PREFILL_END_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_FIRST_SAMPLE_SAW_PREFILL_END: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Resets the seam's thread-local state. Call at the start of any test that
+/// reads `test_take_first_sample_saw_prefill_end` afterward.
+#[cfg(test)]
+fn test_reset_sample_seam() {
+    TEST_PREFILL_END_SEEN.with(|c| c.set(false));
+    TEST_FIRST_SAMPLE_SAW_PREFILL_END.with(|c| c.set(None));
+}
+
+/// Called by a test's `on_raw_event` closure when it observes
+/// `RawGenEvent::PrefillEnd`.
+#[cfg(test)]
+fn test_mark_prefill_end_seen() {
+    TEST_PREFILL_END_SEEN.with(|c| c.set(true));
+}
+
+/// Called from production code (under `#[cfg(test)]`) immediately before the
+/// first call to `sample_token`. Records, the first time only, whether
+/// `PrefillEnd` had already been observed by that point.
+#[cfg(test)]
+fn test_record_first_sample_entry() {
+    TEST_FIRST_SAMPLE_SAW_PREFILL_END.with(|seen_at_sample| {
+        if seen_at_sample.get().is_none() {
+            let seen = TEST_PREFILL_END_SEEN.with(std::cell::Cell::get);
+            seen_at_sample.set(Some(seen));
+        }
+    });
+}
+
+/// Reads the value recorded by `test_record_first_sample_entry`.
+#[cfg(test)]
+fn test_take_first_sample_saw_prefill_end() -> Option<bool> {
+    TEST_FIRST_SAMPLE_SAW_PREFILL_END.with(std::cell::Cell::get)
 }
 
 /// Outcome of [`DecodePolicy::transition`], the one per-step call every decode
@@ -3289,6 +3349,61 @@ mod tests {
             vec![1, 2, 3],
             "RawToken events must be one per generated token, in generation order, with a \
              monotonically increasing 1-based index equal to generated_tokens so far"
+        );
+    }
+
+    /// `RawGenEvent::PrefillEnd` must fire before `sample_token` is entered
+    /// for the first time, not merely before the `RawToken` *callback*
+    /// (codex round-2 medium finding, PR #882): the test above cannot
+    /// distinguish "PrefillEnd fired before sampling" from "PrefillEnd
+    /// fired after sampling but before the RawToken push", because both
+    /// orderings produce the same `[PrefillEnd, RawToken, RawToken,
+    /// RawToken]` event sequence. This test uses the `test_record_first_sample_entry`
+    /// seam, planted at the exact point `sample_token` is called for the
+    /// prefill-derived first token, to check the ordering codex's mutation
+    /// actually exercises.
+    ///
+    /// Mutation sensitivity: moving `on_raw_event(RawGenEvent::PrefillEnd)`
+    /// to immediately after `generated_ids.push(next_id)` (still before the
+    /// `RawToken` callback -- the exact mutation codex applied in its round-2
+    /// review) leaves the event-order test above green, but makes this test's
+    /// `on_raw_event` closure observe `PrefillEnd` only *after*
+    /// `test_record_first_sample_entry` already ran, so
+    /// `test_take_first_sample_saw_prefill_end()` returns `Some(false)`
+    /// instead of `Some(true)` and the assertion below fails. Verified by
+    /// reverting the fix (see PR body's mutation log for this test).
+    #[test]
+    fn raw_observer_prefill_end_precedes_first_sample_not_just_first_raw_token() {
+        test_reset_sample_seam();
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let result = model
+            .generate_streaming_with_observer(
+                "a",
+                &gen_cfg,
+                |_delta| true,
+                || false,
+                |evt| {
+                    if evt == RawGenEvent::PrefillEnd {
+                        test_mark_prefill_end_seen();
+                    }
+                },
+            )
+            .expect("generation must succeed");
+
+        assert_eq!(result.generated_tokens, 3);
+        assert_eq!(
+            test_take_first_sample_saw_prefill_end(),
+            Some(true),
+            "PrefillEnd must have already fired by the moment sample_token is entered for \
+             the prefill-derived first token -- not merely before the RawToken callback, \
+             which a PrefillEnd emitted after sampling (but before the RawToken push) would \
+             also satisfy while silently including sampling time in the reported prefill \
+             interval (codex round-2 medium, PR #882)"
         );
     }
 

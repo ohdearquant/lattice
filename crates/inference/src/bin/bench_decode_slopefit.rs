@@ -201,6 +201,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         stop_strings: vec![],
         reasoning_budget: None,
         logprobs: None,
+        disable_eos: false,
     };
 
     eprintln!(
