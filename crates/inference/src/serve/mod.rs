@@ -308,7 +308,7 @@ pub enum FieldExpectation {
         len: usize,
     },
     /// The pointed-to field must be a JSON string starting with `prefix`
-    /// (issue #828 round 2 medium finding: dynamic response IDs are checked
+    /// (issue #828: dynamic response IDs are checked
     /// by type/prefix, not exact value -- a response ID's suffix varies by
     /// request timestamp/sequence).
     StringPrefix {
@@ -316,7 +316,7 @@ pub enum FieldExpectation {
         prefix: &'static str,
     },
     /// The pointed-to field must be a JSON number representable as `u64`
-    /// (issue #828 round 2 medium finding: timestamps are checked by type,
+    /// (issue #828: timestamps are checked by type,
     /// not exact value).
     UnsignedInt { json_pointer: &'static str },
 }
@@ -535,7 +535,7 @@ pub fn check_sse_events(body: &str, expected: &[EventExpectation]) -> Result<(),
                 })?;
                 match frame {
                     SseFrame::Chunk(c) if matches!(classify_chunk(c), ChunkKind::RoleOpener) => {
-                        // Issue #828 round 2 medium finding: dynamic /id and
+                        // Issue #828: dynamic /id and
                         // /created are type/prefix-checked on the opener
                         // chunk too, not only the non-streaming JSON
                         // baseline -- every `chat.completion.chunk` this
@@ -754,13 +754,12 @@ pub struct ProductionAdapterObservation {
 /// `"<|im_start|>assistant\n"` template. A ground-truth literal, not a call
 /// into either binary's render function, so a template regression in either
 /// binary is visible against this fixture instead of round-tripping through
-/// the same (possibly mutated) function that produced it (issue #828 round 2
-/// major finding).
+/// the same (possibly mutated) function that produced it (issue #828).
 pub const OBSERVATION_GOLDEN_USER_HI_THERE_CHATML: &str =
     "<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n";
 
-/// Full expected value for a [`ProductionAdapterObservation`] (issue #828
-/// round 2 major finding): every `GenerateConfigSnapshot` field, the exact
+/// Full expected value for a [`ProductionAdapterObservation`] (issue #828):
+/// every `GenerateConfigSnapshot` field, the exact
 /// rendered prompt or normalized message list, the exact prompt-token count,
 /// and the terminal outcome -- one shared comparison both binaries' tests
 /// call, instead of each asserting a different hand-picked subset of fields.
@@ -773,8 +772,8 @@ pub struct ExpectedObservation<'a> {
 }
 
 /// Asserts every field of `obs` against `expected`, panicking with a
-/// specific field name on the first mismatch (issue #828 round 2 major
-/// finding). Used by both `lattice.rs`'s and `lattice_serve.rs`'s
+/// specific field name on the first mismatch (issue #828). Used by both
+/// `lattice.rs`'s and `lattice_serve.rs`'s
 /// `production_adapter_observation` test modules so neither binary can drift
 /// back to asserting only a hand-picked subset of `GenerateConfigSnapshot`'s
 /// thirteen fields.

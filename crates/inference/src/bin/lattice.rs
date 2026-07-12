@@ -3601,7 +3601,7 @@ mod serve {
     /// `ModelBackend::Cpu` arm and the test-only `CpuFakeGenerate` arm below
     /// (ADR-080 C2). Before this,
     /// each arm rebuilt `move || *cancel_rx.borrow()` independently, so a
-    /// disposable-worktree mutation that broke ONLY the real `Cpu` arm's
+    /// a mutation that broke ONLY the real `Cpu` arm's
     /// predicate left the `CpuFakeGenerate`-only post-drop oracle green --
     /// it was pinning a copy, not the production call site. Both arms now
     /// funnel through this one function, so mutating the shared predicate
@@ -6208,7 +6208,7 @@ mod serve {
             /// variable into both the recorded observation and the returned
             /// `GenerateOutput`, so a caller of this helper can vary it and prove
             /// the observation genuinely mirrors what the seam returned rather
-            /// than an independent hardcoded literal (round 2 major finding).
+            /// than an independent hardcoded literal.
             async fn run_observed(stopped: bool) -> ProductionAdapterObservation {
                 let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
                 let tokenizer = model.tokenizer().clone();
@@ -6329,7 +6329,7 @@ mod serve {
 
             /// Proves `ProductionAdapterObservation::stopped` is genuinely
             /// derived from what the generation seam returned, not an
-            /// independent hardcoded literal (round 2 major finding: the
+            /// independent hardcoded literal (the
             /// pre-fix `lattice_serve.rs` observation stored `stopped: true`
             /// unconditionally). Running the exact same request through
             /// `run_observed(false)` must observe `stopped == false`.

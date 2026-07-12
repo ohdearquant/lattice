@@ -28,10 +28,10 @@
 
 // -----------------------------------------------------------------------------
 // MTP Q4/F16 tensor resolution (#630, #636) -- pure, `Device`-free, compiled
-// unconditionally in test builds (round-2 fix: these previously lived inside
+// unconditionally in test builds (these previously lived inside
 // `mod inner`, gated on `metal-gpu`, so `cargo test -p lattice-inference --lib
 // resolve_mtp` with no features reported "running 0 tests" -- the exact
-// skip-pass class round 1 flagged, just one layer up. `mod inner` re-imports
+// skip-pass class described below, just one layer up. `mod inner` re-imports
 // these via `use super::{...}` below.)
 // -----------------------------------------------------------------------------
 
@@ -39,7 +39,7 @@
 /// mirroring `MetalQwen35State::q4_tensor_path` -- duplicated here (rather than
 /// called through `MetalQwen35State`, which only exists under `metal-gpu`) so
 /// this module compiles and is unit-testable without the Metal feature at all
-/// (#636 round-2).
+/// (#636).
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 fn mtp_tensor_path(dir: &std::path::Path, tensor_name: &str, ext: &str) -> std::path::PathBuf {
     let sanitized: String = tensor_name
@@ -55,7 +55,7 @@ fn mtp_tensor_path(dir: &std::path::Path, tensor_name: &str, ext: &str) -> std::
     dir.join(format!("{sanitized}.{ext}"))
 }
 
-/// Failure modes for resolving a single MTP tensor from disk (#636 round-1).
+/// Failure modes for resolving a single MTP tensor from disk (#636).
 ///
 /// `Missing` is the pre-existing graceful case: the caller (the MTP
 /// projection-load closure in [`load_mtp_q4_weights`]) turns it into a
@@ -141,7 +141,7 @@ impl MtpTensorSource {
 /// producing rotated-space `.q4` weights that the runtime's
 /// counter-rotation (keyed off the same directory's `quarot_seed`)
 /// would silently apply on top of, corrupting every MTP draft without
-/// any load failure to reveal it (#636 round-1 MAJOR). This is
+/// any load failure to reveal it (#636). This is
 /// rejected loudly instead of silently preferring `.f16`.
 ///
 /// Also validates the resolved tensor's on-disk shape against
@@ -252,7 +252,7 @@ mod mtp_resolve_tests {
     /// `tiny_metal_qwen35_fixture`, which lives inside `mod inner` and is
     /// gated on the `metal-gpu` feature -- these tests must not depend on
     /// it, or they'd silently disappear again on a Metal-less/no-feature
-    /// build, exactly the round-1/round-2 skip-pass class). Field values
+    /// build, exactly the skip-pass class described above). Field values
     /// mirror `tiny_metal_qwen35_fixture`'s config so the derived MTP
     /// projection/norm shapes match the same real-checkpoint-verified
     /// formulas.
@@ -425,7 +425,7 @@ mod mtp_resolve_tests {
     /// The 8 MTP projection tensor names paired with their expected
     /// on-disk shape, derived from the real qwen3.5-0.8b-q4 checkpoint
     /// (`~/.lattice/models/qwen3.5-0.8b-q4/mtp_*.q4` headers, verified by
-    /// hand during #636 round-1 remediation): on-disk shape is always
+    /// hand during #636 remediation): on-disk shape is always
     /// `[d_out, d_in]`, matching `expected_lora_shape`'s `(d_in, d_out)`
     /// convention reversed.
     pub(crate) fn mtp_proj_names_and_shapes(cfg: &Qwen35Config) -> [(&'static str, Vec<usize>); 8] {
@@ -526,7 +526,7 @@ mod mtp_resolve_tests {
 
     #[test]
     fn resolve_mtp_projection_rejects_stale_q4_sibling_under_quarot() {
-        // Round-1 MAJOR: a QuaRot (rotated-space) checkpoint directory
+        // A QuaRot (rotated-space) checkpoint directory
         // must never load an MTP `.q4` sibling even if one exists —
         // that shape is reachable when `quantize_q4` is re-run into an
         // existing QuaRot output dir (the converter reuses a non-empty
@@ -557,7 +557,7 @@ mod mtp_resolve_tests {
 
     #[test]
     fn resolve_mtp_projection_rejects_transposed_q4_shape() {
-        // Round-1 medium #1: a same-numel transposed file must not
+        // A same-numel transposed file must not
         // silently load — it would generate tokens but produce garbage
         // MTP drafts (0% accept class).
         let cfg = tiny_mtp_test_config();
@@ -956,7 +956,7 @@ mod inner {
     use super::GdnStateTrafficScope;
     // MTP Q4/F16 flavor + shape resolution (#630, #636) now lives at the file
     // top level (module-scope, above `mod inner`) so it compiles and is
-    // unit-testable without the `metal-gpu` feature at all (round-2 fix).
+    // unit-testable without the `metal-gpu` feature at all.
     #[cfg(feature = "gdn-state-counters")]
     use super::{
         GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficShape,
@@ -2200,8 +2200,7 @@ mod inner {
         checkpoints: Vec<MetalGdnCheckpoint>,
     }
 
-    /// Worker-local, single-live-entry cross-turn prefix cache (#516 round-1
-    /// remediation, finding 1 + 5).
+    /// Worker-local, single-live-entry cross-turn prefix cache (#516).
     ///
     /// Ownership invariant: at most ONE `MetalCrossTurnPrefixEntry` is ever
     /// retained, bounded by design (never an unbounded per-slot map). The
@@ -3997,7 +3996,7 @@ mod inner {
                 intermediate,
                 max_rank,
             });
-            // #516 round-1 remediation D4: the cross-turn cache's adapter
+            // The cross-turn cache's adapter
             // identity (`cross_turn_metadata`'s `adapter_id`) is a shape-based
             // hash (max_rank/scale/projection count), not a content hash, so
             // two different adapters with the same shape can collide on the
@@ -4012,7 +4011,7 @@ mod inner {
         /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
         pub fn unload_lora_adapter(&mut self) {
             self.lora = None;
-            // #516 round-1 remediation D4: see the matching comment in
+            // See the matching comment in
             // `load_lora_adapter` — any adapter identity change must
             // invalidate the retained cross-turn entry.
             self.cross_turn_prefix_cache.clear();
@@ -6011,7 +6010,7 @@ mod inner {
         /// can only be reached by a library consumer calling the raw entry point with
         /// an out-of-vocabulary id.
         ///
-        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        /// # Cross-turn cache invalidation (#516)
         ///
         /// This is a public raw-forward entry point that advances live KV/GDN
         /// state outside the cache-aware generation family's ownership, so it
@@ -6153,7 +6152,7 @@ mod inner {
         /// generate path never triggers this; it can only be reached by a library
         /// consumer passing raw ids with an out-of-vocabulary value.
         ///
-        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
         /// comment for the invariant this enforces. `generate`/`generate_streaming`/
@@ -6178,7 +6177,7 @@ mod inner {
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
         ///
-        /// # Cross-turn cache invalidation (#516 round-2 D7)
+        /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
         /// comment for the invariant this enforces.
@@ -9291,7 +9290,7 @@ mod inner {
                 pool.active_base_seq_len = None;
             }
             self.session.last_pre_final_hidden = vec![0.0f32; self.engine.config.hidden_size];
-            // #516 round-1 remediation D3: every public path that resets live
+            // Every public path that resets live
             // KV/GDN state (plain `generate_streaming`, chat, the serve
             // worker, and the cache-aware path's own FullRefill/error legs)
             // routes through here, so this is the single place that must
@@ -13518,8 +13517,8 @@ mod inner {
         /// of `[E, 2I, H]`) would otherwise pass, hand `encode_moe_ffn` a
         /// buffer smaller than — or laid out differently than — the
         /// `num_experts * ...` slice it forms from the raw pointer, and
-        /// violate that unsafe function's buffer-size invariant (round-1
-        /// blocker, mirrors the shape check `resolve_mtp_projection`/
+        /// violate that unsafe function's buffer-size invariant (mirrors the
+        /// shape check `resolve_mtp_projection`/
         /// `resolve_mtp_norm` already apply to MTP tensors above).
         fn load_q4_mmap_dequant_f16(
             device: &Device,
@@ -13591,7 +13590,7 @@ mod inner {
         /// f32` in `encode_moe_ffn`, so they must land as f32, not f16.
         ///
         /// `expected_shape` is validated the same way and at the same point as
-        /// in [`Self::load_q4_mmap_dequant_f16`] (round-1 blocker fix): before
+        /// in [`Self::load_q4_mmap_dequant_f16`]: before
         /// mmap/allocation, against the raw header only.
         fn load_q4_mmap_dequant_f32(
             device: &Device,
@@ -13805,8 +13804,8 @@ mod inner {
         /// checkpoint — determined by the caller from `quarot_seed` presence
         /// (`quantize_index.json` object manifest or the legacy `config.json`
         /// field) BEFORE calling this function, so flavor detection never
-        /// depends on which files happen to exist per-tensor (#636 round-1
-        /// MAJOR). Returns `Err` (hard load failure, not a gracefully-disabled
+        /// depends on which files happen to exist per-tensor (#636).
+        /// Returns `Err` (hard load failure, not a gracefully-disabled
         /// warning) when an MTP tensor is present but untrustworthy: an
         /// incompatible stale `.q4` sibling under `is_quarot`, or a
         /// shape/transpose mismatch against the tensor's expected dimensions.
@@ -14734,7 +14733,7 @@ mod inner {
             // Determine the QuaRot flavor BEFORE loading any MTP projection, so a
             // stale MTP `.q4` sibling in a rotated-space checkpoint fails closed
             // instead of silently loading rotated weights under counter-rotation
-            // (#636 round-1 MAJOR). ADR-051 contract: `quarot_seed` lives in
+            // (#636). ADR-051 contract: `quarot_seed` lives in
             // `quantize_index.json`. Fall back to the legacy `config.json` field
             // (`quarot_rotation_seed`) for backwards compatibility with artifacts
             // produced before the contract was formalized. #504 remaining slice 2:
@@ -15056,7 +15055,7 @@ mod inner {
         }
     }
 
-    // #516 round-2 D7: `MtpTargetVerifier` is a public trait and this impl's
+    // `MtpTargetVerifier` is a public trait and this impl's
     // mutating methods (`rollback_cache_to`, `verify_tokens`) advance live
     // KV/GDN state exactly like `forward_step`/`forward_prefill` — they are
     // not currently wired into any live Metal generate loop (Metal MTP decode
@@ -15319,8 +15318,8 @@ mod inner {
                     // the end of generation. Any early return between here
                     // and that save (error `?`, caller-interrupt) leaves
                     // the cache empty rather than retaining a stale entry
-                    // — fail-closed by construction (#516 round-1
-                    // remediation D2). This also removes a ~19MiB GDN
+                    // — fail-closed by construction (#516). This also
+                    // removes a ~19MiB GDN
                     // snapshot clone per restore.
                     let entry = self.cross_turn_prefix_cache.take(slot_id).ok_or_else(|| {
                         InferenceError::PrefixCache(
@@ -15663,7 +15662,7 @@ mod inner {
         /// cache (for `FullRefill`), so an early cancel-return never re-saves
         /// and the slot is left empty rather than holding a stale/partial
         /// entry — the same guarantee the existing error path documents
-        /// (#516 round-1 remediation D2).
+        /// (#516).
         pub fn generate_streaming_with_prefix_cache_and_cancel<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
@@ -16473,7 +16472,7 @@ mod inner {
             topk_set_agreement_or_boundary_tie,
         };
         // Fixture helpers for the MTP Q4/F16 loader tests below now live in
-        // the top-level `mtp_resolve_tests` module (round-2: moved out of
+        // the top-level `mtp_resolve_tests` module (moved out of
         // `mod inner` so the pure resolver tests compile without
         // `metal-gpu` -- these Device-gated integration tests still share
         // the same fixture writers).
@@ -18371,7 +18370,7 @@ mod inner {
         // Qwen3.6-35B-A3B Q4 run is tracked separately (issue body: "35B
         // verification dir ... in-flight") — this is the fast, CI-safe leg.
         //
-        // Round-1 review (codex, PR #883) MAJOR 1: the original fixture
+        // The original fixture
         // filled every Q4 tensor with the same `0.1` constant, so an expert
         // swap, wrong gate/up boundary, or an equal-length transpose left
         // the test numerically finite and effectively unchanged — it could
@@ -18643,7 +18642,8 @@ mod inner {
             // --- (b) direct buffer read: expert-major layout at expert 0/1 offsets ---
             // Read the loaded Metal buffers straight from the built state, before
             // any decode runs, to isolate loader correctness from generation
-            // numerics — this is the layout proof the round-1 review asked for.
+            // numerics — this is the layout proof for the expert-major layout
+            // invariant.
             {
                 use crate::weights::q4_weights::q4_f16_to_f32;
                 let (_, common) = &state.engine.layer_weights[0];
@@ -18720,8 +18720,8 @@ mod inner {
         // transposed-index bug in `load_moe_ffn_q4` would produce (expert 2's
         // *slot* ends up holding expert 0's weights). The router is
         // unchanged, so routing still deterministically selects expert 2
-        // (round-1 review's "make routing deterministically select a nonzero
-        // expert"). If the loader's expert-major offsets were wrong in a way
+        // (routing must deterministically select a nonzero expert). If the
+        // loader's expert-major offsets were wrong in a way
         // the shape gate above cannot catch (e.g. two experts' bytes
         // transposed without changing either header's shape), this
         // corruption would silently have NO effect on which weights actually
@@ -18801,7 +18801,7 @@ mod inner {
         }
 
         // -------------------------------------------------------------------
-        // Round-1 review (codex, PR #883) BLOCKER: `load_q4_mmap_dequant_f16`/
+        // `load_q4_mmap_dequant_f16`/
         // `load_q4_mmap_dequant_f32` used to validate a MoE tensor's Q4
         // header only *self*-consistently (`validate_q4_header_payload_bounds`:
         // `product(shape) == original_len`, payload physically present) —
@@ -18809,7 +18809,7 @@ mod inner {
         // structurally valid but short or same-numel-transposed file would
         // silently load, then violate `encode_moe_ffn`'s unsafe
         // `num_experts * ...`-sized slice invariant. These two tests are
-        // the round-1-mandated regression coverage: a too-short router
+        // regression coverage: a too-short router
         // header, and a same-numel transposed routed-expert header, must
         // both make `from_q4_dir` return an `Err` before `forward_step`.
         // -------------------------------------------------------------------
@@ -18914,7 +18914,7 @@ mod inner {
         // itself (`resolve_mtp_projection`/`resolve_mtp_norm`) lives at the
         // file top level in `mod mtp_resolve_tests`, compiled unconditionally
         // in any test build (not gated on the `metal-gpu` feature), so it
-        // never skip-passes on a Metal-less CI runner (#636 round-2 -- these
+        // never skip-passes on a Metal-less CI runner (#636 -- these
         // tests used to live right here, inside this `metal-gpu`-gated
         // `mod inner`, and `cargo test --lib resolve_mtp` with no features
         // reported "running 0 tests"). The tests below instead exercise
@@ -19035,7 +19035,7 @@ mod inner {
 
         #[test]
         fn load_mtp_q4_weights_hard_errors_on_stale_q4_under_quarot() {
-            // Round-1 MAJOR integration coverage: a mixed/stale QuaRot
+            // Integration coverage: a mixed/stale QuaRot
             // directory (both .q4 and .f16 for a projection, is_quarot=true)
             // must be a hard `Err`, not a gracefully-disabled `None` — this
             // is the exact failure-open scenario this guard closes.
@@ -22430,7 +22430,7 @@ mod inner {
         /// the serial reference clean run-to-run.
         ///
         /// Machine-level half (#628/#629 post-mortem): the in-process mutex cannot
-        /// stop `cargo test` runs launched from OTHER worktrees on the same
+        /// stop concurrent `cargo test` runs launched from another process on the
         /// machine, and concurrent Metal load provably corrupts real-checkpoint
         /// numerics (boundary-tie margins inflated ~3x during a confirmed
         /// contention window). So the guard also holds an exclusive advisory
@@ -23718,7 +23718,7 @@ mod inner {
             // `on_token_calls == 0` alone doesn't prove *which* checkpoint fired --
             // the after-prefill check would produce the same on_token count if the
             // before-prefill one were missing, since prefill's own output never
-            // reaches on_token either way (round-2 review finding). Prefill is the
+            // reaches on_token either way. Prefill is the
             // only thing that advances kv_cache.seq_len (metal_qwen35_chunked_prefill*
             // tests assert seq_len == tokens.len() once it has run), so a still-zero
             // seq_len is direct evidence prefill itself never started.
@@ -26220,7 +26220,7 @@ mod inner {
                 // #ifdef gate) -- it is not actually an optional/conditionally-compiled
                 // kernel, so a missing lookup here means MSL_SOURCE was compiled but the
                 // named kernel silently failed to link, which is itself a bug this test
-                // must catch, not skip past (#862 round 1, medium finding 4: only
+                // must catch, not skip past (#862: only
                 // device-absence may remain a platform-level skip).
                 let pipe_func = lib
                     .get_function("gdn_precompute_keys", None)
@@ -26433,7 +26433,7 @@ mod inner {
             }
 
             // --------------------------------------------------------------
-            // #862 round-2 major-2 follow-up: multi-token gdn_chunk_materialize_c32
+            // #862 follow-up: multi-token gdn_chunk_materialize_c32
             // dispatch (the CHUNKED PREFILL path #850's integration ask names) exercising
             // REAL within-chunk conv-window carryover, not a single n_tokens=1 dispatch.
             //
@@ -26562,7 +26562,7 @@ mod inner {
                 const KD: u32 = 128;
                 const HD: u32 = 16;
                 const WINDOW: u32 = 4; // ks (kernel_size), matches the kernel's constexpr ks=4u
-                const CLEAN_TAIL: u32 = 4; // #862 round-2 major-2: "at least 4 subsequent clean tokens"
+                const CLEAN_TAIL: u32 = 4; // #862: "at least 4 subsequent clean tokens"
                 const N_TOKENS: u32 = WINDOW + CLEAN_TAIL;
                 let qkv_dim = 3 * KD; // [Q(128) | K(128) | V(128)] per token
                 let hidden_in = lcg_vec(41, HD as usize);
@@ -26570,7 +26570,7 @@ mod inner {
                 let in_proj_a = lcg_vec(43, HD as usize);
 
                 // K channel span (label fixed to K: the shipping-path production gap
-                // #862 round 1 found; the sibling single-token test above already
+                // #862 found; the sibling single-token test above already
                 // covers both Q and K for a single dispatch).
                 let (lo, hi) = (KD as usize, 2 * KD as usize);
 
@@ -27714,7 +27714,7 @@ mod inner {
             );
         }
 
-        /// #516 round-3 remediation: `set_gdn_chunked` swaps the GDN prefill
+        /// #516: `set_gdn_chunked` swaps the GDN prefill
         /// algorithm, and the two scans are not bit-exact (measured logit
         /// drift up to ~2e-1 at chunk boundaries). A cache entry saved under
         /// one mode must not seed a restore whose full-refill reference would
@@ -29202,7 +29202,7 @@ mod inner {
                 .collect()
         }
 
-        /// #611 round-1: `generate`'s DECODE-LOOP grammar-masking site
+        /// #611: `generate`'s DECODE-LOOP grammar-masking site
         /// (:10502) must fail closed too, not just the post-prefill site.
         #[test]
         fn generate_decode_loop_fails_closed_on_grammar_blocking_second_token() {
@@ -29256,7 +29256,7 @@ mod inner {
             );
         }
 
-        /// #611 round-1: `generate_streaming`'s DECODE-LOOP grammar-masking
+        /// #611: `generate_streaming`'s DECODE-LOOP grammar-masking
         /// site (`generate_streaming_with_cancel` :14821) must fail closed
         /// too. Also asserts `on_token` is invoked at most once — the
         /// fail-open bug this closes would otherwise emit a bogus second
@@ -29322,7 +29322,7 @@ mod inner {
             );
         }
 
-        /// #611 round-1: `generate_streaming_with_prefix_cache`'s
+        /// #611: `generate_streaming_with_prefix_cache`'s
         /// DECODE-LOOP grammar-masking site (inside
         /// `generate_streaming_with_prefix_cache_inner` :16975) must fail
         /// closed too, AND the public wrapper's error path must not save a
@@ -29986,27 +29986,22 @@ const LM_HEAD_TOPK_TIE_EPSILON: f32 = 1.0e-3;
 // comparator-based code (i.e. no longer count-and-continue; each run panics
 // on its first non-tie mismatch) surfaced margins of 3.61e-2, 2.01e-2, and
 // 5.23e-2 — all 3 runs mismatched, and the new max (5.23e-2) is 4.2x
-// phase-1's. Timeline reconstruction from process-start timestamps confirms
-// this batch finished (~10:20pm) before any other worktree's Metal test
-// process became active on this machine (the next one started ~10:23pm), so
-// this is not explained by the cross-process GPU contention identified below
-// — it is the more likely true noise ceiling, phase-1's 5 samples having
-// under-covered it (consistent with issue #623: this kernel family's
-// reduction order is not run-to-run deterministic, so small samples
-// under-cover the tail).
+// phase-1's. This run was isolated (no concurrent Metal GPU process on the
+// machine, verified via the machine-wide GPU test lock), so it is not
+// explained by the cross-process GPU contention noted below — it is the
+// more likely true noise ceiling, phase-1's 5 samples having under-covered
+// it (consistent with issue #623: this kernel family's reduction order is
+// not run-to-run deterministic, so small samples under-cover the tail).
 //
 // A separate, later confirmation pass on lm_head_q4_real_checkpoint_topk_set_agreement
 // (4 more runs) produced a much larger outlier margin (0.167, k=8, step 3) that
-// this constant deliberately does NOT chase: `ps` timestamps confirmed a
-// concurrent process in a different worktree (`lattice-611`, PID 3395,
-// `cargo test ... forward::metal_qwen35:: --test-threads=4`, later a second
-// batch explicitly re-running these same 4 real-checkpoint tests) actively
-// executing Metal GPU tests on this same physical machine throughout that
-// window. Concurrent GPU load corrupting numerics (not just timing) for
+// this constant deliberately does NOT chase: that run was contended by a
+// concurrent Metal GPU test process on the same machine (see the
+// machine-wide GPU test lock this repo now enforces for exactly this
+// reason). Concurrent GPU load corrupting numerics (not just timing) for
 // these exact tests is an already-documented risk in this repo (see
 // AGENTS.md / CLAUDE.md "Triage Flaky vs Deterministic Before Filing"), so
-// that batch's data is reported (see PR/report history) but excluded from
-// this constant's derivation.
+// that batch's data is excluded from this constant's derivation.
 //
 // This constant is set to 1.0e-1: ~1.9x the phase-1+phase-2 combined greedy
 // max (5.23e-2, from data with no identified contention), inside the

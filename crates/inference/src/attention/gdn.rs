@@ -905,7 +905,7 @@ mod tests {
     /// runs the same shape of proof (poison-only-step-0, two clean steps, explicit-zero
     /// reference) for K instead of Q, through the SHIPPING `gated_delta_net_step_fused`
     /// SIMD path instead of this scalar reference -- that is the production-shaped gap
-    /// #862 round 1 found (blocker 2: `simd_l2_normalize`'s scalar/AVX2/NEON backends
+    /// #862 found (`simd_l2_normalize`'s scalar/AVX2/NEON backends
     /// were fail-open even though this scalar reference and `l2_normalize_vec` were
     /// already fixed). This test remains as the Q-side / scalar-reference-path proof;
     /// it does not by itself cover K or the fused/SIMD path.

@@ -74,8 +74,8 @@ const FAIL_CLOSED_MAX_ABS_DIFF: f32 = 1e-3;
 /// check must catch: NaN, +infinity, and -infinity.
 ///
 /// Mutation-sensitive both ways (reverified against this element-wise
-/// oracle comparison, not just the old NaN-count check, in a disposable
-/// worktree under the GPU lock):
+/// oracle comparison, not just the old NaN-count check, under the
+/// machine-wide GPU test lock):
 /// - reverting `shaders.rs`'s `ATTENTION_SOFTMAX_SHADER` to the pre-fix
 ///   `1.0 / max(sum_scratch[0u], 1e-20)` floor-clamp (no pre-exp scan) makes
 ///   every case below fail (non-finite values leak into the GPU output while

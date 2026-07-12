@@ -1091,7 +1091,7 @@ pub(crate) enum StopCheckOutcome {
 /// whether checking happens at all — is now [`StopMode`], a value chosen
 /// exactly once from the real `gen_cfg.stop_strings` at [`DecodePolicy::init`]
 /// time and stored privately on the policy. A caller can no longer supply a
-/// closure that *decides* the stop outcome (round 2's `stop_check` parameter,
+/// closure that *decides* the stop outcome (a prior `stop_check` parameter,
 /// which could compile as a trivial `|_, _| Continue` for any configuration
 /// regardless of what `stop_strings` actually held); it supplies only raw
 /// per-token I/O primitives — a decoded delta (`decode_delta`) and a
@@ -3236,7 +3236,7 @@ mod tests {
     // Public-prefill-delegation token parity (perf_hunt public-prefill
     // experiment). Requires a real dense Qwen3.5 checkpoint; set
     // LATTICE_INFERENCE_MODEL_DIR to a safetensors directory (e.g.
-    // /Users/lion/.lattice/models/qwen3.5-0.8b). Ignored by default so CI
+    // ~/.lattice/models/qwen3.5-0.8b). Ignored by default so CI
     // and plain `cargo test` runs never depend on local model files.
     // -------------------------------------------------------------------
 

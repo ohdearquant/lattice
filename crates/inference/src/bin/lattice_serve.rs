@@ -525,7 +525,7 @@ mod imp {
                                 // content-part size/count limit at all) --
                                 // a new, stable, lattice_serve-only code
                                 // rather than an invented false match with
-                                // any lattice.rs code (ADR-080 C2 round 2).
+                                // any lattice.rs code (ADR-080 C2).
                                 "content_part_limit_exceeded",
                             ));
                         }
@@ -1296,7 +1296,7 @@ mod imp {
 
     async fn root() -> Json<Value> {
         let t = Instant::now();
-        // ADR-080 C2 round 2: shared with lattice.rs's equivalent route so
+        // ADR-080 C2: shared with lattice.rs's equivalent route so
         // both binaries advertise the same engine-identity document.
         let body = lattice_inference::serve::root_body();
         emit_serve_event(
@@ -1392,7 +1392,7 @@ mod imp {
                 false,
             );
             // Matches lattice.rs's `validate_chat_request` code for the
-            // identical empty-messages condition (ADR-080 C2 round 2).
+            // identical empty-messages condition (ADR-080 C2).
             return err_response(
                 StatusCode::BAD_REQUEST,
                 "`messages` must not be empty",
@@ -3515,7 +3515,7 @@ mod imp {
             };
             use std::sync::Mutex;
 
-            /// Mirrors `lattice.rs`'s equivalent helper (issue #828 round 2):
+            /// Mirrors `lattice.rs`'s equivalent helper (issue #828):
             /// fires the fixed `{"messages":[{"role":"user","content":"hi
             /// there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}`
             /// request through a REAL background thread running the actual
@@ -3525,7 +3525,7 @@ mod imp {
             /// through a single local variable into both the recorded
             /// observation and the returned tuple's third element, and the
             /// real `enforce_prompt_window` return value is the ONLY source for
-            /// `prompt_tokens` -- round 2 major finding fixed the prior
+            /// `prompt_tokens` -- this fixed the prior
             /// `prompt_tokens: 3` / `stopped: true` independent literals.
             async fn run_observed(
                 model_max_context: usize,
@@ -3648,7 +3648,7 @@ mod imp {
 
             /// Proves `stopped` is genuinely derived from what the worker's
             /// generation closure returned, not an independent hardcoded
-            /// literal (round 2 major finding: this was previously
+            /// literal (this was previously
             /// `stopped: true` regardless of the closure's actual return).
             #[tokio::test]
             async fn chat_completions_non_streaming_observation_captures_real_stopped_false() {
