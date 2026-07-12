@@ -1,6 +1,6 @@
 {
   "name": "@khive-ai/lattice-embed-wasm",
-  "version": "0.1.0",
+  "version": "0.6.1",
   "description": "Pure-Rust BERT-family text embeddings compiled to WebAssembly, with a small Node adapter for model resolution, caching, and pooling.",
   "type": "module",
   "license": "Apache-2.0",

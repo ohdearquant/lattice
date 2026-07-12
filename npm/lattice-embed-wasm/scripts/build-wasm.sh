@@ -24,10 +24,21 @@ if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unkno
   rustup target add wasm32-unknown-unknown
 fi
 
-echo "=== build-wasm: compiling lattice-embed for wasm32 ==="
+echo "=== build-wasm: compiling lattice-embed for wasm32 (SIMD128) ==="
+# -C target-feature=+simd128 turns on wasm32 SIMD128 kernels in
+# crates/embed/src/simd/{dot_product,distance,cosine,normalize}.rs (the
+# dispatch resolvers there pick a SIMD128 kernel automatically when the
+# crate is built this way; see README.md "Performance" for measured
+# speedups). Runtime floor: WebAssembly SIMD128 is a baseline feature in
+# every evergreen browser and in Node >=16 (this package's `engines.node`
+# field already requires >=18, so no consumer of this package can be below
+# the floor). There is no non-simd128 fallback artifact published from this
+# flow; a caller needing a pre-SIMD128 runtime should build from source
+# without this flag.
 (
   cd "$REPO_ROOT"
-  cargo build --release --target wasm32-unknown-unknown -p lattice-embed \
+  RUSTFLAGS="-C target-feature=+simd128" \
+    cargo build --release --target wasm32-unknown-unknown -p lattice-embed \
     --no-default-features --features wasm
 )
 
