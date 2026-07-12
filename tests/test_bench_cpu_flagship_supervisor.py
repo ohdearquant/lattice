@@ -20,6 +20,7 @@ Run with: python3 -m pytest tests/test_bench_cpu_flagship_supervisor.py -v
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import statistics
 import sys
@@ -672,6 +673,80 @@ class BuildDecodeCellAggregateTest(unittest.TestCase):
         session["arm_a"][0]["decode_tok_s"] = None
         with self.assertRaises(ValueError):
             supervisor.build_decode_cell_aggregate(session, self.policy, rng_seed=1)
+
+
+class DecodeVerdictTest(unittest.TestCase):
+    """PR #898 review, round 1 finding #2: `decode_verdict` must compare
+    `aggregate.corrected_lower_bound`/`aggregate.point_estimate` (both
+    LOG-space, since `build_decode_cell_aggregate` bootstraps
+    `log_slowdowns`) against LOG-space thresholds (`math.log1p(fail_pct)`/
+    `math.log1p(warn_pct)`), never the raw `perf-policy.toml` fractions
+    directly. These fixtures pin a concrete boundary window
+    `(log1p(x), x]` where a raw-fraction comparison and the correct
+    log-space comparison DISAGREE, so the fix is provably load-bearing
+    rather than a no-op relabeling -- not just "some value below 0.07",
+    but specifically a value the pre-fix comparison would have missed."""
+
+    def _agg(self, *, point_estimate, corrected_lower_bound, n_valid=7, required_n=7, measured_cv=0.01):
+        return harness.CellAggregate(
+            point_estimate=point_estimate,
+            ci_low=point_estimate,
+            ci_high=point_estimate,
+            corrected_lower_bound=corrected_lower_bound,
+            n_valid=n_valid,
+            n_invalid=0,
+            measured_cv=measured_cv,
+            required_n=required_n,
+        )
+
+    def test_bound_in_log1p_boundary_window_is_fail(self):
+        fail_pct = 0.07
+        tau_fail = math.log1p(fail_pct)
+        cb = (tau_fail + fail_pct) / 2.0  # strictly inside (tau_fail, fail_pct]
+        self.assertGreater(cb, tau_fail)
+        self.assertLessEqual(cb, fail_pct)
+        # Precondition proving this window actually disagrees with a raw-
+        # fraction comparison: cb does NOT clear the raw fail_pct itself,
+        # so the pre-fix `cb > fail_pct` comparison would have reported
+        # WARN/PASS here instead of the genuine policy FAIL.
+        self.assertFalse(cb > fail_pct)
+        aggregate = self._agg(point_estimate=0.01, corrected_lower_bound=cb)
+        diagnostics = {"n_pairs": 7, "required_n": 7, "measured_cv": 0.01}
+        verdict, reason = supervisor.decode_verdict(aggregate, diagnostics, fail_pct=fail_pct, warn_pct=0.03)
+        self.assertEqual(verdict, "FAIL")
+        self.assertIsNone(reason)
+
+    def test_point_estimate_in_log1p_boundary_window_is_warn(self):
+        warn_pct = 0.03
+        tau_warn = math.log1p(warn_pct)
+        pe = (tau_warn + warn_pct) / 2.0  # strictly inside (tau_warn, warn_pct]
+        self.assertGreater(pe, tau_warn)
+        self.assertLessEqual(pe, warn_pct)
+        self.assertFalse(pe > warn_pct)
+        aggregate = self._agg(point_estimate=pe, corrected_lower_bound=None)
+        diagnostics = {"n_pairs": 7, "required_n": 7, "measured_cv": 0.01}
+        verdict, reason = supervisor.decode_verdict(aggregate, diagnostics, fail_pct=0.07, warn_pct=warn_pct)
+        self.assertEqual(verdict, "WARN")
+        self.assertIsNone(reason)
+
+    def test_undersampled_session_reports_unsupported_regardless_of_bound(self):
+        aggregate = self._agg(point_estimate=10.0, corrected_lower_bound=10.0, n_valid=2, required_n=7)
+        diagnostics = {"n_pairs": 2, "required_n": 7, "measured_cv": 0.01}
+        verdict, reason = supervisor.decode_verdict(aggregate, diagnostics, fail_pct=0.07, warn_pct=0.03)
+        self.assertEqual(verdict, "unsupported")
+        self.assertIsNotNone(reason)
+
+    def test_gate_eligible_session_can_reach_a_real_verdict(self):
+        """Reconciliation check (PR #898 review, round 1 finding #2): a
+        sufficiently-powered session is NOT unconditionally downgraded to
+        'unsupported' -- it reaches a genuine PASS/WARN/FAIL verdict, so
+        the module docstring/comments must never claim shadow-mode safety
+        comes from an always-unsupported verdict."""
+        aggregate = self._agg(point_estimate=0.0, corrected_lower_bound=0.0)
+        diagnostics = {"n_pairs": 7, "required_n": 7, "measured_cv": 0.01}
+        verdict, reason = supervisor.decode_verdict(aggregate, diagnostics, fail_pct=0.07, warn_pct=0.03)
+        self.assertEqual(verdict, "PASS")
+        self.assertIsNone(reason)
 
 
 class ValidateRunRecordRoundTripTest(unittest.TestCase):
