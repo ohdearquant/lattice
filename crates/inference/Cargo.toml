@@ -7,6 +7,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pure Rust transformer inference engine — safetensors loading, SIMD matmul, BGE/Qwen3 embeddings"
+# Heavy test-only fixtures (~40MB raw) push the packaged crate past the
+# crates.io 10MB upload limit. They are consumed only by integration tests,
+# which are never run from the published crate.
+exclude = ["tests/fixtures/tokenizers", "tests/fixtures/gdn_chunk"]
 
 [features]
 default = ["std", "download", "serve"]
