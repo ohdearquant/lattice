@@ -45,11 +45,18 @@
 //! [`LruPolicy`] mirrors [`crate::forward::moe_expert_cache::ExpertSlotCache`]'s
 //! `touch`/`pick_eviction_slot` order exactly, including the within-token
 //! "never evict a slot touched earlier this token" guard (moe_expert_cache.rs
-//! `pick_eviction_slot`, `touch`, `plan_prefetch`). [`ArcPolicy`] and
-//! [`FreqAdmissionPolicy`] do not implement that guard — see their doc
-//! comments for why real per-token `selected_ids` (duplicate-free top-k
-//! routing output) never exercises it, so its absence does not bias the
-//! hit-rate comparison against the baseline.
+//! `pick_eviction_slot`, `touch`, `plan_prefetch`). That guard protects
+//! EVERY slot resolved earlier in the current token, not only literal
+//! duplicate ids — production's `resolve` sets the touched flag on every
+//! slot it touches, hit or miss, and `pick_eviction_slot` only ever selects
+//! an untouched one (`moe_expert_cache.rs:47`-`58`, `887`-`912`). [`ArcPolicy`]
+//! implements the equivalent token-local protection via
+//! `protected_this_token` (see its doc comment). [`FreqAdmissionPolicy`]
+//! needs no explicit guard — see its doc comment for the structural proof —
+//! but both were audited against this invariant, not assumed safe because
+//! `selected_ids` is duplicate-free (duplicate-freedom was never the
+//! relevant property: evicting a *different* id touched earlier the same
+//! token is just as physically unreachable as evicting a literal repeat).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
@@ -272,17 +279,22 @@ impl AdmissionPolicy for LruPolicy {
 /// literature credits for beating bare LRU under bursty expert reuse
 /// (e.g. a small hot expert set interleaved with a long one-off scan).
 ///
-/// No same-token eviction guard (contrast [`LruPolicy`]): a token's
-/// `selected_ids` never contains a duplicate — the real router's top-k
-/// selection is duplicate-free (see `moe_expert_cache.rs`'s
-/// `plan_prefetch` doc comment) — so no policy here is ever asked to
-/// resolve the same id twice within one `begin_token` window, and the
-/// GPU-buffer-lifetime hazard the guard exists for (evicting a slot a
-/// still-open command buffer references) cannot arise without a same-token
-/// repeat. A future engine implementation of ARC would still need its own
-/// guard analogous to `LruPolicy`'s; this simulator scores achievable hit
-/// rate over the real per-token id sequence, not the exact eviction
-/// bookkeeping a production implementation would additionally need.
+/// Same-token eviction guard, analogous to [`LruPolicy`]'s: `access`
+/// records every id it resolves (hit or miss) into `protected_this_token`,
+/// cleared each `begin_token`. Eviction victim selection (in `replace` and
+/// Case IV's direct `t1` discard) skips protected ids — a token resolved
+/// earlier THIS token must not be evicted before the token boundary,
+/// exactly as production requires (see the module doc comment and
+/// `moe_expert_cache.rs:47`-`58`, `887`-`912`). With `capacity >= top_k`
+/// (validated by `run_simulation`), an unprotected resident always exists
+/// when eviction is needed: a token touches at most `top_k` distinct ids,
+/// so at most `top_k - 1` residents can be protected by the time the next
+/// one needs room. ARC's `p`-adaptive target still picks WHICH list
+/// (`t1`/`t2`) to prefer evicting from; the guard only constrains WHICH
+/// resident within that choice, falling back to the other list if the
+/// preferred one is fully protected — the physical slot has to come from
+/// somewhere, and which ghost list absorbs it is a secondary adaptation
+/// detail, not a correctness requirement.
 pub struct ArcPolicy {
     capacity: usize,
     p: usize,
@@ -291,6 +303,9 @@ pub struct ArcPolicy {
     b1: VecDeque<usize>,
     b2: VecDeque<usize>,
     evictions: usize,
+    /// Ids resolved earlier in the current token — see the struct doc
+    /// comment. Cleared by `begin_token`.
+    protected_this_token: HashSet<usize>,
 }
 
 impl ArcPolicy {
@@ -304,6 +319,7 @@ impl ArcPolicy {
             b1: VecDeque::new(),
             b2: VecDeque::new(),
             evictions: 0,
+            protected_this_token: HashSet::new(),
         }
     }
 
@@ -323,22 +339,53 @@ impl ArcPolicy {
         }
     }
 
+    /// Remove and return the oldest (front-most) id in `list` that is NOT
+    /// in `protected` — the LRU-among-unprotected victim. `None` if every
+    /// id in `list` is protected this token.
+    fn evict_unprotected_from(
+        list: &mut VecDeque<usize>,
+        protected: &HashSet<usize>,
+    ) -> Option<usize> {
+        let pos = list.iter().position(|id| !protected.contains(id))?;
+        list.remove(pos)
+    }
+
     /// REPLACE(x, p): evict one resident id from `t1` or `t2` into the
     /// corresponding ghost list, per the ARC paper's rule — prefer
     /// evicting from `t1` when it exceeds its adaptive target `p` (or sits
     /// exactly at `p` and the id that triggered this REPLACE call came
-    /// from `b2`), otherwise evict from `t2`.
+    /// from `b2`), otherwise evict from `t2`. The victim is additionally
+    /// constrained to ids not in `protected_this_token` (see the struct
+    /// doc comment); if the ARC-preferred list has no unprotected
+    /// candidate, fall back to the other resident list before giving up.
     fn replace(&mut self, triggered_by_b2_hit: bool) {
         let evict_from_t1 = !self.t1.is_empty()
             && (self.t1.len() > self.p || (triggered_by_b2_hit && self.t1.len() == self.p));
-        if evict_from_t1 {
-            if let Some(y) = self.t1.pop_front() {
-                self.b2_or_b1_push(true, y);
+        let victim = if evict_from_t1 {
+            Self::evict_unprotected_from(&mut self.t1, &self.protected_this_token)
+                .map(|y| (y, true))
+                .or_else(|| {
+                    Self::evict_unprotected_from(&mut self.t2, &self.protected_this_token)
+                        .map(|y| (y, false))
+                })
+        } else {
+            Self::evict_unprotected_from(&mut self.t2, &self.protected_this_token)
+                .map(|y| (y, false))
+                .or_else(|| {
+                    Self::evict_unprotected_from(&mut self.t1, &self.protected_this_token)
+                        .map(|y| (y, true))
+                })
+        };
+        match victim {
+            Some((y, from_t1)) => {
+                self.b2_or_b1_push(from_t1, y);
                 self.evictions += 1;
             }
-        } else if let Some(y) = self.t2.pop_front() {
-            self.b2_or_b1_push(false, y);
-            self.evictions += 1;
+            None => panic!(
+                "ArcPolicy::replace: no unprotected resident available for eviction — \
+                 indicates capacity < top_k (should have been rejected by \
+                 run_simulation) or a bug in protected_this_token bookkeeping"
+            ),
         }
     }
 
@@ -356,10 +403,19 @@ impl AdmissionPolicy for ArcPolicy {
         "arc"
     }
 
-    fn begin_token(&mut self) {}
+    fn begin_token(&mut self) {
+        self.protected_this_token.clear();
+    }
 
     fn access(&mut self, x: usize) -> AccessOutcome {
         let c = self.capacity;
+        // Mark x protected from eviction by any LATER access in this same
+        // token, mirroring production's `resolve` setting the touched
+        // flag on every slot it touches, hit or miss (see struct doc
+        // comment). x itself is never a candidate for eviction within
+        // this call — it is not yet resident in t1/t2 at this point on
+        // any path that evicts something to make room for it.
+        self.protected_this_token.insert(x);
 
         // Case I: cache hit.
         if Self::remove_from(&mut self.t1, x) {
@@ -402,8 +458,15 @@ impl AdmissionPolicy for ArcPolicy {
             if self.t1.len() < c {
                 self.b1.pop_front();
                 self.replace(false);
-            } else if self.t1.pop_front().is_some() {
-                self.evictions += 1;
+            } else {
+                match Self::evict_unprotected_from(&mut self.t1, &self.protected_this_token) {
+                    Some(_) => self.evictions += 1,
+                    None => panic!(
+                        "ArcPolicy Case IV: t1 full at capacity with b1 empty, but every \
+                         resident id is protected this token — indicates capacity < \
+                         top_k (should have been rejected by run_simulation)"
+                    ),
+                }
             }
         } else if t1_b1 < c {
             let total = self.t1.len() + self.t2.len() + self.b1.len() + self.b2.len();
@@ -437,9 +500,17 @@ impl AdmissionPolicy for ArcPolicy {
 /// literature (e.g. HOBBIT, ProMoE) motivates as a low-overhead
 /// alternative to full ARC.
 ///
-/// No same-token eviction guard, for the same reason as [`ArcPolicy`] (see
-/// its doc comment): real per-token `selected_ids` never repeats an id
-/// within one token.
+/// No explicit same-token eviction guard is needed, unlike [`ArcPolicy`].
+/// `admit`'s only eviction path is `self.lru.pop_front()`, and every
+/// successful `access` (hit or admission) moves that id to the back of
+/// `self.lru` before returning — so an id touched earlier in the current
+/// token is always more-recently-touched than any not-yet-touched id, and
+/// can only become the front-of-queue victim if it is the cache's ONLY
+/// resident (`capacity == 1`). A token with more than one distinct
+/// selected id requires `capacity > 1` (`run_simulation` validates
+/// `capacity (num_slots) >= top_k`), so that degenerate case cannot occur
+/// for a multi-id token. See `freq_admission_never_evicts_a_same_token_touched_id_without_an_explicit_guard`
+/// for the proof trace.
 pub struct FreqAdmissionPolicy {
     capacity: usize,
     window: usize,
@@ -497,10 +568,15 @@ impl AdmissionPolicy for FreqAdmissionPolicy {
             self.touch_lru(id);
             return AccessOutcome::Hit;
         }
+        // Strict `<`, not `<=`: a `window`-access sliding window ending at
+        // the current position `pos` covers positions
+        // `[pos - window + 1, pos]`, i.e. `pos - prev < window`. A prior
+        // touch exactly `window` positions back sits one position outside
+        // that range.
         let eligible = self
             .last_seen_pos
             .get(&id)
-            .is_some_and(|&prev| self.pos - prev <= self.window);
+            .is_some_and(|&prev| self.pos - prev < self.window);
         self.last_seen_pos.insert(id, self.pos);
         if eligible {
             self.admit(id);
@@ -519,9 +595,14 @@ impl AdmissionPolicy for FreqAdmissionPolicy {
 
 /// Named policy constructor — how the driver enumerates the baseline plus
 /// challenger policies (issue #682 Stage 3 item 3), each rebuilt fresh per
-/// layer (mirroring the real engine's one `ExpertSlotCache` instance per
-/// (layer, gate_up|down) tensor — no cross-layer cache sharing). Adding a
-/// new challenger is one new variant plus one `AdmissionPolicy` impl.
+/// layer — no cross-layer cache sharing. This models ONE logical
+/// (layer, tensor) cache per layer, NOT the two physical
+/// `ExpertSlotCache` instances (gate_up and down) production actually
+/// runs per MoE layer (`metal_qwen35.rs` constructs both with the same
+/// `num_slots` and plans both against the same `selected` id sequence —
+/// see [`LayerStats`]'s doc comment for what this means for reported raw
+/// counts). Adding a new challenger is one new variant plus one
+/// `AdmissionPolicy` impl.
 #[derive(Debug, Clone)]
 pub enum PolicySpec {
     Lru,
@@ -555,6 +636,19 @@ impl PolicySpec {
 
 /// Hit/miss/eviction tally for one policy over one layer's (or the whole
 /// trace's) accesses.
+///
+/// **These counts are per single LOGICAL (layer, tensor) cache, not
+/// physical runtime events.** Production instantiates two `ExpertSlotCache`
+/// instances per MoE layer (gate_up and down) and replays the same
+/// selected-expert id sequence into both (`metal_qwen35.rs`'s
+/// `encode_moe_ffn`), so each miss and eviction reported here happens
+/// TWICE physically — once per tensor — with identical resident histories
+/// in both (same ids, same order, same `num_slots`). `hit_rate` and
+/// `delta_vs_baseline_pp` are unaffected by this (both tensors compute the
+/// same ratio); only the raw `hits`/`misses`/`evictions` integers
+/// understate physical dequant/eviction event counts by 2x. Multiply by 2
+/// for physical totals, or treat these as the logical/representative
+/// count they are.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct LayerStats {
     pub hits: usize,
@@ -630,12 +724,44 @@ pub fn run_simulation(
     cfg: &SimConfig,
     policies: &[PolicySpec],
 ) -> Result<Vec<PolicyReport>, String> {
+    // Fail closed on zero-valued sizing inputs BEFORE any policy is
+    // constructed — `LruPolicy::new`/`ArcPolicy::new`/
+    // `FreqAdmissionPolicy::new` assert `capacity/window > 0` and will
+    // panic on these, which is fine as an internal invariant but wrong as
+    // the response to an ordinary bad CLI argument (e.g. `--num-slots 0`
+    // or `--window 0`). Checked here, not just in the CLI, so it is
+    // covered by `cargo test -p lattice-inference --lib` directly.
+    if cfg.num_slots == 0 {
+        return Err(
+            "num_slots must be > 0 — a zero-capacity cache cannot hold any \
+                     expert"
+                .to_string(),
+        );
+    }
+    if cfg.top_k == 0 {
+        return Err(
+            "top_k must be > 0 — a token that selects zero experts is not a \
+                     valid MoE routing trace"
+                .to_string(),
+        );
+    }
     if cfg.num_slots < cfg.top_k {
         return Err(format!(
             "num_slots ({}) must be >= top_k ({}) — mirrors moe_expert_cache_num_slots's \
              validated invariant; a smaller cache cannot serve one token's routed-expert set",
             cfg.num_slots, cfg.top_k
         ));
+    }
+    for spec in policies {
+        if let PolicySpec::FreqAdmission { window } = spec
+            && *window == 0
+        {
+            return Err(
+                "freq-admission window must be > 0 — a zero-width sliding window can \
+                 never observe a repeat touch"
+                    .to_string(),
+            );
+        }
     }
     if !policies.iter().any(PolicySpec::is_baseline) {
         return Err("policies must include PolicySpec::Lru as the baseline".to_string());
@@ -695,6 +821,13 @@ pub fn run_simulation(
 pub fn format_table(reports: &[PolicyReport]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "NOTE: hits/misses/evictions are per single LOGICAL (layer, tensor) cache. \
+         Production runs TWO such caches per MoE layer (gate_up + down) replaying the \
+         same selected-expert sequence into both — physical event totals are these \
+         figures x2; hit_rate/delta_pp are unaffected (see LayerStats doc comment)."
+    );
     let _ = writeln!(out, "=== overall (all layers) ===");
     let _ = writeln!(
         out,
@@ -749,6 +882,11 @@ mod tests {
             gate_weights: Vec::new(),
             extra: HashMap::new(),
         }
+    }
+
+    /// `VecDeque` has no `PartialEq<Vec<_>>` impl — convert for `assert_eq!`.
+    fn dq(v: &VecDeque<usize>) -> Vec<usize> {
+        v.iter().copied().collect()
     }
 
     // -----------------------------------------------------------------
@@ -955,17 +1093,174 @@ mod tests {
     fn arc_never_exceeds_capacity() {
         let capacity = 3;
         let mut arc = ArcPolicy::new(capacity);
-        // Mixed pattern: repeats, one-offs, and ghost-list churn.
+        // Mixed pattern: repeats, one-offs, and ghost-list churn. One id
+        // per token (begin_token before each) — isolates ARC's ordinary
+        // per-request adaptation from the same-token protection guard
+        // exercised separately below.
         let ids = [
             1, 2, 3, 4, 1, 5, 2, 6, 7, 1, 8, 9, 2, 10, 1, 2, 3, 11, 12, 13,
         ];
         for &id in &ids {
+            arc.begin_token();
             arc.access(id);
             assert!(
                 arc.resident_len() <= capacity,
                 "resident count exceeded capacity after accessing {id}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // BLOCKER regression (review round 1, finding 1): ArcPolicy must not
+    // evict an id resolved earlier in the SAME token. Replays the exact
+    // three-token scenario from the review verdict.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn arc_never_evicts_a_same_token_touched_id() {
+        // capacity = top_k = 2. Token 0 fills t1 = [X, Y] (both cold).
+        // Token 1 re-touches both, promoting them to t2 (p stays 0,
+        // t2 = [X, Y] — Case I hits on both). Token 2 is the hazard: A is
+        // a total miss (Case IV) that evicts an unprotected t2 resident
+        // and lands in t1; B, in the SAME token as A, is also a total
+        // miss — ARC's ordinary per-request algorithm alone would pick
+        // A (t1's sole, and therefore LRU, resident) as B's eviction
+        // victim, which production physically cannot survive: a token's
+        // forward pass encodes every routed expert's GEMV into ONE Metal
+        // command buffer before committing (module doc comment;
+        // moe_expert_cache.rs:47-58, 887-912).
+        let capacity = 2;
+        let mut arc = ArcPolicy::new(capacity);
+        let (x, y, a, b) = (10usize, 20usize, 30usize, 40usize);
+        use AccessOutcome::{Hit, Miss};
+
+        arc.begin_token();
+        assert_eq!(arc.access(x), Miss);
+        assert_eq!(arc.access(y), Miss);
+        assert_eq!(dq(&arc.t1), vec![x, y]);
+
+        arc.begin_token();
+        assert_eq!(arc.access(x), Hit);
+        assert_eq!(arc.access(y), Hit);
+        assert!(
+            arc.t1.is_empty(),
+            "both promoted out of t1 by their 2nd touch"
+        );
+        assert_eq!(
+            dq(&arc.t2),
+            vec![x, y],
+            "both promoted to t2 (frequency-protected)"
+        );
+
+        arc.begin_token();
+        assert_eq!(arc.access(a), Miss);
+        assert_eq!(arc.access(b), Miss);
+        assert_eq!(
+            dq(&arc.t1),
+            vec![a, b],
+            "A must survive B's SAME-token admission — production cannot evict a slot \
+             resolved earlier this token"
+        );
+        assert!(arc.t2.is_empty());
+        assert_eq!(arc.evictions(), 2, "X and Y evicted from t2, not A");
+
+        // Physically-achievable next-token outcome: both A and B, having
+        // survived their shared token, are ordinary cache hits.
+        arc.begin_token();
+        assert_eq!(arc.access(a), Hit);
+        assert_eq!(arc.access(b), Hit);
+    }
+
+    // -----------------------------------------------------------------
+    // Finding 5: hand-computed ARC B1/B2 ghost-hit adaptation trace,
+    // asserting p, T1/T2/B1/B2 contents, and victim choice at each step —
+    // not just the resident-capacity invariant `arc_never_exceeds_capacity`
+    // checks (which a sign-flipped or victim-swapped adaptation could
+    // still satisfy).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn arc_ghost_hit_adaptation_hand_computed() {
+        // capacity=2. One access per token (begin_token before each) —
+        // orthogonal to the same-token guard above; isolates ARC's
+        // ordinary Case I-IV adaptation logic.
+        let capacity = 2;
+        let mut arc = ArcPolicy::new(capacity);
+        use AccessOutcome::{Hit, Miss};
+
+        // t1=[1] (cold miss).
+        arc.begin_token();
+        assert_eq!(arc.access(1), Miss);
+        assert_eq!(dq(&arc.t1), vec![1]);
+
+        // t1=[1,2] (cold miss, cache now full).
+        arc.begin_token();
+        assert_eq!(arc.access(2), Miss);
+        assert_eq!(dq(&arc.t1), vec![1, 2]);
+
+        // Case I (t1 hit): 1 promoted to t2. t1=[2], t2=[1].
+        arc.begin_token();
+        assert_eq!(arc.access(1), Hit);
+        assert_eq!(dq(&arc.t1), vec![2]);
+        assert_eq!(dq(&arc.t2), vec![1]);
+
+        // Case IV (t1_b1 < c, total == c): evicts 2 (t1's only resident)
+        // into b1. t1=[3], t2=[1], b1=[2]. p unchanged by this branch.
+        arc.begin_token();
+        assert_eq!(arc.access(3), Miss);
+        assert_eq!(dq(&arc.t1), vec![3]);
+        assert_eq!(dq(&arc.t2), vec![1]);
+        assert_eq!(dq(&arc.b1), vec![2]);
+        assert_eq!(arc.evictions(), 1);
+        assert_eq!(arc.p, 0);
+
+        // Case I (t2 hit, re-promote 1): no structural change beyond Hit.
+        arc.begin_token();
+        assert_eq!(arc.access(1), Hit);
+
+        // Case II: B1 ghost hit on 2. ratio = (|b2|=0 / |b1|=1).max(1) =
+        // 1. p = (0 + 1).min(2) = 1 — B1 hit must ADAPT p UP (favor t1/
+        // recency). evict_from_t1 = t1.len()(1) > p(1)? false; tie clause
+        // needs triggered_by_b2_hit which is false here -> evict from t2
+        // instead: victim = 1 (t2's only resident) -> b2=[1]. 2 leaves
+        // b1 and is re-admitted into t2 (not t1).
+        arc.begin_token();
+        assert_eq!(arc.access(2), Miss);
+        assert_eq!(arc.p, 1, "B1 ghost hit must increase p toward t1/recency");
+        assert!(arc.b1.is_empty(), "2 must leave b1 once re-admitted");
+        assert_eq!(
+            dq(&arc.t2),
+            vec![2],
+            "2 re-admitted into t2, not t1 (ARC Case II)"
+        );
+        assert_eq!(dq(&arc.t1), vec![3], "t1 untouched by this Case II call");
+        assert_eq!(
+            dq(&arc.b2),
+            vec![1],
+            "evicted victim (1, from t2) becomes a b2 ghost"
+        );
+        assert_eq!(arc.evictions(), 2);
+
+        // Case III: B2 ghost hit on 1. ratio = (|b1|=0 / |b2|=1).max(1) =
+        // 1. p = 1.saturating_sub(1) = 0 — B2 hit must ADAPT p DOWN (favor
+        // t2/frequency). evict_from_t1 = t1.len()(1) > p(0)? true ->
+        // evict t1's only resident (3) into b1. 1 leaves b2 and is
+        // re-admitted into t2.
+        arc.begin_token();
+        assert_eq!(arc.access(1), Miss);
+        assert_eq!(arc.p, 0, "B2 ghost hit must decrease p toward t2/frequency");
+        assert!(arc.b2.is_empty(), "1 must leave b2 once re-admitted");
+        assert_eq!(dq(&arc.t2), vec![2, 1], "1 re-admitted into t2");
+        assert!(
+            arc.t1.is_empty(),
+            "t1's only resident (3) was the Case III victim"
+        );
+        assert_eq!(
+            dq(&arc.b1),
+            vec![3],
+            "evicted victim (3, from t1) becomes a b1 ghost"
+        );
+        assert_eq!(arc.evictions(), 3);
     }
 
     // -----------------------------------------------------------------
@@ -991,10 +1286,69 @@ mod tests {
         // pos=4: gap since A's last touch (pos 1) is 3 > window(2) — NOT
         // admitted, treated as a fresh first touch.
         assert_eq!(policy.access(1), Miss);
-        // pos=5: gap since pos 4 is 1 <= window(2) — admitted now.
+        // pos=5: gap since pos 4 is 1 < window(2) — admitted now.
         assert_eq!(policy.access(1), Miss);
         // pos=6: resident from the previous access — hit.
         assert_eq!(policy.access(1), Hit);
+    }
+
+    // -----------------------------------------------------------------
+    // Finding 2 regression: gap == window is OUTSIDE the sliding window
+    // (off-by-one), not the boundary-inclusive edge.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn freq_admission_gap_equal_to_window_is_not_eligible() {
+        let mut policy = FreqAdmissionPolicy::new(4, 2);
+        use AccessOutcome::{Hit, Miss};
+        assert_eq!(policy.access(1), Miss); // pos=1: A's first touch.
+        assert_eq!(policy.access(2), Miss); // pos=2: filler, unrelated id.
+        // pos=3: gap since A's pos-1 touch is exactly 2 == window. A
+        // 2-access window ending at pos 3 covers positions {2, 3};
+        // position 1 is outside it, so A must NOT be admitted here. With
+        // the old (buggy) `<=` comparator this WOULD admit A.
+        assert_eq!(policy.access(1), Miss);
+        // pos=4: if pos 3 had (incorrectly) admitted A, this would be a
+        // Hit (A already resident). It must be another Miss, proving A
+        // is still not resident after the gap==window touch.
+        assert_eq!(policy.access(1), Miss);
+        // pos=4's own gap (4-3=1 < window) DOES admit A — pos=5 confirms.
+        assert_eq!(policy.access(1), Hit);
+    }
+
+    // -----------------------------------------------------------------
+    // Finding 1 audit (per its closing instruction: "Do the same audit
+    // for every future non-LRU policy"): FreqAdmissionPolicy needs no
+    // explicit same-token guard — proof trace for the struct doc
+    // comment's claim.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn freq_admission_never_evicts_a_same_token_touched_id_without_an_explicit_guard() {
+        let capacity = 2;
+        let window = 100;
+        let records = vec![
+            record(0, 0, &[100]),      // P: first touch
+            record(0, 1, &[200]),      // Q: first touch
+            record(0, 2, &[100]),      // P: admitted
+            record(0, 3, &[200]),      // Q: admitted -> resident = {P, Q}, cache full
+            record(0, 4, &[300]),      // A: first touch
+            record(0, 5, &[400]),      // B: first touch
+            record(0, 6, &[300, 400]), // SAME token: A then B, both admitted here
+        ];
+        let mut policy = FreqAdmissionPolicy::new(capacity, window);
+        for r in &records {
+            policy.begin_token();
+            for &id in &r.selected_ids {
+                policy.access(id);
+            }
+        }
+        assert!(
+            policy.resident.contains(&300) && policy.resident.contains(&400),
+            "A (300) and B (400), both touched in the SAME final token, must both \
+             survive that token"
+        );
+        assert_eq!(policy.evictions(), 2, "P and Q evicted, not A or B");
     }
 
     #[test]
@@ -1028,6 +1382,100 @@ mod tests {
         };
         let err = run_simulation(&layers, &cfg, &[PolicySpec::Lru]).unwrap_err();
         assert!(err.contains("num_slots"), "unexpected error: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Finding 3 regression: zero-valued sizing inputs must fail closed as
+    // an ordinary simulation error, not a policy-constructor panic.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn run_simulation_rejects_zero_num_slots() {
+        let layers = vec![(0usize, vec![record(0, 0, &[])])];
+        let cfg = SimConfig {
+            num_slots: 0,
+            top_k: 0,
+        };
+        let err = run_simulation(&layers, &cfg, &[PolicySpec::Lru]).unwrap_err();
+        assert!(err.contains("num_slots"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn run_simulation_rejects_zero_top_k() {
+        let layers = vec![(0usize, vec![record(0, 0, &[])])];
+        let cfg = SimConfig {
+            num_slots: 4,
+            top_k: 0,
+        };
+        let err = run_simulation(&layers, &cfg, &[PolicySpec::Lru]).unwrap_err();
+        assert!(err.contains("top_k"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn run_simulation_rejects_zero_num_slots_and_top_k_together() {
+        // The exact failure scenario from the review verdict: a one-record
+        // trace with `selected_ids: []` and `--num-slots 0 --top-k 0`.
+        let layers = vec![(0usize, vec![record(0, 0, &[])])];
+        let cfg = SimConfig {
+            num_slots: 0,
+            top_k: 0,
+        };
+        let err = run_simulation(&layers, &cfg, &[PolicySpec::Lru]).unwrap_err();
+        assert!(err.contains("num_slots"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn run_simulation_rejects_zero_freq_admission_window() {
+        let layers = vec![(0usize, vec![record(0, 0, &[1])])];
+        let cfg = SimConfig {
+            num_slots: 4,
+            top_k: 1,
+        };
+        let err = run_simulation(
+            &layers,
+            &cfg,
+            &[PolicySpec::Lru, PolicySpec::FreqAdmission { window: 0 }],
+        )
+        .unwrap_err();
+        assert!(err.contains("window"), "unexpected error: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Finding 4 regression: reported raw counts are per single LOGICAL
+    // cache, not the two physical ExpertSlotCache instances (gate_up +
+    // down) production runs per layer.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn overall_stats_are_per_single_logical_cache_not_physical_two_cache_totals() {
+        // Cold one-layer, one-token, one-expert trace: production would
+        // perform this exact miss in BOTH the gate_up and down
+        // ExpertSlotCache for this layer (identical selected_ids
+        // sequence) — two physical misses. This simulator models one
+        // logical cache per layer, so it reports ONE.
+        let layers = vec![(0usize, vec![record(0, 0, &[42])])];
+        let cfg = SimConfig {
+            num_slots: 1,
+            top_k: 1,
+        };
+        let reports = run_simulation(&layers, &cfg, &[PolicySpec::Lru]).unwrap();
+        assert_eq!(
+            reports[0].overall.misses, 1,
+            "logical single-cache count, not the physical x2 production performs"
+        );
+        assert_eq!(reports[0].overall.hits, 0);
+        assert_eq!(
+            reports[0].overall.evictions, 0,
+            "first-ever access into an empty slot pool is never an eviction"
+        );
+
+        // Forced eviction: capacity=1, two distinct ids across two
+        // tokens — one logical eviction here; production performs this
+        // same eviction independently in both its gate_up and down
+        // caches (physical x2, logical x1).
+        let layers2 = vec![(0usize, vec![record(0, 0, &[1]), record(0, 1, &[2])])];
+        let reports2 = run_simulation(&layers2, &cfg, &[PolicySpec::Lru]).unwrap();
+        assert_eq!(reports2[0].overall.evictions, 1);
     }
 
     #[test]
