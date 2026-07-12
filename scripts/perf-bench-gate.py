@@ -15,7 +15,10 @@ Usage:
 
 Exit codes:
   0 — pass (no gated FAILs)
-  1 — at least one gated FAIL (regression > 7% confirmed by 95% CI)
+  1 — at least one gated FAIL (regression > 7%, using the LOWER bound of
+      Criterion's two-sided 95% CI as a one-sided cutoff — see the
+      WARN_PCT/FAIL_PCT note below for the actual one-sided confidence
+      level this implies, which is tighter than "95%")
   2 — parse error / bad input
 
 --informational-groups-file (lattice#714): quick-mode Criterion runs on
@@ -40,6 +43,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Thresholds — ADR-058 §D3. Edit here; the workflow imports nothing else.
+#
+# Precision note (bench-gate math audit, finding #4): `ci_low`/`ci_high` are
+# Criterion's own TWO-SIDED 95% CI endpoints. Using `ci_low` as a one-sided
+# FAIL cutoff is directionally sound (a slowdown is a one-sided hypothesis,
+# and gating on the lower endpoint of a two-sided interval can only be MORE
+# conservative than a properly-computed one-sided 95% bound, never less —
+# assuming Criterion's CI is symmetric two-sided at 0.95, `ci_low` sits at
+# roughly a 97.5%-one-sided-confidence level, not 95%). This raises the bar
+# for FAIL (fewer true positives caught), never lowers it, so it cannot by
+# itself produce a false FAIL — but "regression >7% confirmed by 95% CI" in
+# this module's docstring/comments overstates precision and should be read
+# as "confirmed at approximately a 97.5% one-sided level via the two-sided
+# 95% CI's lower bound," not a calibrated one-sided-95% test. Verify against
+# the `criterion` crate's own CI-construction source before relying on the
+# exact number if it ever matters (not independently checked here).
 WARN_PCT = 3.0   # CI-lower above this => warning
 FAIL_PCT = 7.0   # CI-lower above this => FAIL
 CELEBRATE_PCT = -3.0  # point estimate below this AND CI-upper<0 => celebrate
