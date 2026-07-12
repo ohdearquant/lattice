@@ -83,6 +83,11 @@ pub use detokenize::bytes_to_unicode;
 // Needed by all generate paths (cpu_q8, cpu_f16, neon_forward, batch_prefill)
 // and by tests. `pub(crate)` keeps it out of the public API surface.
 pub(crate) use generation::should_stop_token;
+// Public raw generation-lifecycle observer event, consumed by
+// `--emit-phase-events` in `qwen35_generate.rs` via
+// `Qwen35Model::generate_streaming_with_observer` (benchmark-overhaul row 2,
+// codex round-1 blocker #1).
+pub use generation::RawGenEvent;
 
 /// Exposed for consumers that need to drive a per-layer coverage check
 /// over a Qwen3.5 checkpoint without going through the model loader —

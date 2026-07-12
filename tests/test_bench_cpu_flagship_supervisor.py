@@ -20,9 +20,12 @@ Run with: python3 -m pytest tests/test_bench_cpu_flagship_supervisor.py -v
 from __future__ import annotations
 
 import importlib.util
+import os
 import statistics
 import sys
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -98,8 +101,12 @@ def write_fake_child(
     # separator must be a bare "\n", not "\n    ", or every line after the
     # first ends up with a mismatched leading indent and the generated
     # child script fails to parse.
+    # token_index is 1-based (matching the real binary's contract and
+    # `bench_decode_harness.parse_phase_event`'s `token_index >= 1`
+    # requirement -- `_validate_trial_trace` now runs `parse_phase_event`
+    # over every event `run_one_trial` returns, including this fixture's).
     token_lines = "\n".join(
-        f'emit(\'@@bench {{"ev":"phase","name":"token_available","monotonic_ns":%d,"token_index":{i}}}\' % ns({prefill_end_ms + (i + 1) * token_gap_ms}))'
+        f'emit(\'@@bench {{"ev":"phase","name":"token_available","monotonic_ns":%d,"token_index":{i + 1}}}\' % ns({prefill_end_ms + (i + 1) * token_gap_ms}))'
         for i in range(n_tokens)
     )
     text = _FAKE_CHILD_TEMPLATE.format(
@@ -221,6 +228,277 @@ class FakeChildTrialTest(unittest.TestCase):
                 sampler=sampler,
                 timeout_s=10.0,
             )
+
+
+def _run_with_bound(fn, bound_s: float):
+    """Runs `fn()` on a background daemon thread and joins it with a hard
+    wall-clock bound. A genuine regression of the timeout/reap fix (e.g.
+    dropping `proc.kill()` on the timeout path) does not merely make
+    `run_one_trial` slow -- it deadlocks it forever (the reader thread's
+    blocking `read()` holds the stdlib io object's internal lock, so the
+    main thread's later `proc.stdout.close()` blocks waiting for that same
+    lock, and the lock never releases because the un-killed child never
+    sends EOF). Calling `run_one_trial` directly from the test body would
+    therefore hang the ENTIRE test process on a regression, defeating the
+    purpose of a test that is supposed to catch it. Running it on a joined,
+    bounded, daemon thread instead means a regression shows up as a clean,
+    prompt test FAILURE ("did not complete within Ns") instead of a wedged
+    CI job -- the outer test process itself is never at risk of hanging.
+    Returns `(completed: bool, result, exc)`.
+    """
+    result_holder: list = []
+    exc_holder: list = []
+
+    def _target():
+        try:
+            result_holder.append(fn())
+        except BaseException as exc:  # noqa: BLE001 -- captured for the joining thread to inspect
+            exc_holder.append(exc)
+
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout=bound_s)
+    completed = not t.is_alive()
+    result = result_holder[0] if result_holder else None
+    exc = exc_holder[0] if exc_holder else None
+    return completed, result, exc
+
+
+class RunOneTrialTimeoutAndReapTest(unittest.TestCase):
+    """Covers codex round-1 major: `timeout_s` must actually bound a child
+    that hangs with its stdout pipe still open, and the killed child must
+    be reaped (never left a zombie/leaked process), and a child that fills
+    its stderr pipe while holding stdout open must not deadlock the
+    parent (fixed by concurrent background-thread draining of both pipes
+    instead of a single blocking `for raw_line in proc.stdout` loop)."""
+
+    def setUp(self):
+        import tempfile
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def test_hanging_child_times_out_and_is_reaped(self):
+        # A silent child: no @@bench output at all, sleeps far longer than
+        # the trial's timeout, with stdout left open the whole time -- the
+        # exact shape that could never reach the pre-fix code's
+        # `proc.wait(timeout=...)` call because the blocking stdout-read
+        # loop ran first and never returned. Sleeps long enough that if
+        # the fix regresses and the child is never killed, this test's own
+        # bounded join (not the child's sleep) is what ends the test.
+        pid_file = Path(self._tmpdir.name) / "child.pid"
+        hang = Path(self._tmpdir.name) / "hang_child.py"
+        # `exec`-based shims (like every other fake child in this file)
+        # replace the shell process image in place, so the shim's own pid
+        # IS the actual running child's pid -- the hang child records its
+        # own pid via os.getpid() before sleeping, no extra process-tree
+        # bookkeeping needed.
+        hang.write_text(
+            f"import os, time\n"
+            f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+            f"time.sleep(120)\n"
+        )
+        shim = Path(self._tmpdir.name) / "hang_shim.sh"
+        shim.write_text(f"#!/bin/sh\nexec {sys.executable} {hang} \"$@\"\n")
+        shim.chmod(0o755)
+
+        sampler = supervisor.RusageSampler()
+        completed, _result, exc = _run_with_bound(
+            lambda: supervisor.run_one_trial(
+                binary=shim,
+                model_dir=Path("/fake/model"),
+                context=1,
+                max_tokens=1,
+                warmup_tokens=0,
+                seed=1,
+                sampler=sampler,
+                timeout_s=2.0,
+            ),
+            bound_s=30.0,
+        )
+        self.assertTrue(completed, "run_one_trial did not honor timeout_s for a hanging child (it hung instead)")
+        self.assertIsInstance(exc, supervisor.TrialFailure)
+
+        # Confirmed reaped: the child process (an `exec`-based shim, so its
+        # pid IS the actual sleeping python process, recorded via its own
+        # os.getpid()) must no longer exist. `os.kill(pid, 0)` raises
+        # ProcessLookupError once a pid is fully reaped/gone; it never
+        # raises for a pid that is still alive (or a zombie still
+        # occupying the process table).
+        if pid_file.exists():
+            child_pid = int(pid_file.read_text().strip())
+            deadline = time.monotonic() + 5.0
+            reaped = False
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    reaped = True
+                    break
+                time.sleep(0.1)
+            self.assertTrue(reaped, f"child pid {child_pid} was never reaped after timeout")
+
+    def test_stderr_filling_child_does_not_deadlock(self):
+        # Writes far more to stderr than a typical OS pipe buffer (64KB on
+        # macOS) while stdout stays open and silent, then exits cleanly.
+        # Without concurrent stderr draining, the child blocks on its own
+        # full stderr pipe, the parent is blocked reading stdout, and
+        # neither side ever makes progress.
+        noisy = Path(self._tmpdir.name) / "noisy_child.py"
+        noisy.write_text(
+            "import sys\n"
+            "for _ in range(20000):\n"
+            "    sys.stderr.write('x' * 100 + '\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.exit(0)\n"
+        )
+        shim = Path(self._tmpdir.name) / "noisy_shim.sh"
+        shim.write_text(f"#!/bin/sh\nexec {sys.executable} {noisy} \"$@\"\n")
+        shim.chmod(0o755)
+
+        sampler = supervisor.RusageSampler()
+        # This child never emits a @@bench summary line, so run_one_trial
+        # is expected to fail closed (no summary) -- the point of this
+        # test is that it fails PROMPTLY (no deadlock), not what it fails
+        # with. Bounded the same way as the hang test: a deadlock
+        # regression here must not be able to wedge the whole test run.
+        completed, _result, exc = _run_with_bound(
+            lambda: supervisor.run_one_trial(
+                binary=shim,
+                model_dir=Path("/fake/model"),
+                context=1,
+                max_tokens=1,
+                warmup_tokens=0,
+                seed=1,
+                sampler=sampler,
+                timeout_s=15.0,
+            ),
+            bound_s=20.0,
+        )
+        self.assertTrue(completed, "run_one_trial deadlocked on a stderr-filling child")
+        self.assertIsInstance(exc, supervisor.TrialFailure)
+
+
+def _phase_events_dicts(
+    *,
+    load_start_ns=0,
+    backend_ready_ns=10_000_000,
+    prefill_start_ns=10_000_000,
+    prefill_end_ns=20_000_000,
+    token_gap_ns=5_000_000,
+    n_tokens=4,
+    token_indices=None,
+) -> list[dict]:
+    """Builds the `run_one_trial`-shaped raw phase-event dict list (the
+    exact shape `_validate_trial_trace` consumes: name/child_ns/token_index/
+    parent_ns) in normal, valid, arrival order. `token_indices`, when given,
+    overrides the default contiguous 1..n_tokens sequence -- used to
+    construct reversed/duplicate/gapped malformed traces for the rejection
+    tests below."""
+    indices = token_indices if token_indices is not None else list(range(1, n_tokens + 1))
+    events = [
+        {"name": "load_start", "child_ns": load_start_ns, "token_index": None, "parent_ns": load_start_ns},
+        {"name": "backend_ready", "child_ns": backend_ready_ns, "token_index": None, "parent_ns": backend_ready_ns},
+        {"name": "prefill_start", "child_ns": prefill_start_ns, "token_index": None, "parent_ns": prefill_start_ns},
+        {"name": "prefill_end", "child_ns": prefill_end_ns, "token_index": None, "parent_ns": prefill_end_ns},
+    ]
+    t = prefill_end_ns
+    for idx in indices:
+        t += token_gap_ns
+        events.append({"name": "token_available", "child_ns": t, "token_index": idx, "parent_ns": t})
+    return events
+
+
+def _valid_summary(n_tokens=4, *, delta_matches=True) -> dict:
+    return {
+        "prompt_tokens": 512,
+        "generated_tokens": n_tokens,
+        "requested_max_tokens": n_tokens,
+        "delta_matches_generated_tokens": delta_matches,
+        "stopped": "length",
+    }
+
+
+class TrialTraceValidationTest(unittest.TestCase):
+    """Direct unit tests of `_validate_trial_trace` -- the always-on, every-
+    trial, pre-aggregation trace validator added for codex round-1 blocker
+    #2 ("the supervisor accepts malformed phase traces ... reorders token
+    events, and therefore lets the n=2 demonstration validate without
+    proving its measurement boundary"). Each rejection case here is one
+    codex explicitly asked for by name; every one must raise
+    `supervisor.TrialFailure`, never silently repair the trace."""
+
+    def test_valid_trace_passes(self):
+        events = _phase_events_dicts(n_tokens=4)
+        supervisor._validate_trial_trace(events, _valid_summary(4), "t")  # must not raise
+
+    def test_reversed_token_events_rejected(self):
+        events = _phase_events_dicts(n_tokens=4)
+        # Reverse only the token_available tail (the four raw dicts appended
+        # after the four single-shot phases), preserving load/backend/
+        # prefill order -- this is the "in-memory trace with its four token
+        # events reversed" case codex reported the pre-fix code accepted.
+        head, tail = events[:4], events[4:]
+        supervisor_events = head + list(reversed(tail))
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(supervisor_events, _valid_summary(4), "t")
+
+    def test_repeated_single_shot_phase_rejected(self):
+        events = _phase_events_dicts(n_tokens=1)
+        events.insert(1, dict(events[0]))  # duplicate load_start
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(events, _valid_summary(1), "t")
+
+    def test_missing_required_phase_rejected(self):
+        events = [e for e in _phase_events_dicts(n_tokens=1) if e["name"] != "prefill_end"]
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(events, _valid_summary(1), "t")
+
+    def test_decreasing_timestamp_rejected(self):
+        events = _phase_events_dicts(n_tokens=1)
+        # Force backend_ready's own child_ns before load_start's.
+        events[1] = dict(events[1], child_ns=-1)
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(events, _valid_summary(1), "t")
+
+    def test_duplicate_token_index_rejected(self):
+        events = _phase_events_dicts(n_tokens=3, token_indices=[1, 2, 2])
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(events, _valid_summary(3), "t")
+
+    def test_gapped_token_index_rejected(self):
+        # Strictly increasing (passes _validate_phase_sequence's own check)
+        # but not contiguous from 1 -- the explicit contiguity check added
+        # on top of the reused harness validator must catch this.
+        events = _phase_events_dicts(n_tokens=3, token_indices=[1, 3, 4])
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(events, _valid_summary(3), "t")
+
+    def test_delta_matches_generated_tokens_false_rejected(self):
+        events = _phase_events_dicts(n_tokens=4)
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(events, _valid_summary(4, delta_matches=False), "t")
+
+    def test_summary_event_count_mismatch_rejected(self):
+        # "a summary claiming 9 generated tokens with only 4 events" --
+        # codex's own reported false-accept.
+        events = _phase_events_dicts(n_tokens=4)
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(events, _valid_summary(9), "t")
+
+    def test_underpowered_record_still_gets_trace_validated(self):
+        """Proves the fix for the second half of blocker #2: trace
+        validation now runs unconditionally inside `run_one_trial`, well
+        before `main()`'s later `verdict = "unsupported"` downgrade
+        decision even exists -- so an n=2 demonstration record's trial
+        traces ARE validated, unlike the pre-fix path where
+        `validate_run_record`'s `_validate_phase_sequence` call was itself
+        skipped for `verdict == "unsupported"` records. A malformed trace
+        from what will become an unsupported-verdict session must still be
+        rejected at `run_one_trial` time."""
+        events = _phase_events_dicts(n_tokens=2, token_indices=[2, 1])  # reversed, tiny n
+        with self.assertRaises(supervisor.TrialFailure):
+            supervisor._validate_trial_trace(events, _valid_summary(2), "underpowered-demo-trial")
 
 
 # ---------------------------------------------------------------------------

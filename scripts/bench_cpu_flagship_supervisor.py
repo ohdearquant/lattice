@@ -66,6 +66,7 @@ import ctypes.util
 import hashlib
 import importlib.util
 import json
+import os
 import platform
 import random
 import statistics
@@ -298,6 +299,162 @@ class TrialFailure(RuntimeError):
     trial."""
 
 
+def _validate_trial_trace(phase_events: list[dict], summary: dict, trial_label: str) -> None:
+    """Validates ONE trial's raw phase-event trace in the EXACT order the
+    child printed it to stdout, before any aggregation, sorting, or
+    verdict-downgrade decision ever touches it (codex round-1 blocker #2).
+
+    The pre-fix supervisor accepted a malformed trace outright: it
+    `sorted()`-ed `token_available` records by `token_index` before this
+    point in the pipeline (masking an out-of-order stream instead of
+    rejecting it), derived `generated_tokens` from the observed event
+    count instead of cross-checking the child's own `summary`, and, most
+    seriously, skipped ALL of this for an underpowered/"unsupported"
+    record -- `validate_run_record`'s `_validate_phase_sequence` check
+    only runs for non-"unsupported" verdicts, so the PR's actual `n=2`
+    demonstration evidence was never validated by anything. Calling this
+    from `run_one_trial` for EVERY trial, unconditionally, closes that
+    gap structurally: the verdict-downgrade decision happens much later,
+    in `main()`, long after every trial this session ran has already
+    passed (or failed) this check.
+
+    Never sorts to repair: raises `TrialFailure` (fail-closed) at the
+    first structural violation found while walking the trace in arrival
+    order, not after silently reordering it into something that validates.
+    """
+    if not phase_events:
+        raise TrialFailure(f"{trial_label}: no phase_events observed")
+
+    try:
+        parsed = tuple(
+            harness.parse_phase_event(
+                {"name": e["name"], "monotonic_ns": e["child_ns"], "token_index": e["token_index"]}
+            )
+            for e in phase_events
+        )
+    except harness.RunRecordValidationError as exc:
+        raise TrialFailure(f"{trial_label}: malformed phase event: {exc}") from exc
+
+    # Reuses PR #877's own load->backend_ready->prefill_start->prefill_end->
+    # token_available(+) sequence validator -- exactly one ordered
+    # single-shot phase each, monotonic_ns non-decreasing, phase rank
+    # non-decreasing, token_index strictly increasing -- against the RAW
+    # arrival-order sequence, never a sorted copy. Reusing it here (rather
+    # than re-deriving the same order/monotonicity rules a second time)
+    # is exactly the kind of duplicated-invariant drift that let this
+    # trace go unchecked in the first place: the supervisor and the
+    # validator each had their own, inconsistent idea of "in order".
+    try:
+        harness._validate_phase_sequence(parsed, trial_label)  # noqa: SLF001 -- deliberate reuse, see docstring
+    except harness.RunRecordValidationError as exc:
+        raise TrialFailure(f"{trial_label}: {exc}") from exc
+
+    # `_validate_phase_sequence` only enforces STRICTLY INCREASING
+    # token_index (1, 3, 4 would pass it), not contiguity. A gapped index
+    # sequence (a dropped/duplicated raw event that still happens to leave
+    # the remainder strictly increasing, and whose count coincidentally
+    # still equals the summary's `generated_tokens`) would otherwise sail
+    # through both that check and the count-equality check below.
+    # `token_available` events must therefore additionally be exactly
+    # 1, 2, ..., N in arrival order -- the real binary's own contract
+    # (first sampled token is index 1) -- checked here explicitly.
+    token_indices = [e.token_index for e in parsed if e.name == "token_available"]
+    expected_indices = list(range(1, len(token_indices) + 1))
+    if token_indices != expected_indices:
+        raise TrialFailure(
+            f"{trial_label}: token_available token_index sequence {token_indices} is not "
+            f"contiguous from 1 (expected {expected_indices}) -- a gapped or duplicated raw "
+            "token stream does not prove one phase event per generated token"
+        )
+
+    observed_tokens = sum(1 for e in parsed if e.name == "token_available")
+    reported_tokens = summary.get("generated_tokens")
+    if isinstance(reported_tokens, bool) or not isinstance(reported_tokens, int):
+        raise TrialFailure(f"{trial_label}: summary generated_tokens is not an int: {reported_tokens!r}")
+    if observed_tokens != reported_tokens:
+        raise TrialFailure(
+            f"{trial_label}: observed {observed_tokens} token_available phase events but the "
+            f"summary reports generated_tokens={reported_tokens} -- the phase-event trace does not "
+            "prove the summary's own token count"
+        )
+    if summary.get("delta_matches_generated_tokens") is False:
+        raise TrialFailure(
+            f"{trial_label}: summary delta_matches_generated_tokens=false -- the child's own "
+            "text-delta accounting disagrees with its generated token count"
+        )
+
+
+def _drain_stdout_lines(
+    proc: subprocess.Popen,
+    monitor: ResourceMonitor,
+    phase_events: list[dict],
+    summary_holder: list[dict],
+    error_holder: list[str],
+) -> None:
+    """Runs in a background thread for the lifetime of the child: reads and
+    parses `@@bench ` lines from `proc.stdout` as they arrive, appending to
+    `phase_events` / `summary_holder` (both mutated in place -- safe under
+    the GIL for a single-appender list). Any parse error is recorded into
+    `error_holder` instead of raised: an exception raised inside a
+    non-daemon-joined background thread is silently swallowed by the
+    interpreter, so the main thread must observe failures through this
+    list after joining, not via a try/except around the thread itself
+    (codex round-1 major #1: the old code did this inline on the MAIN
+    thread via a blocking `for raw_line in proc.stdout`, which is exactly
+    why a hung child with stdout still open could never reach the
+    `proc.wait(timeout=...)` below it -- moving it here, running
+    concurrently with `proc.wait`, is what makes the timeout enforceable).
+    """
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            if not line.startswith(BENCH_LINE_PREFIX):
+                continue
+            parent_ns = time.monotonic_ns()
+            try:
+                payload = json.loads(line[len(BENCH_LINE_PREFIX) :])
+            except json.JSONDecodeError as exc:
+                error_holder.append(f"malformed @@bench line: {line!r} ({exc})")
+                continue
+            ev = payload.get("ev")
+            if ev == "phase":
+                name = payload.get("name")
+                phase_events.append(
+                    {
+                        "name": name,
+                        "child_ns": payload.get("monotonic_ns"),
+                        "token_index": payload.get("token_index"),
+                        "parent_ns": parent_ns,
+                    }
+                )
+                if name in PHASE_EVENT_NAMES:
+                    monitor.record_phase(name)
+            elif ev == "summary":
+                summary_holder.append(payload)
+    except Exception as exc:  # noqa: BLE001 -- surfaced via error_holder, never raised in-thread
+        error_holder.append(f"stdout reader crashed: {exc!r}")
+
+
+def _drain_stderr_chunks(proc: subprocess.Popen, chunks: list[str]) -> None:
+    """Runs in a background thread for the lifetime of the child, draining
+    `proc.stderr` concurrently with the stdout reader and `proc.wait`.
+    Without this, a child that fills the OS pipe buffer writing to stderr
+    (while the parent is busy blocked elsewhere) can deadlock: the child
+    blocks on its own stderr write, the parent never reads it because it
+    is blocked on stdout/wait, and neither side makes progress
+    (codex round-1 major #1's "drain stderr concurrently" requirement)."""
+    try:
+        assert proc.stderr is not None
+        for chunk in proc.stderr:
+            chunks.append(chunk)
+    except Exception:  # noqa: BLE001 -- best-effort drain, never fatal to the trial
+        pass
+
+
+_READER_JOIN_TIMEOUT_S = 5.0
+
+
 def run_one_trial(
     binary: Path,
     model_dir: Path,
@@ -310,10 +467,21 @@ def run_one_trial(
 ) -> dict:
     """Spawns exactly one fresh `qwen35_generate --emit-phase-events` child
     (DESIGN.md: "a fresh child process per trial session"), streams its
-    `@@bench ` lines as they arrive, and returns the raw
+    `@@bench ` lines as they arrive on background reader threads (see
+    `_drain_stdout_lines` / `_drain_stderr_chunks`), and returns the raw
     phase_events/summary/resource_samples for `compute_trial_metrics` to
-    aggregate. Raises `TrialFailure` on any non-zero exit or malformed/
-    incomplete output -- callers must not treat a partial trial as valid.
+    aggregate. Raises `TrialFailure` on any non-zero exit, a timeout, or
+    malformed/incomplete/inconsistent output (see `_validate_trial_trace`)
+    -- callers must not treat a partial trial as valid.
+
+    Deadline-aware and reaping: `proc.wait(timeout=timeout_s)` runs on the
+    MAIN thread while the two reader threads above drain stdout/stderr
+    concurrently, so a child that hangs with its pipes still open cannot
+    starve the timeout the way a blocking `for raw_line in proc.stdout`
+    (the pre-fix code) did. On timeout the child is killed and reaped
+    (`proc.wait()` again, after `kill()`) before this function returns or
+    raises -- never left as a leaked/zombie process (codex round-1 major
+    #1).
     """
     cmd = [
         str(binary),
@@ -333,52 +501,63 @@ def run_one_trial(
     monitor = ResourceMonitor(sampler, proc.pid)
     monitor.start()
     phase_events: list[dict] = []
-    summary: dict | None = None
+    summary_holder: list[dict] = []
+    stdout_errors: list[str] = []
+    stderr_chunks: list[str] = []
+
+    stdout_thread = threading.Thread(
+        target=_drain_stdout_lines,
+        args=(proc, monitor, phase_events, summary_holder, stdout_errors),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(target=_drain_stderr_chunks, args=(proc, stderr_chunks), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    timed_out = False
     try:
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            line = raw_line.rstrip("\n")
-            if not line.startswith(BENCH_LINE_PREFIX):
-                continue
-            parent_ns = time.monotonic_ns()
-            try:
-                payload = json.loads(line[len(BENCH_LINE_PREFIX) :])
-            except json.JSONDecodeError as exc:
-                raise TrialFailure(f"malformed @@bench line: {line!r} ({exc})") from exc
-            ev = payload.get("ev")
-            if ev == "phase":
-                name = payload["name"]
-                phase_events.append(
-                    {
-                        "name": name,
-                        "child_ns": payload["monotonic_ns"],
-                        "token_index": payload.get("token_index"),
-                        "parent_ns": parent_ns,
-                    }
-                )
-                if name in PHASE_EVENT_NAMES:
-                    monitor.record_phase(name)
-            elif ev == "summary":
-                summary = payload
         returncode = proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        try:
+            returncode = proc.wait(timeout=_READER_JOIN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            # SIGKILL delivery is not instantaneous under extreme scheduler
+            # contention; give the kernel one more bounded window to reap it
+            # rather than looping forever.
+            returncode = proc.wait(timeout=_READER_JOIN_TIMEOUT_S)
     finally:
         monitor.stop()
-        if proc.stdout is not None:
-            proc.stdout.close()
 
-    stderr_text = proc.stderr.read() if proc.stderr is not None else ""
+    # The reader threads exit on EOF, which only happens once the (now
+    # killed, if this trial timed out) child has actually closed its
+    # pipes. Bound the join so a wedged OS pipe can never hang this call
+    # indefinitely even after the child process itself is confirmed reaped.
+    stdout_thread.join(timeout=_READER_JOIN_TIMEOUT_S)
+    stderr_thread.join(timeout=_READER_JOIN_TIMEOUT_S)
+    if proc.stdout is not None:
+        proc.stdout.close()
     if proc.stderr is not None:
         proc.stderr.close()
 
+    stderr_text = "".join(stderr_chunks)
+    trial_label = f"context={context} seed={seed} pid={proc.pid}"
+
+    if timed_out:
+        raise TrialFailure(
+            f"{trial_label}: child timed out after {timeout_s}s and was killed; "
+            f"stderr tail: {stderr_text.strip()[-2000:]}"
+        )
+    if stdout_errors:
+        raise TrialFailure(f"{trial_label}: {stdout_errors[0]}")
     if returncode != 0:
-        raise TrialFailure(f"child exited {returncode}: {stderr_text.strip()[-2000:]}")
+        raise TrialFailure(f"{trial_label}: child exited {returncode}: {stderr_text.strip()[-2000:]}")
+    summary = summary_holder[-1] if summary_holder else None
     if summary is None:
-        raise TrialFailure(f"child produced no @@bench summary line (stderr: {stderr_text.strip()[-2000:]})")
-    for required_name in ("load_start", "backend_ready", "prefill_start", "prefill_end"):
-        if not any(e["name"] == required_name for e in phase_events):
-            raise TrialFailure(f"child never emitted required phase event {required_name!r}")
-    if not any(e["name"] == "token_available" for e in phase_events):
-        raise TrialFailure("child emitted no token_available events")
+        raise TrialFailure(f"{trial_label}: child produced no @@bench summary line (stderr: {stderr_text.strip()[-2000:]})")
+
+    _validate_trial_trace(phase_events, summary, trial_label)
 
     return {
         "phase_events": phase_events,
@@ -446,15 +625,30 @@ def compute_trial_metrics(trial: dict) -> dict:
     prefill_start = _first_phase_ns(events, "prefill_start")
     prefill_end = _first_phase_ns(events, "prefill_end")
 
-    token_events = sorted(
-        (e for e in events if e["name"] == "token_available"),
-        key=lambda e: e["token_index"],
-    )
+    # Arrival order, never sorted-to-repair: `_validate_trial_trace` (run
+    # inside `run_one_trial`, BEFORE this function ever sees the trial) has
+    # already proven `token_index` is strictly contiguous in stdout arrival
+    # order for every trial reaching this point, so re-sorting here would
+    # only ever mask a bug in that guarantee rather than fix real data
+    # (codex round-1 blocker #2: sorting here previously accepted a
+    # reversed/out-of-order stream by silently repairing it).
+    token_events = [e for e in events if e["name"] == "token_available"]
     if not token_events:
         raise TrialFailure("no token_available events observed")
 
     prompt_tokens = summary["prompt_tokens"]
-    generated_tokens = len(token_events)
+    # Trust the child's own summary count -- it is what `--emit-phase-events`
+    # asserts equals `GenerateOutput.generated_tokens` before printing it
+    # (see `qwen35_generate.rs`) -- rather than re-deriving it from the
+    # observed event count. `_validate_trial_trace` already enforced these
+    # are equal for every trial before this function runs; this is a
+    # defensive re-check, not the primary source of truth.
+    generated_tokens = summary["generated_tokens"]
+    if generated_tokens != len(token_events):
+        raise TrialFailure(
+            f"generated_tokens mismatch survived trace validation: summary={generated_tokens} "
+            f"observed_token_events={len(token_events)}"
+        )
 
     load_ms = (backend_ready - load_start) / 1e6
 

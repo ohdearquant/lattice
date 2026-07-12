@@ -406,16 +406,59 @@ impl Qwen35Model {
     /// `stopped: false, stop_reason: Some(StopReason::Interrupt)` — a
     /// cancellation is not an OpenAI "stop condition", matching the Metal
     /// contract exactly.
+    ///
+    /// Thin wrapper over [`Self::generate_streaming_with_observer`] with a
+    /// no-op raw-event observer, so every existing caller (production
+    /// serving paths, tests) keeps this exact 4-argument signature and zero
+    /// behavior change.
     pub fn generate_streaming_with_cancel<F, C>(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<GenerateOutput, InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.generate_streaming_with_observer(prompt, gen_cfg, on_token, should_cancel, |_| {})
+    }
+
+    /// [`Self::generate_streaming_with_cancel`] plus a raw generation-lifecycle
+    /// observer (benchmark-overhaul row 2, codex round-1 blocker #1): fires
+    /// [`RawGenEvent::PrefillEnd`] once, after the prefill forward pass has
+    /// produced logits and *before* the first token is sampled, and
+    /// [`RawGenEvent::RawToken`] once per token that actually becomes part of
+    /// `GenerateOutput` (both the prefill-derived first token and every
+    /// decode-loop token), in generation order, with a 1-based
+    /// monotonically-increasing `index` equal to `generated_ids.len()` at
+    /// the moment of firing.
+    ///
+    /// This is deliberately independent of `on_token`'s text deltas: the
+    /// incremental UTF-8 detokenizer buffers incomplete multi-byte
+    /// codepoints, so one text delta is not guaranteed to equal one sampled
+    /// token, and `prefill_end` measured off the first delta would fire
+    /// *after* sampling rather than before it. `on_raw_event` fires exactly
+    /// at the raw-token boundary and is unaffected by detokenizer buffering,
+    /// so a caller measuring prefill/decode timing (`--emit-phase-events` in
+    /// `qwen35_generate.rs`) gets an event count that always equals
+    /// `GenerateOutput.generated_tokens` by construction: it is fired from
+    /// the exact same `push` control-flow point that increments
+    /// `generated_ids`, never from a step that grammar-stops or EOS-stops
+    /// before the token is pushed.
+    pub fn generate_streaming_with_observer<F, C, O>(
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
         mut on_token: F,
         mut should_cancel: C,
+        mut on_raw_event: O,
     ) -> Result<GenerateOutput, InferenceError>
     where
         F: FnMut(&str) -> bool,
         C: FnMut() -> bool,
+        O: FnMut(RawGenEvent),
     {
         let cfg = &self.config;
 
@@ -574,6 +617,13 @@ impl Qwen35Model {
             }
         }
 
+        // Prefill logits are ready and the first token has not been sampled
+        // yet -- the true prefill/decode boundary (codex round-1 blocker #1).
+        // Fired unconditionally here (not gated on the eventual grammar/EOS
+        // outcome below), since prefill itself always completed by this
+        // point regardless of what the first sampled token turns out to be.
+        on_raw_event(RawGenEvent::PrefillEnd);
+
         let next_id = sample_token(
             &scratch.logits[..cfg.vocab_size],
             gen_cfg,
@@ -610,6 +660,13 @@ impl Qwen35Model {
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
+        // Raw-token event for the prefill-derived first token, fired from the
+        // exact point it becomes part of `generated_ids` -- symmetric with
+        // the decode-loop `push` closures below, so the event count always
+        // equals `GenerateOutput.generated_tokens`.
+        on_raw_event(RawGenEvent::RawToken {
+            index: generated_ids.len(),
+        });
 
         // Budget forcing setup: resolve the </think> token id once and seed
         // the thinking_closed state from the prefill token so budget=1 works.
@@ -748,6 +805,13 @@ impl Qwen35Model {
                     |next_id| {
                         generated_ids.push(next_id);
                         all_ids.push(next_id);
+                        // Raw-token event fired from the same `push` point
+                        // that increments `generated_ids` -- never reached on
+                        // a grammar-stop/EOS step that returns before `push`
+                        // (codex round-1 blocker #1).
+                        on_raw_event(RawGenEvent::RawToken {
+                            index: generated_ids.len(),
+                        });
                     },
                     |next_id| detok.push(&self.tokenizer, next_id),
                     &mut text,
@@ -926,6 +990,13 @@ impl Qwen35Model {
                     |next_id| {
                         generated_ids.push(next_id);
                         all_ids.push(next_id);
+                        // Raw-token event fired from the same `push` point
+                        // that increments `generated_ids` -- never reached on
+                        // a grammar-stop/EOS step that returns before `push`
+                        // (codex round-1 blocker #1).
+                        on_raw_event(RawGenEvent::RawToken {
+                            index: generated_ids.len(),
+                        });
                     },
                     |next_id| detok.push(&self.tokenizer, next_id),
                     &mut text,
@@ -990,6 +1061,28 @@ impl Qwen35Model {
             })
         }
     }
+}
+
+/// Raw generation-lifecycle event fired by
+/// [`Qwen35Model::generate_streaming_with_observer`], independent of the
+/// caller's text-delta callback and unaffected by incremental UTF-8
+/// detokenizer buffering (benchmark-overhaul row 2, codex round-1 blocker
+/// #1: a text delta is not guaranteed to equal one raw sampled token, and
+/// measuring `prefill_end` off the first delta fires it after sampling
+/// instead of before).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawGenEvent {
+    /// Fired exactly once, after the prefill forward pass has produced
+    /// logits and before the first token is sampled -- the true
+    /// prefill/decode boundary.
+    PrefillEnd,
+    /// Fired once per token that actually becomes part of
+    /// `GenerateOutput.token_ids` (never for a token that grammar-stops or
+    /// EOS-stops before being pushed), in generation order. `index` is
+    /// 1-based and monotonically increasing, equal to `generated_ids.len()`
+    /// at the moment of firing -- so a caller counting these events always
+    /// gets a count equal to `GenerateOutput.generated_tokens`.
+    RawToken { index: usize },
 }
 
 /// Outcome of [`DecodePolicy::transition`], the one per-step call every decode
@@ -3130,6 +3223,190 @@ mod tests {
             "should_cancel flipping true at the first decode-loop checkpoint must stop \
              after exactly the one pre-loop token (stop-string path); got {}",
             result.generated_tokens
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_streaming_with_observer / RawGenEvent mutation-sensitive tests
+    // (benchmark-overhaul row 2, codex round-1 blocker #1, PR #882)
+    // -----------------------------------------------------------------------
+
+    /// `RawGenEvent::PrefillEnd` must fire exactly once, before the first
+    /// `RawGenEvent::RawToken`, and every subsequent `RawToken` index must be
+    /// monotonically increasing 1..=generated_tokens -- the raw prefill/decode
+    /// boundary the CPU flagship smoke harness measures TTFT and decode
+    /// throughput off, independent of the text-delta callback.
+    ///
+    /// Mutation sensitivity: moving the `on_raw_event(RawGenEvent::PrefillEnd)`
+    /// call to after the first token is pushed (the pre-fix bug this test
+    /// guards -- marking prefill_end off the first confirmed generated token
+    /// instead of the true prefill/decode boundary) makes `events.first()`
+    /// a `RawToken` instead of `PrefillEnd`, failing the first assertion.
+    /// Removing any of the three `on_raw_event(RawGenEvent::RawToken { .. })`
+    /// call sites (pre-loop first token, fast-path decode loop, stop-string
+    /// decode loop) drops an index from the collected sequence, failing the
+    /// monotonic-range assertion. Verified by reverting the fix and
+    /// re-running: see the PR body's mutation log.
+    #[test]
+    fn raw_observer_prefill_end_precedes_first_raw_token_monotonic_index() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let events = std::cell::RefCell::new(Vec::<RawGenEvent>::new());
+        let result = model
+            .generate_streaming_with_observer(
+                "a",
+                &gen_cfg,
+                |_delta| true,
+                || false,
+                |evt| events.borrow_mut().push(evt),
+            )
+            .expect("generation must succeed");
+
+        let events = events.into_inner();
+        assert_eq!(
+            events.first(),
+            Some(&RawGenEvent::PrefillEnd),
+            "the very first raw event must be PrefillEnd -- prefill completed and logits \
+             are ready before any token is sampled; got {events:?}"
+        );
+        let token_indices: Vec<usize> = events
+            .iter()
+            .skip(1)
+            .map(|e| match e {
+                RawGenEvent::RawToken { index } => *index,
+                RawGenEvent::PrefillEnd => {
+                    panic!("PrefillEnd must fire exactly once, at the very start: {events:?}")
+                }
+            })
+            .collect();
+        assert_eq!(result.generated_tokens, 3);
+        assert_eq!(
+            token_indices,
+            vec![1, 2, 3],
+            "RawToken events must be one per generated token, in generation order, with a \
+             monotonically increasing 1-based index equal to generated_tokens so far"
+        );
+    }
+
+    /// One raw-token event fires per generated token even when the
+    /// text-delta stream buffers an incomplete multi-byte UTF-8 sequence and
+    /// therefore does NOT call `on_token` for that step at all (codex
+    /// round-1 blocker #1's core claim: measuring prefill/decode boundaries
+    /// off text deltas is not equivalent to measuring off raw sampled
+    /// tokens, and can *lag* the true boundary by one or more tokens).
+    ///
+    /// Token id 0 is defined (via a custom tiny tokenizer vocab) to decode to
+    /// the single raw byte `0xC2` -- the lead byte of a 2-byte UTF-8 sequence
+    /// (`U+0080..=U+07FF`), which alone is an incomplete codepoint that
+    /// `IncrementalDetokenizer` must buffer rather than emit (verified
+    /// directly: pushing `0xC2` once in isolation yields an empty delta).
+    /// The all-zero-weight tiny model always greedily samples token 0 (tied
+    /// logits, first-wins), so the very *first* generated token -- the
+    /// prefill-derived one, pushed into a fresh, empty detokenizer buffer --
+    /// is guaranteed to buffer rather than emit: the fast decode path's
+    /// `StopMode::Disabled` branch of `stop_check` skips calling `on_token`
+    /// entirely whenever the resulting delta is empty (`generation.rs`:
+    /// `if delta.is_empty() { return StopCheckOutcome::Continue; }`).
+    ///
+    /// This test snapshots `on_token`'s cumulative call count at the instant
+    /// each `RawToken` event fires, rather than comparing final totals: a
+    /// trailing `detok.finish()` flush (emitted once after the decode loop
+    /// ends, for whatever incomplete bytes never got a chance to complete)
+    /// also calls `on_token`, so the *final* on_token-call total is not a
+    /// reliable signal here -- it can coincidentally equal
+    /// `generated_tokens` even though a mid-generation step was buffered.
+    /// The per-event snapshot sidesteps that confound entirely: at the
+    /// moment `RawToken { index: 1 }` fires (in the observer, mid
+    /// generation, before the decode loop or any flush has run), `on_token`
+    /// must not yet have been called even once.
+    ///
+    /// Mutation sensitivity: reverting to the pre-fix design (emitting
+    /// `token_available` from inside `on_token` instead of from
+    /// `on_raw_event`) would silently miss this buffered first token
+    /// entirely (its phase event would fire late, on whatever later step
+    /// finally produces a non-empty delta, or not at all if generation ends
+    /// first) -- this test's first-event snapshot fails immediately on that
+    /// regression, and the raw-index-sequence assertion fails independently
+    /// if any `on_raw_event(RawGenEvent::RawToken { .. })` call site is
+    /// removed.
+    #[test]
+    fn raw_observer_fires_before_on_token_for_buffered_incomplete_utf8_first_token() {
+        const UTF8_LEAD_BYTE_TOK_JSON: &str = r#"{
+  "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"Â":0,"<unk>":1,"a":2},"merges":[]}
+}"#;
+        let model = build_tiny_zero_model_tok(UTF8_LEAD_BYTE_TOK_JSON);
+
+        // Independent confirmation that token id 0 alone is genuinely
+        // incomplete UTF-8, not just asserted by comment: pushing it once
+        // into a fresh detokenizer must yield an empty delta.
+        let mut probe = IncrementalDetokenizer::new();
+        assert_eq!(
+            probe.push(model.tokenizer(), 0),
+            "",
+            "token id 0 (raw byte 0xC2) must be an incomplete UTF-8 lead byte on its own -- \
+             this test's premise depends on it"
+        );
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let raw_indices = std::cell::RefCell::new(Vec::<usize>::new());
+        let on_token_calls = std::cell::Cell::new(0usize);
+        // Snapshot of `on_token_calls` at the instant each RawToken event
+        // fires -- index i (0-based) corresponds to RawToken{index: i+1}.
+        let snapshots_at_raw_event = std::cell::RefCell::new(Vec::<usize>::new());
+        let result = model
+            .generate_streaming_with_observer(
+                "a",
+                &gen_cfg,
+                |_delta: &str| {
+                    on_token_calls.set(on_token_calls.get() + 1);
+                    true
+                },
+                || false,
+                |evt| {
+                    if let RawGenEvent::RawToken { index } = evt {
+                        raw_indices.borrow_mut().push(index);
+                        snapshots_at_raw_event
+                            .borrow_mut()
+                            .push(on_token_calls.get());
+                    }
+                },
+            )
+            .expect("generation over an incomplete-lead-byte vocab must still succeed");
+
+        assert_eq!(
+            result.generated_tokens, 4,
+            "token id 0 (eos_token_id is 96 on this tiny model, never sampled) never \
+             satisfies should_stop_token, so all 4 requested tokens must be generated"
+        );
+        assert_eq!(
+            raw_indices.into_inner(),
+            vec![1, 2, 3, 4],
+            "one monotonically indexed RawToken event per generated token, regardless of \
+             detokenizer buffering"
+        );
+        assert_eq!(
+            snapshots_at_raw_event.borrow()[0],
+            0,
+            "on_token must not have been called yet at the moment the FIRST RawToken event \
+             fires -- the prefill-derived first token's delta is buffered (empty) by the \
+             incomplete-UTF-8 lead byte, so a phase-event trace measured off on_token would \
+             have missed or mis-timed this token entirely; got {} prior on_token calls",
+            snapshots_at_raw_event.borrow()[0]
         );
     }
 

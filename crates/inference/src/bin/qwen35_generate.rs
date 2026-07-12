@@ -333,29 +333,36 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
 
     // The measured trial: fresh timing region, phase events from here on are
     // the ones the supervisor aggregates into the five mandated metrics.
+    //
+    // `prefill_end` and `token_available` are emitted from
+    // `generate_streaming_with_observer`'s raw-event observer (codex
+    // round-1 blocker #1), not from the text-delta callback below: the
+    // incremental UTF-8 detokenizer deliberately buffers incomplete
+    // multi-byte codepoints, so one text delta is not guaranteed to equal
+    // one raw sampled token, and marking `prefill_end` off the first delta
+    // would fire it *after* the first sample rather than before it. The
+    // text callback (`on_token`) is kept purely for `delta_call_count`
+    // disclosure below -- it no longer emits any phase event itself.
     emit_phase(t0, "prefill_start");
-    let mut token_index = 0usize;
-    let mut prefill_end_emitted = false;
+    let mut raw_token_count = 0usize;
     let mut delta_call_count = 0usize;
-    let result = model.generate_streaming_with_cancel(
+    let result = model.generate_streaming_with_observer(
         &prompt,
         &base_cfg,
         |_delta: &str| {
-            // The first confirmed text delta follows immediately from the
-            // prefill-derived first sampled token (no further forward pass
-            // between them), so it marks both prefill_end and the first
-            // token_available event (DESIGN.md: "The first token belongs to
-            // TTFT, not the decode-rate numerator.").
-            if !prefill_end_emitted {
-                emit_phase(t0, "prefill_end");
-                prefill_end_emitted = true;
-            }
             delta_call_count += 1;
-            token_index += 1;
-            emit_token_available(t0, token_index);
             true
         },
         || false,
+        |evt| match evt {
+            lattice_inference::model::qwen35::RawGenEvent::PrefillEnd => {
+                emit_phase(t0, "prefill_end");
+            }
+            lattice_inference::model::qwen35::RawGenEvent::RawToken { index } => {
+                raw_token_count += 1;
+                emit_token_available(t0, index);
+            }
+        },
     );
 
     let output = match result {
@@ -366,13 +373,30 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
         }
     };
 
+    // The raw-event observer fires exactly once per token that becomes part
+    // of `GenerateOutput` (see `RawGenEvent::RawToken`'s doc comment), so
+    // this count is expected to always equal `generated_tokens` by
+    // construction; fail loud rather than silently trust it, since the
+    // supervisor's phase-sequence validator depends on this invariant
+    // holding (codex round-1 blocker #1's adapter-side requirement).
+    if raw_token_count != output.generated_tokens {
+        eprintln!(
+            "FAIL: internal error -- raw phase-event token count ({raw_token_count}) \
+             does not match GenerateOutput.generated_tokens ({}); the phase-event \
+             trace for this trial cannot be trusted",
+            output.generated_tokens
+        );
+        return 1;
+    }
+
     // Honest disclosure (DESIGN.md's own "possible sub-interval undercount
     // ... is part of the method metadata" standard applied here): the
     // streaming callback fires once per *confirmed UTF-8 text delta*, not
     // once per raw sampled token id -- for byte-level BPE this coincides
     // 1:1 with generated tokens for ordinary text, but is not a hard
     // guarantee when a multi-byte codepoint spans more than one token.
-    // Reported here rather than silently assumed.
+    // Reported here rather than silently assumed. (Distinct from
+    // `raw_token_count` above, which is always exact by construction.)
     let delta_matches_generated_tokens = delta_call_count == output.generated_tokens;
     let model_dir_json = json_escape(&model_dir.display().to_string());
 
