@@ -49,11 +49,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
-import shutil
 import stat as stat_mod
 import struct
 import subprocess
@@ -62,7 +62,7 @@ import time
 from pathlib import Path
 
 import numpy as np
-from safetensors.numpy import save_file
+from safetensors.numpy import save as safetensors_save
 
 # ---------------------------------------------------------------------------
 # Defaults (this machine's local checkpoint layout)
@@ -637,7 +637,29 @@ def cmd_self_check(_args: argparse.Namespace) -> int:
             os.close(dfd)
             return 1
         os.close(dfd)
-    print("SELF-CHECK: PASS — scratch provisioning rejects symlinks and detects dir swaps.")
+
+        # fd-anchored write immunity: swap the checked path immediately after
+        # revalidation (the worst-case race window) and prove the write still
+        # lands in the held directory inode, never through the swapped path.
+        (real_root / "arm_A").rmdir()
+        arm_dir, dfd = provision_scratch_dir("A", None, scratch_root=real_root)
+        _revalidate_dir_handle(dfd, arm_dir)
+        moved = base / "arm_A_moved"
+        arm_dir.rename(moved)  # swap: path now free...
+        (base / "outside_target").mkdir(mode=0o700)
+        arm_dir.symlink_to(base / "outside_target")  # ...and points outside
+        _write_bytes_in_dir(dfd, "probe.bin", b"inside")
+        os.close(dfd)
+        if not (moved / "probe.bin").exists():
+            print("SELF-CHECK: FAIL — fd-anchored write did not land in the held directory.")
+            return 1
+        if (base / "outside_target" / "probe.bin").exists():
+            print("SELF-CHECK: FAIL — fd-anchored write escaped through the swapped path.")
+            return 1
+    print(
+        "SELF-CHECK: PASS — scratch provisioning rejects symlinks, detects dir swaps, "
+        "and fd-anchored writes are swap-immune."
+    )
     return 0
 
 
@@ -660,18 +682,33 @@ def git_commit_sha() -> str:
     ).strip()
 
 
+def _write_bytes_in_dir(dfd: int, name: str, data: bytes) -> None:
+    """Write `data` to `name` relative to the held directory handle. Anchoring
+    every mutation to `dfd` (openat semantics) makes the write immune to the
+    checked directory's PATH being swapped after validation — the handle pins
+    the directory inode itself. O_NOFOLLOW refuses a symlink planted at the
+    final component."""
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+
+
 def write_arm_checkpoint(
     arm: str,
     model_dir: Path,
     q4_dir: Path,
     output_dir: Path,
+    dfd: int,
     self_test_result: dict,
 ) -> dict:
     """Write one arm's fake-quantized f16 checkpoint + manifest.json into
-    `output_dir`. Callers must have already run `require_self_test_pass`
-    and pass its result through so it lands in the manifest."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    `output_dir`, with every filesystem mutation anchored to the held
+    directory handle `dfd` — never bare pathnames. The tensor-build phase is
+    long, and a path-based write after it would reopen the swap window that
+    provisioning closed; openat-relative writes are pinned to the directory
+    inode regardless of what the path names by then. Callers must have
+    already run `require_self_test_pass` and pass its result through so it
+    lands in the manifest."""
     st_path = model_dir / "model.safetensors"
     header, data_start = read_safetensors_header(st_path)
     tensor_names = sorted(k for k in header if k != "__metadata__")
@@ -699,16 +736,19 @@ def write_arm_checkpoint(
         out_tensors[name] = arr_f32.reshape(header[name]["shape"]).astype(np.float16)
     elapsed = time.time() - t0
 
-    out_st_path = output_dir / "model.safetensors"
-    save_file(out_tensors, str(out_st_path))
+    st_blob = safetensors_save(out_tensors)
+    del out_tensors
+    checkpoint_sha256 = hashlib.sha256(st_blob).hexdigest()
+    _write_bytes_in_dir(dfd, "model.safetensors", st_blob)
+    st_size = len(st_blob)
+    del st_blob
 
     # config.json + tokenizer.json: config copied (small), tokenizer symlinked
     # (12MB, identical across every arm — no reason to duplicate 5x).
-    shutil.copy2(model_dir / "config.json", output_dir / "config.json")
-    tok_link = output_dir / "tokenizer.json"
-    if tok_link.exists() or tok_link.is_symlink():
-        tok_link.unlink()
-    tok_link.symlink_to(model_dir / "tokenizer.json")
+    _write_bytes_in_dir(dfd, "config.json", (model_dir / "config.json").read_bytes())
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink("tokenizer.json", dir_fd=dfd)
+    os.symlink(str(model_dir / "tokenizer.json"), "tokenizer.json", dir_fd=dfd)
 
     corpus_path = REPO_ROOT / "docs/bench_results/wiki.test.raw"
     manifest = {
@@ -719,7 +759,7 @@ def write_arm_checkpoint(
         "n_tensors_total": len(tensor_names),
         "n_tensors_quantized": n_quantized,
         "scheme_map": scheme_map,
-        "checkpoint_sha256": sha256_file(out_st_path),
+        "checkpoint_sha256": checkpoint_sha256,
         "corpus_file": str(corpus_path),
         "corpus_sha256": sha256_file(corpus_path) if corpus_path.exists() else None,
         "commit_sha": git_commit_sha(),
@@ -732,11 +772,10 @@ def write_arm_checkpoint(
             "n_pass": self_test_result["n_pass"],
         },
     }
-    with open(output_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
+    _write_bytes_in_dir(dfd, "manifest.json", json.dumps(manifest, indent=2).encode())
 
     print(
-        f"[{arm}] wrote {out_st_path} ({out_st_path.stat().st_size / 1e9:.2f} GB), "
+        f"[{arm}] wrote {output_dir / 'model.safetensors'} ({st_size / 1e9:.2f} GB), "
         f"{n_quantized}/{len(tensor_names)} tensors fake-quantized, {elapsed:.1f}s"
     )
     return manifest
@@ -746,10 +785,12 @@ def cmd_quantize(args: argparse.Namespace) -> int:
     arm = args.arm
     model_dir = Path(args.model_dir)
     q4_dir = Path(args.q4_dir)
-    output_dir = Path(args.output_dir)
+    output_dir, dfd = provision_scratch_dir(arm, args.output_dir)
 
     self_test_result = require_self_test_pass(model_dir, q4_dir)
-    write_arm_checkpoint(arm, model_dir, q4_dir, output_dir, self_test_result)
+    _revalidate_dir_handle(dfd, output_dir)
+    write_arm_checkpoint(arm, model_dir, q4_dir, output_dir, dfd, self_test_result)
+    os.close(dfd)
     return 0
 
 
@@ -806,7 +847,11 @@ def cmd_run_arm(args: argparse.Namespace) -> int:
 
     self_test_result = require_self_test_pass(model_dir, q4_dir)
     _revalidate_dir_handle(dfd, output_dir)
-    manifest = write_arm_checkpoint(arm, model_dir, q4_dir, output_dir, self_test_result)
+    manifest = write_arm_checkpoint(arm, model_dir, q4_dir, output_dir, dfd, self_test_result)
+
+    # The evaluator receives output_dir as a PATH (read-only use), so verify
+    # the path still names the provisioned directory right before launch.
+    _revalidate_dir_handle(dfd, output_dir)
 
     eval_cmd = [
         "cargo",
@@ -836,10 +881,7 @@ def cmd_run_arm(args: argparse.Namespace) -> int:
 
     manifest["evaluator_invocation"] = " ".join(eval_cmd)
     manifest["perplexity"] = ppl_event
-    _revalidate_dir_handle(dfd, output_dir)
-    manifest_path = output_dir / "manifest.json"
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
+    _write_bytes_in_dir(dfd, "manifest.json", json.dumps(manifest, indent=2).encode())
 
     try:
         os.unlink("model.safetensors", dir_fd=dfd)
