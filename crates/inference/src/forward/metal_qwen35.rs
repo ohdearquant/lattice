@@ -340,6 +340,88 @@ mod mtp_resolve_tests {
         save_q4_file(&path, &tensor).expect("save .q4 fixture");
     }
 
+    /// Write a tiny `.q4` 2-D tensor `[rows, cols]` where every element in
+    /// row `r` is `row_value(r)` (constant within the row, distinct across
+    /// rows). Used to build a MoE router (`mlp.gate.weight`, `[E, H]`) whose
+    /// per-expert logit is fully controlled by the caller: since `cols` is a
+    /// multiple of the Q4 block size (32) in every fixture this is used
+    /// with, each row occupies whole blocks only (never split across two
+    /// different rows' values), so `quantize_f32_to_q4` reconstructs each
+    /// row's constant exactly (mod one f16 rounding of the input value —
+    /// see `q4_const_roundtrip` for the expected-readback helper).
+    // Only consumed by the Device-gated MoE integration tests in `mod
+    // inner::tests`, which don't exist in a default-feature (no metal-gpu)
+    // build -- looks dead in that configuration (same as
+    // `write_full_mtp_fixture` above).
+    #[allow(dead_code)]
+    pub(crate) fn write_tiny_q4_fixture_per_row(
+        dir: &std::path::Path,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        row_value: impl Fn(usize) -> f32,
+    ) {
+        use crate::weights::q4_weights::{quantize_f32_to_q4, save_q4_file};
+        let mut data = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            data.extend(std::iter::repeat_n(row_value(r), cols));
+        }
+        let tensor =
+            quantize_f32_to_q4(&data, &[rows, cols]).expect("quantize per-row tiny tensor");
+        let path = mtp_tensor_path(dir, name, "q4");
+        save_q4_file(&path, &tensor).expect("save .q4 fixture");
+    }
+
+    /// Write a tiny `.q4` 3-D tensor `[experts, mid, cols]` where every
+    /// element at `(e, m, _)` is `value(e, m)` (constant within an `(e, m)`
+    /// row, distinct per expert AND per position along `mid` — e.g. to
+    /// distinguish the fused gate/up halves of `experts.gate_up_proj`,
+    /// `[E, 2I, H]`, or to distinguish experts in `experts.down_proj`,
+    /// `[E, H, I]`). Same block-alignment argument as
+    /// `write_tiny_q4_fixture_per_row`: `cols` is always a multiple of 32 in
+    /// the fixtures this is used with, so every block sits inside exactly
+    /// one `(e, m)` row and quantization is exact.
+    // Only consumed by the Device-gated MoE integration tests in `mod
+    // inner::tests`; dead in a default-feature (no metal-gpu) build.
+    #[allow(dead_code)]
+    pub(crate) fn write_tiny_q4_fixture_per_expert_row(
+        dir: &std::path::Path,
+        name: &str,
+        experts: usize,
+        mid: usize,
+        cols: usize,
+        value: impl Fn(usize, usize) -> f32,
+    ) {
+        use crate::weights::q4_weights::{quantize_f32_to_q4, save_q4_file};
+        let mut data = Vec::with_capacity(experts * mid * cols);
+        for e in 0..experts {
+            for m in 0..mid {
+                data.extend(std::iter::repeat_n(value(e, m), cols));
+            }
+        }
+        let tensor = quantize_f32_to_q4(&data, &[experts, mid, cols])
+            .expect("quantize per-expert-row tiny tensor");
+        let path = mtp_tensor_path(dir, name, "q4");
+        save_q4_file(&path, &tensor).expect("save .q4 fixture");
+    }
+
+    /// The exact f32 value a constant-valued Q4 block round-trips to: Q4
+    /// asymmetric quantization stores `scale`/`bias` as f16 and, for a
+    /// constant block (`min == max == value`), always packs nibble `0`
+    /// (`(value - min) * inv_scale == 0`), so dequant reduces to `0 * scale
+    /// + bias == bias == f16(value)` regardless of the block's `scale`
+    /// field — exact modulo one f16 rounding of `value` itself.
+    ///
+    /// Lets tests assert readback against the value the pipeline will
+    /// actually produce, not the pre-quantization f32 the fixture requested.
+    // Only consumed by the Device-gated MoE integration tests in `mod
+    // inner::tests`; dead in a default-feature (no metal-gpu) build.
+    #[allow(dead_code)]
+    pub(crate) fn q4_const_roundtrip(value: f32) -> f32 {
+        use crate::weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
+        q4_f16_to_f32(q4_f32_to_f16(value))
+    }
+
     /// The 8 MTP projection tensor names paired with their expected
     /// on-disk shape, derived from the real qwen3.5-0.8b-q4 checkpoint
     /// (`~/.lattice/models/qwen3.5-0.8b-q4/mtp_*.q4` headers, verified by
@@ -1381,12 +1463,10 @@ mod inner {
     }
 
     /// Compiled MSL pipeline state objects.
-    #[allow(dead_code)] // pipeline handles for kernels staged for future dispatch paths
     pub(crate) struct MetalQwen35Pipelines {
         gemv_decode: ComputePipelineState,
         gemv_decode_wide: ComputePipelineState,
         gemv_q8: ComputePipelineState,
-        gemv_q8_wide: ComputePipelineState,
         rms_norm: ComputePipelineState,
         partial_rope: ComputePipelineState,
         per_head_rms_norm: ComputePipelineState,
@@ -1416,11 +1496,9 @@ mod inner {
         fused_residual_add_norm_batch: ComputePipelineState,
         gemm_q8: ComputePipelineState,
         gemm_q8_tiled: Option<ComputePipelineState>,
-        topk_first_pass: ComputePipelineState,
         topk_merge_pass: ComputePipelineState,
         argmax_first: ComputePipelineState,
         argmax_merge: ComputePipelineState,
-        topk_fast_first: ComputePipelineState,
         // Hierarchical k=50 SIMD-group tournament kernels (R2)
         topk_select50_first: ComputePipelineState,
         topk_select50_merge: ComputePipelineState,
@@ -2466,132 +2544,22 @@ mod inner {
 
     /// Convert f32 to IEEE-754 half-precision (f16) stored as u16 bits.
     ///
-    /// Handles signed zero, subnormals, infinities, and NaN. Uses round-to-nearest-even
-    /// for the mantissa truncation to minimize systematic bias.
+    /// Thin wrapper over the single always-compiled scalar encoder in
+    /// [`crate::weights::half_bits`] (lattice#799) — this module used to
+    /// carry its own independent copy of the bit-twiddling arithmetic.
     #[inline]
     fn f32_to_f16(x: f32) -> u16 {
-        let bits = x.to_bits();
-        let sign = ((bits >> 16) & 0x8000) as u16;
-        let exp = ((bits >> 23) & 0xff) as i32;
-        let frac = bits & 0x007f_ffff;
-
-        // Inf or NaN
-        if exp == 0xff {
-            if frac == 0 {
-                return sign | 0x7c00; // infinity
-            }
-            // NaN: preserve some payload, ensure it stays NaN
-            let mut payload = ((frac >> 13) as u16) & 0x03ff;
-            if payload == 0 {
-                payload = 1; // quiet NaN needs nonzero mantissa
-            }
-            payload |= 0x0200; // set quiet bit
-            return sign | 0x7c00 | payload;
-        }
-
-        // Zero or f32 subnormal (becomes f16 zero)
-        if exp == 0 {
-            return sign;
-        }
-
-        let exp32 = exp - 127; // unbiased exponent
-
-        // Overflow to infinity
-        if exp32 > 15 {
-            return sign | 0x7c00;
-        }
-
-        // Normal f16 range
-        if exp32 >= -14 {
-            let mut exp16 = (exp32 + 15) as u16;
-            let mut frac16 = round_shift_right_even(frac, 13) as u16;
-
-            // Mantissa overflow -> carry into exponent
-            if frac16 == 0x0400 {
-                frac16 = 0;
-                exp16 += 1;
-                if exp16 >= 0x1f {
-                    return sign | 0x7c00; // overflow to infinity
-                }
-            }
-
-            return sign | (exp16 << 10) | frac16;
-        }
-
-        // Subnormal f16 range
-        let mant = frac | 0x0080_0000; // add implicit 1
-        let shift = (-exp32 - 1) as u32;
-        if shift >= 32 {
-            return sign; // underflow to zero
-        }
-
-        let frac16 = round_shift_right_even(mant, shift) as u16;
-        if frac16 == 0 {
-            return sign;
-        }
-        // If rounding carried into exponent bit, it becomes smallest normal
-        if frac16 == 0x0400 {
-            return sign | 0x0400;
-        }
-
-        sign | frac16
-    }
-
-    /// Round-to-nearest-even right shift for mantissa truncation.
-    #[inline]
-    fn round_shift_right_even(value: u32, shift: u32) -> u32 {
-        if shift == 0 {
-            return value;
-        }
-        if shift >= 32 {
-            return 0;
-        }
-
-        let base = value >> shift;
-        let mask = (1u32 << shift) - 1;
-        let remainder = value & mask;
-        let half = 1u32 << (shift - 1);
-
-        if remainder > half || (remainder == half && (base & 1) != 0) {
-            base + 1
-        } else {
-            base
-        }
+        crate::weights::half_bits::f32_to_f16_bits(x)
     }
 
     /// Convert f16 bits (u16) back to f32.
     ///
     /// Used for CPU-side reads of f16 weight buffers when needed (e.g., small
-    /// GDN projections dispatched on CPU).
+    /// GDN projections dispatched on CPU). Thin wrapper over
+    /// [`crate::weights::half_bits::f16_bits_to_f32`] (lattice#799).
     #[inline]
     fn f16_to_f32(bits: u16) -> f32 {
-        let sign = ((bits >> 15) & 0x1) as u32;
-        let exp = ((bits >> 10) & 0x1f) as u32;
-        let frac = (bits & 0x03ff) as u32;
-
-        let f32_bits = match (exp, frac) {
-            // Zero
-            (0, 0) => sign << 31,
-            // Subnormal
-            (0, _) => {
-                let mut mant = frac;
-                let mut e = -14i32;
-                while (mant & 0x0400) == 0 {
-                    mant <<= 1;
-                    e -= 1;
-                }
-                mant &= 0x03ff;
-                (sign << 31) | (((e + 127) as u32) << 23) | (mant << 13)
-            }
-            // Infinity
-            (0x1f, 0) => (sign << 31) | 0x7f80_0000,
-            // NaN
-            (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13),
-            // Normal
-            _ => (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
-        };
-
-        f32::from_bits(f32_bits)
+        crate::weights::half_bits::f16_bits_to_f32(bits)
     }
 
     /// Convert a contiguous slice of IEEE-754 half-precision values (stored as u16 bits)
@@ -2994,7 +2962,6 @@ mod inner {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
                 gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
@@ -3040,11 +3007,9 @@ mod inner {
                 fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
                 gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_first_pass: make_pipeline("logits_topk_first_pass")?,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
                 argmax_first: make_pipeline("logits_argmax_first")?,
                 argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_fast_first: make_pipeline("logits_topk_fast_first")?,
                 topk_select50_first: make_pipeline("logits_topk_select50_first")?,
                 topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
                 decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
@@ -13525,6 +13490,311 @@ mod inner {
             Ok((raw, tensor.original_len))
         }
 
+        /// Mmap a `.q4` file and dequantize its payload directly into an f16
+        /// Metal buffer, without ever materializing the raw Q4 bytes as an
+        /// owned `Vec` first (unlike `load_q4_raw_bytes`/`load_q4_file`, which
+        /// `read_exact` the whole file into a fresh heap allocation before any
+        /// dequant happens). MoE routed-expert `.experts.gate_up_proj` /
+        /// `.experts.down_proj` files hold every expert for a layer fused into
+        /// one array and can be tens of GB; mmap keeps the source pages backed
+        /// by the file itself (evictable under memory pressure, like every
+        /// other Q4WeightBuf tensor `from_q4_dir` loads) instead of pinning
+        /// them in anonymous process memory for the duration of the read. The
+        /// output is f16 because the MoE decode kernels (`moe_expert_gemv`,
+        /// `gemv_decode`) read `half`, not packed Q4 — ADR-053's MoE Metal
+        /// kernels were built against the safetensors-upload path, which
+        /// already materializes experts as f16 (see `MetalQwen35Engine::new()`
+        /// around the `FeedForwardWeights::Moe` arm); no Q4-native MoE GEMV
+        /// kernel exists yet, so this mirrors that convention rather than
+        /// introducing a second on-GPU numeric format for MoE only.
+        ///
+        /// `expected_shape` is validated against the on-disk header BEFORE the
+        /// mmap or any allocation happens: `validate_q4_header_payload_bounds`
+        /// only proves the header is *self*-consistent (`product(shape) ==
+        /// original_len` and the file is physically long enough), never that
+        /// the shape matches what `encode_moe_ffn` requires. A structurally
+        /// valid but short or same-numel-transposed expert file (e.g. a `[1,
+        /// H]` router file under a 4-expert config, or `[E, H, 2I]` in place
+        /// of `[E, 2I, H]`) would otherwise pass, hand `encode_moe_ffn` a
+        /// buffer smaller than — or laid out differently than — the
+        /// `num_experts * ...` slice it forms from the raw pointer, and
+        /// violate that unsafe function's buffer-size invariant (round-1
+        /// blocker, mirrors the shape check `resolve_mtp_projection`/
+        /// `resolve_mtp_norm` already apply to MTP tensors above).
+        fn load_q4_mmap_dequant_f16(
+            device: &Device,
+            path: &std::path::Path,
+            label: &str,
+            expected_shape: &[usize],
+        ) -> Result<Buffer, String> {
+            use crate::weights::q4_weights::{
+                q4_f16_to_f32, q4_f32_to_f16, read_q4_header, validate_q4_header_payload_bounds,
+            };
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            let header = read_q4_header(&file)
+                .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
+            if header.shape != expected_shape {
+                return Err(format!(
+                    "{}: MoE tensor has shape {:?}, expected {expected_shape:?} — refusing to \
+                     load (a mismatched/transposed weight file has the same element count but \
+                     a different layout, which would silently corrupt or overrun the GPU MoE \
+                     dispatch instead of failing to load)",
+                    path.display(),
+                    header.shape
+                ));
+            }
+            let file_len = file
+                .metadata()
+                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+                .len();
+            validate_q4_header_payload_bounds(&header, file_len, path)
+                .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
+            // SAFETY: read-only mmap of a file this process does not mutate
+            // while running (same invariant as `mmap_q4_weight`).
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
+                format!(
+                    "{}: payload_offset {} beyond mapped length {}",
+                    path.display(),
+                    header.payload_offset,
+                    mmap.len()
+                )
+            })?;
+            let mut f16_data: Vec<u16> = Vec::with_capacity(header.original_len);
+            for chunk in payload.chunks_exact(20) {
+                let scale = q4_f16_to_f32(u16::from_ne_bytes([chunk[0], chunk[1]]));
+                let bias = q4_f16_to_f32(u16::from_ne_bytes([chunk[2], chunk[3]]));
+                for b in 0..16 {
+                    let byte_val = chunk[4 + b];
+                    f16_data.push(q4_f32_to_f16((byte_val & 0x0f) as f32 * scale + bias));
+                    f16_data.push(q4_f32_to_f16((byte_val >> 4) as f32 * scale + bias));
+                }
+            }
+            f16_data.truncate(header.original_len);
+            let byte_len = (f16_data.len() * std::mem::size_of::<u16>()) as u64;
+            let buf = device.new_buffer_with_data(
+                f16_data.as_ptr() as *const _,
+                byte_len,
+                MTLResourceOptions::StorageModeShared,
+            );
+            buf.set_label(label);
+            Ok(buf)
+        }
+
+        /// Same mmap route as [`Self::load_q4_mmap_dequant_f16`], but dequantizes
+        /// to f32 for the two small MoE tensors the CPU reads directly every
+        /// forward step: the router gate (`mlp.gate.weight`, routing logits) and
+        /// the shared-expert scalar gate (`mlp.shared_expert_gate.weight`,
+        /// sigmoid gate value) — both are read via `Buffer::contents() as *const
+        /// f32` in `encode_moe_ffn`, so they must land as f32, not f16.
+        ///
+        /// `expected_shape` is validated the same way and at the same point as
+        /// in [`Self::load_q4_mmap_dequant_f16`] (round-1 blocker fix): before
+        /// mmap/allocation, against the raw header only.
+        fn load_q4_mmap_dequant_f32(
+            device: &Device,
+            path: &std::path::Path,
+            label: &str,
+            expected_shape: &[usize],
+        ) -> Result<Buffer, String> {
+            use crate::weights::q4_weights::{
+                dequantize_row_q4_0, read_q4_header, validate_q4_header_payload_bounds,
+            };
+            let file = std::fs::File::open(path)
+                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            let header = read_q4_header(&file)
+                .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
+            if header.shape != expected_shape {
+                return Err(format!(
+                    "{}: MoE tensor has shape {:?}, expected {expected_shape:?} - refusing to \
+                     load (a mismatched/transposed weight file has the same element count but \
+                     a different layout, which would silently corrupt or overrun the GPU MoE \
+                     dispatch instead of failing to load)",
+                    path.display(),
+                    header.shape
+                ));
+            }
+            let file_len = file
+                .metadata()
+                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+                .len();
+            validate_q4_header_payload_bounds(&header, file_len, path)
+                .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
+            // SAFETY: read-only mmap of a file this process does not mutate
+            // while running (same invariant as `mmap_q4_weight`).
+            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
+                format!(
+                    "{}: payload_offset {} beyond mapped length {}",
+                    path.display(),
+                    header.payload_offset,
+                    mmap.len()
+                )
+            })?;
+            let values = dequantize_row_q4_0(payload, header.original_len);
+            Ok(make_buffer(device, &values, label))
+        }
+
+        /// Build MoE FFN weights for layer `prefix` from Q4-dir tensors.
+        ///
+        /// Mirrors `MetalQwen35Engine::new()`'s MoE branch (ADR-053, the
+        /// safetensors-upload constructor around the `FeedForwardWeights::Moe`
+        /// arm): same `MoeMetalBuffers` layout, same headroom guard, same f16
+        /// GPU representation for routed/shared expert weights and f32 for the
+        /// two CPU-read router/gate scalars. The only difference is the source:
+        /// every tensor here comes from a `.q4` file in `q4_dir` via
+        /// [`Self::load_q4_mmap_dequant_f16`] / [`Self::load_q4_mmap_dequant_f32`]
+        /// (mmap, not a full-file read) instead of an in-memory `ModelWeights`
+        /// produced by the CPU safetensors reader.
+        fn load_moe_ffn_q4(
+            device: &Device,
+            q4_dir: &std::path::Path,
+            cfg: &Qwen35Config,
+            prefix: &str,
+            layer_idx: usize,
+            moe_routed_bytes_loaded: &std::cell::Cell<u64>,
+        ) -> Result<MetalFfnWeights, String> {
+            let num_experts = cfg
+                .num_experts
+                .ok_or_else(|| "from_q4_dir: MoE config missing num_experts".to_string())?;
+            let top_k = cfg
+                .num_experts_per_tok
+                .ok_or_else(|| "from_q4_dir: MoE config missing num_experts_per_tok".to_string())?;
+            let inter = cfg.moe_intermediate_size();
+            let shared_inter = cfg.shared_expert_intermediate_size();
+            let hidden = cfg.hidden_size;
+
+            // Headroom guard, mirroring new()'s MoE branch — but CUMULATIVE across
+            // every MoE layer, not per-layer. `new()`'s original guard (and this
+            // function's first version) only checked a single layer's routed-expert
+            // byte count against the device budget; since every layer's dequantized
+            // f16 buffers stay resident for the model's lifetime (nothing is freed
+            // between layers), a per-layer-only check passes cleanly on checkpoints
+            // whose PER-LAYER footprint is small while the SUM across all layers
+            // still exceeds available unified memory — e.g. Qwen3.6-35B-A3B (40
+            // layers × 256 experts × moe_intermediate_size=512, hidden=2048) needs
+            // ~1.5 GiB f16 per layer × 40 layers ≈ 60 GiB, comfortably under any
+            // single per-layer threshold but far past a 32 GiB machine's total RAM.
+            // Track a running total across the whole `from_q4_dir` load and fail
+            // closed with a clear diagnostic before attempting to allocate past it,
+            // rather than let the process OOM partway through the layer loop.
+            let routed_bytes = (num_experts * (2 * inter * hidden + hidden * inter) * 2) as u64;
+            let cumulative_bytes = moe_routed_bytes_loaded.get() + routed_bytes;
+            let max_working = device.recommended_max_working_set_size();
+            let threshold = (max_working as f64 * 0.85) as u64;
+            if cumulative_bytes > threshold {
+                return Err(format!(
+                    "from_q4_dir: MoE layer {layer_idx}: cumulative routed expert weights \
+                     across all MoE layers loaded so far ({} MiB, this layer adds {} MiB) \
+                     exceed 0.85 × recommendedMaxWorkingSetSize ({} MiB). The current \
+                     from_q4_dir MoE path eagerly dequantizes every layer's experts to \
+                     f16-resident GPU buffers (no per-layer streaming/eviction yet) — this \
+                     checkpoint needs more unified memory than this device reports, or a \
+                     streaming/partial-residency MoE loader (tracked separately from #876).",
+                    cumulative_bytes / (1024 * 1024),
+                    routed_bytes / (1024 * 1024),
+                    threshold / (1024 * 1024)
+                ));
+            }
+            moe_routed_bytes_loaded.set(cumulative_bytes);
+
+            let routed_gate_up = Self::load_q4_mmap_dequant_f16(
+                device,
+                &Self::q4_tensor_path(q4_dir, &format!("{prefix}.mlp.experts.gate_up_proj"), "q4"),
+                &format!("L{layer_idx}.moe.gate_up.f16"),
+                &[num_experts, 2 * inter, hidden],
+            )?;
+            let routed_down = Self::load_q4_mmap_dequant_f16(
+                device,
+                &Self::q4_tensor_path(q4_dir, &format!("{prefix}.mlp.experts.down_proj"), "q4"),
+                &format!("L{layer_idx}.moe.down.f16"),
+                &[num_experts, hidden, inter],
+            )?;
+            let shared_gate_proj = Self::load_q4_mmap_dequant_f16(
+                device,
+                &Self::q4_tensor_path(
+                    q4_dir,
+                    &format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+                    "q4",
+                ),
+                &format!("L{layer_idx}.moe.sh_gate.f16"),
+                &[shared_inter, hidden],
+            )?;
+            let shared_up_proj = Self::load_q4_mmap_dequant_f16(
+                device,
+                &Self::q4_tensor_path(
+                    q4_dir,
+                    &format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+                    "q4",
+                ),
+                &format!("L{layer_idx}.moe.sh_up.f16"),
+                &[shared_inter, hidden],
+            )?;
+            let shared_down_proj = Self::load_q4_mmap_dequant_f16(
+                device,
+                &Self::q4_tensor_path(
+                    q4_dir,
+                    &format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+                    "q4",
+                ),
+                &format!("L{layer_idx}.moe.sh_down.f16"),
+                &[hidden, shared_inter],
+            )?;
+            let router_gate = Self::load_q4_mmap_dequant_f32(
+                device,
+                &Self::q4_tensor_path(q4_dir, &format!("{prefix}.mlp.gate.weight"), "q4"),
+                &format!("L{layer_idx}.moe.router.f32"),
+                &[num_experts, hidden],
+            )?;
+            let shared_expert_gate = Self::load_q4_mmap_dequant_f32(
+                device,
+                &Self::q4_tensor_path(
+                    q4_dir,
+                    &format!("{prefix}.mlp.shared_expert_gate.weight"),
+                    "q4",
+                ),
+                &format!("L{layer_idx}.moe.sh_gate_scalar.f32"),
+                &[1, hidden],
+            )?;
+
+            let scratch_gate = make_zero_buffer(
+                device,
+                shared_inter.max(inter),
+                &format!("L{layer_idx}.moe.scr_gate"),
+            );
+            let scratch_up = make_zero_buffer(
+                device,
+                shared_inter.max(inter),
+                &format!("L{layer_idx}.moe.scr_up"),
+            );
+            let scratch_expert_out =
+                make_zero_buffer(device, hidden, &format!("L{layer_idx}.moe.scr_exp_out"));
+            let scratch_out =
+                make_zero_buffer(device, hidden, &format!("L{layer_idx}.moe.scr_out"));
+
+            Ok(MetalFfnWeights::Moe(Box::new(MoeMetalBuffers {
+                routed_gate_up,
+                routed_down,
+                shared_gate_proj,
+                shared_up_proj,
+                shared_down_proj,
+                router_gate,
+                shared_expert_gate,
+                scratch_gate,
+                scratch_up,
+                scratch_expert_out,
+                scratch_out,
+                num_experts,
+                inter,
+                shared_inter,
+                hidden,
+                top_k,
+            })))
+        }
+
         /// Load MTP weights from a Q4 directory and build `MetalMtpRuntime`.
         ///
         /// Returns no weights if the model has no MTP layers or if any weight file is
@@ -13863,7 +14133,6 @@ mod inner {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
                 gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q8_wide: make_pipeline("gemv_q8_decode_wide")?,
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
@@ -13909,11 +14178,9 @@ mod inner {
                 fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
                 gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_first_pass: make_pipeline("logits_topk_first_pass")?,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
                 argmax_first: make_pipeline("logits_argmax_first")?,
                 argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_fast_first: make_pipeline("logits_topk_fast_first")?,
                 topk_select50_first: make_pipeline("logits_topk_select50_first")?,
                 topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
                 decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
@@ -14087,6 +14354,11 @@ mod inner {
             // ----------------------------------------------------------------
             let mut layer_weights: Vec<(MetalLayerAttnWeights, MetalCommonLayerWeights)> =
                 Vec::with_capacity(cfg.num_active_layers());
+            // Cumulative routed-expert byte count across every MoE layer loaded so
+            // far (see `Self::load_moe_ffn_q4`'s headroom guard doc comment) — every
+            // layer's f16 buffers stay GPU-resident for the model's lifetime, so the
+            // budget check must accumulate across the whole loop, not reset per-layer.
+            let moe_routed_bytes_loaded = std::cell::Cell::new(0u64);
 
             for i in 0..cfg.num_hidden_layers {
                 if !cfg.is_layer_active(i) {
@@ -14105,7 +14377,22 @@ mod inner {
                         &format!("{prefix}.post_attention_layernorm.weight"),
                         &format!("L{i}.post_norm"),
                     )?,
-                    ffn: {
+                    ffn: if cfg.is_moe() {
+                        // MoE checkpoint: routed + shared expert tensors live under
+                        // `{prefix}.mlp.{experts,shared_expert,shared_expert_gate,gate}.*`
+                        // (see `should_quantize` in quantize_q4.rs — the `.experts.gate_up_proj`
+                        // / `.experts.down_proj` fused per-layer arrays, plus every other MoE
+                        // tensor here, are Q4-quantized). `MetalFfnWeights::Dense`'s
+                        // `mlp.{gate,up,down}_proj.weight` files do not exist for this layer.
+                        Self::load_moe_ffn_q4(
+                            &device,
+                            q4_dir,
+                            cfg,
+                            &prefix,
+                            i,
+                            &moe_routed_bytes_loaded,
+                        )?
+                    } else {
                         let (gate_raw, gate_len) =
                             load_q4_raw_timed(&format!("{prefix}.mlp.gate_proj.weight"))?;
                         let (up_raw, up_len) =
@@ -16191,7 +16478,9 @@ mod inner {
         // `metal-gpu` -- these Device-gated integration tests still share
         // the same fixture writers).
         use super::super::mtp_resolve_tests::{
-            mtp_proj_names_and_shapes, write_full_mtp_fixture, write_tiny_q4_fixture,
+            mtp_proj_names_and_shapes, q4_const_roundtrip, write_full_mtp_fixture,
+            write_tiny_f16_fixture, write_tiny_q4_fixture, write_tiny_q4_fixture_per_expert_row,
+            write_tiny_q4_fixture_per_row,
         };
         use super::*;
         use crate::model::qwen35::{
@@ -18063,6 +18352,557 @@ mod inner {
                 result.is_ok(),
                 "mmap_q4_weight must accept a fully populated payload: {:?}",
                 result.err()
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // from_q4_dir MoE FFN branch (#876): a MoE Q4 checkpoint has no
+        // `mlp.{gate,up,down}_proj.weight` files (`should_quantize` in
+        // quantize_q4.rs routes MoE tensors under `mlp.experts.*` /
+        // `mlp.shared_expert*` / `mlp.gate.weight` instead — see #874), so
+        // `from_q4_dir` must detect `cfg.is_moe()` and load the MoE branch
+        // instead of unconditionally building `MetalFfnWeights::Dense` and
+        // crashing at layer 0 with a missing-file error (the bug this issue
+        // reports). This builds a tiny synthetic 1-layer full-attention MoE
+        // checkpoint entirely on disk (no downloaded model required) and
+        // proves `from_q4_dir` loads it and produces a finite-logit forward
+        // pass end to end — the same code path `chat_metal --model <dir>`
+        // and `MetalQwen35State::from_q4_dir` callers exercise. A real
+        // Qwen3.6-35B-A3B Q4 run is tracked separately (issue body: "35B
+        // verification dir ... in-flight") — this is the fast, CI-safe leg.
+        //
+        // Round-1 review (codex, PR #883) MAJOR 1: the original fixture
+        // filled every Q4 tensor with the same `0.1` constant, so an expert
+        // swap, wrong gate/up boundary, or an equal-length transpose left
+        // the test numerically finite and effectively unchanged — it could
+        // not catch the layout-corruption class the blocker fix above
+        // guards against. Rewritten to (a) give every expert/projection a
+        // DISTINCT block-constant value, (b) directly read the loaded
+        // `routed_gate_up`/`routed_down` Metal buffers at expert 0/1's
+        // known offsets and assert they equal the constants that expert
+        // was written with (proves the expert-major layout end to end,
+        // independent of generation), and (c) force the router to
+        // deterministically select a single nonzero expert (#2 of 4) and
+        // assert decode output changes when that expert's on-disk weights
+        // are corrupted to look like expert 0's (mutation-sensitive to
+        // exactly the "expert swap" bug class the blocker fix rejects at
+        // load time — here proven at the numerical-output level too, for a
+        // malformed-but-shape-valid corruption the shape gate cannot catch
+        // by itself, e.g. two experts' payload bytes swapped without
+        // touching either header).
+        // -------------------------------------------------------------------
+
+        /// Per-expert/per-projection block constants for the synthetic MoE
+        /// fixture below. Every routed tensor is filled row/expert-constant
+        /// (see `write_tiny_q4_fixture_per_expert_row`'s block-alignment
+        /// argument), so these functions double as both "what to write" and
+        /// "what to expect back" (via `q4_const_roundtrip`).
+        fn moe_fixture_gate_const(e: usize) -> f32 {
+            0.02 * (e as f32 + 1.0)
+        }
+        fn moe_fixture_up_const(e: usize) -> f32 {
+            0.05 * (e as f32 + 1.0)
+        }
+        fn moe_fixture_down_const(e: usize) -> f32 {
+            0.03 * (e as f32 + 1.0)
+        }
+
+        /// Router row constants: expert 2 (of 4) carries the largest value,
+        /// so it deterministically wins top-1 routing. This relies on the
+        /// rest of the synthetic checkpoint (embed/attn/norm weights) being
+        /// entirely non-negative (`write_tiny_q4_fixture`'s default `0.1`,
+        /// `write_tiny_f16_fixture`'s default `1.0`): a softmax-weighted
+        /// average of non-negative `V` rows is always non-negative
+        /// regardless of the attention pattern, and RMSNorm with a
+        /// positive, uniform weight maps a uniform non-negative input to a
+        /// uniform non-negative output — so the hidden state reaching the
+        /// router is a uniform *non-negative* vector, and per-expert router
+        /// logits (a per-row-constant weight dotted with that vector) are
+        /// each `row_const[e] * (non-negative scalar)`, preserving the
+        /// `row_const` ordering across experts regardless of the exact
+        /// hidden-state magnitude.
+        const MOE_FIXTURE_ROUTER_ROW_VALUES: [f32; 4] = [1.0, 2.0, 6.0, 3.0];
+        const MOE_FIXTURE_TARGET_EXPERT: usize = 2;
+
+        /// Write the full synthetic 1-layer MoE Q4 checkpoint used by both
+        /// the "correct" and "sabotaged" (mutation) variants below.
+        /// `gate_const`/`up_const`/`down_const` are injected so the
+        /// sabotaged variant can override exactly `MOE_FIXTURE_TARGET_EXPERT`'s
+        /// values to expert 0's, while everything else (router included)
+        /// stays identical between the two builds.
+        fn write_synthetic_moe_checkpoint(
+            dir: &std::path::Path,
+            cfg: &Qwen35Config,
+            gate_const: impl Fn(usize) -> f32,
+            up_const: impl Fn(usize) -> f32,
+            down_const: impl Fn(usize) -> f32,
+        ) {
+            let hidden = cfg.hidden_size;
+            let vocab = cfg.vocab_size;
+            let num_experts = cfg.num_experts.expect("fixture cfg must set num_experts");
+            let moe_inter = cfg.moe_intermediate_size();
+            let shared_inter = cfg.shared_expert_intermediate_size();
+            let q_dim = cfg.full_q_dim();
+            let kv_dim = cfg.full_kv_dim();
+
+            write_tiny_q4_fixture(
+                dir,
+                "model.language_model.embed_tokens.weight",
+                &[vocab, hidden],
+            );
+            write_tiny_f16_fixture(dir, "model.language_model.norm.weight", &[hidden]);
+
+            let prefix = "model.language_model.layers.0";
+            write_tiny_f16_fixture(dir, &format!("{prefix}.input_layernorm.weight"), &[hidden]);
+            write_tiny_f16_fixture(
+                dir,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                &[hidden],
+            );
+            write_tiny_q4_fixture(
+                dir,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                &[q_dim, hidden],
+            );
+            write_tiny_q4_fixture(
+                dir,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                &[kv_dim, hidden],
+            );
+            write_tiny_q4_fixture(
+                dir,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                &[kv_dim, hidden],
+            );
+            write_tiny_q4_fixture(
+                dir,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                &[hidden, q_dim],
+            );
+            write_tiny_f16_fixture(
+                dir,
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                &[cfg.head_dim],
+            );
+            write_tiny_f16_fixture(
+                dir,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                &[cfg.head_dim],
+            );
+
+            // MoE FFN tensors — the exact set `should_quantize` (quantize_q4.rs)
+            // routes to `.q4` for a MoE layer (#874), matching what
+            // `Self::load_moe_ffn_q4` (this PR) reads back.
+            write_tiny_q4_fixture_per_row(
+                dir,
+                &format!("{prefix}.mlp.gate.weight"),
+                num_experts,
+                hidden,
+                |e| MOE_FIXTURE_ROUTER_ROW_VALUES[e],
+            );
+            write_tiny_q4_fixture_per_expert_row(
+                dir,
+                &format!("{prefix}.mlp.experts.gate_up_proj"),
+                num_experts,
+                2 * moe_inter,
+                hidden,
+                |e, m| {
+                    if m < moe_inter {
+                        gate_const(e)
+                    } else {
+                        up_const(e)
+                    }
+                },
+            );
+            // `h_row` (the down-proj output row, one of `hidden`) is folded
+            // into the value on purpose: an expert whose gate/up/down blocks
+            // are all constant across every dimension produces an FFN
+            // contribution that is *uniform* across the output hidden
+            // vector (every output row gets the same scalar). A single
+            // uniform perturbation added to an already-uniform residual
+            // stream is exactly what the model's final RMSNorm (this is a
+            // 1-layer fixture — the FFN output feeds straight into the
+            // final norm before lm_head) is invariant to: RMSNorm divides
+            // by the input's own magnitude, so `x/rms(x)` collapses to
+            // `sign(x)` for any uniform `x`, erasing the perturbation's
+            // magnitude entirely and making an all-uniform mutation
+            // invisible at the logits regardless of which expert ran. This
+            // per-row multiplier breaks that uniformity so a corrupted
+            // expert's contribution is distinguishable post-norm too, not
+            // just via the direct buffer read in test (b) above.
+            write_tiny_q4_fixture_per_expert_row(
+                dir,
+                &format!("{prefix}.mlp.experts.down_proj"),
+                num_experts,
+                hidden,
+                moe_inter,
+                |e, h_row| down_const(e) * (1.0 + 0.003 * h_row as f32),
+            );
+            write_tiny_q4_fixture_per_row(
+                dir,
+                &format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+                shared_inter,
+                hidden,
+                |_| 0.07,
+            );
+            write_tiny_q4_fixture_per_row(
+                dir,
+                &format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+                shared_inter,
+                hidden,
+                |_| 0.09,
+            );
+            write_tiny_q4_fixture_per_row(
+                dir,
+                &format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+                hidden,
+                shared_inter,
+                |_| 0.11,
+            );
+            write_tiny_q4_fixture_per_row(
+                dir,
+                &format!("{prefix}.mlp.shared_expert_gate.weight"),
+                1,
+                hidden,
+                |_| 0.5,
+            );
+        }
+
+        fn synthetic_moe_test_config() -> Qwen35Config {
+            let hidden = 512usize;
+            let vocab = 64usize;
+            let num_experts = 4usize;
+            let top_k = 1usize;
+            let moe_inter = 32usize;
+            let shared_inter = 16usize;
+            Qwen35Config {
+                hidden_size: hidden,
+                num_hidden_layers: 1,
+                vocab_size: vocab,
+                intermediate_size: 64, // unused under MoE; kept for struct parity
+                rms_norm_eps: 1e-6,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                head_dim: 256,
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: 0.25,
+                rope_parameters: None,
+                linear_num_key_heads: 1,
+                linear_num_value_heads: Some(1),
+                linear_key_head_dim: 16,
+                linear_value_head_dim: 16,
+                linear_conv_kernel_dim: 4,
+                num_experts: Some(num_experts),
+                num_experts_per_tok: Some(top_k),
+                moe_intermediate_size: Some(moe_inter),
+                shared_expert_intermediate_size: Some(shared_inter),
+                output_router_logits: false,
+                router_aux_loss_coef: None,
+                tie_word_embeddings: true,
+                mtp_num_hidden_layers: 0,
+                mtp_use_dedicated_embeddings: false,
+                full_attention_interval: 1,
+                layer_types: vec![LayerType::FullAttention],
+                layer_mask: vec![true],
+                eos_token_id: (vocab - 1) as u32,
+                max_position_embeddings: 128,
+                quarot_rotation_seed: None,
+            }
+        }
+
+        #[test]
+        fn from_q4_dir_loads_and_generates_on_synthetic_moe_checkpoint() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            assert!(
+                cfg.is_moe(),
+                "fixture config must exercise from_q4_dir's MoE branch"
+            );
+            let vocab = cfg.vocab_size;
+            let moe_inter = cfg.moe_intermediate_size();
+            let hidden = cfg.hidden_size;
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let mut state = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                .expect("from_q4_dir must load a synthetic MoE Q4 checkpoint (#876 fix)");
+
+            // --- (b) direct buffer read: expert-major layout at expert 0/1 offsets ---
+            // Read the loaded Metal buffers straight from the built state, before
+            // any decode runs, to isolate loader correctness from generation
+            // numerics — this is the layout proof the round-1 review asked for.
+            {
+                use crate::weights::q4_weights::q4_f16_to_f32;
+                let (_, common) = &state.engine.layer_weights[0];
+                let MetalFfnWeights::Moe(moe) = &common.ffn else {
+                    panic!("layer 0 must build MetalFfnWeights::Moe for an is_moe() config");
+                };
+                // SAFETY: StorageModeShared buffers, no GPU work has been
+                // encoded yet (state was just constructed) — safe CPU read.
+                unsafe {
+                    let gate_up_ptr = moe.routed_gate_up.contents() as *const u16;
+                    let down_ptr = moe.routed_down.contents() as *const u16;
+                    for e in [0usize, 1usize] {
+                        let gate_off = e * 2 * moe_inter * hidden;
+                        let up_off = gate_off + moe_inter * hidden;
+                        let down_off = e * hidden * moe_inter;
+                        let gate_read = q4_f16_to_f32(*gate_up_ptr.add(gate_off));
+                        let up_read = q4_f16_to_f32(*gate_up_ptr.add(up_off));
+                        let down_read = q4_f16_to_f32(*down_ptr.add(down_off));
+                        assert_eq!(
+                            gate_read,
+                            q4_const_roundtrip(moe_fixture_gate_const(e)),
+                            "expert {e} gate slice at element offset {gate_off} mismatch \
+                             (expert-major gate/up layout bug)"
+                        );
+                        assert_eq!(
+                            up_read,
+                            q4_const_roundtrip(moe_fixture_up_const(e)),
+                            "expert {e} up slice at element offset {up_off} mismatch \
+                             (expert-major gate/up boundary bug)"
+                        );
+                        assert_eq!(
+                            down_read,
+                            q4_const_roundtrip(moe_fixture_down_const(e)),
+                            "expert {e} down slice at element offset {down_off} mismatch \
+                             (expert-major down-proj layout bug)"
+                        );
+                    }
+                }
+            }
+
+            // ADR-053 v1's MoE dispatch is decode-mode only (batched multi-token
+            // prefill GEMM panics on `MetalFfnWeights::Moe` — see
+            // `forward_prefill`'s "MoE layers are not supported in batch
+            // prefill" guard); drive this checkpoint through `forward_step`
+            // (the M=1 GEMV decode path `encode_moe_ffn` implements) token by
+            // token instead, exactly like a real `chat_metal` decode loop.
+            let tokens: Vec<u32> = vec![1, 2, 3, 4];
+            let mut logits = Vec::new();
+            for (position, &token) in tokens.iter().enumerate() {
+                logits = state.forward_step(token, position);
+                assert_eq!(logits.len(), vocab);
+                assert!(
+                    logits.iter().all(|v| v.is_finite()),
+                    "MoE decode step at position {position} produced non-finite logits: {logits:?}"
+                );
+            }
+
+            let next = cpu_topk_token_ids(&logits, 1)[0];
+            assert!((next as usize) < vocab);
+
+            let logits2 = state.forward_step(next, tokens.len());
+            assert_eq!(logits2.len(), vocab);
+            assert!(
+                logits2.iter().all(|v| v.is_finite()),
+                "MoE decode step produced non-finite logits: {logits2:?}"
+            );
+        }
+
+        // --- (c) mutation sensitivity: an "expert swap" corruption changes decode output ---
+        //
+        // Builds a second checkpoint identical to the one above except that
+        // MOE_FIXTURE_TARGET_EXPERT's (expert 2's) gate/up/down constants are
+        // overridden to expert 0's — i.e. exactly what a wrong-offset or
+        // transposed-index bug in `load_moe_ffn_q4` would produce (expert 2's
+        // *slot* ends up holding expert 0's weights). The router is
+        // unchanged, so routing still deterministically selects expert 2
+        // (round-1 review's "make routing deterministically select a nonzero
+        // expert"). If the loader's expert-major offsets were wrong in a way
+        // the shape gate above cannot catch (e.g. two experts' bytes
+        // transposed without changing either header's shape), this
+        // corruption would silently have NO effect on which weights actually
+        // get used at expert 2's dispatch offset — so decode output
+        // differing here is direct evidence the loaded weights, not just the
+        // headers, are wired to the offsets the review's audit derived.
+        #[test]
+        fn from_q4_dir_moe_decode_is_sensitive_to_expert_weight_corruption() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let vocab = cfg.vocab_size;
+            let tokens: Vec<u32> = vec![1, 2, 3, 4];
+
+            let run = |gate_const: fn(usize) -> f32,
+                       up_const: fn(usize) -> f32,
+                       down_const: fn(usize) -> f32|
+             -> Vec<f32> {
+                let tmp = tempfile::tempdir().expect("tempdir create");
+                let dir = tmp.path();
+                write_synthetic_moe_checkpoint(dir, &cfg, gate_const, up_const, down_const);
+                let tokenizer_path = std::path::Path::new("/dev/null");
+                let mut state = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                    .expect("from_q4_dir must load a synthetic MoE Q4 checkpoint (#876 fix)");
+                let mut logits = Vec::new();
+                for (position, &token) in tokens.iter().enumerate() {
+                    logits = state.forward_step(token, position);
+                }
+                assert_eq!(logits.len(), vocab);
+                assert!(
+                    logits.iter().all(|v| v.is_finite()),
+                    "MoE decode produced non-finite logits: {logits:?}"
+                );
+                logits
+            };
+
+            let correct = run(
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            let sabotaged = run(
+                |e| {
+                    if e == MOE_FIXTURE_TARGET_EXPERT {
+                        moe_fixture_gate_const(0)
+                    } else {
+                        moe_fixture_gate_const(e)
+                    }
+                },
+                |e| {
+                    if e == MOE_FIXTURE_TARGET_EXPERT {
+                        moe_fixture_up_const(0)
+                    } else {
+                        moe_fixture_up_const(e)
+                    }
+                },
+                |e| {
+                    if e == MOE_FIXTURE_TARGET_EXPERT {
+                        moe_fixture_down_const(0)
+                    } else {
+                        moe_fixture_down_const(e)
+                    }
+                },
+            );
+
+            assert_ne!(
+                correct, sabotaged,
+                "decode logits must change when the routed/deterministically-selected expert's \
+                 weights are corrupted to another expert's values — identical output here would \
+                 mean the selected expert's dispatch offset isn't actually wired to its own \
+                 loaded weights (exactly the expert-swap/offset bug class this PR's shape gate \
+                 and mmap offsets must prevent)"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Round-1 review (codex, PR #883) BLOCKER: `load_q4_mmap_dequant_f16`/
+        // `load_q4_mmap_dequant_f32` used to validate a MoE tensor's Q4
+        // header only *self*-consistently (`validate_q4_header_payload_bounds`:
+        // `product(shape) == original_len`, payload physically present) —
+        // never against the shape `encode_moe_ffn` actually requires. A
+        // structurally valid but short or same-numel-transposed file would
+        // silently load, then violate `encode_moe_ffn`'s unsafe
+        // `num_experts * ...`-sized slice invariant. These two tests are
+        // the round-1-mandated regression coverage: a too-short router
+        // header, and a same-numel transposed routed-expert header, must
+        // both make `from_q4_dir` return an `Err` before `forward_step`.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn from_q4_dir_rejects_short_moe_router_header() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+
+            // Overwrite the router file with a self-consistent but SHORT
+            // header: shape `[1, hidden]` instead of the required
+            // `[num_experts, hidden]` — `product(shape) == original_len`
+            // still holds (so `validate_q4_header_payload_bounds` alone
+            // would accept it), but it is not the shape `load_moe_ffn_q4`
+            // requires.
+            write_tiny_q4_fixture_per_row(
+                dir,
+                "model.language_model.layers.0.mlp.gate.weight",
+                1,
+                cfg.hidden_size,
+                |_| 0.42,
+            );
+
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let Err(err) = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16) else {
+                panic!(
+                    "from_q4_dir must reject a short MoE router header before forward_step, \
+                     not silently under-allocate encode_moe_ffn's router buffer"
+                );
+            };
+            assert!(
+                err.contains("shape"),
+                "error must name the shape mismatch so it's diagnosable, got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_transposed_moe_routed_expert_header() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let moe_inter = cfg.moe_intermediate_size();
+            let hidden = cfg.hidden_size;
+            let num_experts = cfg.num_experts.expect("fixture cfg must set num_experts");
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+
+            // Overwrite `experts.down_proj` with a same-numel TRANSPOSED
+            // header: `[E, I, H]` instead of the required `[E, H, I]` (both
+            // have the same element count `E*H*I`, so a bounds-only check
+            // cannot distinguish them — only an exact-shape check can).
+            write_tiny_q4_fixture_per_expert_row(
+                dir,
+                "model.language_model.layers.0.mlp.experts.down_proj",
+                num_experts,
+                moe_inter,
+                hidden,
+                |_e, _m| 0.42,
+            );
+
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let Err(err) = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16) else {
+                panic!(
+                    "from_q4_dir must reject a same-numel transposed routed-expert header \
+                     before forward_step, not silently feed encode_moe_ffn a wrong-layout buffer"
+                );
+            };
+            assert!(
+                err.contains("shape"),
+                "error must name the shape mismatch so it's diagnosable, got: {err}"
             );
         }
 

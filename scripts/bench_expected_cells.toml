@@ -1,0 +1,91 @@
+# bench_expected_cells.toml — the expected-cell registry (DESIGN.md section 2
+# "Required matrix"). A matrix cell may be declared `unsupported`, but must
+# never silently disappear from a run: DESIGN.md — "an expected cell that
+# did not execute [is] infrastructure failure." This file is the SOURCE OF
+# TRUTH a coverage check expands against
+# (`bench_decode_harness.expand_cell_group` /
+# `bench_decode_harness.validate_registry_coverage`); a new supported
+# model/quant/backend family is added HERE, not hand-typed per cell_id.
+#
+# Each `[[group]]` is one row of DESIGN.md's required-matrix table,
+# expanded as the Cartesian product of its axes into individual
+# `cell_id`s of the form
+#   "<path>:<model_tier>:<quant_tier>:<device>:<context_or_batch>"
+# `anchor_*` fields select the SUBSET DESIGN.md calls the "small anchor in
+# hosted PR A/B" (PR 2's shadow smoke matrix); the full axis product is
+# only required at the group's own `required_in` cadence (e.g.
+# "scheduled_trend"). PR 1 lands this registry and its expansion/coverage
+# logic; PR 2-6 progressively wire real adapters and cadences against it
+# (DESIGN.md section 5) -- no cell in this file is executed by PR 1.
+
+schema_version = 1
+
+[[group]]
+name = "decode_cpu"
+path = "decode"
+metric_family = "decode"
+device = "cpu"
+model_tiers = ["qwen3.5-small"]
+quant_tiers = ["f16", "q8", "q4", "q4_quarot"]
+context_points = [128, 512, 1024, 2048, 4096]
+required_in = ["scheduled_trend"]
+anchor_quant_tiers = ["f16"]
+anchor_context_points = [512, 1024, 2048]
+anchor_required_in = ["hosted_pr_smoke"]
+
+[[group]]
+name = "decode_metal"
+path = "decode"
+metric_family = "decode"
+device = "metal"
+model_tiers = ["qwen3.5-small"]
+quant_tiers = ["f16", "q8", "q4", "q4_quarot"]
+context_points = [128, 512, 1024, 2048, 4096]
+required_in = ["scheduled_trend"]
+anchor_quant_tiers = ["q4"]
+anchor_context_points = [512, 1024, 2048]
+anchor_required_in = ["protected_metal_pr"]
+
+[[group]]
+name = "embed_cpu"
+path = "embed_encode"
+metric_family = "embed"
+device = "cpu"
+model_tiers = ["bert-encoder", "qwen3-embed"]
+quant_tiers = ["shipping"]
+context_points = [1, 8, 32]
+required_in = ["scheduled_trend"]
+anchor_quant_tiers = ["shipping"]
+anchor_context_points = [1, 8, 32]
+anchor_required_in = ["hosted_pr_smoke"]
+
+[[group]]
+name = "embed_metal"
+path = "embed_encode"
+metric_family = "embed"
+device = "metal"
+model_tiers = ["bert-encoder", "qwen3-embed"]
+quant_tiers = ["shipping"]
+context_points = [1, 8, 32]
+required_in = ["scheduled_trend"]
+anchor_quant_tiers = ["shipping"]
+anchor_context_points = [1, 8, 32]
+anchor_required_in = ["protected_metal_pr"]
+
+# Reserved, not Phase 1 (DESIGN.md section 2: "streaming MoE (reserved, not
+# Phase 1)"). Present in the registry so a future PR only needs to change
+# `required_in` from "reserved" to a live cadence, never invent a new
+# group shape; `required_in = ["reserved"]` never matches any live
+# cadence filter, so this group can never be treated as missing today.
+[[group]]
+name = "streaming_moe_reserved"
+path = "decode"
+metric_family = "decode"
+device = "cpu_metal_hybrid"
+model_tiers = ["qwen3.6-35b-moe"]
+quant_tiers = ["shipping"]
+context_points = [1024, 4096, 16384]
+required_in = ["reserved"]
+anchor_quant_tiers = []
+anchor_context_points = []
+anchor_required_in = ["reserved"]

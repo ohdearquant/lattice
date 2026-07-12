@@ -9,8 +9,6 @@
 #   SLOPEFIT_FULL=1 ./scripts/bench_decode_slopefit.sh   # full production grid
 #   SLOPEFIT_CONTEXTS="64 512 1024" ./scripts/bench_decode_slopefit.sh
 #   ./scripts/bench_decode_slopefit.sh --out artifacts/adr064-gpu-decode-current.json
-#
-# Does NOT touch bench_decode_slope.sh or the bench-decode Make target.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
