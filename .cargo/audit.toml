@@ -23,13 +23,4 @@ ignore = [
     # tokenizers/wgpu-hal to migrate off it. No known vulnerability, purely
     # an unmaintained-status warning.
     "RUSTSEC-2024-0436",
-
-    # lru 0.12.5 — unsound `IterMut` (Stacked-Borrows violation). Direct
-    # dependency of crates/embed (Cargo.toml pins "0.12"). The fix landed at
-    # >=0.16.3, a semver-incompatible major bump (0.12 -> 0.16) that would
-    # require reviewing lattice-embed's lru usage for API breakage before
-    # taking it; deferred as a follow-up crate bump, not a drop-in `cargo
-    # update`. Tracked at #886. Verified 2026-07-11: `cargo update -p lru`
-    # resolves no newer 0.12.x release (0.12.5 is latest in-range).
-    "RUSTSEC-2026-0002",
 ]
