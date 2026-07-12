@@ -32,8 +32,7 @@ use crate::model::qwen35_config::GenerateConfig;
 /// two binaries still wire it into axum differently.
 pub const REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 
-/// Shared streaming context-overflow parity fixture (ADR-080 C2 round 3,
-/// codex round-3 medium finding #2): both binaries' real-router
+/// Shared streaming context-overflow parity fixture (ADR-080 C2): both binaries' real-router
 /// context-overflow tests build their request from these SAME constants and
 /// configure their real (tiny, test-only CPU) model's effective context
 /// window to this SAME value, so "same input, same effective limit" is
@@ -169,9 +168,9 @@ pub fn reject_zero_max_tokens(effective: usize) -> Result<(), ApiError> {
 
 /// `GET /` response body: a minimal engine-identity/endpoint-discovery
 /// document. Shared so both binaries expose a byte-identical root route
-/// (ADR-080 C2 round 2, codex finding #1): `lattice_serve.rs` already
+/// (ADR-080 C2): `lattice_serve.rs` already
 /// served this; `lattice.rs` had no `GET /` route at all, an undocumented
-/// divergence the review's route-set audit caught. Both binaries expose the
+/// divergence between the two binaries' route sets. Both binaries expose the
 /// same three routes, so the endpoint list is a fixed constant here rather
 /// than a per-binary parameter.
 pub fn root_body() -> Value {
@@ -239,10 +238,9 @@ pub enum Binary {
 /// A parity case's request body. Most cases pin a small literal fixture;
 /// [`CaseBody::Oversized`] generates a body larger than
 /// [`REQUEST_BODY_LIMIT_BYTES`] at test time instead of embedding a >1MiB
-/// string literal in source (ADR-080 C2 round 2, codex round-2 medium
-/// finding #2: neither binary's parity table exercised the oversized-body
-/// case at all, so restoring the daemon's old 400/`invalid_request` mapping
-/// left its parity test green).
+/// string literal in source (ADR-080 C2: neither binary's parity table
+/// exercised the oversized-body case at all, so restoring the daemon's old
+/// 400/`invalid_request` mapping left its parity test green).
 pub enum CaseBody {
     Fixed(&'static str),
     /// A `messages` array whose `content` field alone exceeds
@@ -310,7 +308,7 @@ pub enum FieldExpectation {
         len: usize,
     },
     /// The pointed-to field must be a JSON string starting with `prefix`
-    /// (issue #828 round 2 medium finding: dynamic response IDs are checked
+    /// (issue #828: dynamic response IDs are checked
     /// by type/prefix, not exact value -- a response ID's suffix varies by
     /// request timestamp/sequence).
     StringPrefix {
@@ -318,7 +316,7 @@ pub enum FieldExpectation {
         prefix: &'static str,
     },
     /// The pointed-to field must be a JSON number representable as `u64`
-    /// (issue #828 round 2 medium finding: timestamps are checked by type,
+    /// (issue #828: timestamps are checked by type,
     /// not exact value).
     UnsignedInt { json_pointer: &'static str },
 }
@@ -537,7 +535,7 @@ pub fn check_sse_events(body: &str, expected: &[EventExpectation]) -> Result<(),
                 })?;
                 match frame {
                     SseFrame::Chunk(c) if matches!(classify_chunk(c), ChunkKind::RoleOpener) => {
-                        // Issue #828 round 2 medium finding: dynamic /id and
+                        // Issue #828: dynamic /id and
                         // /created are type/prefix-checked on the opener
                         // chunk too, not only the non-streaming JSON
                         // baseline -- every `chat.completion.chunk` this
@@ -646,17 +644,16 @@ impl ExpectedResponse {
     }
 }
 
-/// One row of the cross-binary HTTP parity table (ADR-080 C2 round 2, codex
-/// finding #1): a request `method`/`path`/`body`, and the expected outcome
-/// for each binary. A case whose `divergence_reason` is `None` means both
-/// binaries must produce an identical outcome for this request (the common
-/// case, post-alignment); `Some` documents an intentional, reviewed
-/// per-binary difference -- an undocumented divergence is exactly the drift
-/// this table exists to catch. `method`/`path` were added in round 2 (codex
-/// medium finding #2) after an unguarded `GET /` route removal on
-/// `lattice.rs` left the round-1 table green: every case before that was
-/// implicitly `POST /v1/chat/completions`, so route exposure itself was
-/// never actually checked.
+/// One row of the cross-binary HTTP parity table (ADR-080 C2): a request
+/// `method`/`path`/`body`, and the expected outcome for each binary. A case
+/// whose `divergence_reason` is `None` means both binaries must produce an
+/// identical outcome for this request (the common case, post-alignment);
+/// `Some` documents an intentional, deliberately-chosen per-binary difference -- an
+/// undocumented divergence is exactly the drift this table exists to catch.
+/// `method`/`path` were added after an unguarded `GET /` route removal on
+/// `lattice.rs` left the table green: every case before that was implicitly
+/// `POST /v1/chat/completions`, so route exposure itself was never actually
+/// checked.
 pub struct ParityCase {
     pub name: &'static str,
     pub method: &'static str,
@@ -665,7 +662,7 @@ pub struct ParityCase {
     lattice: ExpectedResponse,
     lattice_serve: ExpectedResponse,
     /// `Some` only for a documented intentional divergence; explains WHY the
-    /// two expected outcomes differ (reviewed alongside the table, not left
+    /// two expected outcomes differ (recorded explicitly alongside the table, not left
     /// to be inferred from the two variants).
     pub divergence_reason: Option<&'static str>,
 }
@@ -757,13 +754,12 @@ pub struct ProductionAdapterObservation {
 /// `"<|im_start|>assistant\n"` template. A ground-truth literal, not a call
 /// into either binary's render function, so a template regression in either
 /// binary is visible against this fixture instead of round-tripping through
-/// the same (possibly mutated) function that produced it (issue #828 round 2
-/// major finding).
+/// the same (possibly mutated) function that produced it (issue #828).
 pub const OBSERVATION_GOLDEN_USER_HI_THERE_CHATML: &str =
     "<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n";
 
-/// Full expected value for a [`ProductionAdapterObservation`] (issue #828
-/// round 2 major finding): every `GenerateConfigSnapshot` field, the exact
+/// Full expected value for a [`ProductionAdapterObservation`] (issue #828):
+/// every `GenerateConfigSnapshot` field, the exact
 /// rendered prompt or normalized message list, the exact prompt-token count,
 /// and the terminal outcome -- one shared comparison both binaries' tests
 /// call, instead of each asserting a different hand-picked subset of fields.
@@ -776,8 +772,8 @@ pub struct ExpectedObservation<'a> {
 }
 
 /// Asserts every field of `obs` against `expected`, panicking with a
-/// specific field name on the first mismatch (issue #828 round 2 major
-/// finding). Used by both `lattice.rs`'s and `lattice_serve.rs`'s
+/// specific field name on the first mismatch (issue #828). Used by both
+/// `lattice.rs`'s and `lattice_serve.rs`'s
 /// `production_adapter_observation` test modules so neither binary can drift
 /// back to asserting only a hand-picked subset of `GenerateConfigSnapshot`'s
 /// thirteen fields.
@@ -823,8 +819,8 @@ pub fn assert_observation_matches(
 /// contract, driven through each binary's real `Router` via
 /// `tower::ServiceExt::oneshot` in `lattice.rs`'s and `lattice_serve.rs`'s
 /// own test modules. Every case that ISN'T a documented divergence must
-/// resolve to the SAME `(status, code)` on both binaries -- codex's review
-/// named concrete drift this closes: oversized body (413/`request_body_too_large`
+/// resolve to the SAME `(status, code)` on both binaries -- this table closes
+/// concrete drift found across the two binaries: oversized body (413/`request_body_too_large`
 /// vs 400/`invalid_request`), zero `max_tokens` (`invalid_max_tokens` vs
 /// erased to `invalid_request`), and unknown role (generic message/no code
 /// on one side).
@@ -994,8 +990,7 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
     },
     ParityCase {
         name: "get_root_route_exposed",
-        // ADR-080 C2 round 2, codex round-2 medium finding #2, mutation-
-        // proven: every case above targets only `POST
+        // ADR-080 C2, mutation-proven: every case above targets only `POST
         // /v1/chat/completions`, so removing `lattice.rs`'s `.route("/",
         // get(root))` entirely left the parity test green -- route exposure
         // itself was never actually checked. Both binaries must expose
@@ -1016,8 +1011,7 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
     },
     ParityCase {
         name: "oversized_body_over_limit",
-        // ADR-080 C2 round 2, codex round-2 medium finding #2, mutation-
-        // proven: no case above sent a body over
+        // ADR-080 C2, mutation-proven: no case above sent a body over
         // `REQUEST_BODY_LIMIT_BYTES`, so restoring `lattice_serve.rs`'s old
         // 400/`invalid_request` oversized-body mapping (instead of the
         // current 413/`request_body_too_large`) also left the parity test

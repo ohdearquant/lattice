@@ -124,8 +124,8 @@ pub(crate) struct StopStringMatcher {
 }
 
 impl StopStringMatcher {
-    /// `stops` is cloned into an owned `Vec<String>` (codex round-3 major #1,
-    /// PR #787): a `DecodePolicy`-owned `StopMode::Streaming(StopStringMatcher)`
+    /// `stops` is cloned into an owned `Vec<String>` (PR #787): a
+    /// `DecodePolicy`-owned `StopMode::Streaming(StopStringMatcher)`
     /// variant cannot borrow `gen_cfg.stop_strings`'s lifetime without
     /// infecting `DecodePolicy` itself with a lifetime parameter threaded
     /// through every call site; the stop-string list is tiny and constructed
@@ -239,8 +239,7 @@ impl StopStringMatcher {
     /// directly, outside `DecodePolicy` -- out of ADR-080 C3's scope) and
     /// this module's own tests; every `DecodePolicy`-driven call site
     /// (CPU and Metal streaming) accumulates into a caller-owned
-    /// `text: &mut String` via `stop_check`/`finish_stop` instead (codex
-    /// round-3 major #1, PR #787).
+    /// `text: &mut String` via `stop_check`/`finish_stop` instead (PR #787).
     #[cfg(any(test, feature = "metal-gpu"))]
     pub(crate) fn into_text(self) -> String {
         self.full
@@ -436,10 +435,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Empty-stop / empty-delta regression (codex review round 1, PR #657)
+    // Empty-stop / empty-delta regression (PR #657)
     // -----------------------------------------------------------------------
 
-    /// Codex's exact counterexample: `StopStringMatcher::new(&[""]).push("", ...)`
+    /// Exact counterexample: `StopStringMatcher::new(&[""]).push("", ...)`
     /// must report a match at byte 0. `IncrementalDetokenizer::push` can return an
     /// empty delta for the very first generated token (buffering a split UTF-8
     /// scalar, or a token whose chars all fall outside the byte decoder), and an
@@ -524,7 +523,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Token-level byte-split CJK stop string (codex round-1 medium #2, PR #657)
+    // Token-level byte-split CJK stop string (PR #657)
     //
     // The Metal fixture `multibyte_vocab_tokenizer` inserted literal CJK chars
     // ("世", "界") as BPE vocab *strings*. Qwen's real decode path reverses
@@ -577,7 +576,7 @@ mod tests {
 
     /// Same split-CJK token stream, but driven through `StopStringMatcher` with
     /// `stop_strings: ["好"]` — proves the matcher correctly holds back through
-    /// the mid-codepoint empty delta (finding #1's fix) and matches only once
+    /// the mid-codepoint empty delta and matches only once
     /// the codepoint actually completes, excluding it from `into_text()` and
     /// never emitting a dropped/garbled tail for the preceding ASCII text.
     #[test]
@@ -826,7 +825,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Discriminating cases (codex review round on PR #679): overlapping stop
+    // Discriminating cases (PR #679): overlapping stop
     // candidates and repeated near-miss prefixes, arranged so a naive/wrong
     // window bound would drop bytes a live match still needs.
     // -----------------------------------------------------------------------

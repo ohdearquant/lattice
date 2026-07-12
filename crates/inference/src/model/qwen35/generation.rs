@@ -244,7 +244,7 @@ impl Qwen35Model {
         } else {
             None
         };
-        // `DecodePolicy::init` (codex round-2 major #2, PR #787) constructs
+        // `DecodePolicy::init` (PR #787) constructs
         // the policy AND records this prefill-derived first token's logprob
         // in the same call -- replaces the freestanding `record_logprob(...)`
         // call this site used to make independently of the policy.
@@ -301,8 +301,8 @@ impl Qwen35Model {
             // `truncate_token_logprobs_to_retained_text`.
             let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
 
-            // Check stop strings after the first token (codex round-3 major
-            // #1, PR #787 / Leo's ruling): routed through the policy's owned
+            // Check stop strings after the first token (PR #787): routed
+            // through the policy's owned
             // stop-mode adapter (`check_initial_stop`) instead of the free
             // `earliest_stop_match` call this site used to make directly --
             // `full`/`token_logprob_end_offsets` are populated by the adapter
@@ -406,16 +406,59 @@ impl Qwen35Model {
     /// `stopped: false, stop_reason: Some(StopReason::Interrupt)` — a
     /// cancellation is not an OpenAI "stop condition", matching the Metal
     /// contract exactly.
+    ///
+    /// Thin wrapper over [`Self::generate_streaming_with_observer`] with a
+    /// no-op raw-event observer, so every existing caller (production
+    /// serving paths, tests) keeps this exact 4-argument signature and zero
+    /// behavior change.
     pub fn generate_streaming_with_cancel<F, C>(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+    ) -> Result<GenerateOutput, InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+    {
+        self.generate_streaming_with_observer(prompt, gen_cfg, on_token, should_cancel, |_| {})
+    }
+
+    /// [`Self::generate_streaming_with_cancel`] plus a raw generation-lifecycle
+    /// observer (benchmark-overhaul row 2, codex round-1 blocker #1): fires
+    /// [`RawGenEvent::PrefillEnd`] once, after the prefill forward pass has
+    /// produced logits and *before* the first token is sampled, and
+    /// [`RawGenEvent::RawToken`] once per token that actually becomes part of
+    /// `GenerateOutput` (both the prefill-derived first token and every
+    /// decode-loop token), in generation order, with a 1-based
+    /// monotonically-increasing `index` equal to `generated_ids.len()` at
+    /// the moment of firing.
+    ///
+    /// This is deliberately independent of `on_token`'s text deltas: the
+    /// incremental UTF-8 detokenizer buffers incomplete multi-byte
+    /// codepoints, so one text delta is not guaranteed to equal one sampled
+    /// token, and `prefill_end` measured off the first delta would fire
+    /// *after* sampling rather than before it. `on_raw_event` fires exactly
+    /// at the raw-token boundary and is unaffected by detokenizer buffering,
+    /// so a caller measuring prefill/decode timing (`--emit-phase-events` in
+    /// `qwen35_generate.rs`) gets an event count that always equals
+    /// `GenerateOutput.generated_tokens` by construction: it is fired from
+    /// the exact same `push` control-flow point that increments
+    /// `generated_ids`, never from a step that grammar-stops or EOS-stops
+    /// before the token is pushed.
+    pub fn generate_streaming_with_observer<F, C, O>(
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
         mut on_token: F,
         mut should_cancel: C,
+        mut on_raw_event: O,
     ) -> Result<GenerateOutput, InferenceError>
     where
         F: FnMut(&str) -> bool,
         C: FnMut() -> bool,
+        O: FnMut(RawGenEvent),
     {
         let cfg = &self.config;
 
@@ -574,6 +617,20 @@ impl Qwen35Model {
             }
         }
 
+        // Prefill logits are ready and the first token has not been sampled
+        // yet -- the true prefill/decode boundary (codex round-1 blocker #1).
+        // Fired unconditionally here (not gated on the eventual grammar/EOS
+        // outcome below), since prefill itself always completed by this
+        // point regardless of what the first sampled token turns out to be.
+        on_raw_event(RawGenEvent::PrefillEnd);
+
+        // Test-only seam (codex round-2 medium, PR #882): stamp "first sample
+        // entered" right at the point sampling actually begins, so a test can
+        // assert PrefillEnd fired before this instant, not merely before the
+        // RawToken callback further below. No-op outside `cfg(test)`.
+        #[cfg(test)]
+        test_record_first_sample_entry();
+
         let next_id = sample_token(
             &scratch.logits[..cfg.vocab_size],
             gen_cfg,
@@ -610,6 +667,13 @@ impl Qwen35Model {
 
         generated_ids.push(next_id);
         all_ids.push(next_id);
+        // Raw-token event for the prefill-derived first token, fired from the
+        // exact point it becomes part of `generated_ids` -- symmetric with
+        // the decode-loop `push` closures below, so the event count always
+        // equals `GenerateOutput.generated_tokens`.
+        on_raw_event(RawGenEvent::RawToken {
+            index: generated_ids.len(),
+        });
 
         // Budget forcing setup: resolve the </think> token id once and seed
         // the thinking_closed state from the prefill token so budget=1 works.
@@ -618,7 +682,7 @@ impl Qwen35Model {
         } else {
             None
         };
-        // `DecodePolicy::init` (codex round-2 major #2, PR #787) constructs
+        // `DecodePolicy::init` (PR #787) constructs
         // the policy AND records this prefill-derived first token's logprob
         // in the same call -- replaces the freestanding `record_logprob(...)`
         // call this site used to make independently of the policy.
@@ -646,7 +710,7 @@ impl Qwen35Model {
             let mut text = String::new();
             let mut throwaway_offsets: Vec<usize> = Vec::new();
             let delta = detok.push(&self.tokenizer, next_id);
-            // Codex round-3 major #1, PR #787 / Leo's ruling: routed through
+            // PR #787: routed through
             // the policy's owned stop-mode adapter (always `Disabled` here,
             // since `gen_cfg.stop_strings` is empty) instead of a manual
             // `text.push_str` + `on_token` call.
@@ -720,16 +784,15 @@ impl Qwen35Model {
                     &mut rng_state,
                 );
 
-                // One atomic per-step transition (ADR-080 C3 / codex round-1
-                // major #3, PR #787) -- see `DecodePolicy::transition`. Set
+                // One atomic per-step transition (ADR-080 C3, PR #787) -- see
+                // `DecodePolicy::transition`. Set
                 // stopped=true on a grammar stop so the caller sees a
                 // grammar-terminal stop as stopped=true, matching
                 // decode_loop's `return Ok(true)`. `policy.stop_mode` is
                 // always `Disabled` on this path (`gen_cfg.stop_strings` is
                 // empty); the adapter still threads text through to
                 // `on_token` and reports `Interrupted` when the caller's sink
-                // can no longer consume output (codex round-3 major #1, PR
-                // #787 / Leo's ruling).
+                // can no longer consume output.
                 let generated_len_before = generated_ids.len();
                 let outcome = policy.transition(
                     &mut token_logprobs,
@@ -748,6 +811,13 @@ impl Qwen35Model {
                     |next_id| {
                         generated_ids.push(next_id);
                         all_ids.push(next_id);
+                        // Raw-token event fired from the same `push` point
+                        // that increments `generated_ids` -- never reached on
+                        // a grammar-stop/EOS step that returns before `push`
+                        // (codex round-1 blocker #1).
+                        on_raw_event(RawGenEvent::RawToken {
+                            index: generated_ids.len(),
+                        });
                     },
                     |next_id| detok.push(&self.tokenizer, next_id),
                     &mut text,
@@ -899,12 +969,11 @@ impl Qwen35Model {
                     &mut rng_state,
                 );
 
-                // One atomic per-step transition (ADR-080 C3 / codex round-1
-                // major #3, PR #787) -- see `DecodePolicy::transition`.
+                // One atomic per-step transition (ADR-080 C3, PR #787) -- see
+                // `DecodePolicy::transition`.
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` at
                 // construction) owns the incremental byte-holdback
-                // stop-string match itself now (codex round-3 major #1, PR
-                // #787 / Leo's ruling) -- this call site supplies only
+                // stop-string match itself now -- this call site supplies only
                 // `decode_delta` (this loop's own detokenizer) and the
                 // shared `text`/`throwaway_offsets` buffers, so it can no
                 // longer independently choose to skip the real stop check.
@@ -926,6 +995,13 @@ impl Qwen35Model {
                     |next_id| {
                         generated_ids.push(next_id);
                         all_ids.push(next_id);
+                        // Raw-token event fired from the same `push` point
+                        // that increments `generated_ids` -- never reached on
+                        // a grammar-stop/EOS step that returns before `push`
+                        // (codex round-1 blocker #1).
+                        on_raw_event(RawGenEvent::RawToken {
+                            index: generated_ids.len(),
+                        });
                     },
                     |next_id| detok.push(&self.tokenizer, next_id),
                     &mut text,
@@ -992,8 +1068,83 @@ impl Qwen35Model {
     }
 }
 
+/// Raw generation-lifecycle event fired by
+/// [`Qwen35Model::generate_streaming_with_observer`], independent of the
+/// caller's text-delta callback and unaffected by incremental UTF-8
+/// detokenizer buffering (benchmark-overhaul row 2, codex round-1 blocker
+/// #1: a text delta is not guaranteed to equal one raw sampled token, and
+/// measuring `prefill_end` off the first delta fires it after sampling
+/// instead of before).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawGenEvent {
+    /// Fired exactly once, after the prefill forward pass has produced
+    /// logits and before the first token is sampled -- the true
+    /// prefill/decode boundary.
+    PrefillEnd,
+    /// Fired once per token that actually becomes part of
+    /// `GenerateOutput.token_ids` (never for a token that grammar-stops or
+    /// EOS-stops before being pushed), in generation order. `index` is
+    /// 1-based and monotonically increasing, equal to `generated_ids.len()`
+    /// at the moment of firing -- so a caller counting these events always
+    /// gets a count equal to `GenerateOutput.generated_tokens`.
+    RawToken { index: usize },
+}
+
+// Test-only seam (codex round-2 medium finding, PR #882): the existing
+// mutation-sensitive test below only proves `PrefillEnd` fires before the
+// `RawToken` *callback*, not before `sample_token` itself. A `PrefillEnd`
+// moved to just after `generated_ids.push` (after sampling, before the
+// `RawToken` callback) would keep that test green while silently folding
+// sampling time into the reported prefill interval. `test_record_first_sample_entry`
+// is called from the exact point `sample_token` is about to run for the
+// prefill-derived first token; a test's `on_raw_event` closure calls
+// `test_mark_prefill_end_seen` when it observes `PrefillEnd`, and the two
+// are compared to answer "did PrefillEnd fire before the *first sample*",
+// not just "before the first raw-token callback". Zero production effect:
+// every item here is `#[cfg(test)]` and compiles to nothing outside tests.
+#[cfg(test)]
+thread_local! {
+    static TEST_PREFILL_END_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_FIRST_SAMPLE_SAW_PREFILL_END: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Resets the seam's thread-local state. Call at the start of any test that
+/// reads `test_take_first_sample_saw_prefill_end` afterward.
+#[cfg(test)]
+fn test_reset_sample_seam() {
+    TEST_PREFILL_END_SEEN.with(|c| c.set(false));
+    TEST_FIRST_SAMPLE_SAW_PREFILL_END.with(|c| c.set(None));
+}
+
+/// Called by a test's `on_raw_event` closure when it observes
+/// `RawGenEvent::PrefillEnd`.
+#[cfg(test)]
+fn test_mark_prefill_end_seen() {
+    TEST_PREFILL_END_SEEN.with(|c| c.set(true));
+}
+
+/// Called from production code (under `#[cfg(test)]`) immediately before the
+/// first call to `sample_token`. Records, the first time only, whether
+/// `PrefillEnd` had already been observed by that point.
+#[cfg(test)]
+fn test_record_first_sample_entry() {
+    TEST_FIRST_SAMPLE_SAW_PREFILL_END.with(|seen_at_sample| {
+        if seen_at_sample.get().is_none() {
+            let seen = TEST_PREFILL_END_SEEN.with(std::cell::Cell::get);
+            seen_at_sample.set(Some(seen));
+        }
+    });
+}
+
+/// Reads the value recorded by `test_record_first_sample_entry`.
+#[cfg(test)]
+fn test_take_first_sample_saw_prefill_end() -> Option<bool> {
+    TEST_FIRST_SAMPLE_SAW_PREFILL_END.with(std::cell::Cell::get)
+}
+
 /// Outcome of [`DecodePolicy::transition`], the one per-step call every decode
-/// loop drives through (ADR-080 C3 / codex round-1 major #3, PR #787).
+/// loop drives through (ADR-080 C3, PR #787).
 pub(crate) enum StepOutcome {
     /// The (possibly budget-overridden) token was rejected by the backend's
     /// own grammar advance before ever being pushed. The loop must stop with
@@ -1004,7 +1155,7 @@ pub(crate) enum StepOutcome {
     /// `stop_reason = Eos`.
     Eos,
     /// [`DecodePolicy::stop_check`] — driven internally from `self.stop_mode`
-    /// (codex round-3 major #1, PR #787 / Leo's ruling; see [`StopMode`]) —
+    /// (PR #787; see [`StopMode`]) —
     /// reported that a configured stop string matched as of this token. The
     /// token was pushed (via `push`) and every other backend-neutral
     /// per-step control already applied before `stop_check` ran; the loop
@@ -1030,7 +1181,7 @@ pub(crate) enum StepOutcome {
 }
 
 /// Outcome of the mandatory per-step stop-check [`DecodePolicy::transition`]
-/// drives internally (codex round-3 major #1, PR #787: the round-2 mandatory
+/// drives internally (PR #787: a mandatory
 /// `stop_check` closure could still compile as a trivial
 /// `|_, _| StopCheckOutcome::Continue` for a configuration that actually had
 /// stop strings — an arbitrary outcome-producing closure cannot be forced to
@@ -1077,8 +1228,8 @@ pub(crate) enum StopCheckOutcome {
 /// originally exposed each of these as a separate method
 /// (`apply_override` / `note_emitted` / `record_logprob` /
 /// `capture_reasoning_end` / `answer_budget_exhausted`), which let a call
-/// site choreograph a subset of them and skip another — codex round-1
-/// blocker #1 was exactly that failure mode: the Metal prefix-cache loop
+/// site choreograph a subset of them and skip another — that was exactly the
+/// failure mode observed live: the Metal prefix-cache loop
 /// called four of the five and silently never called `record_logprob`.
 /// `transition` replaces all five with the one call above; the five
 /// constituent methods are now private to this module, so a caller in a
@@ -1087,14 +1238,13 @@ pub(crate) enum StopCheckOutcome {
 /// to skip a control, and doing so breaks every one of these behaviors at
 /// once rather than silently dropping just one.
 ///
-/// Stop-string matching (codex round-3 major #1, PR #787 / Leo's Option A
-/// ruling): the streaming vs non-streaming consumption shapes genuinely
+/// Stop-string matching (PR #787): the streaming vs non-streaming consumption shapes genuinely
 /// differ (incremental byte-holdback via [`StopStringMatcher`] vs full-text
 /// rescan via `earliest_stop_match_from`), but which one applies — and
 /// whether checking happens at all — is now [`StopMode`], a value chosen
 /// exactly once from the real `gen_cfg.stop_strings` at [`DecodePolicy::init`]
 /// time and stored privately on the policy. A caller can no longer supply a
-/// closure that *decides* the stop outcome (round 2's `stop_check` parameter,
+/// closure that *decides* the stop outcome (a prior `stop_check` parameter,
 /// which could compile as a trivial `|_, _| Continue` for any configuration
 /// regardless of what `stop_strings` actually held); it supplies only raw
 /// per-token I/O primitives — a decoded delta (`decode_delta`) and a
@@ -1114,8 +1264,7 @@ pub(crate) struct DecodePolicy {
     stop_mode: StopMode,
 }
 
-/// The stop-string check adapter a [`DecodePolicy`] owns (codex round-3
-/// major #1, PR #787 / Leo's Option A ruling). The only place a value of this
+/// The stop-string check adapter a [`DecodePolicy`] owns (PR #787). The only place a value of this
 /// type is ever produced is the private [`StopMode::for_config`], called once
 /// from [`DecodePolicy::init`] on the real `gen_cfg.stop_strings` — there is
 /// no public constructor, so a caller cannot independently choose (or swap
@@ -1162,8 +1311,7 @@ impl StopMode {
 }
 
 impl DecodePolicy {
-    /// The first-step transition (codex round-2 major #2, PR #787 / Leo's
-    /// ruling): constructs the policy AND atomically records the
+    /// The first-step transition (PR #787): constructs the policy AND atomically records the
     /// prefill-derived first token's logprob in the same call, so there is no
     /// longer any way to build a `DecodePolicy` without also recording its
     /// first token's logprob. Before this, `new()` only built the struct and
@@ -1171,7 +1319,7 @@ impl DecodePolicy {
     /// `crate::sampling::record_logprob` for that one token — three
     /// call sites (this module's `generate()` / `generate_streaming_with_cancel()`,
     /// and Metal's `generate_streaming`) duplicated that call independently,
-    /// the exact drift pattern codex's round-1 blocker #1 already proved live
+    /// the exact drift pattern already proved live
     /// once for the *other* four constituent methods (see the struct-level
     /// doc comment above).
     ///
@@ -1231,7 +1379,7 @@ impl DecodePolicy {
     /// otherwise. Call after sampling, before grammar-advance (the actually-emitted
     /// token, post-override, is what grammar must advance on).
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`], which owns the full per-step ordering.
     fn apply_override(&self, generated_len: usize, sampled_id: u32) -> u32 {
         force_close_think(
@@ -1249,7 +1397,7 @@ impl DecodePolicy {
     /// succeeds, before the EOS/stop-token check — mirrors the original inline
     /// ordering across all six sites.
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`], which owns the full per-step ordering.
     fn note_emitted(&mut self, next_id: u32) {
         if Some(next_id) == self.think_close_id {
@@ -1262,7 +1410,7 @@ impl DecodePolicy {
     /// `</think>` itself is the last reasoning token, not the first answer token).
     /// A no-op once already captured or while the block is still open.
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`], which owns the full per-step ordering.
     fn capture_reasoning_end(&mut self, generated_len_after_push: usize) {
         if self.thinking_closed && self.reasoning_end_len.is_none() {
@@ -1273,7 +1421,7 @@ impl DecodePolicy {
     /// True once `max_new_tokens` answer tokens have followed the `</think>` close
     /// point — the decode loop should break on this, in addition to its normal cap.
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`], which owns the full per-step ordering.
     fn answer_budget_exhausted(&self, generated_len: usize) -> bool {
         self.reasoning_end_len
@@ -1286,14 +1434,14 @@ impl DecodePolicy {
     /// vocabulary is paid only when logprobs were actually requested).
     ///
     /// This is the ONLY place in the crate that pushes onto a
-    /// `token_logprobs: &mut Vec<TokenLogprob>` accumulator (codex round-3
-    /// medium #2, PR #787 / Leo's ruling): `crate::sampling` exposes only
+    /// `token_logprobs: &mut Vec<TokenLogprob>` accumulator (PR #787):
+    /// `crate::sampling` exposes only
     /// the pure computation (`compute_step_logprobs`), not a freestanding
     /// "record" function a sibling decode call site could invoke directly
     /// to recreate the exact duplicate-choreography bug this method's
     /// privacy already closes for the other four constituent methods.
     ///
-    /// Private (codex round-1 major #3, PR #787): only reachable through
+    /// Private (PR #787): only reachable through
     /// [`DecodePolicy::transition`] / [`DecodePolicy::init`], which own the
     /// full per-step ordering.
     fn record_logprob(
@@ -1314,8 +1462,7 @@ impl DecodePolicy {
         });
     }
 
-    /// The stop-check adapter dispatch (codex round-3 major #1, PR #787 /
-    /// Leo's Option A ruling): drives whichever [`StopMode`] this policy was
+    /// The stop-check adapter dispatch (PR #787): drives whichever [`StopMode`] this policy was
     /// constructed with, given the caller's freshly decoded delta text for
     /// the current token. The caller supplies no decision logic at all — only
     /// the decoded text and a sink for whatever text is confirmed safe to
@@ -1329,7 +1476,7 @@ impl DecodePolicy {
     /// correctly from the first token onward, exactly as it did when each
     /// call site constructed and drove its own matcher by hand.
     ///
-    /// Private (codex round-1 major #3 / round-3 major #1, PR #787): only
+    /// Private (PR #787): only
     /// reachable through the two methods above.
     fn stop_check(
         &mut self,
@@ -1400,8 +1547,7 @@ impl DecodePolicy {
     }
 
     /// Checks the prefill-derived first token's already-decoded delta text
-    /// against this policy's stop-mode (codex round-3 major #1, PR #787 /
-    /// Leo's ruling), before the decode loop starts — the first token is
+    /// against this policy's stop-mode (PR #787), before the decode loop starts — the first token is
     /// pushed and its logprob recorded by [`DecodePolicy::init`] outside
     /// `transition`'s per-step scope (it has no preceding grammar-advance /
     /// EOS check of its own to run through `transition` for), so its
@@ -1427,7 +1573,7 @@ impl DecodePolicy {
         )
     }
 
-    /// The one per-step transition (ADR-080 C3 / codex round-1 major #3, PR
+    /// The one per-step transition (ADR-080 C3, PR
     /// #787): atomically applies, in the fixed order every decode loop
     /// requires, the reasoning-budget override, the backend's grammar-advance
     /// callback, the emitted-token bookkeeping, the backend's EOS/stop-token
@@ -1448,7 +1594,7 @@ impl DecodePolicy {
     /// `forward_step`) — the caller cannot hand that ownership to the policy.
     ///
     /// `decode_delta` / `text` / `token_logprob_end_offsets` / `emit_confirmed`
-    /// (codex round-3 major #1, PR #787 / Leo's ruling) replace round-2's
+    /// (PR #787) replace an earlier
     /// arbitrary outcome-producing `stop_check` closure: the caller supplies
     /// only raw I/O (decode a token to text; a buffer to accumulate into; an
     /// offset tracker only `StopMode::FullScan` consults; a sink for
@@ -1662,8 +1808,8 @@ fn decode_loop(
             rng_state,
         );
 
-        // One atomic per-step transition (ADR-080 C3 / codex round-1 major
-        // #3, PR #787): budget override, grammar-advance callback, emitted
+        // One atomic per-step transition (ADR-080 C3, PR #787): budget
+        // override, grammar-advance callback, emitted
         // bookkeeping, EOS callback, push callback, logprobs, reasoning-end
         // capture, the stop-check adapter, and the answer-budget check, all
         // in the fixed required order -- see `DecodePolicy::transition`. This
@@ -1674,8 +1820,8 @@ fn decode_loop(
         // at the very end by `decode_tokens`) -- `decode_delta`/`text`/
         // `token_logprob_end_offsets`/`emit_confirmed` are therefore
         // throwaway values the `Disabled` dispatch never populates
-        // meaningfully (codex round-3 major #1, PR #787 / Leo's ruling: this
-        // is honest, not an escape hatch -- the empty-stop_strings guarantee
+        // meaningfully (this is honest, not an escape hatch -- the
+        // empty-stop_strings guarantee
         // now lives in `policy.stop_mode`, derived from the real config at
         // `DecodePolicy::init`, not in a caller-chosen closure).
         let generated_len_before = generated_ids.len();
@@ -1783,9 +1929,9 @@ fn decode_loop_with_stops(
             rng_state,
         );
 
-        // One atomic per-step transition (ADR-080 C3 / codex round-1 major
-        // #3, PR #787) -- see `DecodePolicy::transition`. The stop-check
-        // adapter (codex round-3 major #1, PR #787 / Leo's ruling) now owns
+        // One atomic per-step transition (ADR-080 C3, PR #787) -- see
+        // `DecodePolicy::transition`. The stop-check
+        // adapter now owns
         // the rescan/truncate work this loop used to run itself in a
         // `stop_check` closure -- this call site supplies only `decode_delta`
         // (this loop's own detokenizer) and the shared `full`/
@@ -1891,7 +2037,7 @@ fn decode_loop_with_stops(
 /// one entry per whole token; a token whose text was only partially retained
 /// can't be represented as a partial entry, so it — and any token after it —
 /// is dropped rather than left describing text the caller never receives in
-/// `message.content` (#620 round-1 review finding).
+/// `message.content` (#620).
 ///
 /// `token_logprob_end_offsets[i]` must be the length of the accumulated
 /// output text immediately after token `i`'s delta was appended, and the two
@@ -2023,8 +2169,8 @@ pub(crate) fn check_reasoning_budget_not_set(
     Ok(())
 }
 
-/// Sibling guard to [`check_reasoning_budget_not_set`] (codex round-2 medium
-/// #4, PR #787): fails closed instead of silently ignoring an active MTP
+/// Sibling guard to [`check_reasoning_budget_not_set`] (PR #787): fails
+/// closed instead of silently ignoring an active MTP
 /// request on a generation path that never reads `gen_cfg.enable_mtp`.
 ///
 /// Resolves `enable_mtp` exactly like the Metal `generate()` entry point
@@ -2661,6 +2807,114 @@ mod tests {
         );
     }
 
+    /// `Qwen35Model::config_mut().eos_token_id = u32::MAX` combined with
+    /// `GenerateConfig::stop_token_ids: vec![]` (the flagship CPU/Metal
+    /// benchmark determinism knob -- `qwen35_generate --emit-phase-events`,
+    /// PR #882) must force continuation past a token that would otherwise
+    /// stop generation on the very first step, so a benchmark trial always
+    /// decodes the exact requested `max_new_tokens` count.
+    ///
+    /// This is the established idiom (`cfg.eos_token_id = u32::MAX`) used
+    /// throughout this crate's own test suite to push EOS out of the
+    /// reachable vocab range, rather than a dedicated `GenerateConfig`
+    /// field: `GenerateConfig` is a plain public-literal struct with a
+    /// `Default` impl, so a new field there is
+    /// `constructible_struct_adds_field` under `cargo-semver-checks`, a
+    /// semver-major break `Qwen35Model.config` (private, `config_mut`
+    /// setter) does not incur.
+    ///
+    /// Two-phase design (baseline, then override), both driven through
+    /// `config_mut()`: `build_tiny_zero_model` always greedy-samples token 0
+    /// from this all-zero-logit fixture (see the sibling comment on
+    /// `stop_reason_eos_on_first_stop_token`), so phase 1 first points the
+    /// model's own `eos_token_id` AT 0 via `config_mut()` and confirms that
+    /// alone stops generation immediately (`StopReason::Eos`, 0 tokens
+    /// emitted) -- this is itself mutation-sensitive to `config_mut()`
+    /// returning a real reference into
+    /// `Qwen35Model`'s private `config` field rather than, say, a detached
+    /// clone: a detached clone would leave the real `eos_token_id` at its
+    /// original `VOCAB - 1 = 96`, which the greedy-sampled token 0 never
+    /// matches, so phase 1's own assertions would fail first. Phase 2 then
+    /// re-points `eos_token_id` at the unreachable `u32::MAX` sentinel and
+    /// confirms the SAME config now runs to `max_new_tokens` instead.
+    #[test]
+    fn eos_token_id_override_forces_continuation_past_matching_stop_token() {
+        let mut model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            temperature: 0.0,
+            stop_token_ids: vec![], // benchmark profile: no configured stop tokens either
+            ..Default::default()
+        };
+
+        // Phase 1 (baseline): point eos_token_id at the always-sampled
+        // token 0 -- must stop after exactly 1 token.
+        model.config_mut().eos_token_id = 0;
+        let baseline = model
+            .generate("a", &gen_cfg)
+            .expect("baseline generate must succeed");
+        assert_eq!(
+            baseline.stop_reason,
+            Some(StopReason::Eos),
+            "sanity: eos_token_id = 0 must stop generation on the first greedy-sampled \
+             token (this fixture always samples token 0); got {:?} -- if this fails, \
+             config_mut() is not reaching the real config should_stop_token reads",
+            baseline.stop_reason
+        );
+        assert_eq!(
+            baseline.generated_tokens, 0,
+            "sanity: eos_token_id = 0 must stop before any token is emitted into the \
+             output (the matching token itself is excluded, per should_stop_token's \
+             stop-before-append semantics -- see stop_reason_eos_on_first_stop_token \
+             above), got {}",
+            baseline.generated_tokens
+        );
+
+        // Phase 2 (the benchmark override): push eos_token_id out of the
+        // reachable vocab range -- the same config now runs to max_new_tokens.
+        model.config_mut().eos_token_id = u32::MAX;
+        let result = model
+            .generate("a", &gen_cfg)
+            .expect("eos-override generate must succeed");
+        assert_eq!(
+            result.stop_reason,
+            Some(StopReason::Length),
+            "overriding eos_token_id out of range must force the loop to run to \
+             max_new_tokens (StopReason::Length), not stop early; got {:?}",
+            result.stop_reason
+        );
+        assert_eq!(
+            result.generated_tokens, 5,
+            "eos_token_id override must decode exactly max_new_tokens (5), got {}",
+            result.generated_tokens
+        );
+    }
+
+    /// Sibling of the test above, covering `should_stop_token`'s
+    /// `cfg.eos_token_id` branch directly (the pure predicate `generate()`'s
+    /// decode loop calls every step) rather than threading a real decode
+    /// run through to confirm the override takes effect.
+    #[test]
+    fn eos_token_id_override_suppresses_match_in_should_stop_token() {
+        let mut model = build_tiny_zero_model();
+        let base_cfg = GenerateConfig {
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+        let original_eos_token_id = model.config.eos_token_id;
+        assert!(
+            should_stop_token(&model.config, &base_cfg, original_eos_token_id),
+            "sanity: without the override, the model's own eos_token_id must stop generation"
+        );
+        model.config_mut().eos_token_id = u32::MAX;
+        assert!(
+            !should_stop_token(&model.config, &base_cfg, original_eos_token_id),
+            "eos_token_id override must suppress a match against the model's original \
+             (now-superseded) eos_token_id -- the sentinel u32::MAX itself trivially \
+             matches u32::MAX, so this must check the ORIGINAL id stays unmatched"
+        );
+    }
+
     /// Grammar `advance` returning `false` on the first sampled token must set
     /// `stop_reason = Some(StopReason::Grammar)`.
     ///
@@ -2856,7 +3110,7 @@ mod tests {
     /// then the post-prefill checkpoint (call 2, immediately after prefill,
     /// before sampling) sees `true` and must stop before ANY token is
     /// sampled or emitted. This isolates the post-prefill checkpoint
-    /// specifically (ADR-080 C2 round 2, codex round-1 medium finding #3):
+    /// specifically (ADR-080 C2):
     /// the pre-prefill test above (`n == 1`) cannot tell the two checkpoints
     /// apart, since removing the post-prefill one entirely still leaves that
     /// test green (its cancellation already fires at checkpoint 1).
@@ -3053,9 +3307,248 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // generate_streaming_with_observer / RawGenEvent mutation-sensitive tests
+    // (benchmark-overhaul row 2, codex round-1 blocker #1, PR #882)
+    // -----------------------------------------------------------------------
+
+    /// `RawGenEvent::PrefillEnd` must fire exactly once, before the first
+    /// `RawGenEvent::RawToken`, and every subsequent `RawToken` index must be
+    /// monotonically increasing 1..=generated_tokens -- the raw prefill/decode
+    /// boundary the CPU flagship smoke harness measures TTFT and decode
+    /// throughput off, independent of the text-delta callback.
+    ///
+    /// Mutation sensitivity: moving the `on_raw_event(RawGenEvent::PrefillEnd)`
+    /// call to after the first token is pushed (the pre-fix bug this test
+    /// guards -- marking prefill_end off the first confirmed generated token
+    /// instead of the true prefill/decode boundary) makes `events.first()`
+    /// a `RawToken` instead of `PrefillEnd`, failing the first assertion.
+    /// Removing any of the three `on_raw_event(RawGenEvent::RawToken { .. })`
+    /// call sites (pre-loop first token, fast-path decode loop, stop-string
+    /// decode loop) drops an index from the collected sequence, failing the
+    /// monotonic-range assertion. Verified by reverting the fix and
+    /// re-running: see the PR body's mutation log.
+    #[test]
+    fn raw_observer_prefill_end_precedes_first_raw_token_monotonic_index() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let events = std::cell::RefCell::new(Vec::<RawGenEvent>::new());
+        let result = model
+            .generate_streaming_with_observer(
+                "a",
+                &gen_cfg,
+                |_delta| true,
+                || false,
+                |evt| events.borrow_mut().push(evt),
+            )
+            .expect("generation must succeed");
+
+        let events = events.into_inner();
+        assert_eq!(
+            events.first(),
+            Some(&RawGenEvent::PrefillEnd),
+            "the very first raw event must be PrefillEnd -- prefill completed and logits \
+             are ready before any token is sampled; got {events:?}"
+        );
+        let token_indices: Vec<usize> = events
+            .iter()
+            .skip(1)
+            .map(|e| match e {
+                RawGenEvent::RawToken { index } => *index,
+                RawGenEvent::PrefillEnd => {
+                    panic!("PrefillEnd must fire exactly once, at the very start: {events:?}")
+                }
+            })
+            .collect();
+        assert_eq!(result.generated_tokens, 3);
+        assert_eq!(
+            token_indices,
+            vec![1, 2, 3],
+            "RawToken events must be one per generated token, in generation order, with a \
+             monotonically increasing 1-based index equal to generated_tokens so far"
+        );
+    }
+
+    /// `RawGenEvent::PrefillEnd` must fire before `sample_token` is entered
+    /// for the first time, not merely before the `RawToken` *callback*
+    /// (codex round-2 medium finding, PR #882): the test above cannot
+    /// distinguish "PrefillEnd fired before sampling" from "PrefillEnd
+    /// fired after sampling but before the RawToken push", because both
+    /// orderings produce the same `[PrefillEnd, RawToken, RawToken,
+    /// RawToken]` event sequence. This test uses the `test_record_first_sample_entry`
+    /// seam, planted at the exact point `sample_token` is called for the
+    /// prefill-derived first token, to check the ordering codex's mutation
+    /// actually exercises.
+    ///
+    /// Mutation sensitivity: moving `on_raw_event(RawGenEvent::PrefillEnd)`
+    /// to immediately after `generated_ids.push(next_id)` (still before the
+    /// `RawToken` callback -- the exact mutation codex applied in its round-2
+    /// review) leaves the event-order test above green, but makes this test's
+    /// `on_raw_event` closure observe `PrefillEnd` only *after*
+    /// `test_record_first_sample_entry` already ran, so
+    /// `test_take_first_sample_saw_prefill_end()` returns `Some(false)`
+    /// instead of `Some(true)` and the assertion below fails. Verified by
+    /// reverting the fix (see PR body's mutation log for this test).
+    #[test]
+    fn raw_observer_prefill_end_precedes_first_sample_not_just_first_raw_token() {
+        test_reset_sample_seam();
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let result = model
+            .generate_streaming_with_observer(
+                "a",
+                &gen_cfg,
+                |_delta| true,
+                || false,
+                |evt| {
+                    if evt == RawGenEvent::PrefillEnd {
+                        test_mark_prefill_end_seen();
+                    }
+                },
+            )
+            .expect("generation must succeed");
+
+        assert_eq!(result.generated_tokens, 3);
+        assert_eq!(
+            test_take_first_sample_saw_prefill_end(),
+            Some(true),
+            "PrefillEnd must have already fired by the moment sample_token is entered for \
+             the prefill-derived first token -- not merely before the RawToken callback, \
+             which a PrefillEnd emitted after sampling (but before the RawToken push) would \
+             also satisfy while silently including sampling time in the reported prefill \
+             interval (codex round-2 medium, PR #882)"
+        );
+    }
+
+    /// One raw-token event fires per generated token even when the
+    /// text-delta stream buffers an incomplete multi-byte UTF-8 sequence and
+    /// therefore does NOT call `on_token` for that step at all (codex
+    /// round-1 blocker #1's core claim: measuring prefill/decode boundaries
+    /// off text deltas is not equivalent to measuring off raw sampled
+    /// tokens, and can *lag* the true boundary by one or more tokens).
+    ///
+    /// Token id 0 is defined (via a custom tiny tokenizer vocab) to decode to
+    /// the single raw byte `0xC2` -- the lead byte of a 2-byte UTF-8 sequence
+    /// (`U+0080..=U+07FF`), which alone is an incomplete codepoint that
+    /// `IncrementalDetokenizer` must buffer rather than emit (verified
+    /// directly: pushing `0xC2` once in isolation yields an empty delta).
+    /// The all-zero-weight tiny model always greedily samples token 0 (tied
+    /// logits, first-wins), so the very *first* generated token -- the
+    /// prefill-derived one, pushed into a fresh, empty detokenizer buffer --
+    /// is guaranteed to buffer rather than emit: the fast decode path's
+    /// `StopMode::Disabled` branch of `stop_check` skips calling `on_token`
+    /// entirely whenever the resulting delta is empty (`generation.rs`:
+    /// `if delta.is_empty() { return StopCheckOutcome::Continue; }`).
+    ///
+    /// This test snapshots `on_token`'s cumulative call count at the instant
+    /// each `RawToken` event fires, rather than comparing final totals: a
+    /// trailing `detok.finish()` flush (emitted once after the decode loop
+    /// ends, for whatever incomplete bytes never got a chance to complete)
+    /// also calls `on_token`, so the *final* on_token-call total is not a
+    /// reliable signal here -- it can coincidentally equal
+    /// `generated_tokens` even though a mid-generation step was buffered.
+    /// The per-event snapshot sidesteps that confound entirely: at the
+    /// moment `RawToken { index: 1 }` fires (in the observer, mid
+    /// generation, before the decode loop or any flush has run), `on_token`
+    /// must not yet have been called even once.
+    ///
+    /// Mutation sensitivity: reverting to the pre-fix design (emitting
+    /// `token_available` from inside `on_token` instead of from
+    /// `on_raw_event`) would silently miss this buffered first token
+    /// entirely (its phase event would fire late, on whatever later step
+    /// finally produces a non-empty delta, or not at all if generation ends
+    /// first) -- this test's first-event snapshot fails immediately on that
+    /// regression, and the raw-index-sequence assertion fails independently
+    /// if any `on_raw_event(RawGenEvent::RawToken { .. })` call site is
+    /// removed.
+    #[test]
+    fn raw_observer_fires_before_on_token_for_buffered_incomplete_utf8_first_token() {
+        const UTF8_LEAD_BYTE_TOK_JSON: &str = r#"{
+  "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"Â":0,"<unk>":1,"a":2},"merges":[]}
+}"#;
+        let model = build_tiny_zero_model_tok(UTF8_LEAD_BYTE_TOK_JSON);
+
+        // Independent confirmation that token id 0 alone is genuinely
+        // incomplete UTF-8, not just asserted by comment: pushing it once
+        // into a fresh detokenizer must yield an empty delta.
+        let mut probe = IncrementalDetokenizer::new();
+        assert_eq!(
+            probe.push(model.tokenizer(), 0),
+            "",
+            "token id 0 (raw byte 0xC2) must be an incomplete UTF-8 lead byte on its own -- \
+             this test's premise depends on it"
+        );
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let raw_indices = std::cell::RefCell::new(Vec::<usize>::new());
+        let on_token_calls = std::cell::Cell::new(0usize);
+        // Snapshot of `on_token_calls` at the instant each RawToken event
+        // fires -- index i (0-based) corresponds to RawToken{index: i+1}.
+        let snapshots_at_raw_event = std::cell::RefCell::new(Vec::<usize>::new());
+        let result = model
+            .generate_streaming_with_observer(
+                "a",
+                &gen_cfg,
+                |_delta: &str| {
+                    on_token_calls.set(on_token_calls.get() + 1);
+                    true
+                },
+                || false,
+                |evt| {
+                    if let RawGenEvent::RawToken { index } = evt {
+                        raw_indices.borrow_mut().push(index);
+                        snapshots_at_raw_event
+                            .borrow_mut()
+                            .push(on_token_calls.get());
+                    }
+                },
+            )
+            .expect("generation over an incomplete-lead-byte vocab must still succeed");
+
+        assert_eq!(
+            result.generated_tokens, 4,
+            "token id 0 (eos_token_id is 96 on this tiny model, never sampled) never \
+             satisfies should_stop_token, so all 4 requested tokens must be generated"
+        );
+        assert_eq!(
+            raw_indices.into_inner(),
+            vec![1, 2, 3, 4],
+            "one monotonically indexed RawToken event per generated token, regardless of \
+             detokenizer buffering"
+        );
+        assert_eq!(
+            snapshots_at_raw_event.borrow()[0],
+            0,
+            "on_token must not have been called yet at the moment the FIRST RawToken event \
+             fires -- the prefill-derived first token's delta is buffered (empty) by the \
+             incomplete-UTF-8 lead byte, so a phase-event trace measured off on_token would \
+             have missed or mis-timed this token entirely; got {} prior on_token calls",
+            snapshots_at_raw_event.borrow()[0]
+        );
+    }
+
     /// Stop-string truncation must drop `token_logprobs` entries whose decoded
     /// text didn't fully survive the truncation, not leave them describing
-    /// bytes the caller never sees in `text` (#620 round-1 review finding:
+    /// bytes the caller never sees in `text` (#620:
     /// `build_choice_logprobs` in lattice.rs builds `logprobs.content` directly
     /// off `token_logprobs`, so a stale entry there silently corrupts the
     /// OpenAI-compatible response).
@@ -3108,7 +3601,7 @@ mod tests {
         );
     }
 
-    /// Codex round-3 medium #2 (PR #787 / Leo's ruling): with `gen_cfg.logprobs`
+    /// PR #787: with `gen_cfg.logprobs`
     /// left at its default (`None`), `DecodePolicy::record_logprob` (driven by
     /// both `init` for the prefill token and `transition` for every token
     /// after) must be a true no-op -- `token_logprobs` stays empty for the
@@ -3143,7 +3636,7 @@ mod tests {
         );
     }
 
-    /// Codex round-2 major #2 (PR #787 / Leo's ruling): isolates
+    /// PR #787: isolates
     /// `DecodePolicy::init`'s first-step logprob ownership from
     /// `transition`'s per-step logprob ownership, which
     /// `transition_records_one_logprob_per_generated_token` below already
@@ -3192,7 +3685,7 @@ mod tests {
         );
     }
 
-    /// Codex round-1 major #3 (PR #787): `DecodePolicy::transition` owns
+    /// PR #787: `DecodePolicy::transition` owns
     /// `record_logprob` internally now (the constituent method is private,
     /// only reachable through `transition`). This asserts the positive case
     /// the truncation test above does not: with no stop string to truncate
@@ -3243,7 +3736,7 @@ mod tests {
     // Public-prefill-delegation token parity (perf_hunt public-prefill
     // experiment). Requires a real dense Qwen3.5 checkpoint; set
     // LATTICE_INFERENCE_MODEL_DIR to a safetensors directory (e.g.
-    // /Users/lion/.lattice/models/qwen3.5-0.8b). Ignored by default so CI
+    // ~/.lattice/models/qwen3.5-0.8b). Ignored by default so CI
     // and plain `cargo test` runs never depend on local model files.
     // -------------------------------------------------------------------
 

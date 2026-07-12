@@ -119,6 +119,6 @@ whether to retry with more iterations or a larger epsilon.
 
 ## References
 
-- [`crates/transport/src/sinkhorn.rs`](/Users/lion/projects/lattice/crates/transport/src/sinkhorn.rs) — full solver implementation
-- [`crates/transport/src/logsumexp.rs`](/Users/lion/projects/lattice/crates/transport/src/logsumexp.rs) — `OnlineLogSumExp`, `safe_ln`, `safe_exp`, `logaddexp`
+- [`crates/transport/src/sinkhorn.rs`](../../crates/transport/src/sinkhorn.rs) — full solver implementation
+- [`crates/transport/src/logsumexp.rs`](../../crates/transport/src/logsumexp.rs) — `OnlineLogSumExp`, `safe_ln`, `safe_exp`, `logaddexp`
 - Cuturi, "Sinkhorn Distances: Lightspeed Computation of Optimal Transport", NeurIPS 2013

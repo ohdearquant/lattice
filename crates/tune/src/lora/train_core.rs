@@ -164,15 +164,14 @@ impl GdnLoraParams {
     /// zero-B initialization go through the SAME shape derivation as `zeros`
     /// instead of re-deriving `d_out` per array per call site.
     ///
-    /// This exists because of a real drift: #792 codex round-2 found that
-    /// `train_grad_full.rs` had two independent call sites (gradcheck-mode
-    /// and training-mode initialization) that re-derived `b_b`/`b_a` as
-    /// `num_kh * rank` instead of `value_heads * rank` — the exact blocker
-    /// round-1 fixed in `zeros`, but round-1's fix never touched those two
-    /// inline constructors because they didn't call `zeros` at all. Routing
-    /// both through `shaped` (and `zeros` through `shaped`) makes that class
-    /// of drift a compile-time-shared-code property instead of a
-    /// grep-and-hope one.
+    /// This exists because of a real drift (#792): `train_grad_full.rs` had
+    /// two independent call sites (gradcheck-mode and training-mode
+    /// initialization) that re-derived `b_b`/`b_a` as `num_kh * rank`
+    /// instead of `value_heads * rank` — the same bug already fixed in
+    /// `zeros`, but that fix never touched those two inline constructors
+    /// because they didn't call `zeros` at all. Routing both through
+    /// `shaped` (and `zeros` through `shaped`) makes that class of drift a
+    /// compile-time-shared-code property instead of a grep-and-hope one.
     pub fn shaped(
         rank: usize,
         hidden: usize,
@@ -195,7 +194,7 @@ impl GdnLoraParams {
             a_b: fill_a(checked(rank, hidden, "rank*hidden (a_b)")?),
             // beta (in_proj_b) is projected per VALUE head, matching the
             // shipping gdn_fused forward and the f16 weight loader — NOT
-            // per key head (#792 codex round-1 blocker fix).
+            // per key head (#792).
             b_b: fill_b(checked(gd.value_heads, rank, "value_heads*rank (b_b)")?),
             a_a: fill_a(checked(rank, hidden, "rank*hidden (a_a)")?),
             // alpha (in_proj_a) is likewise per VALUE head.
@@ -1374,10 +1373,10 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: the exact swap codex round 1 found unrejected
-    /// pre-fix — `gqa_layers = [20]` (actually GDN), `gdn_layers = [19]`
-    /// (actually GQA) — both wrong, together. Must be rejected; before this
-    /// fix `TrainCtx::try_new(...).is_ok()` on this input.
+    /// Mutation-sensitive: this exact swap was unrejected pre-fix —
+    /// `gqa_layers = [20]` (actually GDN), `gdn_layers = [19]` (actually
+    /// GQA) — both wrong, together. Must be rejected; before this fix
+    /// `TrainCtx::try_new(...).is_ok()` on this input.
     #[test]
     fn try_new_rejects_gqa_gdn_slot_swap_19_20() {
         let g = valid_geometry();

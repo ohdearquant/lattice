@@ -3,9 +3,7 @@
 **Status**: Proposed (partially superseded — see implementation status below; KV-quant sequencing further superseded at the priority level by ADR-073)
 **Date**: 2026-05-27
 **Crate**: lattice-inference (Metal shaders, KV cache). Phase 0 proposes extracting shaders into a `crates/lattice-metal/` directory tree. **This introduces a new workspace member** — see Crate Layout below for dependency direction, feature gating, and publish-order consequences. If the team prefers keeping shaders inside `crates/inference/`, the same file structure applies under `crates/inference/src/metal/` without a new crate.
-**Research**: RQ-4 (`workspaces/20260527/04.md`)
 **Issues**: #126 (Metal FA2 prefill), #85 (MLX kernel study), #86 (shader extraction)
-**KG entities**: `Metal FA2 Prefill` (0dfbc841), `Metal Fused Attention` (48ee18b2), `FlashAttention-2` (63602a7f), `Chunked Prefill` (018193b3)
 
 ## Implementation status (2026-06-24)
 
@@ -508,18 +506,3 @@ Realistic same-hardware target after f16 KV + MLX-style FA2: **~180-230 tok/s** 
 - ADR-044: QuaRot -- Hadamard-Rotated 4-bit Quantization
 - ADR-047: Paged KV Cache with Prefix Reuse
 - ADR-058: Performance Regression Gate
-
-### KG entities
-
-- `Metal FA2 Prefill` (0dfbc841), `FlashAttention-2` (63602a7f), `Metal Fused Attention` (48ee18b2)
-- `Online Softmax` (8e0e5157), `exp2 Online Softmax` (a55e26b9)
-- `Apple GPU Threadgroup Memory` (078a8ab4), `Tile Size Family` (7eb265aa), `MLX Steel Attention` (024c7d60)
-- `GQA-Aware Tiling` (0a4e7a6b), `GQA` (36e42eb8), `Causal Masking` (86a48852)
-- `f16 KV Cache` (5c9c51ca), `int8 KV Cache` (5c4aad3e), `int4 KV Cache` (1258ab2e)
-- `Fused Quantized Attention` (c3d84793), `KIVI` (0543a8f8), `KVQuant` (8d870807)
-- `Per-Channel KV Quantization` (01d46f27), `Per-Token KV Quantization` (42cf9ef6)
-- `Pre-RoPE K Quantization` (7ae64f86), `WHT for KV Rotation` (c9e6564a), `SRFT` (01916441)
-- `RateQuant` (e6e8c564), `QuaRot` (e754741e), `Chunked Prefill` (018193b3)
-- `Draw Things Metal FA2` (9fb15ed1), `TurboQuant` (f43f50b4)
-- `Sarathi-Serve` (cc6c5094), `POD-Attention` (f59c045f)
-- `lattice` (1c51f097), `lattice-inference` (6c0a97df), `PagedAttention` (c1d9f859), `RoPE` (e6357762)

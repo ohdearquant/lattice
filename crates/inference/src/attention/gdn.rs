@@ -873,7 +873,7 @@ mod tests {
 
     /// ADR-080 C1 fail-closed (#850): GDN state persists across tokens, so a NaN Q
     /// lane must not leak past the token it appears in. Unlike an earlier version of
-    /// this test (see #862 review round 1, major finding 3), the poison here is
+    /// this test (see #862), the poison here is
     /// applied via a weight object used ONLY for step 0 -- steps 1 and 2 run with
     /// ordinary, never-zeroed, never-poisoned weights in BOTH the poisoned and
     /// reference runs, so this actually proves "one poisoned token, then two clean
@@ -905,7 +905,7 @@ mod tests {
     /// runs the same shape of proof (poison-only-step-0, two clean steps, explicit-zero
     /// reference) for K instead of Q, through the SHIPPING `gated_delta_net_step_fused`
     /// SIMD path instead of this scalar reference -- that is the production-shaped gap
-    /// #862 round 1 found (blocker 2: `simd_l2_normalize`'s scalar/AVX2/NEON backends
+    /// #862 found (`simd_l2_normalize`'s scalar/AVX2/NEON backends
     /// were fail-open even though this scalar reference and `l2_normalize_vec` were
     /// already fixed). This test remains as the Q-side / scalar-reference-path proof;
     /// it does not by itself cover K or the fused/SIMD path.

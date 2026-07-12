@@ -56,15 +56,15 @@ A real run against the 0.8B checkpoint (which also carries a vision tower and an
 
 ```
 === quantize_q4: SafeTensors → Q4_0 ===
-Model dir:  /Users/lion/.lattice/models/qwen3.5-0.8b
-Output dir: /Users/lion/.lattice/models/qwen3.5-0.8b-q4
+Model dir:  ~/.lattice/models/qwen3.5-0.8b
+Output dir: ~/.lattice/models/qwen3.5-0.8b-q4
 Tensors:    488
 
   [1/488] F16   model.language_model.embed_tokens.weight  shape=[151936, 1024]  296.8MB  dtype=BF16  0.128s
   [2/488] Q4_0  model.language_model.layers.0.self_attn.q_proj.weight  shape=[4096, 1024]  8.0MB→2.5MB  0.02s
   ...
   [488/488] F16   mtp.pre_fc_norm_hidden.weight  shape=[1024]  0.0MB  dtype=BF16  0.000s
-Index written: /Users/lion/.lattice/models/qwen3.5-0.8b-q4/quantize_index.json
+Index written: ~/.lattice/models/qwen3.5-0.8b-q4/quantize_index.json
 
 === Summary ===
 Tensors processed: 488
@@ -164,8 +164,8 @@ Real output from that command:
 
 ```
 === quantize_quarot: QuaRot Q4_0 converter ===
-Model dir:   /Users/lion/.lattice/models/qwen3.5-0.8b
-Output dir:  /Users/lion/.lattice/models/qwen3.5-0.8b-q4-quarot
+Model dir:   ~/.lattice/models/qwen3.5-0.8b
+Output dir:  ~/.lattice/models/qwen3.5-0.8b-q4-quarot
 Seed:        0x0000000000c0ffee
 Tolerance:   0.00001
 Probe toks:  4

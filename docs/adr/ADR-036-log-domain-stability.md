@@ -157,7 +157,7 @@ carry over. This is a subtle API contract documented in the type.
 
 ## References
 
-- [`crates/transport/src/logsumexp.rs`](/Users/lion/projects/lattice/crates/transport/src/logsumexp.rs) — all numerical primitives
-- [`crates/transport/src/sinkhorn_log.rs`](/Users/lion/projects/lattice/crates/transport/src/sinkhorn_log.rs) — `LogDomainSinkhornSolver`, `EpsilonScalingSchedule`
-- [`crates/transport/src/sinkhorn.rs`](/Users/lion/projects/lattice/crates/transport/src/sinkhorn.rs) — base solver using these primitives
+- [`crates/transport/src/logsumexp.rs`](../../crates/transport/src/logsumexp.rs) — all numerical primitives
+- [`crates/transport/src/sinkhorn_log.rs`](../../crates/transport/src/sinkhorn_log.rs) — `LogDomainSinkhornSolver`, `EpsilonScalingSchedule`
+- [`crates/transport/src/sinkhorn.rs`](../../crates/transport/src/sinkhorn.rs) — base solver using these primitives
 - Schmitzer, "Stabilized Sparse Scaling Algorithms for Entropy Regularized Transport Problems", SIAM J. Sci. Comput. 2019

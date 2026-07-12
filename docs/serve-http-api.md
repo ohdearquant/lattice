@@ -54,7 +54,7 @@ model directory's basename (`qwen3.5-0.8b`, `qwen3.5-0.8b-q4-quarot`, etc.).
 Startup output:
 
 ```
-Loading model from /Users/lion/.lattice/models/qwen3.5-0.8b...
+Loading model from ~/.lattice/models/qwen3.5-0.8b...
 Model loaded. Serving as 'qwen3.5-0.8b'.
 Listening on 127.0.0.1:8080  (model: qwen3.5-0.8b, max_tokens default: 64)
   POST /v1/chat/completions

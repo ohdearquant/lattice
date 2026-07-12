@@ -95,13 +95,13 @@ contract test (this is enforceable in review by grepping the catalog):
 10. **Fail-closed context bounds**: forward paths return errors, never assert-panic, when
     `prompt_len > max_context()`.
 
-#### Amendment (2026-07-10): internal attention-softmax fail-closed scope (PR #794 review)
+#### Amendment (2026-07-10): internal attention-softmax fail-closed scope (PR #794)
 
-PR #794's review read invariant #1 literally against the live Metal
+During PR #794, one reading took invariant #1 literally against the live Metal
 `fused_attention` finalize (`forward/shaders/flash_attention.metal`) and flagged a contract
 conflict: the kernel zeroes an invalid row and the forward call returns `Ok`, while invariant #1
 as originally worded says a softmax row "normalizes to Σ=1.0±ε or returns `InvalidInput`." Both
-readings were independently correct against their own evidence — the review against this ADR's
+readings were independently correct against their own evidence — one against this ADR's
 literal text, the PR against ADR-080 C1's explicit zeroed-row contract (`docs/adr/ADR-080-consolidation-duplicated-contracts.md`,
 section C1) and the two sites ADR-080 names as authoritative (`attention/gqa.rs`,
 `attention/decode.rs`). This amendment resolves the conflict by scoping invariant #1 rather than
@@ -143,7 +143,7 @@ place is a detection problem those higher layers own, and PR #794's own regressi
 verify the arithmetic guarantee, not defect detection.
 
 This amendment does not reopen ADR-080 C1 (unchanged) and does not require the typed-error
-plumbing the round-1 review requested for internal attention; it resolves the review's blocker
+plumbing requested for internal attention; it resolves the open question
 by making explicit what was previously only implicit in ADR-080's separately-landed text.
 
 ### D3. Signal-design rules (how gates report, not just what they check)

@@ -85,41 +85,6 @@ kernel void rms_norm(
     }
 }
 
-// ===== RoPE: rotary position embedding =====
-// Operates on x[total_heads, head_dim] at a given position offset.
-// cos/sin tables: [max_seq_len, half_dim].
-kernel void rope(
-    device float* x              [[buffer(0)]],
-    device const float* cos_tab  [[buffer(1)]],
-    device const float* sin_tab  [[buffer(2)]],
-    constant uint& seq_len       [[buffer(3)]],
-    constant uint& num_heads     [[buffer(4)]],
-    constant uint& head_dim      [[buffer(5)]],
-    constant uint& stride        [[buffer(6)]],  // row stride in x (q_dim or kv_dim)
-    uint gid [[thread_position_in_grid]])
-{
-    uint half_dim = head_dim / 2;
-    uint total_pairs = seq_len * num_heads * half_dim;
-    if (gid >= total_pairs) return;
-
-    // Decompose linear index into (pos, head, pair).
-    uint pair = gid % half_dim;
-    uint tmp = gid / half_dim;
-    uint head = tmp % num_heads;
-    uint pos = tmp / num_heads;
-
-    uint base = pos * stride + head * head_dim;
-    uint cs_base = pos * half_dim;
-
-    float cos_val = cos_tab[cs_base + pair];
-    float sin_val = sin_tab[cs_base + pair];
-
-    float x0 = x[base + pair];
-    float x1 = x[base + half_dim + pair];
-    x[base + pair]            = x0 * cos_val - x1 * sin_val;
-    x[base + half_dim + pair] = x0 * sin_val + x1 * cos_val;
-}
-
 // ===== Fused Attention: Q@K^T + causal softmax + scores@V in one kernel =====
 // Eliminates the global scores buffer. Online softmax in registers.
 // FA_HEAD_DIM and FA_GQA_GROUPS are injected from model config at compile time.

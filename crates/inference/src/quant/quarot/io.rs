@@ -29,10 +29,10 @@
 //! [`tensor_names`]: QuarotTensorReader::tensor_names
 //! [`has_tensor`]: QuarotTensorReader::has_tensor
 //!
-//! On-disk decode for F32 / F16 / BF16 is hand-rolled to keep this module
-//! independent of the `f16` cargo feature. The conversion is bit-identical
-//! to [`crate::weights::f32_weights`]'s internal `f16_to_f32` /
-//! `bf16_to_f32`, then widened to f64 (lossless from f32).
+//! On-disk decode for F32 / F16 / BF16 uses the always-compiled scalar
+//! conversion in [`crate::weights::half_bits`] (independent of the `f16`
+//! cargo feature, which only gates *loading permission* elsewhere), then
+//! widens the result to f64 (lossless from f32).
 //!
 //! Step 3b deliverable per [ADR-044]; consumed by step 3c's
 //! `quantize_quarot` binary.
@@ -637,8 +637,8 @@ fn decode_bytes_to_f64(bytes: &[u8], dtype: SourceDType) -> Result<Vec<f64>, Inf
             Ok(bytes
                 .chunks_exact(2)
                 .map(|b| {
-                    let bf16 = u16::from_le_bytes([b[0], b[1]]);
-                    f32::from_bits((bf16 as u32) << 16) as f64
+                    crate::weights::half_bits::bf16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]))
+                        as f64
                 })
                 .collect())
         }
@@ -651,40 +651,13 @@ fn decode_bytes_to_f64(bytes: &[u8], dtype: SourceDType) -> Result<Vec<f64>, Inf
             }
             Ok(bytes
                 .chunks_exact(2)
-                .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])) as f64)
+                .map(|b| {
+                    crate::weights::half_bits::f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]))
+                        as f64
+                })
                 .collect())
         }
     }
-}
-
-/// IEEE-754 binary16 → f32. Bit-identical to the internal helper in
-/// [`crate::weights::f32_weights`] (which is `#[cfg(feature = "f16")]`-gated
-/// and so unavailable here without dragging the feature flag into QuaRot).
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 0x1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let frac = (bits & 0x03ff) as u32;
-
-    let f32_bits = match (exp, frac) {
-        (0, 0) => sign << 31,
-        (0, _) => {
-            // Subnormal: shift the leading 1 into bit 10, then strip it
-            // and treat the rest as f32 mantissa.
-            let mut mant = frac;
-            let mut e = -14i32;
-            while (mant & 0x0400) == 0 {
-                mant <<= 1;
-                e -= 1;
-            }
-            mant &= 0x03ff;
-            (sign << 31) | (((e + 127) as u32) << 23) | (mant << 13)
-        }
-        (0x1f, 0) => (sign << 31) | 0x7f80_0000,
-        (0x1f, _) => (sign << 31) | 0x7f80_0000 | (frac << 13),
-        _ => (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (frac << 13),
-    };
-
-    f32::from_bits(f32_bits)
 }
 
 #[cfg(test)]

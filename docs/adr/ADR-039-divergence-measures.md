@@ -138,7 +138,7 @@ important for debugging cases where one of the three solves failed to converge.
 
 ## References
 
-- [`crates/transport/src/divergence.rs`](/Users/lion/projects/lattice/crates/transport/src/divergence.rs) — full implementation
-- [`crates/transport/src/sinkhorn.rs`](/Users/lion/projects/lattice/crates/transport/src/sinkhorn.rs) — `SinkhornResult.regularized_cost` field
-- [`crates/transport/src/cost.rs`](/Users/lion/projects/lattice/crates/transport/src/cost.rs) — `DenseCostMatrix`, `PairwiseCostMatrix` used for selection
+- [`crates/transport/src/divergence.rs`](../../crates/transport/src/divergence.rs) — full implementation
+- [`crates/transport/src/sinkhorn.rs`](../../crates/transport/src/sinkhorn.rs) — `SinkhornResult.regularized_cost` field
+- [`crates/transport/src/cost.rs`](../../crates/transport/src/cost.rs) — `DenseCostMatrix`, `PairwiseCostMatrix` used for selection
 - Genevay, Peyré, Cuturi, "Learning Generative Models with Sinkhorn Divergences", AISTATS 2018

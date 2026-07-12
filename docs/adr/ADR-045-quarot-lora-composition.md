@@ -12,15 +12,15 @@ The next step is **LoRA adapter injection on top of the QuaRot Q4 base**. This c
 
 ### What exists in lattice today
 
-| Component | Location | Status |
-|-----------|----------|--------|
-| `LoraHook` trait | `crates/inference/src/lora_hook.rs` | Active, CPU-only |
-| `LoraAdapter` / `LoraLayer` | `crates/tune/src/lora/mod.rs` | Active, loads PEFT safetensors |
-| `LoraConfig` (rank, alpha, targets) | `crates/tune/src/lora/mod.rs` | Active |
-| CPU forward LoRA injection | `crates/inference/src/model/qwen35/model.rs:17` | Active — `Qwen35Model.lora` field, called per projection |
-| Metal Q4 forward path | `crates/inference/src/forward/metal_qwen35.rs` | Active — LoRA dispatch after each projection (PR #37) |
-| QuaRot seed in artifact | `config.json` in quantize_quarot output | Shipped — `inject_quarot_seed` at `crates/inference/src/quant/quarot/convert.rs:136` writes the seed into the output `config.json` under both `text_config` and top-level keys |
-| `RandomizedHadamard` reconstruction | `crates/inference/src/quant/quarot/` | Active — deterministic from seed |
+| Component                           | Location                                        | Status                                                                                                                                                                         |
+| ----------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `LoraHook` trait                    | `crates/inference/src/lora_hook.rs`             | Active, CPU-only                                                                                                                                                               |
+| `LoraAdapter` / `LoraLayer`         | `crates/tune/src/lora/mod.rs`                   | Active, loads PEFT safetensors                                                                                                                                                 |
+| `LoraConfig` (rank, alpha, targets) | `crates/tune/src/lora/mod.rs`                   | Active                                                                                                                                                                         |
+| CPU forward LoRA injection          | `crates/inference/src/model/qwen35/model.rs:17` | Active — `Qwen35Model.lora` field, called per projection                                                                                                                       |
+| Metal Q4 forward path               | `crates/inference/src/forward/metal_qwen35.rs`  | Active — LoRA dispatch after each projection (PR #37)                                                                                                                          |
+| QuaRot seed in artifact             | `config.json` in quantize_quarot output         | Shipped — `inject_quarot_seed` at `crates/inference/src/quant/quarot/convert.rs:136` writes the seed into the output `config.json` under both `text_config` and top-level keys |
+| `RandomizedHadamard` reconstruction | `crates/inference/src/quant/quarot/`            | Active — deterministic from seed                                                                                                                                               |
 
 ### Gaps (remaining)
 
@@ -68,6 +68,7 @@ Both corrections are **exact** (R is orthogonal: `R^T · R = I`). Zero approxima
 The `RandomizedHadamard` operates in-place via Walsh-Hadamard transforms (`O(d log d)` per vector), NOT dense matrix multiplication. No `d × d` matrix is materialized.
 
 Per LoRA layer:
+
 - **Input-side** (A rotation): `rank` WHT applications of length `d_in`. Cost: `O(rank × d_in × log(d_in))`. For rank=16, d=1024: ~160K FLOPs.
 - **Output-side** (B rotation): `rank` WHT applications of length `d_out`. Cost: `O(rank × d_out × log(d_out))`. Same order.
 
@@ -127,22 +128,23 @@ Until this metadata exists, the caller must supply the seed explicitly. The `loa
 
 The rotation `R` is the **residual-stream** rotation. It's absorbed input-side into projections that consume the residual stream directly. From the `RotationPlan` (ADR-044 step 3a):
 
-| Projection | Absorbs R? | LoRA target? | Rotate A? | Rotate B? |
-|-----------|-----------|-------------|-----------|-----------|
-| `q_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
-| `k_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
-| `v_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
-| `o_proj` | Yes (output) | Yes | No | **B ← R·B** |
-| `gate_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
-| `up_proj` | Yes (input) | Yes | **A ← A·R^T** | No |
-| `down_proj` | Yes (output) | Yes | No | **B ← R·B** |
-| `in_proj_qkv` (GDN) | Yes (input) | Yes | **A ← A·R^T** | No |
-| `in_proj_z` (GDN) | Yes (input) | Yes | **A ← A·R^T** | No |
-| `in_proj_a` (GDN) | Yes (input) | Yes | **A ← A·R^T** | No |
-| `in_proj_b` (GDN) | Yes (input) | Yes | **A ← A·R^T** | No |
-| `out_proj` (GDN) | Yes (output) | Yes | No | **B ← R·B** |
+| Projection          | Absorbs R?   | LoRA target? | Rotate A?     | Rotate B?   |
+| ------------------- | ------------ | ------------ | ------------- | ----------- |
+| `q_proj`            | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `k_proj`            | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `v_proj`            | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `o_proj`            | Yes (output) | Yes          | No            | **B ← R·B** |
+| `gate_proj`         | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `up_proj`           | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `down_proj`         | Yes (output) | Yes          | No            | **B ← R·B** |
+| `in_proj_qkv` (GDN) | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `in_proj_z` (GDN)   | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `in_proj_a` (GDN)   | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `in_proj_b` (GDN)   | Yes (input)  | Yes          | **A ← A·R^T** | No          |
+| `out_proj` (GDN)    | Yes (output) | Yes          | No            | **B ← R·B** |
 
 Rules:
+
 - **Input-side** (`W ← W·R^T`): counter-rotate A so `B·(A·R^T)·(R·h) = B·A·h` ✓
 - **Output-side** (`W ← R·W`): rotate B so `(R·B)·A·x = R·(B·A·x)` — delta lands in rotated residual basis ✓
 
@@ -157,12 +159,14 @@ Two options:
 **(b) Separate dispatch**: existing `Q4_GEMV(W, x)` writes to output buffer; new `LoRA_GEMV(B, A, x, scale)` adds to the same buffer. Two dispatches, slightly more overhead, but decoupled and testable independently.
 
 **Decision: (b) separate dispatch for v1.** Rationale:
+
 - The Q4 GEMV kernel is already complex and battle-tested; don't destabilize it.
 - The LoRA GEMV is `d_out × rank + rank × d_in` FLOPs — tiny relative to the Q4 GEMV (which is `d_out × d_in / block_size`). The dispatch overhead is negligible vs the actual compute.
 - Testable independently: LoRA kernel can be validated against CPU reference without touching the Q4 path.
 - Fusion becomes a v2 optimization if profiling shows dispatch overhead matters.
 
 The LoRA Metal kernels (two-phase separate dispatch):
+
 ```
 // Phase 1 (lora_gemv_a): A' @ x → intermediate (rank × 1)
 // Phase 2 (lora_gemv_b_accum): output[i] += scale * B'[i,:] @ intermediate
@@ -193,6 +197,7 @@ and the raw `a`/`b` weight vectors. The loader validates module names against th
 layer type (full-attention vs GDN) and checks dimensions against the model config.
 
 When `quarot_seed` is `Some(seed)`:
+
 1. Reconstruct `R` from seed + hidden_dim using a fixed Qwen3.5 residual-stream plan.
 2. Call `rotate_adapter_for_quarot` which, for each (layer, module):
    - Input-side: computes `A_cr = A · R^T`, uploads `(B, A_cr)` to Metal buffers.
@@ -204,20 +209,20 @@ When `quarot_seed` is `None` (unrotated Q4 base): skip rotation correction, uplo
 
 ### Testing strategy
 
-| Test | What it validates |
-|------|-------------------|
-| Counter-rotation unit test | `B · (A · R^T) · (R · h) == B · A · h` for random A, B, h, R |
-| Metal LoRA kernel vs CPU reference | `GPU_LoRA_GEMV(B, A, x) == scale * B @ (A @ x)` on synthetic data |
-| End-to-end PPL with identity adapter | PPL unchanged when adapter is all-zeros (no-op injection) |
-| End-to-end PPL unrotated-base + adapter | Match CPU LoraHook path on `Qwen35Model` |
-| End-to-end PPL QuaRot-base + counter-rotated adapter | Match CPU path with manually counter-rotated adapter |
-| LoRA load/unload cycle | No memory leak, state resets cleanly |
+| Test                                                 | What it validates                                                 |
+| ---------------------------------------------------- | ----------------------------------------------------------------- |
+| Counter-rotation unit test                           | `B · (A · R^T) · (R · h) == B · A · h` for random A, B, h, R      |
+| Metal LoRA kernel vs CPU reference                   | `GPU_LoRA_GEMV(B, A, x) == scale * B @ (A @ x)` on synthetic data |
+| End-to-end PPL with identity adapter                 | PPL unchanged when adapter is all-zeros (no-op injection)         |
+| End-to-end PPL unrotated-base + adapter              | Match CPU LoraHook path on `Qwen35Model`                          |
+| End-to-end PPL QuaRot-base + counter-rotated adapter | Match CPU path with manually counter-rotated adapter              |
+| LoRA load/unload cycle                               | No memory leak, state resets cleanly                              |
 
 ### Risks
 
 1. **Adapter compatibility**: adapters trained on a different tokenizer / model revision won't match. The governed manifest records `base_model_rev` and `tokenizer_rev`, and the loader fail-closes on status, bounded file size, SHA-256 mismatch, parse errors, rank/alpha/module/dimension validation, **and** (as of issue #610) base/tokenizer revision agreement against the running model — see §Governance Manifest Completion below. A config hash (beyond the two revision strings) is still not compared at load time.
 2. **Multi-adapter / MoLoRA**: a simple weighted decode-time mixture has shipped as a CPU pre-blend: `A_blend = vconcat(A_i)`, `B_blend = hconcat(w_i * B_i)`, then the existing single-adapter Metal path loads the rank-sum adapter. Learned/router mixture code is feature-gated behind `mixture`; W2-barycenter composition remains research background rather than the shipped blend path. The counter-rotation still applies to each expert's A matrix before/within composition.
-3. **Adapter rank explosion at Q4 precision**: the Q4 GEMV operates in reduced precision; the LoRA addition is f32/f16. This is actually *good* — the adapter delta is the high-precision correction on top of the quantized base. No precision loss on the personalization signal.
+3. **Adapter rank explosion at Q4 precision**: the Q4 GEMV operates in reduced precision; the LoRA addition is f32/f16. This is actually _good_ — the adapter delta is the high-precision correction on top of the quantized base. No precision loss on the personalization signal.
 4. **GDN layers**: Qwen3.5's GDN (Gated Delta Network) layers have `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`. If users target these with LoRA (uncommon but possible), the same counter-rotation logic applies — the plan already covers them.
 
 ### Governance Manifest Completion (Issue #610, 2026-07-03)
@@ -232,14 +237,14 @@ Issue #439 (PR #444) shipped the governed manifest schema and fail-closed loader
 
 ## Implementation Steps
 
-| Step | Scope | Status |
-|------|-------|--------|
-| 1 | Adapter rotation library: `quarot::lora::rotate_adapter_for_quarot(layers, seed, hidden_dim, plan)` — input-side A counter-rotation + output-side B rotation, fail-closed for unknown targets | **Done** (PR #35) |
-| 2 | Metal LoRA GEMV kernels: `lora_gemv_a` + `lora_gemv_b_accum` MSL shaders, pipeline compilation | **Done** (PR #35) |
-| 3 | `MetalQwen35State::load_lora_adapter` API: orchestrates rotation + buffer upload + Rust dispatch wrapper | **Done** (PR #36) |
-| 4 | Forward path integration: dispatch LoRA kernel after each adapted Q4 GEMV | **Done** (PR #37) |
-| 5 | End-to-end validation: PPL with adapter vs CPU reference path | Pending |
-| 6 | `bin/chat_metal` adapter flag: `--lora-dir <PATH>` for interactive use | Done — `--lora` flag implemented at `crates/inference/src/bin/chat_metal.rs:405` |
+| Step | Scope                                                                                                                                                                                         | Status                                                                           |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| 1    | Adapter rotation library: `quarot::lora::rotate_adapter_for_quarot(layers, seed, hidden_dim, plan)` — input-side A counter-rotation + output-side B rotation, fail-closed for unknown targets | **Done** (PR #35)                                                                |
+| 2    | Metal LoRA GEMV kernels: `lora_gemv_a` + `lora_gemv_b_accum` MSL shaders, pipeline compilation                                                                                                | **Done** (PR #35)                                                                |
+| 3    | `MetalQwen35State::load_lora_adapter` API: orchestrates rotation + buffer upload + Rust dispatch wrapper                                                                                      | **Done** (PR #36)                                                                |
+| 4    | Forward path integration: dispatch LoRA kernel after each adapted Q4 GEMV                                                                                                                     | **Done** (PR #37)                                                                |
+| 5    | End-to-end validation: PPL with adapter vs CPU reference path                                                                                                                                 | Pending                                                                          |
+| 6    | `bin/chat_metal` adapter flag: `--lora-dir <PATH>` for interactive use                                                                                                                        | Done — `--lora` flag implemented at `crates/inference/src/bin/chat_metal.rs:405` |
 
 Steps 1-4 complete. Prefill falls back to sequential when adapter active (no batch LoRA kernel).
 `in_proj_b`/`in_proj_a` rejected at load time (consumed inside fused kernels).
@@ -253,24 +258,18 @@ Steps 1-4 complete. Prefill falls back to sequential when adapter active (no bat
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Verdict |
-|------------|------|------|---------|
-| Train adapters in the rotated basis | No load-time transform needed | Requires rotated model at train time; not backwards-compatible with existing PEFT adapters | Reject for v1 (offer as v2 "native QuaRot LoRA training" mode) |
-| Runtime rotation of adapter output (`R · (B · A · x)`) | No adapter modification | Per-token `d×d` matmul overhead on GPU — unacceptable for decode latency | Reject |
-| CPU-side LoRA with GPU→CPU→GPU round-trip | Reuses existing `LoraHook` trait | Round-trip latency kills decode throughput (~5× slower) | Reject |
-| Fused Q4+LoRA kernel | Maximum throughput | Couples Q4 layout to LoRA; complex; hard to test | Defer to v2 optimization |
+| Alternative                                            | Pros                             | Cons                                                                                       | Verdict                                                        |
+| ------------------------------------------------------ | -------------------------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------- |
+| Train adapters in the rotated basis                    | No load-time transform needed    | Requires rotated model at train time; not backwards-compatible with existing PEFT adapters | Reject for v1 (offer as v2 "native QuaRot LoRA training" mode) |
+| Runtime rotation of adapter output (`R · (B · A · x)`) | No adapter modification          | Per-token `d×d` matmul overhead on GPU — unacceptable for decode latency                   | Reject                                                         |
+| CPU-side LoRA with GPU→CPU→GPU round-trip              | Reuses existing `LoraHook` trait | Round-trip latency kills decode throughput (~5× slower)                                    | Reject                                                         |
+| Fused Q4+LoRA kernel                                   | Maximum throughput               | Couples Q4 layout to LoRA; complex; hard to test                                           | Defer to v2 optimization                                       |
 
 ## References
 
 - ADR-044: QuaRot rotated quantization (this builds on)
 - ADR-043: LoRA serving verification (existing LoRA correctness framework)
-- KG: `LoRA-Low-Rank-Adaptation` (e916fb8b), `LoraAdapter` (2d2ee731), `LoraHook` (7668f8d9)
-- KG: `QuaRot (Ashkboos 2024)` (86ec6a4f) — now `status: implemented`
-- KG: `W2-Barycenter-Adapter-Blending` (e6a40019) — research background; shipped decode mixture uses weighted rank-sum CPU pre-blend, not W2 barycenter transport
+- W2-Barycenter-Adapter-Blending was the research background for multi-adapter composition;
+  the shipped decode mixture uses weighted rank-sum CPU pre-blend, not W2 barycenter transport
 - Hu et al. 2021, "LoRA: Low-Rank Adaptation of Large Language Models", arXiv:2106.09685
 - Ashkboos et al. 2024, "QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs", arXiv:2404.00456
-
-## Knowledge Graph
-
-- New entity on first implementation PR: `QuaRot-LoRA-Composition` (kind: concept, type: technique, status: proposed → implemented)
-- Edges: `extends` → `QuaRot (Ashkboos 2024)`, `extends` → `LoRA-Low-Rank-Adaptation`, `implements` from the code entity once shipped

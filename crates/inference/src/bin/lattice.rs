@@ -532,14 +532,23 @@ mod doctor {
     ///   file, or a CPU-concat fallback), which has no manifest/directory
     ///   entry of its own — so each contributes 2x total.
     /// - `embed_tokens`: dequantized into a full f16 buffer for the CPU
-    ///   embedding lookup (3.2x, same ratio as `in_proj_a`/`b`) AND
-    ///   separately mmap'd at its own on-disk size for the GPU logits GEMV
-    ///   (`embed_tokens_q8`) — 4.2x total. (In the untied-embeddings case
-    ///   the logits mmap actually targets a separate `lm_head.weight.q4`
-    ///   file instead, which is already its own correctly-1x manifest
-    ///   entry; treating `embed_tokens` as a flat 4.2x in both cases is a
-    ///   deliberate, harmless over-estimate rather than added branching on
-    ///   `tie_word_embeddings` for a difference this small.)
+    ///   embedding lookup (3.2x, same ratio as `in_proj_a`/`b`) AND, only in
+    ///   the *tied* (`tie_word_embeddings == true`) case, ALSO separately
+    ///   mmap'd at its own on-disk size for the GPU logits GEMV
+    ///   (`embed_tokens_q8`) — 4.2x total for tied checkpoints. In the
+    ///   *untied* case, `MetalQwen35State::from_q4_dir` immediately shadows
+    ///   that same-named local binding with a fresh mmap of the separate
+    ///   `lm_head.weight.q4` file (`metal_qwen35.rs`, the
+    ///   `!cfg.tie_word_embeddings` branch a few lines after the tied
+    ///   assignment) — the embedding's own Q4 mmap is dropped before the
+    ///   function returns, so only the 3.2x f16 dequant survives, and
+    ///   `lm_head.weight` is counted separately (and correctly, as a plain
+    ///   1x mmap) via its own manifest/directory entry. Flattening this to
+    ///   a constant 4.2x regardless of `tie_word_embeddings` was a
+    ///   deliberate simplification when this estimator was pure telemetry,
+    ///   but it over-counts untied checkpoints by one full embedding-sized
+    ///   mmap once the estimate started gating a hard pass/fail verdict
+    ///   (#881) — hence the `tie_word_embeddings` parameter below.
     /// - Everything else (full-attention `q/k/v/o_proj`, `mlp.down_proj`,
     ///   `mlp.gate_proj`/`up_proj` fused by plain concatenation into
     ///   `gate_up_proj`, `linear_attn.out_proj`, `lm_head`) is mmap'd
@@ -550,7 +559,14 @@ mod doctor {
     /// `q4_tensor_path`-style filename (dots already replaced with `_`,
     /// optionally with a trailing `.q4`/`.f16` extension) — both retain the
     /// same distinguishing suffix tokens after normalizing separators.
-    fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64) -> u64 {
+    ///
+    /// Even with the `tie_word_embeddings` correction this remains an
+    /// ESTIMATE of peak resident footprint, not a measurement: every mmap
+    /// counted here is a lazy, file-backed no-copy mapping whose pages
+    /// fault into physical memory on first touch rather than at map time,
+    /// so on-disk byte length is an upper bound on eventual residency, not
+    /// proof of it at any given instant.
+    fn q4_resident_bytes(name_or_file: &str, on_disk_bytes: u64, tie_word_embeddings: bool) -> u64 {
         let mut n = name_or_file.replace('.', "_");
         if let Some(stripped) = n.strip_suffix("_q4").or_else(|| n.strip_suffix("_f16")) {
             n = stripped.to_string();
@@ -571,7 +587,8 @@ mod doctor {
             return on_disk_bytes.saturating_mul(2);
         }
         if n.ends_with("embed_tokens_weight") {
-            return (on_disk_bytes as f64 * 4.2).round() as u64;
+            let ratio = if tie_word_embeddings { 4.2 } else { 3.2 };
+            return (on_disk_bytes as f64 * ratio).round() as u64;
         }
         on_disk_bytes
     }
@@ -639,7 +656,8 @@ mod doctor {
                 let file_path = dir.join(&entry.file);
                 match std::fs::metadata(&file_path) {
                     Ok(meta) => {
-                        total_bytes += q4_resident_bytes(&entry.name, meta.len());
+                        total_bytes +=
+                            q4_resident_bytes(&entry.name, meta.len(), cfg.tie_word_embeddings);
                         present_names.insert(entry.name.clone());
                         has_mtp_tensors |= entry.name.starts_with("mtp.");
                     }
@@ -687,7 +705,7 @@ mod doctor {
                 if (name.ends_with(".q4") || name.ends_with(".f16"))
                     && let Ok(meta) = entry.metadata()
                 {
-                    total_bytes += q4_resident_bytes(name, meta.len());
+                    total_bytes += q4_resident_bytes(name, meta.len(), cfg.tie_word_embeddings);
                     tensor_count += 1;
                     has_mtp_tensors |= name.starts_with("mtp_");
                 }
@@ -956,6 +974,31 @@ mod doctor {
             blocking_reasons.push(format!(
                 "requested context {requested} does not fit: max feasible is {max_ctx} tokens"
             ));
+        }
+        // Fail closed on the doctor's own computed numbers even when no
+        // `--context` was requested (#875): a machine that cannot even fit
+        // the weights, or that fits weights but leaves zero room for a
+        // single token of KV cache, is not "ready to load" regardless of
+        // whether the caller asked about a specific context length.
+        if let Some(avail) = available_memory_bytes
+            && inventory.total_bytes > avail
+        {
+            blocking_reasons.push(format!(
+                "estimated weight memory {} exceeds detected system memory {}: this model is \
+                 unlikely to load on this machine (estimate of peak resident footprint from \
+                 on-disk tensor sizes -- mmap'd weights fault into physical memory lazily on \
+                 first touch, so this is not a measurement of memory actually held at any \
+                 instant)",
+                human_bytes(inventory.total_bytes),
+                human_bytes(avail)
+            ));
+        }
+        if max_context_len == Some(0) {
+            blocking_reasons.push(
+                "max feasible context length is 0 tokens: weights and/or KV cache do not fit \
+                 in available memory (not even a single token of context)"
+                    .to_string(),
+            );
         }
 
         Ok(DoctorReport {
@@ -1338,7 +1381,7 @@ mod doctor {
 
         #[test]
         fn inspect_q4_dir_resident_bytes_exceed_raw_on_disk_sum_for_expanded_tensors() {
-            // The Major finding this test guards: several Q4/Metal tensor
+            // What this test guards: several Q4/Metal tensor
             // categories are dequantized or duplicated at load time, so a
             // flat `meta.len()` sum under-reports real resident bytes. This
             // must fail if `inspect_q4_dir` reverts to summing raw on-disk
@@ -1395,92 +1438,138 @@ mod doctor {
             // Direct unit coverage for the classifier itself, independent of
             // the manifest/fallback-scan plumbing above -- also exercises
             // the sanitized-filename form (dots -> `_`, `.q4`/`.f16` suffix)
-            // used by the no-manifest fallback path.
+            // used by the no-manifest fallback path. `tie_word_embeddings`
+            // is fixed at `true` throughout this test except where noted --
+            // see `q4_resident_bytes_embed_tokens_scales_by_tie_word_embeddings`
+            // for the tied/untied comparison this parameter exists for.
             assert_eq!(
-                q4_resident_bytes("model.language_model.norm.weight", 100),
+                q4_resident_bytes("model.language_model.norm.weight", 100, true),
                 200
             );
             assert_eq!(
-                q4_resident_bytes("model_language_model_norm_weight.f16", 100),
+                q4_resident_bytes("model_language_model_norm_weight.f16", 100, true),
                 200
             );
             assert_eq!(
-                q4_resident_bytes("model.language_model.layers.0.linear_attn.A_log", 100),
+                q4_resident_bytes("model.language_model.layers.0.linear_attn.A_log", 100, true),
                 200
             );
             assert_eq!(
-                q4_resident_bytes("model.language_model.layers.0.linear_attn.dt_bias", 100),
+                q4_resident_bytes(
+                    "model.language_model.layers.0.linear_attn.dt_bias",
+                    100,
+                    true
+                ),
                 200
             );
             assert_eq!(
                 q4_resident_bytes(
                     "model.language_model.layers.0.linear_attn.conv1d.weight",
-                    100
+                    100,
+                    true
                 ),
                 200
             );
             assert_eq!(
                 q4_resident_bytes(
                     "model.language_model.layers.0.linear_attn.in_proj_a.weight",
-                    100
+                    100,
+                    true
                 ),
                 320
             );
             assert_eq!(
                 q4_resident_bytes(
                     "model.language_model.layers.0.linear_attn.in_proj_b.weight",
-                    100
+                    100,
+                    true
                 ),
                 320
             );
             assert_eq!(
                 q4_resident_bytes(
                     "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
-                    100
+                    100,
+                    true
                 ),
                 200
             );
             assert_eq!(
                 q4_resident_bytes(
                     "model.language_model.layers.0.linear_attn.in_proj_z.weight",
-                    100
+                    100,
+                    true
                 ),
                 200
             );
             assert_eq!(
-                q4_resident_bytes("model.language_model.embed_tokens.weight", 100),
+                q4_resident_bytes("model.language_model.embed_tokens.weight", 100, true),
                 420
             );
             assert_eq!(
-                q4_resident_bytes("mtp.pre_fc_norm_embedding.weight", 100),
-                200
-            );
-            assert_eq!(q4_resident_bytes("mtp.pre_fc_norm_hidden.weight", 100), 200);
-            assert_eq!(
-                q4_resident_bytes("mtp_pre_fc_norm_embedding_weight.f16", 100),
+                q4_resident_bytes("mtp.pre_fc_norm_embedding.weight", 100, true),
                 200
             );
             assert_eq!(
-                q4_resident_bytes("mtp_pre_fc_norm_hidden_weight.f16", 100),
+                q4_resident_bytes("mtp.pre_fc_norm_hidden.weight", 100, true),
                 200
             );
-            // Unaffected categories stay at exactly 1x.
             assert_eq!(
-                q4_resident_bytes("model.language_model.layers.0.self_attn.q_proj.weight", 100),
+                q4_resident_bytes("mtp_pre_fc_norm_embedding_weight.f16", 100, true),
+                200
+            );
+            assert_eq!(
+                q4_resident_bytes("mtp_pre_fc_norm_hidden_weight.f16", 100, true),
+                200
+            );
+            // Unaffected categories stay at exactly 1x, regardless of
+            // tie_word_embeddings (only embed_tokens reads that flag).
+            assert_eq!(
+                q4_resident_bytes(
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    100,
+                    true
+                ),
                 100
             );
             assert_eq!(
-                q4_resident_bytes("model.language_model.layers.0.mlp.gate_proj.weight", 100),
+                q4_resident_bytes(
+                    "model.language_model.layers.0.mlp.gate_proj.weight",
+                    100,
+                    false
+                ),
                 100
             );
             assert_eq!(
                 q4_resident_bytes(
                     "model.language_model.layers.0.linear_attn.out_proj.weight",
-                    100
+                    100,
+                    true
                 ),
                 100
             );
-            assert_eq!(q4_resident_bytes("lm_head.weight", 100), 100);
+            assert_eq!(q4_resident_bytes("lm_head.weight", 100, false), 100);
+        }
+
+        #[test]
+        fn q4_resident_bytes_embed_tokens_scales_by_tie_word_embeddings() {
+            // #881: a tied checkpoint's `embed_tokens_q8`
+            // binding keeps the raw Q4 mmap of `embed_tokens.weight` itself
+            // (1x) on top of the dequantized f16 lookup buffer (3.2x) =
+            // 4.2x. An untied checkpoint's `from_q4_dir` immediately
+            // shadows that same binding with a fresh mmap of the separate
+            // `lm_head.weight.q4` file, dropping the embedding's own Q4
+            // mmap before the function returns -- only the 3.2x f16 dequant
+            // survives, and `lm_head.weight` is counted on its own (as a
+            // plain 1x, via a different `q4_resident_bytes` call for that
+            // name, which does not match any expansion category).
+            let tensor = "model.language_model.embed_tokens.weight";
+            assert_eq!(q4_resident_bytes(tensor, 1000, true), 4200);
+            assert_eq!(q4_resident_bytes(tensor, 1000, false), 3200);
+            // lm_head itself is always a plain 1x mmap in the inventory,
+            // independent of tie_word_embeddings.
+            assert_eq!(q4_resident_bytes("lm_head.weight", 1000, true), 1000);
+            assert_eq!(q4_resident_bytes("lm_head.weight", 1000, false), 1000);
         }
 
         #[test]
@@ -1825,6 +1914,186 @@ mod doctor {
                 assert_eq!(report.requested_fits, Some(false));
                 assert!(!report.is_ready());
             }
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_weights_exceed_ram_fails_without_explicit_context() {
+            // Issue #875: doctor's own numbers said weights (64.60 GiB)
+            // exceeded system memory (32.00 GiB) yet the verdict was still
+            // "OK" because no `--context` was passed. Reproduce with no
+            // requested context at all -- the fail-closed check must not
+            // depend on `requested_fits`.
+            let dir = tempdir("report-weights-exceed-ram-no-ctx");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+            let weight_bytes = required_tensor_fixture(&cfg).len() as u64 * 64;
+
+            let report = build_report(&dir, None, None, Some(weight_bytes - 1)).unwrap();
+            assert!(!report.is_ready());
+            assert_eq!(report.requested_context, None);
+            assert!(
+                report
+                    .blocking_reasons
+                    .iter()
+                    .any(|r| r.contains("exceeds detected system memory")),
+                "blocking reasons: {:?}",
+                report.blocking_reasons
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_zero_feasible_context_fails_without_explicit_context() {
+            // Weights alone fit, but leave less than one KV-cache token's
+            // worth of headroom -- max feasible context is 0. Must fail
+            // closed even though no `--context` was requested.
+            let dir = tempdir("report-zero-ctx-no-request");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+            let weight_bytes = required_tensor_fixture(&cfg).len() as u64 * 64;
+            let kv_bytes_per_token = cfg.kv_bytes_per_token(kv_cache_dtype_bytes()) as u64;
+            assert!(
+                kv_bytes_per_token > 1,
+                "fixture assumption: at least 2 bytes/token of KV cache"
+            );
+
+            let report = build_report(&dir, None, None, Some(weight_bytes + 1)).unwrap();
+            assert_eq!(report.max_context_len, Some(0));
+            assert!(!report.is_ready());
+            assert_eq!(report.requested_context, None);
+            assert!(
+                report
+                    .blocking_reasons
+                    .iter()
+                    .any(|r| r.contains("max feasible context length is 0 tokens")),
+                "blocking reasons: {:?}",
+                report.blocking_reasons
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_fits_within_ram_is_ready_without_explicit_context() {
+            // Existing passing configurations must still report OK when no
+            // `--context` is requested (acceptance criterion: no
+            // regression on the happy path).
+            let dir = tempdir("report-fits-no-ctx");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            write_complete_safetensors_fixture(&dir, &cfg);
+
+            let report = build_report(&dir, None, None, Some(1u64 << 40)).unwrap();
+            assert!(
+                report.is_ready(),
+                "blocking reasons: {:?}",
+                report.blocking_reasons
+            );
+            assert!(report.max_context_len.unwrap_or(0) > 0);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// Minimal Q4 fixture for the threshold-regression tests below: just
+        /// two manifest entries (an `embed_tokens` tensor and one
+        /// never-expanded tensor, e.g. a plain `q_proj`) rather than the
+        /// full `qwen_required_tensor_names` set. `inspect_q4_dir` sums
+        /// `total_bytes` only over manifest entries actually present, so
+        /// this keeps the expected total small enough to state as a closed
+        /// formula in the test -- computed independently of
+        /// `q4_resident_bytes`/`inspect_q4_dir` themselves, so a regression
+        /// in either is caught rather than silently absorbed into a
+        /// self-referential expectation. `missing_tensors` will list the
+        /// rest of `qwen_required_tensor_names(cfg)` as absent, which is
+        /// irrelevant here: it drives a separate, unrelated blocking
+        /// reason, not the "exceeds detected system memory" one under test.
+        fn write_minimal_q4_fixture(dir: &Path, cfg: &Qwen35Config) -> (u64, u64) {
+            write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 5);
+            write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 3);
+            let embed_bytes = fs::metadata(dir.join("embed.q4")).unwrap().len();
+            let q_proj_bytes = fs::metadata(dir.join("q_proj.q4")).unwrap().len();
+            let index = serde_json::json!([
+                {"name": "model.language_model.embed_tokens.weight", "file": "embed.q4", "quantized": true, "shape": [32], "numel": 32},
+                {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+            write_config_json(dir, cfg);
+            fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
+            (embed_bytes, q_proj_bytes)
+        }
+
+        #[test]
+        fn build_report_q4_untied_embed_tokens_threshold_no_longer_overcounts() {
+            // #881: before this fix, `q4_resident_bytes`
+            // charged `embed_tokens` at a flat 4.2x on-disk size regardless
+            // of `tie_word_embeddings`, even though an UNTIED checkpoint's
+            // loader drops the embedding's own Q4 mmap and only keeps the
+            // 3.2x f16 dequant (see `q4_resident_bytes`'s doc comment). That
+            // stale 4.2x overcounted an untied checkpoint by exactly one
+            // embedding-file's worth of bytes -- enough to push a
+            // near-boundary checkpoint across the new hard-fail threshold
+            // for a machine it would actually fit on.
+            //
+            // Reproduce at the boundary: pick a memory override strictly
+            // between an INDEPENDENTLY hand-computed corrected (3.2x) total
+            // and what the stale flat-4.2x estimate would have been for the
+            // same on-disk bytes -- both computed here with the `* 3.2`/
+            // `* 4.2` arithmetic directly, not by calling
+            // `q4_resident_bytes`/`inspect_q4_dir`, so a regression back to
+            // the flat-4.2x behavior actually pushes `report`'s real
+            // `inventory.total_bytes` back over this test's override and
+            // is caught.
+            let dir = tempdir("report-q4-untied-threshold");
+            let mut cfg = Qwen35Config::qwen35_0_8b();
+            cfg.tie_word_embeddings = false;
+            let (embed_bytes, q_proj_bytes) = write_minimal_q4_fixture(&dir, &cfg);
+
+            let corrected_total = (embed_bytes as f64 * 3.2).round() as u64 + q_proj_bytes; // untied: 3.2x + 1x
+            let stale_would_have_been = (embed_bytes as f64 * 4.2).round() as u64 + q_proj_bytes; // old flat 4.2x + 1x
+            assert!(stale_would_have_been > corrected_total);
+            let threshold_override =
+                corrected_total + (stale_would_have_been - corrected_total) / 2;
+            assert!(threshold_override > corrected_total);
+            assert!(threshold_override < stale_would_have_been);
+
+            let report = build_report(&dir, None, None, Some(threshold_override)).unwrap();
+            assert!(
+                !report
+                    .blocking_reasons
+                    .iter()
+                    .any(|r| r.contains("exceeds detected system memory")),
+                "corrected Q4 estimate must fit within a budget between the corrected and \
+                 stale flat-4.2x estimate; blocking reasons: {:?}",
+                report.blocking_reasons
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_q4_true_over_budget_still_fails() {
+            // Belt-and-suspenders alongside the threshold test above: a Q4
+            // checkpoint that genuinely exceeds even the corrected
+            // (tie_word_embeddings-aware) estimate must still fail closed
+            // -- the fix must not turn into a blanket pass for Q4. Same
+            // independent hand-computed formula as the test above.
+            let dir = tempdir("report-q4-true-over-budget");
+            let mut cfg = Qwen35Config::qwen35_0_8b();
+            cfg.tie_word_embeddings = false;
+            let (embed_bytes, q_proj_bytes) = write_minimal_q4_fixture(&dir, &cfg);
+
+            let corrected_total = (embed_bytes as f64 * 3.2).round() as u64 + q_proj_bytes;
+            let report = build_report(&dir, None, None, Some(corrected_total - 1)).unwrap();
+            assert!(
+                report
+                    .blocking_reasons
+                    .iter()
+                    .any(|r| r.contains("exceeds detected system memory")),
+                "a checkpoint exceeding even the corrected estimate must still fail closed; \
+                 blocking reasons: {:?}",
+                report.blocking_reasons
+            );
             fs::remove_dir_all(&dir).ok();
         }
 
@@ -2373,8 +2642,8 @@ mod serve {
             tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
             max_context: usize,
         },
-        /// Test-only seam (ADR-080 C2 round 2, codex round-2 medium finding
-        /// #3): wraps a real tiny model for `tokenize_len`/`max_context`/
+        /// Test-only seam (ADR-080 C2): wraps a real tiny model for
+        /// `tokenize_len`/`max_context`/
         /// `tokenizer` (so request validation stays realistic) but
         /// substitutes the CPU streaming generation call itself with an
         /// injected closure. This lets a test observe `should_cancel` being
@@ -3135,12 +3404,12 @@ mod serve {
         Json(HealthResponse { status: "ok" })
     }
 
-    /// `GET /` (ADR-080 C2 round 2, codex finding #1): a minimal engine-
+    /// `GET /` (ADR-080 C2): a minimal engine-
     /// identity/endpoint-discovery document, in the same shape
     /// `lattice_serve.rs` already served on its own daemon -- this binary
     /// had no equivalent route at all, an undocumented route-set divergence
-    /// the review's route audit caught (the PR body's "routes now match
-    /// 1:1" claim was false until this route landed).
+    /// between the two binaries -- the routes did not actually match 1:1
+    /// until this route landed.
     pub async fn root() -> Json<Value> {
         Json(lattice_inference::serve::root_body())
     }
@@ -3330,9 +3599,9 @@ mod serve {
     /// The `on_token`/`should_cancel` composition for CPU-style streaming
     /// generation, constructed in exactly ONE place and shared by the real
     /// `ModelBackend::Cpu` arm and the test-only `CpuFakeGenerate` arm below
-    /// (ADR-080 C2 round 3, codex round-3 medium finding #1). Before this,
+    /// (ADR-080 C2). Before this,
     /// each arm rebuilt `move || *cancel_rx.borrow()` independently, so a
-    /// disposable-worktree mutation that broke ONLY the real `Cpu` arm's
+    /// a mutation that broke ONLY the real `Cpu` arm's
     /// predicate left the `CpuFakeGenerate`-only post-drop oracle green --
     /// it was pinning a copy, not the production call site. Both arms now
     /// funnel through this one function, so mutating the shared predicate
@@ -3492,8 +3761,7 @@ mod serve {
             match model {
                 ModelBackend::Cpu(cpu_model) => {
                     // Delegates through the SAME shared helper the test-only
-                    // `CpuFakeGenerate` arm below uses (codex round-3 medium
-                    // finding #1) -- only the generation call itself
+                    // `CpuFakeGenerate` arm below uses -- only the generation call itself
                     // (`cpu_model.generate_streaming_with_cancel` here, an
                     // injected closure there) differs; the `should_cancel`
                     // predicate is constructed once, by the helper, for both.
@@ -3545,7 +3813,7 @@ mod serve {
                         }
                     });
                 }
-                // ADR-080 C2 round 2/3, codex round-3 medium finding #1: goes
+                // ADR-080 C2: goes
                 // through the exact same `spawn_cpu_style_streaming_generation`
                 // helper as the real `Cpu` arm above -- there is no separate
                 // `should_cancel` construction here to leave un-mutated. Only
@@ -3705,7 +3973,7 @@ mod serve {
                             message: "inference failed".to_string(),
                         }
                     })?,
-                // ADR-080 C2 round 2 (codex round-2 medium finding #3) added
+                // ADR-080 C2 added
                 // this variant for the streaming arm's cancellation probe
                 // only, so non-streaming used to bypass the injected
                 // `generate` closure entirely and delegate straight to the
@@ -5148,9 +5416,7 @@ mod serve {
             // Regression fixture for a refactor bug: extracting stop-sequence
             // parsing into the pre-model validation cascade moved it ahead of
             // the context-window check. The pre-refactor inline sequence
-            // (verified directly against `crates/inference/src/bin/lattice.rs`
-            // at commit 3e0f74155, the base this PR built on) checked the
-            // context window BEFORE parsing `stop`. A request that is both
+            // checked the context window BEFORE parsing `stop`. A request that is both
             // over-context and carries a malformed `stop` field must
             // therefore fail with `context_length_exceeded`, not a
             // stop-parsing error.
@@ -5215,15 +5481,14 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // HTTP-level client-disconnect cancellation (ADR-080 C2 round 2, codex
-        // round-1 finding #2) -- gated behind `test-utils` (see
+        // HTTP-level client-disconnect cancellation (ADR-080 C2) -- gated behind `test-utils` (see
         // `lattice_inference::model::qwen35::test_support`) because it needs a
         // real, tiny, deterministic CPU model to exercise the actual
         // `chat_completions` -> `body_stream`'s `cancel_guard` capture ->
         // `generate_streaming_with_cancel` composition end to end, not just the
         // primitive (already unit/mutation-tested in
         // `model/qwen35/generation.rs`) or the guard type (already unit-tested
-        // in `serve/mod.rs`) in isolation. Codex's review: "the disclosed
+        // in `serve/mod.rs`) in isolation. "The disclosed
         // HTTP-level disconnect test gap ... does not waive that gate."
         // -----------------------------------------------------------------------
         #[cfg(feature = "test-utils")]
@@ -5253,7 +5518,7 @@ mod serve {
             /// generation is genuinely under way) before dropping the
             /// response body to simulate a disconnect.
             ///
-            /// Mutation-sensitive to codex's named regression: if
+            /// Mutation-sensitive to a known regression: if
             /// `let _cancel_guard_tied_to_stream_lifetime = &cancel_guard;`
             /// is removed from `body_stream`'s `flat_map` closure in
             /// `chat_completions`, `cancel_guard` is no longer captured by
@@ -5371,13 +5636,13 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // Post-drop generator-side cancellation probe (ADR-080 C2 round 2,
-        // codex round-2 medium finding #3): `chat_completions_streaming_
+        // Post-drop generator-side cancellation probe (ADR-080 C2):
+        // `chat_completions_streaming_
         // disconnect_stops_generation` above proves guard retention BEFORE
         // the response is returned (frame 2 is a real content delta), but
         // does NOT prove `should_cancel` reaching the generator AFTER the
         // drop, independently of `on_token`'s own failed-send stop
-        // condition -- codex's exact reverse mutation (`cancel_rx`
+        // condition -- the exact reverse mutation (`cancel_rx`
         // predicate replaced by `move || false`, `on_token`'s failed-send
         // path left intact) left that test green in 0.02s, because the
         // failed send alone stops a real decode loop just as fast as a
@@ -5391,7 +5656,7 @@ mod serve {
         // outcomes ended that loop over a side channel `chat_completions`
         // itself never sees. Because the probe stops polling `on_token`
         // entirely after the first delta, `on_token`'s failed-send masking
-        // effect (the exact thing that hid finding #3 from the original
+        // effect (the exact thing that hid this bug from the original
         // test) cannot fire here -- only `should_cancel`'s own return value
         // can end the loop.
         // -----------------------------------------------------------------------
@@ -5429,8 +5694,8 @@ mod serve {
             /// `body_stream`'s `flat_map` closure, itself alive because the
             /// test hasn't dropped the body/receiver yet), so `cancel_rx`
             /// cannot have flipped. A `true` reading here is the direct,
-            /// timing-independent signature of finding #1's mutation (guard
-            /// capture removed): `cancel_guard` is then just an unused
+            /// timing-independent signature of the guard-capture-removed
+            /// mutation: `cancel_guard` is then just an unused
             /// local that drops the instant `chat_completions` returns --
             /// gating this read on `checkpoint1` (rather than reading it
             /// immediately after `on_token`, which raced against
@@ -5491,7 +5756,7 @@ mod serve {
                 }
             }
 
-            /// Mutation-sensitive to BOTH of codex's named regressions
+            /// Mutation-sensitive to BOTH known regressions
             /// independently, via a test<->generator handshake that removes
             /// the timing race a plain poll-and-time-it design would have
             /// (an early, timing-dependent version of this test observed
@@ -5652,8 +5917,7 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // Streaming context-overflow status parity (ADR-080 C2 round 2, codex
-        // round-2 major finding #1): `lattice.rs` already gets this right
+        // Streaming context-overflow status parity (ADR-080 C2): `lattice.rs` already gets this right
         // structurally -- `prepare_chat_request`'s context-window preflight
         // (`check_context_window`) runs unconditionally, before
         // `chat_completions` ever branches on `req.stream` -- so a `stream:
@@ -5663,7 +5927,7 @@ mod serve {
         // already pins the underlying cascade ordering as a pure function;
         // this drives the SAME contract through the real `Router`.
         //
-        // ADR-080 C2 round 3, codex round-3 medium finding #2: this now
+        // ADR-080 C2: this now
         // builds its request from `lattice_inference::serve`'s shared
         // `OVERFLOW_PARITY_*` constants -- the SAME body/limits
         // `lattice_serve.rs`'s `real_router_overflow_parity` module drives
@@ -5674,7 +5938,7 @@ mod serve {
         // fixed at `OVERFLOW_PARITY_CONTEXT_WINDOW` (1024) precisely so this
         // side's "effective context limit" matches the daemon side's
         // explicitly-configured `AppState.model_max_context` of the same
-        // value, per codex's finding.
+        // value.
         // -----------------------------------------------------------------------
         #[cfg(feature = "test-utils")]
         mod streaming_context_overflow {
@@ -5716,8 +5980,8 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // Cross-binary `/v1/chat/completions` parity table (ADR-080 C2 round 2,
-        // codex round-1 finding #1): drives every fixture body in
+        // Cross-binary `/v1/chat/completions` parity table (ADR-080 C2):
+        // drives every fixture body in
         // `lattice_inference::serve::CHAT_COMPLETIONS_PARITY_CASES` through
         // THIS binary's real `Router` via `tower::ServiceExt::oneshot`, and
         // compares the resulting status + error code against the case's
@@ -5889,7 +6153,7 @@ mod serve {
         // actually called with, then returns a canned result; it never
         // recomputes `build_cfg`/`validate_temperature`/etc. itself.
         //
-        // DISPUTED (issue #828 fix-round 3, codex round-2 medium finding #1):
+        // DISPUTED (issue #828):
         // this observation captures `rendered_prompt`, not `messages`, and
         // that is the real shape of this seam, not an omission. `chat_completions`
         // computes `to_chat_messages(&req.messages)` (the normalized message
@@ -5907,7 +6171,7 @@ mod serve {
         //
         // Observing `messages` at the CPU seam authentically (not by
         // re-deriving `to_chat_messages` independently in the test, which
-        // would be tautological -- exactly the round-1 major finding this
+        // would be tautological -- exactly the bug this
         // module was written to fix) would require a `MetalFakeGenerate`
         // test double for `ModelBackend::Metal`. `MetalHandle::spawn`
         // hard-requires loading a real Q4 model directory onto a real Metal
@@ -5942,7 +6206,7 @@ mod serve {
             /// variable into both the recorded observation and the returned
             /// `GenerateOutput`, so a caller of this helper can vary it and prove
             /// the observation genuinely mirrors what the seam returned rather
-            /// than an independent hardcoded literal (round 2 major finding).
+            /// than an independent hardcoded literal.
             async fn run_observed(stopped: bool) -> ProductionAdapterObservation {
                 let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
                 let tokenizer = model.tokenizer().clone();
@@ -6063,7 +6327,7 @@ mod serve {
 
             /// Proves `ProductionAdapterObservation::stopped` is genuinely
             /// derived from what the generation seam returned, not an
-            /// independent hardcoded literal (round 2 major finding: the
+            /// independent hardcoded literal (the
             /// pre-fix `lattice_serve.rs` observation stored `stopped: true`
             /// unconditionally). Running the exact same request through
             /// `run_observed(false)` must observe `stopped == false`.

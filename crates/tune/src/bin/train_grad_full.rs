@@ -131,11 +131,10 @@ fn strided_probes(len: usize, count: usize, seed: u64) -> Vec<usize> {
 /// small non-zero random noise, so both `grad_A` and the gate path are
 /// non-vacuous for the finite-difference probe.
 ///
-/// Extracted into a standalone, testable function per #792 codex round-2:
-/// this is the exact constructor that had drifted to `gdn_dims.num_kh` for
-/// `b_b`/`b_a` while `GdnLoraParams::zeros` (fixed in round-1) used the
-/// correct `value_heads`. Now routes through `GdnLoraParams::shaped`, the
-/// single shape source of truth.
+/// Extracted into a standalone, testable function (#792): this is the exact
+/// constructor that had drifted to `gdn_dims.num_kh` for `b_b`/`b_a` while
+/// `GdnLoraParams::zeros` used the correct `value_heads`. Now routes through
+/// `GdnLoraParams::shaped`, the single shape source of truth.
 fn gradcheck_gdn_loras(
     num_gdn_slots: usize,
     rank: usize,
@@ -175,8 +174,8 @@ fn gradcheck_gdn_loras(
 /// Training-mode GDN LoRA initialization: A ~ U(-init_amp, +init_amp), B
 /// zero (delta=0 at init reproduces the base; grad_B != 0 so B moves first).
 ///
-/// Extracted into a standalone, testable function per #792 codex round-2:
-/// see [`gradcheck_gdn_loras`] for why this must route through
+/// Extracted into a standalone, testable function (#792): see
+/// [`gradcheck_gdn_loras`] for why this must route through
 /// `GdnLoraParams::shaped` rather than re-deriving `b_b`/`b_a`'s length
 /// inline (the same drift existed at this call site independently).
 fn zero_b_gdn_loras(
@@ -946,7 +945,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             d_in: dims.hidden,
                             // beta is projected per VALUE head (matches the
                             // shipping gdn_fused forward and the f16 weight
-                            // loader), not per key head (#792 codex blocker).
+                            // loader), not per key head (#792).
                             d_out: gdn_dims.value_heads,
                             rank,
                         },
@@ -1102,10 +1101,10 @@ mod gdn_lora_ctor_tests {
     /// Asymmetric fixture (num_kh=2, value_heads=4) — the only shape that can
     /// distinguish "sized by key heads" from "sized by value heads"; a
     /// symmetric config (e.g. num_kh == value_heads) would pass either way.
-    /// #792 codex round-2 blocker: `gradcheck_gdn_loras`/`zero_b_gdn_loras`
-    /// (this binary's two GDN LoRA initializers) had independently
-    /// re-derived `b_b`/`b_a` as `num_kh * rank` instead of
-    /// `value_heads * rank`, breaking on exactly this shape class.
+    /// #792: `gradcheck_gdn_loras`/`zero_b_gdn_loras` (this binary's two GDN
+    /// LoRA initializers) had independently re-derived `b_b`/`b_a` as
+    /// `num_kh * rank` instead of `value_heads * rank`, breaking on exactly
+    /// this shape class.
     fn asymmetric_gdn_dims() -> GdnDims {
         let key_dim = 8;
         let value_dim = 8;

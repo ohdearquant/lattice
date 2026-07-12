@@ -1,5 +1,5 @@
 //! Test-only tiny zero-weight `Qwen35Model` construction, gated behind the
-//! `test-utils` Cargo feature (ADR-080 C2 round 2, codex finding #2).
+//! `test-utils` Cargo feature (ADR-080 C2).
 //!
 //! `crates/inference/src/model/qwen35/generation.rs`'s `#[cfg(test)] mod
 //! tests` already builds an all-zero-weight tiny model for its own
@@ -8,7 +8,7 @@
 //! specifically, invisible to `crates/inference/src/bin/lattice.rs`'s test
 //! module, which is a *separate* compilation unit that links against this
 //! crate as an ordinary (non-test) dependency. The HTTP-level disconnect
-//! test codex's round-1 review required for `lattice.rs`'s `chat_completions`
+//! test that `lattice.rs`'s `chat_completions`
 //! handler needs a real (but tiny, fast, deterministic) `ModelBackend::Cpu`
 //! to exercise the actual streaming composition end to end, so this function
 //! is the one library-side seam that makes it constructible from the bin's
@@ -19,8 +19,8 @@
 //! independently-readable copies avoids threading a `test-utils`-feature
 //! dependency into the library's own always-on `#[cfg(test)]` build, and the
 //! "deliberate copy" convention already applies elsewhere in this crate for
-//! exactly this kind of test-fixture code (see `AGENTS.md`/`CLAUDE.md`'s
-//! parity-safety note on `generate`/`generate_streaming`).
+//! exactly this kind of test-fixture code, matching the parity-safety
+//! guidance this repo follows for `generate`/`generate_streaming`.
 
 use super::Qwen35Model;
 use super::weights::{

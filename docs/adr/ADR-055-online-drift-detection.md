@@ -48,6 +48,7 @@ uses non-conflicting names (`OnlineDriftDetector`, `OnlineDriftConfig`, `OnlineD
 to coexist with the existing batch API.
 
 The boundary is explicit:
+
 - `lattice-transport` owns: the sliding window, divergence computation, threshold comparison,
   and signal emission. It is distribution-agnostic — it does not know what the samples represent.
 - `lattice-inference` owns: sampling from the inference pipeline (which layer, how often),
@@ -163,7 +164,7 @@ drift before refresh is warranted).
 
 ### Threshold calibration
 
-The `Adapter Refresh Threshold` from the KG entity uses renewal theory:
+The `Adapter Refresh Threshold` uses renewal theory:
 
 ```
 refresh_interval* = sqrt(2 * C_refresh / (δ * rate_of_divergence))
@@ -181,13 +182,13 @@ lets the reactor apply graduated responses (warn vs. force-refresh vs. fallback 
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why Not |
-|---|---|---|---|
-| KL divergence on token ID distribution | O(n log n), no OT | Requires binning; undefined when support differs; no geometry | Continuous hidden states don't bin naturally |
-| MMD (Maximum Mean Discrepancy) | Closed form kernel test | Kernel choice matters; no geometry; harder to threshold | Less interpretable than OT divergence; no transport interpretation |
-| Exponential moving average of cosine similarity | Zero OT cost, O(1) per step | Not a proper divergence; `cos(a, a) = 1` always, no `S(a, b) = 0` guarantee | Cannot distinguish in-distribution drift from magnitude shift |
-| Separate detectors per crate (transport-side only, no inference hook) | Keeps transport fully standalone | Forces inference callers to wire sampling manually; drift is only useful with reaction | Incomplete without the reaction path; adds boilerplate at every callsite |
-| Monitor every token (no `sample_every_n_tokens`) | Maximally sensitive | O(W²) per token is prohibitive at 128 window; 128×128×3 solves at 1 ns/op = 50 µs per token | Sample-and-amortize: every 16 tokens, 50 µs total amortized to 3 µs/token |
+| Alternative                                                           | Pros                             | Cons                                                                                        | Why Not                                                                   |
+| --------------------------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| KL divergence on token ID distribution                                | O(n log n), no OT                | Requires binning; undefined when support differs; no geometry                               | Continuous hidden states don't bin naturally                              |
+| MMD (Maximum Mean Discrepancy)                                        | Closed form kernel test          | Kernel choice matters; no geometry; harder to threshold                                     | Less interpretable than OT divergence; no transport interpretation        |
+| Exponential moving average of cosine similarity                       | Zero OT cost, O(1) per step      | Not a proper divergence; `cos(a, a) = 1` always, no `S(a, b) = 0` guarantee                 | Cannot distinguish in-distribution drift from magnitude shift             |
+| Separate detectors per crate (transport-side only, no inference hook) | Keeps transport fully standalone | Forces inference callers to wire sampling manually; drift is only useful with reaction      | Incomplete without the reaction path; adds boilerplate at every callsite  |
+| Monitor every token (no `sample_every_n_tokens`)                      | Maximally sensitive              | O(W²) per token is prohibitive at 128 window; 128×128×3 solves at 1 ns/op = 50 µs per token | Sample-and-amortize: every 16 tokens, 50 µs total amortized to 3 µs/token |
 
 ---
 
@@ -226,8 +227,6 @@ receives `Vec<f32>` values. Enforcement: `crates/transport/Cargo.toml` must neve
 - ADR-039: Sinkhorn Divergence — `point_set_sinkhorn_divergence`, three-workspace warm-start
 - ADR-040: Gated Attention (MoE router) — router staleness context
 - ADR-043: LoRA Serving Verification — adapter serving context
-- KG entities: `Online Sinkhorn Drift Estimator`, `SinkhornAdapterStalenessDetector`,
-  `Adapter Refresh Threshold`, `Stale Adapter Excess NLL`
 - Genevay, Peyré, Cuturi, "Learning Generative Models with Sinkhorn Divergences", AISTATS 2018
 - Feydy et al., "Interpolating between Optimal Transport and MMD using Sinkhorn Divergences",
   AISTATS 2019 — positive semi-definiteness proof used to justify divergence thresholding

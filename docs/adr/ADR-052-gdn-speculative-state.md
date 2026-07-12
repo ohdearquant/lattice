@@ -43,8 +43,8 @@ S = g * S + outer(k, (v - S @ k) * beta)
 ```
 
 and via the causal conv1d rolling shift. Neither update is invertible. There is no
-`truncate_to` analogue. The KG entity `GDN Multi-Round Error Accumulation` gives the
-error bound under nonexpansive decay: `O(N * eps)` for N spurious steps.
+`truncate_to` analogue. The error bound under nonexpansive decay is `O(N * eps)` for N
+spurious steps.
 
 **Correctness gap.** When speculative decoding rejects a draft token at position `t`, the GDN
 state has already been stepped through positions `t, t+1, ..., t+K-1` (all speculative). Without
@@ -154,12 +154,12 @@ For the full-acceptance path, the snapshot is simply dropped.
 
 ### Memory budget (Qwen3.5-2B)
 
-| Item | Size |
-|---|---|
-| `s_matrices` per GDN layer | 16 × 128 × 128 × 4 B = 1,048,576 B |
-| `conv_buffer` per GDN layer | 6,144 × 3 × 4 B = 73,728 B |
-| Per-layer snapshot | ~1.07 MB |
-| Full snapshot (18 GDN layers) | ~19.3 MB |
+| Item                          | Size                               |
+| ----------------------------- | ---------------------------------- |
+| `s_matrices` per GDN layer    | 16 × 128 × 128 × 4 B = 1,048,576 B |
+| `conv_buffer` per GDN layer   | 6,144 × 3 × 4 B = 73,728 B         |
+| Per-layer snapshot            | ~1.07 MB                           |
+| Full snapshot (18 GDN layers) | ~19.3 MB                           |
 
 19 MB is ephemeral (held for one speculative step). On Apple Silicon unified memory
 (16–192 GB), this is acceptable. Snapshot allocation is paid once per step, not per token.
@@ -221,6 +221,5 @@ time.
 - ADR-006: Speculative Decoding — baseline speculative decode architecture.
 - ADR-050: Rejection Sampling — strict speculative sampling; scoped the GDN gap that this
   ADR resolves.
-- KG entity `GDN Multi-Round Error Accumulation`: error bound `O(N * eps)` under
-  nonexpansive decay, motivating why skipping rollback is not a bounded-error approximation
-  but unbounded state corruption.
+- Error bound `O(N * eps)` under nonexpansive decay, motivating why skipping rollback is not
+  a bounded-error approximation but unbounded state corruption.

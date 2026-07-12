@@ -660,9 +660,9 @@ fn full_attention_step_q8_neon(
         // activation) poisons sum_exp; real (unclamped) `.exp()` already
         // reaches the shared row-finalizer's full-row-zero outcome via that
         // NaN-into-`sum_exp` propagation. Mirrors the Q8 CPU and f32 siblings
-        // (forward::cpu_q8, generate::compute_attention). ADR-080 C1 (#785
-        // round-1 medium 1): routed through `finalize_row` for consolidation
-        // -- behavior-preserving, no output change.
+        // (forward::cpu_q8, generate::compute_attention). ADR-080 C1 (#785):
+        // routed through `finalize_row` for consolidation -- behavior-
+        // preserving, no output change.
         crate::attention::softmax_row::finalize_row(
             &mut scratch.scores[scores_start..scores_start + cur_seq_len],
             sum_exp,
@@ -2343,7 +2343,7 @@ mod tests {
             hidden,
         );
 
-        // ADR-080 C1 (#785 round-1 medium 1) clean-row parity check: before any
+        // ADR-080 C1 (#785) clean-row parity check: before any
         // poisoning, this well-formed single-position row (identity q/k/v
         // projections, non-zero input) must normalize through `finalize_row`,
         // not be incidentally swept into the fail-closed zero branch.

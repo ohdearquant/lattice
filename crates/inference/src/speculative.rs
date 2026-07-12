@@ -943,7 +943,7 @@ impl<'a> MtpVerifier<'a> {
                 self.scratch.scores[scores_start + t] = dot * scale;
             }
 
-            // ADR-080 C1: fail-closed softmax row contract (#785 round-1 blocker 1).
+            // ADR-080 C1: fail-closed softmax row contract (#785).
             // This is MtpVerifier's own GQA attention over its KV cache, not a
             // vocabulary/logit softmax -- a NaN/`+inf` cached score must zero the
             // whole row, not silently poison every weight via `1.0 / sum_exp`.
@@ -1872,8 +1872,8 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 /// - `i >= 1`: `target_logits[i - 1]`.
 ///
 /// `target_logits[n - 1]` is reserved for the bonus token sampled after full
-/// acceptance. Using `target_logits[i]` to verify `draft_tokens[i]` is the
-/// off-by-one flagged in review (Leviathan Algorithm 1 evaluates
+/// acceptance. Using `target_logits[i]` to verify `draft_tokens[i]` would be
+/// an off-by-one against the algorithm (Leviathan Algorithm 1 evaluates
 /// `p_i(x_i)`, not `p_{i+1}(x_i)`).
 ///
 /// For each position `i`:
@@ -4515,7 +4515,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    /// ADR-080 C1 (#785 round-1 blocker 1): `MtpVerifier::forward_one`'s own GQA
+    /// ADR-080 C1 (#785): `MtpVerifier::forward_one`'s own GQA
     /// attention over its KV cache is a production attention row, not a
     /// vocabulary/logit softmax (the PR body's original classification was wrong).
     /// A NaN cached K row must zero the whole attention-context row for every
