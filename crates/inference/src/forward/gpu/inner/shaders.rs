@@ -265,7 +265,7 @@ fn attention_scores(
 }
 "#;
 
-// Guarantee scope (codex round-1 medium #1 on #795): the fail-closed
+// Guarantee scope (#795): the fail-closed
 // zero-row contract below has been verified on this repository's native
 // Metal-backed WGPU adapter (`GpuModelState::new`'s
 // `wgpu::PowerPreference::HighPerformance` request, backend `Backends::all()`
@@ -334,8 +334,7 @@ fn attention_softmax(
     for (var k: u32 = lid.x; k < seq_len; k = k + 128u) {
         if (k <= row) {
             // Inspect the raw score BEFORE it participates in any WGSL
-            // floating-point arithmetic (codex round-1 medium #1 on #795):
-            // WGSL's Finite Math Assumption
+            // floating-point arithmetic (#795): WGSL's Finite Math Assumption
             // (https://www.w3.org/TR/WGSL/#finite-math-assumption) permits an
             // implementation to assume NaN/infinities are absent during
             // shader execution, so a runtime expression that *would*
