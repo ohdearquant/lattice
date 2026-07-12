@@ -19491,11 +19491,11 @@ mod inner {
         /// disarmed, and the collector must stay disarmed rather than
         /// silently self-arming on first use.
         ///
-        /// Mutation check, manually verified (not compiled in): replacing
-        /// `encode_moe_ffn`'s `if let Some(trace) = c.borrow_mut().as_mut()
-        /// { trace.push(..) }` guard with an unconditional
-        /// `c.borrow_mut().get_or_insert_with(Vec::new).push(..)` (the
-        /// collector self-arming instead of staying `None`) makes this test
+        /// Mutation check (documented for the reviewer to exercise, not
+        /// compiled in): replacing `encode_moe_ffn`'s `if let Some(trace) =
+        /// c.borrow_mut().as_mut() { trace.push(..) }` guard with an
+        /// unconditional `c.borrow_mut().get_or_insert_with(Vec::new).push(..)`
+        /// (the collector self-arming instead of staying `None`) makes this test
         /// fail: `take_moe_routing_trace()` returns 2 records instead of the
         /// expected empty trace.
         #[test]
@@ -19549,11 +19549,11 @@ mod inner {
         /// `encode_mlp_block` into `encode_moe_ffn`. Also exercises
         /// `dump_moe_routing_trace_jsonl`'s round-trip.
         ///
-        /// Mutation check, manually verified (not compiled in): commenting
-        /// out the `trace.push(MoeRoutingTraceRecord { .. })` call inside
-        /// `encode_moe_ffn`'s `MOE_ROUTING_TRACE.with(..)` block makes this
-        /// test fail — `take_moe_routing_trace()` returns an empty `Vec`
-        /// instead of the two expected records.
+        /// Mutation check (documented for the reviewer to exercise, not
+        /// compiled in): commenting out the `trace.push(MoeRoutingTraceRecord
+        /// { .. })` call inside `encode_moe_ffn`'s `MOE_ROUTING_TRACE.with(..)`
+        /// block makes this test fail — `take_moe_routing_trace()` returns an
+        /// empty `Vec` instead of the two expected records.
         #[test]
         fn moe_routing_trace_armed_records_forced_selection() {
             let Some(_) = Device::system_default() else {
