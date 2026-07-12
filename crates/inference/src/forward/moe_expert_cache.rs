@@ -84,13 +84,37 @@ pub struct MoeExpertCacheConfig {
 }
 
 impl MoeExpertCacheConfig {
-    /// Read [`MOE_EXPERT_CACHE_SLOTS_ENV`] (unset/unparseable → `None`,
-    /// which falls back to the device-budget default).
-    pub fn from_env() -> Self {
-        let num_slots = std::env::var(MOE_EXPERT_CACHE_SLOTS_ENV)
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok());
-        Self { num_slots }
+    /// Read [`MOE_EXPERT_CACHE_SLOTS_ENV`]. Unset → `Ok(Self { num_slots: None
+    /// })`, which falls back to the device-budget default. Set but not a
+    /// positive integer → `Err`: a garbage override (typo, empty string,
+    /// `0`, negative) must fail loudly rather than being silently treated
+    /// as "unset" and falling back to a default the caller did not ask for
+    /// — see the working-set-budget guard this configures downstream in
+    /// [`moe_expert_cache_num_slots`].
+    pub fn from_env() -> Result<Self, String> {
+        match std::env::var(MOE_EXPERT_CACHE_SLOTS_ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(Self { num_slots: None }),
+            Err(std::env::VarError::NotUnicode(raw)) => Err(format!(
+                "{MOE_EXPERT_CACHE_SLOTS_ENV}={raw:?} is not valid UTF-8 — refusing to fall \
+                 back to the device-budget default silently; unset the variable to use the \
+                 default"
+            )),
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                match trimmed.parse::<usize>() {
+                    Ok(0) => Err(format!(
+                        "{MOE_EXPERT_CACHE_SLOTS_ENV}=\"{raw}\" is 0 — an expert-cache needs at \
+                         least 1 slot; unset the variable to use the device-budget default"
+                    )),
+                    Ok(n) => Ok(Self { num_slots: Some(n) }),
+                    Err(e) => Err(format!(
+                        "{MOE_EXPERT_CACHE_SLOTS_ENV}=\"{raw}\" is not a valid positive integer \
+                         ({e}) — refusing to fall back to the device-budget default silently; \
+                         unset the variable to use the default"
+                    )),
+                }
+            }
+        }
     }
 }
 
@@ -135,10 +159,13 @@ pub fn moe_expert_cache_num_slots(
         ));
     }
 
-    if let Some(n) = cfg.num_slots {
-        return Ok(n.clamp(top_k, num_experts));
-    }
-
+    // The working-set budget is derived and enforced unconditionally — an
+    // explicit `cfg.num_slots` override changes how many slots we'd *like*,
+    // never whether the device can actually hold them. Skipping this for
+    // the override case is exactly the bug this function used to have: a
+    // garbage-large `LATTICE_MOE_EXPERT_CACHE_SLOTS` could clamp up to
+    // `num_experts` and reconstruct the ~61 GiB fully-resident allocation
+    // Stage 1 exists to avoid.
     let num_moe_layers = num_moe_layers.max(1) as u64;
     let threshold = (recommended_max_working_set_size as f64 * 0.85) as u64;
     let per_layer_budget = threshold / num_moe_layers;
@@ -160,7 +187,20 @@ pub fn moe_expert_cache_num_slots(
     } else {
         (per_layer_budget / per_expert_bytes) as usize
     };
-    Ok(affordable.clamp(top_k, num_experts))
+    let budget_max_slots = affordable.clamp(top_k, num_experts);
+
+    if let Some(n) = cfg.num_slots {
+        // An override may ask for fewer slots than the budget-derived
+        // maximum (that's just a smaller cache, always safe) but must never
+        // be granted more than `budget_max_slots` — silently capping here
+        // mirrors the no-override path's own auto-shrink-to-fit behavior
+        // (this function already silently shrinks the `num_experts`
+        // default when it doesn't fit; an override gets the same courtesy,
+        // never a memory-budget exemption).
+        return Ok(n.clamp(top_k, budget_max_slots));
+    }
+
+    Ok(budget_max_slots)
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +365,17 @@ pub(crate) struct ExpertSlotCache {
     lru: VecDeque<usize>,
     expert_to_slot: std::collections::HashMap<usize, usize>,
     label: String,
+    /// Test-only hit/miss/eviction counters (zero-cost in non-test builds:
+    /// the fields don't exist and every increment site is `#[cfg(test)]`).
+    /// Lets a GPU test assert the *effective* number of misses/evictions a
+    /// same-command-buffer `resolve()` sequence produced, rather than only
+    /// inferring it indirectly from decode output.
+    #[cfg(test)]
+    hit_count: usize,
+    #[cfg(test)]
+    miss_count: usize,
+    #[cfg(test)]
+    eviction_count: usize,
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -363,7 +414,30 @@ impl ExpertSlotCache {
             lru: (0..num_slots).collect(),
             expert_to_slot: std::collections::HashMap::with_capacity(num_slots),
             label: label.to_string(),
+            #[cfg(test)]
+            hit_count: 0,
+            #[cfg(test)]
+            miss_count: 0,
+            #[cfg(test)]
+            eviction_count: 0,
         })
+    }
+
+    /// Effective number of resident slots this cache was actually built
+    /// with — lets a test assert the real slot count a run exercised
+    /// (rather than trusting that an env override wasn't silently ignored
+    /// or reclamped elsewhere). Test-only: compiled out entirely in
+    /// non-test builds.
+    #[cfg(test)]
+    pub(crate) fn num_slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Cumulative `(hits, misses, evictions)` since construction. Test-only:
+    /// compiled out entirely in non-test builds.
+    #[cfg(test)]
+    pub(crate) fn hit_miss_eviction_counts(&self) -> (usize, usize, usize) {
+        (self.hit_count, self.miss_count, self.eviction_count)
     }
 
     /// Clear the "touched this token" bookkeeping. Must be called once per
@@ -379,8 +453,16 @@ impl ExpertSlotCache {
     /// top_k`) should have already prevented — see `pick_eviction_slot`.
     pub(crate) fn resolve(&mut self, expert_id: usize) -> &metal::Buffer {
         if let Some(&slot) = self.expert_to_slot.get(&expert_id) {
+            #[cfg(test)]
+            {
+                self.hit_count += 1;
+            }
             self.touch(slot);
             return &self.slots[slot];
+        }
+        #[cfg(test)]
+        {
+            self.miss_count += 1;
         }
         let slot = self.pick_eviction_slot();
         self.load_into(slot, expert_id);
@@ -403,12 +485,24 @@ impl ExpertSlotCache {
                     self.slots.len()
                 )
             });
-        self.lru.remove(pos).expect("position() found it")
+        self.lru.remove(pos).unwrap_or_else(|| {
+            panic!(
+                "{}: lru.remove({pos}) found nothing — `pos` was just returned by \
+                 `lru.iter().position(..)` on this same `self.lru` with no mutation in \
+                 between, so this is unreachable unless that invariant breaks (cache \
+                 internally corrupted, not a data problem)",
+                self.label
+            )
+        })
     }
 
     fn load_into(&mut self, slot: usize, expert_id: usize) {
         if let Some(old_owner) = self.slot_owner[slot].take() {
             self.expert_to_slot.remove(&old_owner);
+            #[cfg(test)]
+            {
+                self.eviction_count += 1;
+            }
         }
         let f16_data = self
             .table
@@ -456,24 +550,59 @@ mod tests {
     }
 
     #[test]
-    fn env_override_clamped_to_top_k_and_num_experts() {
-        // Below top_k clamps up.
+    fn env_override_clamped_to_top_k_and_num_experts_when_budget_is_not_binding() {
+        // Generous working set (400 GB) so the budget-derived maximum for
+        // this shape is >= num_experts (256) and num_experts is the actual
+        // binding upper bound — the case the original clamp-only-to-
+        // num_experts logic was designed for.
         assert_eq!(
-            moe_expert_cache_num_slots(&cfg(Some(1)), 256, 8, 6_291_456, 40, 40_000_000_000)
+            moe_expert_cache_num_slots(&cfg(Some(1)), 256, 8, 6_291_456, 40, 400_000_000_000)
                 .unwrap(),
-            8
+            8,
+            "below top_k clamps up"
         );
-        // Above num_experts clamps down.
+        assert_eq!(
+            moe_expert_cache_num_slots(&cfg(Some(9999)), 256, 8, 6_291_456, 40, 400_000_000_000)
+                .unwrap(),
+            256,
+            "above num_experts clamps down to num_experts when the budget has headroom to spare"
+        );
+        assert_eq!(
+            moe_expert_cache_num_slots(&cfg(Some(64)), 256, 8, 6_291_456, 40, 400_000_000_000)
+                .unwrap(),
+            64,
+            "in-range passes through unchanged"
+        );
+    }
+
+    #[test]
+    fn env_override_capped_at_working_set_budget_even_when_below_num_experts() {
+        // Same 256-expert / top_k=8 / 40-layer / 6 MiB-per-expert shape as
+        // above, but on a tight 40 GB device budget: the budget-derived
+        // maximum here is 135 slots — well below num_experts (256). This is
+        // the exact scenario the Major finding covers: a large override
+        // (or, unbounded, a fully-resident cache) must NOT be able to
+        // exceed what the device can actually hold, even though 135 and
+        // 9999 both clamp to *something* under the old `[top_k,
+        // num_experts]`-only bound.
+        let budget_max = 135;
         assert_eq!(
             moe_expert_cache_num_slots(&cfg(Some(9999)), 256, 8, 6_291_456, 40, 40_000_000_000)
                 .unwrap(),
-            256
+            budget_max,
+            "an override far above num_experts must cap at the working-set budget, not num_experts"
         );
-        // In-range passes through unchanged.
         assert_eq!(
-            moe_expert_cache_num_slots(&cfg(Some(64)), 256, 8, 6_291_456, 40, 40_000_000_000)
+            moe_expert_cache_num_slots(&cfg(Some(200)), 256, 8, 6_291_456, 40, 40_000_000_000)
                 .unwrap(),
-            64
+            budget_max,
+            "an override below num_experts but above the budget must still be capped at the budget"
+        );
+        assert_eq!(
+            moe_expert_cache_num_slots(&cfg(Some(100)), 256, 8, 6_291_456, 40, 40_000_000_000)
+                .unwrap(),
+            100,
+            "an override under the budget passes through unchanged"
         );
     }
 
@@ -528,5 +657,87 @@ mod tests {
     #[test]
     fn rejects_top_k_exceeding_num_experts() {
         assert!(moe_expert_cache_num_slots(&cfg(None), 4, 5, 100, 1, 1_000_000_000).is_err());
+    }
+
+    /// Serializes every test below that mutates the real process
+    /// environment (`LATTICE_MOE_EXPERT_CACHE_SLOTS` is process-global —
+    /// `cargo test` runs this file's tests on multiple threads within one
+    /// process, so unguarded concurrent `set_var`/`remove_var` calls would
+    /// race and flake).
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets (or clears) `LATTICE_MOE_EXPERT_CACHE_SLOTS` for the duration of
+    /// `f`, holding `ENV_TEST_LOCK` and restoring the prior value
+    /// (including "was unset") on the way out, even if `f` panics.
+    fn with_env_var<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var(MOE_EXPERT_CACHE_SLOTS_ENV).ok();
+        // SAFETY: serialized by `ENV_TEST_LOCK` above — no concurrent
+        // reader/writer of this process-global variable.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(MOE_EXPERT_CACHE_SLOTS_ENV, v),
+                None => std::env::remove_var(MOE_EXPERT_CACHE_SLOTS_ENV),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: see above.
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var(MOE_EXPERT_CACHE_SLOTS_ENV, v),
+                None => std::env::remove_var(MOE_EXPERT_CACHE_SLOTS_ENV),
+            }
+        }
+        match result {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn from_env_unset_is_none() {
+        with_env_var(None, || {
+            assert_eq!(MoeExpertCacheConfig::from_env().unwrap().num_slots, None);
+        });
+    }
+
+    #[test]
+    fn from_env_valid_positive_integer_is_some() {
+        with_env_var(Some("42"), || {
+            assert_eq!(
+                MoeExpertCacheConfig::from_env().unwrap().num_slots,
+                Some(42)
+            );
+        });
+        with_env_var(Some("  7  "), || {
+            assert_eq!(MoeExpertCacheConfig::from_env().unwrap().num_slots, Some(7));
+        });
+    }
+
+    #[test]
+    fn from_env_garbage_errors_loudly_instead_of_silently_falling_back() {
+        with_env_var(Some("not-a-number"), || {
+            let err = MoeExpertCacheConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("not a valid positive integer"),
+                "unexpected error message: {err}"
+            );
+        });
+        with_env_var(Some("-5"), || {
+            assert!(MoeExpertCacheConfig::from_env().is_err());
+        });
+        with_env_var(Some(""), || {
+            assert!(MoeExpertCacheConfig::from_env().is_err());
+        });
+    }
+
+    #[test]
+    fn from_env_zero_errors_loudly() {
+        with_env_var(Some("0"), || {
+            let err = MoeExpertCacheConfig::from_env().unwrap_err();
+            assert!(err.contains("is 0"), "unexpected error message: {err}");
+        });
     }
 }

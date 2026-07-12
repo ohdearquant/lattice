@@ -3661,6 +3661,28 @@ mod inner {
         gpu_mlp_us: u128,
     }
 
+    #[cfg(test)]
+    thread_local! {
+        /// Test-only override for `MetalQwen35State::encode_moe_ffn`'s
+        /// CPU-routed top-k expert selection. When set, the real
+        /// logits/softmax computation still runs (harmless extra CPU work,
+        /// compiled out entirely in non-test builds) but its result is
+        /// discarded in favor of this list, so a test can drive a specific,
+        /// deterministic sequence of `ExpertSlotCache::resolve` calls
+        /// through the SAME real encoded command buffer `forward_step` uses
+        /// in production — unlike a helper that calls `resolve()` directly
+        /// outside any encoder, this exercises the actual within-token GPU
+        /// dispatch ordering the eviction invariant depends on. Cleared
+        /// with `None` between tests/tokens by the caller.
+        static FORCED_MOE_EXPERTS_FOR_TEST: std::cell::RefCell<Option<Vec<usize>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_forced_moe_experts_for_test(experts: Option<Vec<usize>>) {
+        FORCED_MOE_EXPERTS_FOR_TEST.with(|c| *c.borrow_mut() = experts);
+    }
+
     impl MetalQwen35State {
         /// **Unstable**: create from CPU weights; weight layout and f16 conversion may change.
         pub fn new(
@@ -10687,6 +10709,25 @@ mod inner {
                 }
             }
 
+            // Test-only override (see `FORCED_MOE_EXPERTS_FOR_TEST`): replace
+            // the CPU-computed selection with a caller-chosen expert list so
+            // tests can drive a specific `ExpertSlotCache::resolve` sequence
+            // through this real, encoded command buffer.
+            #[cfg(test)]
+            FORCED_MOE_EXPERTS_FOR_TEST.with(|c| {
+                if let Some(forced_ids) = c.borrow().as_ref() {
+                    assert_eq!(
+                        forced_ids.len(),
+                        top_k,
+                        "set_forced_moe_experts_for_test: forced expert list length must equal top_k"
+                    );
+                    let weight = 1.0f32 / top_k as f32;
+                    for (slot, &expert_id) in selected.iter_mut().zip(forced_ids.iter()) {
+                        *slot = (expert_id, weight);
+                    }
+                }
+            });
+
             // Renormalize selected weights to sum=1.
             let top_sum: f32 = selected.iter().map(|(_, p)| *p).sum();
             if top_sum > 0.0 {
@@ -13744,7 +13785,8 @@ mod inner {
             let per_expert_bytes_total = gate_up_bytes_per_expert + down_bytes_per_expert;
             let num_moe_layers = cfg.num_active_layers();
             let max_working = device.recommended_max_working_set_size();
-            let cache_cfg = MoeExpertCacheConfig::from_env();
+            let cache_cfg = MoeExpertCacheConfig::from_env()
+                .map_err(|e| format!("from_q4_dir: MoE layer {layer_idx}: {e}"))?;
             let num_slots = moe_expert_cache_num_slots(
                 &cache_cfg,
                 num_experts,
@@ -18656,6 +18698,21 @@ mod inner {
             }
         }
 
+        /// Same fixture shape as [`synthetic_moe_test_config`] (4 experts,
+        /// same hidden/vocab/inter sizes — `write_synthetic_moe_checkpoint`
+        /// and the `moe_fixture_*`/`MOE_FIXTURE_TARGET_EXPERT` constants all
+        /// key off `num_experts=4` only, not `top_k`) but with `top_k=2`,
+        /// so `encode_moe_ffn`'s real CPU routing resolves two distinct
+        /// experts per token instead of one — needed to exercise a genuine
+        /// within-token hit-then-miss `ExpertSlotCache::resolve` sequence
+        /// through the real encoded command buffer (see
+        /// `FORCED_MOE_EXPERTS_FOR_TEST`).
+        fn synthetic_moe_test_config_top_k2() -> Qwen35Config {
+            let mut cfg = synthetic_moe_test_config();
+            cfg.num_experts_per_tok = Some(2);
+            cfg
+        }
+
         #[test]
         fn from_q4_dir_loads_and_generates_on_synthetic_moe_checkpoint() {
             let Some(_) = Device::system_default() else {
@@ -19004,6 +19061,148 @@ mod inner {
             }
         }
 
+        /// Restores `FORCED_MOE_EXPERTS_FOR_TEST` to `None` on scope exit
+        /// (including on panic), so a forced-routing test can't leak its
+        /// override into whichever GPU test the `gpu_test_lock()` mutex
+        /// hands this OS thread's cargo-test worker to next (thread-locals
+        /// persist across tests reusing the same worker thread, unlike a
+        /// per-call stack variable).
+        struct ForcedMoeExpertsGuard;
+        impl ForcedMoeExpertsGuard {
+            fn set(experts: Vec<usize>) -> Self {
+                set_forced_moe_experts_for_test(Some(experts));
+                Self
+            }
+        }
+        impl Drop for ForcedMoeExpertsGuard {
+            fn drop(&mut self) {
+                set_forced_moe_experts_for_test(None);
+            }
+        }
+
+        /// The Medium finding this test closes: the forced-eviction test
+        /// above and the corruption test below never actually observe a
+        /// hit *followed by* a miss inside one real, still-open command
+        /// buffer (the fixture's `top_k=1` only ever resolves one expert
+        /// per `encode_moe_ffn` call, and `force_resolve_layer0` bypasses
+        /// encoding entirely). This test drives `top_k=2` real CPU routing
+        /// through [`set_forced_moe_experts_for_test`] so two distinct
+        /// experts are resolved per token via the SAME `encode_moe_ffn`
+        /// call `forward_step` uses in production, with a 2-slot cache:
+        ///
+        /// - Token 0 forces experts `{2, 3}` — cache starts empty, so both
+        ///   resolves are misses that fill both slots.
+        /// - Token 1 forces experts `{2, 1}` — expert 2 is still
+        ///   LRU-resident (a HIT), resolved first; expert 1 is not (a MISS)
+        ///   and is resolved second, in the SAME token's single command
+        ///   buffer as the hit that preceded it. With only 2 slots and
+        ///   expert 2 protected by this token's `slot_touched` flag (set by
+        ///   its own hit just now), the only evictable slot is expert 3's —
+        ///   `pick_eviction_slot` is exercised for real, mid-encoder-pass.
+        ///
+        /// Asserts the *effective* slot count (so an ignored/garbage env
+        /// override can't silently make this "test" run with more slots
+        /// than intended and never actually force the hit-then-miss path)
+        /// and the exact cumulative hit/miss/eviction counts, not just
+        /// finite output.
+        ///
+        /// Mutation check, manually verified (not compiled in): reverting
+        /// `ExpertSlotCache::pick_eviction_slot` to ignore `slot_touched`
+        /// entirely (evict whatever is at the LRU front, unconditionally)
+        /// does NOT make this test fail — this was checked by hand and is
+        /// expected, not a gap in this test. `touch()` moves a slot to the
+        /// LRU back every time `resolve()` touches it (hit or miss), so a
+        /// slot touched earlier in the *same* token is always more
+        /// recently used than any slot not yet touched this token; combined
+        /// with `num_slots >= top_k` (enforced at construction — see the
+        /// module doc comment), plain recency-order LRU can never reach a
+        /// same-token-touched slot before it runs out of untouched slots to
+        /// pick from first, for any single real `encode_moe_ffn` call. The
+        /// `slot_touched` guard's actual job is turning a hypothetical
+        /// `num_slots < top_k` misconfiguration (which construction-time
+        /// validation should already prevent) into a loud
+        /// `pick_eviction_slot` panic instead of a silent same-token
+        /// overwrite race — not changing the eviction target in the
+        /// well-configured case this test exercises. This test still earns
+        /// its keep as the one exercising a real hit-then-miss sequence
+        /// inside one real, still-open command buffer, with counters
+        /// pinning the exact hit/miss/eviction shape.
+        #[test]
+        fn from_q4_dir_moe_within_token_hit_then_miss_evicts_only_the_untouched_slot() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config_top_k2();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let mut state = {
+                let _env = EnvVarGuard::set(
+                    crate::forward::moe_expert_cache::MOE_EXPERT_CACHE_SLOTS_ENV,
+                    "2",
+                );
+                MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                    .expect("from_q4_dir (top_k=2, forced-eviction N=2) must load")
+            };
+
+            // Token 0: {2, 3} — both miss, both slots filled from empty.
+            let _forced0 = ForcedMoeExpertsGuard::set(vec![2, 3]);
+            let logits0 = state.forward_step(1, 0);
+            assert!(
+                logits0.iter().all(|v| v.is_finite()),
+                "token 0 decode produced non-finite logits: {logits0:?}"
+            );
+
+            // Token 1: {2, 1} — expert 2 hits (still resident), expert 1
+            // misses and forces eviction of expert 3's (untouched) slot —
+            // both resolves happen inside this ONE forward_step's single
+            // encoded command buffer.
+            let _forced1 = ForcedMoeExpertsGuard::set(vec![2, 1]);
+            let logits1 = state.forward_step(2, 1);
+            assert!(
+                logits1.iter().all(|v| v.is_finite()),
+                "token 1 decode produced non-finite logits: {logits1:?}"
+            );
+
+            let (_, common) = &state.engine.layer_weights[0];
+            let MetalFfnWeights::Moe(moe) = &common.ffn else {
+                panic!("layer 0 must build MetalFfnWeights::Moe for an is_moe() config");
+            };
+            let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed else {
+                panic!("from_q4_dir must build RoutedExpertStorage::Cached (#682 Stage 1)");
+            };
+
+            for (label, cache) in [("gate_up", gate_up), ("down", down)] {
+                let cache = cache.borrow();
+                assert_eq!(
+                    cache.num_slots(),
+                    2,
+                    "{label} cache: effective slot count must be exactly the forced N=2 — a \
+                     silently-ignored or reclamped env override would let this test run with \
+                     more slots and never actually exercise the hit-then-miss eviction path"
+                );
+                assert_eq!(
+                    cache.hit_miss_eviction_counts(),
+                    (1, 3, 1),
+                    "{label} cache: expected exactly 1 hit (expert 2 on token 1), 3 misses \
+                     (experts 2 and 3 on token 0, expert 1 on token 1), and 1 eviction (expert \
+                     3's slot reclaimed for expert 1 on token 1) — a wrong count means either \
+                     the within-token touched-slot protection isn't working (expert 2's slot \
+                     evicted instead) or eviction pressure isn't reaching this cache at all"
+                );
+            }
+        }
+
         /// Mutation check for the test above: deliberately break
         /// `ExpertSlotCache`'s within-token eviction guard (make
         /// `pick_eviction_slot` always evict LRU-front regardless of
@@ -19017,11 +19216,22 @@ mod inner {
         /// only one expert is ever selected per `encode_moe_ffn` call), pass
         /// unchanged — which is exactly why the module doc comment's
         /// invariant proof relies on `num_slots >= top_k`, not on this test
-        /// catching every possible violation. The corruption test below is
-        /// this file's actual mutation-sensitive proof that reload
-        /// addressing is correct.
+        /// catching every possible violation.
+        ///
+        /// The corruption test below is this file's mutation-sensitive proof
+        /// that reload *addressing* is correct: it builds two DIFFERENT
+        /// checkpoints (identical except `MOE_FIXTURE_TARGET_EXPERT`'s
+        /// weights) and shows repeated evict/reload cycles still land on
+        /// each checkpoint's own bytes rather than some other expert's slot.
+        /// It does NOT prove that a reload re-reads bytes mutated on disk
+        /// *after* the engine already loaded and decoded once — that is a
+        /// separate claim, proven separately by
+        /// `from_q4_dir_moe_reload_rereads_expert_bytes_mutated_after_initial_load`
+        /// below (mmap semantics mean "loaded once" and "never reads disk
+        /// again" are not the same thing, and only mutating an
+        /// already-mapped file distinguishes them).
         #[test]
-        fn from_q4_dir_moe_reload_after_eviction_is_sensitive_to_expert_weight_corruption() {
+        fn from_q4_dir_moe_reload_after_eviction_addresses_the_correct_expert() {
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19099,11 +19309,141 @@ mod inner {
 
             assert_ne!(
                 correct, sabotaged,
-                "decode logits must change when the target expert's on-disk weights are \
-                 corrupted, even though every decode step in this test forces that expert's \
-                 cache slot to be evicted and reloaded before use — identical output here would \
-                 mean the reload path is serving stale/cached data instead of actually \
-                 re-reading the (changed) on-disk bytes"
+                "decode logits must change when the target expert's checkpoint-provided \
+                 weights differ, even though every decode step in this test forces that \
+                 expert's cache slot to be evicted and reloaded before use — identical output \
+                 here would mean reload addressing is wrong (some other expert's bytes are \
+                 landing in the target expert's slot)"
+            );
+        }
+
+        /// Companion to the addressing test above, proving the claim that
+        /// one does NOT prove: that `ExpertSlotCache::resolve`'s reload path
+        /// actually re-reads the on-disk `.q4` file rather than serving a
+        /// value memoized at (or cached from) the *first* load, once an
+        /// expert has already been loaded, decoded against, evicted, and
+        /// reloaded within the SAME `MetalQwen35State`/mmap.
+        ///
+        /// Sequence: load a checkpoint, run one real decode step (so
+        /// `MOE_FIXTURE_TARGET_EXPERT`'s slot is resident from a genuine
+        /// `forward_step`, not a bypass helper) — THEN overwrite the routed
+        /// expert tensor files on disk in place (`File::create` truncates
+        /// the existing inode rather than replacing it, so the state's
+        /// already-open mmap observes the new bytes; see `save_q4_file`) —
+        /// THEN force that expert's slot out of the 2-slot cache and decode
+        /// again. Comparing against an otherwise-identical run that skips
+        /// the on-disk mutation isolates the effect of the mutation itself
+        /// (both runs still force the same eviction/reload cycle).
+        #[test]
+        fn from_q4_dir_moe_reload_rereads_expert_bytes_mutated_after_initial_load() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let moe_inter = cfg.moe_intermediate_size();
+            let hidden = cfg.hidden_size;
+            let num_experts = cfg.num_experts.expect("fixture cfg must set num_experts");
+            let tokens: Vec<u32> = vec![1, 2, 3, 4];
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let prefix = "model.language_model.layers.0";
+
+            // Overwrite ONLY the two routed-expert tensor files already on
+            // disk in `dir`, in place, with `MOE_FIXTURE_TARGET_EXPERT`'s
+            // constants swapped to expert 0's (same "expert swap" shape as
+            // the sibling addressing test).
+            let mutate_target_expert_on_disk = |dir: &std::path::Path| {
+                write_tiny_q4_fixture_per_expert_row(
+                    dir,
+                    &format!("{prefix}.mlp.experts.gate_up_proj"),
+                    num_experts,
+                    2 * moe_inter,
+                    hidden,
+                    |e, m| {
+                        let e = if e == MOE_FIXTURE_TARGET_EXPERT { 0 } else { e };
+                        if m < moe_inter {
+                            moe_fixture_gate_const(e)
+                        } else {
+                            moe_fixture_up_const(e)
+                        }
+                    },
+                );
+                write_tiny_q4_fixture_per_expert_row(
+                    dir,
+                    &format!("{prefix}.mlp.experts.down_proj"),
+                    num_experts,
+                    hidden,
+                    moe_inter,
+                    |e, h_row| {
+                        let e = if e == MOE_FIXTURE_TARGET_EXPERT { 0 } else { e };
+                        moe_fixture_down_const(e) * (1.0 + 0.003 * h_row as f32)
+                    },
+                );
+            };
+
+            let run = |mutate_on_disk_after_first_decode: bool| -> Vec<f32> {
+                let tmp = tempfile::tempdir().expect("tempdir create");
+                let dir = tmp.path();
+                write_synthetic_moe_checkpoint(
+                    dir,
+                    &cfg,
+                    moe_fixture_gate_const,
+                    moe_fixture_up_const,
+                    moe_fixture_down_const,
+                );
+
+                let mut state = {
+                    let _env = EnvVarGuard::set(
+                        crate::forward::moe_expert_cache::MOE_EXPERT_CACHE_SLOTS_ENV,
+                        "2",
+                    );
+                    MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                        .expect("from_q4_dir (forced-eviction N=2) must load")
+                };
+
+                // Decode once against the correct, as-loaded weights — this
+                // is the "already loaded and decoded once" precondition;
+                // MOE_FIXTURE_TARGET_EXPERT's slot is resident from a real
+                // `forward_step`, and `state`'s `ExpertByteTable` mmaps are
+                // now open over `dir`'s files.
+                let _ = state.forward_step(tokens[0], 0);
+
+                if mutate_on_disk_after_first_decode {
+                    mutate_target_expert_on_disk(dir);
+                }
+
+                // Force every routed expert but the target out of the
+                // 2-slot cache; with only 2 slots and 4 experts this
+                // necessarily evicts the target's slot too (pigeonhole),
+                // so the next real decode step must re-dequantize it.
+                for &other in &[0usize, 1usize, 3usize] {
+                    force_resolve_layer0(&state, other);
+                }
+
+                state.forward_step(tokens[1], 1)
+            };
+
+            let unmutated = run(false);
+            let mutated = run(true);
+
+            assert!(
+                unmutated.iter().all(|v| v.is_finite()),
+                "unmutated-continuation decode produced non-finite logits: {unmutated:?}"
+            );
+            assert!(
+                mutated.iter().all(|v| v.is_finite()),
+                "mutated-continuation decode produced non-finite logits: {mutated:?}"
+            );
+            assert_ne!(
+                unmutated, mutated,
+                "decode logits after a forced evict+reload must change once the target \
+                 expert's on-disk bytes were mutated post-load — identical output here would \
+                 mean the reload path serves memoized/stale data instead of actually re-reading \
+                 the (changed) file, exactly the mmap-staleness risk this test isolates by \
+                 mutating an already-loaded, already-decoded-against checkpoint in place rather \
+                 than starting from two independently built checkpoints (unmutated={unmutated:?}, \
+                 mutated={mutated:?})"
             );
         }
 
