@@ -17,10 +17,10 @@ Same trap as `docs/serve-http-api.md` and `docs/cross-turn-cache.md` describe --
   (introduced PR #435). Metal-GPU-only, its own fixed route list, its own request struct.
 
 Every "supported" claim below cites a `file:line`. Every "not yet" cites the tracking issue.
-Audited against ADR-080 cluster C2 (#782, PR #786) at the `feat/782-c2-shared-serving`
-head (2026-07-10) -- see `crates/inference/src/serve/mod.rs` for the shared contract (error
-envelope, `finish_reason` mapping, `max_tokens == 0` rejection, `/`+`/v1/models` response bodies,
-disconnect-cancellation guard) both binaries now build their routers on top of.
+Audited against ADR-080 cluster C2 (#782, PR #786) -- see `crates/inference/src/serve/mod.rs`
+for the shared contract (error envelope, `finish_reason` mapping, `max_tokens == 0` rejection,
+`/`+`/v1/models` response bodies, disconnect-cancellation guard) both binaries now build their
+routers on top of.
 
 Every row below is backed by an executable fixture or an explicit
 not-testable-yet justification: see the [Fixture manifest](#fixture-manifest-654)

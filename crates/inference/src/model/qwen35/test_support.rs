@@ -19,8 +19,8 @@
 //! independently-readable copies avoids threading a `test-utils`-feature
 //! dependency into the library's own always-on `#[cfg(test)]` build, and the
 //! "deliberate copy" convention already applies elsewhere in this crate for
-//! exactly this kind of test-fixture code (see `AGENTS.md`/`CLAUDE.md`'s
-//! parity-safety note on `generate`/`generate_streaming`).
+//! exactly this kind of test-fixture code, matching the parity-safety
+//! guidance this repo follows for `generate`/`generate_streaming`.
 
 use super::Qwen35Model;
 use super::weights::{

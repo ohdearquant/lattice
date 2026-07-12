@@ -1369,7 +1369,7 @@ mod tests {
     fn test_compute_max_seq_overflow_is_error_not_panic() {
         // A pathological max_new_tokens near usize::MAX must surface a clean
         // InvalidInput error rather than wrapping the addition and panicking
-        // later inside prefill_layer's capacity assertion (finding #2).
+        // later inside prefill_layer's capacity assertion.
         let err = compute_max_seq(10, usize::MAX).unwrap_err();
         assert!(matches!(err, InferenceError::InvalidInput(_)));
         let err = compute_max_seq(usize::MAX, 1).unwrap_err();
@@ -1423,7 +1423,7 @@ mod tests {
     ///
     /// This composes the two real helpers the call site uses in sequence —
     /// `compute_effective_cap` then `check_context_window` — so it pins the
-    /// integration, not just the guard in isolation (review finding #2).
+    /// integration, not just the guard in isolation.
     ///
     /// Mutation check: making `compute_effective_cap` ignore its cap argument (so it
     /// returns `max_seq` — the pre-fix #467 behaviour of guarding the raw sum) makes
@@ -1539,7 +1539,7 @@ mod tests {
         // PR #291 found that guarding only compute_max_seq's
         // addition leaves the downstream `max_seq_len * kv_dim` multiplication
         // unchecked: a huge-yet-non-overflowing effective_cap (here usize::MAX/1024,
-        // matching the reviewer's kv_dim=8*128 counterexample) wraps the cache/scratch
+        // matching a kv_dim=8*128 configuration) wraps the cache/scratch
         // element count and panics on the first write. The guard must reject it.
         let cfg = QwenConfig::qwen3_embedding_0_6b();
         let effective_cap = usize::MAX / 1024;

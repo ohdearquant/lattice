@@ -18374,7 +18374,7 @@ mod inner {
         // filled every Q4 tensor with the same `0.1` constant, so an expert
         // swap, wrong gate/up boundary, or an equal-length transpose left
         // the test numerically finite and effectively unchanged — it could
-        // not catch the layout-corruption class the blocker fix above
+        // not catch the layout-corruption class the from_q4_dir MoE-loading fix above
         // guards against. Rewritten to (a) give every expert/projection a
         // DISTINCT block-constant value, (b) directly read the loaded
         // `routed_gate_up`/`routed_down` Metal buffers at expert 0/1's
@@ -18384,7 +18384,7 @@ mod inner {
         // deterministically select a single nonzero expert (#2 of 4) and
         // assert decode output changes when that expert's on-disk weights
         // are corrupted to look like expert 0's (mutation-sensitive to
-        // exactly the "expert swap" bug class the blocker fix rejects at
+        // exactly the "expert swap" bug class the from_q4_dir MoE-loading fix rejects at
         // load time — here proven at the numerical-output level too, for a
         // malformed-but-shape-valid corruption the shape gate cannot catch
         // by itself, e.g. two experts' payload bytes swapped without
@@ -24037,7 +24037,7 @@ mod inner {
             );
         }
 
-        /// Regression (review finding on the streaming-retention PR): the non-prefix
+        /// Regression guard for the streaming-retention decode loop: the non-prefix
         /// `generate_streaming` decode loop must append every non-empty delta to the
         /// returned `GenerateOutput.text`, not just hand it to `on_token`. A prior
         /// version of the loop body called `on_token(&delta, next_id)` without first
@@ -29999,9 +29999,9 @@ const LM_HEAD_TOPK_TIE_EPSILON: f32 = 1.0e-3;
 // concurrent Metal GPU test process on the same machine (see the
 // machine-wide GPU test lock this repo now enforces for exactly this
 // reason). Concurrent GPU load corrupting numerics (not just timing) for
-// these exact tests is an already-documented risk in this repo (see
-// AGENTS.md / CLAUDE.md "Triage Flaky vs Deterministic Before Filing"), so
-// that batch's data is excluded from this constant's derivation.
+// these exact tests is an already-documented risk in this repo -- exactly
+// what the machine-wide `gpu_test_lock()` advisory flock serializes against
+// -- so that batch's data is excluded from this constant's derivation.
 //
 // This constant is set to 1.0e-1: ~1.9x the phase-1+phase-2 combined greedy
 // max (5.23e-2, from data with no identified contention), inside the

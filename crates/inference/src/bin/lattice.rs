@@ -548,7 +548,7 @@ mod doctor {
     ///   deliberate simplification when this estimator was pure telemetry,
     ///   but it over-counts untied checkpoints by one full embedding-sized
     ///   mmap once the estimate started gating a hard pass/fail verdict
-    ///   (#881 review) — hence the `tie_word_embeddings` parameter below.
+    ///   (#881) — hence the `tie_word_embeddings` parameter below.
     /// - Everything else (full-attention `q/k/v/o_proj`, `mlp.down_proj`,
     ///   `mlp.gate_proj`/`up_proj` fused by plain concatenation into
     ///   `gate_up_proj`, `linear_attn.out_proj`, `lm_head`) is mmap'd
@@ -1553,7 +1553,7 @@ mod doctor {
 
         #[test]
         fn q4_resident_bytes_embed_tokens_scales_by_tie_word_embeddings() {
-            // #881 review (medium): a tied checkpoint's `embed_tokens_q8`
+            // #881: a tied checkpoint's `embed_tokens_q8`
             // binding keeps the raw Q4 mmap of `embed_tokens.weight` itself
             // (1x) on top of the dequantized f16 lookup buffer (3.2x) =
             // 4.2x. An untied checkpoint's `from_q4_dir` immediately
@@ -2026,7 +2026,7 @@ mod doctor {
 
         #[test]
         fn build_report_q4_untied_embed_tokens_threshold_no_longer_overcounts() {
-            // #881 review (medium): before this fix, `q4_resident_bytes`
+            // #881: before this fix, `q4_resident_bytes`
             // charged `embed_tokens` at a flat 4.2x on-disk size regardless
             // of `tie_word_embeddings`, even though an UNTIED checkpoint's
             // loader drops the embedding's own Q4 mmap and only keeps the
@@ -5658,7 +5658,7 @@ mod serve {
         // outcomes ended that loop over a side channel `chat_completions`
         // itself never sees. Because the probe stops polling `on_token`
         // entirely after the first delta, `on_token`'s failed-send masking
-        // effect (the exact thing that hid finding #3 from the original
+        // effect (the exact thing that hid this bug from the original
         // test) cannot fire here -- only `should_cancel`'s own return value
         // can end the loop.
         // -----------------------------------------------------------------------
@@ -5696,8 +5696,8 @@ mod serve {
             /// `body_stream`'s `flat_map` closure, itself alive because the
             /// test hasn't dropped the body/receiver yet), so `cancel_rx`
             /// cannot have flipped. A `true` reading here is the direct,
-            /// timing-independent signature of finding #1's mutation (guard
-            /// capture removed): `cancel_guard` is then just an unused
+            /// timing-independent signature of the guard-capture-removed
+            /// mutation: `cancel_guard` is then just an unused
             /// local that drops the instant `chat_completions` returns --
             /// gating this read on `checkpoint1` (rather than reading it
             /// immediately after `on_token`, which raced against

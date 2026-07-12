@@ -1872,8 +1872,8 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 /// - `i >= 1`: `target_logits[i - 1]`.
 ///
 /// `target_logits[n - 1]` is reserved for the bonus token sampled after full
-/// acceptance. Using `target_logits[i]` to verify `draft_tokens[i]` is the
-/// off-by-one flagged in review (Leviathan Algorithm 1 evaluates
+/// acceptance. Using `target_logits[i]` to verify `draft_tokens[i]` would be
+/// an off-by-one against the algorithm (Leviathan Algorithm 1 evaluates
 /// `p_i(x_i)`, not `p_{i+1}(x_i)`).
 ///
 /// For each position `i`:

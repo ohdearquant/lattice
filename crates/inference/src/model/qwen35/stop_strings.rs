@@ -576,7 +576,7 @@ mod tests {
 
     /// Same split-CJK token stream, but driven through `StopStringMatcher` with
     /// `stop_strings: ["好"]` — proves the matcher correctly holds back through
-    /// the mid-codepoint empty delta (finding #1's fix) and matches only once
+    /// the mid-codepoint empty delta and matches only once
     /// the codepoint actually completes, excluding it from `into_text()` and
     /// never emitting a dropped/garbled tail for the preceding ASCII text.
     #[test]

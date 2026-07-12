@@ -2319,7 +2319,7 @@ mod imp {
                 !entered_decode.load(Ordering::SeqCst),
                 "should_cancel alone (on_token is never called during this phase) \
                  must stop the job before the decode phase is ever reached -- this \
-                 is the exact blind spot from the PR #606 review, where production \
+                 is the exact blind spot #606 fixed, where production \
                  prefill has no on_token callback point and so could run to \
                  completion after the client already disconnected"
             );

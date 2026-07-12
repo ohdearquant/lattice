@@ -6,7 +6,7 @@
 use crate::model::qwen35_config::{GenerateConfig, TopLogprob};
 
 /// Greedy argmax over a dense `f32` logit slice, with **first-wins** tie-break
-/// (ADR-080 C3, #783; held finding from the ADR-080 duplication audit).
+/// (ADR-080 C3, #783).
 ///
 /// `Iterator::max_by` keeps the *last* element on `Ordering::Equal`, so tied
 /// maximum logits (e.g. `[0.0, 1.0, 1.0]`) return the higher token id — the
