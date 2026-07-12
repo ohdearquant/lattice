@@ -43,7 +43,7 @@ fn dispatch_squared(a: &[f32], b: &[f32]) -> f32 {
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        if config.simd128_enabled {
+        if config.simd128_enabled() {
             return unsafe { squared_euclidean_distance_simd128_unrolled(a, b) };
         }
     }

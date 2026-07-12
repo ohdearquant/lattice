@@ -53,7 +53,7 @@ pub fn normalize(vector: &mut [f32]) {
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        if config.simd128_enabled {
+        if config.simd128_enabled() {
             // SAFETY: compiled with wasm32 simd128 (compile-time gate, see
             // `SimdConfig::simd128_enabled`). The mutable slice is valid for
             // the call lifetime; the callee uses alignment-free loads/stores

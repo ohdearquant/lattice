@@ -52,7 +52,7 @@ fn resolve_cosine_kernel() -> CosineKernel {
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        if config.simd128_enabled {
+        if config.simd128_enabled() {
             return cosine_simd128_kernel;
         }
     }

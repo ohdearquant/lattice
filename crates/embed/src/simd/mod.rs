@@ -78,15 +78,6 @@ pub struct SimdConfig {
     /// Mandatory on Armv8.4+; optional on Armv8.2/v8.3. Always false on non-aarch64.
     /// SDOT kernels must only be dispatched when this is `true`.
     pub dotprod_enabled: bool,
-    /// **Unstable**: wasm32 SIMD128 support available.
-    ///
-    /// Unlike the x86_64/aarch64 fields above, this is a **compile-time**, not
-    /// runtime, signal: wasm has no runtime CPU feature detection (a given
-    /// `.wasm` binary either was or wasn't compiled with `-C
-    /// target-feature=+simd128`; there is no dispatching between two
-    /// codepaths inside one binary). Mirrors `cfg!(target_feature =
-    /// "simd128")`. Always false on non-wasm32 targets.
-    pub simd128_enabled: bool,
 }
 
 impl Default for SimdConfig {
@@ -111,7 +102,6 @@ impl SimdConfig {
                     && is_x86_feature_detected!("avx512vnni"),
                 neon_enabled: false,
                 dotprod_enabled: false,
-                simd128_enabled: false,
             }
         }
         #[cfg(target_arch = "aarch64")]
@@ -126,7 +116,6 @@ impl SimdConfig {
                 avx512vnni_enabled: false,
                 neon_enabled: true,
                 dotprod_enabled: std::arch::is_aarch64_feature_detected!("dotprod"),
-                simd128_enabled: false,
             }
         }
         #[cfg(target_arch = "wasm32")]
@@ -143,7 +132,6 @@ impl SimdConfig {
                 avx512vnni_enabled: false,
                 neon_enabled: false,
                 dotprod_enabled: false,
-                simd128_enabled: cfg!(target_feature = "simd128"),
             }
         }
         #[cfg(not(any(
@@ -159,9 +147,22 @@ impl SimdConfig {
                 avx512vnni_enabled: false,
                 neon_enabled: false,
                 dotprod_enabled: false,
-                simd128_enabled: false,
             }
         }
+    }
+
+    /// **Unstable**: wasm32 SIMD128 support available.
+    ///
+    /// Unlike the x86_64/aarch64 fields, this is a **compile-time**, not
+    /// runtime, signal: wasm has no runtime CPU feature detection (a given
+    /// `.wasm` binary either was or wasn't compiled with `-C
+    /// target-feature=+simd128`; there is no dispatching between two
+    /// codepaths inside one binary). Mirrors `cfg!(target_feature =
+    /// "simd128")` and is always false on non-wasm32 targets. A method rather
+    /// than a field so existing `SimdConfig` struct literals keep compiling.
+    #[inline]
+    pub fn simd128_enabled(&self) -> bool {
+        cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
     }
 
     /// **Unstable**: check if any SIMD is available; logic may expand with new ISAs.
@@ -171,7 +172,7 @@ impl SimdConfig {
             || self.avx512vnni_enabled
             || self.avx2_enabled
             || self.neon_enabled
-            || self.simd128_enabled
+            || self.simd128_enabled()
     }
 
     /// Force scalar-only mode (useful for testing).
@@ -184,7 +185,6 @@ impl SimdConfig {
             avx512vnni_enabled: false,
             neon_enabled: false,
             dotprod_enabled: false,
-            simd128_enabled: false,
         }
     }
 }

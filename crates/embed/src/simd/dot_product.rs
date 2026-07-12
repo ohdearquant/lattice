@@ -48,7 +48,7 @@ fn resolve_dot_product_kernel() -> DotKernel {
 
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        if config.simd128_enabled {
+        if config.simd128_enabled() {
             return dot_product_simd128_kernel;
         }
     }
