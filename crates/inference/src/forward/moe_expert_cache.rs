@@ -690,10 +690,33 @@ impl ExpertSlotCache {
     /// `expert_ids` may contain the same id more than once (defensive,
     /// though `encode_moe_ffn`'s top-k selection never repeats one within
     /// a token) — a repeat is simply a hit against the slot the first
-    /// occurrence just claimed.
+    /// occurrence just claimed — INCLUDING a repeat that was itself cold
+    /// (a miss the first time this same call assigned it a fresh
+    /// `PrefetchTask`): `planned_this_call` tracks every expert this call
+    /// has already assigned a slot to (ready or not), so a second
+    /// occurrence never pushes a second task for the same slot, matching
+    /// what a second `resolve()` call for the same id would do (by the
+    /// time a second `resolve()` runs, the first's `load_into` already
+    /// completed synchronously and left the slot ready — a hit).
     pub(crate) fn plan_prefetch(&mut self, expert_ids: &[usize]) -> Vec<PrefetchTask> {
         let mut tasks = Vec::new();
+        let mut planned_this_call: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for &expert_id in expert_ids {
+            if let Some(&slot) = planned_this_call.get(&expert_id) {
+                // Repeat of an id this SAME call already assigned a task
+                // to (cold or not) — the task already covers it, so this
+                // is a hit against that pending assignment: no second
+                // task, no second slot mutation (the distinct-slot
+                // contract every task in one `plan_prefetch` call relies
+                // on — see `PrefetchTask`'s doc comment).
+                #[cfg(test)]
+                {
+                    self.hit_count += 1;
+                }
+                self.touch(slot);
+                continue;
+            }
             if let Some(&slot) = self.expert_to_slot.get(&expert_id) {
                 if self.slot_ready[slot] {
                     #[cfg(test)]
@@ -717,6 +740,7 @@ impl ExpertSlotCache {
                 }
                 self.slot_ready[slot] = false;
                 self.touch(slot);
+                planned_this_call.insert(expert_id, slot);
                 tasks.push(PrefetchTask { slot, expert_id });
                 continue;
             }
@@ -736,6 +760,7 @@ impl ExpertSlotCache {
             self.expert_to_slot.insert(expert_id, slot);
             self.slot_ready[slot] = false;
             self.touch(slot);
+            planned_this_call.insert(expert_id, slot);
             tasks.push(PrefetchTask { slot, expert_id });
         }
         tasks

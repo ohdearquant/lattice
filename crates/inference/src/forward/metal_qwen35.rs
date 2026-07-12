@@ -20344,6 +20344,103 @@ mod inner {
             }
         }
 
+        /// Regression: a duplicate COLD id within ONE `plan_prefetch` call
+        /// used to push a second `PrefetchTask` for
+        /// the same expert — the first occurrence assigns a slot but
+        /// leaves it `slot_ready == false` until `apply_prefetch_results`
+        /// runs (deferred, unlike `resolve()`'s synchronous `load_into`),
+        /// so the second occurrence's `expert_to_slot` lookup found an
+        /// UNREADY mapping and took the reload branch, pushing a second
+        /// task for the SAME slot — violating the distinct-slot contract
+        /// [`PrefetchTask`]'s doc comment claims ("every task in one
+        /// `plan_prefetch` call owns a distinct slot") and silently
+        /// double-mutating that slot's bookkeeping. The equivalence test
+        /// above never caught this: its one repeated id (`5, 5, 4`) was
+        /// already `slot_ready` from a PRIOR token, so it took the
+        /// ready-hit branch, not the buggy path. Production is unaffected
+        /// (`encode_moe_ffn`'s top-k selection never repeats an id within
+        /// one call), but the defensive contract and its claimed coverage
+        /// were wrong.
+        ///
+        /// Plans a single call with a fresh (never-before-seen, i.e. cold)
+        /// duplicate id `[7, 7]` and asserts: exactly one `PrefetchTask`
+        /// (not two), the distinct-slot invariant holds trivially, and —
+        /// after dequanting and applying that one task — the cache's
+        /// bookkeeping matches an independently built cache driven by two
+        /// `resolve(7)` calls (the second of which is a hit against the
+        /// first's now-ready slot, exactly what the dedup guard makes the
+        /// second occurrence here equivalent to).
+        #[test]
+        fn moe_prefetch_plan_dedups_within_call_cold_duplicate() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            let experts = 8usize;
+            let mid = 1usize;
+            let cols = 32usize;
+            let name = "prefetch_cold_dup_test.experts.gate_up_proj";
+            write_tiny_q4_fixture_per_expert_row(dir, name, experts, mid, cols, |e, _m| {
+                0.01 * (e as f32 + 1.0)
+            });
+            let path = mtp_tensor_path(dir, name, "q4");
+
+            let build_cache = || {
+                crate::forward::moe_expert_cache::ExpertSlotCache::new(
+                    &device,
+                    &path,
+                    &[experts, mid, cols],
+                    4,
+                    "prefetch_cold_dup_test.cache",
+                )
+                .expect("ExpertSlotCache::new over the tiny fixture")
+            };
+
+            let mut cache_prefetch = build_cache();
+            cache_prefetch.begin_token();
+            let tasks = cache_prefetch.plan_prefetch(&[7, 7]);
+            assert_eq!(
+                tasks.len(),
+                1,
+                "a cold id repeated within one plan_prefetch call must produce exactly one \
+                 task, not one per occurrence"
+            );
+            let mut slots: Vec<usize> = tasks.iter().map(|t| t.slot).collect();
+            let before = slots.len();
+            slots.sort_unstable();
+            slots.dedup();
+            assert_eq!(
+                slots.len(),
+                before,
+                "distinct-slot invariant: every task in one plan_prefetch call must own a \
+                 distinct slot"
+            );
+
+            let results = std::thread::scope(|scope| {
+                let handle = cache_prefetch.spawn_dequant(tasks, true, None, None, scope);
+                handle.expect("tasks is non-empty").join()
+            })
+            .expect("dequant must not panic");
+            cache_prefetch.apply_prefetch_results(&results);
+
+            let mut cache_resolve = build_cache();
+            cache_resolve.begin_token();
+            let _ = cache_resolve.resolve(7);
+            let _ = cache_resolve.resolve(7);
+
+            assert_eq!(
+                cache_resolve.debug_snapshot(),
+                cache_prefetch.debug_snapshot(),
+                "plan_prefetch([7, 7]) (deduped) must match two resolve(7) calls' bookkeeping \
+                 exactly — the second resolve(7) is a hit against the first's now-ready slot, \
+                 which is exactly what the within-call dedup guard makes the second [7, 7] \
+                 occurrence equivalent to"
+            );
+        }
+
         // -------------------------------------------------------------------
         // `load_q4_mmap_dequant_f16`/
         // `load_q4_mmap_dequant_f32` used to validate a MoE tensor's Q4
