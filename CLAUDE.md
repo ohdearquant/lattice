@@ -103,17 +103,20 @@ PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.
 
 ### Merge Gate
 
-A PR merges only when its branch is **up to date with main** AND **green at its actual head**.
-Branch protection enforces this (`required_status_checks.strict = true`), added after #634
-merged green-on-a-stale-base and broke main for two hours: main had gained call sites of the
-API it changed, and the merged combination was never compiled anywhere before landing. Four
-more stale-base PRs (#636, #638, #639, #642) then auto-merged onto the red main.
+A PR merges once required checks are green **at the PR's own head**. Branch protection
+no longer requires the branch to be up to date with main first (`required_status_checks.strict
+= false` as of 2026-07-12) — required checks gate the PR's own commits, not the hypothetical
+merge of those commits onto current main.
 
-- Never arm auto-merge on a PR whose branch is behind main; `gh pr update-branch <N>` first.
-- When main goes red, treat every armed auto-merge as suspect: disarm or hold until main is
-  green, then refresh branches and let CI re-run at the true merge state.
-- After each merge from a queue of armed PRs, the survivors are out of date again by
-  definition; refresh them one at a time rather than arming a stale stack.
+That gap is exactly what broke main for two hours after #634: it merged green-on-a-stale-base,
+but main had gained call sites of the API it changed, and the merged combination was never
+compiled anywhere before landing (four more stale-base PRs — #636, #638, #639, #642 — then
+auto-merged onto the red main). With strict checks off, closing that gap is a review-side job:
+when a PR changes a function signature, trait, or other public surface, check it against
+current main during review, not just against the PR's own diff.
+
+- After every merge to main, watch the main-push CI run.
+- If main goes red, revert fast rather than fix-forward — root-cause after main is green again.
 
 ## Agent Spawning
 
