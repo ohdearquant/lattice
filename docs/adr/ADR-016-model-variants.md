@@ -132,5 +132,5 @@ with the download URL.
 
 ## References
 
-- [`crates/embed/src/model.rs`](/Users/lion/projects/lattice/crates/embed/src/model.rs) — `EmbeddingModel`, `ModelConfig`, `ModelProvenance`
-- [`crates/embed/src/service/native.rs`](/Users/lion/projects/lattice/crates/embed/src/service/native.rs) — model loading, `qwen_model_dir`, `LATTICE_QWEN_MODEL_DIR`
+- [`crates/embed/src/model.rs`](../../crates/embed/src/model.rs) — `EmbeddingModel`, `ModelConfig`, `ModelProvenance`
+- [`crates/embed/src/service/native.rs`](../../crates/embed/src/service/native.rs) — model loading, `qwen_model_dir`, `LATTICE_QWEN_MODEL_DIR`

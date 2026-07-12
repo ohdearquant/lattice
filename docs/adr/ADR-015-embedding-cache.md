@@ -95,6 +95,6 @@ This avoids cross-shard contention on the counter updates — there is no shared
 
 ## References
 
-- [`crates/embed/src/cache.rs`](/Users/lion/projects/lattice/crates/embed/src/cache.rs) — full implementation
-- [`crates/embed/src/service/cached.rs`](/Users/lion/projects/lattice/crates/embed/src/service/cached.rs) — `CachedEmbeddingService` consumer
-- [`crates/embed/src/model.rs`](/Users/lion/projects/lattice/crates/embed/src/model.rs) — `ModelConfig::dimensions()` used for key construction
+- [`crates/embed/src/cache.rs`](../../crates/embed/src/cache.rs) — full implementation
+- [`crates/embed/src/service/cached.rs`](../../crates/embed/src/service/cached.rs) — `CachedEmbeddingService` consumer
+- [`crates/embed/src/model.rs`](../../crates/embed/src/model.rs) — `ModelConfig::dimensions()` used for key construction

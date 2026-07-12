@@ -124,7 +124,7 @@ by eliminating two norm-squared accumulations and two square roots.
 
 ## References
 
-- [`crates/embed/src/simd/quantized.rs`](/Users/lion/projects/lattice/crates/embed/src/simd/quantized.rs) — INT8 implementation, NEON/AVX2/VNNI kernels
-- [`crates/embed/src/simd/int4.rs`](/Users/lion/projects/lattice/crates/embed/src/simd/int4.rs) — INT4 nibble packing
-- [`crates/embed/src/simd/binary.rs`](/Users/lion/projects/lattice/crates/embed/src/simd/binary.rs) — binary quantization, Hamming distance
-- [`crates/embed/src/simd/tier.rs`](/Users/lion/projects/lattice/crates/embed/src/simd/tier.rs) — `QuantizationTier`, `QuantizedData`, `PreparedQuery`, distance dispatch
+- [`crates/embed/src/simd/quantized.rs`](../../crates/embed/src/simd/quantized.rs) — INT8 implementation, NEON/AVX2/VNNI kernels
+- [`crates/embed/src/simd/int4.rs`](../../crates/embed/src/simd/int4.rs) — INT4 nibble packing
+- [`crates/embed/src/simd/binary.rs`](../../crates/embed/src/simd/binary.rs) — binary quantization, Hamming distance
+- [`crates/embed/src/simd/tier.rs`](../../crates/embed/src/simd/tier.rs) — `QuantizationTier`, `QuantizedData`, `PreparedQuery`, distance dispatch

@@ -122,7 +122,7 @@ window resets on process restart — this is intentional and accepted.
 
 ## References
 
-- [`crates/embed/src/backfill/coordinator.rs`](/Users/lion/projects/lattice/crates/embed/src/backfill/coordinator.rs) — `BackfillCoordinator` implementation
-- [`crates/embed/src/backfill/types.rs`](/Users/lion/projects/lattice/crates/embed/src/backfill/types.rs) — `EmbeddingRoute`, `RoutingPhase`, `BackfillConfig`, `EmbeddingRoutingConfig`
-- [`crates/embed/src/migration/controller.rs`](/Users/lion/projects/lattice/crates/embed/src/migration/controller.rs) — `MigrationController` state machine
-- [`crates/embed/src/migration/types.rs`](/Users/lion/projects/lattice/crates/embed/src/migration/types.rs) — `MigrationPlan`, `MigrationProgress`, `MigrationState`
+- [`crates/embed/src/backfill/coordinator.rs`](../../crates/embed/src/backfill/coordinator.rs) — `BackfillCoordinator` implementation
+- [`crates/embed/src/backfill/types.rs`](../../crates/embed/src/backfill/types.rs) — `EmbeddingRoute`, `RoutingPhase`, `BackfillConfig`, `EmbeddingRoutingConfig`
+- [`crates/embed/src/migration/controller.rs`](../../crates/embed/src/migration/controller.rs) — `MigrationController` state machine
+- [`crates/embed/src/migration/types.rs`](../../crates/embed/src/migration/types.rs) — `MigrationPlan`, `MigrationProgress`, `MigrationState`

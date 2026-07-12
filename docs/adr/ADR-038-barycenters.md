@@ -133,7 +133,7 @@ outer iteration (points move), so only owned data structures are appropriate.
 
 ## References
 
-- [`crates/transport/src/barycenter.rs`](/Users/lion/projects/lattice/crates/transport/src/barycenter.rs) — both barycenter algorithms
-- [`crates/transport/src/logsumexp.rs`](/Users/lion/projects/lattice/crates/transport/src/logsumexp.rs) — `OnlineLogSumExp`, `max_abs_diff`, `normalize_log_weights`
-- [`crates/transport/src/sinkhorn.rs`](/Users/lion/projects/lattice/crates/transport/src/sinkhorn.rs) — `SinkhornSolver` used as inner loop
+- [`crates/transport/src/barycenter.rs`](../../crates/transport/src/barycenter.rs) — both barycenter algorithms
+- [`crates/transport/src/logsumexp.rs`](../../crates/transport/src/logsumexp.rs) — `OnlineLogSumExp`, `max_abs_diff`, `normalize_log_weights`
+- [`crates/transport/src/sinkhorn.rs`](../../crates/transport/src/sinkhorn.rs) — `SinkhornSolver` used as inner loop
 - Cuturi & Doucet, "Fast Computation of Wasserstein Barycenters", ICML 2014

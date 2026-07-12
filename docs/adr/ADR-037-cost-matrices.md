@@ -123,5 +123,5 @@ Before building any cost matrix from point sets, `validate_point_set` checks: no
 
 ## References
 
-- [`crates/transport/src/cost.rs`](/Users/lion/projects/lattice/crates/transport/src/cost.rs) — all cost matrix types and metrics
-- [`crates/transport/src/divergence.rs`](/Users/lion/projects/lattice/crates/transport/src/divergence.rs) — 16 MB dense/lazy selection logic
+- [`crates/transport/src/cost.rs`](../../crates/transport/src/cost.rs) — all cost matrix types and metrics
+- [`crates/transport/src/divergence.rs`](../../crates/transport/src/divergence.rs) — 16 MB dense/lazy selection logic
