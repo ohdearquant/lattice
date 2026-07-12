@@ -1,0 +1,35 @@
+# cargo-audit configuration — supply-chain vulnerability gate for the lattice
+# workspace. Enforced in CI by `.github/workflows/cargo-audit.yml`, which
+# runs `cargo audit` and fails the job on any *vulnerability*-severity
+# advisory. This file exists solely to document and ignore advisories that
+# are warnings only (unmaintained / unsound-with-no-semver-compatible-fix)
+# and have no actionable remediation today. Never add a vulnerability-severity
+# advisory here — those must be fixed by an upgrade, not silenced.
+#
+# Companion note: `deny.toml` already runs `cargo deny check advisories` as
+# an INFORMATIONAL step inside the existing `cargo-deny` CI job (continue-on-
+# error, so it cannot block merges). This file is for the separate, blocking
+# `cargo-audit` gate — the two run different tools against the same
+# advisory-db and are deliberately independent (cargo-deny stays soft/broad,
+# cargo-audit is the hard vulnerability gate).
+
+[advisories]
+ignore = [
+    # paste 1.0.15 — unmaintained (author archived the crate, no successor
+    # published). Transitive only: pulled in via macro_rules_attribute
+    # (-> tokenizers -> lattice-inference) and via metal/wgpu-hal (-> wgpu ->
+    # lattice-fann/lattice-tune/lattice-inference). We have no direct
+    # dependency to bump or drop; removing it means waiting on upstream
+    # tokenizers/wgpu-hal to migrate off it. No known vulnerability, purely
+    # an unmaintained-status warning.
+    "RUSTSEC-2024-0436",
+
+    # lru 0.12.5 — unsound `IterMut` (Stacked-Borrows violation). Direct
+    # dependency of crates/embed (Cargo.toml pins "0.12"). The fix landed at
+    # >=0.16.3, a semver-incompatible major bump (0.12 -> 0.16) that would
+    # require reviewing lattice-embed's lru usage for API breakage before
+    # taking it; deferred as a follow-up crate bump, not a drop-in `cargo
+    # update`. Verified 2026-07-11: `cargo update -p lru` resolves no newer
+    # 0.12.x release (0.12.5 is latest in-range).
+    "RUSTSEC-2026-0002",
+]

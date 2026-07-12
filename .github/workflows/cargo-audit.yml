@@ -1,0 +1,56 @@
+name: cargo audit
+#
+# Dedicated vulnerability gate. `ci.yml`'s `cargo-deny` job already runs
+# `cargo deny check advisories`, but that step is deliberately INFORMATIONAL
+# (continue-on-error) so an unrelated upstream disclosure never wedges a
+# merge — see deny.toml's header comment. This workflow is the hard gate:
+# `cargo audit` FAILS the job on any vulnerability-severity RUSTSEC advisory.
+# Warnings (unmaintained / unsound-with-no-fix) are informational here too —
+# see .cargo/audit.toml for the documented, individually-justified ignore
+# list, and never add a vulnerability-severity advisory to that list.
+#
+# Triggered on manifest/lockfile changes (a bump can introduce or resolve an
+# advisory), on changes to the audit config itself, weekly on a schedule
+# (fresh advisory-db entries land with no code change of ours), and on
+# manual dispatch.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'crates/**/Cargo.toml'
+      - '.cargo/audit.toml'
+      - '.github/workflows/cargo-audit.yml'
+  schedule:
+    - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - name: Cache cargo-audit binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-bin-${{ runner.os }}-v0.22.2
+      - name: Install cargo-audit
+        run: |
+          if [ ! -x ~/.cargo/bin/cargo-audit ]; then
+            cargo install cargo-audit --version 0.22.2 --locked
+          fi
+      - name: cargo audit (fails on vulnerabilities, warnings informational per .cargo/audit.toml)
+        run: cargo audit
