@@ -1961,9 +1961,11 @@ mod tests {
     ///
     /// Both runs use `weights_window` (head-0's entire K row block zeroed) for ALL FOUR
     /// window steps (0-3), not just step 0 — the poisoned run additionally sets exactly
-    /// one weight entry to NaN, ONLY at step 0. Steps 4-7 (four clean tokens, the number
-    /// needed to observe the poisoned value fully age out of the `kernel_size == 4`
-    /// conv window) use ordinary `weights_clean`, identical in both runs.
+    /// one weight entry to NaN, ONLY at step 0. Steps 4-7 (four extra clean tokens
+    /// exercising post-window recovery; the poisoned value has already aged out of the
+    /// conv buffer by the post-step-3 snapshot, since the rolling buffer holds
+    /// `kernel_size - 1 == 3` past values) use ordinary `weights_clean`, identical in
+    /// both runs.
     ///
     /// This is a deliberate, disclosed choice, not a narrowing of the claim: holding the
     /// K row at true zero for the *whole* contamination window (not just step 0) is the
@@ -2024,7 +2026,7 @@ mod tests {
         );
         let kernel_size = cfg.linear_conv_kernel_dim;
         let window = kernel_size; // # of dispatch steps a single poisoned raw value contaminates
-        let clean_tail = 4; // number of clean tokens needed to fully evict the poisoned value from the kernel_size=4 conv window
+        let clean_tail = 4; // extra clean tokens exercising post-window recovery (the poisoned value is already evicted by the post-step-3 snapshot)
         let total_steps = window + clean_tail;
 
         let (base_weights, cfg) = make_test_weights_for_cfg(cfg, 77);
