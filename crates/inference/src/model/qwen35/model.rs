@@ -80,6 +80,30 @@ impl Qwen35Model {
         &self.config
     }
 
+    /// **Unstable**: mutable access to the post-load Qwen3.5 configuration.
+    ///
+    /// Additive builder-style setter (`Qwen35Model.config` is a private
+    /// field; this is the only way an external caller can adjust it after
+    /// load). Intended for benchmark/tooling call sites that need to change
+    /// generation behavior without adding a new field to the
+    /// request-scoped [`GenerateConfig`](crate::model::qwen35_config::GenerateConfig)
+    /// (which is a plain public-literal struct with a `Default` impl --
+    /// `cargo-semver-checks` treats any new field there as
+    /// `constructible_struct_adds_field`, a semver-major break).
+    ///
+    /// Established idiom already used throughout this crate's own test
+    /// suite (e.g. `cfg.eos_token_id = u32::MAX`) to push the model's
+    /// configured EOS token id out of the reachable vocab range, which
+    /// `should_stop_token` (the single shared stop predicate every
+    /// CPU/Metal decode loop calls) then never matches -- see
+    /// `qwen35_generate --emit-phase-events` (PR #882), which combines this
+    /// with `GenerateConfig::stop_token_ids: vec![]` (already public) to
+    /// force continuation to the exact requested token count for a
+    /// benchmark trial.
+    pub fn config_mut(&mut self) -> &mut Qwen35Config {
+        &mut self.config
+    }
+
     /// **Unstable**: access the BPE tokenizer.
     pub fn tokenizer(&self) -> &BpeTokenizer {
         &self.tokenizer

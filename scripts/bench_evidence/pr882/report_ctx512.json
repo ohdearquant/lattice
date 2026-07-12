@@ -1,0 +1,3331 @@
+{
+  "run_kind": "demonstration",
+  "cell_id": "decode:qwen3.5-small:f16:cpu:512",
+  "context": 512,
+  "n_pairs_requested": 2,
+  "model": {
+    "model_dir": "/Users/lion/.lattice/models/qwen3.5-0.8b",
+    "weight_files": {
+      "model.safetensors-00001-of-00001.safetensors": {
+        "sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+      },
+      "model.safetensors.index.json": {
+        "sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e"
+      }
+    }
+  },
+  "command": "/Users/lion/projects/khive/lattice-bench2/target/release/qwen35_generate --emit-phase-events --model-dir /Users/lion/.lattice/models/qwen3.5-0.8b --context 512 --max-tokens 128 --warmup-tokens 16 --seed <per-trial, derived from --seed base>",
+  "resource_sampler": {
+    "available": true,
+    "error": null
+  },
+  "session": {
+    "pairs": [
+      {
+        "pair_index": 0,
+        "order": "AB",
+        "seed_a": 42,
+        "seed_b": 43,
+        "arm_a": {
+          "prompt_tokens": 512,
+          "generated_tokens": 128,
+          "requested_max_tokens": 128,
+          "load_ms": 6210.154125,
+          "prefill_tok_s": 122.37108922290456,
+          "ttft_ms": 4184.118209,
+          "decode_tok_s": 13.948084415763569,
+          "per_token_latencies_ms": [
+            81.281875,
+            70.855416,
+            68.371959,
+            68.919291,
+            69.849084,
+            74.816291,
+            68.277084,
+            67.504375,
+            67.593125,
+            67.345416,
+            68.125417,
+            67.525,
+            67.892833,
+            71.176459,
+            83.636125,
+            67.512,
+            67.553541,
+            67.699875,
+            69.070042,
+            68.555292,
+            67.653291,
+            67.731709,
+            67.589833,
+            67.850458,
+            67.54625,
+            68.266834,
+            67.792416,
+            67.835417,
+            69.077875,
+            69.533417,
+            69.595166,
+            75.322709,
+            78.018041,
+            74.539917,
+            74.564917,
+            73.032875,
+            69.522333,
+            68.135292,
+            68.941541,
+            68.472792,
+            68.11625,
+            69.166583,
+            70.283792,
+            70.683708,
+            69.252917,
+            71.9785,
+            69.644792,
+            71.628958,
+            68.244125,
+            69.529125,
+            73.061375,
+            70.565125,
+            70.122917,
+            70.454333,
+            73.057875,
+            68.911833,
+            68.895125,
+            69.0235,
+            81.746125,
+            72.104875,
+            78.158292,
+            71.811042,
+            69.995458,
+            70.003833,
+            73.229334,
+            69.983791,
+            69.910125,
+            68.523084,
+            68.74,
+            68.680125,
+            69.204916,
+            71.720625,
+            70.180292,
+            69.395542,
+            76.735833,
+            88.247083,
+            110.51525,
+            82.07175,
+            78.437334,
+            74.099958,
+            73.959875,
+            74.290417,
+            82.431708,
+            90.276833,
+            76.196084,
+            70.688208,
+            69.99575,
+            72.720125,
+            70.807167,
+            69.995166,
+            71.320625,
+            68.980542,
+            70.411417,
+            75.803125,
+            73.363833,
+            69.121083,
+            69.128084,
+            78.033708,
+            70.243042,
+            69.434041,
+            69.639584,
+            70.194208,
+            70.253792,
+            69.571083,
+            69.698042,
+            69.651833,
+            71.404375,
+            70.077,
+            70.754042,
+            70.273416,
+            80.058209,
+            69.697083,
+            70.170125,
+            69.998875,
+            69.79375,
+            69.797292,
+            71.54925,
+            70.029458,
+            71.673417,
+            74.939375,
+            73.502958,
+            70.483042,
+            69.810416,
+            70.405417,
+            69.755583,
+            73.3745,
+            70.736917
+          ],
+          "per_token_p50_ms": 70.003833,
+          "per_token_p95_ms": 81.60685,
+          "per_token_p99_ms": 89.74909799999999,
+          "peak_phys_footprint_bytes": 6220519424,
+          "peak_phys_footprint_by_phase": {
+            "load": 6220519424,
+            "prefill": 3208384784,
+            "decode": 3220902184
+          },
+          "delta_matches_generated_tokens": true,
+          "stopped": false,
+          "raw_phase_events": [
+            {
+              "name": "load_start",
+              "monotonic_ns": 41,
+              "token_index": null
+            },
+            {
+              "name": "backend_ready",
+              "monotonic_ns": 6210154166,
+              "token_index": null
+            },
+            {
+              "name": "prefill_start",
+              "monotonic_ns": 12187535291,
+              "token_index": null
+            },
+            {
+              "name": "prefill_end",
+              "monotonic_ns": 16371530083,
+              "token_index": null
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16371653500,
+              "token_index": 1
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16452935375,
+              "token_index": 2
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16523790791,
+              "token_index": 3
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16592162750,
+              "token_index": 4
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16661082041,
+              "token_index": 5
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16730931125,
+              "token_index": 6
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16805747416,
+              "token_index": 7
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16874024500,
+              "token_index": 8
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16941528875,
+              "token_index": 9
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17009122000,
+              "token_index": 10
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17076467416,
+              "token_index": 11
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17144592833,
+              "token_index": 12
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17212117833,
+              "token_index": 13
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17280010666,
+              "token_index": 14
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17351187125,
+              "token_index": 15
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17434823250,
+              "token_index": 16
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17502335250,
+              "token_index": 17
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17569888791,
+              "token_index": 18
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17637588666,
+              "token_index": 19
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17706658708,
+              "token_index": 20
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17775214000,
+              "token_index": 21
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17842867291,
+              "token_index": 22
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17910599000,
+              "token_index": 23
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17978188833,
+              "token_index": 24
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18046039291,
+              "token_index": 25
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18113585541,
+              "token_index": 26
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18181852375,
+              "token_index": 27
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18249644791,
+              "token_index": 28
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18317480208,
+              "token_index": 29
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18386558083,
+              "token_index": 30
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18456091500,
+              "token_index": 31
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18525686666,
+              "token_index": 32
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18601009375,
+              "token_index": 33
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18679027416,
+              "token_index": 34
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18753567333,
+              "token_index": 35
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18828132250,
+              "token_index": 36
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18901165125,
+              "token_index": 37
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18970687458,
+              "token_index": 38
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19038822750,
+              "token_index": 39
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19107764291,
+              "token_index": 40
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19176237083,
+              "token_index": 41
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19244353333,
+              "token_index": 42
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19313519916,
+              "token_index": 43
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19383803708,
+              "token_index": 44
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19454487416,
+              "token_index": 45
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19523740333,
+              "token_index": 46
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19595718833,
+              "token_index": 47
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19665363625,
+              "token_index": 48
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19736992583,
+              "token_index": 49
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19805236708,
+              "token_index": 50
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19874765833,
+              "token_index": 51
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19947827208,
+              "token_index": 52
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20018392333,
+              "token_index": 53
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20088515250,
+              "token_index": 54
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20158969583,
+              "token_index": 55
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20232027458,
+              "token_index": 56
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20300939291,
+              "token_index": 57
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20369834416,
+              "token_index": 58
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20438857916,
+              "token_index": 59
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20520604041,
+              "token_index": 60
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20592708916,
+              "token_index": 61
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20670867208,
+              "token_index": 62
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20742678250,
+              "token_index": 63
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20812673708,
+              "token_index": 64
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20882677541,
+              "token_index": 65
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20955906875,
+              "token_index": 66
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21025890666,
+              "token_index": 67
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21095800791,
+              "token_index": 68
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21164323875,
+              "token_index": 69
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21233063875,
+              "token_index": 70
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21301744000,
+              "token_index": 71
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21370948916,
+              "token_index": 72
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21442669541,
+              "token_index": 73
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21512849833,
+              "token_index": 74
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21582245375,
+              "token_index": 75
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21658981208,
+              "token_index": 76
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21747228291,
+              "token_index": 77
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21857743541,
+              "token_index": 78
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21939815291,
+              "token_index": 79
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22018252625,
+              "token_index": 80
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22092352583,
+              "token_index": 81
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22166312458,
+              "token_index": 82
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22240602875,
+              "token_index": 83
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22323034583,
+              "token_index": 84
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22413311416,
+              "token_index": 85
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22489507500,
+              "token_index": 86
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22560195708,
+              "token_index": 87
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22630191458,
+              "token_index": 88
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22702911583,
+              "token_index": 89
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22773718750,
+              "token_index": 90
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22843713916,
+              "token_index": 91
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22915034541,
+              "token_index": 92
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 22984015083,
+              "token_index": 93
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23054426500,
+              "token_index": 94
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23130229625,
+              "token_index": 95
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23203593458,
+              "token_index": 96
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23272714541,
+              "token_index": 97
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23341842625,
+              "token_index": 98
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23419876333,
+              "token_index": 99
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23490119375,
+              "token_index": 100
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23559553416,
+              "token_index": 101
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23629193000,
+              "token_index": 102
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23699387208,
+              "token_index": 103
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23769641000,
+              "token_index": 104
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23839212083,
+              "token_index": 105
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23908910125,
+              "token_index": 106
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 23978561958,
+              "token_index": 107
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24049966333,
+              "token_index": 108
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24120043333,
+              "token_index": 109
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24190797375,
+              "token_index": 110
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24261070791,
+              "token_index": 111
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24341129000,
+              "token_index": 112
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24410826083,
+              "token_index": 113
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24480996208,
+              "token_index": 114
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24550995083,
+              "token_index": 115
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24620788833,
+              "token_index": 116
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24690586125,
+              "token_index": 117
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24762135375,
+              "token_index": 118
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24832164833,
+              "token_index": 119
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24903838250,
+              "token_index": 120
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 24978777625,
+              "token_index": 121
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 25052280583,
+              "token_index": 122
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 25122763625,
+              "token_index": 123
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 25192574041,
+              "token_index": 124
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 25262979458,
+              "token_index": 125
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 25332735041,
+              "token_index": 126
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 25406109541,
+              "token_index": 127
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 25476846458,
+              "token_index": 128
+            }
+          ]
+        },
+        "arm_b": {
+          "prompt_tokens": 512,
+          "generated_tokens": 128,
+          "requested_max_tokens": 128,
+          "load_ms": 1992.765708,
+          "prefill_tok_s": 124.16381788933475,
+          "ttft_ms": 4123.714416,
+          "decode_tok_s": 13.707622359432316,
+          "per_token_latencies_ms": [
+            71.792084,
+            70.4135,
+            70.673583,
+            67.901292,
+            67.734125,
+            67.462458,
+            67.649125,
+            67.458958,
+            68.304625,
+            67.891709,
+            73.7315,
+            71.146166,
+            67.648542,
+            67.563542,
+            67.698833,
+            67.958125,
+            68.373292,
+            67.898833,
+            68.322458,
+            68.305084,
+            67.851416,
+            67.996417,
+            69.099375,
+            68.05625,
+            67.938417,
+            74.547291,
+            69.730375,
+            70.323417,
+            69.654042,
+            68.405541,
+            68.913167,
+            67.837083,
+            67.865,
+            68.475417,
+            67.874583,
+            68.334834,
+            68.0025,
+            68.709291,
+            68.113875,
+            68.237917,
+            68.137958,
+            75.992917,
+            68.099417,
+            70.298333,
+            68.097625,
+            69.066333,
+            68.54375,
+            68.439542,
+            68.818708,
+            71.710334,
+            70.842958,
+            70.325667,
+            71.091041,
+            69.2385,
+            69.349959,
+            68.641625,
+            68.421208,
+            70.669125,
+            70.757833,
+            68.907292,
+            68.669958,
+            68.409917,
+            70.250417,
+            68.476083,
+            71.662292,
+            69.61675,
+            76.186541,
+            122.161375,
+            74.203167,
+            80.548583,
+            78.086209,
+            75.441833,
+            75.981292,
+            71.553416,
+            70.016875,
+            70.884834,
+            69.874166,
+            70.998625,
+            69.890625,
+            72.977917,
+            73.242417,
+            79.77225,
+            79.05525,
+            92.96775,
+            97.146708,
+            97.323708,
+            82.329917,
+            80.50175,
+            83.745667,
+            78.858375,
+            78.736041,
+            77.206209,
+            76.188791,
+            79.341417,
+            83.595583,
+            86.324542,
+            71.06775,
+            71.108792,
+            87.987333,
+            84.360208,
+            75.178584,
+            71.509541,
+            72.017625,
+            75.019584,
+            85.503166,
+            71.291792,
+            71.904667,
+            72.333916,
+            71.726959,
+            71.375541,
+            72.384625,
+            71.165417,
+            72.270958,
+            71.552459,
+            73.208208,
+            70.987708,
+            71.955084,
+            76.230333,
+            72.527917,
+            71.64275,
+            76.761208,
+            72.073292,
+            72.408,
+            74.301166,
+            72.324625,
+            78.884125,
+            72.283459
+          ],
+          "per_token_p50_ms": 70.998625,
+          "per_token_p95_ms": 85.16027859999998,
+          "per_token_p99_ms": 97.277688,
+          "peak_phys_footprint_bytes": 6218979328,
+          "peak_phys_footprint_by_phase": {
+            "load": 6218979328,
+            "prefill": 3325710656,
+            "decode": 3326726464
+          },
+          "delta_matches_generated_tokens": true,
+          "stopped": false,
+          "raw_phase_events": [
+            {
+              "name": "load_start",
+              "monotonic_ns": 42,
+              "token_index": null
+            },
+            {
+              "name": "backend_ready",
+              "monotonic_ns": 1992765750,
+              "token_index": null
+            },
+            {
+              "name": "prefill_start",
+              "monotonic_ns": 7881390292,
+              "token_index": null
+            },
+            {
+              "name": "prefill_end",
+              "monotonic_ns": 12004974833,
+              "token_index": null
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12005104708,
+              "token_index": 1
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12076896792,
+              "token_index": 2
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12147310292,
+              "token_index": 3
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12217983875,
+              "token_index": 4
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12285885167,
+              "token_index": 5
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12353619292,
+              "token_index": 6
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12421081750,
+              "token_index": 7
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12488730875,
+              "token_index": 8
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12556189833,
+              "token_index": 9
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12624494458,
+              "token_index": 10
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12692386167,
+              "token_index": 11
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12766117667,
+              "token_index": 12
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12837263833,
+              "token_index": 13
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12904912375,
+              "token_index": 14
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12972475917,
+              "token_index": 15
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13040174750,
+              "token_index": 16
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13108132875,
+              "token_index": 17
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13176506167,
+              "token_index": 18
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13244405000,
+              "token_index": 19
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13312727458,
+              "token_index": 20
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13381032542,
+              "token_index": 21
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13448883958,
+              "token_index": 22
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13516880375,
+              "token_index": 23
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13585979750,
+              "token_index": 24
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13654036000,
+              "token_index": 25
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13721974417,
+              "token_index": 26
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13796521708,
+              "token_index": 27
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13866252083,
+              "token_index": 28
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13936575500,
+              "token_index": 29
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14006229542,
+              "token_index": 30
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14074635083,
+              "token_index": 31
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14143548250,
+              "token_index": 32
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14211385333,
+              "token_index": 33
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14279250333,
+              "token_index": 34
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14347725750,
+              "token_index": 35
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14415600333,
+              "token_index": 36
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14483935167,
+              "token_index": 37
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14551937667,
+              "token_index": 38
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14620646958,
+              "token_index": 39
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14688760833,
+              "token_index": 40
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14756998750,
+              "token_index": 41
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14825136708,
+              "token_index": 42
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14901129625,
+              "token_index": 43
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14969229042,
+              "token_index": 44
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15039527375,
+              "token_index": 45
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15107625000,
+              "token_index": 46
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15176691333,
+              "token_index": 47
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15245235083,
+              "token_index": 48
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15313674625,
+              "token_index": 49
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15382493333,
+              "token_index": 50
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15454203667,
+              "token_index": 51
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15525046625,
+              "token_index": 52
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15595372292,
+              "token_index": 53
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15666463333,
+              "token_index": 54
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15735701833,
+              "token_index": 55
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15805051792,
+              "token_index": 56
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15873693417,
+              "token_index": 57
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15942114625,
+              "token_index": 58
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16012783750,
+              "token_index": 59
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16083541583,
+              "token_index": 60
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16152448875,
+              "token_index": 61
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16221118833,
+              "token_index": 62
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16289528750,
+              "token_index": 63
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16359779167,
+              "token_index": 64
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16428255250,
+              "token_index": 65
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16499917542,
+              "token_index": 66
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16569534292,
+              "token_index": 67
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16645720833,
+              "token_index": 68
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16767882208,
+              "token_index": 69
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16842085375,
+              "token_index": 70
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16922633958,
+              "token_index": 71
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17000720167,
+              "token_index": 72
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17076162000,
+              "token_index": 73
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17152143292,
+              "token_index": 74
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17223696708,
+              "token_index": 75
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17293713583,
+              "token_index": 76
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17364598417,
+              "token_index": 77
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17434472583,
+              "token_index": 78
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17505471208,
+              "token_index": 79
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17575361833,
+              "token_index": 80
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17648339750,
+              "token_index": 81
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17721582167,
+              "token_index": 82
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17801354417,
+              "token_index": 83
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17880409667,
+              "token_index": 84
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17973377417,
+              "token_index": 85
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18070524125,
+              "token_index": 86
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18167847833,
+              "token_index": 87
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18250177750,
+              "token_index": 88
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18330679500,
+              "token_index": 89
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18414425167,
+              "token_index": 90
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18493283542,
+              "token_index": 91
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18572019583,
+              "token_index": 92
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18649225792,
+              "token_index": 93
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18725414583,
+              "token_index": 94
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18804756000,
+              "token_index": 95
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18888351583,
+              "token_index": 96
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18974676125,
+              "token_index": 97
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19045743875,
+              "token_index": 98
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19116852667,
+              "token_index": 99
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19204840000,
+              "token_index": 100
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19289200208,
+              "token_index": 101
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19364378792,
+              "token_index": 102
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19435888333,
+              "token_index": 103
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19507905958,
+              "token_index": 104
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19582925542,
+              "token_index": 105
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19668428708,
+              "token_index": 106
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19739720500,
+              "token_index": 107
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19811625167,
+              "token_index": 108
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19883959083,
+              "token_index": 109
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19955686042,
+              "token_index": 110
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20027061583,
+              "token_index": 111
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20099446208,
+              "token_index": 112
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20170611625,
+              "token_index": 113
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20242882583,
+              "token_index": 114
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20314435042,
+              "token_index": 115
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20387643250,
+              "token_index": 116
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20458630958,
+              "token_index": 117
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20530586042,
+              "token_index": 118
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20606816375,
+              "token_index": 119
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20679344292,
+              "token_index": 120
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20750987042,
+              "token_index": 121
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20827748250,
+              "token_index": 122
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20899821542,
+              "token_index": 123
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20972229542,
+              "token_index": 124
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21046530708,
+              "token_index": 125
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21118855333,
+              "token_index": 126
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21197739458,
+              "token_index": 127
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21270022917,
+              "token_index": 128
+            }
+          ]
+        },
+        "thermal_state_before": 0,
+        "thermal_state_before_name": "nominal",
+        "thermal_state_after": 0,
+        "thermal_state_after_name": "nominal",
+        "thermal_error": null
+      },
+      {
+        "pair_index": 1,
+        "order": "BA",
+        "seed_a": 44,
+        "seed_b": 45,
+        "arm_a": {
+          "prompt_tokens": 512,
+          "generated_tokens": 128,
+          "requested_max_tokens": 128,
+          "load_ms": 1369.52225,
+          "prefill_tok_s": 123.33849110652993,
+          "ttft_ms": 4151.303833,
+          "decode_tok_s": 12.865270969641418,
+          "per_token_latencies_ms": [
+            70.945417,
+            86.933458,
+            67.960084,
+            67.361833,
+            67.546958,
+            70.526667,
+            71.197208,
+            71.143959,
+            73.8965,
+            78.753958,
+            69.471833,
+            73.179584,
+            72.8235,
+            78.037833,
+            71.071333,
+            68.167667,
+            67.441417,
+            67.811666,
+            68.149167,
+            69.232167,
+            69.988708,
+            68.983708,
+            68.110042,
+            68.534042,
+            70.637458,
+            68.113917,
+            81.379208,
+            67.565417,
+            69.966916,
+            70.676084,
+            69.399958,
+            72.89925,
+            73.496083,
+            68.965375,
+            70.089209,
+            69.546583,
+            72.824125,
+            71.913333,
+            73.98025,
+            69.284209,
+            71.74925,
+            71.583208,
+            69.697958,
+            70.020959,
+            71.628625,
+            70.665416,
+            68.639792,
+            69.884042,
+            69.756083,
+            80.229917,
+            77.886583,
+            75.187625,
+            72.440042,
+            79.634291,
+            77.381459,
+            72.4885,
+            72.336291,
+            75.666834,
+            74.400625,
+            71.086875,
+            76.232791,
+            72.832,
+            71.948709,
+            73.68,
+            71.284208,
+            74.52,
+            74.405375,
+            83.572292,
+            70.987,
+            69.364041,
+            72.134375,
+            72.513,
+            82.335209,
+            80.500875,
+            75.390708,
+            74.611875,
+            70.839875,
+            71.621833,
+            71.963125,
+            71.005209,
+            88.248916,
+            76.053125,
+            74.946417,
+            79.774125,
+            79.386333,
+            75.766875,
+            74.975959,
+            73.863208,
+            78.262708,
+            76.775042,
+            73.548917,
+            71.411875,
+            73.764458,
+            85.396083,
+            77.594042,
+            75.370375,
+            76.979125,
+            76.1435,
+            73.975583,
+            74.638625,
+            71.193667,
+            71.152417,
+            75.4075,
+            75.324208,
+            73.502042,
+            77.825583,
+            73.379208,
+            75.821209,
+            71.63725,
+            70.57825,
+            71.218958,
+            76.39475,
+            101.316375,
+            93.325208,
+            150.847917,
+            103.801333,
+            182.450084,
+            148.051166,
+            130.102584,
+            102.35575,
+            97.718291,
+            86.948167,
+            95.651292,
+            123.465375,
+            83.219791,
+            82.52,
+            77.3405
+          ],
+          "per_token_p50_ms": 73.379208,
+          "per_token_p95_ms": 102.04393749999998,
+          "per_token_p99_ms": 150.12076173999998,
+          "peak_phys_footprint_bytes": 6219388928,
+          "peak_phys_footprint_by_phase": {
+            "load": 6219388928,
+            "prefill": 3497595176,
+            "decode": 3197997352
+          },
+          "delta_matches_generated_tokens": true,
+          "stopped": false,
+          "raw_phase_events": [
+            {
+              "name": "load_start",
+              "monotonic_ns": 209,
+              "token_index": null
+            },
+            {
+              "name": "backend_ready",
+              "monotonic_ns": 1369522459,
+              "token_index": null
+            },
+            {
+              "name": "prefill_start",
+              "monotonic_ns": 6805300417,
+              "token_index": null
+            },
+            {
+              "name": "prefill_end",
+              "monotonic_ns": 10956478167,
+              "token_index": null
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 10956604250,
+              "token_index": 1
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11027549667,
+              "token_index": 2
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11114483125,
+              "token_index": 3
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11182443209,
+              "token_index": 4
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11249805042,
+              "token_index": 5
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11317352000,
+              "token_index": 6
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11387878667,
+              "token_index": 7
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11459075875,
+              "token_index": 8
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11530219834,
+              "token_index": 9
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11604116334,
+              "token_index": 10
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11682870292,
+              "token_index": 11
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11752342125,
+              "token_index": 12
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11825521709,
+              "token_index": 13
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11898345209,
+              "token_index": 14
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 11976383042,
+              "token_index": 15
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12047454375,
+              "token_index": 16
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12115622042,
+              "token_index": 17
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12183063459,
+              "token_index": 18
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12250875125,
+              "token_index": 19
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12319024292,
+              "token_index": 20
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12388256459,
+              "token_index": 21
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12458245167,
+              "token_index": 22
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12527228875,
+              "token_index": 23
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12595338917,
+              "token_index": 24
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12663872959,
+              "token_index": 25
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12734510417,
+              "token_index": 26
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12802624334,
+              "token_index": 27
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12884003542,
+              "token_index": 28
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12951568959,
+              "token_index": 29
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13021535875,
+              "token_index": 30
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13092211959,
+              "token_index": 31
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13161611917,
+              "token_index": 32
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13234511167,
+              "token_index": 33
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13308007250,
+              "token_index": 34
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13376972625,
+              "token_index": 35
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13447061834,
+              "token_index": 36
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13516608417,
+              "token_index": 37
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13589432542,
+              "token_index": 38
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13661345875,
+              "token_index": 39
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13735326125,
+              "token_index": 40
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13804610334,
+              "token_index": 41
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13876359584,
+              "token_index": 42
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13947942792,
+              "token_index": 43
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14017640750,
+              "token_index": 44
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14087661709,
+              "token_index": 45
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14159290334,
+              "token_index": 46
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14229955750,
+              "token_index": 47
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14298595542,
+              "token_index": 48
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14368479584,
+              "token_index": 49
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14438235667,
+              "token_index": 50
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14518465584,
+              "token_index": 51
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14596352167,
+              "token_index": 52
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14671539792,
+              "token_index": 53
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14743979834,
+              "token_index": 54
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14823614125,
+              "token_index": 55
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14900995584,
+              "token_index": 56
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14973484084,
+              "token_index": 57
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15045820375,
+              "token_index": 58
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15121487209,
+              "token_index": 59
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15195887834,
+              "token_index": 60
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15266974709,
+              "token_index": 61
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15343207500,
+              "token_index": 62
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15416039500,
+              "token_index": 63
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15487988209,
+              "token_index": 64
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15561668209,
+              "token_index": 65
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15632952417,
+              "token_index": 66
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15707472417,
+              "token_index": 67
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15781877792,
+              "token_index": 68
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15865450084,
+              "token_index": 69
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15936437084,
+              "token_index": 70
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16005801125,
+              "token_index": 71
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16077935500,
+              "token_index": 72
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16150448500,
+              "token_index": 73
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16232783709,
+              "token_index": 74
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16313284584,
+              "token_index": 75
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16388675292,
+              "token_index": 76
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16463287167,
+              "token_index": 77
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16534127042,
+              "token_index": 78
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16605748875,
+              "token_index": 79
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16677712000,
+              "token_index": 80
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16748717209,
+              "token_index": 81
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16836966125,
+              "token_index": 82
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16913019250,
+              "token_index": 83
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16987965667,
+              "token_index": 84
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17067739792,
+              "token_index": 85
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17147126125,
+              "token_index": 86
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17222893000,
+              "token_index": 87
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17297868959,
+              "token_index": 88
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17371732167,
+              "token_index": 89
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17449994875,
+              "token_index": 90
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17526769917,
+              "token_index": 91
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17600318834,
+              "token_index": 92
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17671730709,
+              "token_index": 93
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17745495167,
+              "token_index": 94
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17830891250,
+              "token_index": 95
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17908485292,
+              "token_index": 96
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17983855667,
+              "token_index": 97
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18060834792,
+              "token_index": 98
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18136978292,
+              "token_index": 99
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18210953875,
+              "token_index": 100
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18285592500,
+              "token_index": 101
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18356786167,
+              "token_index": 102
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18427938584,
+              "token_index": 103
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18503346084,
+              "token_index": 104
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18578670292,
+              "token_index": 105
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18652172334,
+              "token_index": 106
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18729997917,
+              "token_index": 107
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18803377125,
+              "token_index": 108
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18879198334,
+              "token_index": 109
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18950835584,
+              "token_index": 110
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19021413834,
+              "token_index": 111
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19092632792,
+              "token_index": 112
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19169027542,
+              "token_index": 113
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19270343917,
+              "token_index": 114
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19363669125,
+              "token_index": 115
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19514517042,
+              "token_index": 116
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19618318375,
+              "token_index": 117
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19800768459,
+              "token_index": 118
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19948819625,
+              "token_index": 119
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20078922209,
+              "token_index": 120
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20181277959,
+              "token_index": 121
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20278996250,
+              "token_index": 122
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20365944417,
+              "token_index": 123
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20461595709,
+              "token_index": 124
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20585061084,
+              "token_index": 125
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20668280875,
+              "token_index": 126
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20750800875,
+              "token_index": 127
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20828141375,
+              "token_index": 128
+            }
+          ]
+        },
+        "arm_b": {
+          "prompt_tokens": 512,
+          "generated_tokens": 128,
+          "requested_max_tokens": 128,
+          "load_ms": 2515.569125,
+          "prefill_tok_s": 122.9462852602352,
+          "ttft_ms": 4164.541042,
+          "decode_tok_s": 14.093576744200112,
+          "per_token_latencies_ms": [
+            67.9705,
+            67.544041,
+            68.531417,
+            68.991792,
+            69.992041,
+            69.282959,
+            69.240375,
+            71.177208,
+            69.128958,
+            68.359125,
+            74.832792,
+            70.256,
+            68.013917,
+            68.72075,
+            69.730875,
+            69.831708,
+            73.218042,
+            68.087791,
+            68.105334,
+            67.765791,
+            68.178084,
+            68.341291,
+            68.739792,
+            71.203292,
+            68.069416,
+            68.2755,
+            68.380875,
+            68.064334,
+            67.83925,
+            69.278041,
+            69.210292,
+            68.221125,
+            68.087167,
+            69.872958,
+            68.467417,
+            68.116708,
+            71.37575,
+            76.894292,
+            71.394791,
+            71.906667,
+            86.995292,
+            72.9175,
+            69.185541,
+            70.2295,
+            73.515,
+            72.0975,
+            69.083209,
+            68.06125,
+            68.232291,
+            68.46225,
+            68.398709,
+            68.662291,
+            68.099167,
+            68.263083,
+            68.71125,
+            78.826375,
+            68.261834,
+            68.266625,
+            69.710375,
+            70.934291,
+            68.945375,
+            70.417,
+            72.398834,
+            70.902458,
+            68.807167,
+            69.915,
+            70.063083,
+            72.267917,
+            71.69725,
+            68.935666,
+            68.815875,
+            69.780875,
+            70.72625,
+            73.759125,
+            69.383792,
+            68.817792,
+            68.750875,
+            69.225208,
+            72.188583,
+            74.682625,
+            68.937542,
+            68.893583,
+            72.309875,
+            72.285917,
+            80.938083,
+            69.204542,
+            71.214875,
+            71.123833,
+            69.148875,
+            69.749792,
+            69.447333,
+            70.292959,
+            69.027458,
+            70.34975,
+            73.674583,
+            77.406375,
+            71.121375,
+            78.12325,
+            71.35525,
+            69.762667,
+            72.491458,
+            70.174542,
+            69.583167,
+            72.670791,
+            69.6795,
+            69.766417,
+            70.438,
+            69.409208,
+            70.720209,
+            73.080125,
+            69.441666,
+            76.77975,
+            69.533292,
+            69.865667,
+            71.0255,
+            88.692166,
+            72.335125,
+            73.716709,
+            72.9115,
+            73.740416,
+            72.019459,
+            74.427125,
+            73.984666,
+            75.849792,
+            81.349375,
+            73.901375,
+            73.149792
+          ],
+          "per_token_p50_ms": 69.780875,
+          "per_token_p95_ms": 77.25275009999999,
+          "per_token_p99_ms": 85.52735357999997,
+          "peak_phys_footprint_bytes": 6221076480,
+          "peak_phys_footprint_by_phase": {
+            "load": 6221076480,
+            "prefill": 3281260840,
+            "decode": 3282604352
+          },
+          "delta_matches_generated_tokens": true,
+          "stopped": false,
+          "raw_phase_events": [
+            {
+              "name": "load_start",
+              "monotonic_ns": 42,
+              "token_index": null
+            },
+            {
+              "name": "backend_ready",
+              "monotonic_ns": 2515569167,
+              "token_index": null
+            },
+            {
+              "name": "prefill_start",
+              "monotonic_ns": 8460614000,
+              "token_index": null
+            },
+            {
+              "name": "prefill_end",
+              "monotonic_ns": 12625034250,
+              "token_index": null
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12625155042,
+              "token_index": 1
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12693125542,
+              "token_index": 2
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12760669583,
+              "token_index": 3
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12829201000,
+              "token_index": 4
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12898192792,
+              "token_index": 5
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 12968184833,
+              "token_index": 6
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13037467792,
+              "token_index": 7
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13106708167,
+              "token_index": 8
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13177885375,
+              "token_index": 9
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13247014333,
+              "token_index": 10
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13315373458,
+              "token_index": 11
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13390206250,
+              "token_index": 12
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13460462250,
+              "token_index": 13
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13528476167,
+              "token_index": 14
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13597196917,
+              "token_index": 15
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13666927792,
+              "token_index": 16
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13736759500,
+              "token_index": 17
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13809977542,
+              "token_index": 18
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13878065333,
+              "token_index": 19
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 13946170667,
+              "token_index": 20
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14013936458,
+              "token_index": 21
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14082114542,
+              "token_index": 22
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14150455833,
+              "token_index": 23
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14219195625,
+              "token_index": 24
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14290398917,
+              "token_index": 25
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14358468333,
+              "token_index": 26
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14426743833,
+              "token_index": 27
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14495124708,
+              "token_index": 28
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14563189042,
+              "token_index": 29
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14631028292,
+              "token_index": 30
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14700306333,
+              "token_index": 31
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14769516625,
+              "token_index": 32
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14837737750,
+              "token_index": 33
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14905824917,
+              "token_index": 34
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 14975697875,
+              "token_index": 35
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15044165292,
+              "token_index": 36
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15112282000,
+              "token_index": 37
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15183657750,
+              "token_index": 38
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15260552042,
+              "token_index": 39
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15331946833,
+              "token_index": 40
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15403853500,
+              "token_index": 41
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15490848792,
+              "token_index": 42
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15563766292,
+              "token_index": 43
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15632951833,
+              "token_index": 44
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15703181333,
+              "token_index": 45
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15776696333,
+              "token_index": 46
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15848793833,
+              "token_index": 47
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15917877042,
+              "token_index": 48
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 15985938292,
+              "token_index": 49
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16054170583,
+              "token_index": 50
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16122632833,
+              "token_index": 51
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16191031542,
+              "token_index": 52
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16259693833,
+              "token_index": 53
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16327793000,
+              "token_index": 54
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16396056083,
+              "token_index": 55
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16464767333,
+              "token_index": 56
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16543593708,
+              "token_index": 57
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16611855542,
+              "token_index": 58
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16680122167,
+              "token_index": 59
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16749832542,
+              "token_index": 60
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16820766833,
+              "token_index": 61
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16889712208,
+              "token_index": 62
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 16960129208,
+              "token_index": 63
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17032528042,
+              "token_index": 64
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17103430500,
+              "token_index": 65
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17172237667,
+              "token_index": 66
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17242152667,
+              "token_index": 67
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17312215750,
+              "token_index": 68
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17384483667,
+              "token_index": 69
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17456180917,
+              "token_index": 70
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17525116583,
+              "token_index": 71
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17593932458,
+              "token_index": 72
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17663713333,
+              "token_index": 73
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17734439583,
+              "token_index": 74
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17808198708,
+              "token_index": 75
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17877582500,
+              "token_index": 76
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 17946400292,
+              "token_index": 77
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18015151167,
+              "token_index": 78
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18084376375,
+              "token_index": 79
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18156564958,
+              "token_index": 80
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18231247583,
+              "token_index": 81
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18300185125,
+              "token_index": 82
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18369078708,
+              "token_index": 83
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18441388583,
+              "token_index": 84
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18513674500,
+              "token_index": 85
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18594612583,
+              "token_index": 86
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18663817125,
+              "token_index": 87
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18735032000,
+              "token_index": 88
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18806155833,
+              "token_index": 89
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18875304708,
+              "token_index": 90
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 18945054500,
+              "token_index": 91
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19014501833,
+              "token_index": 92
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19084794792,
+              "token_index": 93
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19153822250,
+              "token_index": 94
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19224172000,
+              "token_index": 95
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19297846583,
+              "token_index": 96
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19375252958,
+              "token_index": 97
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19446374333,
+              "token_index": 98
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19524497583,
+              "token_index": 99
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19595852833,
+              "token_index": 100
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19665615500,
+              "token_index": 101
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19738106958,
+              "token_index": 102
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19808281500,
+              "token_index": 103
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19877864667,
+              "token_index": 104
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 19950535458,
+              "token_index": 105
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20020214958,
+              "token_index": 106
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20089981375,
+              "token_index": 107
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20160419375,
+              "token_index": 108
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20229828583,
+              "token_index": 109
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20300548792,
+              "token_index": 110
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20373628917,
+              "token_index": 111
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20443070583,
+              "token_index": 112
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20519850333,
+              "token_index": 113
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20589383625,
+              "token_index": 114
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20659249292,
+              "token_index": 115
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20730274792,
+              "token_index": 116
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20818966958,
+              "token_index": 117
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20891302083,
+              "token_index": 118
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 20965018792,
+              "token_index": 119
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21037930292,
+              "token_index": 120
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21111670708,
+              "token_index": 121
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21183690167,
+              "token_index": 122
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21258117292,
+              "token_index": 123
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21332101958,
+              "token_index": 124
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21407951750,
+              "token_index": 125
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21489301125,
+              "token_index": 126
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21563202500,
+              "token_index": 127
+            },
+            {
+              "name": "token_available",
+              "monotonic_ns": 21636352292,
+              "token_index": 128
+            }
+          ]
+        },
+        "thermal_state_before": 0,
+        "thermal_state_before_name": "nominal",
+        "thermal_state_after": 0,
+        "thermal_state_after_name": "nominal",
+        "thermal_error": null
+      }
+    ],
+    "order_balance": [
+      1,
+      1
+    ]
+  },
+  "aggregate": {
+    "point_estimate_log_slowdown": -0.03689875460947403,
+    "ci_low": -0.03689875460947403,
+    "ci_high": -0.03689875460947403,
+    "corrected_lower_bound": -0.03689875460947403,
+    "n_valid": 2,
+    "n_invalid": 0,
+    "measured_cv": 0.05711069871767803,
+    "required_n": 25
+  },
+  "diagnostics": {
+    "log_slowdowns": [
+      0.017390126257099545,
+      -0.09118763547604761
+    ],
+    "measured_cv": 0.05711069871767803,
+    "required_n": 25,
+    "cell_class": "A",
+    "n_pairs": 2,
+    "order_balance": [
+      1,
+      1
+    ]
+  },
+  "verdict": "unsupported",
+  "unsupported_reason": "n_valid=2 < required_n=25 for measured_cv=0.05711069871767803 (bench_gate_math.required_n, correction 1) -- shadow/demonstration run, not a gated cell",
+  "validate_run_record": "PASS (validate_run_record raised nothing)",
+  "provenance": {
+    "repo_sha": "e5dfceab2eebcdc734a53fc0a252d4f17f057e65",
+    "dirty": true,
+    "policy_version": 1,
+    "policy_sha": "17c4f9ef52c647aeb32642c065af135607d03ccc329d6245482ff899abf1de3c",
+    "hardware_fingerprint": "Darwin-arm64-Apple_M2_Max",
+    "collected_at": "2026-07-12T02:07:45.828442+00:00"
+  }
+}
