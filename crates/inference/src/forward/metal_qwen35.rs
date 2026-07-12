@@ -4000,7 +4000,7 @@ mod inner {
             // identity (`cross_turn_metadata`'s `adapter_id`) is a shape-based
             // hash (max_rank/scale/projection count), not a content hash, so
             // two different adapters with the same shape can collide on the
-            // same `AdapterId` (finding 3). The metadata hash is
+            // same `AdapterId`. The metadata hash is
             // defense-in-depth; the unconditional clear here is the actual
             // correctness mechanism.
             self.cross_turn_prefix_cache.clear();
@@ -9008,7 +9008,7 @@ mod inner {
 
             // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
             // so we never emit a token the caller did not ask for. Mirrors the
-            // guard in generate() above (#612 sibling-path audit).
+            // guard in generate() above (#612).
             if gen_cfg.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -9297,7 +9297,7 @@ mod inner {
             // invalidate any retained cross-turn entry. A retained entry
             // describes exactly the state this call just vacated; leaving it
             // alive would let a later cache-aware call restore GDN state for
-            // KV rows that no longer represent it (finding 2).
+            // KV rows that no longer represent it.
             self.cross_turn_prefix_cache.clear();
             // Issue #171: a compact top-k request from a
             // prior generation must not leak into the next one. Without this, a
@@ -17246,7 +17246,7 @@ mod inner {
             );
         }
 
-        // --- Edge cases (from auditor static_analysis.md) ---
+        // --- Edge cases ---
 
         /// cache_len=1: first-token decode. The only cached token gets weight 1.0,
         /// so flash output must equal the old reference exactly (same f32 arithmetic).
@@ -18727,7 +18727,7 @@ mod inner {
         // corruption would silently have NO effect on which weights actually
         // get used at expert 2's dispatch offset — so decode output
         // differing here is direct evidence the loaded weights, not just the
-        // headers, are wired to the offsets the review's audit derived.
+        // headers, are wired to the offsets this test expects.
         #[test]
         fn from_q4_dir_moe_decode_is_sensitive_to_expert_weight_corruption() {
             let Some(_) = Device::system_default() else {
@@ -21766,8 +21766,8 @@ mod inner {
 
         /// `generate_multimodal` with `max_new_tokens == 0` must return zero
         /// generated tokens without running prefill or sampling (#612 sibling-
-        /// invocation-path audit found this 4th guard site; #621 flagged it
-        /// as missing mutation-sensitive coverage).
+        /// invocation-path's 4th guard site; #621 tracks its
+        /// missing mutation-sensitive coverage).
         ///
         /// Unlike the CPU-side zero-budget tests (which use empty weight vecs
         /// to make mutation trivially observable via a panic), Metal GPU state
@@ -23661,7 +23661,7 @@ mod inner {
             );
         }
 
-        /// PR #606 review (Major finding): `on_token`-only cancellation cannot
+        /// PR #606: `on_token`-only cancellation cannot
         /// observe a disconnect that happens before or during prefill, since
         /// prefill has no callback point at all. `generate_streaming_with_cancel`
         /// must check `should_cancel` before paying for prefill, so a client
@@ -23741,7 +23741,7 @@ mod inner {
             );
         }
 
-        /// PR #606 review (Major finding): the decode loop only called
+        /// PR #606: the decode loop only called
         /// `on_token` for non-empty deltas, so a client disconnect could be
         /// missed for however many iterations produced an empty delta (an
         /// incomplete UTF-8 tail mid-codepoint). This proves `should_cancel`
@@ -24527,7 +24527,7 @@ mod inner {
             // KNOWN ISSUE (2026-06-03): the chunked-batched prefill path exhibits a
             // nondeterministic, contention/occupancy-sensitive logit divergence vs the
             // token-by-token reference, observed up to ~0.94 in a tight back-to-back loop.
-            // A full static audit of `gdn_recurrence_fused` and `decode_attention` found
+            // Static analysis of `gdn_recurrence_fused` and `decode_attention` shows
             // both kernels barrier-correct with no uninitialized threadgroup reads, no
             // intra-dispatch cross-threadgroup device race, and no untracked buffers on the
             // path — the magnitude is too large for FP-reorder noise, so the hazard is a
@@ -25641,8 +25641,8 @@ mod inner {
             if any_d4_watch {
                 eprintln!(
                     "gdn175 S1b: one or more cells landed near (but under) the 1e-5 KILL \
-                     tolerance — see D4-WATCH lines above; report as a D4 f32-accumulator \
-                     finding."
+                     tolerance — see D4-WATCH lines above; this indicates a D4 f32-accumulator \
+                     issue."
                 );
             } else {
                 eprintln!("gdn175 S1b: no cells near the 1e-5 tolerance boundary.");
@@ -26714,7 +26714,7 @@ mod inner {
         }
 
         // -------------------------------------------------------------------
-        // Q8_0 non-finite input guard — mutation-sensitive (Finding 1, PR #452)
+        // Q8_0 non-finite input guard — mutation-sensitive (PR #452)
         //
         // IEEE 754: `NaN > x` is always false, so a fold-max over a block
         // containing NaN leaves `amax` unchanged, and the NaN element is
@@ -27305,10 +27305,10 @@ mod inner {
 
         // -------------------------------------------------------------------
         // #516 remediation — regression coverage for
-        // findings 1/2/3/4.
+        // D1/D3/D4/D5.
         // -------------------------------------------------------------------
 
-        /// Finding 1 (slot isolation): a divergent-prompt call on a
+        /// D1 (slot isolation): a divergent-prompt call on a
         /// different slot must evict the single retained entry (D1's
         /// single-live-entry cache), so a later append to the ORIGINAL
         /// slot's prefix cannot silently restore GDN state left by a
@@ -27385,7 +27385,7 @@ mod inner {
             );
         }
 
-        /// Finding 2, plain-path leg (D3): interleaving a plain
+        /// D3 (plain-path leg): interleaving a plain
         /// `generate_streaming` call (which goes through `reset_state`)
         /// between two cache-aware calls must invalidate the retained
         /// entry — the plain path overwrites live KV/GDN state without
@@ -27461,7 +27461,7 @@ mod inner {
             );
         }
 
-        /// Finding 4 (D5): retrying the exact same prompt through the
+        /// D5: retrying the exact same prompt through the
         /// cache-aware path must not hit the empty-suffix invariant error
         /// in `forward_prefill_from` — the planner must fall back to
         /// `FullRefill` when the new prompt exactly equals the entry's
@@ -27535,7 +27535,7 @@ mod inner {
             );
         }
 
-        /// Finding 3 (D4): LoRA adapter load/unload must invalidate the
+        /// D4: LoRA adapter load/unload must invalidate the
         /// retained cross-turn entry. The adapter-identity hash in
         /// `CrossTurnPrefixMetadata` is shape-based (max_rank/scale/
         /// projection count), not content-based, so two different adapters
@@ -27613,8 +27613,8 @@ mod inner {
         /// D7: a public raw-forward call
         /// (`forward_step`) interleaved between two cache-aware calls on the
         /// SAME slot must invalidate the retained entry, exactly like
-        /// `generate_streaming`'s `reset_state()` does for finding 2's
-        /// plain-path leg (D3, `cross_turn_cache_interleaved_plain_path_invalidates`
+        /// `generate_streaming`'s `reset_state()` does for D3's
+        /// plain-path leg (`cross_turn_cache_interleaved_plain_path_invalidates`
         /// above) — `forward_step` mutates the same live KV/GDN buffers
         /// without ever routing through `reset_state` or the cache's own
         /// save path, so it is a second, independent way to leave a stale
@@ -28306,7 +28306,7 @@ mod inner {
                         // Accept only the first generated token (the
                         // pre-decode-loop prefill sample); reject the second,
                         // which is produced inside the decode loop -- the
-                        // branch finding 1 patches.
+                        // rejected-token case the cache-boundary logic below accounts for.
                         n < 2
                     },
                     || false,
@@ -28342,7 +28342,7 @@ mod inner {
             // it must reuse through exactly `prompt_len + 1` tokens (the
             // prompt plus the one token the client actually received) and
             // never through `prompt_len + 2` (prompt plus the rejected
-            // token). Without the finding-1 fix, the persisted entry's
+            // token). Without excluding the rejected token, the persisted entry's
             // `represented_len` is `prompt_len + 2`, its trailing token is
             // `rejected_id` (not `diverging_char`'s id), so the shared
             // prefix against `followup_prompt`'s tokens stops at
@@ -28400,8 +28400,7 @@ mod inner {
         // of the three functions (`generate`, `generate_streaming_with_cancel`,
         // `generate_streaming_with_prefix_cache_inner`) — is reachable only
         // from step 2 onward and needs a grammar that allows exactly one
-        // token and then blocks everything. #611 (medium
-        // finding): that gap is covered separately by the
+        // token and then blocks everything. #611: that gap is covered separately by the
         // "DECODE-LOOP integration tests" block below this one, which builds
         // exactly that allow-then-block fixture.
         //
@@ -29153,8 +29152,7 @@ mod inner {
         }
 
         // -----------------------------------------------------------------------
-        // Grammar fail-closed DECODE-LOOP integration tests (#611
-        // finding, medium)
+        // Grammar fail-closed DECODE-LOOP integration tests (#611)
         //
         // The three tests above only reach the post-prefill masking site: their
         // fixture blocks every vocab entry from step 0, so `has_finite_logit`

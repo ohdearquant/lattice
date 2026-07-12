@@ -1381,7 +1381,7 @@ mod doctor {
 
         #[test]
         fn inspect_q4_dir_resident_bytes_exceed_raw_on_disk_sum_for_expanded_tensors() {
-            // The Major finding this test guards: several Q4/Metal tensor
+            // What this test guards: several Q4/Metal tensor
             // categories are dequantized or duplicated at load time, so a
             // flat `meta.len()` sum under-reports real resident bytes. This
             // must fail if `inspect_q4_dir` reverts to summing raw on-disk
@@ -3408,8 +3408,8 @@ mod serve {
     /// identity/endpoint-discovery document, in the same shape
     /// `lattice_serve.rs` already served on its own daemon -- this binary
     /// had no equivalent route at all, an undocumented route-set divergence
-    /// the review's route audit caught (the PR body's "routes now match
-    /// 1:1" claim was false until this route landed).
+    /// between the two binaries -- the routes did not actually match 1:1
+    /// until this route landed.
     pub async fn root() -> Json<Value> {
         Json(lattice_inference::serve::root_body())
     }
@@ -5416,9 +5416,7 @@ mod serve {
             // Regression fixture for a refactor bug: extracting stop-sequence
             // parsing into the pre-model validation cascade moved it ahead of
             // the context-window check. The pre-refactor inline sequence
-            // (verified directly against `crates/inference/src/bin/lattice.rs`
-            // at commit 3e0f74155, the base this PR built on) checked the
-            // context window BEFORE parsing `stop`. A request that is both
+            // checked the context window BEFORE parsing `stop`. A request that is both
             // over-context and carries a malformed `stop` field must
             // therefore fail with `context_length_exceeded`, not a
             // stop-parsing error.

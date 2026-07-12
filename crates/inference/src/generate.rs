@@ -1500,8 +1500,8 @@ mod tests {
 
     /// check_alloc_capacity rejects a config whose num_attention_heads * head_dim
     /// overflows usize while kv_dim remains safe (num_key_value_heads = 1).
-    /// This closes the residual query-side gap found in the PR #449 cross-family review:
-    /// the existing kv_dim guard let this config through, then q_dim wrapped silently
+    /// This closes the residual query-side gap left by PR #449's kv_dim guard:
+    /// that guard let this config through, then q_dim wrapped silently
     /// in release mode, undersizing q_buf / attn_out / qkv_buf for the prefill write.
     ///
     /// Mutation-sensitivity contract:

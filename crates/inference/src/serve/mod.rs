@@ -170,7 +170,7 @@ pub fn reject_zero_max_tokens(effective: usize) -> Result<(), ApiError> {
 /// document. Shared so both binaries expose a byte-identical root route
 /// (ADR-080 C2): `lattice_serve.rs` already
 /// served this; `lattice.rs` had no `GET /` route at all, an undocumented
-/// divergence a route-set audit caught. Both binaries expose the
+/// divergence between the two binaries' route sets. Both binaries expose the
 /// same three routes, so the endpoint list is a fixed constant here rather
 /// than a per-binary parameter.
 pub fn root_body() -> Value {
@@ -648,7 +648,7 @@ impl ExpectedResponse {
 /// `method`/`path`/`body`, and the expected outcome for each binary. A case
 /// whose `divergence_reason` is `None` means both binaries must produce an
 /// identical outcome for this request (the common case, post-alignment);
-/// `Some` documents an intentional, reviewed per-binary difference -- an
+/// `Some` documents an intentional, deliberately-chosen per-binary difference -- an
 /// undocumented divergence is exactly the drift this table exists to catch.
 /// `method`/`path` were added after an unguarded `GET /` route removal on
 /// `lattice.rs` left the table green: every case before that was implicitly
@@ -662,7 +662,7 @@ pub struct ParityCase {
     lattice: ExpectedResponse,
     lattice_serve: ExpectedResponse,
     /// `Some` only for a documented intentional divergence; explains WHY the
-    /// two expected outcomes differ (reviewed alongside the table, not left
+    /// two expected outcomes differ (recorded explicitly alongside the table, not left
     /// to be inferred from the two variants).
     pub divergence_reason: Option<&'static str>,
 }

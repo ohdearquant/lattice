@@ -2634,7 +2634,7 @@ mod imp {
             // build_cfg clamps max_new_tokens to min(6, 7)=6, reasoning_room=8-6-1=1,
             // reasoning_budget=min(1,1)=1. 1 (prompt) + 6 (max_new_tokens) +
             // 1 (reasoning_budget) + 1 (delimiter) = 9 > 8 -- the "+1 delimiter"
-            // edge case from the review: still overflows by exactly one slot,
+            // edge case still overflows by exactly one slot,
             // so it must ALSO reject, proving the check catches the boundary
             // exactly rather than off-by-one under-rejecting.
             let defaults = Defaults {
