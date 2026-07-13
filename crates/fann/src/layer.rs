@@ -1,7 +1,10 @@
-//! Neural network layer implementation
+//! Dense feedforward-layer storage and inference.
 //!
-//! A layer consists of a weight matrix, bias vector, and activation function.
-//! Optimized for fast inference with pre-allocated buffers.
+//! A layer owns row-major weights, biases, and an activation, and writes its
+//! result into a caller-provided buffer. SIMD matrix-vector kernels are used
+//! when the enabled target supports them.
+//!
+//! See `docs/network.md` for layout, initialization, and dispatch details.
 
 use crate::activation::Activation;
 use crate::error::{FannError, FannResult, validate_layer_dimensions};
@@ -37,11 +40,7 @@ fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// NEON dot product — 4x4-wide FMA (16 elements/iter) with 4 independent accumulators.
-///
-/// Uses 4 independent accumulator registers to hide the 4-cycle FMA latency on
-/// typical ARM cores (Cortex-A76, Apple M-series). Each accumulator processes 4
-/// f32 elements per iteration = 16 elements total per loop body.
+/// NEON dot product with four independent FMA accumulators (16 elements/iteration).
 ///
 /// # Safety
 /// Caller must ensure `a.len() == b.len()`. NEON is mandatory on aarch64.
@@ -113,11 +112,7 @@ unsafe fn simd_dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
-/// AVX2+FMA dot product — 4x8-wide FMA (32 elements/iter) with 4 independent accumulators.
-///
-/// Uses 4 independent __m256 accumulators to hide FMA latency (typically 4-5 cycles
-/// on Haswell/Skylake). Each accumulator processes 8 f32 elements per iteration =
-/// 32 elements total per loop body.
+/// AVX2+FMA dot product with four independent accumulators (32 elements/iteration).
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA are available and `a.len() == b.len()`.
@@ -198,10 +193,7 @@ unsafe fn simd_dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
-/// AVX-512 dot product — 4x16-wide FMA (64 elements/iter) with 4 independent accumulators.
-///
-/// Uses 512-bit registers (16 f32 lanes each) with 4 independent accumulators =
-/// 64 elements per loop iteration. Available on Skylake-X, Ice Lake, Zen 4+.
+/// AVX-512 dot product with four independent accumulators (64 elements/iteration).
 ///
 /// # Safety
 /// Caller must ensure AVX-512F is available and `a.len() == b.len()`.
@@ -299,11 +291,7 @@ pub struct Layer {
     activation: Activation,
 }
 
-/// Deserialization shadow for [`Layer`] that routes through [`Layer::with_weights`].
-///
-/// A corrupt or hand-crafted serialized layer whose `weights`/`biases` lengths
-/// disagree with its dimensions is rejected with a `FannError` instead of
-/// triggering an out-of-bounds panic during `forward`.
+/// Serde input that validates dimensions and tensor lengths through [`Layer::with_weights`].
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct LayerData {

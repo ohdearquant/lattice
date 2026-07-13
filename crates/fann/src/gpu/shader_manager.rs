@@ -1,7 +1,8 @@
-//! Shader compilation and pipeline caching
+//! WGSL compute-pipeline selection, warmup, and cache accounting.
 //!
-//! Precompiles and caches compute pipelines to avoid
-//! compilation overhead during inference.
+//! Common inference pipelines are compiled when a [`ShaderManager`] is created;
+//! remaining shader types compile on their first request.
+//! See `docs/gpu.md` for the shader inventory and cache behavior.
 
 use super::error::GpuResult;
 use super::shaders;

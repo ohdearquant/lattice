@@ -1,17 +1,9 @@
-//! GPU buffer pool: 3-tier size-categorized pooling (see [`BufferCategory`]) with
-//! per-buffer lifecycle tracking, to avoid the ~100-500us cost of a fresh GPU
-//! allocation on every call. Integrates with [`CircuitBreaker`] to throttle
-//! pooling and force CPU fallback under memory pressure.
+//! Three-tier GPU buffer reuse pool with lifecycle-based eviction and pressure control.
 //!
-//! GPU deallocation is asynchronous even though Rust's `Drop` runs synchronously,
-//! so a training loop that repeatedly allocates without releasing can hit an
-//! out-of-memory condition despite buffers appearing freed on the Rust side.
-//! Call [`BufferPool::flush`] (and then poll the device) periodically — e.g. once
-//! per epoch — to force pending GPU deallocations through before the next batch.
-//!
-//! Tier sizing/capacity and the full memory-pressure handling design: see
-//! ADR-025 and
-//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/fann/docs/design.md).
+//! Allocation sizes are rounded to the required 256-byte Apple-Silicon alignment.
+//! GPU `Drop` is asynchronous: periodically flush the pool *and* poll or wait for
+//! completion during long-running work, or apparently freed buffers can still OOM.
+//! See ADR-025 and `docs/gpu.md` for the full backend design.
 
 use super::apple_silicon::BUFFER_ALIGNMENT;
 use super::circuit_breaker::{CircuitBreaker, MemoryPressure};

@@ -1,6 +1,10 @@
-//! Network serialization and deserialization
+//! Compact binary network serialization.
 //!
-//! Provides binary serialization for efficient network storage and loading.
+//! The format is little-endian, versioned, and contains each layer's shape,
+//! activation, weights, and biases. Parsing validates bounds before allocation
+//! and requires an exact-length blob.
+//!
+//! See `docs/network.md` for the complete on-disk format and invariants.
 
 use crate::activation::Activation;
 use crate::error::{FannError, FannResult, validate_allocation_size, validate_layer_dimensions};
@@ -8,19 +12,8 @@ use crate::layer::Layer;
 use crate::network::Network;
 
 impl Network {
-    /// Serialize the network to a compact binary format
-    ///
-    /// Format:
-    /// - Magic: 4 bytes "FANN"
-    /// - Version: u32 little-endian (1)
-    /// - Num layers: u32 little-endian
-    /// - For each layer:
-    ///   - num_inputs: u32 little-endian
-    ///   - num_outputs: u32 little-endian
-    ///   - activation_type: u8 (0=Linear, 1=Sigmoid, 2=Tanh, 3=ReLU, 4=LeakyReLU, 5=Softmax)
-    ///   - If LeakyReLU: alpha f32 little-endian
-    ///   - weights: num_inputs * num_outputs f32s little-endian
-    ///   - biases: num_outputs f32s little-endian
+    /// Serialize the network to the versioned little-endian format documented
+    /// in `docs/network.md`.
     ///
     /// # Example
     ///

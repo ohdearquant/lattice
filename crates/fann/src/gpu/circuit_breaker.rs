@@ -1,7 +1,9 @@
-//! Circuit breaker for memory pressure handling
+//! Memory-pressure levels and a fail-closed circuit breaker for GPU allocations.
 //!
-//! Prevents cascade failures by temporarily rejecting requests
-//! when too many allocation failures occur.
+//! Pressure maps pool usage against a caller-set budget; `Critical` signals that
+//! callers should block allocations. The breaker transitions `Closed` -> `Open` ->
+//! `HalfOpen` after its recovery timeout, and reopens on a failed recovery probe.
+//! See `docs/gpu.md` for thresholds, cleanup policy, and state-machine details.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};

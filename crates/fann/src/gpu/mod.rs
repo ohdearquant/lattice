@@ -1,9 +1,9 @@
-//! GPU compute backend for lattice-fann: buffer pooling, circuit-breaker memory
-//! pressure handling, pipeline caching, and Apple Silicon (Metal) tuning, with
-//! automatic CPU fallback below the size thresholds in [`thresholds`] where GPU
-//! launch overhead would dominate the computation (see ADR-025 for the full
-//! architecture, the GPU/CPU decision heuristics, and
-//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/fann/docs/design.md)).
+//! GPU compute backend: contexts, pooled memory, WGSL pipelines, and dense inference.
+//!
+//! CPU selection uses a 10,000 effective-element threshold; activation policy uses 1,000.
+//! Keep each dispatch at or below 100,000 elements to retain 1.5 ms headroom beneath Metal's
+//! 2 ms watchdog. Apple Silicon uses 256-byte pool-buffer alignment and 32-thread matmul /
+//! 256-thread element-wise workgroups. See ADR-025 and `docs/gpu.md`.
 
 mod buffer;
 mod circuit_breaker;

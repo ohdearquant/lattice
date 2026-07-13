@@ -1,146 +1,189 @@
 # lattice-fann design
 
-`lattice-fann` implements lightweight neural network primitives for sub-5ms CPU
-inference on small dense networks (up to roughly 100K parameters) — the kind of
-model used as a knowledge-distillation student rather than a full transformer.
-It provides a fluent `NetworkBuilder`, the common activations (ReLU, Sigmoid,
-Tanh, Softmax, LeakyReLU), basic backpropagation training with momentum, and
-optional feature-gated batch inference (`parallel`), serialization (`serde`),
-and GPU acceleration (`gpu`).
+`lattice-fann` is a compact, dense, feedforward neural-network crate. It is
+intended for local student models and classifiers where CPU inference must stay
+predictable. It is not a general tensor runtime: its core operation is a dense
+matrix-vector multiply followed by an activation.
 
-## Architecture
+The crate is CPU-first. GPU execution, parallel batches, and persistence are
+optional capabilities around the same layer and network representation; a
+complete CPU path does not depend on any of them.
+
+## Component map
 
 ```text
-NetworkBuilder --> Network --> [Layer, Layer, ...] --> output
-                     |
-                     +-- pre-allocated buffers (no alloc during inference)
+NetworkBuilder ──creates──> Layer ──owned by──> Network
+       │                         │                 │
+       │                         │                 ├── CPU forward inference
+       │                         │                 ├── optional parallel batches
+       │                         │                 └── binary / serde persistence
+       │                         │
+       │                         └── weights + biases + Activation
+       │
+BackpropTrainer ──updates──> Network::layers_mut() / Layer parameters
+
+GpuContext + GpuNetwork (feature = "gpu") ──optional accelerated path──> CPU model
 ```
 
-`NetworkBuilder::build()` allocates every intermediate activation buffer once,
-up front, sized from the layer dimensions. Each `Layer::forward` then writes
-in place into its pre-allocated output buffer, and the top-level `Network::forward`
-ping-pongs between two buffers via `split_at_mut()` to satisfy the borrow checker
-without copying. This removes heap allocation from the inference hot path
-entirely (see ADR-021 for the full rationale and the buffer-ping-pong mechanics).
+| Component | Owns | Responsibility |
+| --- | --- | --- |
+| `NetworkBuilder` | Input width and ordered layer specifications | Validates an architecture and initializes layers. |
+| `Layer` | Shape, row-major weights, biases, activation | Writes one dense affine transform and activation into a supplied buffer. |
+| `Network` | Layers and preallocated activation buffers | Checks connectivity, sequences CPU inference, and provides inspection APIs. |
+| Training types | Optimizer and gradient state | Update a network's existing parameter storage. |
+| GPU types | Device-facing context and acceleration state | Provide an optional execution route while retaining the CPU model. |
 
-## Training
+A `Layer` does not allocate an output vector for `forward`. A `Network` owns the
+mutable buffers that carry a sample through its layers. This separates immutable
+parameters from per-inference activations and keeps allocation out of the normal
+single-sample forward path.
 
-`BackpropTrainer` implements gradient descent with momentum, driven by a
-`TrainingConfig` (learning rate, max epochs, and related knobs). A typical
-training loop:
+## Building a network
+
+A builder records an input width and a sequence of output widths and
+activations. `input(n)` establishes the width consumed by the first layer;
+every `hidden` or `output` call appends a layer. `hidden` and `output` are
+runtime-equivalent; the latter documents the caller's intent and the last
+appended layer is the actual output layer.
 
 ```rust
-use lattice_fann::{NetworkBuilder, Activation, BackpropTrainer, TrainingConfig, Trainer};
+use lattice_fann::{Activation, NetworkBuilder};
 
 let mut network = NetworkBuilder::new()
-    .input(2)
-    .hidden(4, Activation::Tanh)
-    .output(1, Activation::Tanh)
-    .build()
-    .unwrap();
-
-// XOR training data
-let inputs = vec![
-    vec![0.0, 0.0],
-    vec![0.0, 1.0],
-    vec![1.0, 0.0],
-    vec![1.0, 1.0],
-];
-let targets = vec![
-    vec![0.0],
-    vec![1.0],
-    vec![1.0],
-    vec![0.0],
-];
-
-let mut trainer = BackpropTrainer::new();
-let config = TrainingConfig::new()
-    .learning_rate(0.5)
-    .max_epochs(1000);
-
-let result = trainer.train(&mut network, &inputs, &targets, &config);
+    .input(4)
+    .hidden(8, Activation::ReLU)
+    .output(3, Activation::Softmax)
+    .build_with_seed(7)?;
+# Ok::<(), lattice_fann::FannError>(())
 ```
 
-`GradientGuardStrategy` controls how the trainer reacts to NaN/Inf gradients
-during backprop (see ADR-022 for the guard strategies and their trade-offs).
+`build` initializes weights from entropy. `build_with_seed` instead feeds one
+`SmallRng` seeded from the supplied `u64` through every layer construction, so
+the same architecture and seed produce the same parameter values. Both paths
+enforce the same rules:
 
-## GPU backend (`gpu` feature)
+1. The input width is present and nonzero.
+2. At least one layer is specified, and every layer width is nonzero.
+3. Softmax is used only in the final layer.
+4. Layer allocation limits are respected during construction.
+5. Adjacent layer widths match when `Network::new` constructs the result.
+
+The final connectivity check is repeated by `Network::new`, because callers can
+also construct a network directly from `Layer` values.
+
+### Why Softmax is terminal
+
+Softmax couples the values in its output vector. Its derivative is a Jacobian,
+not a pointwise function. The trainer computes the output-layer relationship
+where it has the required context, while `Activation` derivative helpers expose
+only the Jacobian diagonal. An interior Softmax would therefore train with an
+incomplete gradient, so the builder rejects it. See ADR-023 for the accepted
+limitation.
+
+## CPU inference lifecycle
+
+Construction performs the allocations normal inference needs. `Network::new`
+creates one zero-filled activation buffer per layer; buffer *i* has exactly
+`layers[i].num_outputs()` elements. The caller's input is borrowed directly and
+is not copied into the buffer set.
 
 ```text
-GpuContext (device/queue) ─┬─> BufferPool (3-tier, lifecycle tracking)
-                           ├─> ShaderManager (compiled pipelines)
-                           └─> CircuitBreaker (memory pressure)
-
-GpuNetwork (inference) ──> GpuContext
-GpuTrainer (training) ───> GpuContext
+caller input ──> Layer 0 ──> buffer 0 ──> Layer 1 ──> buffer 1 ──> ... ──> buffer last
 ```
 
-`GpuNetwork` wraps a CPU `Network` and keeps it as the fallback path. A static
-`should_use_gpu(elements, batch_size)` predicate gates every dispatch, since GPU
-kernel launch overhead dominates for the small networks this crate targets:
+For each layer, the network writes `activation(Wx + b)` into its buffer and
+checks the result for `NaN` or infinity. The next layer reads the previous
+buffer and writes its own. Internally, `split_at_mut` yields distinct borrows of
+the previous and current buffer without copying an activation vector.
 
-| Operation      | Threshold          | Rationale                                 |
-| -------------- | ------------------ | ------------------------------------------ |
-| Matrix-vector  | >10,000 elements   | GPU launch overhead dominates below this   |
-| Batch matmul   | batch_size > 100   | Amortize kernel launch cost                |
-| Activation     | >1,000 elements    | Element-wise is memory-bound               |
-| Max dispatch   | 100,000 elements   | Stay under the Metal 2ms watchdog          |
+This is a chain of preallocated buffers, not a two-buffer implementation. The
+network retains every layer's latest activation so `Network::activations(i)` can
+expose it for debugging or training. A later forward pass overwrites all of
+them.
 
-Softmax always runs on CPU after reading the output buffer back from GPU — the
-only softmax use in this crate is a final classification layer, so the
-CPU post-processing pass is on the cold path, not the hot one.
+`Network::forward` takes `&mut self` because it overwrites these buffers and
+returns a borrowed view of the final one. The result remains current only until
+the next mutable use of the network. `forward_async` performs the same CPU work
+but returns an owned copy for compatibility with the GPU-facing API.
 
-### Apple Silicon tuning
+With the `parallel` feature, `forward_batch` shares read-only layer parameters
+across Rayon workers and creates a separate activation-buffer set for each
+input. It avoids cloning weights but intentionally trades per-input allocations
+for independent concurrent mutable state.
 
-- Buffers are aligned to 256 bytes (`apple_silicon::BUFFER_ALIGNMENT`).
-- Buffers are capped at 128MB (`apple_silicon::MAX_BUFFER_SIZE`).
-- Matmul shaders dispatch with a 32-lane workgroup (matches Apple Silicon's SIMD
-  group width); other shaders use a 256-lane workgroup for throughput.
-- Dispatches are kept under a 1.5ms headroom against the Metal 2ms watchdog
-  (`thresholds::MAX_DISPATCH_TIME_MS`) — if a single layer would exceed it, the
-  entire forward pass falls back to CPU rather than risking a GPU timeout.
+For shapes, matrix layout, numerical checks, SIMD dispatch, and serialization,
+see [network.md](network.md).
 
-### Buffer pool
+## Training integration
 
-`BufferPool` categorizes buffers by size to avoid the ~100-500us cost of a fresh
-GPU allocation on every call:
+The training module uses the same `Network` representation as deployment.
+`Network::layer_mut` and `Network::layers_mut` let training reach parameter
+storage; `Layer::weights_mut` and `Layer::biases_mut` expose the slices it
+updates. Model format, initialization, activations, and forward math therefore
+remain shared between training and inference.
 
-| Tier   | Size range | Max pooled | Max age | Typical use            |
-| ------ | ---------- | ---------- | ------- | ----------------------- |
-| Small  | < 1MB      | 256        | 5 min   | Biases, small activations |
-| Medium | 1-10MB     | 64         | 3 min   | Layer weights            |
-| Large  | > 10MB     | 16         | 1 min   | Batch data, large layers |
+`BackpropTrainer` is configured through `TrainingConfig`.
+`GradientGuardStrategy` controls how training reacts to non-finite gradients.
+Those are training-time choices: independently, inference scans every layer
+output and returns `FannError::NumericInstability` rather than returning a
+non-finite prediction. Parameter updates do not invalidate the reusable
+activation buffers; the next forward pass overwrites them with new values.
 
-Each pooled buffer tracks creation time, last-used time, and use count, so idle
-or aged-out buffers can be evicted independently per tier.
+Read [training.md](training.md) for the backpropagation algorithm, optimizer
+state, and gradient safety mechanisms.
 
-GPU deallocation is asynchronous even though Rust's `Drop` runs synchronously.
-A training loop that repeatedly allocates without releasing can hit an
-out-of-memory condition despite buffers appearing freed on the Rust side.
-Call `BufferPool::flush` (which releases every cached buffer immediately) and
-then poll the device periodically — for example once per epoch:
+## Optional GPU integration
 
-```ignore
-for epoch in 0..epochs {
-    for batch in dataset.batches() {
-        train_step(&mut network, batch);
-    }
-    ctx.buffer_pool().flush();
-    ctx.poll(); // process pending GPU deallocations
-}
-```
+The `gpu` feature accelerates rather than replaces the core model. Without it,
+the `gpu` module is absent and CPU `Network` is the complete implementation.
+With it, `GpuContext` supplies device-facing resources and `GpuNetwork` provides
+an accelerated network interface. The CPU representation remains available as
+the compatibility and fallback path.
 
-### Circuit breaker
+This division keeps model construction, validation, CPU execution, and
+serialization free of device requirements. It also keeps GPU resource lifetime
+and dispatch policy out of the `Layer` API, so small CPU models do not pay for a
+GPU dependency. See [gpu.md](gpu.md) for device policy, resource reuse, and
+fallback behavior.
 
-`CircuitBreaker` classifies memory pressure from a `usage / budget` ratio into
-`MemoryPressure::{Low, Medium, High, Critical}` and exposes its own
-`CircuitBreakerState::{Closed, Open, HalfOpen}` (the standard circuit-breaker
-pattern: closed allows requests, open blocks them, half-open probes recovery).
-`GpuContext::set_memory_pressure_handler` registers a callback invoked by
-`notify_memory_pressure()` so callers can react — e.g. trigger aggressive
-buffer eviction — before the breaker opens and forces CPU fallback.
+## Features and portability
 
-See ADR-025 for the full alternatives-considered analysis (CUDA, native Metal,
-candle/burn) and the known limitations (the buffer pool is not yet wired into
-`GpuNetwork::forward_gpu`'s own buffer creation, and softmax in hidden layers
-is not GPU-accelerated).
+| Feature | Effect |
+| --- | --- |
+| `std` | Default standard-library support. |
+| `simd` | Enables target-specific CPU matrix-vector and activation kernels with scalar fallback. |
+| `parallel` | Adds Rayon-backed batch inference with shared weights and per-input buffers. |
+| `serde` | Enables structured persistence that reconstructs transient buffers during load. |
+| `gpu` | Adds the WGPU-based acceleration interface without changing CPU availability. |
+
+SIMD is an optimization, not a different numerical model. Unsupported
+architectures and unavailable x86 capabilities fall back to scalar code.
+
+## Validation and failure boundaries
+
+Validation occurs at boundaries where invalid data could otherwise create an
+oversized allocation, an out-of-bounds parameter access, or a misleading result.
+
+| Boundary | Check | Failure |
+| --- | --- | --- |
+| Layer construction | Nonzero dimensions, checked product, 100,000,000-element cap | `InvalidLayerDimensions` or `ShapeTooLarge` |
+| Explicit parameters | Exact weights and biases for the declared shape | Count-mismatch error |
+| Network construction | Nonempty stack and matching adjacent dimensions | `EmptyNetwork` or `InvalidLayerDimensions` |
+| CPU forward | Input/output widths and finite layer results | Size mismatch or `NumericInstability` |
+| Binary loading | Header, version, bounds before allocation, exact payload length | `InvalidBuilder`, `ShapeTooLarge`, or `EmptyNetwork` |
+| Serde loading | Constructor validation and buffer reconstruction | Deserialization error rather than unusable state |
+
+The 100,000,000-element guard applies to a single requested tensor allocation.
+At four bytes per `f32`, that is approximately 400 MB. It is both a practical
+memory limit and a binary-parser hardening boundary: the parser applies it
+before it reads and collects a declared weight payload.
+
+## Documentation map
+
+- [network.md](network.md): layer mechanics, builder validation, CPU execution,
+  activations, SIMD, errors, and the binary format.
+- [training.md](training.md): backpropagation, optimizer state, and gradient
+  safeguards.
+- [gpu.md](gpu.md): optional device backend, resource lifecycle, and fallback
+  policy.
+- [INDEX.md](INDEX.md): entry point for this documentation set.

@@ -1,4 +1,9 @@
-//! GPU-accelerated neural network inference
+//! GPU dense-network inference with size-based CPU fallback.
+//!
+//! ReLU is fused with matrix-vector multiplication; other supported activations use
+//! a second dispatch. GPU softmax is applied only for the final layer during readback;
+//! a non-final softmax is unsupported on this path.
+//! See `docs/gpu.md` for execution, fallback, and synchronization details.
 
 use super::context::GpuContext;
 use super::error::{GpuError, GpuResult};
