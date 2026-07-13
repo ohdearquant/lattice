@@ -223,6 +223,62 @@ class LatticeAdapterModelIdentityTest(unittest.TestCase):
             self.assertIn("no .q4 files", str(ctx.exception))
 
 
+class LatticeAdapterQ4IdentityOSErrorTest(unittest.TestCase):
+    """issue #813 codex round-1 finding 3: a permission error (or a TOCTOU
+    directory removal between the `is_dir()` precheck and the identity
+    iteration) must surface as `LatticeUnavailableError`, matching
+    `detect_format`'s own fail-closed-to-Unknown behavior on a
+    `read_dir` error -- never a raw `PermissionError`/`FileNotFoundError`
+    escaping from `iterdir()`."""
+
+    def test_unreadable_dir_raises_lattice_unavailable_not_os_error(self):
+        import os
+        import tempfile
+
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.skipTest("cannot exercise a permission-denied directory as root")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp) / "q4model"
+            model_dir.mkdir()
+            (model_dir / "weights.q4").write_bytes(b"stub")
+            model_dir.chmod(0o000)
+            try:
+                adapter = adapters.LatticeAdapter(
+                    bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+                )
+                with self.assertRaises(adapters.LatticeUnavailableError) as ctx:
+                    adapter.run(
+                        prompt="hi", n_tokens=32, warmup=False, model="m", quantization="q4"
+                    )
+                self.assertIn("could not inspect", str(ctx.exception))
+            finally:
+                model_dir.chmod(0o755)
+
+    def test_removed_dir_during_iteration_raises_lattice_unavailable(self):
+        """TOCTOU: the dir passes `run()`'s `is_dir()` precheck but is gone
+        by the time `_assert_q4_identity` iterates it."""
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp) / "q4model"
+            model_dir.mkdir()
+            (model_dir / "weights.q4").write_bytes(b"stub")
+            adapter = adapters.LatticeAdapter(
+                bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+            )
+
+            def _raise_missing(self):
+                raise FileNotFoundError(f"[Errno 2] No such file or directory: '{self}'")
+
+            with mock.patch.object(Path, "iterdir", _raise_missing), self.assertRaises(
+                adapters.LatticeUnavailableError
+            ) as ctx:
+                adapter.run(prompt="hi", n_tokens=32, warmup=False, model="m", quantization="q4")
+            self.assertIn("could not inspect", str(ctx.exception))
+
+
 class LatticeResultParsingTest(unittest.TestCase):
     def test_parses_result_line(self):
         self.assertEqual(

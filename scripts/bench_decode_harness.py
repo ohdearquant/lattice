@@ -1190,9 +1190,34 @@ class SlopeResult:
     window_n: int
 
 
+def _primary_elapsed_seconds(o: Observation) -> float:
+    """The duration used for aggregation/slope computation and legacy TSV
+    rendering: the adapter-reported native/engine duration
+    (`engine_native_ns`) when the adapter provided one, falling back to the
+    harness's own outer wall-clock `elapsed_ns` only when it did not (e.g.
+    MLX's in-process `generate()` call, where there is no separate native
+    reading -- the wall clock IS the measured work).
+
+    This distinction matters because `elapsed_ns` measures the FULL adapter
+    invocation -- for the lattice/ollama subprocess-per-call adapters, that
+    includes one subprocess spawn and (for lattice) one model load per
+    measured/warmup call, time the legacy per-process-loop scripts
+    (`bench_apples_precise.sh`, `bench_q4_apples.sh`,
+    `bench_context_scaling.sh`) never paid per observation -- they load the
+    model once and time only the engine's own reported duration
+    (`RESULT total_ms=`/ollama's `total_duration`) for every repeat.
+    Aggregating `elapsed_ns` unconditionally would silently make every
+    migrated slope non-comparable with its legacy predecessor (issue #813
+    codex round-1 finding 1) -- `elapsed_ns` remains on every `Observation`
+    for provenance/diagnostics, but is never the primary aggregated value
+    when a native duration is available.
+    """
+    return (o.engine_native_ns if o.engine_native_ns is not None else o.elapsed_ns) / 1e9
+
+
 def _measured_elapsed_seconds(observations: tuple[Observation, ...], engine: str, window: int) -> list[float]:
     return [
-        o.elapsed_ns / 1e9
+        _primary_elapsed_seconds(o)
         for o in observations
         if o.engine == engine and o.requested_completion_tokens == window and not o.warmup
     ]

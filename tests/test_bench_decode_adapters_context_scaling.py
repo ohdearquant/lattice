@@ -57,6 +57,23 @@ class _FakeAdapter:
         )
 
 
+class _SequencedNativeAdapter:
+    """Returns a pre-scripted `native_ns` per call, in call order, ignoring
+    the wall clock entirely -- lets a test drive exact elapsed-seconds
+    values for `compute_context_scaling_aggregate` without choreographing a
+    `_StepClock`."""
+
+    def __init__(self, native_ns_sequence: list[int]):
+        self._durations = iter(native_ns_sequence)
+
+    def run(self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str):
+        return harness.AdapterRunResult(
+            actual_completion_tokens=n_tokens,
+            native_ns=next(self._durations),
+            engine_version="fake-native",
+        )
+
+
 class ProfileParameterEquivalenceTest(unittest.TestCase):
     """bench_context_scaling.sh: N1=8 baseline, default CONTEXTS=(64 128
     256), RUNS=5, only mlx warms (4 tokens, once, before the whole loop)."""
@@ -146,8 +163,8 @@ class LegacyTsvRenderingTest(unittest.TestCase):
         _, profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)
         profile = profiles["context_scaling"]
         result = harness.run_profile(profile, {"lattice": _FakeAdapter()}, allow_missing_engine=True, clock=_FakeClock())
-        slopes = harness.aggregate(result)
-        tsv = adapters.render_legacy_tsv(result, slopes)
+        slopes, medians = adapters.compute_context_scaling_aggregate(result)
+        tsv = adapters.render_legacy_tsv(result, slopes, medians)
         lines = tsv.strip("\n").split("\n")
         self.assertEqual(lines[0], "engine\tcontext_tokens\tslope_tok_s\tt1_ms\tt2_ms\truns")
         self.assertEqual(len(lines), 1 + len(slopes))
@@ -182,6 +199,166 @@ class ContextsAndRunsOverrideTest(unittest.TestCase):
         overridden = dataclasses.replace(profile, measured_repeats=10)
         self.assertEqual(overridden.measured_repeats, 10)
         self.assertEqual(overridden.windows, profile.windows)
+
+
+class ParseContextsTest(unittest.TestCase):
+    """issue #813 codex round-1 finding 2a: --contexts must preserve caller
+    order (never sort) and reject a duplicated baseline/internal
+    duplicate."""
+
+    def test_preserves_caller_order_not_sorted(self):
+        self.assertEqual(adapters.parse_contexts("256,64,128", 8), (256, 64, 128))
+
+    def test_skips_blank_entries_and_whitespace(self):
+        self.assertEqual(adapters.parse_contexts(" 64, ,128 ", 8), (64, 128))
+
+    def test_rejects_internal_duplicate(self):
+        with self.assertRaises(adapters.ContextsConfigError):
+            adapters.parse_contexts("64,128,64", 8)
+
+    def test_rejects_context_equal_to_baseline(self):
+        with self.assertRaises(adapters.ContextsConfigError):
+            adapters.parse_contexts("8,64", 8)
+
+    def test_rejects_non_positive_entry(self):
+        with self.assertRaises(adapters.ContextsConfigError):
+            adapters.parse_contexts("0,64", 8)
+
+    def test_rejects_non_integer_entry(self):
+        with self.assertRaises(adapters.ContextsConfigError):
+            adapters.parse_contexts("64,abc", 8)
+
+    def test_rejects_empty(self):
+        with self.assertRaises(adapters.ContextsConfigError):
+            adapters.parse_contexts("", 8)
+
+
+class LegacyOrderedMedianTest(unittest.TestCase):
+    """issue #813 codex round-1 finding 2b: the exact per-engine even-n
+    tie-break `bench_context_scaling.sh`'s lattice_median/ollama_median
+    (lower middle) and MLX heredoc (upper middle) implement."""
+
+    def test_odd_n_matches_true_median_for_every_engine(self):
+        values = [5.0, 1.0, 3.0, 2.0, 4.0]
+        for engine in ("lattice", "ollama", "mlx"):
+            self.assertEqual(adapters._legacy_ordered_median(values, engine), 3.0)
+
+    def test_even_n_lattice_and_ollama_take_lower_middle(self):
+        # sorted: [1,2,3,4,5,6] -- lower middle (1-indexed position 3) = 3.0
+        values = [6.0, 2.0, 4.0, 1.0, 5.0, 3.0]
+        self.assertEqual(adapters._legacy_ordered_median(values, "lattice"), 3.0)
+        self.assertEqual(adapters._legacy_ordered_median(values, "ollama"), 3.0)
+
+    def test_even_n_mlx_takes_upper_middle(self):
+        values = [6.0, 2.0, 4.0, 1.0, 5.0, 3.0]
+        self.assertEqual(adapters._legacy_ordered_median(values, "mlx"), 4.0)
+
+    def test_empty_values_rejected(self):
+        with self.assertRaises(ValueError):
+            adapters._legacy_ordered_median([], "lattice")
+
+
+class ContextScalingEvenRunsLegacyMedianTest(unittest.TestCase):
+    """issue #813 codex round-1 finding 2b/2c, end to end: with an even
+    RUNS override, lattice takes the LOWER middle sample and mlx takes the
+    UPPER middle -- `statistics.median()` would instead average them -- and
+    the TSV's t1_ms/t2_ms must come from that SAME aggregate, never an
+    independently recomputed mean."""
+
+    @staticmethod
+    def _profile(measured_repeats: int, windows: list[int]):
+        raw = {
+            "description": "test",
+            "windows": windows,
+            "measured_repeats": measured_repeats,
+            "engines": [
+                {"name": "lattice", "warmup_repeats": 0, "model": "m", "quantization": "q8"},
+                {"name": "mlx", "warmup_repeats": 0, "model": "m", "quantization": "q8"},
+            ],
+            "prompt": "test prompt",
+        }
+        return harness._parse_profile("unit_test_ctx", raw)
+
+    def test_even_runs_lower_vs_upper_middle_and_tsv_consistency(self):
+        profile = self._profile(measured_repeats=6, windows=[8, 64])
+        # sorted ms: [10,20,30,40,50,60] -- lower middle=30, upper middle=40
+        baseline_ms = [50, 10, 60, 20, 40, 30]
+        # sorted ms: [100,...,600] -- lower middle=300, upper middle=400
+        window_ms = [100, 200, 300, 400, 500, 600]
+        sequence = [int(v * 1e6) for v in baseline_ms + window_ms]
+
+        result = harness.run_profile(
+            profile,
+            {
+                "lattice": _SequencedNativeAdapter(list(sequence)),
+                "mlx": _SequencedNativeAdapter(list(sequence)),
+            },
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        slopes, medians = adapters.compute_context_scaling_aggregate(result)
+
+        self.assertAlmostEqual(medians[("lattice", 8)], 0.030, places=9)
+        self.assertAlmostEqual(medians[("lattice", 64)], 0.300, places=9)
+        self.assertAlmostEqual(medians[("mlx", 8)], 0.040, places=9)
+        self.assertAlmostEqual(medians[("mlx", 64)], 0.400, places=9)
+        # statistics.median() would average the two middle values (35ms /
+        # 350ms for BOTH engines) -- assert we are not doing that.
+        self.assertNotAlmostEqual(medians[("lattice", 8)], 0.035, places=6)
+        self.assertNotAlmostEqual(medians[("mlx", 8)], 0.035, places=6)
+
+        lattice_slope = next(s for s in slopes if s.engine == "lattice")
+        mlx_slope = next(s for s in slopes if s.engine == "mlx")
+        self.assertAlmostEqual(lattice_slope.slope_tok_per_s, 56 / 0.27, places=6)
+        self.assertAlmostEqual(mlx_slope.slope_tok_per_s, 56 / 0.36, places=6)
+
+        tsv = adapters.render_legacy_tsv(result, slopes, medians)
+        for line in tsv.strip("\n").split("\n")[1:]:
+            engine, _ctx, _slope, t1_ms, t2_ms, _runs = line.split("\t")
+            if engine == "lattice":
+                self.assertAlmostEqual(float(t1_ms), 30.0, places=3)
+                self.assertAlmostEqual(float(t2_ms), 300.0, places=3)
+            else:
+                self.assertAlmostEqual(float(t1_ms), 40.0, places=3)
+                self.assertAlmostEqual(float(t2_ms), 400.0, places=3)
+
+
+class ContextScalingSkewedFiveSampleTsvTest(unittest.TestCase):
+    """issue #813 codex round-1 finding 2c, at the DEFAULT odd RUNS=5: the
+    legacy script's t1_ms/t2_ms were always medians, never means -- a
+    single high outlier in an otherwise tight five-sample set must not
+    move the rendered value."""
+
+    def test_tsv_uses_median_not_mean_when_skewed(self):
+        raw = {
+            "description": "test",
+            "windows": [8, 64],
+            "measured_repeats": 5,
+            "engines": [
+                {"name": "lattice", "warmup_repeats": 0, "model": "m", "quantization": "q8"}
+            ],
+            "prompt": "test prompt",
+        }
+        profile = harness._parse_profile("unit_test_skew", raw)
+        baseline_ms = [10, 130, 15, 25, 20]  # median=20, mean=40
+        window_ms = [200, 210, 205, 195, 800]  # median=205, mean=322
+        adapter = _SequencedNativeAdapter([int(v * 1e6) for v in baseline_ms + window_ms])
+        result = harness.run_profile(
+            profile,
+            {"lattice": adapter},
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        slopes, medians = adapters.compute_context_scaling_aggregate(result)
+        tsv = adapters.render_legacy_tsv(result, slopes, medians)
+        line = tsv.strip("\n").split("\n")[1]
+        _engine, _ctx, _slope, t1_ms, t2_ms, _runs = line.split("\t")
+        self.assertAlmostEqual(float(t1_ms), 20.0, places=3)
+        self.assertAlmostEqual(float(t2_ms), 205.0, places=3)
+        self.assertNotAlmostEqual(float(t1_ms), 40.0, places=1)
+        self.assertNotAlmostEqual(float(t2_ms), 322.0, places=1)
 
 
 class OllamaResponseParsingTest(unittest.TestCase):

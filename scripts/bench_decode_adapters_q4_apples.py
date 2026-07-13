@@ -107,14 +107,32 @@ class LatticeAdapter:
         `crates/inference/src/model_format.rs::detect_format` precedence:
         safetensors markers win over `.q4` files, so their presence means the
         binary would silently benchmark the full-precision checkpoint under a
-        Q4 label -- exactly the historical bench_q4_apples.sh failure mode."""
-        for marker in ("model.safetensors", "model.safetensors.index.json"):
-            if (self.model_dir / marker).exists():
-                raise LatticeUnavailableError(
-                    f"lattice: {self.model_dir} contains {marker}; detect_format would "
-                    "load safetensors, not Q4 -- refusing to mislabel the run"
-                )
-        if not any(p.suffix == ".q4" for p in self.model_dir.iterdir()):
+        Q4 label -- exactly the historical bench_q4_apples.sh failure mode.
+
+        `detect_format` (crates/inference/src/model_format.rs) suppresses
+        `read_dir` errors with `.ok()`, resolving an unreadable or
+        concurrently-removed directory to `Unknown` rather than panicking --
+        this method fails closed the same way, raising
+        `LatticeUnavailableError` rather than letting a raw
+        `PermissionError`/`FileNotFoundError` escape from the marker
+        `.exists()` checks or `iterdir()` (issue #813 codex round-1 finding
+        3: a permission error, or a TOCTOU directory removal between the
+        `is_dir()` precheck in `run()` and this method's filesystem calls,
+        must not raise an untyped exception the wrapper's callers don't
+        expect)."""
+        try:
+            for marker in ("model.safetensors", "model.safetensors.index.json"):
+                if (self.model_dir / marker).exists():
+                    raise LatticeUnavailableError(
+                        f"lattice: {self.model_dir} contains {marker}; detect_format would "
+                        "load safetensors, not Q4 -- refusing to mislabel the run"
+                    )
+            has_q4_file = any(p.suffix == ".q4" for p in self.model_dir.iterdir())
+        except OSError as exc:
+            raise LatticeUnavailableError(
+                f"lattice: could not inspect {self.model_dir} to establish Q4 identity: {exc}"
+            ) from exc
+        if not has_q4_file:
             raise LatticeUnavailableError(
                 f"lattice: {self.model_dir} has no .q4 files; detect_format would not "
                 "load it as Q4 -- refusing to mislabel the run"
