@@ -216,6 +216,20 @@ fn check_prompt_fits_window(
     prompt_len: usize,
     cfg: &GenerateConfig,
 ) -> Result<(), ApiError> {
+    // `lattice.rs`'s pre-refactor `check_context_window` also rejected an
+    // empty rendered prompt (`prompt_token_count == 0`) as part of the same
+    // predicate, independent of the window arithmetic; preserve that
+    // conjunct for the policy that reproduces it.
+    if matches!(policy, ContextWindowPolicy::PromptAndMaxTokens) && prompt_len == 0 {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "prompt (0 tokens) plus max_tokens ({max_tokens}) exceeds model \
+                 context window ({model_max_context})",
+                max_tokens = cfg.max_new_tokens,
+            ),
+            code: "context_length_exceeded",
+        });
+    }
     let (decode_cap, delimiter_tokens) = match policy {
         ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
         ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
@@ -1062,6 +1076,38 @@ mod tests {
         );
         assert!(
             check_prompt_fits_window(ContextWindowPolicy::PromptAndMaxTokens, 8, 2, &cfg).is_err()
+        );
+    }
+
+    /// `lattice.rs`'s original `check_context_window` rejects a zero-token
+    /// prompt independent of the window arithmetic; the policy that
+    /// reproduces that predicate must too, even when `max_new_tokens`
+    /// alone fits the window. The delimiter policy never had that
+    /// conjunct and must keep accepting a zero-length prompt that fits.
+    #[test]
+    fn lattice_policy_rejects_zero_token_prompt_even_when_window_fits() {
+        let cfg = cfg_with(7, None);
+        let err = check_prompt_fits_window(ContextWindowPolicy::PromptAndMaxTokens, 8, 0, &cfg)
+            .unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(
+                    message.contains("0 tokens"),
+                    "error must name the zero-length prompt: {message}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        assert!(
+            check_prompt_fits_window(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                9,
+                0,
+                &cfg_with(7, None),
+            )
+            .is_ok()
         );
     }
 
