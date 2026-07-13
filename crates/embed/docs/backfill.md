@@ -67,10 +67,10 @@ The coordinator offers two levels of routing information:
 
 An <code>EmbeddingRoute</code> is an instruction to the caller:
 
-| Route | Required application behavior |
-| --- | --- |
-| <code>Legacy</code> | Use only the source model and source index. |
-| <code>Target</code> | Use only the target model and target index. |
+| Route                  | Required application behavior                          |
+| ---------------------- | ------------------------------------------------------ |
+| <code>Legacy</code>    | Use only the source model and source index.            |
+| <code>Target</code>    | Use only the target model and target index.            |
 | <code>DualWrite</code> | Produce and persist both source and target embeddings. |
 
 Returning <code>DualWrite</code> does not itself issue two embedding calls or commit two
@@ -82,13 +82,13 @@ index writes.
 existing-document case represents ordinary re-embedding rather than the historical work that
 the backfill worker is processing.
 
-| Migration state | New document | Existing document |
-| --- | --- | --- |
-| Planned | Legacy | Legacy |
-| InProgress, dual write enabled | DualWrite | Legacy |
-| InProgress, dual write disabled | Legacy | Legacy |
-| Completed | Target | Target |
-| Paused, Failed, or Cancelled | Legacy | Legacy |
+| Migration state                 | New document | Existing document |
+| ------------------------------- | ------------ | ----------------- |
+| Planned                         | Legacy       | Legacy            |
+| InProgress, dual write enabled  | DualWrite    | Legacy            |
+| InProgress, dual write disabled | Legacy       | Legacy            |
+| Completed                       | Target       | Target            |
+| Paused, Failed, or Cancelled    | Legacy       | Legacy            |
 
 Disabling <code>dual_write</code> means newly indexed documents are not automatically added
 to the target index while the migration is in progress. The caller must accept that coverage
@@ -119,14 +119,14 @@ the migration progress itself and choose a threshold policy deliberately.
 <code>EmbeddingRoutingConfig</code> is the authoritative representation for an application
 that manages separate query and write paths:
 
-| Controller state and timing | Query model | Write models | Phase | Migration ID |
-| --- | --- | --- | --- | --- |
-| Planned | source | source | Stable | absent |
-| InProgress, dual write enabled | source | source, target | Migrating | present |
-| InProgress, dual write disabled | source | source | Migrating | present |
-| Completed, rollback window open | target | source, target | RollbackWindow | present |
-| Completed, rollback window elapsed | target | target | Stable | absent |
-| Paused, Failed, or Cancelled | source | source | Stable | absent |
+| Controller state and timing        | Query model | Write models   | Phase          | Migration ID |
+| ---------------------------------- | ----------- | -------------- | -------------- | ------------ |
+| Planned                            | source      | source         | Stable         | absent       |
+| InProgress, dual write enabled     | source      | source, target | Migrating      | present      |
+| InProgress, dual write disabled    | source      | source         | Migrating      | present      |
+| Completed, rollback window open    | target      | source, target | RollbackWindow | present      |
+| Completed, rollback window elapsed | target      | target         | Stable         | absent       |
+| Paused, Failed, or Cancelled       | source      | source         | Stable         | absent       |
 
 The rollback-window row always writes both models; it does not depend on the
 <code>dual_write</code> setting that applies during <code>InProgress</code>. That preserves
@@ -154,7 +154,7 @@ budget. The formula matches the controller's completion threshold, whose effecti
 
 A typical worker loop is:
 
-~~~rust
+```rust
 coordinator.start()?;
 
 loop {
@@ -167,7 +167,7 @@ loop {
     // and commit their target-index entries before reporting the completed count.
     coordinator.record_batch(batch_size)?;
 }
-~~~
+```
 
 The sketch only shows coordinator calls. A production worker must use a durable work cursor
 or equivalent claim mechanism; otherwise retries can embed or count the same record more
@@ -209,13 +209,13 @@ state. An application rollback procedure must supply those storage and serving a
 
 <code>BackfillConfig::default()</code> uses the following policy:
 
-| Field | Default | Meaning |
-| --- | ---: | --- |
-| <code>batch_size</code> | 100 | Maximum entries suggested by <code>next_batch_size</code>. |
-| <code>max_concurrent</code> | 4 | Concurrency budget for the caller to enforce. |
-| <code>dual_write</code> | true | Dual-write new documents while active. |
-| <code>target_query_threshold</code> | 0.8 | Raw progress fraction at which <code>route_query</code> may choose target. |
-| <code>rollback_window_secs</code> | 86,400 | Time to retain source writes after completed cutover. |
+| Field                               | Default | Meaning                                                                    |
+| ----------------------------------- | ------: | -------------------------------------------------------------------------- |
+| <code>batch_size</code>             |     100 | Maximum entries suggested by <code>next_batch_size</code>.                 |
+| <code>max_concurrent</code>         |       4 | Concurrency budget for the caller to enforce.                              |
+| <code>dual_write</code>             |    true | Dual-write new documents while active.                                     |
+| <code>target_query_threshold</code> |     0.8 | Raw progress fraction at which <code>route_query</code> may choose target. |
+| <code>rollback_window_secs</code>   |  86,400 | Time to retain source writes after completed cutover.                      |
 
 The configuration and full routing configuration are serializable with snake-case phase
 names. A serialized routing configuration includes concrete model selections and should be
@@ -239,3 +239,49 @@ Before starting a transition, ensure that:
 The coordinator provides deterministic routing from its local state. Correct migration
 outcomes still depend on the caller making embedding writes, index updates, cursor commits,
 and query aliases agree with that routing decision.
+
+## BackfillCoordinator::route_request
+
+`route_request(is_new_document)` is the coordinator's coarse routing helper for a write-like
+embedding request. `is_new_document` means the caller is indexing the document for the first
+time. `false` denotes ordinary re-embedding and does not describe the historical backfill
+worker's own work.
+
+While the controller is `InProgress`, a new document returns `DualWrite` only when
+`dual_write` is enabled; the caller must then create and persist source and target embeddings.
+Every other active request returns `Legacy`. Planned, paused, failed, and cancelled migrations
+also return `Legacy`, while completed migrations return `Target`. The helper never performs
+the requested embedding or index writes.
+
+This route deliberately omits the post-cutover source-write requirement. It returns `Target`
+for a completed migration even during the rollback window, so applications that need to retain
+the source copy must use `routing_config()` instead. That configuration is the complete
+read/write plan because it exposes both write models and the `RollbackWindow` phase.
+
+## BackfillCoordinator::record_batch
+
+Call `record_batch(count)` only after the caller has completed the storage work it intends to
+claim. The coordinator adds `count` to its independent `backfilled_count`, then delegates to
+the migration controller's `record_progress(count)`. The counter update happens before the
+delegated operation can return an invalid-transition error, so this method is not a
+transactional acknowledgement and a failed call does not roll that counter back.
+
+If the delegated progress call changes the controller from `InProgress` to `Completed`, the
+coordinator records a process-local `Instant` as `cutover_at`. That timestamp enables the
+rollback-window policy; it is not a durable or externally meaningful cutover record. Directly
+changing lifecycle state through another path cannot set this timestamp, so the coordinator
+only recognises cutover that it observed through this method.
+
+## BackfillCoordinator::next_batch_size
+
+`next_batch_size()` gives a worker an upper bound for the next historical batch; it does not
+select or reserve documents. During `InProgress`, it computes:
+
+    remaining = saturating_sub(saturating_sub(total, processed), skipped)
+    next_batch_size = min(remaining, configured_batch_size)
+
+It returns zero in every other lifecycle state. Saturating subtraction makes an oversupplied
+processed or skipped count yield no further work rather than an underflow. The formula follows
+the controller's effective-total completion rule, so a worker that honours it will not request
+more entries than remain after permanent skips. It still needs a durable cursor or claim
+mechanism to prevent concurrent workers or retries from processing the same document.

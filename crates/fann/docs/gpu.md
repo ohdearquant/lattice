@@ -23,12 +23,12 @@ GpuNetwork
 
 The backend has four cooperating parts:
 
-| Component | Responsibility |
-| --- | --- |
-| `GpuContext` | Selects an adapter, creates the `wgpu` device and queue, records device metadata, owns the pool and pipeline cache, and exposes synchronization and pressure APIs. |
-| `BufferPool` | Reuses compatible buffers in small, medium, and large tiers, tracks pool-managed bytes, and sheds cached buffers under pressure. |
-| `CircuitBreaker` | Stops repeated allocation attempts from cascading after recorded failures, then permits a recovery probe after a cooldown. |
-| `GpuNetwork` | Uploads an ordinary `Network`, chooses CPU or GPU inference, submits per-layer work, and reads the final vector back to the CPU. |
+| Component        | Responsibility                                                                                                                                                     |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GpuContext`     | Selects an adapter, creates the `wgpu` device and queue, records device metadata, owns the pool and pipeline cache, and exposes synchronization and pressure APIs. |
+| `BufferPool`     | Reuses compatible buffers in small, medium, and large tiers, tracks pool-managed bytes, and sheds cached buffers under pressure.                                   |
+| `CircuitBreaker` | Stops repeated allocation attempts from cascading after recorded failures, then permits a recovery probe after a cooldown.                                         |
+| `GpuNetwork`     | Uploads an ordinary `Network`, chooses CPU or GPU inference, submits per-layer work, and reads the final vector back to the CPU.                                   |
 
 The `shaders` module supplies the WGSL source used by `ShaderManager`. `ShaderType` is the
 closed set of operations exposed to the current inference path.
@@ -86,13 +86,13 @@ nor included in this counter.
 The module exports the following policy constants. They are deliberately visible so callers can
 make the same choices as the built-in wrapper.
 
-| Constant | Value | Current use |
-| --- | ---: | --- |
-| `MATMUL_MIN_ELEMENTS` | 10,000 | A one-input network uses GPU only at or above this parameter count. |
-| `BATCH_MIN_SIZE` | 100 | Part of the batch heuristic: for `batch_size > 1`, `elements * batch_size` must be at least `100 * 100` (10,000). |
-| `ACTIVATION_MIN_ELEMENTS` | 1,000 | Published activation crossover policy; the current `GpuNetwork` does not independently gate activation dispatches with it. |
+| Constant                    |   Value | Current use                                                                                                                    |
+| --------------------------- | ------: | ------------------------------------------------------------------------------------------------------------------------------ |
+| `MATMUL_MIN_ELEMENTS`       |  10,000 | A one-input network uses GPU only at or above this parameter count.                                                            |
+| `BATCH_MIN_SIZE`            |     100 | Part of the batch heuristic: for `batch_size > 1`, `elements * batch_size` must be at least `100 * 100` (10,000).              |
+| `ACTIVATION_MIN_ELEMENTS`   |   1,000 | Published activation crossover policy; the current `GpuNetwork` does not independently gate activation dispatches with it.     |
 | `MAX_ELEMENTS_PER_DISPATCH` | 100,000 | A layer with more elements than this causes the whole `GpuNetwork` forward pass to restart on CPU. Exactly 100,000 is allowed. |
-| `MAX_DISPATCH_TIME_MS` | 1.5 ms | Target headroom for the element-count cap; it is not measured dynamically by the current code. |
+| `MAX_DISPATCH_TIME_MS`      |  1.5 ms | Target headroom for the element-count cap; it is not measured dynamically by the current code.                                 |
 
 `should_use_gpu(elements, batch_size)` uses a simple threshold rather than a runtime benchmark:
 
@@ -116,12 +116,12 @@ mixing GPU and CPU layers.
 
 The Apple-Silicon tuning constants are:
 
-| Constant | Value | Meaning |
-| --- | ---: | --- |
-| `BUFFER_ALIGNMENT` | 256 bytes | Buffer-pool requests are rounded up to this boundary. |
-| `MAX_BUFFER_SIZE` | 128 MiB | Published platform limit; the pool and network do not currently enforce it themselves. |
-| `WORKGROUP_SIZE` | 32 | Matmul workgroup width, matching Apple Silicon's 32-lane SIMD width. |
-| `ACTIVATION_WORKGROUP_SIZE` | 256 | Element-wise workgroup width chosen for throughput. |
+| Constant                    |     Value | Meaning                                                                                |
+| --------------------------- | --------: | -------------------------------------------------------------------------------------- |
+| `BUFFER_ALIGNMENT`          | 256 bytes | Buffer-pool requests are rounded up to this boundary.                                  |
+| `MAX_BUFFER_SIZE`           |   128 MiB | Published platform limit; the pool and network do not currently enforce it themselves. |
+| `WORKGROUP_SIZE`            |        32 | Matmul workgroup width, matching Apple Silicon's 32-lane SIMD width.                   |
+| `ACTIVATION_WORKGROUP_SIZE` |       256 | Element-wise workgroup width chosen for throughput.                                    |
 
 `GpuContext::is_apple_silicon()` recognizes a Metal backend whose name includes `Apple`, `M1`,
 `M2`, or `M3`. `optimal_workgroup_size("matmul")` reports 32 for those devices and 64 elsewhere;
@@ -133,11 +133,11 @@ own workgroup sizes, and `GpuNetwork` dispatches using `ShaderType::workgroup_si
 Creating a new GPU allocation can cost roughly 100–500 microseconds, so the pool keeps returned
 buffers for a compatible future request. It has three categories based on the **aligned** size:
 
-| Category | Size range | Maximum retained | Maximum age |
-| --- | --- | ---: | ---: |
-| `Small` | less than 1 MiB | 256 | 300 seconds |
-| `Medium` | 1 MiB through less than 10 MiB | 64 | 180 seconds |
-| `Large` | 10 MiB or more | 16 | 60 seconds |
+| Category | Size range                     | Maximum retained | Maximum age |
+| -------- | ------------------------------ | ---------------: | ----------: |
+| `Small`  | less than 1 MiB                |              256 | 300 seconds |
+| `Medium` | 1 MiB through less than 10 MiB |               64 | 180 seconds |
+| `Large`  | 10 MiB or more                 |               16 |  60 seconds |
 
 ### Allocation and reuse
 
@@ -165,20 +165,19 @@ within the last 60 seconds **or** its reuse rate exceeds one use per hour.
 `return_buffer` immediately drops a buffer that is no longer retainable and subtracts its size
 from pool accounting. Otherwise it appends the buffer to its category. If that category is at its
 configured capacity, it evicts the retained buffer with the lowest use count before inserting the
-new one. The implementation's selection is use-count based even though an adjacent code comment
-uses the word “oldest”.
+new one.
 
 `cleanup(pressure)` shrinks every tier to a pressure-dependent target. It sorts the tier by use
 count and drops the least-reused buffers first. The target is the floored product
 `(1 - cleanup_aggressiveness) * tier_capacity`:
 
-| Pressure | Cleanup aggressiveness | Retained target |
-| --- | ---: | ---: |
-| `None` | 0.1 | 90% of capacity |
-| `Low` | 0.3 | 70% of capacity |
-| `Medium` | 0.5 | 50% of capacity |
-| `High` | 0.7 | 30% of capacity |
-| `Critical` | 1.0 | 0 buffers |
+| Pressure   | Cleanup aggressiveness | Retained target |
+| ---------- | ---------------------: | --------------: |
+| `None`     |                    0.1 | 90% of capacity |
+| `Low`      |                    0.3 | 70% of capacity |
+| `Medium`   |                    0.5 | 50% of capacity |
+| `High`     |                    0.7 | 30% of capacity |
+| `Critical` |                    1.0 |       0 buffers |
 
 `flush()` drains all categories; `flush_category(category)` drains only one. Both report bytes
 dropped and update evictions and current-memory accounting. `pooled_count()` reports the number
@@ -194,13 +193,13 @@ recording those outcomes if they want circuit-breaker state to reflect them.
 `GpuContext` can maintain a caller-provided memory budget. Once set, it maps
 `memory_usage() / budget` to `MemoryPressure`:
 
-| Usage ratio | Level | Intended response |
-| --- | --- | --- |
-| below 60% | `None` | Normal operation; light cleanup still retains 90% of each tier. |
-| 60% to below 70% | `Low` | Begin monitoring and reduce the cache target. |
-| 70% to below 80% | `Medium` | Reduce allocations and retain half of each tier. |
-| 80% to below 90% | `High` | Clean aggressively. |
-| 90% or more | `Critical` | Signal that callers should block new allocations and remove all cached pool buffers. |
+| Usage ratio      | Level      | Intended response                                                                    |
+| ---------------- | ---------- | ------------------------------------------------------------------------------------ |
+| below 60%        | `None`     | Normal operation; light cleanup still retains 90% of each tier.                      |
+| 60% to below 70% | `Low`      | Begin monitoring and reduce the cache target.                                        |
+| 70% to below 80% | `Medium`   | Reduce allocations and retain half of each tier.                                     |
+| 80% to below 90% | `High`     | Clean aggressively.                                                                  |
+| 90% or more      | `Critical` | Signal that callers should block new allocations and remove all cached pool buffers. |
 
 `check_memory_pressure()` returns `None` until a budget is configured. The context does not
 validate the budget or automatically invoke cleanup or allocation blocking. Call
@@ -253,14 +252,14 @@ failure time, and refreshes the state-change timestamp.
 
 `ShaderManager` maps a `ShaderType` to WGSL source, a debug label, and a fixed workgroup size.
 
-| Shader type | Operation | Workgroup |
-| --- | --- | ---: |
-| `MatrixVectorMultiply` | `y = W x + b` | 32 × 1 × 1 |
-| `MatrixVectorMultiplyRelu` | `max(0, W x + b)` in one kernel | 32 × 1 × 1 |
-| `ReLU` | In-place `max(0, x)` | 256 × 1 × 1 |
-| `LeakyReLU` | In-place `x` when positive, otherwise `alpha * x` | 256 × 1 × 1 |
-| `Sigmoid` | In-place logistic function | 256 × 1 × 1 |
-| `Tanh` | In-place hyperbolic tangent | 256 × 1 × 1 |
+| Shader type                | Operation                                         |   Workgroup |
+| -------------------------- | ------------------------------------------------- | ----------: |
+| `MatrixVectorMultiply`     | `y = W x + b`                                     |  32 × 1 × 1 |
+| `MatrixVectorMultiplyRelu` | `max(0, W x + b)` in one kernel                   |  32 × 1 × 1 |
+| `ReLU`                     | In-place `max(0, x)`                              | 256 × 1 × 1 |
+| `LeakyReLU`                | In-place `x` when positive, otherwise `alpha * x` | 256 × 1 × 1 |
+| `Sigmoid`                  | In-place logistic function                        | 256 × 1 × 1 |
+| `Tanh`                     | In-place hyperbolic tangent                       | 256 × 1 × 1 |
 
 Context construction warms `MatrixVectorMultiply`, `MatrixVectorMultiplyRelu`, `ReLU`,
 `Sigmoid`, and `Tanh`. `LeakyReLU` remains lazy and is compiled on its first request. A cache hit
@@ -352,9 +351,12 @@ fallback or a GPU softmax kernel is implemented.
 
 ### Weight synchronization and flushing
 
-`sync_weights()` overwrites each uploaded weight and bias buffer with the current values in the
-owned CPU network. Call it after modifying those values through whatever owns or updates the
-network; creating `GpuNetwork` does not establish automatic weight synchronization.
+`sync_weights()` overwrites each uploaded weight and bias buffer with the values in the owned CPU
+network. It accepts no weight data, and `cpu_network()` exposes only `&Network`, so callers cannot
+modify the wrapped network through the public GPU API. To use updated caller-owned weights, update
+a `Network` before transferring it and construct a replacement `GpuNetwork` from that network;
+construction performs the upload. There is no automatic synchronization with an external network
+copy.
 
 `GpuNetwork::flush()` delegates to `GpuContext::flush_memory()`. It drains only the context's
 buffer pool and waits for queued work. It does not retroactively pool the network's direct
@@ -398,3 +400,76 @@ For diagnostics, inspect `GpuContext::info()`, `BufferPool::stats()`, pipeline `
 the circuit-breaker state and counters. A low pool hit rate can mean the workload's allocation
 sizes or usage flags are too variable for reuse; it is not evidence that direct allocations made
 by `GpuNetwork` are being pooled.
+
+## `BufferPool::flush`
+
+`flush()` drains every returned-buffer tier, increments the eviction counter for each buffer, and
+returns the pool-accounted byte total it removed. It is the appropriate cache-shedding operation
+during long-running work or memory pressure, but dropping a `wgpu::Buffer` does not guarantee that
+the device has completed asynchronous destruction. Pair a pool flush with `GpuContext::poll()` or
+`GpuContext::wait()` at a safe workload boundary when the next allocation burst depends on the
+memory becoming available.
+
+## `CircuitBreaker`
+
+The breaker starts `Closed`. Recorded failures open it when their cumulative count reaches the
+configured threshold. Once the recovery timeout expires, the next allowed request transitions the
+breaker to `HalfOpen`; a recorded success closes it and resets failures, while a recorded failure
+opens it again. Request-path lock poisoning fails closed. Although `HalfOpen` represents a
+recovery probe, the current implementation permits every request while it remains in that state.
+
+```text
+Closed -- failures reach threshold --> Open
+  ^                                  |
+  |                                  | recovery timeout elapses
+  |                                  v
+  +--------- success ----------- HalfOpen
+                                      |
+                                      | failure
+                                      v
+                                    Open
+```
+
+## `GpuContext::flush_memory`
+
+`flush_memory()` drains the context's `BufferPool` before blocking in `wait()`, then returns the
+number of pool bytes dropped. The order makes the operation a deliberate release boundary: it
+removes host-side references before waiting for queued GPU work that may still retain device
+memory. It applies only to pool-managed allocations; direct buffers created by `GpuNetwork` are
+not added to the pool or to its byte accounting.
+
+## `GpuContext::set_memory_pressure_handler`
+
+Install a callback to respond to pressure calculated from the caller-configured budget and
+pool-accounted usage. The callback runs only when the caller invokes
+`notify_memory_pressure()` after significant pool activity; notifications are not edge-triggered,
+so the same level can be reported repeatedly. A handler can reduce application batch sizes, shed
+pooled buffers, or choose the CPU path. It should not assume that the count includes direct
+`wgpu` allocations.
+
+```rust,ignore
+context.set_memory_budget(512 * 1024 * 1024);
+context.set_memory_pressure_handler(|level, bytes| {
+    if matches!(level, MemoryPressureLevel::High | MemoryPressureLevel::Critical) {
+        eprintln!("GPU pool uses {} MiB at {level:?}", bytes / 1024 / 1024);
+    }
+});
+```
+
+## `GpuNetwork::sync_weights`
+
+`sync_weights()` writes the weights and biases held by the `GpuNetwork`'s owned CPU `Network`
+into its existing GPU storage buffers. It has no weight argument, and `cpu_network()` exposes only
+`&Network`; callers cannot mutate the wrapped CPU network through the public GPU API. Therefore,
+the accessible way to use updated caller-owned weights is to update a `Network` before transfer
+and construct a replacement `GpuNetwork` from it (retaining the `Arc<GpuContext>` used to create
+the original wrapper). The initial construction performs the upload. `sync_weights()` is only
+useful when an internal or future mutable path has already changed the wrapper's owned CPU
+network; it does not synchronize an external network copy automatically.
+
+## `GpuNetwork::flush`
+
+`GpuNetwork::flush()` delegates to `GpuContext::flush_memory()`: it drains cached buffers in the
+context pool, waits for pending GPU work, and returns the pool byte total. Network forward-path
+buffers are directly allocated rather than pooled, so flushing does not retroactively make them
+reusable; the wait remains the synchronization boundary needed for asynchronous resource release.

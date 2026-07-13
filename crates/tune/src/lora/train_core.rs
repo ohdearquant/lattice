@@ -137,18 +137,9 @@ impl LoraParams {
 
 pub type Grads = LoraParams;
 
-/// LoRA parameters (and, doubling as the gradient container, LoRA gradients)
-/// for the 5 GDN projections: in_proj_qkv, in_proj_z, in_proj_b (beta),
-/// in_proj_a (alpha), out_proj. Mirrors `GdnGrads` in
-/// `lattice_inference::attention::gdn_backward` field-for-field so a
-/// `GdnGrads` can be converted straight into a `GdnLoraParams` gradient slot.
-///
-/// Shapes (rank = LoRA rank, dims from `GdnDims`):
-///   a_qkv: [rank, hidden]        b_qkv: [qkv_dim, rank]
-///   a_z:   [rank, hidden]        b_z:   [output_dim, rank]
-///   a_b:   [rank, hidden]        b_b:   [value_heads, rank]
-///   a_a:   [rank, hidden]        b_a:   [value_heads, rank]
-///   a_out: [rank, output_dim]    b_out: [hidden, rank]
+/// Parameters or gradients for the five GDN LoRA projections.
+/// Its fields mirror inference's `GdnGrads` for direct gradient transfer.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#gdnloraparams) for all shapes and the value-head invariant.
 #[derive(Clone)]
 pub struct GdnLoraParams {
     pub a_qkv: Vec<f32>,
@@ -164,21 +155,9 @@ pub struct GdnLoraParams {
 }
 
 impl GdnLoraParams {
-    /// Shape-aware constructor: the single source of truth for every GDN LoRA
-    /// array's length (mirrors the `d_out`/`d_in` table in the struct's doc
-    /// comment above). `fill_a`/`fill_b` receive the exact element count and
-    /// return the initialised vec, so callers that need randomized or
-    /// zero-B initialization go through the SAME shape derivation as `zeros`
-    /// instead of re-deriving `d_out` per array per call site.
-    ///
-    /// This exists because of a real drift (#792): `train_grad_full.rs` had
-    /// two independent call sites (gradcheck-mode and training-mode
-    /// initialization) that re-derived `b_b`/`b_a` as `num_kh * rank`
-    /// instead of `value_heads * rank` — the same bug already fixed in
-    /// `zeros`, but that fix never touched those two inline constructors
-    /// because they didn't call `zeros` at all. Routing both through
-    /// `shaped` (and `zeros` through `shaped`) makes that class of drift a
-    /// compile-time-shared-code property instead of a grep-and-hope one.
+    /// Build GDN LoRA arrays from checked shapes and caller-provided fillers.
+    /// `zeros` delegates here so every initializer shares the same dimensions.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#gdnloraparams) for the drift-prevention rationale.
     pub fn shaped(
         rank: usize,
         hidden: usize,
@@ -199,12 +178,10 @@ impl GdnLoraParams {
             a_z: fill_a(checked(rank, hidden, "rank*hidden (a_z)")?),
             b_z: fill_b(checked(gd.output_dim, rank, "output_dim*rank (b_z)")?),
             a_b: fill_a(checked(rank, hidden, "rank*hidden (a_b)")?),
-            // beta (in_proj_b) is projected per VALUE head, matching the
-            // shipping gdn_fused forward and the f16 weight loader — NOT
-            // per key head (#792).
+            // Beta is projected per value head.
             b_b: fill_b(checked(gd.value_heads, rank, "value_heads*rank (b_b)")?),
             a_a: fill_a(checked(rank, hidden, "rank*hidden (a_a)")?),
-            // alpha (in_proj_a) is likewise per VALUE head.
+            // Alpha is projected per value head.
             b_a: fill_b(checked(gd.value_heads, rank, "value_heads*rank (b_a)")?),
             a_out: fill_a(checked(rank, gd.output_dim, "rank*output_dim (a_out)")?),
             b_out: fill_b(checked(hidden, rank, "hidden*rank (b_out)")?),
@@ -216,10 +193,7 @@ impl GdnLoraParams {
     }
 }
 
-/// Geometry inputs shared by every tape entry point: the flat per-array
-/// dimensions (`Dims`), the GDN-specific dimensions (`GdnDims`), and the model
-/// config both were derived from. Held as references so the tape borrows the
-/// caller's already-computed geometry instead of cloning it per call.
+/// Borrowed dimensions and model configuration used by tape entry points.
 pub struct TapeGeometry<'a> {
     dims: &'a Dims,
     gdn_dims: &'a GdnDims,
@@ -227,9 +201,7 @@ pub struct TapeGeometry<'a> {
 }
 
 impl<'a> TapeGeometry<'a> {
-    /// Bundle references to the tape's geometry. Consistency between `dims`,
-    /// `gdn_dims`, and `model` is checked by [`TrainCtx::try_new`], not here —
-    /// this constructor is a plain aggregate, not a validator.
+    /// Bundle geometry references; [`TrainCtx::try_new`] validates consistency.
     pub fn new(dims: &'a Dims, gdn_dims: &'a GdnDims, model: &'a Qwen35Config) -> Self {
         Self {
             dims,
@@ -239,28 +211,20 @@ impl<'a> TapeGeometry<'a> {
     }
 }
 
-/// The private, execution-only `{rank, scale}` pair derived from
-/// `alpha / rank` by [`TrainCtx::try_new`]. Not adapter governance (the
-/// adapter descriptor scoped to issue #615 owns rank/alpha/target-module
-/// governance) — this is just the two scalars the forward/backward tape
-/// multiplies LoRA deltas by.
+/// Runtime LoRA rank and scale derived by [`TrainCtx::try_new`].
 struct LoraExecution {
     rank: usize,
     scale: f32,
 }
 
-/// The GQA-slot and GDN-slot layer index layout for a materialised tape run.
-/// `gqa_layers[slot]` / `gdn_layers[slot]` give the global model layer index
-/// trained by that slot; slot count is the slice length (see
-/// [`TrainCtx::num_gqa_slots`] / [`TrainCtx::num_gdn_slots`]).
+/// Mapping from GQA and GDN tape slots to global model-layer indices.
 pub struct SlotLayout<'a> {
     gqa_layers: &'a [usize],
     gdn_layers: &'a [usize],
 }
 
 impl<'a> SlotLayout<'a> {
-    /// Bundle the GQA/GDN slot-layer index slices. Uniqueness, in-range, and
-    /// mixer-kind agreement are checked by [`TrainCtx::try_new`], not here.
+    /// Bundle slot-layer slices; [`TrainCtx::try_new`] validates them.
     pub fn new(gqa_layers: &'a [usize], gdn_layers: &'a [usize]) -> Self {
         Self {
             gqa_layers,
@@ -290,10 +254,7 @@ impl AdamConfig {
     }
 }
 
-/// Validated, immutable context for the training tape's core entry points.
-///
-/// It binds geometry, layer slots, execution scale, and Adam policy, but never
-/// owns weights, caches, gradients, LoRA vectors, or optimizer state.
+/// Validated immutable geometry, slot, LoRA, and Adam inputs for the tape.
 pub struct TrainCtx<'a> {
     geometry: TapeGeometry<'a>,
     lora: LoraExecution,
@@ -302,24 +263,9 @@ pub struct TrainCtx<'a> {
 }
 
 impl<'a> TrainCtx<'a> {
-    /// Construct a validated `TrainCtx`.
-    ///
-    /// `alpha` is not stored: the execution-only `scale = alpha / rank` is
-    /// derived once here and held privately alongside `rank`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(TuneError::Validation)` if:
-    /// - `rank == 0`.
-    /// - `alpha`, `adam.learning_rate`, `adam.beta1`, `adam.beta2`, or
-    ///   `adam.epsilon` is non-finite (NaN or +/-inf).
-    /// - `geometry.dims` or `geometry.gdn_dims` disagree with
-    ///   `geometry.model` (a geometry built from a different config than the
-    ///   one the tape will index weights through).
-    /// - `slots.gqa_layers` or `slots.gdn_layers` contains a duplicate layer
-    ///   index, an index `>= geometry.model.num_hidden_layers`, or a layer
-    ///   index that appears in both lists (a mixer-kind conflict: the same
-    ///   layer cannot be trained as both GQA and GDN).
+    /// Construct a context after validating tape geometry, slots, and Adam values.
+    /// Derives and stores execution scale from `alpha / rank`.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#trainctxtry_new) for every validation invariant.
     pub fn try_new(
         geometry: TapeGeometry<'a>,
         rank: usize,
@@ -790,12 +736,9 @@ pub fn eval_chain_nll(
     Ok((nll_sum / n.max(1) as f64) as f32)
 }
 
-/// Reverse-mode NLL + gradients over the assembled multi-layer tape.
-///
-/// `num_slots`/`grads` cover the GQA LoRA slots (surface-A, unchanged).
-/// `num_gdn_slots`/the returned `Vec<GdnLoraParams>` cover the GDN LoRA slots
-/// (surface-B, ported from lattice PR #202) — empty when no GDN layer in the
-/// materialised range carries a LoRA slot.
+/// Compute reverse-mode NLL and gradients for the assembled tape.
+/// Returns separate GQA and GDN slot gradients; either collection may be empty.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#nll_and_grads) for reverse-pass ordering.
 pub fn nll_and_grads(
     fwd: &FullFwd,
     layers: &[LayerW<'_>],
@@ -1017,9 +960,8 @@ pub fn apply_adam_updates(
     }
 }
 
-/// Adam step for the GDN LoRA slots (surface-B). Mirrors `apply_adam_updates`
-/// but steps all 5 GDN projections' A/B pairs (10 arrays/slot) instead of the
-/// 2 GQA projections' A/B pairs (4 arrays/slot).
+/// Apply Adam updates to all ten factor arrays in each GDN LoRA slot.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#nll_and_grads) for the GDN slot layout.
 pub fn apply_gdn_adam_updates(
     adam: &mut AdamState,
     gdn_loras: &mut [GdnLoraParams],

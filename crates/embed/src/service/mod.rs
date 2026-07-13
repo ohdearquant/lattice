@@ -28,7 +28,7 @@ pub use native::NativeEmbeddingService;
 /// Can be overridden by using chunked calls if larger batches are needed.
 pub const DEFAULT_MAX_BATCH_SIZE: usize = 1000;
 
-/// **Stable**: maximum allowed text length in characters.
+/// **Stable**: maximum allowed text length in UTF-8 bytes.
 ///
 /// This limit prevents OOM attacks via extremely large input texts.
 /// 32KB is sufficient for most embedding use cases while preventing abuse.
@@ -36,15 +36,8 @@ pub const MAX_TEXT_CHARS: usize = 32768;
 
 /// **Stable**: role of text in asymmetric retrieval.
 ///
-/// Models trained with asymmetric objectives (E5, Qwen3-Embedding) use different
-/// prompt prefixes for queries vs documents.  Providing the wrong role causes the
-/// embedding to land in the wrong region of the model's retrieval space, degrading
-/// retrieval quality.
-///
-/// Use [`EmbeddingService::embed_query`] / [`EmbeddingService::embed_passage`] to
-/// apply the correct prefix automatically.  The role is also included in the cache
-/// key so that `embed_query("hello")` and `embed_passage("hello")` are stored as
-/// separate entries even when the raw text is identical.
+/// Selects query, passage, or generic preparation and cache-key namespace.
+/// See [`docs/service.md`](../../docs/service.md#trait-api-details) for retrieval-role semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbeddingRole {
     /// Query / question text — may receive a query-side prompt prefix.
@@ -56,10 +49,7 @@ pub enum EmbeddingRole {
 }
 
 impl EmbeddingRole {
-    /// Short ASCII tag included in the cache key hash.
-    ///
-    /// Distinct strings ensure that role changes affect the Blake3 hash even
-    /// when the raw text and model config are identical.
+    /// Returns this role's short cache-key tag.
     #[inline]
     pub(crate) const fn cache_tag(self) -> &'static str {
         match self {
@@ -72,25 +62,9 @@ impl EmbeddingRole {
 
 /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
 ///
-/// Trait for embedding generation services.
+/// Async interface for producing one embedding per input text.
 ///
-/// This trait defines the interface for services that can convert text
-/// into vector embeddings. Implementations may use local models (native Rust)
-/// or remote APIs.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use lattice_embed::{EmbeddingService, EmbeddingModel, NativeEmbeddingService};
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let service = NativeEmbeddingService::default();
-///     let embedding = service.embed_one("Hello, world!", EmbeddingModel::default()).await?;
-///     assert_eq!(embedding.len(), 384);
-///     Ok(())
-/// }
-/// ```
+/// See [`docs/service.md`](../../docs/service.md#trait-api-details) for role handling and implementation requirements.
 #[async_trait]
 pub trait EmbeddingService: Send + Sync {
     /// **Stable**: generate embeddings for multiple texts.
@@ -112,28 +86,18 @@ pub trait EmbeddingService: Send + Sync {
             .ok_or_else(|| EmbedError::Internal("no embedding generated".into()))
     }
 
-    /// **Stable**: embed query texts with model-specific query prompt prefix applied.
+    /// **Stable**: embed query texts after applying the model's query instruction.
     ///
-    /// For models that use asymmetric prompts (BGE, E5, Qwen3-Embedding), this prepends the
-    /// `query_instruction()` prefix before calling the model forward.  For models with
-    /// no query prefix (MiniLM), this is equivalent to `embed()`.
-    ///
-    /// Cache keys produced by this method are distinct from those produced by
-    /// `embed_passage()` and `embed()` even when the raw text is identical.
+    /// See [`docs/service.md`](../../docs/service.md#trait-api-details) for role and cache behavior.
     async fn embed_query(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
         let prefix = model.query_instruction();
         let prompted = apply_prefix(texts, prefix);
         self.embed(&prompted, model).await
     }
 
-    /// **Stable**: embed document/passage texts with model-specific document prompt prefix applied.
+    /// **Stable**: embed passages after applying the model's document instruction.
     ///
-    /// For models that use asymmetric prompts (E5), this prepends the
-    /// `document_instruction()` prefix before calling the model forward.  For models with
-    /// no document prefix (BGE, MiniLM, Qwen3), this is equivalent to `embed()`.
-    ///
-    /// Cache keys produced by this method are distinct from those produced by
-    /// `embed_query()` and `embed()` even when the raw text is identical.
+    /// See [`docs/service.md`](../../docs/service.md#trait-api-details) for role and cache behavior.
     async fn embed_passage(
         &self,
         texts: &[String],
@@ -144,11 +108,9 @@ pub trait EmbeddingService: Send + Sync {
         self.embed(&prompted, model).await
     }
 
-    /// **Unstable**: returns the effective `ModelConfig` for a given model on this service.
+    /// **Unstable**: returns the effective configuration used for this model's cache keys.
     ///
-    /// The default returns a config with no MRL truncation. `NativeEmbeddingService`
-    /// overrides this to expose the configured output dimension so `CachedEmbeddingService`
-    /// can include the actual dimension in cache keys.
+    /// See [`docs/service.md`](../../docs/service.md#trait-api-details) for output-dimension behavior.
     fn model_config(&self, model: EmbeddingModel) -> ModelConfig {
         ModelConfig::new(model)
     }
@@ -160,12 +122,7 @@ pub trait EmbeddingService: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// Apply an optional prompt prefix to each text.
-///
-/// Returns a new `Vec<String>` with the prefix prepended where the prefix is
-/// `Some`, or a cloned vec of the original texts when the prefix is `None`.
-/// This is a free function (not a method) so it can be called from default
-/// trait method bodies without going through `self`.
+/// Prepends an optional prompt prefix to each text, cloning unchanged inputs when absent.
 pub(crate) fn apply_prefix(texts: &[String], prefix: Option<&str>) -> Vec<String> {
     match prefix {
         None => texts.to_vec(),

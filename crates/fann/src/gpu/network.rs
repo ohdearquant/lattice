@@ -141,11 +141,10 @@ impl GpuNetwork {
 
         // Process each layer
         for layer in self.layers.iter() {
-            // Check watchdog limit
+            // Keep each dispatch below the watchdog limit.
             let elements = layer.num_inputs * layer.num_outputs;
             if elements > thresholds::MAX_ELEMENTS_PER_DISPATCH {
-                // Fall back to CPU for this layer to avoid watchdog
-                // In production, we'd tile the dispatch instead
+                // Oversized layers restart the full forward pass on CPU; tiling is not implemented.
                 return self.forward_cpu(input);
             }
 
@@ -389,7 +388,9 @@ impl GpuNetwork {
         &self.cpu_network
     }
 
-    /// Sync weights from CPU to GPU
+    /// Re-uploads weights from this wrapper's owned CPU network.
+    ///
+    /// See [`docs/gpu.md`](../../docs/gpu.md#gpunetworksync_weights) for the public update path.
     pub fn sync_weights(&mut self) -> GpuResult<()> {
         for (layer_data, cpu_layer) in self.layers.iter().zip(self.cpu_network.layers()) {
             self.ctx.queue.write_buffer(
@@ -411,13 +412,9 @@ impl GpuNetwork {
         self.use_gpu
     }
 
-    /// Flush GPU memory
+    /// Drops pooled buffers, waits for GPU work, and returns freed pool bytes.
     ///
-    /// Releases cached buffers and waits for pending GPU operations.
-    /// Call this periodically during long training loops to prevent OOM
-    /// from async VRAM deallocation lag.
-    ///
-    /// Returns the number of bytes freed from the buffer pool.
+    /// See [`docs/gpu.md`](../../docs/gpu.md#gpunetworkflush) for the memory-release boundary.
     pub fn flush(&self) -> u64 {
         self.ctx.flush_memory()
     }

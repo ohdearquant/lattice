@@ -62,10 +62,9 @@ pub struct SimdConfig {
     pub avx512vnni_enabled: bool,
     /// **Unstable**: NEON support available (aarch64/ARM64).
     pub neon_enabled: bool,
-    /// **Unstable**: ARM FEAT_DotProd (SDOT/UDOT instructions) available (aarch64).
+    /// **Unstable**: whether aarch64 FEAT_DotProd is available for SDOT/UDOT dispatch.
     ///
-    /// Mandatory on Armv8.4+; optional on Armv8.2/v8.3. Always false on non-aarch64.
-    /// SDOT kernels must only be dispatched when this is `true`.
+    /// Always false off aarch64. See [`docs/simd.md`](../../docs/simd.md#dispatch-model) for availability rules.
     pub dotprod_enabled: bool,
 }
 
@@ -140,10 +139,9 @@ impl SimdConfig {
         }
     }
 
-    /// **Unstable**: reports compile-time wasm32 SIMD128 availability.
+    /// **Unstable**: reports whether this wasm32 artifact was built with SIMD128.
     ///
-    /// This mirrors the build's `target-feature=+simd128` setting; no
-    /// `SimdConfig` instance can override it at runtime. See docs/simd.md.
+    /// See [`docs/simd.md`](../../docs/simd.md#dispatch-model) for the compile-time dispatch model.
     #[inline]
     pub fn simd128_enabled(&self) -> bool {
         cfg!(all(target_arch = "wasm32", target_feature = "simd128"))

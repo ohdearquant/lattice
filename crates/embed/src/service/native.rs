@@ -17,11 +17,7 @@ enum LoadedModel {
     Qwen(Arc<QwenModel>),
 }
 
-// SA-161/162: Both BertModel and QwenModel derive Send + Sync automatically:
-// BertModel has no interior mutability; QwenModel wraps mutable state in Mutex
-// which is itself Send + Sync. The manual unsafe impls are therefore redundant
-// and have been removed to prevent a stale "read-only" comment from misleading
-// future readers.
+// Wrapped model types provide the required thread-safety — see docs/service.md.
 
 impl LoadedModel {
     fn encode_batch(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
@@ -48,21 +44,10 @@ impl LoadedModel {
 
 /// **Unstable**: model-loading API still evolving; signature may change as lattice-inference matures.
 ///
-/// Pure Rust embedding service backed by lattice-inference.
+/// Pure-Rust local embedding service for one BERT-family or Qwen model configuration.
 ///
-/// Uses SIMD-accelerated matrix multiplication and safetensors weight loading.
-/// No ONNX Runtime, no C++ FFI, no fastembed dependency.
-///
-/// Supports both encoder (BERT/BGE) and decoder (Qwen3) architectures.
-///
-/// # Cancellation Safety
-///
-/// Model loading uses `std::sync::OnceLock` + `spawn_blocking` instead of
-/// `tokio::sync::OnceCell`. This is critical because `tokio::sync::OnceCell::
-/// get_or_try_init` resets when the calling future is dropped (e.g., client
-/// disconnect during MCP timeout). With `OnceLock`, the blocking task runs to
-/// completion and stores the result regardless of async cancellation, so the
-/// model only loads once per process lifetime.
+/// It memoizes the load result independently of cancellation.
+/// See [`docs/service.md`](../../docs/service.md#nativeembeddingservice-implementation-notes) for loading and architecture details.
 pub struct NativeEmbeddingService {
     model: Arc<OnceLock<std::result::Result<LoadedModel, String>>>,
     model_config: ModelConfig,
@@ -155,25 +140,17 @@ impl NativeEmbeddingService {
             .unwrap_or(0)
     }
 
-    /// **Unstable**: download and load the model without producing any embeddings.
+    /// **Unstable**: preload the model without performing an encode pass.
     ///
-    /// Performs the same download + checksum-verify + model-load sequence as the
-    /// first call to `embed`, then returns `Ok(())` without running an encode pass.
-    /// Intended for use by the `--download-only` CLI flag so that the model is
-    /// warmed into the file-system cache without wasting a forward pass.
-    ///
-    /// Errors are the same as those from `embed`: network failures, checksum
-    /// mismatches, and unsupported model variants surface as `EmbedError`.
+    /// Returns the same loading errors as the first `embed` call.
+    /// See [`docs/service.md`](../../docs/service.md#nativeembeddingservice-implementation-notes) for preload behavior.
     pub async fn ensure_loaded(&self) -> Result<()> {
         self.ensure_model().await.map(|_| ())
     }
 
-    /// Ensure the model is loaded (cancellation-safe).
+    /// Ensures the shared model load has completed.
     ///
-    /// Uses `std::sync::OnceLock` so the model loading runs to completion
-    /// inside `spawn_blocking` even if the calling async future is dropped
-    /// (e.g., client disconnect during MCP timeout). The model loads exactly
-    /// once per process lifetime.
+    /// See [`docs/service.md`](../../docs/service.md#nativeembeddingservice-implementation-notes) for the cancellation invariant.
     async fn ensure_model(&self) -> Result<&LoadedModel> {
         // Fast path: already loaded.
         if let Some(result) = self.model.get() {
@@ -182,16 +159,12 @@ impl NativeEmbeddingService {
                 .map_err(|e| EmbedError::ModelInitialization(e.clone()));
         }
 
-        // Slow path: load model on blocking thread.
-        // Clone the Arc so spawn_blocking can store the result directly
-        // in the OnceLock, surviving async cancellation.
+        // The shared lock outlives a cancelled caller — see docs/service.md.
         let model_lock = self.model.clone();
         let model_config = self.model_config;
 
         tokio::task::spawn_blocking(move || {
-            // OnceLock::get_or_init blocks until init completes.
-            // If another thread is already loading, this waits for it.
-            // This is fine because we're on the blocking thread pool.
+            // Serialize initialization on the blocking thread pool.
             model_lock.get_or_init(|| load_model_sync(model_config));
         })
         .await

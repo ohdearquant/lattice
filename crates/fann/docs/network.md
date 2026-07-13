@@ -8,14 +8,14 @@ persistence. For training and the optional GPU path, see
 ## Mathematical model
 
 `Network` is an ordered, nonempty sequence of `Layer` values. A layer maps an
-input vector of width *I* to an output vector of width *O*:
+input vector of width _I_ to an output vector of width _O_:
 
 ```text
 z[o] = bias[o] + sum(input[i] * weight[o, i], i = 0..I)
 output[o] = activation(z[o])
 ```
 
-The output width of layer *k* must equal the input width of layer *k + 1*.
+The output width of layer _k_ must equal the input width of layer _k + 1_.
 `Network::new` checks this whether layers originate from a builder, binary data,
 Serde, or direct construction. There is no input-layer object: the first layer
 consumes the slice given to `Network::forward`, and the final layer buffer is the
@@ -25,13 +25,13 @@ network result.
 
 `Layer` owns the data below.
 
-| Field | Shape | Meaning |
-| --- | --- | --- |
-| `num_inputs` | scalar | Width of a vector accepted by the layer. |
-| `num_outputs` | scalar | Width written by the layer. |
-| `weights` | `num_outputs * num_inputs` `f32`s | Dense matrix in output-major row order. |
-| `biases` | `num_outputs` `f32`s | One additive bias for each output. |
-| `activation` | `Activation` | Function applied after the affine calculation. |
+| Field         | Shape                             | Meaning                                        |
+| ------------- | --------------------------------- | ---------------------------------------------- |
+| `num_inputs`  | scalar                            | Width of a vector accepted by the layer.       |
+| `num_outputs` | scalar                            | Width written by the layer.                    |
+| `weights`     | `num_outputs * num_inputs` `f32`s | Dense matrix in output-major row order.        |
+| `biases`      | `num_outputs` `f32`s              | One additive bias for each output.             |
+| `activation`  | `Activation`                      | Function applied after the affine calculation. |
 
 The row for output `o` begins at `o * num_inputs`. A two-output, three-input
 layer stores its matrix as:
@@ -127,7 +127,7 @@ accepted limitation.
 ## Preallocated forward execution
 
 When a network is constructed, it allocates exactly one activation `Vec<f32>`
-for every layer. Buffer *i* has `layers[i].num_outputs()` values. The user input
+for every layer. Buffer _i_ has `layers[i].num_outputs()` values. The user input
 is borrowed by the first layer rather than copied.
 
 ```text
@@ -178,14 +178,14 @@ derivatives calculated from an activation output `y`. `forward` is useful for
 pointwise functions. A scalar Softmax evaluates to `1.0`; use `forward_batch` to
 normalize an actual output vector.
 
-| Variant | Forward rule | Derivative from output | Range |
-| --- | --- | --- | --- |
-| `Linear` | `x` | `1` | unbounded |
-| `Sigmoid` | `1 / (1 + exp(-x))` | `y * (1 - y)` | `(0, 1)` for finite input |
-| `Tanh` | `tanh(x)` | `1 - y²` | `[-1, 1]` |
-| `ReLU` | `max(0, x)` | `1` when `y > 0`, else `0` | `[0, infinity)` |
-| `LeakyReLU(a)` | `x` if `x > 0`, else `a*x` | `1` when `y > 0`, else `a` | usually unbounded |
-| `Softmax` | normalized exponentials over the slice | diagonal only: `y * (1 - y)` | finite results sum to `1` |
+| Variant        | Forward rule                           | Derivative from output       | Range                     |
+| -------------- | -------------------------------------- | ---------------------------- | ------------------------- |
+| `Linear`       | `x`                                    | `1`                          | unbounded                 |
+| `Sigmoid`      | `1 / (1 + exp(-x))`                    | `y * (1 - y)`                | `(0, 1)` for finite input |
+| `Tanh`         | `tanh(x)`                              | `1 - y²`                     | `[-1, 1]`                 |
+| `ReLU`         | `max(0, x)`                            | `1` when `y > 0`, else `0`   | `[0, infinity)`           |
+| `LeakyReLU(a)` | `x` if `x > 0`, else `a*x`             | `1` when `y > 0`, else `a`   | usually unbounded         |
+| `Softmax`      | normalized exponentials over the slice | diagonal only: `y * (1 - y)` | finite results sum to `1` |
 
 `ReLU` is the default. `Activation::DEFAULT_LEAKY_ALPHA` is `0.01`, while a
 `LeakyReLU` value stores its chosen alpha. `is_bounded` is true for Sigmoid,
@@ -221,12 +221,12 @@ general full-Softmax-Jacobian API.
 
 The `simd` feature changes implementation strategy, not layer semantics.
 
-| Target | Dot-product path | Vector work | Scalar tail |
-| --- | --- | --- | --- |
-| AArch64 | NEON | Four 4-lane FMA accumulators: 16 values | 0–3 values |
-| x86_64 with AVX-512F | AVX-512 | Four 16-lane FMA accumulators: 64 values | 0–15 values |
-| x86_64 with AVX2 + FMA | AVX2/FMA | Four 8-lane FMA accumulators: 32 values | 0–7 values |
-| Other or unsupported runtime | Scalar | One value at a time | not applicable |
+| Target                       | Dot-product path | Vector work                              | Scalar tail    |
+| ---------------------------- | ---------------- | ---------------------------------------- | -------------- |
+| AArch64                      | NEON             | Four 4-lane FMA accumulators: 16 values  | 0–3 values     |
+| x86_64 with AVX-512F         | AVX-512          | Four 16-lane FMA accumulators: 64 values | 0–15 values    |
+| x86_64 with AVX2 + FMA       | AVX2/FMA         | Four 8-lane FMA accumulators: 32 values  | 0–7 values     |
+| Other or unsupported runtime | Scalar           | One value at a time                      | not applicable |
 
 On x86, runtime feature checks choose AVX-512F first, then AVX2 plus FMA, then
 the scalar loop. AArch64 relies on mandatory NEON. The independent accumulators
@@ -246,10 +246,10 @@ the bytes specified below.
 
 ### Header
 
-| Bytes | Encoding | Value |
-| --- | --- | --- |
-| `0..4` | four ASCII bytes | Magic `FANN` |
-| `4..8` | little-endian `u32` | Version `1` |
+| Bytes   | Encoding            | Value           |
+| ------- | ------------------- | --------------- |
+| `0..4`  | four ASCII bytes    | Magic `FANN`    |
+| `4..8`  | little-endian `u32` | Version `1`     |
 | `8..12` | little-endian `u32` | Layer count `L` |
 
 `L` cannot be zero. The first layer begins at byte 12.
@@ -258,23 +258,23 @@ the bytes specified below.
 
 Each layer is written in network order:
 
-| Field | Encoding | Notes |
-| --- | --- | --- |
-| input width | little-endian `u32` | `I`, nonzero when decoded |
-| output width | little-endian `u32` | `O`, nonzero when decoded |
-| activation tag | `u8` | Listed below |
-| LeakyReLU alpha | little-endian `f32` | Present only for tag `4` |
-| weights | `I * O` little-endian `f32`s | Output-major row layout |
-| biases | `O` little-endian `f32`s | Output order |
+| Field           | Encoding                     | Notes                     |
+| --------------- | ---------------------------- | ------------------------- |
+| input width     | little-endian `u32`          | `I`, nonzero when decoded |
+| output width    | little-endian `u32`          | `O`, nonzero when decoded |
+| activation tag  | `u8`                         | Listed below              |
+| LeakyReLU alpha | little-endian `f32`          | Present only for tag `4`  |
+| weights         | `I * O` little-endian `f32`s | Output-major row layout   |
+| biases          | `O` little-endian `f32`s     | Output order              |
 
-| Tag | Activation | Extra bytes |
-| --- | --- | --- |
-| `0` | `Linear` | none |
-| `1` | `Sigmoid` | none |
-| `2` | `Tanh` | none |
-| `3` | `ReLU` | none |
+| Tag | Activation         | Extra bytes |
+| --- | ------------------ | ----------- |
+| `0` | `Linear`           | none        |
+| `1` | `Sigmoid`          | none        |
+| `2` | `Tanh`             | none        |
+| `3` | `ReLU`             | none        |
 | `4` | `LeakyReLU(alpha)` | alpha `f32` |
-| `5` | `Softmax` | none |
+| `5` | `Softmax`          | none        |
 
 A non-LeakyReLU record is `9 + 4*I*O + 4*O` bytes. LeakyReLU adds four alpha
 bytes. The total serialized size is the 12-byte header plus all layer records.
@@ -319,16 +319,136 @@ pass with empty buffers or malformed row storage.
 `FannResult<T>` is `Result<T, FannError>`. Core error variants identify the
 failed boundary:
 
-| Error | Typical source |
-| --- | --- |
-| `InputSizeMismatch` / `OutputSizeMismatch` | Forward slice has the wrong width. |
-| `WeightCountMismatch` / `BiasCountMismatch` | Parameter vectors disagree with a declared shape. |
-| `InvalidLayerDimensions` | A width is zero or adjacent layers do not connect. |
-| `ShapeTooLarge` | A tensor exceeds the cap or its product overflows. |
-| `EmptyNetwork` | Construction or decoding has no layers. |
-| `InvalidBuilder` | Builder setup or binary input is malformed. |
-| `NumericInstability` | A layer output contains `NaN` or infinity. |
-| `InvalidDistributionParams` | Xavier/Glorot distribution setup failed. |
-| `SerializationError` | Serde-specific failure when that feature is enabled. |
+| Error                                       | Typical source                                       |
+| ------------------------------------------- | ---------------------------------------------------- |
+| `InputSizeMismatch` / `OutputSizeMismatch`  | Forward slice has the wrong width.                   |
+| `WeightCountMismatch` / `BiasCountMismatch` | Parameter vectors disagree with a declared shape.    |
+| `InvalidLayerDimensions`                    | A width is zero or adjacent layers do not connect.   |
+| `ShapeTooLarge`                             | A tensor exceeds the cap or its product overflows.   |
+| `EmptyNetwork`                              | Construction or decoding has no layers.              |
+| `InvalidBuilder`                            | Builder setup or binary input is malformed.          |
+| `NumericInstability`                        | A layer output contains `NaN` or infinity.           |
+| `InvalidDistributionParams`                 | Xavier/Glorot distribution setup failed.             |
+| `SerializationError`                        | Serde-specific failure when that feature is enabled. |
 
 For `TrainingError` and `GradientError`, see [training.md](training.md).
+
+## NetworkBuilder
+
+`NetworkBuilder` keeps architecture declaration separate from parameter
+initialization. This creates a two-layer classifier and validates the complete
+topology before constructing any `Layer`:
+
+```rust
+use lattice_fann::{Activation, NetworkBuilder};
+
+let network = NetworkBuilder::new()
+    .input(784)
+    .hidden(128, Activation::ReLU)
+    .output(10, Activation::Softmax)
+    .build()?;
+# Ok::<(), lattice_fann::FannError>(())
+```
+
+`build_with_seed` follows the same validation and layer order as `build`, but
+uses one `SmallRng` seeded with the supplied `u64` for every layer. Two builder
+values with the same input width, ordered layer specifications, and seed receive
+identical weights and zero biases. It is useful for repeatable tests and
+comparisons; `build` instead obtains its initialization entropy from the system
+RNG.
+
+## Network
+
+`Network` is mutable for forward evaluation because it owns reusable activation
+buffers. A typical call borrows the final buffer rather than making an output
+copy:
+
+```rust
+use lattice_fann::{Activation, NetworkBuilder};
+
+let mut network = NetworkBuilder::new()
+    .input(4)
+    .hidden(8, Activation::ReLU)
+    .output(2, Activation::Softmax)
+    .build()?;
+let output = network.forward(&[1.0, 2.0, 3.0, 4.0])?;
+assert_eq!(output.len(), 2);
+# Ok::<(), lattice_fann::FannError>(())
+```
+
+The output slice aliases the final activation buffer and cannot survive another
+mutable network operation. Layer accessors expose parameters for training or
+inspection, while `activations(i)` exposes the most recently written buffer for
+layer `i`.
+
+## Network::forward_async
+
+CPU computation is synchronous, but `forward_async` supplies the same awaitable
+shape as the feature-gated GPU interface. It delegates to `forward` and copies
+the final activation slice into an owned `Vec<f32>`, so its result can outlive
+later evaluation. Input-width and numeric-stability errors are unchanged from
+the synchronous path.
+
+## Network::forward_batch
+
+With the `parallel` feature, `forward_batch` distributes inputs over Rayon
+workers while borrowing one immutable set of layer parameters. It gives each
+input fresh activation vectors because a network's regular buffers are mutable
+output state. This avoids cloning weights and biases, but deliberately allocates
+per input; it is a throughput API rather than the allocation-free single-sample
+path.
+
+## Network serialization
+
+`to_bytes` and `from_bytes` are the API boundary for the versioned format
+documented above. A round trip preserves layer dimensions, activation values,
+weights, and biases; transient activation buffers are rebuilt rather than
+stored.
+
+The parser treats all byte slices as untrusted. It verifies the magic, version,
+nonzero layer count, and a minimum nine-byte record budget before reserving the
+layer vector. For each record it validates dimensions before collecting `f32`
+payloads, calculates payload byte counts with checked arithmetic, then routes
+vectors through `Layer::with_weights`. Finally, `Network::new` verifies
+connectivity and rebuilds buffers. Exact-length parsing rejects trailing data,
+so an extended or concatenated blob cannot masquerade as a valid v1 model.
+
+## Activation::forward_batch
+
+For `Linear`, `Sigmoid`, `Tanh`, `ReLU`, and `LeakyReLU`, batch evaluation
+applies the same pointwise rule as repeated scalar `forward` calls. Softmax is
+the exception: it must see the full vector to subtract the shared maximum and
+divide each exponent by the shared sum. Scalar `forward` on `Softmax` therefore
+returns `1.0`, the only possible result for a one-element normalization.
+
+With `simd`, batch ReLU and LeakyReLU use NEON on AArch64 or AVX2 on supported
+x86-64 CPUs; other CPUs retain the scalar loop. Vector routines preserve scalar
+semantics and process a scalar tail after full vector-width chunks.
+
+## Activation derivatives
+
+`derivative` and `derivative_batch` take post-activation output values rather
+than pre-activation inputs. This supports the pointwise formulas without a
+second temporary vector. Softmax is the exception: these APIs return
+`s[i] * (1 - s[i])`, its Jacobian diagonal, not a matrix derivative. The
+output-layer training path supplies cross-output terms; hidden Softmax remains
+invalid for the reasons in [Softmax is output-only](#softmax-is-output-only).
+
+## Layer
+
+`Layer::with_weights` accepts the output-major row layout used by forward
+evaluation. For `I` inputs and `O` outputs, the weight vector has exactly
+`I * O` elements and row `o` begins at `o * I`; the bias vector has exactly `O`
+elements. Constructors reject zero dimensions, multiplication overflow, and the
+100,000,000-element cap before accepting or allocating parameter storage.
+
+`Layer::new` samples a Xavier/Glorot normal distribution from entropy, while
+`Layer::new_with_rng` samples the same distribution from a caller-provided RNG.
+The latter supports reproducible construction. Both initialize biases to zero;
+`Layer::zeros` is the deterministic all-zero alternative.
+
+`Layer::forward` validates both caller-supplied slice widths, computes each
+affine row, and applies the activation in the supplied output buffer. It never
+allocates an output vector. The SIMD matrix path has the same output-major
+semantics as the scalar loop; on x86 it may prefetch only the next existing row
+as a performance hint.

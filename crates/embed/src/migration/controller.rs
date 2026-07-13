@@ -105,9 +105,7 @@ impl MigrationController {
                 total,
                 skipped,
             } => {
-                // Guard: processed + skipped must not reach total before this skip is
-                // counted. Equality means the budget is already exhausted (duplicate or
-                // retried skip); allow only while strictly less than total.
+                // Accept skips only while their combined work count is strictly below total.
                 if *processed + *skipped >= *total {
                     return Err(MigrationError::InvalidTransition {
                         from: format!("{:?}", self.state),
