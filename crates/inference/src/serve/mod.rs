@@ -25,6 +25,13 @@ use tokio::sync::watch;
 
 use crate::model::qwen35_config::GenerateConfig;
 
+/// Shared Metal GPU worker owner (issue #832, ADR-080 cluster C2/C3):
+/// the single dedicated thread that owns the `!Send` `MetalQwen35State` for
+/// the whole process lifetime, used by both the `lattice` unified server and
+/// the `lattice_serve` daemon.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub mod metal_worker;
+
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries
 /// already enforced this exact limit independently (`lattice.rs` via
 /// `DefaultBodyLimit::max`, `lattice_serve.rs` via `to_bytes(body, LIMIT)`);
