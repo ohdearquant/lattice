@@ -1,40 +1,27 @@
-//! **Stability tier**: Unstable
-//!
-//! The SIMD dispatch layer (`simd/`) and model-loading API are actively evolving.
-//! Platform consumers should use this crate via `lattice-engine`, not directly.
+//! **Stability tier: Unstable.** The SIMD dispatch layer (`simd/`) and model-loading API
+//! are actively evolving; platform consumers should use this crate via `lattice-engine`,
+//! not directly.
 //!
 //! **Exception — stable khive ANN consumer contract:**
 //! `simd::{squared_euclidean_distance, euclidean_distance, dot_product, cosine_similarity}`
 //! are a stable consumer contract for khive's ANN indexes (`khive-hnsw`, `khive-vamana`;
 //! ADR-012): their `(&[f32], &[f32]) -> f32` signatures and documented degenerate-input
 //! behaviour are guaranteed across the 0.4.x line, as is the squared-L2 ordering invariant
-//! relative to this crate's Euclidean wrapper (both derive from the same accumulated squared
-//! distance; SIMD is not bit-identical to scalar and promises no exact ordering of near-ties).
-//! The rest of `simd/` remains unstable.
-//!
-//! The 25 `unsafe` blocks are gated SIMD intrinsic calls: 21 on the
-//! AVX512/AVX2/NEON paths plus 4 wasm32 SIMD128 dispatch sites.
-//! See `foundation/STABILITY.md` for the full policy.
+//! relative to this crate's Euclidean wrapper (SIMD is not bit-identical to scalar and
+//! promises no exact ordering of near-ties). The rest of `simd/` remains unstable. The 25
+//! `unsafe` blocks in the crate are gated SIMD intrinsic calls: 21 on the AVX-512/AVX2/NEON
+//! paths plus 4 wasm32 SIMD128 dispatch sites.
 //!
 //! # lattice-embed
-
-#![warn(missing_docs)]
-#![allow(clippy::clone_on_copy)]
 //!
-//! Vector embedding generation with SIMD-accelerated operations for the lattice-runtime substrate.
+//! Vector embedding generation with SIMD-accelerated operations for the lattice-runtime
+//! substrate: pure-Rust local inference (no ONNX, no Python) over the BGE and multilingual
+//! E5/Qwen3 model families, an async API, and an in-process migration/backfill workflow for
+//! moving stored embeddings between model versions. See
+//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/embed/docs/design.md)
+//! for the module map and the migration/backfill architecture.
 //!
-//! This crate provides embedding generation services that convert text into
-//! high-dimensional vector representations suitable for semantic search and
-//! similarity matching.
-//!
-//! ## Features
-//!
-//! - **Native Embeddings**: Generate embeddings locally using pure Rust inference (default)
-//! - **BGE Models**: Support for BGE family of models (small/base/large)
-//! - **Async API**: Full async/await support with tokio
-//! - **SIMD Acceleration**: AVX2/NEON optimized vector operations
-//!
-//! ## Quick Start
+//! # Example
 //!
 //! ```rust,no_run
 //! use lattice_embed::{EmbeddingService, EmbeddingModel, NativeEmbeddingService};
@@ -54,36 +41,9 @@
 //!     Ok(())
 //! }
 //! ```
-//!
-//! ## Batch Processing
-//!
-//! ```rust,no_run
-//! use lattice_embed::{EmbeddingService, EmbeddingModel, NativeEmbeddingService};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let service = NativeEmbeddingService::default();
-//!
-//!     let texts = vec![
-//!         "First document".to_string(),
-//!         "Second document".to_string(),
-//!         "Third document".to_string(),
-//!     ];
-//!
-//!     let embeddings = service.embed(&texts, EmbeddingModel::BgeSmallEnV15).await?;
-//!     assert_eq!(embeddings.len(), 3);
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Available Models
-//!
-//! | Model | Dimensions | Use Case |
-//! |-------|------------|----------|
-//! | `BgeSmallEnV15` | 384 | Fast, general purpose (default) |
-//! | `BgeBaseEnV15` | 768 | Balanced quality/speed |
-//! | `BgeLargeEnV15` | 1024 | Highest quality |
+
+#![warn(missing_docs)]
+#![allow(clippy::clone_on_copy)]
 
 pub mod backfill;
 mod cache;

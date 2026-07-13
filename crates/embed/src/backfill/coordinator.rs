@@ -1,16 +1,8 @@
-//! Backfill coordinator: orchestrates embedding migration with routing logic.
-//!
-//! # Overview
-//!
-//! When migrating from one embedding model to another, the system needs to:
-//!
-//! 1. Continue serving queries against existing (legacy) embeddings
-//! 2. Route new document embeddings appropriately (dual-write or target-only)
-//! 3. Backfill old documents with the new model's embeddings in batches
-//! 4. Switch queries to the new model once sufficient coverage exists
-//!
-//! The [`BackfillCoordinator`] wraps a [`MigrationController`] and adds routing
-//! logic and batch management on top of the state machine.
+//! Backfill coordinator: orchestrates embedding migration with routing logic. See
+//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/embed/docs/design.md)
+//! for the four-stage migration workflow this coordinates. The [`BackfillCoordinator`]
+//! wraps a [`MigrationController`] and adds routing logic and batch management on top of
+//! the state machine.
 //!
 //! # Example
 //!
