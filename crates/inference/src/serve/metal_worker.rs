@@ -515,7 +515,7 @@ impl MetalWorker {
 // `lattice_inference::model::qwen35::test_support`'s own doc comment for the
 // same reasoning spelled out in full).
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 impl WorkerJob {
     /// Reply to this job with one event, exactly as the production worker
     /// loop would via its own `job.tx.send(..)`. Returns `false` once the
@@ -534,7 +534,7 @@ impl WorkerJob {
 /// generalized so both binaries' test suites build on one shared seam
 /// instead of each rolling its own raw `mpsc::unbounded_channel::<Job>()`
 /// pair.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerJob>) {
     // A large, effectively-unbounded cap: the overwhelming majority of
     // existing callers of this seam predate the #932 admission cap and
@@ -548,7 +548,7 @@ pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<Wor
 /// Same as [`test_client_and_jobs`], with an explicit admission cap (issue
 /// #932) instead of the effectively-unbounded default -- for tests that
 /// exercise `MetalWorkerClient::submit`'s admission rejection itself.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn test_client_and_jobs_with_cap(
     max_pending: usize,
 ) -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerJob>) {
@@ -566,7 +566,7 @@ pub fn test_client_and_jobs_with_cap(
 /// `test_client_and_jobs`/`spawn_fake` (the two test-utils seams that predate
 /// issue #932) use so pre-existing callers keep seeing effectively-unbounded
 /// admission unless they opt into the `_with_cap` variant.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 const TEST_EFFECTIVELY_UNBOUNDED_CAP: usize = 1_000_000;
 
 /// A [`MetalWorkerClient`] backed by a REAL background thread running the
@@ -585,7 +585,7 @@ const TEST_EFFECTIVELY_UNBOUNDED_CAP: usize = 1_000_000;
 /// value the real window-check computed) alongside `messages`/`cfg`, so a
 /// caller can build a faithful `GenerateOutput`/observation without
 /// re-deriving that count independently.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::type_complexity)]
 pub fn spawn_fake(
     context_window_policy: ContextWindowPolicy,
@@ -617,7 +617,7 @@ pub fn spawn_fake(
 /// instead of the effectively-unbounded default -- for tests that exercise
 /// `MetalWorkerClient::submit`'s admission rejection at the real-router
 /// (HTTP) layer.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::type_complexity)]
 pub fn spawn_fake_with_cap(
     max_pending: usize,
