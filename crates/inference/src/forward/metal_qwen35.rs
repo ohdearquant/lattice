@@ -19542,11 +19542,15 @@ mod inner {
         /// #682 Stage 4: armed, `encode_moe_ffn` records exactly the forced
         /// routing selection (post-renormalization gate weights) for each
         /// decoded token, keyed by the real `(layer_idx, token_idx)` the
-        /// token was decoded at — `token_idx` reading back `0` then `1`
-        /// (not e.g. a call counter reading `0` then `1`-per-layer, which
-        /// would coincide here since this fixture has one MoE layer) proves
-        /// `position` is the value actually threaded through
-        /// `encode_mlp_block` into `encode_moe_ffn`. Also exercises
+        /// token was decoded at. Because each position is normally decoded
+        /// exactly once, a per-layer invocation counter stays numerically
+        /// equal to the decode position no matter which positions are
+        /// chosen — so the discriminating probe here is the third decode,
+        /// which REPEATS position `1`: the threaded `position` reads back
+        /// `1` again, while any invocation counter (since arm or since
+        /// state creation) would have advanced to a new value. That third
+        /// record is what proves `position` is the value actually threaded
+        /// through `encode_mlp_block` into `encode_moe_ffn`. Also exercises
         /// `dump_moe_routing_trace_jsonl`'s round-trip.
         ///
         /// Mutation check (documented for the reviewer to exercise, not
@@ -19588,11 +19592,21 @@ mod inner {
             assert!(logits1.iter().all(|v| v.is_finite()));
             drop(_forced1);
 
+            // Third decode REPEATS position 1 (mechanically fine: it just
+            // rewrites that KV slot). This is the counter-vs-position
+            // discriminator: a per-layer invocation counter — since arm or
+            // since state creation — has advanced past 1 by this third
+            // call, so only the genuinely threaded `position` reads 1 here.
+            let _forced2 = ForcedMoeExpertsGuard::set(vec![0, 3]);
+            let logits2 = state.forward_step(3, 1);
+            assert!(logits2.iter().all(|v| v.is_finite()));
+            drop(_forced2);
+
             let trace = take_moe_routing_trace();
             assert_eq!(
                 trace.len(),
-                2,
-                "expected exactly one record per decoded token (1 MoE layer x 2 tokens): {trace:?}"
+                3,
+                "expected exactly one record per decode call (1 MoE layer x 3 calls): {trace:?}"
             );
             assert_eq!(trace[0].layer_idx, 0);
             assert_eq!(trace[0].token_idx, 0);
@@ -19600,6 +19614,13 @@ mod inner {
             assert_eq!(trace[1].layer_idx, 0);
             assert_eq!(trace[1].token_idx, 1);
             assert_eq!(trace[1].selected_ids, vec![2, 1]);
+            assert_eq!(trace[2].layer_idx, 0);
+            assert_eq!(
+                trace[2].token_idx, 1,
+                "repeated-position decode must record the threaded position (1), \
+                 not an invocation count (which would be 2 by this call): {trace:?}"
+            );
+            assert_eq!(trace[2].selected_ids, vec![0, 3]);
             for record in &trace {
                 assert_eq!(record.gate_weights.len(), 2);
                 for w in &record.gate_weights {
@@ -19614,7 +19635,7 @@ mod inner {
             dump_moe_routing_trace_jsonl(&trace, &dump_path).expect("jsonl dump must succeed");
             let dumped = std::fs::read_to_string(&dump_path).expect("read back jsonl");
             let lines: Vec<&str> = dumped.lines().collect();
-            assert_eq!(lines.len(), 2, "one JSONL line per record: {dumped:?}");
+            assert_eq!(lines.len(), 3, "one JSONL line per record: {dumped:?}");
             let parsed: MoeRoutingTraceRecord =
                 serde_json::from_str(lines[0]).expect("line 0 must parse as MoeRoutingTraceRecord");
             assert_eq!(parsed.token_idx, 0);
