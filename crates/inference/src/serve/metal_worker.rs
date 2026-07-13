@@ -57,14 +57,25 @@ use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
 use tokio::sync::{mpsc, watch};
 
+/// Selects the context-window formula enforced before Metal generation.
+/// Each serve adapter supplies the policy matching its pre-worker contract.
+#[derive(Debug, Clone, Copy)]
+pub enum ContextWindowPolicy {
+    /// Enforce `prompt_tokens + max_new_tokens <= model_max_context`.
+    PromptAndMaxTokens,
+    /// Enforce `prompt_tokens + max_new_tokens + reasoning_budget + 1
+    /// <= model_max_context`.
+    PromptAndDecodeWithDelimiter,
+}
+
 /// Everything a successful [`MetalWorker::spawn`] resolves to describe the
-/// loaded model, beyond the client handle itself: the format string and the
-/// actual KV context the loader allocated (never a hard-coded constant --
-/// `lattice_serve.rs`'s pre-existing `WorkerReady`/`#551` contract).
+/// loaded model, beyond the client handle itself: the format string, the
+/// actual KV context the loader allocated, and the adapter's window policy.
 #[derive(Debug, Clone)]
 pub struct WorkerMetadata {
     pub format: String,
     pub model_max_context: usize,
+    pub context_window_policy: ContextWindowPolicy,
 }
 
 /// One token-stream event from the worker back to a request handler.
@@ -189,45 +200,44 @@ impl MetalWorkerClient {
     }
 }
 
-/// Full KV-window invariant shared by both binaries' Metal jobs (#656):
-/// `prompt_len + max_new_tokens + reasoning_budget + 1 <= model_max_context`.
-/// `build_cfg`-equivalent request preparation on either binary only clamps
-/// `max_new_tokens`/`reasoning_budget` against the context window *in
-/// isolation* -- neither has visibility into the actual rendered prompt's
-/// token length at that point. Called here, on the worker thread, right
-/// after rendering+tokenizing the prompt and before any generation starts,
-/// so a request that would overrun the KV cache is rejected up front
-/// instead of silently hitting a mid-generation cache failure.
+/// Adapter-selected KV-window invariant for Metal jobs (#656).
+/// `lattice_serve` only knows the rendered prompt length on this worker, so
+/// its full-window check runs here. `lattice` already checks the rendered
+/// prompt in its HTTP preflight; repeating that adapter's exact formula here
+/// prevents the shared worker from tightening its accepted boundary.
 ///
-/// Ported verbatim (same math, same message shape) from
-/// `lattice_serve.rs`'s pre-existing `check_prompt_fits_window`, which this
-/// replaces. `lattice.rs`'s own HTTP-layer `check_context_window` (in
-/// `prepare_chat_request`, shared by its CPU and Metal backends alike) is
-/// untouched by this refactor and still runs first; for the Metal backend
-/// specifically this worker-level check now also runs afterward as part of
-/// the single shared loop, and is unreachable in practice given
-/// `check_context_window` already ran -- except for one theoretical
-/// exact-boundary edge (`prompt_tokens + max_tokens == max_context` with
-/// zero `reasoning_budget`) that `check_context_window`'s `<=` boundary
-/// accepts and this stricter (`+1`) invariant would not. See the PR body
-/// for why that edge is treated as a safe, unreachable-in-practice
-/// tightening rather than an observable regression.
+/// `lattice_serve.rs` keeps its pre-existing full-decode formula, including
+/// reasoning tokens and one delimiter slot. `lattice.rs` keeps its
+/// pre-existing HTTP formula, which accepts
+/// `prompt_tokens + max_tokens == max_context`.
 fn check_prompt_fits_window(
+    policy: ContextWindowPolicy,
     model_max_context: usize,
     prompt_len: usize,
     cfg: &GenerateConfig,
 ) -> Result<(), ApiError> {
-    let decode_cap = cfg
-        .max_new_tokens
-        .saturating_add(cfg.reasoning_budget.unwrap_or(0));
-    let required = prompt_len.saturating_add(decode_cap).saturating_add(1);
+    let (decode_cap, delimiter_tokens) = match policy {
+        ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
+        ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
+            cfg.max_new_tokens
+                .saturating_add(cfg.reasoning_budget.unwrap_or(0)),
+            1,
+        ),
+    };
+    let required = prompt_len
+        .saturating_add(decode_cap)
+        .saturating_add(delimiter_tokens);
     if required > model_max_context {
         let available = model_max_context.saturating_sub(prompt_len);
+        let delimiter_clause = match delimiter_tokens {
+            0 => String::new(),
+            n => format!(" plus {n}"),
+        };
         return Err(ApiError::BadRequest {
             message: format!(
                 "prompt has {prompt_len} tokens, leaving {available} of the \
                  {model_max_context}-token context window for generation, but this \
-                 request needs {decode_cap} generated tokens plus 1 (total {required}); \
+                 request needs {decode_cap} generated tokens{delimiter_clause} (total {required}); \
                  reduce max_tokens/reasoning_budget or shorten the prompt"
             ),
             code: "context_length_exceeded",
@@ -352,8 +362,13 @@ impl MetalWorker {
                     // both the window check and the generation call below.
                     let prompt = format_chat_template(messages);
                     let prompt_len = tokenizer.tokenize(&prompt).real_length;
-                    check_prompt_fits_window(meta.model_max_context, prompt_len, cfg)
-                        .map_err(WorkerFailure::Rejected)?;
+                    check_prompt_fits_window(
+                        meta.context_window_policy,
+                        meta.model_max_context,
+                        prompt_len,
+                        cfg,
+                    )
+                    .map_err(WorkerFailure::Rejected)?;
 
                     // Cache-aware + cancellation-aware call (#462/#744):
                     // reuses the previous turn's shared token prefix
@@ -469,6 +484,7 @@ pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<Wor
 #[cfg(feature = "test-utils")]
 #[allow(clippy::type_complexity)]
 pub fn spawn_fake(
+    context_window_policy: ContextWindowPolicy,
     model_max_context: usize,
     tokenizer: BpeTokenizer,
     mut generate: impl FnMut(
@@ -486,7 +502,7 @@ pub fn spawn_fake(
         run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
             let prompt = format_chat_template(messages);
             let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
-            check_prompt_fits_window(model_max_context, prompt_tokens, cfg)
+            check_prompt_fits_window(context_window_policy, model_max_context, prompt_tokens, cfg)
                 .map_err(WorkerFailure::Rejected)?;
             generate(messages, cfg, prompt_tokens, on_token, should_cancel)
                 .map_err(WorkerFailure::Failed)
@@ -1019,7 +1035,13 @@ mod tests {
         // model_max_context=8, prompt_len=2, max_new_tokens=7, reasoning_budget=None:
         // 2 (prompt) + 7 (decode) + 1 (delimiter) = 10 > 8 -- must reject.
         let cfg = cfg_with(7, None);
-        let err = check_prompt_fits_window(8, 2, &cfg).unwrap_err();
+        let err = check_prompt_fits_window(
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+            8,
+            2,
+            &cfg,
+        )
+        .unwrap_err();
         match err {
             ApiError::BadRequest { message, code } => {
                 assert_eq!(code, "context_length_exceeded");
@@ -1033,19 +1055,52 @@ mod tests {
     }
 
     #[test]
-    fn check_prompt_fits_window_accepts_exact_boundary_no_needless_truncation() {
-        // model_max_context=8, prompt_len=1, max_new_tokens=6, reasoning_budget=1:
-        // 1 + 6 + 1 + 1 (delimiter) = 9 > 8 -- must reject.
-        let cfg = cfg_with(6, Some(1));
-        assert!(check_prompt_fits_window(8, 1, &cfg).is_err());
+    fn lattice_context_boundary_accepts_exact_window_and_rejects_one_past() {
+        let cfg = cfg_with(7, None);
+        assert!(
+            check_prompt_fits_window(ContextWindowPolicy::PromptAndMaxTokens, 8, 1, &cfg).is_ok()
+        );
+        assert!(
+            check_prompt_fits_window(ContextWindowPolicy::PromptAndMaxTokens, 8, 2, &cfg).is_err()
+        );
+    }
 
-        // Same request, one more slot of room (9): 1 + 6 + 1 + 1 = 9 <= 9 -- accepted.
-        assert!(check_prompt_fits_window(9, 1, &cfg).is_ok());
+    #[test]
+    fn lattice_serve_context_boundary_accepts_exact_window_and_rejects_one_past() {
+        let at_boundary = cfg_with(5, Some(1));
+        assert!(
+            check_prompt_fits_window(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                8,
+                1,
+                &at_boundary,
+            )
+            .is_ok()
+        );
+
+        let one_past = cfg_with(6, Some(1));
+        assert!(
+            check_prompt_fits_window(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                8,
+                1,
+                &one_past,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn check_prompt_fits_window_accepts_ordinary_prompt_unclamped() {
         let cfg = cfg_with(50, None);
-        assert!(check_prompt_fits_window(4096, 100, &cfg).is_ok());
+        assert!(
+            check_prompt_fits_window(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                4096,
+                100,
+                &cfg,
+            )
+            .is_ok()
+        );
     }
 }

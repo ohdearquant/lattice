@@ -76,12 +76,13 @@ mod imp {
     };
     use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::serve::metal_worker::{
-        MetalWorker, MetalWorkerClient, StartupError, WorkerEvent, WorkerMetadata,
+        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
+        WorkerMetadata,
     };
     /// Only used by the test module's `.tokenize(..)` calls on a real (tiny)
     /// tokenizer; production code never tokenizes outside the shared worker
-    /// (`lattice_inference::serve::metal_worker`), hence `#[cfg(test)]`.
-    #[cfg(test)]
+    /// (`lattice_inference::serve::metal_worker`), hence the test feature gate.
+    #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use lattice_inference::tokenizer::Tokenizer as _;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use serde::Deserialize;
@@ -92,7 +93,7 @@ mod imp {
     /// (`mpsc::UnboundedReceiver<WorkerJob>` etc. -- see
     /// `lattice_inference::serve::metal_worker`'s `test-utils`-gated
     /// surface); production code only ever holds a `MetalWorkerClient`.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use tokio::sync::mpsc;
 
     /// Normalizes [`WorkerEvent::Cancelled`] (the job was skipped at dequeue
@@ -1735,6 +1736,7 @@ mod imp {
             WorkerMetadata {
                 format: fmt,
                 model_max_context,
+                ..
             },
         ) = match MetalWorker::spawn(move || {
             let LoadedModel {
@@ -1749,6 +1751,7 @@ mod imp {
                 WorkerMetadata {
                     format,
                     model_max_context,
+                    context_window_policy: ContextWindowPolicy::PromptAndDecodeWithDelimiter,
                 },
             ))
         }) {
@@ -1811,9 +1814,13 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use lattice_inference::serve::ApiError;
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use lattice_inference::serve::metal_worker::{WorkerJob, spawn_fake, test_client_and_jobs};
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::sync::Arc;
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::time::Duration;
 
         // NOTE (issue #832): the FIFO/cancellation/window-check worker-loop
@@ -1850,6 +1857,7 @@ mod imp {
         /// `lattice.rs`'s
         /// `metal_handle_is_backed_by_the_shared_metal_worker_client` for
         /// the sibling marker on the other binary.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[test]
         fn app_state_is_backed_by_the_shared_metal_worker_client() {
             fn build_from_shared_client(jobs: MetalWorkerClient) -> AppState {
@@ -2063,6 +2071,7 @@ mod imp {
         // seam, receiver half discarded) is a faithful stand-in: no GPU, no
         // model load.
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn test_app_state() -> AppState {
             let (jobs, _rx) = test_client_and_jobs();
             AppState {
@@ -2080,6 +2089,7 @@ mod imp {
             }
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         async fn error_message_of(response: Response) -> (StatusCode, String) {
             let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2094,6 +2104,7 @@ mod imp {
             (status, message)
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_unknown_role_400() {
             // A role string that is not an OpenAI chat role at all (as
@@ -2112,6 +2123,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_tool_and_developer_role_400_unsupported_feature() {
             for role in ["tool", "developer"] {
@@ -2132,6 +2144,7 @@ mod imp {
             }
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_image_url_400() {
             let body = Body::from(
@@ -2146,6 +2159,7 @@ mod imp {
             assert_eq!(message, IMAGE_REQUIRES_VISION_MESSAGE);
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_oversized_part_400() {
             let big_text = "x".repeat(MAX_CONTENT_PART_BYTES + 1);
@@ -2167,6 +2181,7 @@ mod imp {
         // unsupported field instead of a plain-text completion that quietly
         // ignored the request's actual contract.
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_tools_400() {
             let body = Body::from(
@@ -2183,6 +2198,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_tool_choice_400() {
             let body = Body::from(
@@ -2197,6 +2213,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_json_response_format_400() {
             let body = Body::from(
@@ -2213,6 +2230,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_n_greater_than_one_400() {
             let body =
@@ -2223,6 +2241,7 @@ mod imp {
             assert_eq!(message, "n > 1 is not supported");
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_logprobs_400() {
             let body = Body::from(
@@ -2237,6 +2256,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_stop_400() {
             let body = Body::from(
@@ -2248,6 +2268,7 @@ mod imp {
             assert_eq!(message, "stop is not supported by this server");
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_conflicting_max_tokens_400() {
             let body = Body::from(
@@ -2266,6 +2287,7 @@ mod imp {
 
         // ── ADR-080 C2 (#782): max_tokens=0 rejection + finish_reason round-trip ──
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_max_tokens_zero_400() {
             // #745: previously clamped straight through into a zero-budget
@@ -2284,6 +2306,7 @@ mod imp {
         /// tests can stand in for the worker: reply with whatever
         /// `WorkerEvent` sequence the test wants (via `WorkerJob::reply`,
         /// also `test-utils`-gated) without a real GPU/model.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn test_app_state_with_jobs() -> (AppState, mpsc::UnboundedReceiver<WorkerJob>) {
             let (jobs, jobs_rx) = test_client_and_jobs();
             let state = AppState {
@@ -2307,6 +2330,7 @@ mod imp {
         /// not a hardcoded `"stop"`. A fake worker task stands in for the
         /// GPU, replying with a crafted `WorkerEvent::Complete` (`stopped`)
         /// directly.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         async fn non_streaming_finish_reason_for(stopped: bool) -> String {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
@@ -2337,11 +2361,13 @@ mod imp {
                 .to_string()
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_non_streaming_finish_reason_stop_when_engine_stopped() {
             assert_eq!(non_streaming_finish_reason_for(true).await, "stop");
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_non_streaming_finish_reason_length_when_not_stopped() {
             // Previously this hardcoded "stop" unconditionally, so a
@@ -2353,6 +2379,7 @@ mod imp {
         /// Same round-trip as above, but through the SSE streaming path
         /// (`Phase::Body`'s `Ev::Done` arm) instead of the non-streaming
         /// JSON body.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         async fn streaming_finish_reason_for(stopped: bool) -> String {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
@@ -2380,6 +2407,7 @@ mod imp {
             String::from_utf8(bytes.to_vec()).expect("SSE body must be valid UTF-8")
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_streaming_finish_reason_stop_when_engine_stopped() {
             let text = streaming_finish_reason_for(true).await;
@@ -2389,6 +2417,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_streaming_finish_reason_length_when_not_stopped() {
             let text = streaming_finish_reason_for(false).await;
@@ -2435,6 +2464,7 @@ mod imp {
         /// carrying a `finish_reason: "length"` terminal chunk instead of a
         /// 400 error envelope. Verified by reverting the preflight and
         /// re-running: see the PR body's mutation log.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse() {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
@@ -2512,7 +2542,7 @@ mod imp {
         /// reason as `lattice.rs`'s equivalent test modules: this needs a
         /// real (tiny) `BpeTokenizer`, which is only constructible outside
         /// this crate's own `#[cfg(test)]` build via that feature.
-        #[cfg(feature = "test-utils")]
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod real_router_overflow_parity {
             use super::*;
             use lattice_inference::serve::{
@@ -2532,6 +2562,7 @@ mod imp {
                     .tokenizer()
                     .clone();
                 let jobs = spawn_fake(
+                    ContextWindowPolicy::PromptAndDecodeWithDelimiter,
                     model_max_context,
                     tokenizer,
                     |_messages, _cfg, prompt_tokens, _on_token, _should_cancel| {
@@ -2637,6 +2668,7 @@ mod imp {
         // that no longer exists here.
         // -----------------------------------------------------------------------
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn cm_lattice_serve_model_mismatch_accepted_expected_deviation() {
             // Expected-deviation fixture, not a bug fix: `lattice serve` (the
@@ -2706,7 +2738,7 @@ mod imp {
         // `parity_table` module gating. CI's "serve-surface capability-
         // matrix fixtures" step adds `test-utils` alongside `f16,metal-gpu`
         // for this binary to keep running it (see `.github/workflows/ci.yml`).
-        #[cfg(feature = "test-utils")]
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod parity_table {
             use super::*;
             use lattice_inference::serve::{
@@ -2731,6 +2763,7 @@ mod imp {
                     .tokenizer()
                     .clone();
                 let jobs = spawn_fake(
+                    ContextWindowPolicy::PromptAndDecodeWithDelimiter,
                     model_max_context,
                     tokenizer,
                     |_messages, _cfg, _prompt_tokens, on_token, _should_cancel| {
@@ -2863,7 +2896,7 @@ mod imp {
         // `&[ChatMessage]`/`&GenerateConfig` it was called with, then
         // returns a canned result; it never recomputes `build_cfg` itself.
         // -----------------------------------------------------------------------
-        #[cfg(feature = "test-utils")]
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod production_adapter_observation {
             use super::*;
             use lattice_inference::serve::{
@@ -2897,6 +2930,7 @@ mod imp {
                     Arc::new(Mutex::new(None));
                 let observed_for_worker = Arc::clone(&observed);
                 let jobs = spawn_fake(
+                    ContextWindowPolicy::PromptAndDecodeWithDelimiter,
                     model_max_context,
                     tokenizer,
                     move |messages, cfg, prompt_tokens, on_token, _should_cancel| {

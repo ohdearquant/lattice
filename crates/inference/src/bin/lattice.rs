@@ -2653,7 +2653,7 @@ mod serve {
             tokenizer_dir: Option<std::path::PathBuf>,
         ) -> Result<(Self, usize), String> {
             use lattice_inference::serve::metal_worker::{
-                MetalWorker, StartupError, WorkerMetadata,
+                ContextWindowPolicy, MetalWorker, StartupError, WorkerMetadata,
             };
 
             let tokenizer_path = tokenizer_dir
@@ -2703,6 +2703,7 @@ mod serve {
                     WorkerMetadata {
                         format: "q4".to_string(),
                         model_max_context: max_context,
+                        context_window_policy: ContextWindowPolicy::PromptAndMaxTokens,
                     },
                 ))
             })
