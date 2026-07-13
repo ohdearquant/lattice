@@ -247,3 +247,126 @@ warmup_repeats = 1
 warmup_tokens = 8
 model = "qwen3.5-0.8b"
 quantization = "q4"
+
+# bench_apples_precise.sh migration (issue #813 step 2). windows/prompt are
+# IDENTICAL to the legacy script's N1=64/N2=512/PROMPT; measured_repeats=13
+# + warmup_repeats=2 (per engine, at N2=512 tokens) reproduce "15 runs total,
+# 2 warmup, 13 measured" for every engine (the legacy script warms every
+# engine identically, unlike apples_to_apples_q8's mlx-only warmup). The
+# legacy script's own aggregation (trimmed mean dropping the top/bottom 2
+# of the MEASURED set, 95% normal-approximation CI) is `trimmed_mean`/
+# `trim=2` -- see SlopeResult.slope_ci95_legacy for why this is carried over
+# as a legacy heuristic, not corrected.
+[profiles.apples_precise]
+description = "bench_apples_precise.sh: reduced-noise edition, N1=64/N2=512, 13 measured + 2 warmup, trimmed mean"
+windows = [64, 512]
+measured_repeats = 13
+prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
+aggregation = "trimmed_mean"
+trim = 2
+
+[[profiles.apples_precise.engines]]
+name = "lattice"
+warmup_repeats = 2
+warmup_tokens = 512
+model = "qwen3.5-0.8b"
+quantization = "q8"
+
+[[profiles.apples_precise.engines]]
+name = "ollama"
+warmup_repeats = 2
+warmup_tokens = 512
+model = "qwen3.5:0.8b"
+quantization = "q8"
+
+[[profiles.apples_precise.engines]]
+name = "mlx"
+warmup_repeats = 2
+warmup_tokens = 512
+model = "qwen3.5-0.8b"
+quantization = "q8"
+
+# bench_q4_apples.sh migration (issue #813 step 2). windows/measured_repeats/
+# prompt identical to the legacy script's N1=32/N2=256/RUNS=5/PROMPT; neither
+# lattice nor ollama gets a warmup (the script issues none for either), mlx
+# warms once at 8 tokens before its loop -- same shape as
+# apples_to_apples_q4, but this is bench_q4_apples.sh's OWN (separate,
+# pre-existing) reimplementation of that shape, migrated on its own profile
+# per the issue's "one script per PR" plan.
+#
+# DISCLOSED CORRECTION vs the legacy script: bench_q4_apples.sh set
+# BENCH_Q4_DIR/BENCH_TOKENIZER_DIR env vars when invoking bench_decode_ab,
+# but bench_decode_ab.rs never reads either of those names (only
+# LATTICE_MODEL_DIR/LATTICE_TOKENIZER_DIR) -- so the legacy script's lattice
+# leg silently fell back to LATTICE_MODEL_DIR's default
+# (~/.lattice/models/qwen3.5-0.8b, i.e. Q8 safetensors), never actually
+# exercising the Q4 weights its own output labeled "Lattice Q4". This
+# profile's `lattice` engine group uses the model/dir mapping the adapter
+# actually wires to LATTICE_MODEL_DIR (qwen3.5-0.8b-q4, the plain-Q4
+# directory bench_q4_apples.sh named but never reached) -- a bug fix, not a
+# parameter change: windows/repeats/warmup are unchanged from the legacy
+# script, only the broken env-var name is corrected so "q4" observations are
+# actually Q4.
+[profiles.q4_apples]
+description = "bench_q4_apples.sh: quant-matched Q4 comparison, N1=32/N2=256/runs=5 (lattice model-dir env-var bug fixed, see comment above)"
+windows = [32, 256]
+measured_repeats = 5
+prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
+aggregation = "median"
+
+[[profiles.q4_apples.engines]]
+name = "lattice"
+warmup_repeats = 0
+model = "qwen3.5-0.8b-q4"
+quantization = "q4"
+
+[[profiles.q4_apples.engines]]
+name = "ollama"
+warmup_repeats = 0
+model = "qwen3.5:0.8b"
+quantization = "q8"
+
+[[profiles.q4_apples.engines]]
+name = "mlx"
+warmup_repeats = 1
+warmup_tokens = 8
+model = "qwen3.5-0.8b"
+quantization = "q4"
+
+# bench_context_scaling.sh migration (issue #813 step 2). `windows` is the
+# fixed baseline N1=8 followed by the default CONTEXTS=(64 128 256) -- the
+# harness's own aggregate() always computes every later window's slope
+# against `windows[0]`, exactly reproducing "measure the N1 baseline once,
+# reuse its median for every context length" without any measured_calls
+# override. measured_repeats=5 matches the legacy RUNS default. Only mlx
+# gets a warmup (4 tokens, once, before the whole baseline+context loop);
+# lattice and ollama get none, matching the legacy script's per-engine
+# structure exactly. CONTEXTS/RUNS are runtime-overridable via the wrapper
+# script (scripts/bench_context_scaling.sh), which rebuilds an equivalent
+# ProfileConfig with the requested windows/measured_repeats when either
+# environment variable is set, so this profile's values are the DEFAULTS.
+[profiles.context_scaling]
+description = "bench_context_scaling.sh: decode throughput vs context length, N1=8 baseline vs {64,128,256}"
+windows = [8, 64, 128, 256]
+measured_repeats = 5
+prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
+aggregation = "median"
+
+[[profiles.context_scaling.engines]]
+name = "lattice"
+warmup_repeats = 0
+model = "qwen3.5-0.8b"
+quantization = "q8"
+
+[[profiles.context_scaling.engines]]
+name = "ollama"
+warmup_repeats = 0
+model = "qwen3.5:0.8b"
+quantization = "q8"
+
+[[profiles.context_scaling.engines]]
+name = "mlx"
+warmup_repeats = 1
+warmup_tokens = 4
+model = "qwen3.5-0.8b"
+quantization = "q8"
