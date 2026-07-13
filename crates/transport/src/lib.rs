@@ -8,9 +8,9 @@
 //! between model versions (for example, BGE-small to mE5-small). The load-bearing
 //! numerical invariant is that the solvers stay in log space throughout and never
 //! materialize the Gibbs kernel `exp(-C/epsilon)`, which prevents underflow at small
-//! regularization epsilon. The crate is a dependency-free leaf: pure-Rust math with
-//! no BLAS/LAPACK, and [`SinkhornWorkspace`] preallocates the inner-loop buffers so
-//! callers allocate once and reuse.
+//! regularization epsilon. The crate is a leaf with no intra-workspace dependencies:
+//! pure-Rust math with no BLAS/LAPACK, and [`SinkhornWorkspace`] preallocates the
+//! inner-loop buffers so callers allocate once and reuse.
 //!
 //! The layers run from the numerical foundation ([`logsumexp`]) up through the
 //! [`cost`] abstraction, the core solvers ([`sinkhorn`], [`sinkhorn_log`],

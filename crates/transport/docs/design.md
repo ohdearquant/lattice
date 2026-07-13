@@ -11,8 +11,9 @@ drift across stored embeddings.
 The crate is organized into layers, leaf-most first:
 
 - **Numerical foundation** — `math`, `logsumexp`: stable log-domain arithmetic.
-- **Cost abstraction** — `cost`: the `CostMatrix` trait and its implementations
-  (`DenseCostMatrix`, `PairwiseCostMatrix`, `SquaredEuclidean`, `CosineDistance`).
+- **Cost abstraction** — `cost`: the `CostMatrix` trait with its `DenseCostMatrix`
+  and `PairwiseCostMatrix` implementations, plus the `PointMetric` distance types
+  `SquaredEuclidean` and `CosineDistance`.
 - **Core solvers** — `sinkhorn` (balanced), `sinkhorn_log` (epsilon-scaling
   schedule, more stable at small epsilon), `unbalanced` (KL-relaxed marginals for
   imprecise source/target masses).
