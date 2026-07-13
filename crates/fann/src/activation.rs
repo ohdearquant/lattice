@@ -1,7 +1,9 @@
-//! Activation functions for neural networks
+//! Activation functions for dense networks.
 //!
-//! Provides common activation functions with forward and derivative computations.
-//! Optimized for fast inference with minimal branching.
+//! Element-wise and batch evaluation cover the common nonlinearities; batch
+//! Softmax normalizes the entire layer. ReLU variants use SIMD when available.
+//!
+//! See `docs/network.md` for formulas, numerical rules, and derivative limits.
 
 /// Activation function types
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -312,18 +314,11 @@ impl Activation {
         }
     }
 
-    /// Compute derivative of activation function at given output value
+    /// Compute an activation derivative from its output value.
     ///
-    /// For backpropagation, we typically have the activation output `y = f(x)`
-    /// and need `f'(x)`. For efficiency, many activation derivatives can be
-    /// computed from the output `y` directly.
-    ///
-    /// For Softmax, both this method and `derivative_batch` return only the
-    /// **diagonal** of the Jacobian: `s_i * (1 − s_i)`.  The full Jacobian
-    /// (`J[i,j] = s_i * (δ_ij − s_j)`) is required for mathematically correct
-    /// Softmax gradients; it is implemented for the output layer in
-    /// `backprop.rs::compute_gradients`.  Hidden-layer Softmax uses only the
-    /// diagonal approximation (accepted limitation, see ADR-023).
+    /// Softmax returns only the Jacobian diagonal. Output-layer backpropagation
+    /// computes the full Jacobian; the builder rejects hidden-layer Softmax
+    /// (see ADR-023).
     #[inline]
     pub fn derivative(&self, output: f32) -> f32 {
         match self {

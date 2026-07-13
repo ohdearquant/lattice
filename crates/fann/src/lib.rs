@@ -1,48 +1,12 @@
-//! lattice-fann: fast neural network primitives for sub-5ms CPU inference.
+//! `lattice-fann` provides small dense neural networks for CPU-first inference.
 //!
-//! Lightweight building blocks for tiny models — knowledge-distillation students
-//! rather than full transformers — that need to run without GPU acceleration:
-//! pre-allocated layer buffers so the forward pass makes no allocations (see
-//! ADR-021), a fluent [`NetworkBuilder`], the common activations (ReLU, Sigmoid,
-//! Tanh, Softmax, LeakyReLU), and basic backpropagation training with momentum
-//! (`BackpropTrainer`, gradient guards per ADR-022). Batch inference (`parallel`),
-//! serialization (`serde`), and GPU acceleration via wgpu (`gpu`, see ADR-025) are
-//! optional features.
+//! Use [`NetworkBuilder`] to assemble layers, [`Network`] to run them, and
+//! [`BackpropTrainer`] to train them. The CPU forward path reuses activation
+//! buffers; `parallel`, `serde`, and `gpu` add batch inference, persistence, and
+//! optional GPU acceleration. `simd` accelerates supported CPU kernels.
 //!
-//! For the network/training architecture and the GPU backend's buffer-pool and
-//! circuit-breaker design, see
-//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/fann/docs/design.md).
-//!
-//! # Example
-//!
-//! ```
-//! use lattice_fann::{Network, NetworkBuilder, Activation};
-//!
-//! // Build a simple classifier: 4 inputs -> 8 hidden -> 3 outputs
-//! let mut network = NetworkBuilder::new()
-//!     .input(4)
-//!     .hidden(8, Activation::ReLU)
-//!     .output(3, Activation::Softmax)
-//!     .build()
-//!     .unwrap();
-//!
-//! // Run inference
-//! let input = [1.0, 2.0, 3.0, 4.0];
-//! let output = network.forward(&input).unwrap();
-//!
-//! // Output is a probability distribution (sums to 1.0)
-//! assert_eq!(output.len(), 3);
-//! let sum: f32 = output.iter().sum();
-//! assert!((sum - 1.0).abs() < 1e-5);
-//! ```
-//!
-//! # Feature Flags
-//!
-//! - `std` (default): Enable standard library support
-//! - `simd` (default): Enable SIMD optimizations for matrix operations
-//! - `parallel`: Enable parallel batch inference via rayon
-//! - `serde`: Enable serialization/deserialization support
-//! - `gpu`: Enable GPU acceleration via wgpu (Metal/Vulkan/DX12)
+//! See `docs/design.md` for the crate architecture and `docs/network.md` for
+//! the network, activation, and binary-format reference.
 
 #![warn(missing_docs)]
 

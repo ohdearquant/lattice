@@ -1,12 +1,10 @@
 //! REINFORCE with Leave-One-Out baseline (RLOO) policy-gradient trainer.
 //!
-//! Trains a selector gate network to prefer adapters that produce positive
-//! reward signals. The gate network must use `Activation::Linear` on its
-//! output layer (raw logits); softmax is applied inside this module.
+//! Trains a selector gate from rewards over its raw output logits. Its output
+//! layer must use `Activation::Linear`; this module applies softmax itself.
+//! EWC integration remains an independent call-site concern.
 //!
-//! EWC forgetting-guard integration is intentionally absent here — compose
-//! [`crate::training::ewc::DiagonalFisher`] at the call site to pin prior-task
-//! parameters independently of the policy-gradient update.
+//! See `docs/training.md` for reward semantics, RLOO sampling, and loss terms.
 
 use crate::activation::Activation;
 use crate::error::{FannError, FannResult, validate_allocation_size};

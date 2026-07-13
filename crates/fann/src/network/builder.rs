@@ -1,6 +1,10 @@
-//! Network builder for fluent API construction
+//! Fluent construction of dense feedforward networks.
 //!
-//! Provides `NetworkBuilder` for constructing neural networks with a fluent API.
+//! The builder records layer sizes and activations, then validates and creates
+//! `Layer` objects at build time. It can use either entropy or a caller seed
+//! for Xavier/Glorot initialization.
+//!
+//! See `docs/network.md` for build-time validation and buffer allocation.
 
 use crate::activation::Activation;
 use crate::error::{FannError, FannResult};
@@ -31,12 +35,7 @@ pub struct NetworkBuilder {
     layers: Vec<(usize, Activation)>,
 }
 
-/// Reject Softmax on any hidden (non-final) layer.
-///
-/// Softmax normalises over the simplex — meaningful only at the output.
-/// On hidden layers the gradient degrades to the diagonal approximation
-/// `s_i*(1-s_i)`, producing silently wrong gradients (accepted limitation,
-/// see ADR-023).
+/// Reject Softmax before the final layer: its derivative here is only diagonal (see ADR-023).
 fn validate_no_hidden_softmax(layers: &[(usize, Activation)]) -> FannResult<()> {
     if layers.len() < 2 {
         return Ok(());

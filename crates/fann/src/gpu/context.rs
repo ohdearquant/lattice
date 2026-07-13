@@ -1,4 +1,8 @@
-//! GPU compute context - device, queue, and resource management
+//! GPU device context: adapter selection, queue ownership, pooled memory, and pipelines.
+//!
+//! `flush_memory` drops pooled buffers and waits for pending work. GPU destruction is
+//! asynchronous, so dropping buffers without polling or waiting can still cause OOM.
+//! See `docs/gpu.md` for the full backend design.
 
 use super::buffer::BufferPool;
 use super::circuit_breaker::MemoryPressure;
