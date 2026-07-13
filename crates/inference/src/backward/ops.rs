@@ -53,10 +53,13 @@ pub fn cross_entropy_backward(
 ///
 /// Reuses the same GEMM dispatch the forward path uses (`matmul_into`, m=1):
 /// `dx = g @ W` treating `g` as a `[1, d_out]` row and `w` as `[d_out, d_in]`
-/// row-major — Accelerate/AMX on macOS, SIMD-tiled fallback elsewhere. This is
-/// the single largest scalar loop in the tape (`d_out` reaches vocab_size at
-/// the LM head), so dispatching it through the same kernel as the forward
-/// pass is the primary lever in #737 stage 1.
+/// row-major — Accelerate `cblas_sgemm` on macOS; on non-macOS `matmul_into`
+/// currently routes straight to the generic scalar matmul (only `matmul_bt`
+/// has the tiled/SIMD dispatch), so this rewrite's speedup is a macOS-only
+/// claim until a non-macOS GEMM path lands. This is the single largest
+/// scalar loop in the tape (`d_out` reaches vocab_size at the LM head), so
+/// dispatching it through the same kernel as the forward pass is the
+/// primary lever in #737 stage 1 — on macOS.
 pub fn linear_vjp(w: &[f32], g: &[f32], d_in: usize, d_out: usize) -> Vec<f32> {
     assert_eq!(w.len(), d_out * d_in);
     assert_eq!(g.len(), d_out);
@@ -115,10 +118,15 @@ pub fn lora_vjp(
     }
 
     // dx = A^T (bt_g): dx[j] = scale * Σ_r A[r,j] * bt_g[r]. A is [rank, d_in]
-    // row-major ⇒ dx = (scale*bt_g) @ A via the shared GEMM dispatch.
-    let scaled_bt_g: Vec<f32> = bt_g.iter().map(|&v| v * scale).collect();
+    // row-major ⇒ dx = (scale*bt_g) @ A via the shared GEMM dispatch. Scale
+    // bt_g in place (same `v * scale` rounding order as the old allocated
+    // form) instead of collecting a fresh Vec — bt_g isn't read again after
+    // this point in the tape hot path.
+    for v in bt_g.iter_mut() {
+        *v *= scale;
+    }
     let mut dx = vec![0.0f32; d_in];
-    crate::forward::cpu::matmul_into(&scaled_bt_g, a, &mut dx, 1, rank, d_in);
+    crate::forward::cpu::matmul_into(&bt_g, a, &mut dx, 1, rank, d_in);
 
     (grad_b, grad_a, dx)
 }
