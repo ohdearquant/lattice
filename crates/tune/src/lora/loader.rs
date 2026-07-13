@@ -10,6 +10,23 @@ use crate::error::{Result, TuneError};
 use crate::registry::sha256_hash;
 use std::path::Path;
 
+const ALPHA_TOLERANCE: f32 = 1e-4;
+
+fn validate_manifest_alpha(adapter: &LoraAdapter, entry: &ManifestEntry) -> Result<()> {
+    let difference = (adapter.config.alpha - entry.alpha).abs();
+    if !adapter.config.alpha.is_finite()
+        || !entry.alpha.is_finite()
+        || !difference.is_finite()
+        || difference > ALPHA_TOLERANCE
+    {
+        return Err(TuneError::Validation(format!(
+            "alpha mismatch for '{}': manifest says {}, file has {}",
+            entry.id, entry.alpha, adapter.config.alpha
+        )));
+    }
+    Ok(())
+}
+
 /// A successfully loaded and fully validated adapter.
 #[derive(Debug)]
 pub struct LoadedAdapter {
@@ -287,12 +304,7 @@ pub fn load_adapters_from_manifest(
         // whose header omits alpha — the synthesised 16 ≠ declared 64. The
         // synthesis fallback therefore cannot smuggle a mismatched alpha past the
         // governed loader.
-        if (adapter.config.alpha - entry.alpha).abs() > 1e-4 {
-            return Err(TuneError::Validation(format!(
-                "alpha mismatch for '{}': manifest says {}, file has {}",
-                entry.id, entry.alpha, adapter.config.alpha
-            )));
-        }
+        validate_manifest_alpha(&adapter, entry)?;
 
         // Check 8: target_modules in adapter must be a subset of entry's list.
         for module in &adapter.config.target_modules {
@@ -926,6 +938,30 @@ mod tests {
             msg.contains("alpha mismatch"),
             "expected alpha mismatch rejection; got: {msg}"
         );
+    }
+
+    #[test]
+    fn loader_rejects_nan_adapter_alpha_against_finite_manifest_alpha() {
+        let adapter = LoraAdapter::new(
+            super::super::LoraConfig {
+                rank: 4,
+                alpha: f32::NAN,
+                target_modules: vec!["q_proj".to_string()],
+            },
+            std::collections::HashMap::new(),
+        );
+        let entry = make_entry(
+            "nan-alpha",
+            "adapter.safetensors",
+            "unused",
+            4,
+            8.0,
+            AdapterStatus::Approved,
+            vec!["q_proj".to_string()],
+        );
+
+        let err = validate_manifest_alpha(&adapter, &entry).unwrap_err();
+        assert!(err.to_string().contains("alpha mismatch"));
     }
 
     /// FIX-3 (round 2), mutation-sensitive: a symlink inside base_dir that points

@@ -366,29 +366,36 @@ pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, T
 
     let rank = rank.unwrap_or(0);
 
-    // Recover the LoRA alpha from the safetensors header metadata that
-    // save_peft_safetensors writes. Without this, every adapter would load with
-    // alpha = rank (scale = 1.0), applying a model trained at alpha != rank at the
-    // wrong magnitude. Fall back to `rank` (scale = 1.0) when the metadata is
-    // absent or unparseable, preserving behavior for adapters that lack it.
-    let alpha = SafeTensors::read_metadata(bytes)
+    let alpha_metadata = SafeTensors::read_metadata(bytes)
         .ok()
         .and_then(|(_, meta)| {
             meta.metadata()
                 .as_ref()
                 .and_then(|m| m.get("alpha").cloned())
-        })
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank as f32);
+        });
+    let alpha = match alpha_metadata {
+        Some(value) => {
+            let alpha = value.parse::<f32>().map_err(|e| {
+                TuneError::Serialization(format!("invalid LoRA alpha metadata '{value}': {e}"))
+            })?;
+            if !alpha.is_finite() {
+                return Err(TuneError::Serialization(format!(
+                    "LoRA alpha metadata must be finite, got '{value}'"
+                )));
+            }
+            alpha
+        }
+        None => rank as f32,
+    };
 
-    Ok(LoraAdapter {
-        config: LoraConfig {
-            rank,
-            alpha,
-            target_modules: target_modules.into_iter().collect(),
-        },
-        layers,
-    })
+    let config = LoraConfig {
+        rank,
+        alpha,
+        target_modules: target_modules.into_iter().collect(),
+    };
+    config.validate()?;
+
+    Ok(LoraAdapter { config, layers })
 }
 
 /// Read the `adapter_id` metadata key from a PEFT safetensors byte slice.
@@ -599,6 +606,8 @@ pub fn save_peft_safetensors(
     path: &Path,
     governance: Option<&AdapterGovernance>,
 ) -> Result<(), TuneError> {
+    adapter.config.validate()?;
+
     // Collect owned byte buffers first; TensorView borrows from these.
     let mut byte_data: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
 
@@ -1028,6 +1037,38 @@ mod tests {
         bytes.extend_from_slice(header.as_bytes());
         bytes.extend_from_slice(data);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn peft_bytes_with_alpha(alpha: &str) -> Vec<u8> {
+        use safetensors::Dtype;
+        use safetensors::tensor::{TensorView, serialize};
+
+        let a_bytes = 1.0f32.to_le_bytes();
+        let b_bytes = 1.0f32.to_le_bytes();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.lora_A.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![1, 1], &a_bytes).unwrap(),
+        );
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.lora_B.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![1, 1], &b_bytes).unwrap(),
+        );
+        let metadata = HashMap::from([("alpha".to_string(), alpha.to_string())]);
+        serialize(&tensors, &Some(metadata)).unwrap()
+    }
+
+    #[test]
+    fn test_rejects_non_finite_alpha_metadata() {
+        for alpha in ["nan", "inf", "-inf"] {
+            let bytes = peft_bytes_with_alpha(alpha);
+            let err = load_peft_safetensors_bytes(&bytes).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("LoRA alpha metadata must be finite"),
+                "expected descriptive rejection for {alpha}, got: {message}"
+            );
+        }
     }
 
     #[test]

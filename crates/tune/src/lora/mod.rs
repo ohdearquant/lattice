@@ -81,11 +81,42 @@ pub struct LoraConfig {
 impl LoraConfig {
     /// Compute the LoRA scaling factor: `alpha / rank`.
     pub fn scale(&self) -> f32 {
-        if self.rank == 0 {
+        let scale = if self.rank == 0 {
             0.0
         } else {
             self.alpha / self.rank as f32
+        };
+        if self.alpha.is_finite() && scale.is_finite() {
+            scale
+        } else {
+            0.0
         }
+    }
+
+    /// Validate that the LoRA alpha and effective scale are finite.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::TuneError::Validation`] when `alpha` or the
+    /// effective `alpha / rank` scale is not finite.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !self.alpha.is_finite() {
+            return Err(crate::error::TuneError::Validation(format!(
+                "LoRA alpha must be finite, got {}",
+                self.alpha
+            )));
+        }
+        let scale = if self.rank == 0 {
+            0.0
+        } else {
+            self.alpha / self.rank as f32
+        };
+        if !scale.is_finite() {
+            return Err(crate::error::TuneError::Validation(format!(
+                "LoRA effective scale must be finite, got {scale}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -223,6 +254,7 @@ impl LoraAdapter {
         &self,
         config: &lattice_inference::model::qwen35_config::Qwen35Config,
     ) -> crate::error::Result<()> {
+        self.config.validate()?;
         for ((layer_idx, module), layer) in &self.layers {
             if *layer_idx >= config.num_hidden_layers {
                 return Err(crate::error::TuneError::Validation(format!(
@@ -330,6 +362,21 @@ mod tests {
             target_modules: vec![],
         };
         assert_eq!(config_zero.scale(), 0.0);
+    }
+
+    #[test]
+    fn test_config_rejects_non_finite_alpha_and_scale_fails_closed() {
+        for alpha in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let config = LoraConfig {
+                rank: 8,
+                alpha,
+                target_modules: vec![],
+            };
+
+            let err = config.validate().unwrap_err();
+            assert!(err.to_string().contains("alpha must be finite"));
+            assert_eq!(config.scale(), 0.0);
+        }
     }
 
     #[test]
