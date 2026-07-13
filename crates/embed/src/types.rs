@@ -151,15 +151,8 @@ impl EmbeddingKey {
         }
     }
 
-    /// Returns canonical bytes for deterministic hashing.
-    ///
-    /// Format:
-    /// - model (4-byte big-endian length prefix + UTF-8 bytes)
-    /// - revision (4-byte big-endian length prefix + UTF-8 bytes)
-    /// - dims (4 bytes, big-endian)
-    /// - metric (1 byte)
-    /// - dtype (1 byte)
-    /// - norm (1 byte)
+    /// Returns deterministic bytes that identify this exact embedding space.
+    /// See [`docs/design.md`] (§Vector-space identity wire format) for the byte layout.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 

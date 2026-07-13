@@ -93,8 +93,9 @@ solely because their raw input happens to match.
 
 ## Request validation
 
-The native service and cache wrapper enforce the same request limits before inference or cache
-lookup:
+The cache wrapper validates empty batches, batch size, and text length before any lookup. The
+native service enforces those same limits when it is called and additionally verifies that the
+requested model matches its configured model:
 
 | Rule | Failure |
 | --- | --- |
@@ -108,9 +109,12 @@ lookup:
 the prefix bytes count too. A caller that needs a character-based product limit should enforce
 that separately before calling the service.
 
-The cache performs validation even for an all-hit request. This makes failure behavior stable:
-a request that is invalid cannot start succeeding merely because an older result happens to be
-cached.
+The wrapper performs its own three request-bound checks even for an all-hit request. It does
+not call `inner.embed` merely to validate a cache hit, so an inner service's model-specific
+checks are not part of the all-hit path. In particular, `NativeEmbeddingService` compares the
+requested model with its configured model only when the cache is disabled or the wrapper has at
+least one miss to delegate. A fully cached request therefore bypasses that native model check;
+a mixed request reaches it only for its missing subset.
 
 ## NativeEmbeddingService
 
@@ -209,7 +213,7 @@ are management APIs rather than a promise of distributed or persistent caching.
 For every generic, query, or passage request, the wrapper does the following:
 
 1. Apply the role prefix, if any. Generic calls remain raw text with the `Generic` role.
-2. Validate the full, prompted batch before looking at the cache.
+2. Validate only the wrapper-owned empty-batch, batch-size, and text-length bounds before lookup.
 3. If capacity is zero, bypass hash computation and locks and delegate the prompted batch to the
    inner service.
 4. Ask the inner service for the effective `ModelConfig`, then hash each prompted text with the
@@ -225,8 +229,7 @@ For every generic, query, or passage request, the wrapper does the following:
 
 The wrapper avoids mixing role-specific data in two ways: text has already been prompted when a
 role needs a prefix, and the cache key additionally contains the `EmbeddingRole` tag. The latter
-protects behavior as prompt policies evolve and preserves the backward-compatible generic key
-form for `embed`.
+keeps generic, query, and passage requests in distinct cache namespaces as prompt policies evolve.
 
 The cache is a reuse optimization, not a single-flight coordinator. Concurrent cache misses for
 the same text may each call the inner service before either request inserts its result. Callers
@@ -256,3 +259,54 @@ Errors are descriptive but not a transaction protocol: if a batch fails after an
 has done work, a caller should assume no usable batch result was returned and decide whether its
 own retry policy is safe. In particular, cache insertion happens only after the wrapper has
 received the expected number of new vectors.
+
+## Trait API details
+
+`EmbeddingService` is the stable async contract. `embed` produces one vector per input in input
+order and represents the `Generic` role. `embed_one` is a one-item convenience call and reports
+an internal error if an implementation violates that cardinality contract rather than fabricating
+an empty vector.
+
+`embed_query` and `embed_passage` obtain a model instruction, prefix every text when one exists,
+then delegate to `embed`. The defaults cannot create role-separated cache entries by themselves:
+that behavior comes from `CachedEmbeddingService` overriding those methods and supplying its
+`Query` or `Passage` role tag. `EmbeddingRole::Generic` also has its own tag, so all three wrapper
+entry points receive distinct cache keys even when their resulting text is identical.
+
+`model_config` defaults to the model's native dimension. A service that has selected an MRL
+dimension overrides it so a caching wrapper hashes the actual output space, not merely the model
+variant. `supports_model` is a capability query and `name` is a static implementation label;
+neither replaces a caller's own model/index compatibility checks.
+
+## NativeEmbeddingService implementation notes
+
+The native service contains an `Arc<OnceLock<Result<LoadedModel, String>>>` together with one
+`ModelConfig`. It delegates BERT-family and Qwen inference to `lattice-inference`, using local
+SIMD-capable kernels and safetensors rather than an external runtime. The wrapped model types
+already satisfy the service's `Send + Sync` requirements, so the wrapper adds no manual unsafe
+thread-safety implementation.
+
+The first preload or embedding request checks the lock and otherwise schedules
+`OnceLock::get_or_init` on Tokio's blocking pool. The cloned lock remains owned by the blocking
+worker if the awaiting future is dropped, so cancellation cannot reset an in-progress load.
+Concurrent callers share the same initializer; both a successful load and a loading failure are
+memoized for the service lifetime. `ensure_loaded` exercises that sequence without encoding text,
+which makes it suitable for an explicit download/load warm-up.
+
+The BERT path calls `encode_batch` once after selecting CLS pooling for BGE or masked mean pooling
+for E5 and MiniLM. The Qwen path calls `encode` once per text, in input order, so Qwen's
+model-local cache participates. The persistent Qwen cache described above is separate from this
+wrapper's LRU.
+
+## CachedEmbeddingService cache-hit behavior
+
+The wrapper applies an optional role prefix, performs its local request-bound checks, and then
+either bypasses a disabled cache or computes keys from the prompted text, effective model
+configuration, and role. It gathers every LRU hit before deciding whether to call the inner
+service. A full hit returns immediately and never invokes the inner service.
+
+Consequently, the wrapper cannot enforce an inner service's model selection, authorization, or
+other service-specific validation on a full hit. With at least one miss it delegates only the
+misses, and `NativeEmbeddingService::embed` performs its configured-model check before loading or
+encoding them. The wrapper rejects a mismatched number of returned vectors before insertion, which
+prevents a partial `zip` from losing original result positions.

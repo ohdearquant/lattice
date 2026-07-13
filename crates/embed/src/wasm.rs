@@ -7,25 +7,17 @@
 use lattice_inference::{BertModel, BertPooling};
 use wasm_bindgen::prelude::*;
 
-/// Install a panic hook that forwards Rust panics to the browser console via
-/// `console.error`, instead of the opaque default
-/// `"unreachable executed"` wasm trap message.
-///
-/// Call this once, before constructing a [`LatticeEmbedder`], if you want
-/// readable panic diagnostics. Safe to call more than once (`set_once` is
-/// idempotent) and safe to skip entirely.
+/// Installs console-backed panic diagnostics for browser embeddings.
+/// This optional, idempotent hook should run before constructing a [`LatticeEmbedder`].
+/// See [`docs/design.md`] (§WebAssembly API details) for browser failure behavior.
 #[wasm_bindgen(js_name = initPanicHook)]
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
-/// A loaded BERT-family embedding model, ready to embed text.
-///
-/// Constructed from in-memory model bytes, see [`LatticeEmbedder::new`].
-/// Defaults to mean pooling; call [`LatticeEmbedder::use_cls_pooling`] for
-/// BGE-family models, which expect CLS-token pooling instead (see
-/// `lattice_inference::BertPooling`'s doc comment for the per-model-family
-/// table).
+/// An in-memory BERT-family embedding model for browser use.
+/// It defaults to mean pooling; BGE v1.5 callers must select CLS pooling before embedding.
+/// See [`docs/design.md`] (§WebAssembly API details) for model and pooling requirements.
 #[wasm_bindgen]
 pub struct LatticeEmbedder {
     model: BertModel,
@@ -33,15 +25,9 @@ pub struct LatticeEmbedder {
 
 #[wasm_bindgen]
 impl LatticeEmbedder {
-    /// Load a model from in-memory bytes.
-    ///
-    /// - `model_bytes`: the raw bytes of `model.safetensors`.
-    /// - `config_bytes`: the UTF-8 bytes of `config.json`.
-    /// - `tokenizer_bytes`: the UTF-8 bytes of `tokenizer.json`.
-    ///
-    /// Returns a JS exception (the `Err` arm, thrown by `wasm-bindgen`) if the
-    /// bytes are not valid UTF-8 where text is expected, fail to parse, or
-    /// don't describe a supported BERT-family model.
+    /// Loads a supported BERT-family model from safetensors, config, and tokenizer bytes.
+    /// Returns a JavaScript exception for invalid JSON text, parsing failures, or unsupported models.
+    /// See [`docs/design.md`] (§WebAssembly API details) for the in-memory loading boundary.
     #[wasm_bindgen(constructor)]
     pub fn new(
         model_bytes: &[u8],
@@ -59,11 +45,9 @@ impl LatticeEmbedder {
         Ok(LatticeEmbedder { model })
     }
 
-    /// Switch to CLS-token pooling (the hidden state at position 0), the
-    /// pooling strategy BGE v1.5 models expect. The default is mean pooling
-    /// (attention-mask-weighted average), which is correct for E5 and MiniLM
-    /// families. Call this immediately after construction for BGE models,
-    /// before any `embed` call.
+    /// Selects CLS-token pooling for BGE v1.5 models.
+    /// Call this before embedding; mean pooling remains the default for E5 and MiniLM.
+    /// See [`docs/design.md`] (§WebAssembly API details) for pooling selection.
     #[wasm_bindgen(js_name = useClsPooling)]
     pub fn use_cls_pooling(&mut self) {
         self.model.set_pooling(BertPooling::CLS);
@@ -83,17 +67,7 @@ impl LatticeEmbedder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Vector-op bindings: expose `simd::*` directly to JS/wasm callers.
-//
-// Unrelated to `LatticeEmbedder` above (which wraps the BERT-family forward
-// pass). These four are the `simd::*` khive ANN consumer contract
-// (`dot_product`, `squared_euclidean_distance`, `cosine_similarity`,
-// `normalize`; see `lib.rs`'s crate-level doc comment) made callable from JS,
-// so a wasm/JS consumer benefits from the same SIMD128 kernels a native
-// consumer gets, instead of falling back to a hand-rolled JS loop. Also the
-// entry points `scripts/bench_wasm_simd.mjs` calls for its A/B measurement.
-// ---------------------------------------------------------------------------
+// Expose the stable SIMD consumer contract to JavaScript — see docs/design.md.
 
 /// Dot product of two equal-length vectors via `simd::dot_product`.
 ///
@@ -135,19 +109,9 @@ pub fn simd_normalize(v: &mut [f32]) {
     crate::simd::normalize(v)
 }
 
-/// Reports whether the four `simd*` bindings above are dispatching to the
-/// wasm32 SIMD128 kernels in *this* build.
-///
-/// Returns the exact same value the kernels themselves read to choose a
-/// codepath (`crate::simd::simd_config().simd128_enabled()`), not a fresh
-/// `cfg!(target_feature = "simd128")` re-derived here -- a binding-local
-/// re-check could drift from the real dispatch condition without anyone
-/// noticing. Exists so a two-build parity harness (one plain
-/// `wasm32-unknown-unknown` build, one built with
-/// `-C target-feature=+simd128`) can assert the SIMD128 build is actually
-/// exercising the SIMD128 kernels instead of a stale or misconfigured
-/// artifact silently falling back to scalar; see
-/// `crates/embed/tests/wasm/simd128_parity_wasm.mjs`.
+/// Reports whether the vector bindings use this artifact's SIMD128 dispatch path.
+/// Reads the dispatcher decision rather than independently re-deriving the build feature.
+/// See [`docs/design.md`] (§WebAssembly API details) for parity-harness semantics.
 #[wasm_bindgen(js_name = simdSimd128Dispatch)]
 pub fn simd_simd128_dispatch() -> bool {
     crate::simd::simd_config().simd128_enabled()

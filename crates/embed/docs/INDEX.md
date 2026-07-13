@@ -14,5 +14,3 @@ guide, then follow the subsystem relevant to the code or operational decision at
 
 The crate-level Rust documentation is the short entry point; API-level contracts remain beside
 their types and functions in `src/`.
-
-

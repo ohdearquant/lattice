@@ -363,3 +363,57 @@ Do not compare float SIMD output for bit equality with the scalar reference, do
 not feed `i8::MIN` to an INT8 SIMD raw path, and do not count padding bits in
 packed INT4 or binary vectors. Those are correctness requirements rather than
 performance suggestions.
+
+## Public API contracts
+
+The low-level `simd` API is unstable in general, but its float operation
+signatures and mismatch sentinels are consumed by the khive ANN indexes during
+the 0.4.x line. `dot_product` returns `0.0` for a dimensional mismatch;
+`cosine_similarity` returns `0.0` for a mismatch or empty input; and both L2
+operations return `f32::MAX` for a mismatch. The stable ergonomic wrappers are
+available under `lattice_embed::utils`.
+
+For unit-normalized data, dot product is cosine similarity and
+`squared_euclidean_distance` is `2 * (1 - dot)`. Squared L2 is the ANN hot
+path because its monotonic relationship with L2 preserves mathematical ranking
+without a square root. Floating-point reduction order may differ between SIMD
+and scalar kernels, so near ties must not rely on an exact scalar bit pattern.
+
+`dot_product_batch4` evaluates a query against four equally-sized candidates
+and returns four zeroes when any candidate differs in length. The higher-level
+batch routine uses that kernel only when a four-item group borrows the same
+query slice (identical pointer and length); equal values in different slices do
+not qualify for the reuse optimization.
+
+## Kernel safety boundary
+
+All unsafe float kernels are reached only after the dispatcher has selected an
+available target feature. They use unaligned loads and stores, calculate vector
+chunk counts by floor division before pointer arithmetic, and finish with safe
+tails. These three properties are the memory-safety contract: changing a lane
+width, unroll factor, or tail calculation must preserve them.
+
+Wasm SIMD128 is selected at build time, not detected at runtime. Its loads are
+alignment-independent by the WebAssembly specification. AVX and NEON paths may
+use FMA or a different reduction tree, which explains numerical differences
+from scalar execution without changing the operation's mathematical contract.
+
+The NEON normalization kernel estimates reciprocal square root with
+`vrsqrteq_f32` and two Newton--Raphson refinements. If a positive subnormal
+norm produces a non-finite estimate it uses the scalar reciprocal square root
+instead, preventing an otherwise valid vector from becoming non-finite.
+
+## Raw INT8 input invariant
+
+`dot_product_i8_raw` is an intentionally unchecked hot-path interface except
+for debug assertions. Every input byte must be in `[-127, 127]`; `-128` is not
+valid. The x86 signed-dot transformations negate bytes to construct a
+sign-adjusted operand, and two's-complement negation leaves `-128` unchanged,
+silently producing an incorrect result. This is numerical corruption rather
+than memory unsafety. Values created by `QuantizedVector::from_f32` are already
+clamped; external quantizers must map `-128` to `-127` before calling the raw
+entry point.
+
+Prepared-query internals use trusted INT8 functions only for those
+constructor-owned vectors. They retain debug checks but deliberately avoid an
+O(n) release scan on every candidate comparison.

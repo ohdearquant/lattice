@@ -264,14 +264,10 @@ pub fn prepare_query_with_norm(
     PreparedQueryWithMeta::from_f32(query_f32, tier, norm)
 }
 
-/// **Unstable**: prepared cosine distance; query tier must match stored data tier.
+/// **Unstable**: computes prepared cosine distance in `[0, 2]` for matching tiers.
 ///
-/// Returns a value in [0, 2] where 0 = identical, 2 = opposite.
-///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] if the query tier does not match the
-/// stored-data tier.
+/// Returns [`EmbedError::TierMismatch`] for a different stored tier.
+/// See [`docs/simd.md`] (§Prepared queries and tier matching) for the per-tier paths.
 #[inline]
 pub fn approximate_cosine_distance_prepared(
     query: &PreparedQuery,
@@ -310,17 +306,10 @@ pub fn try_approximate_dot_product_prepared(
     approximate_dot_product_prepared(query, stored)
 }
 
-/// Cosine distance with a caller-asserted unit-norm fast path.
+/// Computes prepared cosine distance, using the `Full` unit-norm fast path when asserted.
 ///
-/// Matching `Unit` hints on `Full` vectors use `1.0 - clamp(dot(q, s), -1, 1)`;
-/// all other combinations use [`approximate_cosine_distance_prepared`].
-///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] (propagated from
-/// [`approximate_cosine_distance_prepared`]) if the query tier does not match the
-/// stored-data tier. The unit-norm `Full` fast path returns directly and never
-/// reaches the delegate.
+/// Returns [`EmbedError::TierMismatch`] for a tier mismatch.
+/// See [`docs/simd.md`] (§Prepared queries and tier matching) for hint semantics.
 #[inline]
 pub fn approximate_cosine_distance_prepared_with_meta(
     meta: &PreparedQueryWithMeta,
@@ -337,13 +326,10 @@ pub fn approximate_cosine_distance_prepared_with_meta(
     approximate_cosine_distance_prepared(&meta.query, stored)
 }
 
-/// **Unstable**: prepared dot product dispatch; query tier must match stored data tier.
+/// **Unstable**: computes a prepared dot product for matching non-binary tiers.
 ///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] if the query tier does not match the
-/// stored-data tier, or [`EmbedError::Internal`] if called with `Binary` data
-/// (binary has no meaningful dot product; use cosine distance instead).
+/// Returns [`EmbedError::TierMismatch`] for different tiers or [`EmbedError::Internal`] for binary.
+/// See [`docs/simd.md`] (§Prepared queries and tier matching) for supported paths.
 #[inline]
 pub fn approximate_dot_product_prepared(
     query: &PreparedQuery,
@@ -364,13 +350,9 @@ pub fn approximate_dot_product_prepared(
     }
 }
 
-/// Compute cosine distances from one prepared query to a slice of stored vectors.
+/// Computes distances from one prepared query to all stored vectors.
 ///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] (propagated from
-/// [`approximate_cosine_distance_prepared`]) if the query tier does not match any
-/// stored vector's tier.
+/// Returns [`EmbedError::TierMismatch`] if any stored tier differs.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared(
     query: &PreparedQuery,
@@ -382,16 +364,10 @@ pub fn batch_approximate_cosine_distance_prepared(
         .collect()
 }
 
-/// Like [`batch_approximate_cosine_distance_prepared`] but writes into a caller-supplied buffer.
+/// Writes prepared-query distances into a reusable buffer, clearing it on error.
 ///
-/// Clears and reuses the buffer to avoid allocations across repeated searches. On error the
-/// buffer is left cleared (no partial results are written).
-///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] (propagated from
-/// [`approximate_cosine_distance_prepared`]) if the query tier does not match any
-/// stored vector's tier.
+/// Returns [`EmbedError::TierMismatch`] if any stored tier differs.
+/// See [`docs/simd.md`] (§Prepared queries and tier matching) for buffer semantics.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared_into(
     query: &PreparedQuery,
@@ -412,13 +388,9 @@ pub fn batch_approximate_cosine_distance_prepared_into(
     Ok(())
 }
 
-/// Compute cosine distances from a prepared INT8 query to a slice of INT8 candidates.
+/// Computes distances from one prepared INT8 query without re-quantizing it.
 ///
-/// The query is quantized once outside this function; no per-iteration `from_f32` is called.
-///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] if `query` is not an `Int8` `PreparedQuery`.
+/// Returns [`EmbedError::TierMismatch`] unless the query is INT8.
 #[inline]
 pub fn approximate_int8_batch_prepared(
     query: &PreparedQuery,
@@ -437,13 +409,9 @@ pub fn approximate_int8_batch_prepared(
         .collect())
 }
 
-/// Like [`approximate_int8_batch_prepared`] but writes into a caller-supplied buffer.
+/// Writes prepared INT8 distances into a reusable buffer, clearing it on error.
 ///
-/// On error the buffer is left cleared (no partial results are written).
-///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] if `query` is not an `Int8` `PreparedQuery`.
+/// Returns [`EmbedError::TierMismatch`] unless the query is INT8.
 #[inline]
 pub fn approximate_int8_batch_prepared_into(
     query: &PreparedQuery,
@@ -467,13 +435,9 @@ pub fn approximate_int8_batch_prepared_into(
     Ok(())
 }
 
-/// Compute cosine distances from a prepared INT4 query to a slice of INT4 candidates.
+/// Computes distances from one prepared INT4 query without re-quantizing it.
 ///
-/// The query is quantized once outside this function; no per-iteration `from_f32` is called.
-///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] if `query` is not an `Int4` `PreparedQuery`.
+/// Returns [`EmbedError::TierMismatch`] unless the query is INT4.
 #[inline]
 pub fn approximate_int4_batch_prepared(
     query: &PreparedQuery,
@@ -492,13 +456,9 @@ pub fn approximate_int4_batch_prepared(
         .collect())
 }
 
-/// Like [`approximate_int4_batch_prepared`] but writes into a caller-supplied buffer.
+/// Writes prepared INT4 distances into a reusable buffer, clearing it on error.
 ///
-/// On error the buffer is left cleared (no partial results are written).
-///
-/// # Errors
-///
-/// Returns [`EmbedError::TierMismatch`] if `query` is not an `Int4` `PreparedQuery`.
+/// Returns [`EmbedError::TierMismatch`] unless the query is INT4.
 #[inline]
 pub fn approximate_int4_batch_prepared_into(
     query: &PreparedQuery,
@@ -522,12 +482,10 @@ pub fn approximate_int4_batch_prepared_into(
     Ok(())
 }
 
-/// **Unstable**: approximate tiered cosine distance from an `f32` query.
+/// **Unstable**: quantizes an `f32` query and computes tiered cosine distance.
 ///
-/// # Precondition
-///
-/// `query_f32.len()` must equal the stored vector's dimensionality. Violating
-/// this is a caller bug; correct HNSW usage never triggers it.
+/// `query_f32.len()` must match stored dimensionality.
+/// See [`docs/simd.md`] (§Prepared queries and tier matching) for hot-loop guidance.
 pub fn approximate_cosine_distance(query_f32: &[f32], stored: &QuantizedData) -> f32 {
     debug_assert_eq!(
         query_f32.len(),

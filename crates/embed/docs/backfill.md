@@ -239,3 +239,49 @@ Before starting a transition, ensure that:
 The coordinator provides deterministic routing from its local state. Correct migration
 outcomes still depend on the caller making embedding writes, index updates, cursor commits,
 and query aliases agree with that routing decision.
+
+## BackfillCoordinator::route_request
+
+`route_request(is_new_document)` is the coordinator's coarse routing helper for a write-like
+embedding request. `is_new_document` means the caller is indexing the document for the first
+time. `false` denotes ordinary re-embedding and does not describe the historical backfill
+worker's own work.
+
+While the controller is `InProgress`, a new document returns `DualWrite` only when
+`dual_write` is enabled; the caller must then create and persist source and target embeddings.
+Every other active request returns `Legacy`. Planned, paused, failed, and cancelled migrations
+also return `Legacy`, while completed migrations return `Target`. The helper never performs
+the requested embedding or index writes.
+
+This route deliberately omits the post-cutover source-write requirement. It returns `Target`
+for a completed migration even during the rollback window, so applications that need to retain
+the source copy must use `routing_config()` instead. That configuration is the complete
+read/write plan because it exposes both write models and the `RollbackWindow` phase.
+
+## BackfillCoordinator::record_batch
+
+Call `record_batch(count)` only after the caller has completed the storage work it intends to
+claim. The coordinator adds `count` to its independent `backfilled_count`, then delegates to
+the migration controller's `record_progress(count)`. The counter update happens before the
+delegated operation can return an invalid-transition error, so this method is not a
+transactional acknowledgement and a failed call does not roll that counter back.
+
+If the delegated progress call changes the controller from `InProgress` to `Completed`, the
+coordinator records a process-local `Instant` as `cutover_at`. That timestamp enables the
+rollback-window policy; it is not a durable or externally meaningful cutover record. Directly
+changing lifecycle state through another path cannot set this timestamp, so the coordinator
+only recognises cutover that it observed through this method.
+
+## BackfillCoordinator::next_batch_size
+
+`next_batch_size()` gives a worker an upper bound for the next historical batch; it does not
+select or reserve documents. During `InProgress`, it computes:
+
+    remaining = saturating_sub(saturating_sub(total, processed), skipped)
+    next_batch_size = min(remaining, configured_batch_size)
+
+It returns zero in every other lifecycle state. Saturating subtraction makes an oversupplied
+processed or skipped count yield no further work rather than an underflow. The formula follows
+the controller's effective-total completion rule, so a worker that honours it will not request
+more entries than remain after permanent skips. It still needs a durable cursor or claim
+mechanism to prevent concurrent workers or retries from processing the same document.

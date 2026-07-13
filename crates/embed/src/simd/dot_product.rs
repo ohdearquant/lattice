@@ -183,19 +183,9 @@ fn dot_product_simd128_kernel(a: &[f32], b: &[f32]) -> f32 {
     unsafe { dot_product_simd128_unrolled(a, b) }
 }
 
-/// Dot product over equal-length `f32` slices.
+/// Computes the float dot product, returning `0.0` for a dimensional mismatch.
 ///
-/// For normalized vectors, this equals cosine similarity (and `sq-L2 = 2*(1 - dot)`),
-/// so it backs cosine/inner-product ANN search on unit-norm vectors.
-/// Returns 0.0 if vectors have different lengths.
-///
-/// # Stability — khive ANN consumer contract
-///
-/// Part of the `simd::*` distance surface consumed directly by khive's ANN indexes
-/// (`khive-hnsw`, `khive-vamana`; ADR-012). The `(&[f32], &[f32]) -> f32` signature
-/// and length-mismatch behaviour (returns 0.0) are a **stable consumer contract**
-/// across the 0.4.x line. For the general-purpose ergonomic wrapper use
-/// `lattice_embed::utils::dot_product`.
+/// See [`docs/simd.md`] (§Public API contracts) for ANN and normalization semantics.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     // Runtime length check to prevent UB in release builds
@@ -212,24 +202,11 @@ pub(crate) fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-/// AVX-512F-accelerated dot product using FMA with 4x unrolling and multiple accumulators.
-///
-/// Processes 64 floats per iteration (4 x 16 floats) with 4 independent accumulators
-/// to break dependency chains and maximize throughput.
+/// Computes a four-accumulator dot product with AVX-512F.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX-512F instructions (verified via `simd_config()`)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm512_loadu_ps` for unaligned loads (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk/remainder calculation:
-///   `chunks = n / CHUNK_SIZE` (floor), so `chunks * CHUNK_SIZE <= n`.
-///   `remaining_chunks = remaining / SIMD_WIDTH` (floor), so all SIMD loads stay in bounds.
-/// - Final scalar loop iterates `scalar_start..n` using safe `a[i]` / `b[i]` indexing
-///   and never reads past the end of the slice.
+/// Caller must provide AVX-512F and equal slices; chunked unaligned loads stay in bounds.
+/// See [`docs/simd.md`] (§Kernel safety boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn dot_product_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -310,24 +287,11 @@ pub(crate) unsafe fn horizontal_sum_avx512(v: __m512) -> f32 {
     _mm512_reduce_add_ps(v)
 }
 
-/// AVX2-accelerated dot product using 8 independent accumulators.
-///
-/// Processes 64 floats per iteration (8 x 8 floats) with 8 independent accumulators
-/// to better hide FMA latency on modern x86 CPUs. AVX2 provides 16 YMM registers;
-/// 8 accumulators + 1 A load + 1 B load = 10 registers, well within budget.
+/// Computes an eight-accumulator dot product with AVX2 and FMA.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX2 and FMA instructions (verified via `simd_config()`)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm256_loadu_ps` for unaligned loads (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk/remainder calculation:
-///   `chunks = n / CHUNK_SIZE` (floor), so `chunks * CHUNK_SIZE <= n`.
-///   `remaining_chunks = remaining / SIMD_WIDTH` (floor), so all SIMD loads stay in bounds.
-/// - Final scalar loop uses safe `a[i]` / `b[i]` indexing and never reads past slice end.
+/// Caller must provide AVX2/FMA and equal slices; chunked unaligned loads stay in bounds.
+/// See [`docs/simd.md`] (§Kernel safety boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
@@ -419,21 +383,11 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
     total
 }
 
-/// AVX2-accelerated dot product specialized for 384-dimension vectors.
-///
-/// 384 = 48 x 8, so 384d vectors divide evenly into 48 AVX2 iterations
-/// with zero remainder. This eliminates all remainder handling branches.
-/// Uses 8 accumulators across 6 iterations of 8 FMAs each (48 total).
+/// Computes the fixed-size 384-dimension AVX2/FMA dot product.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX2 and FMA instructions (verified via `simd_config()`)
-/// - `a` and `b` have equal length == 384 (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm256_loadu_ps` for unaligned loads (safe for any alignment)
-/// - Fixed iteration count (48) covers exactly 384 elements, no out-of-bounds
+/// Caller must provide AVX2/FMA and two 384-element slices.
+/// See [`docs/simd.md`] (§Dot product) for the specialization rationale.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_384_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -551,16 +505,11 @@ fn dot_product_batch4_avx2_kernel(
     }
 }
 
-/// AVX2 batch-4 dot product specialized for 384-dimension vectors.
-///
-/// 384 = 24 × 16, processed exactly as 24 chunks (2 AVX2 loads per chunk) with no
-/// scalar remainder, matching the existing `dot_product_384_avx2` specialization.
+/// Computes one 384-dimension query against four candidates with AVX2/FMA.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX2 and FMA (verified via dispatch table)
-/// - All 5 slices have equal length == 384 (enforced by `dot_product_batch4`)
+/// Caller must provide AVX2/FMA and five 384-element slices.
+/// See [`docs/simd.md`] (§Dot product) for the batch-kernel layout.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_384_batch4_avx2(
@@ -608,20 +557,11 @@ unsafe fn dot_product_384_batch4_avx2(
     ]
 }
 
-/// AVX2 batch-4 dot product for arbitrary-length vectors.
-///
-/// Processes 16 floats per loop (2 AVX2 query loads reused across 4 candidates),
-/// with 2 accumulators per candidate to break FMA dependency chains.
+/// Computes one query against four candidates with AVX2/FMA.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX2 and FMA (verified via dispatch table)
-/// - All 5 slices have equal length (enforced by `dot_product_batch4`)
-///
-/// Memory safety:
-/// - `chunks * CHUNK <= q.len()` by construction (floor division)
-/// - Scalar tail uses safe `q[i]` / `cN[i]` indexing within slice bounds
+/// Caller must provide AVX2/FMA and five equal-length slices; bounds are chunked.
+/// See [`docs/simd.md`] (§Dot product) for the reuse and accumulator strategy.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_batch4_avx2(
@@ -680,22 +620,11 @@ unsafe fn dot_product_batch4_avx2(
     out
 }
 
-/// NEON-accelerated dot product with 4x unrolling and multiple accumulators.
-///
-/// Processes 16 floats per iteration (4 x 4 floats) with 4 independent accumulators.
+/// Computes a four-accumulator dot product with NEON.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Running on aarch64 (NEON is mandatory, always available)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `vld1q_f32` for loads (handles any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk/remainder calculation:
-///   `chunks = n / CHUNK_SIZE` (floor), so `chunks * CHUNK_SIZE <= n`.
-///   `remaining_chunks = remaining / SIMD_WIDTH` (floor), so all NEON loads stay in bounds.
-/// - Final scalar loop uses safe `a[i]` / `b[i]` indexing and never reads past slice end.
+/// Caller must run on aarch64 with equal slices; chunked loads stay in bounds.
+/// See [`docs/simd.md`] (§Kernel safety boundary) for the shared kernel invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -774,42 +703,11 @@ pub(crate) unsafe fn horizontal_sum_neon(v: float32x4_t) -> f32 {
     vaddvq_f32(v)
 }
 
-/// wasm32 SIMD128-accelerated dot product with 4x unrolling and multiple accumulators.
-///
-/// Processes 16 floats per iteration (4 x 4 floats) with 4 independent accumulators,
-/// mirroring the NEON kernel's structure above. wasm SIMD128 has no fused
-/// multiply-add instruction (unlike AVX2/AVX-512/NEON), so each lane does a
-/// separate multiply then add (`f32x4_add(acc, f32x4_mul(...))`).
-///
-/// # Reassociation warning
-///
-/// Like every SIMD kernel in this module, lane-parallel accumulation reorders
-/// the summation relative to the scalar left-to-right reference (`a.iter().zip(b.iter())...sum()`),
-/// so results are NOT bit-identical to [`dot_product_scalar`] -- only equal within
-/// a tight relative epsilon (~1e-6). See the module-level docs and the parity
-/// tests in `simd/tests.rs`.
+/// Computes a four-accumulator dot product with wasm32 SIMD128.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Compiled with the wasm32 `simd128` target feature (this function only
-///   exists under `#[cfg(target_feature = "simd128")]`; wasm has no runtime
-///   feature detection, so this is a compile-time, not runtime, precondition
-///   -- unlike the `is_x86_feature_detected!`/`is_aarch64_feature_detected!`
-///   guards above)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `v128_load` for loads. wasm's alignment immediate is a performance
-///   hint only -- misaligned loads are always well-defined, so this is safe
-///   for any pointer alignment (matching `_mm256_loadu_ps`/`vld1q_f32` above,
-///   not the aligned `_mm256_load_ps` family).
-/// - Pointer arithmetic stays within slice bounds via chunk/remainder
-///   calculation: `chunks = n / CHUNK_SIZE` (floor), so `chunks * CHUNK_SIZE
-///   <= n`. `remaining_chunks = remaining / SIMD_WIDTH` (floor), so all
-///   SIMD128 loads stay in bounds.
-/// - Final scalar loop iterates `scalar_start..n` using safe `a[i]` / `b[i]`
-///   indexing and never reads past the end of the slice.
+/// This function requires compile-time SIMD128 and equal slices; bounds are chunked.
+/// See [`docs/simd.md`] (§Kernel safety boundary) for wasm and reassociation semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn dot_product_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -912,21 +810,11 @@ fn dot_product_batch4_neon_kernel(
     unsafe { dot_product_batch4_neon(q, c0, c1, c2, c3) }
 }
 
-/// NEON batch-4 dot product: one query vs. 4 candidates simultaneously.
-///
-/// Processes 8 floats per loop (2 NEON vector loads from query, reused across all
-/// 4 candidates). Uses 2 accumulators per candidate to break vfmaq_f32 latency chains.
-/// NEON provides 32 Q-registers; 8 accumulators + 2 query loads = 10 registers, no spill.
+/// Computes one query against four candidates with NEON.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Running on aarch64 (NEON is mandatory — always true on this arch)
-/// - All 5 slices have equal length (enforced by `dot_product_batch4`)
-///
-/// Memory safety:
-/// - `chunks * CHUNK <= q.len()` by construction
-/// - Scalar tail uses safe `q[i]` / `cN[i]` indexing within slice bounds
+/// Caller must run on aarch64 with five equal-length slices; bounds are chunked.
+/// See [`docs/simd.md`] (§Dot product) for the reuse and accumulator strategy.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_product_batch4_neon(

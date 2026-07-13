@@ -210,3 +210,18 @@ desired handling of permanently skipped entries.
 
 See [backfill.md](backfill.md) for the embedding-specific routing and batch policy built on
 top of this state machine.
+
+## MigrationController::record_skip
+
+`record_skip` accounts for an item that will never receive a target embedding. It stores the
+given `SkipReason` for the controller's in-memory audit list and increases `skipped` by one;
+it does not count the item as processed. The effective work budget consequently becomes
+`total - skipped`, using saturating subtraction.
+
+The method accepts a skip only while `processed + skipped < total`. This strict inequality
+rejects duplicate or retried skips once all planned work has already been accounted for. A
+skip does not itself make the controller completed, even when it reduces the effective total
+to the processed count (or zero). The caller must report progress, including
+`record_progress(0)` when appropriate, to take the normal completion transition. This keeps
+the state change attributable to the operation that confirms the caller's intended work
+boundary.

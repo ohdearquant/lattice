@@ -333,3 +333,53 @@ The cache stores only embedding values and never owns the model or its weights.
 Clearing it releases the entries, not the model that produced them. A process
 restart creates an empty cache; cache keys and contents are not an on-disk
 format.
+
+## EmbeddingModel source behavior
+
+`EmbeddingModel` is the source of the model facts consumed by services: native dimensions,
+conservative input-token limits, local-versus-remote execution, prompt policy, BERT pooling, and
+the cache-key revision. `native_dimensions()` and `dimensions()` both report the registry's full
+width; a service-specific active dimension belongs to `ModelConfig` instead. This distinction
+keeps callers from allocating or indexing for a Qwen MRL space as though it were the full model
+width.
+
+`max_input_tokens()` is a conservative chunking limit rather than a tokenizer operation. It
+leaves room for special tokens and currently reports 512 for BGE and E5, 256 for all-MiniLM,
+128 for paraphrase multilingual MiniLM, 8,192 for Qwen3-Embedding, and 8,191 for the remote
+OpenAI variant.
+
+The query and document instruction accessors return the literal prefix that must be prepended to
+the original text, or `None` for raw text. E5 uses paired `query:` and `passage:` prefixes, each
+including a trailing space; BGE and Qwen use only a query instruction; MiniLM and the remote model
+use neither. Prompted and unprompted text occupy different retrieval semantics, which is why
+callers should select a role instead of copying these strings ad hoc.
+
+With the `native` feature, BGE selects CLS pooling and E5 and MiniLM select masked mean pooling.
+Qwen and the remote model return no BERT pooling choice because their inference paths own that
+operation. `key_version()` groups BGE/E5 as `v1.5`, MiniLM as `v2`, and Qwen/remote as `v3` for
+cache identity; it is not a substitute for the provider model identifier.
+
+`Display` emits the canonical lowercase model name. `FromStr` lowercases, trims, converts
+underscores to hyphens, removes a BAAI prefix, and accepts selected short aliases and provider
+identifiers. That convenience is suitable for configuration input, whereas persisted identity
+should use the selected registry variant and cache-key revision.
+
+## ModelConfig source behavior
+
+`ModelConfig` pairs an `EmbeddingModel` with an optional output dimension. `try_new` and
+`validate` allow an explicit dimension only for Qwen3-Embedding, require at least 32 dimensions,
+and reject a value above the model's native width. `new` leaves truncation unset and
+`dimensions()` then returns the native width.
+
+Its fields are public for serialization and configuration, so directly constructed values should
+be validated before use. A changed active dimension is a changed embedding space: it must use a
+separate vector-index namespace and cache key, even when the underlying Qwen model is unchanged.
+
+## ModelProvenance source behavior
+
+`ModelProvenance::new` records the selected model, caller-provided source identifier, current
+load time, and an RFC 3339 rendering of that time. Its 64-character BLAKE3 hexadecimal `hash`
+is calculated from `{model_id}:{loaded_at_iso}:{model_debug_representation}`. It identifies a
+metadata load event, not the contents or integrity of model weights; weight verification belongs
+to the inference layer's checksum facilities. `dimensions()` reports the model's native width and
+`matches_model()` compares the recorded variant with an expected one.

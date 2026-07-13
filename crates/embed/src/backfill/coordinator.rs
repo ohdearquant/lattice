@@ -61,14 +61,10 @@ impl BackfillCoordinator {
         self.controller.start()
     }
 
-    /// Route an embedding request based on current migration state.
+    /// Routes an embedding write request according to migration state.
     ///
-    /// - `is_new_document`: `true` if this is a new document being indexed
-    ///   for the first time, `false` if it is being re-embedded as part of
-    ///   normal operations (not backfill).
-    ///
-    /// During active migration with `dual_write` enabled, new documents are
-    /// embedded with both source and target models to keep both indexes current.
+    /// `is_new_document` distinguishes initial indexing from ordinary re-embedding.
+    /// See [docs/backfill.md](../../docs/backfill.md) (§`BackfillCoordinator::route_request`) for dual-write semantics.
     pub fn route_request(&self, is_new_document: bool) -> EmbeddingRoute {
         match self.controller.state() {
             MigrationState::Planned => EmbeddingRoute::Legacy,
@@ -112,16 +108,15 @@ impl BackfillCoordinator {
         }
     }
 
-    /// Record a completed backfill batch.
+    /// Records a completed backfill batch and advances the migration.
     ///
-    /// Updates both the internal backfilled count and the underlying
-    /// migration controller's progress. If this causes processed to
-    /// reach total, the migration auto-completes and the cutover timestamp
-    /// is recorded for rollback window tracking.
+    /// Starts rollback timing when the batch completes the migration.
     ///
     /// # Errors
     ///
-    /// Returns [`MigrationError::InvalidTransition`] if not in `InProgress` state.
+    /// Returns [`MigrationError::InvalidTransition`] outside `InProgress`.
+    ///
+    /// See [docs/backfill.md](../../docs/backfill.md) (§`BackfillCoordinator::record_batch`) for accounting and cutover timing.
     pub fn record_batch(&mut self, count: usize) -> Result<(), MigrationError> {
         let was_in_progress = matches!(self.controller.state(), MigrationState::InProgress { .. });
         self.backfilled_count += count;
@@ -270,14 +265,10 @@ impl BackfillCoordinator {
         self.backfilled_count
     }
 
-    /// Compute the next batch size to process.
+    /// Returns the number of items that may be processed in the next batch.
     ///
-    /// Returns `0` if the migration is not in `InProgress` state.
-    /// Otherwise returns the smaller of the configured batch size and the
-    /// effective remaining items (total minus processed minus skipped).
-    /// This keeps the batch estimate coherent with `record_progress`, which
-    /// also uses `effective_total = total − skipped` as its completion
-    /// threshold.
+    /// Returns zero outside `InProgress` and caps effective remaining work at the configured size.
+    /// See [docs/backfill.md](../../docs/backfill.md) (§`BackfillCoordinator::next_batch_size`) for its accounting rule.
     pub fn next_batch_size(&self) -> usize {
         match self.controller.state() {
             MigrationState::InProgress {
