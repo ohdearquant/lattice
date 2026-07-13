@@ -392,6 +392,15 @@ class OllamaResponseParsingTest(unittest.TestCase):
         with self.assertRaises(adapters.OllamaResponseError):
             adapters.ollama_response_to_result(data)
 
+    def test_fractional_eval_duration_alone_raises(self):
+        # eval_count is validated first, so the all-fractional case above
+        # never reaches eval_duration; this isolates it (a "clean" 1.0
+        # would survive int() conversion without truncation, so it is the
+        # sharpest float to reject on type alone).
+        data = {"eval_count": 32, "eval_duration": 1.0, "total_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
     def test_fractional_total_duration_alone_raises(self):
         data = {"eval_count": 32, "eval_duration": 1, "total_duration": 2.9}
         with self.assertRaises(adapters.OllamaResponseError):
