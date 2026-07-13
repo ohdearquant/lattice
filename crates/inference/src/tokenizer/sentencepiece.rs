@@ -7,7 +7,7 @@
 use crate::error::InferenceError;
 use crate::tokenizer::common::{
     JsonValue, ThreadSafeLruCache, TokenizedInput, Tokenizer, json_path, known_special_id, pad_ids,
-    parse_json, parse_post_processor_flags, push_eos_preserving_limit,
+    parse_added_tokens, parse_json, parse_post_processor_flags, push_eos_preserving_limit,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -75,6 +75,8 @@ struct SentencePieceInner {
     remove_extra_whitespaces: bool,
     escape_whitespaces: bool,
     byte_fallback_ids: Vec<Option<u32>>,
+    added_tokens: HashMap<String, u32>,
+    added_tokens_sorted: Vec<String>,
     cache: ThreadSafeLruCache<String, Vec<u32>>,
 }
 
@@ -145,6 +147,7 @@ struct ParsedSentencePieceModel {
     dummy_prefix: bool,
     remove_extra_whitespaces: bool,
     escape_whitespaces: bool,
+    added_tokens: HashMap<String, u32>,
 }
 
 impl Default for ParsedSentencePieceModel {
@@ -160,6 +163,7 @@ impl Default for ParsedSentencePieceModel {
             dummy_prefix: true,
             remove_extra_whitespaces: true,
             escape_whitespaces: true,
+            added_tokens: HashMap::new(),
         }
     }
 }
@@ -261,7 +265,8 @@ impl SentencePieceTokenizer {
 
         let unk_id = json_path(&root, &["model", "unk_id"])
             .and_then(JsonValue::as_u64)
-            .map(|v| v as u32)
+            .map(|value| checked_special_id(value, "unk_id"))
+            .transpose()?
             .or_else(|| known_special_id(&vocab_map, &["<unk>"]));
         let bos_id = known_special_id(&vocab_map, &["<bos>", "<s>"]);
         let eos_id = known_special_id(&vocab_map, &["<eos>", "</s>"]);
@@ -283,6 +288,7 @@ impl SentencePieceTokenizer {
             dummy_prefix: true,
             remove_extra_whitespaces: true,
             escape_whitespaces: true,
+            added_tokens: parse_added_tokens(&root),
         };
 
         Self::from_parsed_model(
@@ -293,7 +299,7 @@ impl SentencePieceTokenizer {
     }
 
     fn from_parsed_model(
-        model: ParsedSentencePieceModel,
+        mut model: ParsedSentencePieceModel,
         cache_capacity: usize,
         max_seq_len: usize,
     ) -> Result<Self, InferenceError> {
@@ -304,8 +310,8 @@ impl SentencePieceTokenizer {
 
         // A malformed tokenizer.json (`model.unk_id`) or native `.model` trainer_spec
         // (unk/bos/eos/pad fields) can declare a special-token id past the end of the
-        // vocabulary — the value is cast `as u32` with no bounds check at parse time.
-        // viterbi_encode emits `unk_id` directly for unmatched input, and bos/eos are
+        // vocabulary even when it fits in u32. viterbi_encode emits `unk_id` directly
+        // for unmatched input, and bos/eos are
         // prepended/appended, so an out-of-range id flows straight into the model's
         // embedding gather (out-of-bounds read) or `id_to_piece` lookup. Reject the
         // malformed model at construction rather than emit an invalid token id (mirrors
@@ -331,6 +337,9 @@ impl SentencePieceTokenizer {
             .iter()
             .map(|piece| piece.score)
             .fold(f32::INFINITY, f32::min);
+        model.added_tokens.retain(|token, _| !token.is_empty());
+        let mut added_tokens_sorted: Vec<String> = model.added_tokens.keys().cloned().collect();
+        added_tokens_sorted.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         let mut trie = ByteTrie::new();
         let mut byte_fallback_ids = vec![None; 256];
         let mut id_to_piece = Vec::with_capacity(model.pieces.len());
@@ -369,6 +378,8 @@ impl SentencePieceTokenizer {
             remove_extra_whitespaces: model.remove_extra_whitespaces,
             escape_whitespaces: model.escape_whitespaces,
             byte_fallback_ids,
+            added_tokens: model.added_tokens,
+            added_tokens_sorted,
             cache: ThreadSafeLruCache::new(cache_capacity),
         };
 
@@ -395,6 +406,7 @@ impl SentencePieceTokenizer {
                 dummy_prefix: true,
                 remove_extra_whitespaces: true,
                 escape_whitespaces: true,
+                added_tokens: HashMap::new(),
             },
             DEFAULT_SENTENCEPIECE_CACHE_CAPACITY,
             DEFAULT_SENTENCEPIECE_MAX_SEQ_LEN,
@@ -421,6 +433,8 @@ impl SentencePieceTokenizer {
             remove_extra_whitespaces: self.inner.remove_extra_whitespaces,
             escape_whitespaces: self.inner.escape_whitespaces,
             byte_fallback_ids: self.inner.byte_fallback_ids.clone(),
+            added_tokens: self.inner.added_tokens.clone(),
+            added_tokens_sorted: self.inner.added_tokens_sorted.clone(),
             cache: self.inner.cache.clone(),
         };
         Self {
@@ -532,24 +546,58 @@ impl SentencePieceTokenizer {
     }
 
     fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        if self.inner.added_tokens_sorted.is_empty() {
+            self.tokenize_regular_segment(text, &mut ids);
+        } else {
+            let mut pos = 0usize;
+            while pos < text.len() {
+                if let Some((end, id)) = self.match_added_token(text, pos) {
+                    ids.push(id);
+                    pos = end;
+                } else {
+                    let segment_start = pos;
+                    while pos < text.len() && self.match_added_token(text, pos).is_none() {
+                        let ch = text[pos..]
+                            .chars()
+                            .next()
+                            .expect("invariant: pos is inside non-empty UTF-8 text");
+                        pos += ch.len_utf8();
+                    }
+                    self.tokenize_regular_segment(&text[segment_start..pos], &mut ids);
+                }
+            }
+        }
+        self.add_special_tokens_and_truncate(&mut ids);
+        ids
+    }
+
+    fn tokenize_regular_segment(&self, text: &str, ids: &mut Vec<u32>) {
         let normalized = self.normalize(text);
         if normalized.is_empty() {
-            let mut ids = Vec::new();
-            self.add_special_tokens_and_truncate(&mut ids);
-            return ids;
+            return;
         }
 
         if let Some(cached) = self.inner.cache.get(&normalized) {
-            let mut ids = cached.as_ref().clone();
-            self.add_special_tokens_and_truncate(&mut ids);
-            return ids;
+            ids.extend(cached.iter().copied());
+            return;
         }
 
-        let mut ids = self.viterbi_encode(&normalized);
-        self.inner.cache.insert(normalized, ids.clone());
+        let segment_ids = self.viterbi_encode(&normalized);
+        self.inner.cache.insert(normalized, segment_ids.clone());
+        ids.extend(segment_ids);
+    }
 
-        self.add_special_tokens_and_truncate(&mut ids);
-        ids
+    fn match_added_token(&self, text: &str, pos: usize) -> Option<(usize, u32)> {
+        let tail = &text[pos..];
+        for token in &self.inner.added_tokens_sorted {
+            if tail.starts_with(token)
+                && let Some(&id) = self.inner.added_tokens.get(token)
+            {
+                return Some((pos + token.len(), id));
+            }
+        }
+        None
     }
 
     fn viterbi_encode(&self, sentence: &str) -> Vec<u32> {
@@ -696,6 +744,12 @@ fn parse_byte_piece(piece: &str) -> Option<u8> {
     u8::from_str_radix(hex, 16).ok()
 }
 
+fn checked_special_id(value: u64, name: &str) -> Result<u32, InferenceError> {
+    u32::try_from(value).map_err(|_| {
+        InferenceError::Tokenizer(format!("SentencePiece {name} ({value}) exceeds u32 range"))
+    })
+}
+
 fn parse_sentencepiece_model(bytes: &[u8]) -> Result<ParsedSentencePieceModel, InferenceError> {
     let mut model = ParsedSentencePieceModel::default();
     let mut pos = 0usize;
@@ -778,10 +832,18 @@ fn parse_trainer_spec(
     while pos < bytes.len() {
         let (field, wire_type) = read_key(bytes, &mut pos)?;
         match (field, wire_type) {
-            (40, 0) => model.unk_id = Some(read_varint(bytes, &mut pos)? as u32),
-            (41, 0) => model.bos_id = Some(read_varint(bytes, &mut pos)? as u32),
-            (42, 0) => model.eos_id = Some(read_varint(bytes, &mut pos)? as u32),
-            (43, 0) => model.pad_id = Some(read_varint(bytes, &mut pos)? as u32),
+            (40, 0) => {
+                model.unk_id = Some(checked_special_id(read_varint(bytes, &mut pos)?, "unk_id")?)
+            }
+            (41, 0) => {
+                model.bos_id = Some(checked_special_id(read_varint(bytes, &mut pos)?, "bos_id")?)
+            }
+            (42, 0) => {
+                model.eos_id = Some(checked_special_id(read_varint(bytes, &mut pos)?, "eos_id")?)
+            }
+            (43, 0) => {
+                model.pad_id = Some(checked_special_id(read_varint(bytes, &mut pos)?, "pad_id")?)
+            }
             _ => skip_field(bytes, &mut pos, wire_type)?,
         }
     }
@@ -937,11 +999,11 @@ mod tests {
     #[test]
     fn test_out_of_range_special_id_rejected_at_construction() {
         // A malformed tokenizer.json / .model can declare unk_id (or bos/eos/pad) past
-        // the end of the vocab; the value is cast `as u32` with no bounds check at parse
-        // time. Without the construction guard, from_parsed_model would build a tokenizer
-        // that emits that out-of-range id from viterbi_encode's unmatched-char fallback,
-        // which then indexes the model's embedding table out of bounds. Construction must
-        // reject it. Here vocab has 3 pieces (ids 0..3) and unk_id = 5.
+        // the end of the vocab even when the value fits in u32. Without the construction
+        // guard, from_parsed_model would build a tokenizer that emits that out-of-range id
+        // from viterbi_encode's unmatched-char fallback, which then indexes the model's
+        // embedding table out of bounds. Construction must reject it. Here vocab has 3
+        // pieces (ids 0..3) and unk_id = 5.
         let pieces = vec![
             SentencePieceEntry {
                 piece: "<unk>".to_string(),
@@ -968,17 +1030,57 @@ mod tests {
 
     #[test]
     fn test_out_of_range_unk_id_rejected_from_json() {
-        // The tokenizer.json loader path (from_tokenizer_json_str -> from_parsed_model)
-        // casts `model.unk_id` `as u32` with no bounds check. A malformed file declaring
-        // unk_id past the vocab end must be rejected at construction, mirroring the
-        // .model path covered by from_pieces_for_test above. Vocab has 2 pieces (ids 0,1)
-        // and unk_id = 4.
+        // A malformed file declaring unk_id past the vocab end must be rejected at
+        // construction, mirroring the .model path covered by from_pieces_for_test above.
+        // Vocab has 2 pieces (ids 0,1) and unk_id = 4.
         let json = r#"{"model":{"type":"Unigram","unk_id":4,"vocab":[["<unk>",0.0],["▁a",-1.0]]}}"#;
         let result = SentencePieceTokenizer::from_tokenizer_json_str(json);
         assert!(
             result.is_err(),
             "an out-of-range unk_id from tokenizer.json must be rejected at construction"
         );
+    }
+
+    #[test]
+    fn test_overflowing_unk_id_rejected_from_json() {
+        let json = r#"{"model":{"type":"Unigram","unk_id":4294967296,"vocab":[["<unk>",0.0],["▁a",-1.0]]}}"#;
+        let result = SentencePieceTokenizer::from_tokenizer_json_str(json);
+        assert!(
+            result.is_err(),
+            "a SentencePiece special id outside the u32 domain must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_overflowing_special_id_rejected_from_protobuf() {
+        fn push_varint(mut value: u64, out: &mut Vec<u8>) {
+            while value >= 0x80 {
+                out.push((value as u8 & 0x7f) | 0x80);
+                value >>= 7;
+            }
+            out.push(value as u8);
+        }
+
+        let mut trainer_spec = Vec::new();
+        push_varint(40 << 3, &mut trainer_spec);
+        push_varint(u64::from(u32::MAX) + 1, &mut trainer_spec);
+        let mut model = ParsedSentencePieceModel::default();
+        let result = parse_trainer_spec(&trainer_spec, &mut model);
+        assert!(
+            result.is_err(),
+            "a protobuf SentencePiece special id outside the u32 domain must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_json_added_token_matches_before_normalization() {
+        let json = r#"{
+            "added_tokens":[{"id":2,"content":"<extra>","special":false}],
+            "model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["▁a",-1.0]]}
+        }"#;
+        let tokenizer = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
+        let input = tokenizer.tokenize("<extra>");
+        assert_eq!(&input.input_ids[..input.real_length], &[2]);
     }
 
     #[test]

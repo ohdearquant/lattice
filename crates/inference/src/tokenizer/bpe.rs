@@ -471,19 +471,27 @@ impl BpeTokenizer {
     ///
     /// `vocab_bytes()[i]` is the UTF-8 byte sequence that token `i` decodes to,
     /// after applying the GPT-2 byte-level encoding reversal.
+    /// The table includes added-token IDs; skipped control-token slots are empty.
     ///
     /// Used by [`GrammarEngine::new`](crate::grammar::GrammarEngine::new) to build
     /// the precomputed vocabulary partition for grammar-constrained decoding (ADR-046).
     ///
     /// Cost: O(vocab_size) — called once at engine initialisation.
     pub fn vocab_bytes(&self) -> Vec<Vec<u8>> {
-        self.inner
-            .id_to_token
-            .iter()
-            .map(|token_str| {
-                // Apply GPT-2 byte-level encoding reversal (same as byte_decode_token).
-                let decoded = byte_decode_token(token_str);
-                decoded.into_bytes()
+        let max_added_id = self
+            .inner
+            .special_tokens
+            .values()
+            .chain(self.inner.added_render.keys())
+            .copied()
+            .max()
+            .map_or(0usize, |id| id as usize + 1);
+        let model_vocab_size = self.inner.id_to_token.len().max(max_added_id);
+        (0..model_vocab_size)
+            .map(|id| {
+                self.token_for_id(id as u32)
+                    .map(byte_decode_token_bytes)
+                    .unwrap_or_default()
             })
             .collect()
     }
@@ -1497,6 +1505,59 @@ mod tests {
         // prior generate.rs detokenize block discarded the text entirely.
         assert_eq!(tokenizer.decode(&ids), Some("hello world".to_string()));
         assert_eq!(tokenizer.decode(&[]), Some(String::new()));
+    }
+
+    #[test]
+    fn test_grammar_vocab_preserves_split_utf8_bytes() {
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+
+        let byte_encoder = bytes_to_unicode();
+        let mut vocab = HashMap::new();
+        vocab.insert(byte_encoder[0xE5].to_string(), 0);
+        vocab.insert(byte_encoder[0xA5].to_string(), 1);
+        vocab.insert(byte_encoder[0xBD].to_string(), 2);
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new()).unwrap();
+        let vocab_bytes = tokenizer.vocab_bytes();
+        assert_eq!(vocab_bytes, vec![vec![0xE5], vec![0xA5], vec![0xBD]]);
+
+        let spec = GrammarSpec::Gbnf("root ::= \"好\"\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab_bytes).unwrap();
+        let mut state = engine.initial_state();
+        for token_id in 0..3u32 {
+            let mut logits = vec![0.0; 3];
+            engine.mask_logits(&mut state, &mut logits);
+            assert!(
+                logits[token_id as usize].is_finite(),
+                "split UTF-8 token {token_id} must remain grammar-legal"
+            );
+            assert!(engine.advance(&mut state, token_id));
+        }
+    }
+
+    #[test]
+    fn test_grammar_vocab_masks_rendered_added_tokens_and_controls() {
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+
+        let json = r#"{
+            "model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]},
+            "added_tokens":[
+                {"id":99,"content":"<control>","special":true},
+                {"id":100,"content":"<extra>","special":false}
+            ]
+        }"#;
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        let vocab_bytes = tokenizer.vocab_bytes();
+        assert_eq!(vocab_bytes.len(), 101);
+        assert!(vocab_bytes[99].is_empty());
+        assert_eq!(vocab_bytes[100], b"<extra>");
+
+        let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab_bytes).unwrap();
+        let mut state = engine.initial_state();
+        let mut logits = vec![0.0; 101];
+        engine.mask_logits(&mut state, &mut logits);
+        assert_eq!(logits[99], f32::NEG_INFINITY);
+        assert_eq!(logits[100], f32::NEG_INFINITY);
     }
 
     #[test]
