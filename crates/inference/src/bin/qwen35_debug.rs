@@ -1,7 +1,15 @@
 //! Debug diagnostic for Qwen3.5-2B — checks each stage of the forward pass.
 
+use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_inference::tokenizer::common::Tokenizer;
 use std::path::PathBuf;
+
+fn decode_token(tokenizer: &BpeTokenizer, token_id: u32) -> String {
+    tokenizer
+        .token_bytes_for_id(token_id)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_else(|| "??".to_string())
+}
 
 fn main() {
     let model_dir = std::env::var("LATTICE_MODEL_CACHE")
@@ -45,8 +53,7 @@ fn main() {
 
             // Decode each token
             for &tid in &output.token_ids {
-                let tok = tokenizer.token_for_id(tid).unwrap_or("??");
-                let decoded = lattice_inference::tokenizer::bpe::byte_decode_token(tok);
+                let decoded = decode_token(tokenizer, tid);
                 println!("  {tid} -> {decoded:?}");
             }
         }
@@ -72,8 +79,7 @@ fn main() {
     si.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     println!("Top-5:");
     for (i, (tok, logit)) in si.iter().take(5).enumerate() {
-        let name = tokenizer.token_for_id(*tok as u32).unwrap_or("??");
-        let decoded = lattice_inference::tokenizer::bpe::byte_decode_token(name);
+        let decoded = decode_token(tokenizer, *tok as u32);
         println!("  {i}: token_id={tok}, logit={logit:.4}, decoded={decoded:?}");
     }
     println!("Python: 2614(' following')=12.69, 220(' ')=11.50, 7193(' purpose')=11.13");
@@ -95,8 +101,7 @@ fn main() {
     println!("\nTop-10 tokens:");
     println!("Python top: 11751(' Paris')=18.875, 279(' the')=16.5, 264(' a')=16.25");
     for (i, (tok, logit)) in indexed.iter().take(10).enumerate() {
-        let name = tokenizer.token_for_id(*tok as u32).unwrap_or("??");
-        let decoded = lattice_inference::tokenizer::bpe::byte_decode_token(name);
+        let decoded = decode_token(tokenizer, *tok as u32);
         println!("  {i}: token_id={tok}, logit={logit:.4}, decoded={decoded:?}");
     }
 

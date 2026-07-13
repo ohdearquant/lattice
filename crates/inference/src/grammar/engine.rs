@@ -143,7 +143,7 @@ impl GrammarEngine {
     /// Build a `GrammarEngine` from a `GrammarSpec` and the model vocabulary.
     ///
     /// `vocab_bytes[i]` is the UTF-8 / byte-level representation of token `i`.
-    /// For BPE tokenizers, obtain this via `BpeTokenizer::vocab_bytes()`.
+    /// For BPE tokenizers, obtain this via `BpeTokenizer::vocab_bytes(model_vocab_size)`.
     ///
     /// This runs in O(|states| × vocab_size × max_token_len) time.  For
     /// large vocabularies (e.g. Qwen3 at 248,320 tokens) this may take

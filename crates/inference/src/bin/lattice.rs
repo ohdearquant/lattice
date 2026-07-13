@@ -3353,13 +3353,8 @@ mod serve {
         tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
         token_id: u32,
     ) -> (String, Option<Vec<u8>>) {
-        match tokenizer.token_for_id(token_id) {
-            Some(tok_str) => (
-                lattice_inference::tokenizer::bpe::byte_decode_token(tok_str),
-                Some(lattice_inference::tokenizer::bpe::byte_decode_token_bytes(
-                    tok_str,
-                )),
-            ),
+        match tokenizer.token_bytes_for_id(token_id) {
+            Some(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), Some(bytes)),
             None => (format!("<|unresolved_token_{token_id}|>"), None),
         }
     }

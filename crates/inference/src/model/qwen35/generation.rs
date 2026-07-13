@@ -924,6 +924,7 @@ impl Qwen35Model {
 
             let mut stopped = false;
             let mut stopped_by_caller = false;
+            let mut confirmed_stop_string_match = false;
             let mut stop_reason = StopReason::Length;
             // Decode loop for the string-stop path.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
@@ -1024,6 +1025,7 @@ impl Qwen35Model {
                     }
                     StepOutcome::Stopped => {
                         stopped = true;
+                        confirmed_stop_string_match = true;
                         stop_reason = StopReason::Eos;
                         break;
                     }
@@ -1043,8 +1045,10 @@ impl Qwen35Model {
             // Skip when the caller asked to stop -- it is no longer consuming
             // the stream, and `on_token`'s return value here would not change
             // why generation actually stopped.
-            if !stopped_by_caller {
-                let tail_stopped = policy.finish_stop(&mut text, &detok.finish(), |s| on_token(s));
+            if !stopped_by_caller
+                && let Some(tail) = finish_detokenizer(&mut detok, confirmed_stop_string_match)
+            {
+                let tail_stopped = policy.finish_stop(&mut text, &tail, |s| on_token(s));
                 // finish_stop may itself complete a stop in the tail bytes.
                 if tail_stopped && !stopped {
                     stopped = true;
@@ -1739,6 +1743,13 @@ fn initial_rng_state(seed: Option<u64>) -> u64 {
     }
 }
 
+fn finish_detokenizer(
+    detok: &mut IncrementalDetokenizer,
+    confirmed_stop_string_match: bool,
+) -> Option<String> {
+    (!confirmed_stop_string_match).then(|| detok.finish())
+}
+
 fn prefill_tokens(
     model: &Qwen35Model,
     prompt_ids: &[u32],
@@ -1895,6 +1906,7 @@ fn decode_loop_with_stops(
 ) -> Result<(bool, StopReason), InferenceError> {
     let cfg = &model.config;
     let mut stopped = false;
+    let mut confirmed_stop_string_match = false;
     let mut stop_reason = StopReason::Length;
     let cap = policy.cap();
     for _ in 1..cap {
@@ -1973,6 +1985,7 @@ fn decode_loop_with_stops(
             }
             StepOutcome::Stopped => {
                 stopped = true;
+                confirmed_stop_string_match = true;
                 stop_reason = StopReason::Eos;
                 break;
             }
@@ -2000,23 +2013,24 @@ fn decode_loop_with_stops(
         }
     }
 
-    // Only flush detok tail when no stop was hit. A stop already truncated `full` to
-    // the correct position; appending tail bytes from past the stop would corrupt it.
-    if !stopped {
-        let tail = detok.finish();
-        if !tail.is_empty() {
-            full.push_str(&tail);
-            // The tail itself might complete a stop string.
-            if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
-                full.truncate(hit);
-                truncate_token_logprobs_to_retained_text(
-                    token_logprobs,
-                    token_logprob_end_offsets,
-                    hit,
-                );
+    if let Some(tail) = finish_detokenizer(detok, confirmed_stop_string_match)
+        && !tail.is_empty()
+    {
+        full.push_str(&tail);
+        // The tail itself might complete a stop string.
+        if let Some(hit) = earliest_stop_match(full, &gen_cfg.stop_strings) {
+            full.truncate(hit);
+            truncate_token_logprobs_to_retained_text(
+                token_logprobs,
+                token_logprob_end_offsets,
+                hit,
+            );
+            if !stopped {
                 return Ok((true, StopReason::Eos));
             }
         }
+    }
+    if !stopped {
         return Ok((false, StopReason::Length));
     }
     Ok((stopped, stop_reason))
@@ -3629,6 +3643,44 @@ mod tests {
              have missed or mis-timed this token entirely; got {} prior on_token calls",
             snapshots_at_raw_event.borrow()[0]
         );
+    }
+
+    #[test]
+    fn eos_flushes_incomplete_utf8_tail_in_streaming_and_nonstreaming() {
+        const TOK_JSON: &str = r#"{
+  "version":"1.0","truncation":null,"padding":null,
+  "added_tokens":[{"id":7,"content":"</think>","special":false}],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"Â":0,"<unk>":1,"a":2},"merges":[]}
+}"#;
+        let model = build_tiny_zero_model_tok(TOK_JSON);
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            enable_thinking: true,
+            reasoning_budget: Some(1),
+            stop_token_ids: vec![7],
+            stop_strings: vec!["never".to_string()],
+            ..Default::default()
+        };
+
+        let nonstreaming = model.generate("a", &gen_cfg).unwrap();
+        let mut streamed_text = String::new();
+        let streaming = model
+            .generate_streaming("a", &gen_cfg, |delta| streamed_text.push_str(delta))
+            .unwrap();
+
+        assert_eq!(nonstreaming.stop_reason, Some(StopReason::Eos));
+        assert_eq!(streaming.stop_reason, Some(StopReason::Eos));
+        assert_eq!(nonstreaming.token_ids, vec![0]);
+        assert_eq!(nonstreaming.text, "�");
+        assert_eq!(nonstreaming.text, streaming.text);
+        assert_eq!(streaming.text, streamed_text);
     }
 
     /// Stop-string truncation must drop `token_logprobs` entries whose decoded

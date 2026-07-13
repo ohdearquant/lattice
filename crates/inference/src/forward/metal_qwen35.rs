@@ -13102,10 +13102,7 @@ mod inner {
     }
 
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
-        ids.iter()
-            .filter_map(|id| tokenizer.token_for_id(*id))
-            .map(crate::tokenizer::bpe::byte_decode_token)
-            .collect()
+        crate::model::qwen35::detokenize::decode_tokens(tokenizer, ids)
     }
 
     // -----------------------------------------------------------------------
