@@ -164,12 +164,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut metal: MetalQwen35State;
 
     if is_q4 {
-        let cfg = if dir.join("config.json").exists() {
-            Qwen35Config::from_config_json(&dir.join("config.json"))
-                .map_err(|e| format!("config.json parse: {e}"))?
-        } else {
-            Qwen35Config::qwen35_0_8b()
-        };
+        let cfg =
+            Qwen35Config::from_model_dir(dir).map_err(|e| format!("config.json load: {e}"))?;
         metal = MetalQwen35State::from_q4_dir(
             dir,
             &tokenizer_dir.join("tokenizer.json"),

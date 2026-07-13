@@ -893,29 +893,14 @@ mod doctor {
 
         let (placement, cfg, inventory) = match format {
             crate::backend::ModelFormat::Safetensors => {
-                let config_path = model_dir.join("config.json");
-                let cfg = if config_path.exists() {
-                    Qwen35Config::from_config_json(&config_path)
-                        .map_err(|e| format!("config.json parse failed: {e}"))?
-                } else {
-                    // Mirrors `Qwen35Model::from_safetensors`'s own fallback.
-                    Qwen35Config::qwen35_2b()
-                };
+                let cfg = Qwen35Config::from_model_dir(model_dir)
+                    .map_err(|e| format!("config.json load failed: {e}"))?;
                 let inventory = inspect_safetensors_dir(model_dir, &cfg)?;
                 (Placement::Cpu, cfg, inventory)
             }
             crate::backend::ModelFormat::Q4 => {
-                let config_path = model_dir.join("config.json");
-                let cfg = if config_path.exists() {
-                    Qwen35Config::from_config_json(&config_path)
-                        .map_err(|e| format!("config.json parse failed: {e}"))?
-                } else {
-                    // Mirrors `load_q4_config`'s own fallback (that function
-                    // is `metal-gpu`-only; `doctor` must work without the
-                    // feature too, so the two-line fallback is duplicated
-                    // here rather than shared across the cfg-gate).
-                    Qwen35Config::qwen36_27b()
-                };
+                let cfg = Qwen35Config::from_model_dir(model_dir)
+                    .map_err(|e| format!("config.json load failed: {e}"))?;
                 let inventory = inspect_q4_dir(model_dir, &cfg)?;
                 (Placement::Metal, cfg, inventory)
             }
@@ -2124,6 +2109,62 @@ mod doctor {
             fs::remove_dir_all(&dir).ok();
         }
 
+        // ---- #923: missing config.json is a hard, uniform error -----------
+        //
+        // Before the fix, this Safetensors branch silently substituted
+        // `Qwen35Config::qwen35_2b()` and the Q4 branch silently substituted
+        // `Qwen35Config::qwen36_27b()` -- two different guessed presets, and
+        // neither told the caller a config.json was even missing. Both
+        // branches now go through the same `Qwen35Config::from_model_dir`
+        // fail-closed helper as every other loader in this crate. Reverting
+        // either branch's call site back to the old exists-then-preset
+        // pattern makes its half of this test fail (it would return `Ok`
+        // instead of an error naming `config.json`).
+
+        #[test]
+        fn build_report_safetensors_missing_config_json_is_hard_error() {
+            let dir = tempdir("report-safetensors-no-config");
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let tensors = required_tensor_fixture(&cfg);
+            let refs: Vec<(&str, &str, u64, u64)> = tensors
+                .iter()
+                .map(|(n, d, s, e)| (n.as_str(), d.as_str(), *s, *e))
+                .collect();
+            write_fake_safetensors(&dir.join("model.safetensors"), &refs);
+            // Deliberately no config.json and no tokenizer.json.
+
+            let err = build_report(&dir, None, None, Some(1u64 << 40)).unwrap_err();
+            assert!(
+                err.contains("config.json"),
+                "error must name the missing config.json, not a guessed preset: {err}"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn build_report_q4_missing_config_json_is_hard_error() {
+            let dir = tempdir("report-q4-no-config");
+            write_fake_q4_file(&dir.join("embed.q4"), 2, &[32], 32, 5);
+            write_fake_q4_file(&dir.join("q_proj.q4"), 2, &[32], 32, 3);
+            let index = serde_json::json!([
+                {"name": "model.language_model.embed_tokens.weight", "file": "embed.q4", "quantized": true, "shape": [32], "numel": 32},
+                {"name": "model.language_model.layers.0.self_attn.q_proj.weight", "file": "q_proj.q4", "quantized": true, "shape": [32], "numel": 32},
+            ]);
+            fs::write(
+                dir.join("quantize_index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+            // Deliberately no config.json.
+
+            let err = build_report(&dir, None, None, Some(1u64 << 40)).unwrap_err();
+            assert!(
+                err.contains("config.json"),
+                "error must name the missing config.json, not a guessed preset: {err}"
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
+
         // ---- DoctorReport Display: MTP disclosure --------------------------
 
         fn minimal_doctor_report(has_mtp_tensors: bool) -> DoctorReport {
@@ -2180,25 +2221,17 @@ mod doctor {
 // chat subcommand
 // ---------------------------------------------------------------------------
 
-/// Load `config.json` for a Q4 directory, falling back to the Qwen3.6-27B
-/// default config (matching `chat_metal.rs` / `lattice_serve.rs`) when the
-/// directory has none, with a visible warning so a missing config.json is
-/// never silently misinterpreted as intentional.
+/// Load `config.json` for a Q4 directory, via the single shared
+/// config-resolution policy (`Qwen35Config::from_model_dir`, #923) used by
+/// every loader in this crate: a missing `config.json` is a hard,
+/// descriptive error naming the directory, never a silently-substituted
+/// architecture preset.
 #[cfg(feature = "metal-gpu")]
 fn load_q4_config(
     dir: &std::path::Path,
 ) -> Result<lattice_inference::model::qwen35_config::Qwen35Config, String> {
-    let config_path = dir.join("config.json");
-    if config_path.exists() {
-        lattice_inference::model::qwen35_config::Qwen35Config::from_config_json(&config_path)
-            .map_err(|e| format!("config.json parse failed: {e}"))
-    } else {
-        eprintln!(
-            "Warning: {} has no config.json; falling back to the Qwen3.6-27B default config.",
-            dir.display()
-        );
-        Ok(lattice_inference::model::qwen35_config::Qwen35Config::qwen36_27b())
-    }
+    lattice_inference::model::qwen35_config::Qwen35Config::from_model_dir(dir)
+        .map_err(|e| format!("config.json load failed: {e}"))
 }
 
 /// Metal-GPU chat backend: owns a `MetalQwen35State` plus the tokenizer and
