@@ -33,11 +33,15 @@ The watchdog check (`elements > MAX_ELEMENTS_PER_DISPATCH`) inside `forward_gpu`
 
 #### Shader Types and Compilation
 
-The `ShaderType` enum covers 13 WGSL compute shaders:
+The `ShaderType` enum covers 6 WGSL compute shaders:
 
 - **Inference**: `MatrixVectorMultiply`, `MatrixVectorMultiplyRelu` (fused), `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`
-- **Softmax**: `SoftmaxMax`, `SoftmaxExpSum`, `SoftmaxNorm` (3-pass for numerical stability)
-- **Optimizers**: `SgdMomentum`, `Adam`, `AdamW`
+
+Softmax remains CPU-side (see "Softmax on CPU" below), and `lattice-fann` does not
+provide optimizer shader dispatch. The enum originally also declared 3-pass Softmax
+(`SoftmaxMax`, `SoftmaxExpSum`, `SoftmaxNorm`) and optimizer (`SgdMomentum`, `Adam`,
+`AdamW`) variants, but no dispatch path ever constructed them and they were removed
+as dead code (issue #852).
 
 `ShaderManager` compiles pipelines lazily via `get_or_compile(shader_type)` using a `RwLock<HashMap<ShaderType, Arc<ComputePipeline>>>`. Cache hits take a read lock; misses acquire a write lock and call `wgpu::Device::create_compute_pipeline`. Compile time is tracked in `CacheStats`.
 
