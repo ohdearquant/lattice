@@ -422,7 +422,7 @@ def run_selftest() -> int:
         # regression that added a group only to bench-compare.sh's array
         # (e.g. simd_normalize) stayed invisible. Two probes against the
         # real helper (scripts/lib/bench-informational-groups.sh, the same
-        # file bench-compare.sh sources for production runs): first dump
+        # file bench-compare.sh invokes for production runs): first dump
         # the raw array (--print-allowlist) and require it to equal the
         # reviewed expectation set — this is what catches an array-only
         # addition — then run the intersection against a controlled

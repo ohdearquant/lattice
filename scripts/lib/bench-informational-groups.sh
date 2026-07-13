@@ -7,7 +7,7 @@
 # the top-level group names actually present in that listing — one name per
 # line, sorted.
 #
-# scripts/bench-compare.sh sources this file for the real run so the exact
+# scripts/bench-compare.sh invokes this file for the real run so the exact
 # same array and intersection logic feeds the gate. scripts/perf-bench-gate.py
 # --selftest invokes this script two ways: with --print-allowlist (dump the
 # raw array, no listing) so the Python-side expected set is compared against
