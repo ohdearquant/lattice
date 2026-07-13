@@ -1,4 +1,5 @@
 //! `lattice-fann` provides small dense neural networks for CPU-first inference.
+//! It targets roughly 100,000-parameter classifiers with a sub-5 ms CPU budget.
 //!
 //! Use [`NetworkBuilder`] to assemble layers, [`Network`] to run them, and
 //! [`BackpropTrainer`] to train them. The CPU forward path reuses activation

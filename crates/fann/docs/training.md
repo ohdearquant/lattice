@@ -88,11 +88,14 @@ one call, but not across two separate calls on the same `BackpropTrainer`.
 `compute_gradients` runs one forward pass per sample, then walks the layer stack
 backward:
 
-1. **Output-layer delta.** For a Softmax output layer, the *full* Jacobian is
-   used (not the diagonal approximation — see [Activations](network.md#activations)):
+1. **Output-layer delta.** The implementation uses the derivative of the
+   unscaled half-squared-error term, while it reports separately normalized MSE.
+   For a Softmax output layer, the *full* Jacobian is used (not the diagonal
+   approximation — see [Activation reference](network.md#activation-reference)):
    `delta[i] = Σ_j (output[j] − target[j]) · J[j,i]` where `J[j,i] = output[j]·(δ_ij − output[i])`.
-   For every other output activation, `delta[i] = (output[i] − target[i]) · f'(output[i])`
-   (plain MSE-derivative chain rule).
+   For every other output activation, `delta[i] = (output[i] − target[i]) · f'(output[i])`.
+   The reported sample MSE is `Σ_i (output[i] − target[i])² / output_width`; its
+   formal derivative would additionally include `2 / output_width`.
 2. **Hidden-layer deltas**, propagated backward layer by layer:
    `delta_i^(l) = f'(a_i^(l)) · Σ_j W_ji^(l+1) · delta_j^(l+1)`, reading the
    next layer's weight matrix in its row-major `[out * num_inputs + in]` layout.
@@ -289,6 +292,15 @@ gradient. It is a direct, relative suppression of an already computed update:
 the largest Fisher entry receives scale zero, while lower-importance entries
 receive a scale relative to that maximum. Choose one approach deliberately, or
 combine them only when the resulting amount of protection is intended.
+
+### API error contracts
+
+`DiagonalFisher::new` rejects a non-finite or out-of-range `decay` with
+`InvalidDistributionParams` and a too-large parameter count with
+`ShapeTooLarge`. `observe_gradient`, `set_anchor`, and `penalty_gradient`
+return `InputSizeMismatch` when their full-length slice arguments do not match
+the guard. `project_delta` deliberately differs: it processes only the common
+prefix so a guard can be applied to a parameter sub-slice.
 
 ## REINFORCE with Leave-One-Out (RLOO)
 

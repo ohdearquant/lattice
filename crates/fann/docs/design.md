@@ -9,6 +9,12 @@ The crate is CPU-first. GPU execution, parallel batches, and persistence are
 optional capabilities around the same layer and network representation; a
 complete CPU path does not depend on any of them.
 
+## Scope and performance target
+
+`lattice-fann` targets local classifiers of roughly 100,000 parameters, with a
+sub-5 ms CPU-inference budget. This is a scope target for small dense models,
+not a latency guarantee across architectures, hardware, or feature sets.
+
 ## Component map
 
 ```text
@@ -170,7 +176,7 @@ oversized allocation, an out-of-bounds parameter access, or a misleading result.
 | Explicit parameters | Exact weights and biases for the declared shape | Count-mismatch error |
 | Network construction | Nonempty stack and matching adjacent dimensions | `EmptyNetwork` or `InvalidLayerDimensions` |
 | CPU forward | Input/output widths and finite layer results | Size mismatch or `NumericInstability` |
-| Binary loading | Header, version, bounds before allocation, exact payload length | `InvalidBuilder`, `ShapeTooLarge`, or `EmptyNetwork` |
+| Binary loading | Header, version, bounds before allocation, exact payload length | `InvalidBuilder`, `InvalidLayerDimensions`, `ShapeTooLarge`, or `EmptyNetwork` |
 | Serde loading | Constructor validation and buffer reconstruction | Deserialization error rather than unusable state |
 
 The 100,000,000-element guard applies to a single requested tensor allocation.

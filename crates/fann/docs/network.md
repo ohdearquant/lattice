@@ -332,3 +332,123 @@ failed boundary:
 | `SerializationError` | Serde-specific failure when that feature is enabled. |
 
 For `TrainingError` and `GradientError`, see [training.md](training.md).
+
+## NetworkBuilder
+
+`NetworkBuilder` keeps architecture declaration separate from parameter
+initialization. This creates a two-layer classifier and validates the complete
+topology before constructing any `Layer`:
+
+```rust
+use lattice_fann::{Activation, NetworkBuilder};
+
+let network = NetworkBuilder::new()
+    .input(784)
+    .hidden(128, Activation::ReLU)
+    .output(10, Activation::Softmax)
+    .build()?;
+# Ok::<(), lattice_fann::FannError>(())
+```
+
+`build_with_seed` follows the same validation and layer order as `build`, but
+uses one `SmallRng` seeded with the supplied `u64` for every layer. Two builder
+values with the same input width, ordered layer specifications, and seed receive
+identical weights and zero biases. It is useful for repeatable tests and
+comparisons; `build` instead obtains its initialization entropy from the system
+RNG.
+
+## Network
+
+`Network` is mutable for forward evaluation because it owns reusable activation
+buffers. A typical call borrows the final buffer rather than making an output
+copy:
+
+```rust
+use lattice_fann::{Activation, NetworkBuilder};
+
+let mut network = NetworkBuilder::new()
+    .input(4)
+    .hidden(8, Activation::ReLU)
+    .output(2, Activation::Softmax)
+    .build()?;
+let output = network.forward(&[1.0, 2.0, 3.0, 4.0])?;
+assert_eq!(output.len(), 2);
+# Ok::<(), lattice_fann::FannError>(())
+```
+
+The output slice aliases the final activation buffer and cannot survive another
+mutable network operation. Layer accessors expose parameters for training or
+inspection, while `activations(i)` exposes the most recently written buffer for
+layer `i`.
+
+## Network::forward_async
+
+CPU computation is synchronous, but `forward_async` supplies the same awaitable
+shape as the feature-gated GPU interface. It delegates to `forward` and copies
+the final activation slice into an owned `Vec<f32>`, so its result can outlive
+later evaluation. Input-width and numeric-stability errors are unchanged from
+the synchronous path.
+
+## Network::forward_batch
+
+With the `parallel` feature, `forward_batch` distributes inputs over Rayon
+workers while borrowing one immutable set of layer parameters. It gives each
+input fresh activation vectors because a network's regular buffers are mutable
+output state. This avoids cloning weights and biases, but deliberately allocates
+per input; it is a throughput API rather than the allocation-free single-sample
+path.
+
+## Network serialization
+
+`to_bytes` and `from_bytes` are the API boundary for the versioned format
+documented above. A round trip preserves layer dimensions, activation values,
+weights, and biases; transient activation buffers are rebuilt rather than
+stored.
+
+The parser treats all byte slices as untrusted. It verifies the magic, version,
+nonzero layer count, and a minimum nine-byte record budget before reserving the
+layer vector. For each record it validates dimensions before collecting `f32`
+payloads, calculates payload byte counts with checked arithmetic, then routes
+vectors through `Layer::with_weights`. Finally, `Network::new` verifies
+connectivity and rebuilds buffers. Exact-length parsing rejects trailing data,
+so an extended or concatenated blob cannot masquerade as a valid v1 model.
+
+## Activation::forward_batch
+
+For `Linear`, `Sigmoid`, `Tanh`, `ReLU`, and `LeakyReLU`, batch evaluation
+applies the same pointwise rule as repeated scalar `forward` calls. Softmax is
+the exception: it must see the full vector to subtract the shared maximum and
+divide each exponent by the shared sum. Scalar `forward` on `Softmax` therefore
+returns `1.0`, the only possible result for a one-element normalization.
+
+With `simd`, batch ReLU and LeakyReLU use NEON on AArch64 or AVX2 on supported
+x86-64 CPUs; other CPUs retain the scalar loop. Vector routines preserve scalar
+semantics and process a scalar tail after full vector-width chunks.
+
+## Activation derivatives
+
+`derivative` and `derivative_batch` take post-activation output values rather
+than pre-activation inputs. This supports the pointwise formulas without a
+second temporary vector. Softmax is the exception: these APIs return
+`s[i] * (1 - s[i])`, its Jacobian diagonal, not a matrix derivative. The
+output-layer training path supplies cross-output terms; hidden Softmax remains
+invalid for the reasons in [Softmax is output-only](#softmax-is-output-only).
+
+## Layer
+
+`Layer::with_weights` accepts the output-major row layout used by forward
+evaluation. For `I` inputs and `O` outputs, the weight vector has exactly
+`I * O` elements and row `o` begins at `o * I`; the bias vector has exactly `O`
+elements. Constructors reject zero dimensions, multiplication overflow, and the
+100,000,000-element cap before accepting or allocating parameter storage.
+
+`Layer::new` samples a Xavier/Glorot normal distribution from entropy, while
+`Layer::new_with_rng` samples the same distribution from a caller-provided RNG.
+The latter supports reproducible construction. Both initialize biases to zero;
+`Layer::zeros` is the deterministic all-zero alternative.
+
+`Layer::forward` validates both caller-supplied slice widths, computes each
+affine row, and applies the activation in the supplied output buffer. It never
+allocates an output vector. The SIMD matrix path has the same output-major
+semantics as the scalar loop; on x86 it may prefetch only the next existing row
+as a performance hint.

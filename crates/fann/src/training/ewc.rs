@@ -8,20 +8,10 @@
 
 use crate::error::{FannError, FannResult, validate_allocation_size};
 
-/// Diagonal Fisher information matrix for Elastic Weight Consolidation (EWC++).
+/// A flat-slice EWC++ diagonal-Fisher forgetting guard.
 ///
-/// Tracks per-parameter importance via an exponential moving average (EMA) of
-/// squared gradients. Accumulate importance with [`observe_gradient`], fix the
-/// reference point at a task boundary with [`set_anchor`], then either call
-/// [`penalty_gradient`] to inject the EWC regularisation term into the backward
-/// pass, or [`project_delta`] to null-space-damp a raw parameter update.
-///
-/// All operations on flat `&[f32]` slices — no network type dependency.
-///
-/// [`observe_gradient`]: DiagonalFisher::observe_gradient
-/// [`set_anchor`]: DiagonalFisher::set_anchor
-/// [`penalty_gradient`]: DiagonalFisher::penalty_gradient
-/// [`project_delta`]: DiagonalFisher::project_delta
+/// Tracks EMA importance and a matching parameter anchor for each entry.
+/// See [`docs/training.md`](../../docs/training.md#elastic-weight-consolidation-ewc) for the lifecycle and update formulas.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DiagonalFisher {
@@ -34,30 +24,12 @@ pub struct DiagonalFisher {
 }
 
 impl DiagonalFisher {
-    /// Create a new zeroed Fisher estimate for `num_params` parameters.
+    /// Creates zeroed Fisher and anchor vectors for `num_params` parameters.
     ///
-    /// Both `values` (Fisher diagonal) and `anchor` (reference parameters)
-    /// are initialised to zero. Call [`observe_gradient`] to warm up the
-    /// Fisher estimate, then [`set_anchor`] once at the task boundary before
-    /// starting the next task.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FannError::InvalidDistributionParams`] if `decay` is non-finite
-    /// or outside the supported open interval `(0, 1)`.  Outside this interval the
-    /// EMA update `F ← decay·F + (1−decay)·g²` either stalls (`decay ≥ 1`, making
-    /// `1−decay ≤ 0` which reverses the penalty sign) or degenerates (`decay = 0`,
-    /// pure replacement with no memory).
-    ///
-    /// Returns [`FannError::ShapeTooLarge`] if `num_params` exceeds the
-    /// allocation safety limit.
-    ///
-    /// [`observe_gradient`]: DiagonalFisher::observe_gradient
-    /// [`set_anchor`]: DiagonalFisher::set_anchor
+    /// Returns [`FannError::InvalidDistributionParams`] for non-finite or out-of-range `decay`, or [`FannError::ShapeTooLarge`] for an oversized allocation.
+    /// See [`docs/training.md`](../../docs/training.md#diagonal-fisher-information-as-an-importance-estimate) for the EMA rule and decay rationale.
     pub fn new(num_params: usize, decay: f32) -> FannResult<Self> {
-        // Reject decay outside (0, 1) and non-finite values before any allocation.
-        // decay ≥ 1 makes (1−decay) ≤ 0, which reverses accumulated importance;
-        // decay = 0 collapses to pure-replacement with no EMA memory.
+        // Decay must retain history and a positive fresh-gradient contribution — see docs/training.md.
         if !decay.is_finite() || decay <= 0.0 || decay >= 1.0 {
             return Err(FannError::InvalidDistributionParams(format!(
                 "EWC decay must be finite and in the open interval (0, 1), got {decay}"
@@ -71,17 +43,10 @@ impl DiagonalFisher {
         })
     }
 
-    /// Update the diagonal Fisher estimate with one gradient observation.
+    /// Updates each Fisher entry from the corresponding gradient observation.
     ///
-    /// Applies the EWC++ online rule:
-    ///
-    /// ```text
-    /// F_i ← decay · F_i  +  (1 − decay) · g_i²
-    /// ```
-    ///
-    /// Call this after every backward pass on the prior-task distribution to
-    /// maintain a running importance estimate. Returns an error if `grad.len()`
-    /// does not equal the number of parameters this guard was created for.
+    /// Returns [`FannError::InputSizeMismatch`] unless `grad` matches the parameter count.
+    /// See [`docs/training.md`](../../docs/training.md#diagonal-fisher-information-as-an-importance-estimate) for the EWC++ EMA rule.
     pub fn observe_gradient(&mut self, grad: &[f32]) -> FannResult<()> {
         if grad.len() != self.values.len() {
             return Err(FannError::InputSizeMismatch {
@@ -113,15 +78,10 @@ impl DiagonalFisher {
         Ok(())
     }
 
-    /// Accumulate the EWC penalty gradient into `out`.
+    /// Adds the EWC penalty gradient for `params` into `out`.
     ///
-    /// The EWC regularisation loss is `(λ/2) Σ F_i (θ_i − θ*_i)²`.
-    /// Its gradient with respect to θ_i is `λ · F_i · (θ_i − θ*_i)`,
-    /// which is *added* into `out` — the caller subtracts the combined
-    /// gradient in the descent step.
-    ///
-    /// Returns an error if `params` or `out` have a different length than
-    /// the Fisher diagonal.
+    /// Returns [`FannError::InputSizeMismatch`] unless both slices match the Fisher length.
+    /// See [`docs/training.md`](../../docs/training.md#anchor--penalty-gradient) for the formula and descent integration.
     pub fn penalty_gradient(&self, params: &[f32], lambda: f32, out: &mut [f32]) -> FannResult<()> {
         let n = self.values.len();
         if params.len() != n {
@@ -150,20 +110,10 @@ impl DiagonalFisher {
         Ok(())
     }
 
-    /// Damp a raw parameter update `delta` toward the Fisher null-space.
+    /// Damp the common prefix of a raw parameter update by Fisher importance.
     ///
-    /// Diagonal approximation: parameters with high Fisher importance (large
-    /// squared-gradient EMA = important to prior tasks) have their update
-    /// magnitude scaled toward zero; parameters with near-zero Fisher pass
-    /// through unchanged.  Full SVD null-space projection is deferred; this
-    /// O(n) diagonal approximation is appropriate for online continual learning.
-    ///
-    /// Processes `min(delta.len(), self.values.len())` entries so the guard
-    /// can be used on parameter sub-slices without error.
-    ///
-    /// Degenerate-Fisher guard: if `f_max < 1e-8` (no importance signal has
-    /// accumulated yet) the function returns immediately — no projection, no
-    /// division, no panic.
+    /// Leaves `delta` unchanged when the estimate has no importance signal.
+    /// See [`docs/training.md`](../../docs/training.md#null-space-delta-projection) for the scaling rule and trade-offs.
     pub fn project_delta(&self, delta: &mut [f32]) {
         let f_max = self.values.iter().copied().fold(0.0_f32, f32::max);
 
@@ -172,9 +122,7 @@ impl DiagonalFisher {
             return;
         }
 
-        // High-Fisher parameters are important to past tasks; damping their
-        // update toward zero reduces forgetting.  Low-Fisher parameters
-        // (values[i]/f_max ≈ 0) are free to change and pass through at scale ≈ 1.
+        // Damp high-Fisher updates while preserving low-Fisher ones — see docs/training.md.
         for (d, &v) in delta.iter_mut().zip(self.values.iter()) {
             *d *= (1.0 - v / f_max).max(0.0);
         }

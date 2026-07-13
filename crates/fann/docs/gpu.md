@@ -352,9 +352,12 @@ fallback or a GPU softmax kernel is implemented.
 
 ### Weight synchronization and flushing
 
-`sync_weights()` overwrites each uploaded weight and bias buffer with the current values in the
-owned CPU network. Call it after modifying those values through whatever owns or updates the
-network; creating `GpuNetwork` does not establish automatic weight synchronization.
+`sync_weights()` overwrites each uploaded weight and bias buffer with the values in the owned CPU
+network. It accepts no weight data, and `cpu_network()` exposes only `&Network`, so callers cannot
+modify the wrapped network through the public GPU API. To use updated caller-owned weights, update
+a `Network` before transferring it and construct a replacement `GpuNetwork` from that network;
+construction performs the upload. There is no automatic synchronization with an external network
+copy.
 
 `GpuNetwork::flush()` delegates to `GpuContext::flush_memory()`. It drains only the context's
 buffer pool and waits for queued work. It does not retroactively pool the network's direct
@@ -398,3 +401,76 @@ For diagnostics, inspect `GpuContext::info()`, `BufferPool::stats()`, pipeline `
 the circuit-breaker state and counters. A low pool hit rate can mean the workload's allocation
 sizes or usage flags are too variable for reuse; it is not evidence that direct allocations made
 by `GpuNetwork` are being pooled.
+
+## `BufferPool::flush`
+
+`flush()` drains every returned-buffer tier, increments the eviction counter for each buffer, and
+returns the pool-accounted byte total it removed. It is the appropriate cache-shedding operation
+during long-running work or memory pressure, but dropping a `wgpu::Buffer` does not guarantee that
+the device has completed asynchronous destruction. Pair a pool flush with `GpuContext::poll()` or
+`GpuContext::wait()` at a safe workload boundary when the next allocation burst depends on the
+memory becoming available.
+
+## `CircuitBreaker`
+
+The breaker starts `Closed`. Recorded failures open it when their cumulative count reaches the
+configured threshold. Once the recovery timeout expires, the next allowed request transitions the
+breaker to `HalfOpen`; a recorded success closes it and resets failures, while a recorded failure
+opens it again. Request-path lock poisoning fails closed. Although `HalfOpen` represents a
+recovery probe, the current implementation permits every request while it remains in that state.
+
+```text
+Closed -- failures reach threshold --> Open
+  ^                                  |
+  |                                  | recovery timeout elapses
+  |                                  v
+  +--------- success ----------- HalfOpen
+                                      |
+                                      | failure
+                                      v
+                                    Open
+```
+
+## `GpuContext::flush_memory`
+
+`flush_memory()` drains the context's `BufferPool` before blocking in `wait()`, then returns the
+number of pool bytes dropped. The order makes the operation a deliberate release boundary: it
+removes host-side references before waiting for queued GPU work that may still retain device
+memory. It applies only to pool-managed allocations; direct buffers created by `GpuNetwork` are
+not added to the pool or to its byte accounting.
+
+## `GpuContext::set_memory_pressure_handler`
+
+Install a callback to respond to pressure calculated from the caller-configured budget and
+pool-accounted usage. The callback runs only when the caller invokes
+`notify_memory_pressure()` after significant pool activity; notifications are not edge-triggered,
+so the same level can be reported repeatedly. A handler can reduce application batch sizes, shed
+pooled buffers, or choose the CPU path. It should not assume that the count includes direct
+`wgpu` allocations.
+
+```rust,ignore
+context.set_memory_budget(512 * 1024 * 1024);
+context.set_memory_pressure_handler(|level, bytes| {
+    if matches!(level, MemoryPressureLevel::High | MemoryPressureLevel::Critical) {
+        eprintln!("GPU pool uses {} MiB at {level:?}", bytes / 1024 / 1024);
+    }
+});
+```
+
+## `GpuNetwork::sync_weights`
+
+`sync_weights()` writes the weights and biases held by the `GpuNetwork`'s owned CPU `Network`
+into its existing GPU storage buffers. It has no weight argument, and `cpu_network()` exposes only
+`&Network`; callers cannot mutate the wrapped CPU network through the public GPU API. Therefore,
+the accessible way to use updated caller-owned weights is to update a `Network` before transfer
+and construct a replacement `GpuNetwork` from it (retaining the `Arc<GpuContext>` used to create
+the original wrapper). The initial construction performs the upload. `sync_weights()` is only
+useful when an internal or future mutable path has already changed the wrapper's owned CPU
+network; it does not synchronize an external network copy automatically.
+
+## `GpuNetwork::flush`
+
+`GpuNetwork::flush()` delegates to `GpuContext::flush_memory()`: it drains cached buffers in the
+context pool, waits for pending GPU work, and returns the pool byte total. Network forward-path
+buffers are directly allocated rather than pooled, so flushing does not retroactively make them
+reusable; the wait remains the synchronization boundary needed for asynchronous resource release.
