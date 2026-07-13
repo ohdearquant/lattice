@@ -14,7 +14,14 @@ mod inner {
     // MSL Compute Shaders
     // ---------------------------------------------------------------------------
 
-    const MSL_TEMPLATE: &str = include_str!("shaders/flash_attention.metal");
+    // #854: the shared RMS-norm reduction helper is assembled as a prefix
+    // fragment ahead of the kernel bodies that call it (Metal requires the
+    // callee be visible textually before its call sites in the same
+    // translation unit).
+    const MSL_TEMPLATE: &str = concat!(
+        include_str!("shaders/rms_reduce.metal"),
+        include_str!("shaders/flash_attention.metal")
+    );
 
     // ---------------------------------------------------------------------------
     // Weight and Activation Buffer Structs

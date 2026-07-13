@@ -984,7 +984,14 @@ mod inner {
     // MSL Compute Shaders
     // ---------------------------------------------------------------------------
 
-    const MSL_SOURCE: &str = include_str!("shaders/qwen35.metal");
+    // #854: the shared RMS-norm reduction helper is assembled as a prefix
+    // fragment ahead of the kernel bodies that call it (Metal requires the
+    // callee be visible textually before its call sites in the same
+    // translation unit).
+    const MSL_SOURCE: &str = concat!(
+        include_str!("shaders/rms_reduce.metal"),
+        include_str!("shaders/qwen35.metal")
+    );
 
     const MSL_Q4_TILED_SOURCE: &str = include_str!("shaders/gemm_q4_tiled.metal");
 
