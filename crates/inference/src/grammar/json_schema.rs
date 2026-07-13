@@ -2844,7 +2844,7 @@ mod tests {
 
     /// Standalone `{"type":"string","enum":[1,2]}` is unsatisfiable;
     /// `compile_string_type` must emit the empty language, not the `json_string`
-    /// fallback (issue #472 blocker 2, standalone path). Mutation guard: the
+    /// fallback (standalone path). Mutation guard: the
     /// `json_string` fallback accepts "zzz".
     #[test]
     fn standalone_typed_enum_no_string_members_rejects_all() {
@@ -2858,8 +2858,8 @@ mod tests {
 
     /// Standalone const/enum intersection through `compile_string_type`, which
     /// `compile_schema_inner` reaches via the `enum` dispatch — without the
-    /// intersection a sibling `const` would be silently ignored (issue #472
-    /// blocker 1, standalone path). Mutation guard: dropping the const-narrowing
+    /// intersection a sibling `const` would be silently ignored (standalone
+    /// path). Mutation guard: dropping the const-narrowing
     /// accepts "y" in both cases.
     #[test]
     fn standalone_string_const_enum_intersection() {

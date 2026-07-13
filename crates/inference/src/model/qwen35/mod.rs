@@ -85,8 +85,7 @@ pub use detokenize::bytes_to_unicode;
 pub(crate) use generation::should_stop_token;
 // Public raw generation-lifecycle observer event, consumed by
 // `--emit-phase-events` in `qwen35_generate.rs` via
-// `Qwen35Model::generate_streaming_with_observer` (benchmark-overhaul row 2,
-// codex round-1 blocker #1).
+// `Qwen35Model::generate_streaming_with_observer`.
 pub use generation::RawGenEvent;
 
 /// Exposed for consumers that need to drive a per-layer coverage check

@@ -7,8 +7,8 @@
 //! the paper's equations (Yuan et al., arXiv:2502.11089, Eq. 5, 7–12). It shares NO code
 //! with the kernel body — but, like the kernel, it transcribes its spec from the paper
 //! via ADR-042, so a kernel-vs-oracle parity test is implementation-independent, *not*
-//! specification-independent. (Round-1 review caught an Eq. 9 sign error that both had
-//! copied from this ADR.) The Eq. 9 index is therefore also checked against the paper
+//! specification-independent. (Both the kernel and the oracle previously carried an
+//! Eq. 9 sign error copied from this ADR.) The Eq. 9 index is therefore also checked against the paper
 //! directly by `aggregate_selection_importance`'s hand-computed unit test in the kernel
 //! module — that test, not this parity oracle, is the spec-level anchor for Eq. 9.
 //!
@@ -994,7 +994,7 @@ fn test_causal_masking_integration() {
     );
 }
 
-/// Selection-branch causal-leak regression (round-2 review, finding 1).
+/// Selection-branch causal-leak regression.
 ///
 /// Soft-masking future tokens with a finite sentinel (e.g. `-10000`) leaks when a
 /// *real* valid score falls below the sentinel: after softmax the masked future
@@ -1160,7 +1160,7 @@ fn assert_prefix_invariant(
     }
 }
 
-/// Causal prefix-invariance regression (round-3 review, finding 1; broadened round-4).
+/// Causal prefix-invariance regression.
 ///
 /// The selection-block count was computed with `floor`, so a short prefix could have
 /// *zero* selection blocks while the same prefix inside a longer sequence had one —

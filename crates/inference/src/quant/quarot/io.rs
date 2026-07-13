@@ -148,7 +148,7 @@ struct ParsedEntry {
 /// crate. Kept inline rather than depending on `safetensors` to match
 /// the hand-roll pattern of [`crate::weights::f32_weights`] (which also
 /// parses safetensors headers directly). When upstream adds a dtype,
-/// add it here and to the round-4 regression tests.
+/// add it here and to the dtype-coverage regression tests.
 fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
     match dtype_str {
         "F4" => Some(4),
