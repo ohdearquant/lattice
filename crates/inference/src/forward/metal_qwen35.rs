@@ -30414,7 +30414,22 @@ mod inner {
         /// `..._rejects_logprobs_request_preserves_warm_entry` immediately
         /// below: warm the slot first, submit the empty-prompt request,
         /// assert both the exact error and that the pre-existing entry is
-        /// byte-identical afterward.
+        /// unchanged afterward.
+        ///
+        /// PR #915 review, second pass: the first version of this
+        /// test only compared `generic.token_ids` while claiming
+        /// "byte-identical" survival; `MetalCrossTurnPrefixEntry` also
+        /// carries `gdn_snapshot` and sparse `checkpoints`. This version
+        /// compares every field: `generic` (`kv_cache::CrossTurnPrefixEntry`,
+        /// which derives `PartialEq`/`Eq` over `slot_id`, `metadata`,
+        /// `token_ids`, `represented_len`, the `kv` handle -- itself a
+        /// small `Copy` value type of offsets/lengths, not a raw device
+        /// pointer -- and `gdn_snapshot_len`) via a direct `==`, plus
+        /// `gdn_snapshot` (`Vec<(Vec<f32>, Vec<f32>)>`) and each
+        /// `checkpoints` entry's `(len, snapshot)` via element-wise `==`
+        /// (neither type derives `PartialEq` itself, but their constituent
+        /// `Vec<f32>`/tuple/`usize` fields all do). There is no field on
+        /// `MetalCrossTurnPrefixEntry` this leaves uncompared.
         ///
         /// Mutation sensitivity: reverting the `check_prompt_not_empty`
         /// call in the wrapper makes this fail two ways -- the call
@@ -30455,10 +30470,14 @@ mod inner {
                 .cross_turn_prefix_cache
                 .entry
                 .as_ref()
-                .expect("precondition: the warm-up call must retain a cache entry")
-                .generic
-                .token_ids
-                .clone();
+                .expect("precondition: the warm-up call must retain a cache entry");
+            let warm_generic = warm_entry.generic.clone();
+            let warm_gdn_snapshot = warm_entry.gdn_snapshot.clone();
+            let warm_checkpoints: Vec<(usize, crate::attention::gdn::GdnSnapshot)> = warm_entry
+                .checkpoints
+                .iter()
+                .map(|c| (c.len, c.snapshot.clone()))
+                .collect();
 
             let rejected_cfg = cross_turn_test_gen_cfg(9, 2);
             let result = state.generate_streaming_with_prefix_cache(
@@ -30474,18 +30493,32 @@ mod inner {
                  prompt with Err(Inference(\"empty prompt\")) (#856); got {result:?}"
             );
 
-            let entry_after = state
-                .cross_turn_prefix_cache
-                .entry
-                .as_ref()
-                .map(|e| e.generic.token_ids.clone());
-            assert_eq!(
-                entry_after,
-                Some(warm_entry),
+            let entry_after = state.cross_turn_prefix_cache.entry.as_ref().expect(
                 "an empty-prompt rejection must not evict a pre-existing \
-                 cache entry it never touched -- the guard runs before \
-                 _inner's destructive Err-recovery block, same invariant \
-                 as the logprobs/MTP preflight tests"
+                     cache entry it never touched -- the guard runs before \
+                     _inner's destructive Err-recovery block, same invariant \
+                     as the logprobs/MTP preflight tests",
+            );
+            assert_eq!(
+                entry_after.generic, warm_generic,
+                "the retained entry's generic (slot_id/metadata/token_ids/\
+                 represented_len/kv handle/gdn_snapshot_len) must be \
+                 unchanged by a rejected empty-prompt request"
+            );
+            assert_eq!(
+                entry_after.gdn_snapshot, warm_gdn_snapshot,
+                "the retained entry's GDN recurrent-state snapshot must be \
+                 unchanged by a rejected empty-prompt request"
+            );
+            let after_checkpoints: Vec<(usize, crate::attention::gdn::GdnSnapshot)> = entry_after
+                .checkpoints
+                .iter()
+                .map(|c| (c.len, c.snapshot.clone()))
+                .collect();
+            assert_eq!(
+                after_checkpoints, warm_checkpoints,
+                "the retained entry's sparse GDN checkpoints must be \
+                 unchanged by a rejected empty-prompt request"
             );
         }
 
@@ -32913,30 +32946,53 @@ impl MetalQwen35State {
         Vec::new()
     }
 
-    /// **Unstable**: Metal generate stub; always errors without metal-gpu feature.
+    /// **Unstable**: Metal generate stub; always panics without metal-gpu feature.
     ///
-    /// #856 follow-up (PR #915 review feedback): this used to return an
-    /// unconditional `Ok(GenerateOutput { .. })` with empty text/tokens for
-    /// *every* prompt, including non-empty ones. Because `MetalQwen35State`
-    /// is a public unit struct on this cfg (directly constructible without
-    /// going through the fallible `new`/`from_q4_dir`), that made this the
-    /// one reachable fail-open hole in the #856 unified empty-prompt
-    /// contract: an external caller building without the `metal-gpu`
-    /// feature could construct the stub directly and get a *successful*
-    /// empty completion back from an empty (or any) prompt. This now
-    /// matches the real (metal-gpu-enabled) `generate`'s fallible
-    /// signature and always returns a capability error instead, for every
-    /// input, so the empty-prompt case and every other case both fail
-    /// closed here too.
+    /// #856 follow-up (PR #915 review, first pass): this used to
+    /// return an unconditional `Ok(GenerateOutput { .. })` with empty
+    /// text/tokens for *every* prompt, including non-empty ones. Because
+    /// `MetalQwen35State` is a public unit struct on this cfg (directly
+    /// constructible without going through the fallible
+    /// `new`/`from_q4_dir`), that made this the one reachable fail-open
+    /// hole in the #856 unified empty-prompt contract: an external caller
+    /// building without the `metal-gpu` feature could construct the stub
+    /// directly and get a *successful* empty completion back from an
+    /// empty (or any) prompt.
+    ///
+    /// PR #915 review, second pass: the first fix changed this
+    /// method's return type to `Result<GenerateOutput, InferenceError>`,
+    /// which is itself a semver-breaking signature change -- this stub is
+    /// what every **default** build gets (`metal-gpu` is not a default
+    /// feature), so any existing downstream default-build caller
+    /// consuming a bare `GenerateOutput` would stop compiling, and
+    /// `cargo-semver-checks`' inherent-method lint would not catch a
+    /// non-unit-to-non-unit return type change. `lattice-inference` v0.6.1
+    /// just shipped, so the signature is restored to the published
+    /// `-> GenerateOutput`.
+    ///
+    /// Instead this fails **loud**: it panics with a message identifying
+    /// the missing capability, rather than silently returning a
+    /// successful-looking empty completion. That is strictly better than
+    /// the pre-#856/#915 fail-open state (a panic is impossible to miss;
+    /// an empty `Ok` looked like a real, if vacuous, generation) and
+    /// matches the v0.6.0 release notes' fail-loudly convention for
+    /// unimplemented GPU arms elsewhere in this crate. It is not the
+    /// intended long-term shape -- a panic in a library function is still
+    /// a rougher contract than a typed `Err` -- so the eventual fallible
+    /// signature is tracked for a semver-major-eligible release at
+    /// <https://github.com/ohdearquant/lattice/issues/917> (targets
+    /// 0.7.0, sibling to #916's `generate_with_speculation` tracking).
     pub fn generate(
         &mut self,
         _prompt: &str,
         _tokenizer: &crate::tokenizer::bpe::BpeTokenizer,
         _cfg: &crate::model::qwen35_config::GenerateConfig,
-    ) -> Result<crate::model::qwen35_config::GenerateOutput, crate::error::InferenceError> {
-        Err(crate::error::InferenceError::Inference(
-            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
-        ))
+    ) -> crate::model::qwen35_config::GenerateOutput {
+        panic!(
+            "MetalQwen35State::generate called on a build compiled without \
+             the metal-gpu feature; construct via new() which returns an \
+             error on such builds"
+        );
     }
 
     /// **Unstable**: load LoRA adapter stub; always errors without metal-gpu feature.
@@ -32988,13 +33044,19 @@ impl MetalQwen35State {
 /// build where `MetalQwen35State` is directly constructible as a public
 /// unit struct without going through the fallible `new`/`from_q4_dir`.
 ///
+/// PR #915 review, second pass: the stub's `generate` keeps its
+/// published `-> GenerateOutput` signature (changing it to `Result` would
+/// itself be a semver break for every default build, since `metal-gpu` is
+/// not a default feature) and instead panics with a message identifying
+/// the missing capability. These tests assert the panic, not a `Result`.
+///
 /// Mutation sensitivity: reverting the stub's `generate` to its old
-/// unconditional `Ok(GenerateOutput { .. })` return makes both assertions
-/// below fail (`matches!` against `Err` no longer matches an `Ok`).
+/// unconditional `GenerateOutput { .. }` return (no panic) makes both
+/// tests below fail (`#[should_panic]` requires the call to panic; a
+/// normal return is a test failure).
 #[cfg(all(test, not(all(target_os = "macos", feature = "metal-gpu"))))]
 mod non_metal_stub_tests {
     use super::MetalQwen35State;
-    use crate::error::InferenceError;
     use crate::model::qwen35_config::GenerateConfig;
     use crate::tokenizer::bpe::BpeTokenizer;
     use std::collections::HashMap;
@@ -33012,35 +33074,28 @@ mod non_metal_stub_tests {
     }
 
     #[test]
+    #[should_panic(expected = "metal-gpu")]
     fn non_metal_stub_generate_rejects_empty_prompt() {
         let tokenizer = tiny_tokenizer();
         let gen_cfg = GenerateConfig::default();
         let mut state = MetalQwen35State;
 
-        let result = state.generate("", &tokenizer, &gen_cfg);
-        assert!(
-            matches!(result, Err(InferenceError::Inference(_))),
-            "the non-metal-gpu MetalQwen35State stub must reject an empty \
-             prompt with a typed Err, not the old Ok(empty GenerateOutput); \
-             got {result:?}"
-        );
+        // Must panic (fail loud) rather than return a successful-looking
+        // empty GenerateOutput for an empty prompt.
+        let _ = state.generate("", &tokenizer, &gen_cfg);
     }
 
-    /// The stub fails closed for every prompt, not only the empty one --
+    /// The stub fails loud for every prompt, not only the empty one --
     /// directly-constructing it (bypassing the fallible `new`/`from_q4_dir`)
     /// must never yield a successful (if vacuous) completion.
     #[test]
+    #[should_panic(expected = "metal-gpu")]
     fn non_metal_stub_generate_rejects_nonempty_prompt() {
         let tokenizer = tiny_tokenizer();
         let gen_cfg = GenerateConfig::default();
         let mut state = MetalQwen35State;
 
-        let result = state.generate("hello", &tokenizer, &gen_cfg);
-        assert!(
-            matches!(result, Err(InferenceError::Inference(_))),
-            "the non-metal-gpu MetalQwen35State stub must reject every \
-             prompt (capability error), not just an empty one; got {result:?}"
-        );
+        let _ = state.generate("hello", &tokenizer, &gen_cfg);
     }
 }
 
