@@ -419,12 +419,8 @@ fn run() -> Result<(), String> {
     let device_name = device.name().to_string();
 
     // --- Load config ---
-    let cfg = if model_dir.join("config.json").exists() {
-        Qwen35Config::from_config_json(&model_dir.join("config.json"))
-            .map_err(|err| format!("failed to parse config.json: {err}"))?
-    } else {
-        Qwen35Config::qwen36_27b()
-    };
+    let cfg = Qwen35Config::from_model_dir(&model_dir)
+        .map_err(|err| format!("failed to load model config.json: {err}"))?;
 
     // Validate tokenizer path by loading it (path check is not enough for corrupted files)
     let _tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path).map_err(|err| {
