@@ -137,6 +137,15 @@ fn read_lora_alpha_from_metadata(path: &std::path::Path) -> Option<f32> {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn is_supported_lora_target(block: &str, module: &str) -> bool {
+    match block {
+        "self_attn" => true,
+        "mlp" => matches!(module, "gate_proj" | "up_proj" | "down_proj"),
+        _ => false,
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn load_lora_safetensors(
     path: &std::path::Path,
 ) -> Result<
@@ -185,7 +194,7 @@ fn load_lora_safetensors(
             // parts: [i, "self_attn" | "mlp", module, "lora_A" | "lora_B", "weight"]
             if parts.len() >= 4
                 && let Ok(layer_idx) = parts[0].parse::<usize>()
-                && matches!(parts[1], "self_attn" | "mlp")
+                && is_supported_lora_target(parts[1], parts[2])
             {
                 let module = parts[2].to_string();
                 let is_a = parts[3] == "lora_A";
@@ -208,7 +217,7 @@ fn load_lora_safetensors(
             // parts: [i, "self_attn" | "mlp", module, "lora_a" | "lora_b"]
             if parts.len() >= 4
                 && let Ok(layer_idx) = parts[0].parse::<usize>()
-                && matches!(parts[1], "self_attn" | "mlp")
+                && is_supported_lora_target(parts[1], parts[2])
             {
                 let module = parts[2].to_string();
                 let is_a = parts[3] == "lora_a";
@@ -1126,6 +1135,56 @@ mod tests {
             let modules: Vec<&str> = layers.iter().map(|layer| layer.module.as_str()).collect();
             assert_eq!(modules, ["gate_proj", "q_proj"]);
         }
+    }
+
+    #[test]
+    fn lora_loader_ignores_unknown_peft_mlp_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peft_unknown_mlp.safetensors");
+        write_lora_safetensors(
+            &path,
+            &[
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                    vec![2, 4],
+                ),
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                    vec![6, 2],
+                ),
+                (
+                    "base_model.model.model.layers.0.mlp.extra_proj.lora_A.weight",
+                    vec![2, 4],
+                ),
+                (
+                    "base_model.model.model.layers.0.mlp.extra_proj.lora_B.weight",
+                    vec![8, 2],
+                ),
+            ],
+        );
+
+        let (layers, _) = load_lora_safetensors(&path).unwrap();
+        let modules: Vec<&str> = layers.iter().map(|layer| layer.module.as_str()).collect();
+        assert_eq!(modules, ["q_proj"]);
+    }
+
+    #[test]
+    fn lora_loader_ignores_unknown_mlx_mlp_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mlx_unknown_mlp.safetensors");
+        write_lora_safetensors(
+            &path,
+            &[
+                ("model.layers.0.self_attn.q_proj.lora_a", vec![4, 2]),
+                ("model.layers.0.self_attn.q_proj.lora_b", vec![2, 6]),
+                ("model.layers.0.mlp.extra_proj.lora_a", vec![4, 2]),
+                ("model.layers.0.mlp.extra_proj.lora_b", vec![2, 8]),
+            ],
+        );
+
+        let (layers, _) = load_lora_safetensors(&path).unwrap();
+        let modules: Vec<&str> = layers.iter().map(|layer| layer.module.as_str()).collect();
+        assert_eq!(modules, ["q_proj"]);
     }
 
     #[test]
