@@ -662,10 +662,17 @@ class ProfileConfigTest(unittest.TestCase):
 
 
 class LoadProfilesFileTest(unittest.TestCase):
-    def test_scaffold_file_loads_with_no_profiles(self):
+    def test_shipped_file_loads_and_parses_cleanly(self):
+        # Issue #813 step 2 migrates live consumers onto this file one
+        # script per PR; it no longer stays empty past the first migration
+        # (bench_apples_to_apples.sh -- see
+        # tests/test_bench_decode_adapters_apples_to_apples.py for the
+        # parameter- and call-schedule-equivalence gates on those profiles).
+        # This test only asserts the file itself is well-formed against the
+        # shipped schema version, independent of which profiles it defines.
         schema_version, profiles = harness.load_profiles_file(harness.DEFAULT_PROFILES_FILE)
         self.assertEqual(schema_version, harness.SCHEMA_VERSION)
-        self.assertEqual(profiles, {})
+        self.assertIsInstance(profiles, dict)
 
     def test_wrong_schema_version_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

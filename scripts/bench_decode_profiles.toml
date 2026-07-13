@@ -184,3 +184,66 @@
 schema_version = 1
 
 [profiles]
+
+# bench_apples_to_apples.sh migration (issue #813 step 2, first script).
+# Two profiles because the legacy script runs two independent tiers with
+# different engine sets and different lattice/mlx quantization: Q8
+# (lattice safetensors auto-quant, ollama registry default, mlx
+# nn.quantize(bits=8)) and Q4 (lattice QuaRot .q4 dir, mlx
+# nn.quantize(bits=4); ollama has no Q4 variant for qwen3.5:0.8b, so it is
+# simply absent from this profile's engines list -- the harness's
+# missing-engine handling is not needed here since ollama was never
+# requested for Q4, not requested-and-unavailable).
+#
+# windows/measured_repeats/prompt are IDENTICAL to bench_apples_to_apples.sh's
+# N1=32, N2=256, RUNS=5, and PROMPT. Neither lattice nor ollama gets a
+# harness-level warmup (the shell script issues no extra warmup call for
+# either); only mlx gets warmup_repeats=1/warmup_tokens=8, reproducing the
+# script's single pre-loop 8-token MLX-only warmup exactly (see
+# bench_decode_harness.py's own `test_heterogeneous_engine_schedule_exact_call_
+# sequence_and_identities`, which validates this identical shape).
+[profiles.apples_to_apples_q8]
+description = "bench_apples_to_apples.sh Q8 tier: lattice (Metal auto Q8) vs ollama vs mlx (private AMX reference)"
+windows = [32, 256]
+measured_repeats = 5
+prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
+aggregation = "median"
+
+[[profiles.apples_to_apples_q8.engines]]
+name = "lattice"
+warmup_repeats = 0
+model = "qwen3.5-0.8b"
+quantization = "q8"
+
+[[profiles.apples_to_apples_q8.engines]]
+name = "ollama"
+warmup_repeats = 0
+model = "qwen3.5:0.8b"
+quantization = "q8"
+
+[[profiles.apples_to_apples_q8.engines]]
+name = "mlx"
+warmup_repeats = 1
+warmup_tokens = 8
+model = "qwen3.5-0.8b"
+quantization = "q8"
+
+[profiles.apples_to_apples_q4]
+description = "bench_apples_to_apples.sh Q4 tier: lattice (QuaRot Q4) vs mlx Q4 (ollama has no Q4 variant, omitted)"
+windows = [32, 256]
+measured_repeats = 5
+prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
+aggregation = "median"
+
+[[profiles.apples_to_apples_q4.engines]]
+name = "lattice"
+warmup_repeats = 0
+model = "qwen3.5-0.8b-q4-quarot"
+quantization = "q4"
+
+[[profiles.apples_to_apples_q4.engines]]
+name = "mlx"
+warmup_repeats = 1
+warmup_tokens = 8
+model = "qwen3.5-0.8b"
+quantization = "q4"
