@@ -1,8 +1,7 @@
 # lattice-transport
 
-**Stability tier: Unstable.** The Sinkhorn API is functional but consumed by only one crate.
-API shape may change as Brain Phase 7 Objective synthesis adopts it. The crate will be promoted
-to Stable after a second consumer lands. See `foundation/STABILITY.md` for the full policy.
+**Stability tier: Unstable.** The Sinkhorn API is functional but currently consumed by only one
+crate, so its shape may still change.
 
 ---
 
@@ -13,8 +12,8 @@ in log-domain for numerical stability. Its primary use case is quantifying how m
 geometry shifts between model versions — for example, when `lattice-embed` swaps from
 BGE-small to mE5-small and needs to detect distribution drift across stored embeddings.
 
-The crate was extracted from `foundation/score` in Wave4 so that Brain Phase 7 Objective
-synthesis can consume optimal-transport primitives independently of the scoring infrastructure.
+For the architecture layers and the design rationale behind the log-domain formulation, see
+[`docs/design.md`](docs/design.md).
 
 ---
 

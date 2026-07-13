@@ -1,40 +1,23 @@
-//! **Stability tier**: Unstable
+//! Sinkhorn optimal transport for embedding distribution drift detection.
 //!
-//! Extracted from `foundation/score` in Wave4. The Sinkhorn API is functional but
-//! not yet consumed by more than one crate. API shape may change as Brain Phase 7
-//! Objective synthesis adopts it. Promote to Stable after second consumer lands.
-//! See `foundation/STABILITY.md` for the full policy.
+//! **Stability tier: Unstable.** The Sinkhorn API is functional but currently
+//! consumed by only one crate; its shape may still change.
 //!
-//! Sinkhorn Optimal Transport for embedding distribution drift detection.
+//! This crate implements entropy-regularized optimal transport (the Sinkhorn-Knopp
+//! algorithm) in the log domain, for quantifying how much embedding geometry shifts
+//! between model versions (for example, BGE-small to mE5-small). The load-bearing
+//! numerical invariant is that the solvers stay in log space throughout and never
+//! materialize the Gibbs kernel `exp(-C/epsilon)`, which prevents underflow at small
+//! regularization epsilon. The crate is a dependency-free leaf: pure-Rust math with
+//! no BLAS/LAPACK, and [`SinkhornWorkspace`] preallocates the inner-loop buffers so
+//! callers allocate once and reuse.
 //!
-//! This crate implements entropy-regularized optimal transport (Sinkhorn algorithm)
-//! in log-domain for numerical stability. It is designed for quantifying how much
-//! embedding geometry shifts between model versions (e.g., BGE-small to mE5-small).
-//!
-//! Extracted from `foundation/score` as a peer crate so that Brain Phase 7
-//! Objective synthesis can consume optimal-transport primitives independently
-//! of scoring infrastructure.
-//!
-//! # Architecture
-//!
-//! The crate is organized into layers:
-//!
-//! - **Numerical foundation**: `math`, [`logsumexp`] -- stable log-domain arithmetic
-//! - **Cost abstraction**: [`cost`] -- cost matrix traits and implementations
-//! - **Core solvers**: [`sinkhorn`] (balanced), [`sinkhorn_log`] (epsilon-scaling),
-//!   [`unbalanced`] (KL-relaxed marginals)
-//! - **Post-processing**: [`transport_plan`] (sparse plan extraction),
-//!   [`divergence`] (debiased Sinkhorn divergence)
-//! - **High-level API**: [`drift`] (embedding drift detection),
-//!   [`barycenter`] (Wasserstein barycenters)
-//!
-//! # Key Design Choices
-//!
-//! - **Log-domain throughout**: Never materializes the Gibbs kernel `exp(-C/epsilon)`
-//!   directly. All scaling vectors stay in log space.
-//! - **Pre-allocated buffers**: [`SinkhornWorkspace`] avoids heap allocation during
-//!   the inner iteration loop.
-//! - **No external dependencies**: Pure Rust math, no BLAS/LAPACK requirement.
+//! The layers run from the numerical foundation ([`logsumexp`]) up through the
+//! [`cost`] abstraction, the core solvers ([`sinkhorn`], [`sinkhorn_log`],
+//! [`unbalanced`]), post-processing ([`transport_plan`], [`divergence`]), and the
+//! high-level [`drift`] and [`barycenter`] APIs. See
+//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/transport/docs/design.md)
+//! for the architecture and design rationale in full.
 //!
 //! # Example
 //!
