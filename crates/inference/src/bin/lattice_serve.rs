@@ -1836,6 +1836,41 @@ mod imp {
         // `metal_worker` `test-utils` seam (`test_client_and_jobs`/
         // `spawn_fake`) instead of this binary's own private job channel.
 
+        /// #832 checklist: "Add a Metal-feature test asserting an explicit
+        /// common-worker marker, so a silently-reintroduced per-binary
+        /// fallback cannot pass green." `AppState.jobs`'s field type is
+        /// private, so this test can only be written from inside `mod imp`
+        /// (same module as `AppState`, so private-field access is allowed)
+        /// -- it constructs an `AppState` directly from a
+        /// `lattice_inference::serve::metal_worker::MetalWorkerClient`,
+        /// which only type-checks if `AppState.jobs` still holds that exact
+        /// shared type. A private per-binary fallback job channel (any type
+        /// other than the shared `MetalWorkerClient`) would fail to compile
+        /// here, not just fail some behavioral assertion at runtime. See
+        /// `lattice.rs`'s
+        /// `metal_handle_is_backed_by_the_shared_metal_worker_client` for
+        /// the sibling marker on the other binary.
+        #[test]
+        fn app_state_is_backed_by_the_shared_metal_worker_client() {
+            fn build_from_shared_client(jobs: MetalWorkerClient) -> AppState {
+                AppState {
+                    jobs,
+                    model_id: Arc::from("marker-test-model"),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
+                    model_max_context: 4096,
+                }
+            }
+            let (jobs, _rx) = test_client_and_jobs();
+            let _state: AppState = build_from_shared_client(jobs);
+        }
+
         // ── #641 / #649 request parsing and clamp tests ──────────────────
 
         #[test]

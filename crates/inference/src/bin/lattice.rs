@@ -4078,6 +4078,32 @@ mod serve {
         #[cfg(feature = "metal-gpu")]
         use lattice_inference::forward::metal_qwen35::ChatRole;
 
+        /// #832 checklist: "Add a Metal-feature test asserting an explicit
+        /// common-worker marker, so a silently-reintroduced per-binary
+        /// fallback cannot pass green." `MetalHandle::client`'s field type
+        /// is private, so this test can only be written from inside
+        /// `mod serve` (same module, so private-field access is allowed) —
+        /// it constructs a `MetalHandle` directly from a
+        /// `lattice_inference::serve::metal_worker::MetalWorkerClient`,
+        /// which only type-checks if `MetalHandle` still wraps that exact
+        /// shared type. A private per-binary fallback worker (any type
+        /// other than the shared `MetalWorkerClient`) would fail to compile
+        /// here, not just fail some behavioral assertion at runtime.
+        /// `test-utils`-gated: `test_client_and_jobs` (the only way to
+        /// obtain a real `MetalWorkerClient` without a live GPU worker
+        /// thread) lives behind that feature — see its own doc comment.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[test]
+        fn metal_handle_is_backed_by_the_shared_metal_worker_client() {
+            fn build_from_shared_client(
+                client: lattice_inference::serve::metal_worker::MetalWorkerClient,
+            ) -> MetalHandle {
+                MetalHandle { client }
+            }
+            let (client, _jobs_rx) = lattice_inference::serve::metal_worker::test_client_and_jobs();
+            let _handle: MetalHandle = build_from_shared_client(client);
+        }
+
         #[test]
         fn validate_max_tokens_rejects_zero() {
             let err = validate_max_tokens(Some(0), None, 256, 4096).unwrap_err();
