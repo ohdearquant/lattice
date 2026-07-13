@@ -163,10 +163,10 @@ fn load_lora_safetensors(
 
     // We need to pair lora_A and lora_B tensors by layer and module.
     // Supported key formats:
-    //   PEFT: base_model.model.model.layers.{i}.self_attn.{module}.lora_A.weight
-    //         base_model.model.model.layers.{i}.self_attn.{module}.lora_B.weight
-    //   MLX:  model.layers.{i}.self_attn.{module}.lora_a
-    //         model.layers.{i}.self_attn.{module}.lora_b
+    //   PEFT: base_model.model.model.layers.{i}.{self_attn|mlp}.{module}.lora_A.weight
+    //         base_model.model.model.layers.{i}.{self_attn|mlp}.{module}.lora_B.weight
+    //   MLX:  model.layers.{i}.{self_attn|mlp}.{module}.lora_a
+    //         model.layers.{i}.{self_attn|mlp}.{module}.lora_b
 
     struct ParsedKey {
         layer_idx: usize,
@@ -179,13 +179,13 @@ fn load_lora_safetensors(
     let mut rank_global: Option<usize> = None;
 
     for name in &names {
-        // Try PEFT format: base_model.model.model.layers.{i}.self_attn.{module}.lora_A.weight
+        // Try PEFT format.
         if let Some(rest) = name.strip_prefix("base_model.model.model.layers.") {
             let parts: Vec<&str> = rest.splitn(6, '.').collect();
-            // parts: [i, "self_attn", module, "lora_A" | "lora_B", "weight"]
+            // parts: [i, "self_attn" | "mlp", module, "lora_A" | "lora_B", "weight"]
             if parts.len() >= 4
                 && let Ok(layer_idx) = parts[0].parse::<usize>()
-                && parts[1] == "self_attn"
+                && matches!(parts[1], "self_attn" | "mlp")
             {
                 let module = parts[2].to_string();
                 let is_a = parts[3] == "lora_A";
@@ -202,13 +202,13 @@ fn load_lora_safetensors(
             continue;
         }
 
-        // Try MLX format: model.layers.{i}.self_attn.{module}.lora_a / lora_b
+        // Try MLX format.
         if let Some(rest) = name.strip_prefix("model.layers.") {
             let parts: Vec<&str> = rest.splitn(5, '.').collect();
-            // parts: [i, "self_attn", module, "lora_a" | "lora_b"]
+            // parts: [i, "self_attn" | "mlp", module, "lora_a" | "lora_b"]
             if parts.len() >= 4
                 && let Ok(layer_idx) = parts[0].parse::<usize>()
-                && parts[1] == "self_attn"
+                && matches!(parts[1], "self_attn" | "mlp")
             {
                 let module = parts[2].to_string();
                 let is_a = parts[3] == "lora_a";
@@ -247,14 +247,36 @@ fn load_lora_safetensors(
         }
     }
 
+    if groups
+        .values()
+        .all(|(a_name, b_name)| a_name.is_none() || b_name.is_none())
+    {
+        return Err(
+            "LoRA loader: all tensor pairs were incomplete (missing A or B for every group)".into(),
+        );
+    }
+
     let mut layers: Vec<LoraLayerData> = Vec::new();
 
     for ((layer_idx, module), (a_name, b_name)) in &groups {
-        let (Some(a_name), Some(b_name)) = (a_name, b_name) else {
-            eprintln!(
-                "[chat_metal] skipping layer {layer_idx} module {module}: missing A or B tensor"
-            );
-            continue;
+        let (a_name, b_name) = match (a_name, b_name) {
+            (Some(a_name), Some(b_name)) => (a_name, b_name),
+            (Some(a_name), None) => {
+                return Err(
+                    format!("LoRA adapter has tensor '{a_name}' but no matching B tensor").into(),
+                );
+            }
+            (None, Some(b_name)) => {
+                return Err(
+                    format!("LoRA adapter has tensor '{b_name}' but no matching A tensor").into(),
+                );
+            }
+            (None, None) => {
+                return Err(format!(
+                    "LoRA adapter has an empty tensor group at layer {layer_idx} module '{module}'"
+                )
+                .into());
+            }
         };
 
         let (a_data, a_shape) = sf.get_f32_tensor(a_name)?;
@@ -321,15 +343,15 @@ fn load_lora_safetensors(
             (a_data.to_vec(), rank, d_in, b_data.to_vec(), d_out)
         };
 
-        // Track global rank (should be consistent across all layers).
-        if let Some(prev) = rank_global {
-            if prev != rank {
-                eprintln!(
-                    "[chat_metal] warning: rank mismatch across layers ({prev} vs {rank}); using first"
-                );
+        match rank_global {
+            None => rank_global = Some(rank),
+            Some(prev) if prev != rank => {
+                return Err(format!(
+                    "inconsistent LoRA ranks: first seen rank={prev}, layer {layer_idx} module '{module}' has rank={rank}"
+                )
+                .into());
             }
-        } else {
-            rank_global = Some(rank);
+            _ => {}
         }
 
         layers.push(LoraLayerData {
@@ -1034,6 +1056,135 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_lora_safetensors(path: &std::path::Path, tensors: &[(&str, Vec<usize>)]) {
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+
+        for (name, shape) in tensors {
+            let start = data.len();
+            let byte_len = shape.iter().product::<usize>() * std::mem::size_of::<f32>();
+            data.resize(start + byte_len, 0);
+            header.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [start, start + byte_len],
+                }),
+            );
+        }
+
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&data);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn lora_loader_accepts_attention_and_mlp_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = [
+            (
+                "peft.safetensors",
+                vec![
+                    (
+                        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                        vec![2, 4],
+                    ),
+                    (
+                        "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                        vec![6, 2],
+                    ),
+                    (
+                        "base_model.model.model.layers.0.mlp.gate_proj.lora_A.weight",
+                        vec![2, 4],
+                    ),
+                    (
+                        "base_model.model.model.layers.0.mlp.gate_proj.lora_B.weight",
+                        vec![8, 2],
+                    ),
+                ],
+            ),
+            (
+                "mlx.safetensors",
+                vec![
+                    ("model.layers.0.self_attn.q_proj.lora_a", vec![4, 2]),
+                    ("model.layers.0.self_attn.q_proj.lora_b", vec![2, 6]),
+                    ("model.layers.0.mlp.gate_proj.lora_a", vec![4, 2]),
+                    ("model.layers.0.mlp.gate_proj.lora_b", vec![2, 8]),
+                ],
+            ),
+        ];
+
+        for (filename, tensors) in fixtures {
+            let path = dir.path().join(filename);
+            write_lora_safetensors(&path, &tensors);
+
+            let (layers, _) = load_lora_safetensors(&path).unwrap();
+            let modules: Vec<&str> = layers.iter().map(|layer| layer.module.as_str()).collect();
+            assert_eq!(modules, ["gate_proj", "q_proj"]);
+        }
+    }
+
+    #[test]
+    fn lora_loader_rejects_missing_b_with_valid_pair_present() {
+        const ORPHAN_A: &str = "base_model.model.model.layers.0.self_attn.k_proj.lora_A.weight";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing_b.safetensors");
+        write_lora_safetensors(
+            &path,
+            &[
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                    vec![2, 4],
+                ),
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                    vec![6, 2],
+                ),
+                (ORPHAN_A, vec![2, 4]),
+            ],
+        );
+
+        let Err(err) = load_lora_safetensors(&path) else {
+            panic!("adapter with an orphan A tensor must be rejected");
+        };
+        assert!(err.to_string().contains(ORPHAN_A));
+    }
+
+    #[test]
+    fn lora_loader_rejects_mixed_ranks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed_rank.safetensors");
+        write_lora_safetensors(
+            &path,
+            &[
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                    vec![2, 4],
+                ),
+                (
+                    "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                    vec![6, 2],
+                ),
+                (
+                    "base_model.model.model.layers.0.self_attn.k_proj.lora_A.weight",
+                    vec![3, 4],
+                ),
+                (
+                    "base_model.model.model.layers.0.self_attn.k_proj.lora_B.weight",
+                    vec![8, 3],
+                ),
+            ],
+        );
+
+        let Err(err) = load_lora_safetensors(&path) else {
+            panic!("adapter with mixed ranks must be rejected");
+        };
+        assert!(err.to_string().contains("inconsistent LoRA ranks"));
+    }
 
     fn defaults() -> ServeRequestDefaults {
         ServeRequestDefaults {
