@@ -1292,6 +1292,19 @@ mod tests {
         }
     }
 
+    /// Top-1 token choice for the f16-vs-f32 KV-cache logits oracle below.
+    ///
+    /// Delegates to the shared first-wins `crate::speculative::argmax` so
+    /// the oracle's tie-break matches the engine's documented greedy
+    /// contract (lowest index wins on an exact tie — see
+    /// `forward::metal_qwen35`, `sampling`, and `torch.argmax`, all
+    /// first-wins per #280). `Iterator::max_by` resolves ties to the *last*
+    /// index instead, which let the oracle silently score a different top-1
+    /// token than production would pick on an exact tie (#861).
+    fn oracle_top1(logits: &[f32]) -> usize {
+        crate::speculative::argmax(logits)
+    }
+
     /// The mandatory tensor oracle: compare f32-KV reference vs f16-KV-via-FlatKVCache.
     ///
     /// Produces actual measured logit_max_abs_diff and top1_match_rate.
@@ -1424,18 +1437,8 @@ mod tests {
                 let nans = logits_f16.iter().filter(|&&x| x.is_nan()).count();
                 nan_count += nans;
 
-                let top1_f32 = logits_f32
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap();
-                let top1_f16 = logits_f16
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(i, _)| i)
-                    .unwrap();
+                let top1_f32 = oracle_top1(&logits_f32);
+                let top1_f16 = oracle_top1(&logits_f16);
 
                 // Synthetic NLL delta on deterministic target token.
                 let target = (seq_len * 37 + 11) % VOCAB;
@@ -1486,6 +1489,29 @@ mod tests {
         assert!(
             max_synth_nll_delta < 0.01,
             "max synthetic NLL delta {max_synth_nll_delta:.4e} >= 0.01"
+        );
+    }
+
+    /// Regression test for #861: the top-1 oracle used in
+    /// `f16_kv_tensor_oracle_logit_diff` (via `oracle_top1`) must resolve
+    /// exact ties the same way the production greedy sampler does — first
+    /// occurrence wins (lowest index). This fixture constructs a logits
+    /// vector with an exact tie between the lowest-index and a higher-index
+    /// entry so that first-wins and `Iterator::max_by`'s last-wins behavior
+    /// disagree on the winner; it goes red if `oracle_top1` regresses to
+    /// `max_by`.
+    #[test]
+    fn top1_oracle_tie_break_matches_first_wins_contract() {
+        // Two entries tie for the maximum: index 1 (first) and index 4 (last).
+        let logits = [0.5_f32, 2.0, 1.0, 0.25, 2.0, -3.0];
+
+        let top1 = oracle_top1(&logits);
+
+        assert_eq!(
+            top1, 1,
+            "tie between indices 1 and 4 must resolve to the FIRST (lowest) \
+             index per the greedy contract; got {top1}. `Iterator::max_by` \
+             would return 4 (last-wins), which is the #861 regression."
         );
     }
 
