@@ -11,12 +11,10 @@ use uuid::Uuid;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// Checkpoint of training state.
+/// In-memory checkpoint state, including metadata, metrics, and serialized bytes.
 ///
-/// With `serde`, the representation is JSON. `weights` are little-endian `f32`
-/// values ordered layer-by-layer (row-major weights, then biases, input to
-/// output); `optimizer_state` stores momentum or Adam moment vectors per
-/// parameter. See `docs/train.md` for the full format and persistence contract.
+/// With `serde`, this type serializes as JSON.
+/// See [`docs/train.md`](§checkpoint-byte-layout) for byte layouts and resume limits.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Checkpoint {

@@ -407,3 +407,42 @@ optional final accuracy, completed-step count, elapsed seconds, early-stop and
 timeout flags, and the complete loss history. `is_success()` means only that
 the run did not time out and its final loss is finite; an early-stopped result
 can be successful. `avg_loss()` returns zero for an empty history.
+
+## Checkpoint byte layout
+
+`Checkpoint` is an in-memory record; it does not serialize itself or verify
+the contents of either byte vector. With the `serde` feature, the enclosing
+record serializes as JSON. Producers and consumers of the two byte fields must
+therefore agree on their binary contents independently of that JSON envelope.
+
+`weights` contains little-endian `f32` values in network order: for each layer
+from input to output, write its row-major weight matrix followed by its bias
+vector. `optimizer_state` is optimizer-specific and is ordered per parameter:
+momentum SGD uses one velocity vector, while Adam uses its first (`m`) and
+second (`v`) moment vectors. The constructor leaves both fields empty, so a
+checkpoint made by `TrainingLoop` contains metadata and metrics only unless a
+caller populates those vectors.
+
+Restoring through `TrainingLoop::resume_from` copies only epoch, global step,
+and aggregate metrics. It cannot restore these byte vectors, learning rate,
+early-stopping counters, callbacks, or dataset position. External persistence
+code must restore model and optimizer state itself, and must not treat this API
+as a complete continuation mechanism.
+
+## GPU placeholder-gradient path
+
+`GpuTrainer::train_batch` runs forward evaluation, rejects non-finite outputs,
+computes loss, checks the loss, prepares placeholder gradients, and then calls
+the optimizer dispatcher. The backward preparation first forms `output -
+target` with the unsmoothed target, but the current CPU fallback does not use
+those values to derive parameter gradients. For every layer, it uploads the
+same `0.01 / batch_size` value for every weight and bias. The recorded
+activation set contains only the input and output vectors.
+
+This is explicitly scaffolding, not a gradient implementation. The optimizer
+dispatcher then returns `TuneError::Training` for every optimizer choice until
+network buffer binding and weight write-back exist. Because the error is
+propagated before bookkeeping, a failed call leaves `global_step` and
+`current_lr` unchanged. Only a completed forward, backward, and optimizer
+update may advance the step; it then recomputes the learning rate from the base
+rate using that new step and an approximate epoch of `global_step / 100`.

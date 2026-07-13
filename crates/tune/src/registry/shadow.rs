@@ -28,8 +28,7 @@ pub struct ShadowComparison {
 
 /// Configuration for shadow evaluation.
 ///
-/// Defines the sampling strategy and acceptance criteria for
-/// promoting a candidate model.
+/// Defines sampling and acceptance criteria for evaluating a candidate.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ShadowConfig {
@@ -160,13 +159,8 @@ pub struct ShadowSession {
 }
 
 impl ShadowSession {
-    /// Create a new shadow evaluation session.
-    ///
-    /// # Arguments
-    ///
-    /// * `production_model_id` - ID of the current production model
-    /// * `candidate_model_id` - ID of the candidate model to evaluate
-    /// * `config` - Evaluation configuration
+    /// Creates a running session for a production/candidate pair and its configuration.
+    /// See [`docs/registry.md`] (§`ShadowSession` public methods) for sampling and transition rules.
     pub fn new(production_model_id: Uuid, candidate_model_id: Uuid, config: ShadowConfig) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -193,16 +187,9 @@ impl ShadowSession {
         session
     }
 
-    /// Record a sample comparison.
-    ///
-    /// This should be called for each sampled request where both models
-    /// were invoked. Only records if the session is still running.
-    ///
-    /// # Arguments
-    ///
-    /// * `agreed` - Whether the production and shadow outputs agreed
-    /// * `latency_diff_ms` - Latency difference (shadow - production) in ms.
-    ///   Positive means shadow was slower.
+    /// Records a comparison while the session is running.
+    /// `latency_diff_ms` is candidate minus production latency; positive means slower.
+    /// See [`docs/registry.md`] (§`ShadowSession` public methods) for sampling rules.
     pub fn record_sample(&mut self, agreed: bool, latency_diff_ms: f64) {
         if let ShadowState::Running {
             samples_collected, ..
@@ -213,17 +200,9 @@ impl ShadowSession {
         }
     }
 
-    /// Evaluate the session and update state if criteria are met.
-    ///
-    /// If the minimum sample count is reached, computes the comparison
-    /// statistics and transitions to [`ShadowState::Passed`] or
-    /// [`ShadowState::Failed`].
-    ///
-    /// If not enough samples yet, returns the current running state.
-    ///
-    /// # Returns
-    ///
-    /// The current (possibly updated) session state.
+    /// Evaluates a running session after its minimum sample count and returns its state.
+    /// Both agreement and latency thresholds must pass for [`ShadowState::Passed`].
+    /// See [`docs/registry.md`] (§`ShadowSession` public methods) for transition rules.
     pub fn evaluate(&mut self) -> &ShadowState {
         if let ShadowState::Running { .. } = &self.state
             && self.samples.len() >= self.config.min_samples

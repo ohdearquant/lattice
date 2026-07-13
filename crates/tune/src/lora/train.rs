@@ -19,22 +19,18 @@ use crate::lora::train_core::{
 use crate::lora::{AdamState, LoraAdapter, LoraConfig, LoraLayer};
 
 /// Upper bound on LoRA rank accepted by [`train_micro_lora`].
-///
-/// Practical LoRA ranks are 4–64; 512 is a generous safety valve that blocks
-/// accidental overflow in buffer-size products (`rank * hidden`) while still
-/// accommodating any foreseeable use case.
+/// Limits caller-controlled buffer-size products.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the safety-bound rationale.
 const MAX_LORA_RANK: usize = 512;
 
 /// Upper bound on training steps accepted by [`train_micro_lora`].
-///
-/// 100 000 steps is well above any micro-LoRA use case and prevents an
-/// accidentally large caller-supplied value from locking the process for hours.
+/// Limits unbounded caller-controlled work.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the safety-bound rationale.
 const MAX_TRAIN_STEPS: usize = 100_000;
 
 /// Upper bound on `max_seq_len` accepted by [`train_micro_lora`].
-///
-/// 8 192 tokens is a generous ceiling for a micro-training helper; the actual
-/// model context window is the binding constraint at runtime.
+/// Limits tape allocation; the model context window remains authoritative.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the safety-bound rationale.
 const MAX_TRAIN_SEQ_LEN: usize = 8_192;
 
 /// A single training example: tokenized text plus the index at which the
@@ -77,14 +73,9 @@ impl Default for MicroLoraConfig {
     }
 }
 
-/// Validate all caller-supplied inputs for [`train_micro_lora`].
-///
-/// Extracted so the validation logic can be tested without a real model
-/// checkpoint. `vocab_size` and `num_hidden_layers` come from `model.config()`;
-/// `num_hidden_layers` bounds the layer range the trainer will index, so a model
-/// with too few layers is rejected before any layer access.
-///
-/// Returns `Err(TuneError::Validation)` on the first anomaly found.
+/// Validate `train_micro_lora` inputs before model access or allocation.
+/// Returns the first [`TuneError::Validation`] failure.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the preflight boundary.
 pub(crate) fn validate_micro_lora_inputs(
     vocab_size: usize,
     num_hidden_layers: usize,
@@ -119,12 +110,7 @@ pub(crate) fn validate_micro_lora_inputs(
             config.max_seq_len, MAX_TRAIN_SEQ_LEN
         )));
     }
-    // first_layer and the hardcoded TOP_LAYER must both be valid indices into the
-    // model's layer stack. train_micro_lora iterates `first_layer ..= TOP_LAYER`
-    // and indexes `model.weights.layers[idx]` directly (through gqa_layer_weights /
-    // gdn_layer_weights), which panics out of bounds. A model with fewer than
-    // TOP_LAYER + 1 layers, or a first_layer past TOP_LAYER, must be rejected here,
-    // before any model access in the layer loop below.
+    // Keep the materialized inclusive range valid before direct layer access.
     if config.first_layer > TOP_LAYER {
         return Err(TuneError::Validation(format!(
             "train_micro_lora: first_layer {} exceeds maximum trainable layer index {TOP_LAYER}",
@@ -181,41 +167,16 @@ pub(crate) fn validate_micro_lora_inputs(
     Ok(())
 }
 
-/// Train a LoRA adapter with exact CPU gradients over the provided pairs.
-///
-/// Returns a [`LoraAdapter`] covering `q_proj` and `v_proj` in every GQA layer
-/// in `[config.first_layer ..= 23]`. GDN layers in the same range are frozen
-/// but their backward pass threads gradients through to lower GQA layers.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - `pairs` is empty.
-/// - Any pair has fewer than 2 tokens or exceeds `config.max_seq_len`.
-/// - Any pair has `completion_start == 0` or `>= tokens.len()`.
-/// - Any token ID is `>= vocab_size` (would panic on logit indexing).
-/// - `config.rank == 0` or exceeds [`MAX_LORA_RANK`].
-/// - `config.steps` exceeds [`MAX_TRAIN_STEPS`].
-/// - `config.max_seq_len` exceeds [`MAX_TRAIN_SEQ_LEN`].
-/// - `config.first_layer` exceeds the top trainable layer, or the model has
-///   fewer layers than the trainer indexes.
-/// - Buffer-size arithmetic overflows (rank × hidden, etc.).
-/// - The model architecture contains unexpected layer types.
-/// - The frozen-prefix capture fails.
-///
-/// # Implementation note
-///
-/// This function mirrors `train_grad_full`'s CPU forward/backward + Adam loop
-/// (verified line-equivalent; intentionally duplicated because the binary's
-/// private helpers are not importable from library code). A follow-up will
-/// extract the shared tape into a library-private module.
+/// Train GQA `q_proj` and `v_proj` LoRA weights with exact CPU gradients.
+/// GDN layers in the selected suffix remain frozen but propagate gradients.
+/// Returns validation errors for invalid data, incompatible models, or unsafe sizes.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the tape, limits, and implementation rationale.
 pub fn train_micro_lora(
     model: &Qwen35Model,
     pairs: &[TrainingPair],
     config: &MicroLoraConfig,
 ) -> Result<LoraAdapter> {
-    // Validate all caller-supplied inputs before any model access or allocation.
-    // The extracted helper is separately testable without a real checkpoint.
+    // Validate caller-controlled bounds before model access or allocation.
     let vocab_size = model.config().vocab_size;
     let num_hidden_layers = model.config().num_hidden_layers;
     validate_micro_lora_inputs(vocab_size, num_hidden_layers, pairs, config)?;
@@ -302,8 +263,7 @@ pub fn train_micro_lora(
         ));
     }
 
-    // Capture the frozen-prefix output (h_in entering first_layer) and RoPE tables.
-    // All pair bounds are already validated above before model access.
+    // Capture frozen-prefix state and RoPE tables after input validation.
     let mut caches: Vec<SeqCtx> = Vec::with_capacity(pairs.len());
     for pair in pairs {
         let (h_in, _) = model
@@ -323,10 +283,7 @@ pub fn train_micro_lora(
         });
     }
 
-    // Checked buffer sizes: verify each rank × dimension product before
-    // allocating. These can only overflow with adversarial config values (rank
-    // is already capped at MAX_LORA_RANK), but we guard explicitly so a future
-    // caller cannot reach a capacity-overflow abort.
+    // Check every allocation product before constructing LoRA buffers.
     let a_q_len = rank.checked_mul(dims.hidden).ok_or_else(|| {
         TuneError::Validation(format!(
             "rank({rank}) * hidden_size({}) overflows buffer size",
@@ -355,8 +312,7 @@ pub fn train_micro_lora(
         ))
     })?;
 
-    // Init LoRA: A ~ U(-1/sqrt(hidden), +1/sqrt(hidden)), B = 0.
-    // Matches mlx_lm LoRALinear init for on-par convergence.
+    // Initialize A uniformly and B to zero; the initial adapter is a no-op.
     let init_amp = 1.0 / (dims.hidden as f32).sqrt();
     let mut rng = 0xFEED_FACEu64;
     let mut loras: Vec<LoraParams> = (0..num_slots)
@@ -372,9 +328,7 @@ pub fn train_micro_lora(
     let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
     let lr = config.learning_rate;
 
-    // This library entry point trains GQA q_proj/v_proj slots only (no GDN
-    // LoRA request surface yet), so the GDN slot arrays stay empty — forward_full
-    // and nll_and_grads fall back to the byte-identical no-LoRA GDN path.
+    // This public entry point trains GQA slots only; GDN stays on the frozen path.
     let gdn_loras: Vec<GdnLoraParams> = Vec::new();
     let gdn_slot_layers: Vec<usize> = Vec::new();
     let train_ctx = TrainCtx::try_new(

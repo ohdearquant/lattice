@@ -228,3 +228,104 @@ For a simple local import without manifest governance, use
 path retains the bounded read and tensor-format validation, but it deliberately
 does not establish status, approved location, whole-file integrity, manifest
 claims, or serving-revision compatibility.
+
+## `load_adapters_from_manifest`
+
+`load_adapters_from_manifest` admits every approved entry or returns an error;
+it never returns a partial adapter list. It first pre-scans the entire manifest
+before allocating the output or opening an adapter file. A single
+`Quarantined` or `Revoked` entry therefore prevents reads of earlier approved
+entries as well as itself. The per-entry status check is repeated in the load
+loop as defense in depth.
+
+For each approved entry, the loader rejects an absolute URI or a URI containing
+`..`, canonicalizes both the base directory and joined target, and requires the
+target to remain under the canonical base. A canonicalization failure is an
+admission failure: it never falls back to the lexical joined path, because that
+path has not been proven confined. The bounded reader then opens the proven
+path once. This folds existence into the read instead of adding an `exists()`
+precheck that would widen the canonicalize-to-open race. A whole-file SHA-256
+comparison backstops final-component replacement after canonicalization.
+
+The remaining checks are complete safetensors parsing; rank equality; alpha
+equality within `1e-4`; target modules being a subset of the manifest claim;
+optional active-model dimension validation; optional header `adapter_id`
+equality; and optional serving-revision equality. If a file omits alpha, the
+parser synthesizes `alpha = rank` (scale `1.0`) and that synthesized value is
+still compared, so omitted header metadata cannot bypass a non-rank manifest
+claim. Any failure discards the complete load result.
+
+## `RunningRevisions`
+
+`RunningRevisions` represents the base-model and tokenizer revisions actually
+serving requests. In strict mode both values are compared by exact string
+equality with each manifest entry. The literal `"none"` is a value, not a
+wildcard; a legacy untracked entry requires the running side to provide the
+same literal.
+
+`permissive` is an explicit migration or backfill escape hatch. It allows a
+mismatch but marks the corresponding `LoadedAdapter` with
+`rev_mismatch_overridden = true`, which callers should surface in logs or
+telemetry. This distinction matters because a LoRA adapter trained against a
+different base model or tokenizer can load and execute while silently
+degrading output quality. Omitting running revisions disables this check only
+when there is no live serving context, such as offline manifest validation.
+
+## `load_peft_safetensors_bytes`
+
+The byte-level parser is shared by local import and governed loading. The
+caller is responsible for path context and, in the governed path, for bounded
+I/O and whole-file integrity before handing bytes to the parser. The parser
+recognizes PEFT and normalized MLX factor keys, decodes supported numeric
+representations to finite `f32`, pairs A and B by layer and module, normalizes
+MLX orientation, and requires complete, rank-consistent two-dimensional
+factors before constructing a `LoraAdapter`.
+
+## `read_lora_file_bounded`
+
+Adapter parsing materializes its input in memory, so every path-based read
+uses a shared byte ceiling. The reader first rejects a file whose metadata size
+already exceeds the cap. It then opens the file and reads through
+`take(max_bytes + 1)`; the extra byte detects a file that grew between the
+metadata check and the open while allowing a file exactly at the cap. Both the
+direct path loader and the manifest loader use this entry point, so one cannot
+bypass the allocation bound through the other.
+
+## `AdapterGovernance`
+
+`AdapterGovernance` stores provenance fields that a safetensors header can
+coherently carry: name, owner, base-model revision, tokenizer revision, dtype,
+and status. The status is a string rather than `AdapterStatus` so the type
+remains usable when safetensors support is enabled without the serde-gated
+manifest module. With serde, `from_entry` copies the common field set from a
+manifest entry.
+
+The header never carries `integrity_sha256`. That hash is defined over the
+complete output file, including the header; inserting a hash changes the bytes
+being hashed. The governed manifest is therefore the sole authority for
+whole-file integrity. Governance-header reads are deliberately advisory:
+`gov_name` signals a writer-produced six-field set, and an absent or malformed
+header yields `None` rather than a governance decision.
+
+## `load_peft_safetensors`
+
+The plain path loader first applies the shared bounded read and then delegates
+to the byte parser. It rejects unreadable or malformed safetensors files,
+orphaned A/B factors, unsupported/non-finite tensor values, invalid shapes,
+and rank-inconsistent adapter pairs. It intentionally does not confer manifest
+status, path confinement, integrity approval, or serving-revision
+compatibility.
+
+## `save_peft_safetensors`
+
+The exporter writes F32 A and B tensors under PEFT keys of the form
+`base_model.model.model.layers.{i}.{block}.{module}.lora_{A,B}.weight`. It
+chooses `self_attn` for the standard attention projections and `mlp` for the
+standard MLP projections; an unknown module retains its module name under
+`self_attn`. The header always records `rank`, `alpha`, and `target_modules`,
+and includes the six `AdapterGovernance` fields only when supplied.
+
+An empty A or B buffer denotes an untrained module and is omitted. Emitting a
+non-zero-shaped tensor with no bytes would make an invalid safetensors view,
+so omission preserves a valid PEFT file while allowing partially populated
+adapter layouts.

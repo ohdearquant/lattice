@@ -205,12 +205,7 @@ impl GpuTrainer {
         // Update weights
         self.update_weights()?;
 
-        // Only a fully completed step (forward + backward + optimizer
-        // update all succeeded) counts toward global_step/LR/epoch
-        // accounting. A failed step above must not advance this counter —
-        // see #797: every GpuOptimizer arm currently errors until real
-        // buffer/gradient wiring lands, so this guards against every
-        // failed call silently inflating the step count.
+        // Only completed updates advance scheduling state — see docs/train.md.
         self.global_step += 1;
 
         // Update learning rate
@@ -318,8 +313,7 @@ impl GpuTrainer {
             output_grads.push(grad);
         }
 
-        // Backpropagate through layers
-        // This is a simplified implementation - full implementation would use GPU shaders
+        // Use the placeholder CPU backpropagation path — see docs/train.md.
         self.backprop_cpu(&output_grads, batch)?;
 
         Ok(())
@@ -327,8 +321,7 @@ impl GpuTrainer {
 
     /// CPU backpropagation (fallback for now)
     fn backprop_cpu(&mut self, output_grads: &[Vec<f32>], _batch: &Batch) -> Result<()> {
-        // For now, compute average gradients on CPU and upload to GPU
-        // This will be replaced with full GPU backprop in a later iteration
+        // Upload placeholder gradients — see docs/train.md.
 
         let network = self.network.cpu_network();
         let batch_size = output_grads.len() as f32;
@@ -338,8 +331,7 @@ impl GpuTrainer {
             let num_weights = layer.num_inputs() * layer.num_outputs();
             let num_biases = layer.num_outputs();
 
-            // Simple gradient accumulation (placeholder)
-            // Real implementation would compute proper gradients
+            // Uniform placeholder gradients — see docs/train.md.
             let weight_grads = vec![0.01f32 / batch_size; num_weights];
             let bias_grads = vec![0.01f32 / batch_size; num_biases];
 

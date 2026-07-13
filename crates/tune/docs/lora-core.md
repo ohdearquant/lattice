@@ -440,3 +440,154 @@ Passing no running revision context skips revision enforcement, and passing no
 model configuration skips model-dimension validation. Those modes are useful
 for offline inspection but are weaker admission checks than live serving.
 
+## train_micro_lora
+
+`train_micro_lora` is deliberately bounded before it reads a model weight or
+allocates a tape buffer. It validates the caller's pairs against the model
+configuration, then materializes the inclusive suffix
+`first_layer..=TOP_LAYER` where `TOP_LAYER` is 23. Both endpoints must be
+valid model-layer indices: an invalid suffix would otherwise reach direct
+layer-weight indexing and panic.
+
+The public helper applies these policy caps:
+
+| Input           |     Cap | Purpose                                       |
+| --------------- | ------: | --------------------------------------------- |
+| LoRA rank       |     512 | Bounds rank-by-dimension buffer products.     |
+| Adam steps      | 100,000 | Bounds caller-controlled CPU work.            |
+| Sequence length |   8,192 | Bounds captured activations and tape buffers. |
+
+These caps are safety limits, not quality recommendations, and the model's
+own context limit still applies. Each pair must have at least two tokens, fit
+the requested sequence limit, begin its completion at a nonzero index before
+the final token, and contain only vocabulary IDs valid for the model. These
+checks protect the supervised-position range and language-model-head indexing.
+
+After preflight, the trainer captures the frozen prefix activation entering
+`first_layer` and the matching RoPE tables. It checks every allocation product
+before creating A/B buffers. A is deterministically initialized from
+`U(-1/sqrt(hidden), +1/sqrt(hidden))`; B starts at zero, so the initial adapter
+does not perturb frozen-model output. The public surface allocates slots only
+for GQA `q_proj` and `v_proj`; GDN layers run the preserved no-LoRA path so
+their backward derivatives still reach preceding GQA layers.
+
+The library loop intentionally mirrors the training binary's private CPU
+forward/backward and Adam sequence. Its library implementation uses the
+private tape in `train_core.rs` as its execution boundary.
+
+## AdamState::step
+
+`AdamState::step` identifies optimizer state by a stable parameter key. The
+moment vectors and the bias-correction timestep belong to that key, so every
+tensor uses the exponent for its own number of updates rather than its
+position in an optimizer round. Reusing a key requires preserving the tensor
+length because its stored moments are reused.
+
+For gradient `g`, it computes the standard update:
+
+```text
+m_t = beta1 * m_(t-1) + (1 - beta1) * g
+v_t = beta2 * v_(t-1) + (1 - beta2) * g^2
+m_hat = m_t / (1 - beta1^t)
+v_hat = v_t / (1 - beta2^t)
+theta -= learning_rate * m_hat / (sqrt(v_hat) + epsilon)
+```
+
+When `decoupled` is true, the method first applies
+`theta -= learning_rate * weight_decay * theta`; otherwise `weight_decay` is
+unused and the update is ordinary Adam. A single global timestep would make
+later A/B tensors in one logical round appear older than they are and distort
+their early bias correction.
+
+## blend_lora_adapters
+
+Blending groups source layers by `(layer_idx, module)` and plans the complete
+output allocation before creating either output matrix. The per-projection
+rank cap prevents one unusually wide low-rank update, while the aggregate
+element cap prevents a full-model adapter with many individually acceptable
+projections from allocating an unacceptable total. All rank and dimension
+products use checked arithmetic; malformed source A/B buffers are rejected
+before their declared row-major shapes are copied.
+
+Within a group, A blocks are vertically stacked in source order. For every
+output row, B blocks are horizontally concatenated in the same order after
+each block is multiplied by `mixture_weight * source_scale`. This is why the
+returned configuration sets `alpha == rank`: all source scaling is already in
+B and the output adapter must have a scale of one. The full derivation and the
+exact capacity limits are in [Exact adapter blending](#exact-adapter-blending).
+
+## GdnLoraParams
+
+`GdnLoraParams` serves both as the parameter container and as the gradient
+container for GatedDeltaNet LoRA. It mirrors the inference backward module's
+GDN gradient fields so a backward result can be assigned directly to a slot.
+
+| Projection    | A shape              | B shape               |
+| ------------- | -------------------- | --------------------- |
+| `in_proj_qkv` | `(rank, hidden)`     | `(qkv_dim, rank)`     |
+| `in_proj_z`   | `(rank, hidden)`     | `(output_dim, rank)`  |
+| `in_proj_b`   | `(rank, hidden)`     | `(value_heads, rank)` |
+| `in_proj_a`   | `(rank, hidden)`     | `(value_heads, rank)` |
+| `out_proj`    | `(rank, output_dim)` | `(hidden, rank)`      |
+
+The beta and alpha projections use `value_heads`, not key heads. This matters
+for configurations with asymmetric key and value head counts. `shaped` is the
+single checked length derivation used by both randomized/custom initialization
+and `zeros`; routing every initializer through it prevents a call site from
+silently reintroducing a different beta/alpha width.
+
+## TrainCtx::try_new
+
+`TrainCtx` is the immutable agreement used by tape forward, reverse,
+evaluation, and optimizer entry points. Construction derives the execution
+scale once from `alpha / rank` and validates all values that could poison a
+training run: rank must be nonzero; alpha and Adam hyperparameters must be
+finite; RMSNorm epsilon and the GDN attention scale must be finite as well.
+
+The constructor also proves that `Dims` and `GdnDims` were derived from the
+same `Qwen35Config` the tape will access. It compares all relevant widths,
+head counts, RoPE and intermediate dimensions, RMSNorm epsilon, GDN kernel
+dimensions, and GDN attention scale. This prevents a plausible-looking flat
+buffer layout from being paired with weights from another model.
+
+Finally, GQA and GDN slot lists must be individually unique, in model range,
+and classified as the mixer kind the model actually uses. No model layer may
+appear in both lists. These conditions keep slot-indexed LoRA vectors,
+gradient accumulators, and Adam keys aligned with the mixer that consumes
+them.
+
+## nll_and_grads
+
+The reverse pass first accumulates each supervised position's normalized
+softmax-cross-entropy derivative through the language-model head and final
+RMSNorm. It then walks materialized layers in reverse: backpropagating the
+SwiGLU branch and post-mixer RMSNorm into the residual, then the saved GQA or
+GDN mixer, then the pre-mixer RMSNorm into the previous residual. Both
+residual joins add their incoming derivatives.
+
+The result contains one GQA gradient container per GQA slot and one
+`GdnLoraParams` container per GDN slot. A GQA slot has four arrays for Q/V A
+and B; a GDN slot has ten arrays for five projection factors. Either set may
+be empty when the materialized suffix has no slots of that mixer kind. GDN
+Adam updates use distinct projection-specific parameter keys for all ten
+arrays, preserving the per-tensor timestep invariant.
+
+## Adapter validation
+
+`LoraAdapter::validate_against` is the serving-side dimension gate. For every
+adapted `(layer_idx, module)` it checks that the layer exists, the module is
+recognized for that mixer's architecture, and the stored input/output widths
+match the model configuration before the adapter is installed. Attention and
+MLP projections use their corresponding hidden, query/key/value, and
+intermediate dimensions. GDN `in_proj_b` and `in_proj_a` specifically use
+the number of value heads; using key-head width rejects valid asymmetric-head
+models or accepts malformed adapters.
+
+Safetensors saving may include optional governance provenance in the metadata
+header. That metadata describes the adapter but is not a substitute for the
+manifest's whole-file integrity and admission checks described above.
+
+PEFT tensor names identify a layer and projection, for example
+`base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.weight`. Loading
+requires each projection's A/B pair and a consistent rank; parsing failures
+remain errors before an adapter can be installed.

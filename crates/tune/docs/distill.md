@@ -338,3 +338,44 @@ filling in the missing network step:
 The provider client should remain an implementation detail of `distill`. The
 embedding and student-training concerns stay outside this module, connected
 only through the data types documented here and in [data.md](data.md).
+
+## RawExample::to_prompt
+
+`RawExample::to_prompt` is the text-to-prompt boundary used by the current
+placeholder and by any future provider client. It renders chronological
+context, when present, as a numbered `Context (previous messages)` block and
+then renders the current message under `Current message to classify`.
+
+Before it formats either kind of text, the method limits every input string to
+`MAX_MESSAGE_LENGTH` and removes control characters other than newline, tab,
+and carriage return. It then limits the assembled prompt content to
+`MAX_PROMPT_LENGTH` and appends `[truncated]` on overflow. These are resource
+bounds, not a prompt-injection defense: user-provided strings remain untrusted
+teacher-visible content.
+
+## TeacherConfig::verify_endpoint
+
+`TeacherConfig::verify_endpoint` resolves the configured endpoint or the
+provider default, then applies `EndpointSecurity::verify_endpoint`. That local
+policy checks the required scheme and, when configured, the exact allowlisted
+host. It also calls `validate_cert_fingerprint`, which checks only that a
+configured SHA-256 fingerprint has 64 ASCII-hex characters.
+
+The method opens no connection, compares no peer certificate, and does not
+calculate a local model checksum. A live provider client must perform TLS
+verification and certificate-pin comparison after it has the peer certificate;
+an integration that loads local weights must separately pass its calculated
+checksum to `verify_model_checksum`.
+
+## DistillationPipeline::label_single
+
+`label_single` is deliberately a provider-shaped placeholder. It starts timing
+and materializes the bounded prompt, but it does not send the prompt, read the
+configured API-key environment variable, retry, or parse a response. Instead,
+it emits its fixed score vector, optionally softmax-normalizes it, assigns
+confidence `0.85`, and applies the configured confidence threshold.
+
+This preserves the eventual client boundary: a real implementation should
+replace only the simulated result with provider I/O and response validation,
+while retaining the prompt limits, label order, threshold behavior, and result
+accounting described above.

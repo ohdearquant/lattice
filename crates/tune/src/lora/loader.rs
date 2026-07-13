@@ -38,25 +38,15 @@ pub struct LoadedAdapter {
     pub entry: ManifestEntry,
     /// The loaded adapter weights.
     pub adapter: LoraAdapter,
-    /// `true` when this adapter's `base_model_rev`/`tokenizer_rev` did not
-    /// match the [`RunningRevisions`] supplied to
-    /// [`load_adapters_from_manifest`], but the load proceeded anyway because
-    /// `allow_mismatch` was set. Always `false` when `running` was `None`
-    /// (enforcement not requested) or when both revisions matched. Callers
-    /// should surface a `true` value (log, telemetry) — it means a
-    /// governance check was knowingly bypassed.
+    /// Whether an allowed serving-revision mismatch bypassed the admission check.
+    /// This is `false` when revisions matched or enforcement was not requested.
+    /// See `docs/lora-io.md` (§RunningRevisions) for serving implications.
     pub rev_mismatch_overridden: bool,
 }
 
-/// The base-model / tokenizer revisions the caller believes are currently
-/// serving, used by [`load_adapters_from_manifest`] (Check 11) to fail-closed
-/// on adapters trained against a different revision.
-///
-/// Comparison is plain string equality against `ManifestEntry::base_model_rev`
-/// / `tokenizer_rev` — the literal `"none"` sentinel some entries use for
-/// "untracked" is not treated as a wildcard. If a manifest predates revision
-/// tracking, supply `"none"` on the running side too, or use
-/// [`RunningRevisions::permissive`].
+/// Revisions of the base model and tokenizer currently serving an adapter.
+/// They are compared literally with each manifest entry when supplied to the loader.
+/// See `docs/lora-io.md` (§RunningRevisions) for strict and migration behavior.
 #[derive(Debug, Clone, Copy)]
 pub struct RunningRevisions<'a> {
     /// Revision of the base model weights currently loaded for serving.
@@ -92,45 +82,9 @@ impl<'a> RunningRevisions<'a> {
     }
 }
 
-/// Load and validate all approved adapters in a manifest.
-///
-/// Fails closed: returns `Err` on **any** anomaly. Returns
-/// `Ok(Vec<LoadedAdapter>)` only when every adapter in the manifest passes all
-/// checks. Quarantined and Revoked entries are rejected immediately — the
-/// function does not even attempt to read their files.
-///
-/// # Validation checklist (all mandatory, in order)
-///
-/// For each `ManifestEntry` in `manifest.adapters`:
-/// 1. `status == Approved` — else `Err` (quarantined/revoked message).
-/// 2. Resolve `uri` under `base_dir`. Absolute URIs and `..` components are
-///    rejected; the resolved path is canonicalized and must stay within a
-///    canonicalized `base_dir` (symlink-escape proof).
-/// 3. File exists — else `Err(TuneError::Io(...))`.
-/// 4. File readable and SHA-256 of bytes == `integrity_sha256` — else `Err`.
-/// 5. Bytes parse as a valid PEFT safetensors adapter — else `Err` (propagated).
-/// 6. Loaded `config.rank == entry.rank` — else `Err(TuneError::Validation(...))`.
-/// 7. Loaded `config.alpha` within 1e-4 of `entry.alpha` — else `Err`.
-/// 8. Loaded `config.target_modules ⊆ entry.target_modules` — else `Err`.
-/// 9. (When `inference-hook` feature active and `model_config` is `Some`)
-///    `adapter.validate_against(model_config)` passes — else `Err`.
-/// 10. If the adapter's safetensors header contains an `adapter_id` key, it
-///     must equal `entry.id` — else `Err(TuneError::Validation(...))`.
-/// 11. (When `running` is `Some`) `entry.base_model_rev == running.base_model_rev`
-///     and `entry.tokenizer_rev == running.tokenizer_rev` — else `Err`, unless
-///     `running.allow_mismatch` is set, in which case the load proceeds and
-///     `LoadedAdapter::rev_mismatch_overridden` is set to `true`.
-///
-/// # Arguments
-///
-/// * `manifest` — Parsed `LoraManifest`.
-/// * `base_dir` — Directory for resolving relative URIs (typically the
-///   manifest file's parent directory).
-/// * `model_config` — (Only when `inference-hook` is active) Model config for
-///   dimension validation; `None` skips step 9.
-/// * `running` — Base-model/tokenizer revisions currently serving, for step
-///   11. `None` skips revision enforcement entirely (e.g. offline manifest
-///   validation with no live model context).
+/// Load every approved manifest adapter or reject the entire manifest.
+/// Validates confinement, integrity, format, manifest claims, and optional live-serving context.
+/// See `docs/lora-io.md` (§load_adapters_from_manifest) for the ordered admission checks.
 pub fn load_adapters_from_manifest(
     manifest: &LoraManifest,
     base_dir: &Path,
@@ -139,10 +93,7 @@ pub fn load_adapters_from_manifest(
     >,
     running: Option<&RunningRevisions<'_>>,
 ) -> Result<Vec<LoadedAdapter>> {
-    // Pre-scan: verify ALL entries are Approved before touching any file or
-    // allocating the output buffer. A quarantined/revoked entry anywhere in the
-    // manifest must prevent all file IO — not just its own entry — so an attacker
-    // cannot hide a bad entry after good ones and have the good files read first.
+    // Reject a disallowed manifest before any adapter I/O — see docs/lora-io.md.
     for entry in &manifest.adapters {
         match entry.status {
             AdapterStatus::Quarantined => {
@@ -161,8 +112,7 @@ pub fn load_adapters_from_manifest(
         }
     }
 
-    // Allocate output capacity only after the prescan confirms all entries are
-    // Approved (and the manifest size is bounded by the FIX-1a manifest cap).
+    // Allocate only after the admission pre-scan.
     let mut out = Vec::with_capacity(manifest.adapters.len());
 
     for entry in &manifest.adapters {
@@ -184,11 +134,7 @@ pub fn load_adapters_from_manifest(
             AdapterStatus::Approved => {}
         }
 
-        // Check 2: Resolve URI and enforce path confinement.
-        // Absolute URIs are rejected because a manifest is an attacker-influenced
-        // governance input; an absolute URI could reach any file on the filesystem.
-        // `..` components escape base_dir even with a relative path.
-        // Canonicalization catches symlinks that point outside base_dir.
+        // Check 2: canonicalization must prove an untrusted URI remains in `base_dir`.
         let full_path = {
             let p = Path::new(&entry.uri);
             if p.is_absolute() {
@@ -206,11 +152,7 @@ pub fn load_adapters_from_manifest(
                 }
             }
             let joined = base_dir.join(p);
-            // Canonicalize both base_dir and the joined target to catch symlink
-            // escapes, then require the resolved target to stay under base_dir.
-            // A canonicalize failure (missing target, unreadable component, or an
-            // unresolved parent symlink) fails closed below — we never read a path
-            // whose canonical form was not proven in-base.
+            // Prove both endpoints before reading — see docs/lora-io.md.
             let canonical_base = std::fs::canonicalize(base_dir).map_err(|e| {
                 TuneError::Io(std::io::Error::new(
                     e.kind(),
@@ -234,13 +176,7 @@ pub fn load_adapters_from_manifest(
                     canonical_joined
                 }
                 Err(e) => {
-                    // Fail closed. A real approved adapter always exists and
-                    // canonicalizes (we are about to read and hash it). A
-                    // canonicalize failure means the target is missing, a path
-                    // component is unreadable, or a parent is an unresolved
-                    // symlink. Falling back to the lexical `joined` would read
-                    // through a path the confinement check never proved in-base,
-                    // so report not-found directly instead.
+                    // Never fall back to an unproven lexical path.
                     return Err(TuneError::Io(std::io::Error::new(
                         e.kind(),
                         format!(
@@ -253,20 +189,7 @@ pub fn load_adapters_from_manifest(
             }
         };
 
-        // Check 3 (existence) is folded into Check 4: `full_path` is the
-        // canonicalized, in-base path proven above, and the size-bounded read
-        // opens it and fails closed if it is missing or unreadable. A separate
-        // `exists()` precheck would only widen the canonicalize-to-open window.
-        // The residual window (the proven path's final component being swapped to
-        // a symlink between canonicalization and open) is backstopped by the
-        // SHA-256 integrity check in Check 4 and grants no capability without
-        // write access to base_dir, which already defeats confinement.
-        //
-        // Check 4: Read bytes (size-bounded) and verify SHA-256 integrity. The
-        // size bound is enforced by a metadata stat before the read, so a
-        // manifest URI pointing at an oversized file is refused without
-        // allocating for its contents — the path-based loader's guard, applied
-        // here so this bytes path cannot bypass it.
+        // Checks 3–4: read the proven path once; bounded I/O and SHA-256 backstop races.
         let bytes = crate::lora::safetensors::read_lora_file_bounded(
             &full_path,
             crate::lora::safetensors::MAX_LORA_SIZE,
@@ -300,14 +223,7 @@ pub fn load_adapters_from_manifest(
             )));
         }
 
-        // Check 7: Alpha must match within f32 round-trip tolerance.
-        // When an adapter file omits explicit alpha metadata, the parser
-        // synthesises `alpha = rank` (scale = 1.0). That synthesised value is
-        // still compared here against `entry.alpha`, so a manifest that declares
-        // a non-rank alpha (e.g. alpha=64, rank=16) correctly rejects an adapter
-        // whose header omits alpha — the synthesised 16 ≠ declared 64. The
-        // synthesis fallback therefore cannot smuggle a mismatched alpha past the
-        // governed loader.
+        // Check 7: synthesized alpha also must match; omission cannot bypass the claim.
         validate_manifest_alpha(adapter.config().alpha, entry)?;
 
         // Check 8: target_modules in adapter must be a subset of entry's list.
@@ -343,17 +259,7 @@ pub fn load_adapters_from_manifest(
             )));
         }
 
-        // Check 11: Base-model / tokenizer revision enforcement (fail-closed).
-        // A revision mismatch is the classic silent-quality-loss failure for
-        // LoRA serving: an adapter trained against a different base or
-        // tokenizer revision loads and runs fine, it just produces worse
-        // output, with no error to signal the mismatch. `running` is `None`
-        // when the caller has no live-model context (e.g. offline manifest
-        // validation) — enforcement is skipped entirely in that case,
-        // mirroring the `model_config` idiom in Check 9. Placed last (rather
-        // than renumbering Checks 1-10) to keep this change additive; it does
-        // not gate file IO for other entries, only this one's already-read
-        // bytes are discarded on rejection.
+        // Check 11: reject silent serving-quality loss from revision drift — see docs/lora-io.md.
         let mut rev_mismatch_overridden = false;
         if let Some(running) = running {
             let mut mismatches = Vec::new();

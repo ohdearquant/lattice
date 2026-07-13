@@ -226,3 +226,73 @@ Persist `gate_bytes`, replay state, and Fisher state together when continuity
 across process restarts matters. Restoring only the gate discards the
 anti-forgetting history; restoring only the Fisher state with a different gate
 will fail its parameter-count validation.
+
+## `update_router`
+
+`update_router` is an all-or-nothing refit. It takes a FANN gate payload, a
+non-empty batch of feedback, mutable replay and Fisher state, and a
+`RouterUpdateConfig`; it returns a complete replacement FANN payload rather
+than a parameter patch. The caller must retain the returned bytes together
+with the updated replay and Fisher values to preserve online-learning
+continuity.
+
+Before changing any state, the function deserializes the gate and validates
+every event against its input and output dimensions, including finite context
+values. It also validates the configuration and either initializes an empty
+Fisher to the gate's parameter count or proves that an existing Fisher has
+matching finite state. The refit then combines all current events with a
+deterministic replay sample, performs the configured number of epochs,
+anchors the Fisher at the final parameters, adds only current positive events
+to replay, measures post-refit replay accuracy, and serializes the gate.
+
+Both feedback polarities deliberately use the same `RlooTrainer::step` path.
+The signed reward from `PreferenceSignal::reward()` carries the direction:
+positive feedback raises the named adapter's score, while negative feedback
+lowers it. A separate negative-feedback path would risk treating an adapter
+known to be bad as though it named a replacement.
+
+The function reports `TuneError::Validation` for bad event dimensions or
+indices, non-finite contexts, invalid configuration, or invalid Fisher state.
+Gate deserialization, policy-gradient, Fisher-observation, and anchor-update
+failures are surfaced as `TuneError::Training`.
+
+## `RouterUpdateConfig::ewc_lambda`
+
+`ewc_lambda` belongs to the planned anchor-pullback (`penalty_gradient`) EWC
+path. It is already validated and retained in configuration so callers can
+persist a stable config shape, but the v1 refit uses only
+`DiagonalFisher::project_delta`; that projection does not consult
+`ewc_lambda`. Therefore changing only this value cannot change otherwise
+identical v1 gate bytes. A zero value remains a useful declaration of intended
+no-regularization behavior for a future penalty-gradient implementation.
+
+## `ReplayBuffer`
+
+Replay contains only positive `(context_vector, preferred_adapter_idx)`
+observations. Positive feedback identifies an adapter to reinforce, so replay
+can safely train it with `+1.0`; negative feedback identifies only an adapter
+to suppress and cannot name a correct replacement. The buffer is a bounded
+FIFO: a full buffer evicts its oldest entry before accepting a new one, while a
+zero-capacity buffer retains nothing.
+
+Sampling is deterministic and spread across the insertion history. For an
+effective requested count `n`, the implementation uses `ceil(len / n)` as the
+step and takes at most `n` entries. Samples are cloned before refit, and new
+positive events are appended only after all refit epochs, so current feedback
+does not receive extra replay updates in its initial call.
+
+## `one_gradient_step`
+
+Each update snapshots the gate's flattened parameters in forward layer order
+(row-major weights followed by biases), lets RLOO apply its signed policy
+gradient, and measures `raw_delta = after - before`. It approximates the
+gradient as `-raw_delta / max(abs(learning_rate), 1e-10)` before observing it
+in the diagonal Fisher EMA. `project_delta` then damps updates at parameters
+with high accumulated squared-gradient importance, and the gate is restored
+as `before + projected_delta`.
+
+This projection is the v1 anti-forgetting mechanism. It protects parameters
+that recent feedback identifies as important to earlier routing behavior while
+leaving low-importance directions free to adapt. The reward sign is preserved
+through every stage: a positive reward increases the selected output and a
+negative reward decreases it.

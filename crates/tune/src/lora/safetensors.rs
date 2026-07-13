@@ -32,17 +32,7 @@ enum LoraMatrix {
     B,
 }
 
-/// Parse a PEFT safetensors key into its components.
-///
-/// Accepted formats:
-/// - `base_model.model.model.layers.{i}.self_attn.{module}.lora_A.weight`
-/// - `base_model.model.model.layers.{i}.mlp.{module}.lora_B.weight`
-///
-/// Also handles the simpler HuggingFace format without the `base_model.model` prefix:
-/// - `model.layers.{i}.self_attn.{module}.lora_A.weight`
-/// - `model.layers.{i}.mlp.{module}.lora_B.weight`
-///
-/// Returns `None` for keys that don't match (e.g., non-LoRA metadata tensors).
+/// Parse a recognized PEFT or MLX LoRA tensor key, ignoring non-factor keys.
 fn parse_peft_key(key: &str) -> Option<PeftKey> {
     // Strip the trailing `.weight` if present
     let key = key.strip_suffix(".weight").unwrap_or(key);
@@ -194,14 +184,9 @@ fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-/// Load a LoRA adapter from raw PEFT-format safetensors bytes.
-///
-/// This is the byte-level counterpart of [`load_peft_safetensors`]. It is
-/// used by the manifest-driven loader, which reads and integrity-checks the
-/// bytes externally before calling this function.
-///
-/// Error messages omit the original file path because the caller has already
-/// provided that context.
+/// Parse raw PEFT or MLX safetensors bytes into a complete LoRA adapter.
+/// The caller supplies file-path and integrity context when needed.
+/// See `docs/lora-io.md` (§load_peft_safetensors_bytes) for parsing invariants.
 pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, TuneError> {
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|e| TuneError::Serialization(format!("failed to parse safetensors: {e}")))?;
@@ -404,19 +389,9 @@ pub(crate) fn read_peft_header_adapter_id(data: &[u8]) -> Option<String> {
     })
 }
 
-/// Governance provenance fields embeddable into a saved adapter's
-/// safetensors metadata header, closing the "a manifest-less adapter file
-/// carries no provenance" gap (issue #610).
-///
-/// Deliberately does **not** include `integrity_sha256`: that field (as
-/// carried by a manifest `ManifestEntry`) is a SHA-256 hash of the
-/// *complete* safetensors file, header included (see the manifest loader's
-/// Check 4). A file cannot correctly embed a hash of its own complete byte
-/// stream inside itself — writing the hash into the header changes the
-/// header bytes, which changes the true hash, and there is no fixed point
-/// short of a cryptographic preimage. The governed manifest remains the sole
-/// authority for whole-file integrity; this struct carries everything else
-/// from the #439 field set that a header CAN coherently hold.
+/// Provenance metadata embeddable in an adapter safetensors header.
+/// Whole-file integrity remains manifest-owned because a file cannot embed its own digest.
+/// See `docs/lora-io.md` (§AdapterGovernance) for header and integrity boundaries.
 #[derive(Debug, Clone)]
 pub struct AdapterGovernance {
     /// Human-readable name for logging and debugging.
@@ -429,13 +404,7 @@ pub struct AdapterGovernance {
     pub tokenizer_rev: String,
     /// Tensor dtype label (e.g. `"f32"`, `"f16"`, `"bf16"`).
     pub dtype: String,
-    /// Governance status as a lowercase string (`"approved"` /
-    /// `"quarantined"` / `"revoked"`). A plain `String` here (rather than the
-    /// manifest's `AdapterStatus` enum) keeps this struct constructible when
-    /// the crate is built with `safetensors` but not `serde` — `AdapterStatus`
-    /// lives in the `serde`-gated `manifest` module. See
-    /// [`AdapterGovernance::from_entry`] for the common case of building this
-    /// from an existing manifest entry.
+    /// Lowercase governance status, kept as a string so this type does not require `serde`.
     pub status: String,
 }
 
@@ -457,21 +426,9 @@ impl AdapterGovernance {
     }
 }
 
-/// Read the governance fields embedded by [`save_peft_safetensors`] back out
-/// of a safetensors header, if present.
-///
-/// Returns `None` if the bytes cannot be parsed, the header has no metadata,
-/// or the `gov_name` key is absent. `gov_name` is used as the presence
-/// sentinel: the writer always sets all six governance keys together from a
-/// single `Option<&AdapterGovernance>`, so its absence means no governance
-/// was embedded (the other five default to an empty string rather than also
-/// gating on presence, since a partially-written header is not expected in
-/// practice and this reader is best-effort/advisory, not itself a
-/// governance gate).
-///
-/// Exercised today only by the round-trip tests below (no production caller
-/// consumes it yet — writing governance is the acceptance-critical half of
-/// issue #610; reading it back is provided for completeness/future tooling).
+/// Read optional, advisory governance metadata from a safetensors header.
+/// `gov_name` is the presence sentinel for a writer-produced six-field set.
+/// See `docs/lora-io.md` (§AdapterGovernance) for advisory-read semantics.
 #[allow(dead_code)]
 pub(crate) fn read_peft_header_governance(data: &[u8]) -> Option<AdapterGovernance> {
     let (_, meta) = SafeTensors::read_metadata(data).ok()?;
@@ -486,36 +443,15 @@ pub(crate) fn read_peft_header_governance(data: &[u8]) -> Option<AdapterGovernan
     })
 }
 
-/// Maximum on-disk size of a single LoRA adapter file, in bytes (10 GiB).
-///
-/// Adapter files are read fully into memory before parsing, so an unbounded
-/// read of a caller-supplied path is an allocation-DoS vector. Every path that
-/// materialises adapter bytes from disk routes through [`read_lora_file_bounded`]
-/// with this ceiling, so a second reader cannot reintroduce the bypass.
+/// Maximum in-memory adapter file size (10 GiB).
+/// See `docs/lora-io.md` (§read_lora_file_bounded) for the allocation bound.
 pub(crate) const MAX_LORA_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
-/// Read a file into memory after rejecting it if it exceeds `max_bytes`.
-///
-/// Two-layer defence against oversized reads:
-///
-/// 1. **Fast-path stat**: `metadata().len()` checked before the file is opened.
-///    A known-huge file is refused without any allocation.
-/// 2. **Bounded read**: `File::open` + `.take(max_bytes + 1)` enforces the cap
-///    at read time. The `+1` sentinel detects a file that grew between the stat
-///    and the open (TOCTOU window), because an exactly-at-cap file reads fully
-///    while any larger file produces `buf.len() > max_bytes` after the read.
-///
-/// This is the single guarded entry point for loading adapter bytes from disk;
-/// both the path-based [`load_peft_safetensors`] and the manifest-driven loader
-/// route through here, so the size bound cannot be bypassed by a second reader.
-///
-/// # Errors
-///
-/// Returns an error if the file metadata cannot be read, the file is larger
-/// than `max_bytes`, or the read itself fails.
+/// Read an adapter file into memory without exceeding `max_bytes`.
+/// Returns I/O errors for metadata, over-limit, open, or read failures.
+/// See `docs/lora-io.md` (§read_lora_file_bounded) for the two-stage bound.
 pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, TuneError> {
-    // Fast-path: stat before open. A known-oversized file is refused without
-    // allocating for its contents (defence-in-depth — the read is also bounded).
+    // Reject a known-oversized file before allocation.
     let file_size = std::fs::metadata(path)
         .map_err(|e| {
             TuneError::Io(std::io::Error::new(
@@ -533,9 +469,7 @@ pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<
             ),
         )));
     }
-    // Bounded read: take max_bytes + 1 bytes so a file that grew after the
-    // stat is still caught. If buf.len() exceeds max_bytes at read time, the
-    // file is rejected even though the stat passed.
+    // The one-byte sentinel catches growth after the metadata check.
     use std::io::Read;
     let f = std::fs::File::open(path).map_err(|e| {
         TuneError::Io(std::io::Error::new(
@@ -562,38 +496,17 @@ pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<
     Ok(buf)
 }
 
-/// Load a LoRA adapter from a PEFT-format safetensors file.
-///
-/// Reads the file, parses all LoRA tensor keys, pairs A/B matrices per
-/// (layer_idx, module), and assembles the adapter.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The file cannot be read or is not valid safetensors
-/// - A/B matrix pairs are incomplete (A without B or vice versa)
-/// - Tensor shapes are inconsistent (ranks must match within a pair)
+/// Load and validate a PEFT or MLX safetensors LoRA adapter from `path`.
+/// Rejects unreadable, malformed, incomplete, or shape-inconsistent files.
+/// See `docs/lora-io.md` (§load_peft_safetensors) for parser checks.
 pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
     let data = read_lora_file_bounded(path, MAX_LORA_SIZE)?;
     load_peft_safetensors_bytes(&data)
 }
 
-/// Save a LoRA adapter to a PEFT-format safetensors file.
-///
-/// Writes one `lora_A` and one `lora_B` tensor per `(layer_idx, module)` pair
-/// using the standard PEFT key format:
-/// `base_model.model.model.layers.{i}.{block}.{module}.lora_{A,B}.weight`
-///
-/// Metadata stored in the safetensors header: `rank`, `alpha`, `target_modules`,
-/// and, when `governance` is `Some`, `gov_name`, `gov_owner`,
-/// `gov_base_model_rev`, `gov_tokenizer_rev`, `gov_dtype`, `gov_status` (see
-/// [`AdapterGovernance`] for why `integrity_sha256` is deliberately not
-/// among them). Pass `None` to save without embedding governance metadata
-/// (unchanged behavior from before issue #610).
-///
-/// # Errors
-///
-/// Returns an error if tensor views cannot be created or the file cannot be written.
+/// Save an adapter as PEFT safetensors, optionally embedding provenance metadata.
+/// Returns errors for invalid tensor views or file writes.
+/// See `docs/lora-io.md` (§save_peft_safetensors) for keys and header fields.
 pub fn save_peft_safetensors(
     adapter: &LoraAdapter,
     path: &Path,
@@ -605,9 +518,7 @@ pub fn save_peft_safetensors(
     let mut byte_data: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
 
     for ((layer_idx, module), layer) in adapter.layers() {
-        // A LoRA layer with an empty factor buffer means "this module was not trained"
-        // (e.g. GDN-attention slots leave q_proj/v_proj empty). Skip it rather than
-        // emit an InvalidTensorView for a zero-byte tensor with non-zero shape.
+        // Empty factors denote an untrained module and cannot form a tensor view.
         if layer.a.is_empty() || layer.b.is_empty() {
             continue;
         }

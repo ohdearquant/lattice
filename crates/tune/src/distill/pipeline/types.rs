@@ -196,12 +196,8 @@ impl RawExample {
         self
     }
 
-    /// Format a bounded, control-character-sanitized teacher prompt.
-    ///
-    /// Applies the following sanitization:
-    /// - Strips control characters (except newlines and tabs)
-    /// - Truncates individual messages to `MAX_MESSAGE_LENGTH`
-    /// - Truncates prompt content to `MAX_PROMPT_LENGTH`
+    /// Format the context and current message as a bounded, sanitized teacher prompt.
+    /// See [`docs/distill.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/distill.md#rawexampletoprompt) (§RawExample::to_prompt) for its layout and limits.
     pub fn to_prompt(&self) -> String {
         let mut prompt = String::new();
 

@@ -69,12 +69,8 @@ impl Default for RollbackController {
 }
 
 impl RollbackController {
-    /// Create a new rollback controller with specified history limit.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_history` - Maximum number of rollback records to retain.
-    ///   When exceeded, oldest records are removed first.
+    /// Creates a controller retaining at most `max_history` rollback records.
+    /// See [`docs/registry.md`] (§`RollbackController` retention) for eviction behavior.
     pub fn new(max_history: usize) -> Self {
         Self {
             history: Vec::new(),
@@ -82,22 +78,9 @@ impl RollbackController {
         }
     }
 
-    /// Record a rollback operation.
-    ///
-    /// Creates a new [`RollbackRecord`] with the current timestamp and
-    /// adds it to the history. If history exceeds `max_history`, the
-    /// oldest record is removed.
-    ///
-    /// # Arguments
-    ///
-    /// * `from_id` - The model ID being rolled back from (current production)
-    /// * `to_id` - The model ID being rolled back to (new production)
-    /// * `reason` - Human-readable reason for the rollback
-    /// * `initiated_by` - Optional identifier for who/what initiated the rollback
-    ///
-    /// # Returns
-    ///
-    /// The created [`RollbackRecord`].
+    /// Appends and returns a timestamped rollback audit record.
+    /// Evicts the oldest record after exceeding the configured capacity.
+    /// See [`docs/registry.md`] (§`RollbackController` retention) for lifecycle limits.
     pub fn record_rollback(
         &mut self,
         from_id: Uuid,

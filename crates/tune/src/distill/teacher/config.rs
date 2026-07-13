@@ -193,20 +193,16 @@ Respond ONLY with the JSON object, no other text."#.to_string()
         Ok(())
     }
 
-    /// Verify the teacher endpoint before use
+    /// Verify the effective endpoint against the configured local security policy.
     ///
-    /// This performs additional security checks that may require network access:
-    /// - TLS certificate validation (if fingerprint specified)
-    /// - Model checksum verification (for local models)
-    ///
-    /// Call this before starting distillation to ensure the endpoint is trusted.
+    /// This performs no network I/O and only validates the format of a configured
+    /// certificate fingerprint. See [`docs/distill.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/distill.md#teacherconfigverify_endpoint) (§TeacherConfig::verify_endpoint) for the client-side checks that remain.
     pub fn verify_endpoint(&self) -> Result<(), String> {
-        // Get the actual endpoint
+        // Resolve the provider default before applying local policy.
         let endpoint = self.get_endpoint();
         self.security.verify_endpoint(&endpoint)?;
 
-        // If certificate fingerprint is specified, validate format
-        // (actual cert verification happens at connection time)
+        // A provider client must compare this format-validated value to its peer certificate.
         self.security.validate_cert_fingerprint("")?;
 
         Ok(())
