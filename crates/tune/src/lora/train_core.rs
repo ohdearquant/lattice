@@ -558,15 +558,22 @@ pub struct FullFwd {
     positions: Vec<HeadPos>,
 }
 
+// lm_head is [vocab, hidden] row-major; the naive scalar form (one dot product
+// per vocab row) pays vocab*hidden scalar FLOPs per completion token — by far
+// the largest per-token cost in the tape (vocab reaches ~250k). Route through
+// the same GEMM dispatch the forward path uses elsewhere (Accelerate/AMX on
+// macOS, SIMD-tiled fallback otherwise): logits = final_normed @ lm_head^T,
+// i.e. a matmul_bt with m=1 (#737 stage 1).
 fn lm_head_logits(lm_head: &[f32], final_normed: &[f32], hidden: usize, vocab: usize) -> Vec<f32> {
     let mut logits = vec![0.0f32; vocab];
-    for (i, l) in logits.iter_mut().enumerate() {
-        *l = lm_head[i * hidden..(i + 1) * hidden]
-            .iter()
-            .zip(final_normed.iter())
-            .map(|(w, x)| w * x)
-            .sum();
-    }
+    lattice_inference::forward::cpu::matmul_bt(
+        final_normed,
+        lm_head,
+        &mut logits,
+        1,
+        hidden,
+        vocab,
+    );
     logits
 }
 
