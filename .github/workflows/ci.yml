@@ -555,9 +555,17 @@ jobs:
         run: python3 tests/test_ci_changed_files.py -v
 
   # Deterministic fake-adapter unit tests + raw-observation schema validation
-  # for the decode-benchmark harness core (issue #813 step 1). Stdlib-only,
-  # no engine binary or model weights required — cheap ubuntu-only, so it is
-  # ungated like typos/actionlint above rather than routed through ci-gate.
+  # for the decode-benchmark harness core (issue #813 step 1) and every
+  # migrated profile's adapter module (issue #813 step 2: apples_to_apples,
+  # apples_precise, q4_apples, context_scaling). Stdlib-only (mlx_lm/ollama
+  # are never imported by these test files -- adapters are exercised only
+  # through pure parsing helpers and the harness's own deterministic fake
+  # adapters), no engine binary or model weights required — cheap
+  # ubuntu-only, so it is ungated like typos/actionlint above rather than
+  # routed through ci-gate. (The four adapter test files were not wired into
+  # any CI job before this issue's step-2 migrations landed; this closes
+  # that gap for all of them at once rather than repeating the same
+  # omission per migrated script.)
   bench-decode-harness-tests:
     name: bench-decode-harness-tests
     runs-on: ubuntu-latest
@@ -568,6 +576,14 @@ jobs:
           python-version: '3.11'
       - name: python3 tests/test_bench_decode_harness.py
         run: python3 tests/test_bench_decode_harness.py -v
+      - name: python3 tests/test_bench_decode_adapters_apples_to_apples.py
+        run: python3 tests/test_bench_decode_adapters_apples_to_apples.py -v
+      - name: python3 tests/test_bench_decode_adapters_apples_precise.py
+        run: python3 tests/test_bench_decode_adapters_apples_precise.py -v
+      - name: python3 tests/test_bench_decode_adapters_q4_apples.py
+        run: python3 tests/test_bench_decode_adapters_q4_apples.py -v
+      - name: python3 tests/test_bench_decode_adapters_context_scaling.py
+        run: python3 tests/test_bench_decode_adapters_context_scaling.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is
