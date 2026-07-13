@@ -52,16 +52,22 @@ let emb2 = cached.embed_one("Hello", EmbeddingModel::default()).await?; // cache
 
 ## SIMD Vector Operations
 
-All operations use runtime feature detection with automatic scalar fallback.
+On x86_64 and aarch64, operations use runtime feature detection with automatic scalar
+fallback. On wasm32 the SIMD choice is fixed at compile time and covers the f32 kernels
+only (see below).
 
-| Platform | Instructions                       |
-| -------- | ---------------------------------- |
-| x86_64   | AVX-512 VNNI > AVX2 + FMA > scalar |
-| aarch64  | ARM NEON (mandatory)               |
-| wasm32   | SIMD128 (compile-time) > scalar    |
-| Other    | Scalar fallback                    |
+| Platform | Instructions                                      |
+| -------- | ------------------------------------------------- |
+| x86_64   | AVX-512 VNNI > AVX2 + FMA > scalar                |
+| aarch64  | ARM NEON (mandatory)                              |
+| wasm32   | SIMD128 (compile-time, f32 kernels only) > scalar |
+| Other    | Scalar fallback                                   |
 
 ### wasm32 (SIMD128)
+
+The SIMD128 route exists for the four f32 kernels: `dot_product`, `cosine_similarity`,
+squared Euclidean distance, and `normalize`. The int8 path (`dot_product_i8`) has no
+SIMD128 branch and always dispatches to the scalar kernel on wasm32.
 
 Unlike the x86_64/aarch64 rows above, wasm32 has no runtime CPU-feature detection: a given
 `.wasm` binary either was or wasn't compiled with `-C target-feature=+simd128`, and that
