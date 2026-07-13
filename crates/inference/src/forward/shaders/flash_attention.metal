@@ -66,18 +66,7 @@ kernel void rms_norm(
         float v = x[base + i];
         local_sum += v * v;
     }
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Tree reduction.
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) {
-            shared[lid] += shared[lid + s];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms = rsqrt(shared[0] / float(row_len) + eps);
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
 
     // Scale each element.
     for (uint i = lid; i < row_len; i += tgs) {

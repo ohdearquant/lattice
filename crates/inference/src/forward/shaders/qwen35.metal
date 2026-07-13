@@ -269,17 +269,7 @@ kernel void rms_norm_qwen35(
         float v = x[base + i];
         local_sum += v * v;
     }
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) {
-            shared[lid] += shared[lid + s];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms = rsqrt(shared[0] / float(row_len) + eps);
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
 
     // Qwen3.5: shifted RMSNorm (1 + gamma). Empirically required — plain
     // gamma produces garbage logits on this model.
@@ -346,17 +336,7 @@ kernel void per_head_rms_norm(
         float v = x[base + i];
         local_sum += v * v;
     }
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) {
-            shared[lid] += shared[lid + s];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms = rsqrt(shared[0] / float(head_dim) + eps);
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, head_dim, eps);
 
     // Qwen3.5: shifted RMSNorm (1 + gamma) — per-head variant for q_norm/k_norm.
     for (uint i = lid; i < head_dim; i += tgs) {
@@ -789,14 +769,7 @@ kernel void fused_residual_add_norm(
         local_sum += val * val;
     }
 
-    // Reduce sum of squares
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] += shared[lid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rms = rsqrt(shared[0] / float(row_len) + eps);
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
 
     // Phase 2: normed_out = residual_out * rms * (1 + gamma) (Qwen3.5 shifted RMSNorm).
     for (uint i = lid; i < row_len; i += tgs) {
@@ -2133,14 +2106,7 @@ kernel void copy_and_rms_norm(
         local_sum += v * v;
     }
 
-    // Reduce sum of squares
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] += shared[lid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rms = rsqrt(shared[0] / float(row_len) + eps);
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
 
     // Phase 2: normalize src in-place with Qwen3.5 shifted RMSNorm (1 + gamma).
     for (uint i = lid; i < row_len; i += tgs) {
@@ -2173,13 +2139,7 @@ kernel void copy_and_rms_norm_batch(
         local_sum += v * v;
     }
 
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] += shared[lid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rms = rsqrt(shared[0] / float(row_len) + eps);
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
 
     for (uint i = lid; i < row_len; i += tgs) {
         src[base + i] = src[base + i] * rms * (1.0f + gamma[i]);
@@ -2213,13 +2173,7 @@ kernel void fused_residual_add_norm_batch(
         local_sum += val * val;
     }
 
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] += shared[lid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    float rms = rsqrt(shared[0] / float(row_len) + eps);
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, row_len, eps);
 
     for (uint i = lid; i < row_len; i += tgs) {
         normed_out[base_off + i] = residual_out[base_off + i] * rms * (1.0f + gamma[i]);
@@ -2420,15 +2374,7 @@ kernel void per_head_rms_norm_batch(
         float v = x[base + i];
         local_sum += v * v;
     }
-    shared[lid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint s = tgs / 2; s > 0; s >>= 1) {
-        if (lid < s) shared[lid] += shared[lid + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float rms = rsqrt(shared[0] / float(head_dim) + eps);
+    float rms = rms_inv_from_local_sum(shared, local_sum, lid, tgs, head_dim, eps);
 
     // Qwen3.5 shifted RMSNorm: same (1 + gamma) convention as per_head_rms_norm.
     for (uint i = lid; i < head_dim; i += tgs) {

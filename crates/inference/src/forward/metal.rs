@@ -904,6 +904,189 @@ mod inner {
             }
         }
 
+        /// #854: guards against a reintroduced manual copy of the RMS-norm
+        /// reduction tree. `rms_norm` must be the sole call site of the shared
+        /// `rms_inv_from_local_sum` helper in the assembled `flash_attention.metal`
+        /// translation unit (one definition + one caller).
+        #[test]
+        fn flash_attention_rms_norm_uses_shared_reduction_helper() {
+            let msl = msl_source_for(128, 2);
+            let helper_occurrences = msl.matches("rms_inv_from_local_sum(").count();
+            assert_eq!(
+                helper_occurrences, 2,
+                "expected 1 definition (rms_reduce.metal fragment) + 1 call site \
+                 (rms_norm) in the assembled flash_attention.metal, got {helper_occurrences}"
+            );
+            let inline_leftover = msl.matches("shared[lid] = local_sum;").count();
+            assert_eq!(
+                inline_leftover, 1,
+                "expected exactly one occurrence, inside rms_inv_from_local_sum's own \
+                 body; any additional occurrence is a reintroduced manual copy of the \
+                 reduction tree"
+            );
+        }
+
+        /// #854 numeric parity fixture (pre-refactor vs. post-refactor): `rms_norm`'s
+        /// reduction tree before this PR (frozen verbatim below as
+        /// `RMS_NORM_PRE_854_ORACLE`, byte-identical to the body this PR replaced —
+        /// see commit history) vs. the live post-refactor kernel that calls
+        /// `rms_inv_from_local_sum`. Both run on the same GPU with the same compile
+        /// options and identical finite input; the only source difference is
+        /// inline-body vs. helper-call, so any numeric drift here would mean the
+        /// extraction changed the barrier count, tree order, or rsqrt expression —
+        /// exactly the class of regression this PR's bit-exactness constraint
+        /// forbids (RMS-norm is a nonlinearity; f32 reduction order is part of the
+        /// contract).
+        #[test]
+        fn rms_norm_matches_pre_854_oracle_on_finite_input() {
+            const RMS_NORM_PRE_854_ORACLE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void rms_norm_pre_854_oracle(
+    device float* x           [[buffer(0)]],
+    device const float* gamma [[buffer(1)]],
+    constant uint& row_len    [[buffer(2)]],
+    constant uint& num_rows   [[buffer(3)]],
+    constant float& eps       [[buffer(4)]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tgs  [[threads_per_threadgroup]])
+{
+    if (gid >= num_rows) return;
+    constexpr uint RMS_WG = 256;
+    uint base = gid * row_len;
+
+    threadgroup float shared[RMS_WG];
+    float local_sum = 0.0f;
+    for (uint i = lid; i < row_len; i += tgs) {
+        float v = x[base + i];
+        local_sum += v * v;
+    }
+    shared[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = tgs / 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            shared[lid] += shared[lid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms = rsqrt(shared[0] / float(row_len) + eps);
+
+    for (uint i = lid; i < row_len; i += tgs) {
+        x[base + i] = x[base + i] * rms * gamma[i];
+    }
+}
+"#;
+
+            let Some(device) = metal_test_device("rms_norm_matches_pre_854_oracle_on_finite_input")
+            else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+
+            fn f32_buf(device: &Device, data: &[f32]) -> Buffer {
+                device.new_buffer_with_data(
+                    data.as_ptr() as *const _,
+                    std::mem::size_of_val(data) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            fn read_f32(buf: &Buffer, len: usize) -> Vec<f32> {
+                // SAFETY: buffer is StorageModeShared, written by a completed
+                // command buffer, and sized for `len` f32 elements.
+                unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, len).to_vec() }
+            }
+            fn lcg_vec(seed: u64, n: usize) -> Vec<f32> {
+                let mut state = seed;
+                (0..n)
+                    .map(|_| {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        (((state >> 32) as u32) as f32 / u32::MAX as f32 - 0.5) * 4.0
+                    })
+                    .collect()
+            }
+
+            fn run(
+                device: &Device,
+                lib: &metal::Library,
+                kernel_name: &str,
+                x: &[f32],
+                gamma: &[f32],
+                row_len: u32,
+                num_rows: u32,
+                eps: f32,
+            ) -> Vec<f32> {
+                let func = lib
+                    .get_function(kernel_name, None)
+                    .unwrap_or_else(|e| panic!("kernel {kernel_name} missing: {e}"));
+                let pipe = device
+                    .new_compute_pipeline_state_with_function(&func)
+                    .unwrap_or_else(|e| panic!("pipeline for {kernel_name} failed: {e}"));
+                let x_buf = f32_buf(device, x);
+                let gamma_buf = f32_buf(device, gamma);
+                let queue = device.new_command_queue();
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(&x_buf), 0);
+                enc.set_buffer(1, Some(&gamma_buf), 0);
+                enc.set_bytes(2, 4, &row_len as *const u32 as *const _);
+                enc.set_bytes(3, 4, &num_rows as *const u32 as *const _);
+                enc.set_bytes(4, 4, &eps as *const f32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_rows as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                read_f32(&x_buf, x.len())
+            }
+
+            // Finite fixture: 3 rows x 130 elements (non-multiple-of-256, exercises
+            // the strided accumulation loop's tail), includes small/negative/near-zero
+            // values.
+            let row_len = 130u32;
+            let num_rows = 3u32;
+            let n = (row_len * num_rows) as usize;
+            let mut x = lcg_vec(42, n);
+            x[0] = 1e-6; // near-zero lane, exercises the `+ eps` floor
+            x[row_len as usize] = -3.5;
+            let gamma = lcg_vec(7, row_len as usize);
+            let eps = 1e-6f32;
+
+            let opts = CompileOptions::new();
+            let oracle_lib = device
+                .new_library_with_source(RMS_NORM_PRE_854_ORACLE, &opts)
+                .expect("frozen pre-#854 oracle must compile");
+            let live_lib = device
+                .new_library_with_source(&msl_source_for(128, 2), &opts)
+                .expect("live post-#854 flash_attention.metal must compile");
+
+            let oracle_out = run(
+                &device,
+                &oracle_lib,
+                "rms_norm_pre_854_oracle",
+                &x,
+                &gamma,
+                row_len,
+                num_rows,
+                eps,
+            );
+            let live_out = run(
+                &device, &live_lib, "rms_norm", &x, &gamma, row_len, num_rows, eps,
+            );
+
+            assert_eq!(
+                oracle_out, live_out,
+                "rms_norm output diverged from the frozen pre-#854 oracle on a finite \
+                 fixture — the reduction-tree extraction must be bit-exact"
+            );
+        }
+
         /// ADR-080 C1 (#789) regression fixture: corrupts a single entry of
         /// `q_proj_weight` with `corrupt_value` so one attention head's Q vector
         /// carries that value at every query position (K/V/embeddings/residual stay
