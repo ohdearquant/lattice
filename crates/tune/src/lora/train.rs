@@ -420,7 +420,7 @@ pub fn train_micro_lora(
         alpha,
         target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
     };
-    Ok(LoraAdapter::new(lora_config, adapter_layers))
+    LoraAdapter::new(lora_config, adapter_layers)
 }
 
 #[cfg(test)]

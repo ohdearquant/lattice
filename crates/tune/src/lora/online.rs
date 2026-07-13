@@ -43,11 +43,11 @@ pub fn adapt_step(
     target_delta: &[f32],
     learning_rate: f32,
 ) -> Result<AdaptStepResult, TuneError> {
-    // Extract scale before any mutable borrow of adapter.layers.
-    let scale = adapter.config.scale();
+    // Extract scale before any mutable borrow of adapter layers.
+    let scale = adapter.config().scale();
 
     let lora = adapter
-        .layers
+        .layers_mut()
         .get_mut(&(layer_idx, module.to_string()))
         .ok_or_else(|| TuneError::Training(format!("no LoRA layer for ({layer_idx}, {module})")))?;
 
@@ -165,15 +165,15 @@ mod tests {
                 rank: 2,
             },
         );
-        LoraAdapter::new(config, layers)
+        LoraAdapter::new(config, layers).expect("valid adapter config")
     }
 
     #[test]
     fn test_adapt_step_basic() {
         let mut adapter = make_small_adapter();
         let key = (0usize, "q_proj".to_string());
-        let a_init = adapter.layers[&key].a.clone();
-        let b_init = adapter.layers[&key].b.clone();
+        let a_init = adapter.layers()[&key].a.clone();
+        let b_init = adapter.layers()[&key].b.clone();
 
         let input = [1.0f32, 2.0, 3.0];
         let target_delta = [5.0f32, 5.0];
@@ -183,8 +183,8 @@ mod tests {
 
         assert!(r1.loss > 0.0, "initial loss must be positive");
         assert!(r1.grad_norm > 0.0, "initial grad_norm must be positive");
-        assert_ne!(adapter.layers[&key].a, a_init, "A must change after step");
-        assert_ne!(adapter.layers[&key].b, b_init, "B must change after step");
+        assert_ne!(adapter.layers()[&key].a, a_init, "A must change after step");
+        assert_ne!(adapter.layers()[&key].b, b_init, "B must change after step");
 
         let r2 = adapt_step(&mut adapter, 0, "q_proj", &input, &target_delta, 0.01)
             .expect("second adapt_step should succeed");
@@ -266,7 +266,7 @@ mod tests {
         );
 
         let key = (0usize, "q_proj".to_string());
-        assert_eq!(adapter1.layers[&key].a, adapter2.layers[&key].a);
-        assert_eq!(adapter1.layers[&key].b, adapter2.layers[&key].b);
+        assert_eq!(adapter1.layers()[&key].a, adapter2.layers()[&key].a);
+        assert_eq!(adapter1.layers()[&key].b, adapter2.layers()[&key].b);
     }
 }

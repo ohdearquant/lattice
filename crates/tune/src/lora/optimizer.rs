@@ -179,10 +179,10 @@ pub fn compute_lora_gradients(
     input: &[f32],
     target_delta: &[f32],
 ) -> Result<LoraGradients, TuneError> {
-    let scale = adapter.config.scale();
+    let scale = adapter.config().scale();
 
     let lora = adapter
-        .layers
+        .layers()
         .get(&(layer_idx, module.to_string()))
         .ok_or_else(|| TuneError::Training(format!("no LoRA layer for ({layer_idx}, {module})")))?;
 
@@ -289,7 +289,7 @@ mod tests {
                 rank: 2,
             },
         );
-        LoraAdapter::new(config, layers)
+        LoraAdapter::new(config, layers).expect("valid adapter config")
     }
 
     // ─── gradient computation tests ────────────────────────────────────────

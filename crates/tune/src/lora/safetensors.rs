@@ -366,29 +366,34 @@ pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, T
 
     let rank = rank.unwrap_or(0);
 
-    // Recover the LoRA alpha from the safetensors header metadata that
-    // save_peft_safetensors writes. Without this, every adapter would load with
-    // alpha = rank (scale = 1.0), applying a model trained at alpha != rank at the
-    // wrong magnitude. Fall back to `rank` (scale = 1.0) when the metadata is
-    // absent or unparseable, preserving behavior for adapters that lack it.
-    let alpha = SafeTensors::read_metadata(bytes)
+    let alpha_metadata = SafeTensors::read_metadata(bytes)
         .ok()
         .and_then(|(_, meta)| {
             meta.metadata()
                 .as_ref()
                 .and_then(|m| m.get("alpha").cloned())
-        })
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank as f32);
+        });
+    let alpha = match alpha_metadata {
+        Some(value) => {
+            let alpha = value.parse::<f32>().map_err(|e| {
+                TuneError::Serialization(format!("invalid LoRA alpha metadata '{value}': {e}"))
+            })?;
+            if !alpha.is_finite() {
+                return Err(TuneError::Serialization(format!(
+                    "LoRA alpha metadata must be finite, got '{value}'"
+                )));
+            }
+            alpha
+        }
+        None => rank as f32,
+    };
 
-    Ok(LoraAdapter {
-        config: LoraConfig {
-            rank,
-            alpha,
-            target_modules: target_modules.into_iter().collect(),
-        },
-        layers,
-    })
+    let config = LoraConfig {
+        rank,
+        alpha,
+        target_modules: target_modules.into_iter().collect(),
+    };
+    LoraAdapter::new(config, layers)
 }
 
 /// Read the `adapter_id` metadata key from a PEFT safetensors byte slice.
@@ -599,10 +604,12 @@ pub fn save_peft_safetensors(
     path: &Path,
     governance: Option<&AdapterGovernance>,
 ) -> Result<(), TuneError> {
+    adapter.config().validate()?;
+
     // Collect owned byte buffers first; TensorView borrows from these.
     let mut byte_data: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
 
-    for ((layer_idx, module), layer) in &adapter.layers {
+    for ((layer_idx, module), layer) in adapter.layers() {
         // A LoRA layer with an empty factor buffer means "this module was not trained"
         // (e.g. GDN-attention slots leave q_proj/v_proj empty). Skip it rather than
         // emit an InvalidTensorView for a zero-byte tensor with non-zero shape.
@@ -637,11 +644,11 @@ pub fn save_peft_safetensors(
     }
 
     let mut metadata_map = HashMap::new();
-    metadata_map.insert("rank".to_string(), adapter.config.rank.to_string());
-    metadata_map.insert("alpha".to_string(), adapter.config.alpha.to_string());
+    metadata_map.insert("rank".to_string(), adapter.config().rank.to_string());
+    metadata_map.insert("alpha".to_string(), adapter.config().alpha.to_string());
     metadata_map.insert(
         "target_modules".to_string(),
-        adapter.config.target_modules.join(","),
+        adapter.config().target_modules.join(","),
     );
     if let Some(governance) = governance {
         metadata_map.insert("gov_name".to_string(), governance.name.clone());
@@ -881,28 +888,28 @@ mod tests {
         let adapter = load_peft_safetensors(&path).unwrap();
 
         // Check config
-        assert_eq!(adapter.config.rank, rank);
-        assert_eq!(adapter.config.target_modules.len(), 2);
+        assert_eq!(adapter.config().rank, rank);
+        assert_eq!(adapter.config().target_modules.len(), 2);
         assert!(
             adapter
-                .config
+                .config()
                 .target_modules
                 .contains(&"q_proj".to_string())
         );
         assert!(
             adapter
-                .config
+                .config()
                 .target_modules
                 .contains(&"gate_proj".to_string())
         );
 
         // Check we got both layers
-        assert_eq!(adapter.layers.len(), 2);
-        assert!(adapter.layers.contains_key(&(0, "q_proj".to_string())));
-        assert!(adapter.layers.contains_key(&(2, "gate_proj".to_string())));
+        assert_eq!(adapter.layers().len(), 2);
+        assert!(adapter.layers().contains_key(&(0, "q_proj".to_string())));
+        assert!(adapter.layers().contains_key(&(2, "gate_proj".to_string())));
 
         // Check dimensions
-        let q_lora = &adapter.layers[&(0, "q_proj".to_string())];
+        let q_lora = &adapter.layers()[&(0, "q_proj".to_string())];
         assert_eq!(q_lora.rank, rank);
         assert_eq!(q_lora.d_in, d_in);
         assert_eq!(q_lora.d_out, d_out);
@@ -915,7 +922,7 @@ mod tests {
         assert!((q_lora.a[2] - 0.02).abs() < 1e-6);
 
         // Check gate_proj layer
-        let g_lora = &adapter.layers[&(2, "gate_proj".to_string())];
+        let g_lora = &adapter.layers()[&(2, "gate_proj".to_string())];
         assert_eq!(g_lora.rank, rank);
         assert!((g_lora.a[1] - (-0.01)).abs() < 1e-6);
     }
@@ -958,9 +965,9 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         let adapter = load_peft_safetensors(&path).unwrap();
-        assert_eq!(adapter.config.rank, 2);
+        assert_eq!(adapter.config().rank, 2);
 
-        let lora = &adapter.layers[&(0, "q_proj".to_string())];
+        let lora = &adapter.layers()[&(0, "q_proj".to_string())];
         assert_eq!(lora.rank, 2);
         assert_eq!(lora.d_in, 4);
         assert_eq!(lora.d_out, 3);
@@ -1006,17 +1013,17 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         let adapter = load_peft_safetensors(&path).unwrap();
-        assert_eq!(adapter.config.rank, 1);
+        assert_eq!(adapter.config().rank, 1);
         // Default alpha = rank = 1, so scale = 1.0
 
-        let lora = &adapter.layers[&(0, "v_proj".to_string())];
+        let lora = &adapter.layers()[&(0, "v_proj".to_string())];
         // x = [3, 5]
         // A @ x = [0*3 + 1*5] = [5]
         // B @ [5] = [1*5, 0*5] = [5, 0]
         // scale = 1.0 => output += [5, 0]
         let x = [3.0f32, 5.0];
         let mut output = [10.0, 20.0];
-        super::super::apply_lora(lora, adapter.config.scale(), &x, &mut output);
+        super::super::apply_lora(lora, adapter.config().scale(), &x, &mut output);
 
         assert!((output[0] - 15.0).abs() < 1e-6);
         assert!((output[1] - 20.0).abs() < 1e-6);
@@ -1028,6 +1035,38 @@ mod tests {
         bytes.extend_from_slice(header.as_bytes());
         bytes.extend_from_slice(data);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    fn peft_bytes_with_alpha(alpha: &str) -> Vec<u8> {
+        use safetensors::Dtype;
+        use safetensors::tensor::{TensorView, serialize};
+
+        let a_bytes = 1.0f32.to_le_bytes();
+        let b_bytes = 1.0f32.to_le_bytes();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.lora_A.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![1, 1], &a_bytes).unwrap(),
+        );
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.lora_B.weight".to_string(),
+            TensorView::new(Dtype::F32, vec![1, 1], &b_bytes).unwrap(),
+        );
+        let metadata = HashMap::from([("alpha".to_string(), alpha.to_string())]);
+        serialize(&tensors, &Some(metadata)).unwrap()
+    }
+
+    #[test]
+    fn test_rejects_non_finite_alpha_metadata() {
+        for alpha in ["nan", "inf", "-inf"] {
+            let bytes = peft_bytes_with_alpha(alpha);
+            let err = load_peft_safetensors_bytes(&bytes).unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("LoRA alpha metadata must be finite"),
+                "expected descriptive rejection for {alpha}, got: {message}"
+            );
+        }
     }
 
     #[test]
@@ -1141,20 +1180,20 @@ mod tests {
             },
         );
 
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
 
         let temp = NamedTempFile::new().unwrap();
         save_peft_safetensors(&adapter, temp.path(), None).unwrap();
 
         let loaded = load_peft_safetensors(temp.path()).unwrap();
 
-        assert_eq!(loaded.layers.len(), adapter.layers.len());
-        assert_eq!(loaded.config.rank, adapter.config.rank);
-        assert_eq!(loaded.config.alpha, adapter.config.alpha);
+        assert_eq!(loaded.layers().len(), adapter.layers().len());
+        assert_eq!(loaded.config().rank, adapter.config().rank);
+        assert_eq!(loaded.config().alpha, adapter.config().alpha);
 
-        for (key, orig) in &adapter.layers {
+        for (key, orig) in adapter.layers() {
             let got = loaded
-                .layers
+                .layers()
                 .get(key)
                 .expect("layer key missing after round-trip");
             assert_eq!(got.rank, orig.rank);
@@ -1198,7 +1237,7 @@ mod tests {
                 rank,
             },
         );
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
 
         let governance = AdapterGovernance {
             name: "test-adapter".to_string(),
@@ -1245,7 +1284,7 @@ mod tests {
                 rank,
             },
         );
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
 
         let temp = NamedTempFile::new().unwrap();
         save_peft_safetensors(&adapter, temp.path(), None).unwrap();
@@ -1313,14 +1352,14 @@ mod tests {
             },
         );
 
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
         let temp = NamedTempFile::new().unwrap();
         save_peft_safetensors(&adapter, temp.path(), None).unwrap();
         let loaded = load_peft_safetensors(temp.path()).unwrap();
 
-        assert_eq!(loaded.config.rank, 4);
-        assert_eq!(loaded.config.alpha, 16.0);
-        assert!((loaded.config.alpha - 16.0).abs() < f32::EPSILON);
+        assert_eq!(loaded.config().rank, 4);
+        assert_eq!(loaded.config().alpha, 16.0);
+        assert!((loaded.config().alpha - 16.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -1352,8 +1391,8 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         let loaded = load_peft_safetensors(&path).unwrap();
-        assert_eq!(loaded.config.rank, 2);
-        assert_eq!(loaded.config.alpha, 2.0);
+        assert_eq!(loaded.config().rank, 2);
+        assert_eq!(loaded.config().alpha, 2.0);
     }
 
     #[test]
@@ -1462,7 +1501,7 @@ mod tests {
             },
         );
 
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
 
         let temp = NamedTempFile::new().unwrap();
         // This was the regression: pre-fix this call returned Err(InvalidTensorView).
@@ -1474,19 +1513,19 @@ mod tests {
         // The real layer is present.
         let real_key = (19usize, "q_proj".to_string());
         assert!(
-            loaded.layers.contains_key(&real_key),
+            loaded.layers().contains_key(&real_key),
             "real GQA layer (19, q_proj) must be present after round-trip"
         );
 
         // The empty layer was dropped — it must NOT appear in the saved file.
         let empty_key = (20usize, "v_proj".to_string());
         assert!(
-            !loaded.layers.contains_key(&empty_key),
+            !loaded.layers().contains_key(&empty_key),
             "empty GDN-slot layer (20, v_proj) must be absent from saved adapter"
         );
 
         // The A buffer of the real layer must be bit-exact.
-        let got = &loaded.layers[&real_key];
+        let got = &loaded.layers()[&real_key];
         let expected_a = vec![0.1f32; rank * 1024];
         assert_eq!(got.a.len(), expected_a.len());
         for (g, w) in got.a.iter().zip(&expected_a) {

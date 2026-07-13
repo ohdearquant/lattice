@@ -89,9 +89,9 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
     // Value: list of (LoraLayer ref, effective_weight = w_e * s_e).
     let mut grouped: HashMap<(usize, String), Vec<(&LoraLayer, f32)>> = HashMap::new();
     for (adapter, weight) in adapters {
-        let s_e = adapter.config.scale();
+        let s_e = adapter.config().scale();
         let eff = weight * s_e;
-        for ((layer_idx, module), layer) in &adapter.layers {
+        for ((layer_idx, module), layer) in adapter.layers() {
             grouped
                 .entry((*layer_idx, module.clone()))
                 .or_default()
@@ -165,7 +165,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         target_modules,
     };
 
-    Ok(LoraAdapter::new(config, blended_layers))
+    LoraAdapter::new(config, blended_layers)
 }
 
 /// Blend multiple `(LoraLayer, effective_weight)` entries for a single
@@ -309,12 +309,13 @@ mod tests {
             },
             layers,
         )
+        .expect("valid adapter config")
     }
 
     // Apply a LoraAdapter to x and return the delta (excludes base output).
     fn lora_delta(adapter: &LoraAdapter, x: &[f32]) -> Vec<f32> {
-        let (_, layer) = adapter.layers.iter().next().unwrap();
-        let scale = adapter.config.scale();
+        let (_, layer) = adapter.layers().iter().next().unwrap();
+        let scale = adapter.config().scale();
         let rank = layer.rank;
         let d_in = layer.d_in;
         let d_out = layer.d_out;
@@ -375,8 +376,8 @@ mod tests {
 
         let delta_orig = lora_delta(&adapter, &x);
         // Blended adapter has scale=1.0 (alpha=rank_total).
-        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
-        let delta_blend = layer_delta(blended_layer, blended.config.scale(), &x);
+        let blended_layer = blended.layers().get(&(0, "q_proj".to_string())).unwrap();
+        let delta_blend = layer_delta(blended_layer, blended.config().scale(), &x);
 
         let max_diff = delta_orig
             .iter()
@@ -414,8 +415,8 @@ mod tests {
         // Expected: w1*Δ1 + w2*Δ2
         let expected: Vec<f32> = d1.iter().zip(&d2).map(|(a, b)| w1 * a + w2 * b).collect();
 
-        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
-        let actual = layer_delta(blended_layer, blended.config.scale(), &x);
+        let blended_layer = blended.layers().get(&(0, "q_proj".to_string())).unwrap();
+        let actual = layer_delta(blended_layer, blended.config().scale(), &x);
 
         let max_diff = expected
             .iter()
@@ -439,7 +440,7 @@ mod tests {
 
         let blended = blend_lora_adapters(&[(&adapter1, 0.5), (&adapter2, 0.5)]).unwrap();
 
-        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
+        let blended_layer = blended.layers().get(&(0, "q_proj".to_string())).unwrap();
         assert_eq!(
             blended_layer.rank,
             1 + 2,
@@ -496,7 +497,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(
             result.is_err(),
@@ -533,7 +535,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(
             result.is_err(),
@@ -570,7 +573,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(
             result.is_err(),
@@ -612,10 +616,11 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
 
         let blended = blend_lora_adapters(&[(&adapter, w)]).unwrap();
-        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
+        let blended_layer = blended.layers().get(&(0, "q_proj".to_string())).unwrap();
 
         let x: Vec<f32> = (0..d_in).map(|i| (i + 1) as f32).collect();
         let scale = alpha / rank as f32; // = 2.0
@@ -630,7 +635,7 @@ mod tests {
             .collect();
 
         // Blended adapter has alpha=rank_total so scale()=1.0; use layer_delta directly.
-        let actual = layer_delta(blended_layer, blended.config.scale(), &x);
+        let actual = layer_delta(blended_layer, blended.config().scale(), &x);
 
         let max_diff = expected
             .iter()
@@ -660,7 +665,7 @@ mod tests {
         let adapter2 = make_adapter(r2, d_in, d_out, 2.0);
 
         let blended = blend_lora_adapters(&[(&adapter1, w1), (&adapter2, w2)]).unwrap();
-        let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
+        let blended_layer = blended.layers().get(&(0, "q_proj".to_string())).unwrap();
 
         assert_eq!(blended_layer.rank, r1 + r2);
 
@@ -673,7 +678,7 @@ mod tests {
             .map(|(a, b)| w1 * a + w2 * b)
             .collect();
 
-        let actual = layer_delta(blended_layer, blended.config.scale(), &x);
+        let actual = layer_delta(blended_layer, blended.config().scale(), &x);
 
         let max_diff = expected
             .iter()
@@ -716,7 +721,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
         // per-entry checked_mul is defense-in-depth for the same class.
@@ -795,7 +801,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(result.is_err(), "aggregate budget exceeded must return Err");
         let msg = result.unwrap_err().to_string();

@@ -978,7 +978,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 alpha,
                 target_modules,
             };
-            let adapter = LoraAdapter::new(config, adapter_layers);
+            let adapter = LoraAdapter::new(config, adapter_layers)
+                .map_err(|e| format!("construct adapter: {e}"))?;
             adapter
                 .save_safetensors(std::path::Path::new(path), None)
                 .map_err(|e| format!("save adapter: {e}"))?;

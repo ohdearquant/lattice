@@ -112,17 +112,17 @@ fn main() {
 
         match lattice_tune::lora::LoraAdapter::from_safetensors(lora) {
             Ok(adapter) => {
-                println!(
-                    "  Adapter: {} pairs, rank={}, scale={:.2}, {} parameters",
-                    adapter.num_adapted_layers(),
-                    adapter.config.rank,
-                    adapter.config.scale(),
-                    adapter.num_parameters()
-                );
                 if let Err(e) = adapter.validate_against(model.config()) {
                     eprintln!("LoRA adapter incompatible with loaded model: {e}");
                     std::process::exit(1);
                 }
+                println!(
+                    "  Adapter: {} pairs, rank={}, scale={:.2}, {} parameters",
+                    adapter.num_adapted_layers(),
+                    adapter.config().rank,
+                    adapter.config().scale(),
+                    adapter.num_parameters()
+                );
                 model.set_lora(Box::new(adapter));
                 println!(
                     "  LoRA active (loaded in {}ms)",

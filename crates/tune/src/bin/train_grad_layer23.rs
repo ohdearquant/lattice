@@ -334,6 +334,7 @@ fn shifted(gamma: &[f32]) -> Vec<f32> {
 /// Typed CLI config for `train_grad_layer23`. Field defaults are the
 /// documented contract in `usage()` and issue #845's flag table — the
 /// snapshot tests below pin them.
+#[derive(Debug)]
 struct Config {
     model_dir: PathBuf,
     data_dir: PathBuf,
@@ -347,8 +348,24 @@ struct Config {
     save_path: Option<String>,
 }
 
-fn parse_config(argv: &ArgView) -> Config {
-    Config {
+fn parse_alpha(argv: &ArgView) -> Result<f32, String> {
+    if !argv.flag("--alpha") {
+        return Ok(16.0);
+    }
+    let value = argv
+        .arg("--alpha")
+        .ok_or_else(|| "invalid --alpha: missing value".to_string())?;
+    let alpha = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid --alpha '{value}': expected a finite number"))?;
+    if !alpha.is_finite() {
+        return Err(format!("invalid --alpha '{value}': value must be finite"));
+    }
+    Ok(alpha)
+}
+
+fn parse_config(argv: &ArgView) -> Result<Config, String> {
+    Ok(Config {
         model_dir: argv
             .arg("--model-dir")
             .map(PathBuf::from)
@@ -366,10 +383,7 @@ fn parse_config(argv: &ArgView) -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1e-3),
         rank: argv.arg("--rank").and_then(|s| s.parse().ok()).unwrap_or(8),
-        alpha: argv
-            .arg("--alpha")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(16.0),
+        alpha: parse_alpha(argv)?,
         seq_len_cap: argv
             .arg("--seq-len")
             .and_then(|s| s.parse().ok())
@@ -383,7 +397,7 @@ fn parse_config(argv: &ArgView) -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(5),
         save_path: argv.arg("--save"),
-    }
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -405,7 +419,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_train,
         log_every,
         save_path,
-    } = parse_config(&argv);
+    } = parse_config(&argv)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
 
     println!("=== exact-gradient LoRA trainer (layer {LAYER}, gated GQA) ===");
     println!("model-dir:  {}", model_dir.display());
@@ -696,7 +711,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 alpha,
                 target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
             };
-            let adapter = LoraAdapter::new(config, layers);
+            let adapter =
+                LoraAdapter::new(config, layers).map_err(|e| format!("construct adapter: {e}"))?;
             adapter
                 .save_safetensors(std::path::Path::new(save_path), None)
                 .map_err(|e| format!("save adapter: {e}"))?;
@@ -725,7 +741,7 @@ mod cli_contract_tests {
     #[test]
     fn defaults_match_documented_table() {
         let a = args(&[]);
-        let cfg = parse_config(&ArgView::new(&a));
+        let cfg = parse_config(&ArgView::new(&a)).expect("default config must parse");
         assert_eq!(cfg.data_dir, PathBuf::from("data/lora-train"));
         assert_eq!(cfg.steps, 25);
         assert_eq!(cfg.lr, 1e-3);
@@ -762,7 +778,7 @@ mod cli_contract_tests {
             "--save",
             "/tmp/out.safetensors",
         ]);
-        let cfg = parse_config(&ArgView::new(&a));
+        let cfg = parse_config(&ArgView::new(&a)).expect("explicit config must parse");
         assert_eq!(cfg.model_dir, PathBuf::from("/tmp/m"));
         assert_eq!(cfg.data_dir, PathBuf::from("/tmp/d"));
         assert_eq!(cfg.steps, 7);
@@ -773,6 +789,24 @@ mod cli_contract_tests {
         assert_eq!(cfg.max_train, 1);
         assert_eq!(cfg.log_every, 2);
         assert_eq!(cfg.save_path, Some("/tmp/out.safetensors".to_string()));
+    }
+
+    #[test]
+    fn rejects_invalid_alpha_values() {
+        for alpha in ["nan", "inf", "-inf", "invalid"] {
+            let a = args(&["--alpha", alpha]);
+            let err = parse_config(&ArgView::new(&a))
+                .expect_err("invalid --alpha must fail parsing before training");
+            assert!(err.contains("--alpha"));
+        }
+    }
+
+    #[test]
+    fn rejects_missing_alpha_value() {
+        let a = args(&["--alpha"]);
+        let err = parse_config(&ArgView::new(&a))
+            .expect_err("--alpha without a value must fail parsing before training");
+        assert!(err.contains("--alpha"));
     }
 
     #[test]

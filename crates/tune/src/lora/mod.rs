@@ -81,11 +81,42 @@ pub struct LoraConfig {
 impl LoraConfig {
     /// Compute the LoRA scaling factor: `alpha / rank`.
     pub fn scale(&self) -> f32 {
-        if self.rank == 0 {
+        let scale = if self.rank == 0 {
             0.0
         } else {
             self.alpha / self.rank as f32
+        };
+        if self.alpha.is_finite() && scale.is_finite() {
+            scale
+        } else {
+            0.0
         }
+    }
+
+    /// Validate that the LoRA alpha and effective scale are finite.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::TuneError::Validation`] when `alpha` or the
+    /// effective `alpha / rank` scale is not finite.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if !self.alpha.is_finite() {
+            return Err(crate::error::TuneError::Validation(format!(
+                "LoRA alpha must be finite, got {}",
+                self.alpha
+            )));
+        }
+        let scale = if self.rank == 0 {
+            0.0
+        } else {
+            self.alpha / self.rank as f32
+        };
+        if !scale.is_finite() {
+            return Err(crate::error::TuneError::Validation(format!(
+                "LoRA effective scale must be finite, got {scale}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -112,13 +143,43 @@ pub struct LoraLayer {
 ///
 /// Loaded from a PEFT-format safetensors file and applied at inference time
 /// to modify the output of specific linear projections in the transformer.
+///
+/// ```compile_fail
+/// use lattice_tune::lora::{LoraAdapter, LoraConfig};
+/// use std::collections::HashMap;
+///
+/// let adapter = LoraAdapter {
+///     config: LoraConfig {
+///         rank: 8,
+///         alpha: f32::NAN,
+///         target_modules: Vec::new(),
+///     },
+///     layers: HashMap::new(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use lattice_tune::lora::{LoraAdapter, LoraConfig};
+/// use std::collections::HashMap;
+///
+/// let mut adapter = LoraAdapter::new(
+///     LoraConfig {
+///         rank: 8,
+///         alpha: 16.0,
+///         target_modules: Vec::new(),
+///     },
+///     HashMap::new(),
+/// )
+/// .unwrap();
+/// adapter.config.alpha = f32::NAN;
+/// ```
 #[derive(Debug, Clone)]
 pub struct LoraAdapter {
     /// Adapter configuration.
-    pub config: LoraConfig,
+    config: LoraConfig,
     /// Per-layer, per-module LoRA weights.
     /// Key: `(layer_idx, module_name)` e.g. `(5, "q_proj")`.
-    pub layers: HashMap<(usize, String), LoraLayer>,
+    layers: HashMap<(usize, String), LoraLayer>,
 }
 
 impl LoraAdapter {
@@ -157,8 +218,30 @@ impl LoraAdapter {
 
     /// Construct an adapter from pre-built components (for testing or
     /// when loading from a custom format).
-    pub fn new(config: LoraConfig, layers: HashMap<(usize, String), LoraLayer>) -> Self {
-        Self { config, layers }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the adapter configuration is invalid.
+    pub fn new(
+        config: LoraConfig,
+        layers: HashMap<(usize, String), LoraLayer>,
+    ) -> crate::error::Result<Self> {
+        config.validate()?;
+        Ok(Self { config, layers })
+    }
+
+    /// Return the validated adapter configuration.
+    pub fn config(&self) -> &LoraConfig {
+        &self.config
+    }
+
+    /// Return the adapter weights keyed by transformer layer and module name.
+    pub fn layers(&self) -> &HashMap<(usize, String), LoraLayer> {
+        &self.layers
+    }
+
+    fn layers_mut(&mut self) -> &mut HashMap<(usize, String), LoraLayer> {
+        &mut self.layers
     }
 
     /// Apply the LoRA adapter to a single projection output.
@@ -174,32 +257,32 @@ impl LoraAdapter {
     /// * `base_output` - Base projection output to modify in-place (length = d_out)
     pub fn apply(&self, layer_idx: usize, module: &str, x: &[f32], base_output: &mut [f32]) {
         let key = (layer_idx, module.to_string());
-        if let Some(lora_layer) = self.layers.get(&key) {
-            let scale = self.config.scale();
+        if let Some(lora_layer) = self.layers().get(&key) {
+            let scale = self.config().scale();
             apply_lora(lora_layer, scale, x, base_output);
         }
     }
 
     /// Check if the adapter has weights for a specific layer and module.
     pub fn has_adapter(&self, layer_idx: usize, module: &str) -> bool {
-        self.layers.contains_key(&(layer_idx, module.to_string()))
+        self.layers().contains_key(&(layer_idx, module.to_string()))
     }
 
     /// Return the number of adapted projection layers.
     pub fn num_adapted_layers(&self) -> usize {
-        self.layers.len()
+        self.layers().len()
     }
 
     /// Return the total number of LoRA parameters (A + B matrices).
     pub fn num_parameters(&self) -> usize {
-        self.layers.values().map(|l| l.a.len() + l.b.len()).sum()
+        self.layers().values().map(|l| l.a.len() + l.b.len()).sum()
     }
 
     /// Return `(layer_idx, module_name)` pairs whose module is not in `known`.
     ///
     /// Useful for detecting typos in adapter target modules before inference.
     pub fn validate_modules(&self, known: &[&str]) -> Vec<(usize, String)> {
-        self.layers
+        self.layers()
             .keys()
             .filter(|(_, m)| !known.iter().any(|k| k == m))
             .cloned()
@@ -223,7 +306,8 @@ impl LoraAdapter {
         &self,
         config: &lattice_inference::model::qwen35_config::Qwen35Config,
     ) -> crate::error::Result<()> {
-        for ((layer_idx, module), layer) in &self.layers {
+        self.config().validate()?;
+        for ((layer_idx, module), layer) in self.layers() {
             if *layer_idx >= config.num_hidden_layers {
                 return Err(crate::error::TuneError::Validation(format!(
                     "LoRA layer index {layer_idx} >= model num_hidden_layers {} (module: {module})",
@@ -312,7 +396,7 @@ mod tests {
             },
         );
 
-        LoraAdapter::new(config, layers)
+        LoraAdapter::new(config, layers).expect("valid adapter config")
     }
 
     #[test]
@@ -330,6 +414,38 @@ mod tests {
             target_modules: vec![],
         };
         assert_eq!(config_zero.scale(), 0.0);
+    }
+
+    #[test]
+    fn test_config_rejects_non_finite_alpha_and_scale_fails_closed() {
+        for alpha in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let config = LoraConfig {
+                rank: 8,
+                alpha,
+                target_modules: vec![],
+            };
+
+            let err = config.validate().unwrap_err();
+            assert!(err.to_string().contains("alpha must be finite"));
+            assert_eq!(config.scale(), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_adapter_construction_rejects_non_finite_alpha() {
+        for alpha in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result = LoraAdapter::new(
+                LoraConfig {
+                    rank: 8,
+                    alpha,
+                    target_modules: vec![],
+                },
+                HashMap::new(),
+            );
+
+            let err = result.expect_err("non-finite alpha must reject adapter construction");
+            assert!(err.to_string().contains("alpha must be finite"));
+        }
     }
 
     #[test]
@@ -422,7 +538,7 @@ mod tests {
                 rank: 2,
             },
         );
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
         let unknown = adapter.validate_modules(&["q_proj", "v_proj"]);
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0], (0, "q_porj".to_string()));
@@ -435,7 +551,7 @@ mod tests {
             alpha: 4.0,
             target_modules: vec![],
         };
-        let adapter = LoraAdapter::new(config, HashMap::new());
+        let adapter = LoraAdapter::new(config, HashMap::new()).expect("valid adapter config");
         let unknown = adapter.validate_modules(&["q_proj"]);
         assert!(unknown.is_empty());
     }
@@ -471,6 +587,7 @@ mod tests {
                 },
                 layers,
             )
+            .expect("valid adapter config")
         }
 
         #[test]
