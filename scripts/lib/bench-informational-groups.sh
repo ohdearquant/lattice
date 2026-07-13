@@ -9,17 +9,19 @@
 #
 # scripts/bench-compare.sh sources this file for the real run so the exact
 # same array and intersection logic feeds the gate. scripts/perf-bench-gate.py
-# --selftest also invokes this script directly (as a subprocess, against a
-# controlled listing) so a shell-only regression here — e.g. a name added
-# only to this array — fails the selftest instead of staying invisible. An
-# earlier fixture kept its own hardcoded copy of this list in Python and
-# never exercised this file at all; extracting the logic here closed that.
+# --selftest invokes this script two ways: with --print-allowlist (dump the
+# raw array, no listing) so the Python-side expected set is compared against
+# the ACTUAL array — a name added only here, or only there, fails the
+# selftest — and as the intersection subprocess against a controlled listing
+# so the production code path is exercised end-to-end. An earlier fixture
+# kept its own hardcoded copy of this list in Python and never exercised
+# this file at all; extracting the logic here closed that.
 #
 # Adding a group to the allowlist requires the same kind of same-toolchain
-# A/A quantitative evidence that justified these two (see scripts/bench-
-# compare.sh's "Quick-mode informational-groups" comment), reviewed in a PR —
-# never derived automatically from `--list`, which would silently exempt
-# every future group added to the target.
+# A/A quantitative evidence that justified every current entry (see scripts/
+# bench-compare.sh's "Quick-mode informational-groups" comment), reviewed in
+# a PR — never derived automatically from `--list`, which would silently
+# exempt every future group added to the target.
 set -euo pipefail
 
 INFO_GROUPS_ALLOWLIST=(
@@ -35,6 +37,11 @@ INFO_GROUPS_ALLOWLIST=(
   "int4_cosine_distance"
   "simd_batch_cosine_non_normalized_query"
 )
+
+if [ "${1:-}" = "--print-allowlist" ]; then
+  printf '%s\n' "${INFO_GROUPS_ALLOWLIST[@]}" | sort
+  exit 0
+fi
 
 input="${1:-/dev/stdin}"
 listed_groups=$(awk -F/ '/: benchmark$/{print $1}' "$input" | sort -u)

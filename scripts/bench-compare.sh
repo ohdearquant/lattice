@@ -123,10 +123,11 @@ fi
 
 # --- Quick-mode informational-groups (lattice#714) ---
 # Fixed, reviewed allowlist of the issue-evidenced noisy groups only — NOT a
-# target-wide dump. lattice#714's quantitative reproduction (same-toolchain
-# A/A runs on identical refs, --quick mode) confined every flip-signed FAIL/
-# WARN to two lattice-embed `simd` groups; no other group in that target has
-# issue-backed noise evidence, so no other group is exempted here. The
+# target-wide dump. Every entry carries same-toolchain A/A evidence on
+# identical refs in --quick mode (lattice#714's original reproduction for
+# the first two; isolated bench-window A/A runs for the 2026-07-13
+# additions); no other group in that target has that evidence, so no other
+# group is exempted here. The
 # allowlist itself and the intersection-with-the-real-listing logic live in
 # scripts/lib/bench-informational-groups.sh, invoked below — kept in its own
 # file (rather than inline here) so scripts/perf-bench-gate.py --selftest can
@@ -138,7 +139,7 @@ fi
 # if that ever becomes a concern, namespace by target (e.g. "embed:<group>")
 # on both sides of the handoff instead of trusting name uniqueness. Adding a
 # group requires the same kind of same-toolchain A/A quantitative evidence
-# that justified the current two, reviewed in a PR — never derived
+# that justified every current entry, reviewed in a PR — never derived
 # automatically from `--list`, which would silently exempt every future
 # group added to the target.
 INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
