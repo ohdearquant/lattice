@@ -3754,6 +3754,61 @@ mod inner {
         MOE_PREFETCH_STEP2_DONE_TX_FOR_TEST.with(|c| *c.borrow_mut() = tx);
     }
 
+    /// One recorded top-k routing decision: which experts `encode_moe_ffn`'s
+    /// CPU router selected for one token at one MoE layer, and their
+    /// (post-renormalization) gate weights, in `selected_ids[i]` /
+    /// `gate_weights[i]` correspondence.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct MoeRoutingTraceRecord {
+        pub layer_idx: usize,
+        pub token_idx: usize,
+        pub selected_ids: Vec<usize>,
+        pub gate_weights: Vec<f32>,
+    }
+
+    thread_local! {
+        /// Optional per-token routing-divergence trace collector for
+        /// `encode_moe_ffn`'s CPU top-k selection (#682 Stage 4 instrumentation
+        /// seam). Same arm/drain-via-free-function shape as
+        /// `FORCED_MOE_EXPERTS_FOR_TEST` above, but NOT `#[cfg(test)]`-gated:
+        /// production harnesses (e.g. `eval_perplexity`) arm it outside of
+        /// tests to record per-token top-k expert-id sets and gate weights,
+        /// for computing set-agreement (Jaccard) between a quantized arm and
+        /// a full-precision reference. `None` (the default) makes every
+        /// `encode_moe_ffn` call a single branch-on-None with no allocation.
+        static MOE_ROUTING_TRACE: std::cell::RefCell<Option<Vec<MoeRoutingTraceRecord>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Arm the routing-trace collector on this thread: every subsequent
+    /// `encode_moe_ffn` call appends one [`MoeRoutingTraceRecord`], until
+    /// [`take_moe_routing_trace`] disarms it. Re-arming an already-armed
+    /// collector discards any records buffered since the previous arm.
+    pub fn arm_moe_routing_trace() {
+        MOE_ROUTING_TRACE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Disarm the collector and return every record buffered since the last
+    /// [`arm_moe_routing_trace`] call (empty if it was never armed).
+    pub fn take_moe_routing_trace() -> Vec<MoeRoutingTraceRecord> {
+        MOE_ROUTING_TRACE.with(|c| c.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// Write `records` as newline-delimited JSON, one [`MoeRoutingTraceRecord`]
+    /// per line, so an external harness can diff a trace against a reference run.
+    pub fn dump_moe_routing_trace_jsonl(
+        records: &[MoeRoutingTraceRecord],
+        path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+        for record in records {
+            serde_json::to_writer(&mut out, record).map_err(std::io::Error::other)?;
+            out.write_all(b"\n")?;
+        }
+        out.flush()
+    }
+
     impl MetalQwen35State {
         /// **Unstable**: create from CPU weights; weight layout and f16 conversion may change.
         pub fn new(
@@ -5815,6 +5870,7 @@ mod inner {
                             mlp_enc,
                             compact_idx,
                             layer_i,
+                            position,
                             &cfg,
                             &mut prof,
                             false,
@@ -5854,6 +5910,7 @@ mod inner {
                             mlp_enc,
                             compact_idx,
                             layer_i,
+                            position,
                             &cfg,
                             &mut prof,
                             false,
@@ -10061,6 +10118,7 @@ mod inner {
             enc: &ComputeCommandEncoderRef,
             compact_idx: usize,
             layer_idx: usize,
+            position: usize,
             cfg: &Qwen35Config,
             prof: &mut StepProfile,
             profiling: bool,
@@ -10142,7 +10200,7 @@ mod inner {
                     let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
                     // SAFETY: moe_bufs is owned by layer_weights which is live.
                     unsafe {
-                        self.encode_moe_ffn(enc, &*moe_ptr, cfg);
+                        self.encode_moe_ffn(enc, &*moe_ptr, cfg, layer_idx, position);
                     }
                 }
             }
@@ -10168,7 +10226,7 @@ mod inner {
             enc: &ComputeCommandEncoderRef,
             compact_idx: usize,
             linear_idx: usize,
-            _position: usize,
+            position: usize,
             layer_idx: usize,
             cfg: &Qwen35Config,
             prof: &mut StepProfile,
@@ -10447,7 +10505,7 @@ mod inner {
             );
 
             if with_mlp {
-                self.encode_mlp_block(enc, compact_idx, layer_idx, cfg, prof, profiling);
+                self.encode_mlp_block(enc, compact_idx, layer_idx, position, cfg, prof, profiling);
             }
 
             1 // one GDN GPU dispatch per layer
@@ -10685,7 +10743,7 @@ mod inner {
             }
 
             if with_mlp {
-                self.encode_mlp_block(enc, compact_idx, layer_idx, cfg, prof, profiling);
+                self.encode_mlp_block(enc, compact_idx, layer_idx, position, cfg, prof, profiling);
             }
         }
 
@@ -10715,6 +10773,8 @@ mod inner {
             enc: &ComputeCommandEncoderRef,
             moe: &MoeMetalBuffers,
             _cfg: &Qwen35Config,
+            layer_idx: usize,
+            token_idx: usize,
         ) {
             let hidden = moe.hidden;
             let inter = moe.inter;
@@ -10806,6 +10866,20 @@ mod inner {
                     *prob /= top_sum;
                 }
             }
+
+            // #682 Stage 4: optional routing-divergence trace. Single
+            // branch-on-None (`with` + `borrow` on an unset thread-local) when
+            // disarmed, the production default — see `MOE_ROUTING_TRACE`.
+            MOE_ROUTING_TRACE.with(|c| {
+                if let Some(trace) = c.borrow_mut().as_mut() {
+                    trace.push(MoeRoutingTraceRecord {
+                        layer_idx,
+                        token_idx,
+                        selected_ids: selected.iter().map(|(id, _)| *id).collect(),
+                        gate_weights: selected.iter().map(|(_, w)| *w).collect(),
+                    });
+                }
+            });
 
             // ── Step 2: Shared expert (always active) ─────────────────────────────
             // Extracted into a closure (called exactly once, either inline
@@ -20370,6 +20444,169 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                      evicted instead) or eviction pressure isn't reaching this cache at all"
                 );
             }
+        }
+
+        /// #682 Stage 4: the routing-trace collector's hot path is a single
+        /// branch on `MOE_ROUTING_TRACE`'s thread-local `None` state when
+        /// never armed — `encode_moe_ffn` must record nothing while
+        /// disarmed, and the collector must stay disarmed rather than
+        /// silently self-arming on first use.
+        ///
+        /// Mutation check (documented for the reviewer to exercise, not
+        /// compiled in): replacing `encode_moe_ffn`'s `if let Some(trace) =
+        /// c.borrow_mut().as_mut() { trace.push(..) }` guard with an
+        /// unconditional `c.borrow_mut().get_or_insert_with(Vec::new).push(..)`
+        /// (the collector self-arming instead of staying `None`) makes this test
+        /// fail: `take_moe_routing_trace()` returns 2 records instead of the
+        /// expected empty trace.
+        #[test]
+        fn moe_routing_trace_disarmed_records_nothing() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let mut state = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                .expect("from_q4_dir must load");
+
+            // Defensive: drain+disarm in case a prior test on this worker
+            // thread left the collector armed — thread-locals persist across
+            // tests reusing the same `gpu_test_lock()`-serialized OS thread
+            // (same reasoning as `ForcedMoeExpertsGuard`'s doc comment).
+            let _ = take_moe_routing_trace();
+
+            let logits0 = state.forward_step(1, 0);
+            let logits1 = state.forward_step(2, 1);
+            assert!(logits0.iter().all(|v| v.is_finite()));
+            assert!(logits1.iter().all(|v| v.is_finite()));
+
+            let trace = take_moe_routing_trace();
+            assert!(
+                trace.is_empty(),
+                "encode_moe_ffn must record nothing while MOE_ROUTING_TRACE is disarmed \
+                 (None) — got {} record(s): {trace:?}",
+                trace.len()
+            );
+        }
+
+        /// #682 Stage 4: armed, `encode_moe_ffn` records exactly the forced
+        /// routing selection (post-renormalization gate weights) for each
+        /// decoded token, keyed by the real `(layer_idx, token_idx)` the
+        /// token was decoded at. For the ordinary contiguous `0, 1` decode
+        /// sequence used here, a per-layer invocation counter is numerically
+        /// identical to the decode position, so the first two records cannot
+        /// discriminate the two — the discriminating probe is the third
+        /// decode, which REPEATS position `1`: the threaded `position` reads
+        /// back `1` again, while any invocation counter (since arm or since
+        /// state creation) would have advanced to `2`. That third
+        /// record is what proves `position` is the value actually threaded
+        /// through `encode_mlp_block` into `encode_moe_ffn`. Also exercises
+        /// `dump_moe_routing_trace_jsonl`'s round-trip.
+        ///
+        /// Mutation check (documented for the reviewer to exercise, not
+        /// compiled in): commenting out the `trace.push(MoeRoutingTraceRecord
+        /// { .. })` call inside `encode_moe_ffn`'s `MOE_ROUTING_TRACE.with(..)`
+        /// block makes this test fail — `take_moe_routing_trace()` returns an
+        /// empty `Vec` instead of the three expected records.
+        #[test]
+        fn moe_routing_trace_armed_records_forced_selection() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config_top_k2();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let mut state = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
+                .expect("from_q4_dir (top_k=2) must load");
+
+            let _ = take_moe_routing_trace(); // start from a known-disarmed state
+            arm_moe_routing_trace();
+
+            let _forced0 = ForcedMoeExpertsGuard::set(vec![2, 3]);
+            let logits0 = state.forward_step(1, 0);
+            assert!(logits0.iter().all(|v| v.is_finite()));
+            drop(_forced0);
+
+            let _forced1 = ForcedMoeExpertsGuard::set(vec![2, 1]);
+            let logits1 = state.forward_step(2, 1);
+            assert!(logits1.iter().all(|v| v.is_finite()));
+            drop(_forced1);
+
+            // Third decode REPEATS position 1. Mechanically safe: raw
+            // `forward_step` has no position-monotonicity check, and the KV
+            // write appends at `seq_len` (slot 2) while applying RoPE
+            // position 1, well below capacity. This is the counter-vs-
+            // position discriminator: a per-layer invocation counter — since
+            // arm or since state creation — has advanced past 1 by this
+            // third call, so only the genuinely threaded `position` reads 1.
+            let _forced2 = ForcedMoeExpertsGuard::set(vec![0, 3]);
+            let logits2 = state.forward_step(3, 1);
+            assert!(logits2.iter().all(|v| v.is_finite()));
+            drop(_forced2);
+
+            let trace = take_moe_routing_trace();
+            assert_eq!(
+                trace.len(),
+                3,
+                "expected exactly one record per decode call (1 MoE layer x 3 calls): {trace:?}"
+            );
+            assert_eq!(trace[0].layer_idx, 0);
+            assert_eq!(trace[0].token_idx, 0);
+            assert_eq!(trace[0].selected_ids, vec![2, 3]);
+            assert_eq!(trace[1].layer_idx, 0);
+            assert_eq!(trace[1].token_idx, 1);
+            assert_eq!(trace[1].selected_ids, vec![2, 1]);
+            assert_eq!(trace[2].layer_idx, 0);
+            assert_eq!(
+                trace[2].token_idx, 1,
+                "repeated-position decode must record the threaded position (1), \
+                 not an invocation count (which would be 2 by this call): {trace:?}"
+            );
+            assert_eq!(trace[2].selected_ids, vec![0, 3]);
+            for record in &trace {
+                assert_eq!(record.gate_weights.len(), 2);
+                for w in &record.gate_weights {
+                    assert!(
+                        (w - 0.5).abs() < 1e-6,
+                        "forced top_k=2 equal-weight gate renormalizes to 0.5 each: {trace:?}"
+                    );
+                }
+            }
+
+            let dump_path = dir.join("routing_trace.jsonl");
+            dump_moe_routing_trace_jsonl(&trace, &dump_path).expect("jsonl dump must succeed");
+            let dumped = std::fs::read_to_string(&dump_path).expect("read back jsonl");
+            let lines: Vec<&str> = dumped.lines().collect();
+            assert_eq!(lines.len(), 3, "one JSONL line per record: {dumped:?}");
+            let parsed: MoeRoutingTraceRecord =
+                serde_json::from_str(lines[0]).expect("line 0 must parse as MoeRoutingTraceRecord");
+            assert_eq!(parsed.token_idx, 0);
+            assert_eq!(parsed.selected_ids, vec![2, 3]);
+
+            // Collector auto-disarms on take; a follow-up decode must not append further.
+            let _more = state.forward_step(3, 2);
+            assert!(take_moe_routing_trace().is_empty());
         }
 
         /// Mutation check for the test above: deliberately break
@@ -33571,8 +33808,9 @@ mod gdn_state_traffic_tests {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, PathProofSnapshot, blend_lora_layer_data,
-    format_chat_template,
+    LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord, PathProofSnapshot,
+    arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
+    format_chat_template, take_moe_routing_trace,
 };
 
 #[cfg(all(
