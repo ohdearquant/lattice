@@ -60,6 +60,14 @@ enum Command {
         /// co-located tokenizer; safetensors directories always ship one).
         #[arg(long)]
         tokenizer_dir: Option<String>,
+        /// Cap on outstanding (queued + in-flight) requests to the Metal GPU
+        /// worker (issue #932) before new requests are rejected with HTTP
+        /// 503. Only applies to Q4/Metal-backed serving; the CPU backend has
+        /// no shared worker queue to bound. Conservative default: this
+        /// worker serializes all generation onto one dedicated thread, so a
+        /// deep queue just means memory growth with no throughput benefit.
+        #[arg(long, default_value = "32")]
+        max_pending: usize,
     },
     /// Preflight check: memory fit and artifact compatibility, without
     /// loading any model weights (config + tensor index inspection only).
@@ -2532,7 +2540,11 @@ mod serve {
         ) -> Result<GenerateOutput, ApiError> {
             use lattice_inference::serve::metal_worker::WorkerEvent;
 
-            let mut rx = self.client.submit(messages, gen_cfg, cancel);
+            // #932: the ONE way `MetalWorkerClient::submit` fails outwardly
+            // -- the shared worker's outstanding-job admission cap is full.
+            // Surfaces as an ordinary `ApiError::ServiceUnavailable` (503),
+            // exactly like any other `Err` this method already returns.
+            let mut rx = self.client.submit(messages, gen_cfg, cancel)?;
             let mut deliver_deltas = true;
             loop {
                 let Some(ev) = rx.recv().await else {
@@ -2651,6 +2663,7 @@ mod serve {
         pub fn spawn_metal(
             model_dir: std::path::PathBuf,
             tokenizer_dir: Option<std::path::PathBuf>,
+            max_pending: usize,
         ) -> Result<(Self, usize), String> {
             use lattice_inference::serve::metal_worker::{
                 ContextWindowPolicy, MetalWorker, StartupError, WorkerMetadata,
@@ -2687,26 +2700,29 @@ mod serve {
             let max_context = super::MetalChatBackend::MAX_CACHE_LEN;
             let model_dir_for_loader = model_dir.clone();
             let tokenizer_path_for_loader = tokenizer_path.clone();
-            let (owner, client, _meta) = MetalWorker::spawn(move || {
-                let cfg = super::load_q4_config(&model_dir_for_loader)?;
-                let state =
-                    lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
-                        &model_dir_for_loader,
-                        &tokenizer_path_for_loader,
-                        &cfg,
-                        max_context,
-                    )
-                    .map_err(|e| format!("Q4 model load failed: {e}"))?;
-                Ok((
-                    state,
-                    tokenizer_for_worker,
-                    WorkerMetadata {
-                        format: "q4".to_string(),
-                        model_max_context: max_context,
-                        context_window_policy: ContextWindowPolicy::PromptAndMaxTokens,
-                    },
-                ))
-            })
+            let (owner, client, _meta) = MetalWorker::spawn(
+                move || {
+                    let cfg = super::load_q4_config(&model_dir_for_loader)?;
+                    let state =
+                        lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
+                            &model_dir_for_loader,
+                            &tokenizer_path_for_loader,
+                            &cfg,
+                            max_context,
+                        )
+                        .map_err(|e| format!("Q4 model load failed: {e}"))?;
+                    Ok((
+                        state,
+                        tokenizer_for_worker,
+                        WorkerMetadata {
+                            format: "q4".to_string(),
+                            model_max_context: max_context,
+                            context_window_policy: ContextWindowPolicy::PromptAndMaxTokens,
+                        },
+                    ))
+                },
+                max_pending,
+            )
             .map_err(|e| match e {
                 StartupError::Load(msg) => msg,
                 // Preserves this binary's exact prior wording (distinct
@@ -6391,6 +6407,7 @@ async fn main() {
             max_tokens,
             model_id,
             tokenizer_dir,
+            max_pending,
         } => {
             use std::path::Path;
             use std::sync::Arc;
@@ -6430,6 +6447,7 @@ async fn main() {
                         match serve::ModelBackend::spawn_metal(
                             model_path.to_path_buf(),
                             tokenizer_dir_path,
+                            max_pending,
                         ) {
                             Ok((backend, _max_context)) => backend,
                             Err(e) => {
@@ -6441,6 +6459,7 @@ async fn main() {
                     #[cfg(not(feature = "metal-gpu"))]
                     {
                         let _ = &tokenizer_dir;
+                        let _ = max_pending;
                         eprintln!("Error: {}", backend::metal_gpu_required_message(model_path));
                         std::process::exit(1);
                     }
