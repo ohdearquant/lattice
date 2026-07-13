@@ -19542,13 +19542,13 @@ mod inner {
         /// #682 Stage 4: armed, `encode_moe_ffn` records exactly the forced
         /// routing selection (post-renormalization gate weights) for each
         /// decoded token, keyed by the real `(layer_idx, token_idx)` the
-        /// token was decoded at. Because each position is normally decoded
-        /// exactly once, a per-layer invocation counter stays numerically
-        /// equal to the decode position no matter which positions are
-        /// chosen — so the discriminating probe here is the third decode,
-        /// which REPEATS position `1`: the threaded `position` reads back
-        /// `1` again, while any invocation counter (since arm or since
-        /// state creation) would have advanced to a new value. That third
+        /// token was decoded at. For the ordinary contiguous `0, 1` decode
+        /// sequence used here, a per-layer invocation counter is numerically
+        /// identical to the decode position, so the first two records cannot
+        /// discriminate the two — the discriminating probe is the third
+        /// decode, which REPEATS position `1`: the threaded `position` reads
+        /// back `1` again, while any invocation counter (since arm or since
+        /// state creation) would have advanced to `2`. That third
         /// record is what proves `position` is the value actually threaded
         /// through `encode_mlp_block` into `encode_moe_ffn`. Also exercises
         /// `dump_moe_routing_trace_jsonl`'s round-trip.
@@ -19557,7 +19557,7 @@ mod inner {
         /// compiled in): commenting out the `trace.push(MoeRoutingTraceRecord
         /// { .. })` call inside `encode_moe_ffn`'s `MOE_ROUTING_TRACE.with(..)`
         /// block makes this test fail — `take_moe_routing_trace()` returns an
-        /// empty `Vec` instead of the two expected records.
+        /// empty `Vec` instead of the three expected records.
         #[test]
         fn moe_routing_trace_armed_records_forced_selection() {
             let Some(_) = Device::system_default() else {
@@ -19592,11 +19592,13 @@ mod inner {
             assert!(logits1.iter().all(|v| v.is_finite()));
             drop(_forced1);
 
-            // Third decode REPEATS position 1 (mechanically fine: it just
-            // rewrites that KV slot). This is the counter-vs-position
-            // discriminator: a per-layer invocation counter — since arm or
-            // since state creation — has advanced past 1 by this third
-            // call, so only the genuinely threaded `position` reads 1 here.
+            // Third decode REPEATS position 1. Mechanically safe: raw
+            // `forward_step` has no position-monotonicity check, and the KV
+            // write appends at `seq_len` (slot 2) while applying RoPE
+            // position 1, well below capacity. This is the counter-vs-
+            // position discriminator: a per-layer invocation counter — since
+            // arm or since state creation — has advanced past 1 by this
+            // third call, so only the genuinely threaded `position` reads 1.
             let _forced2 = ForcedMoeExpertsGuard::set(vec![0, 3]);
             let logits2 = state.forward_step(3, 1);
             assert!(logits2.iter().all(|v| v.is_finite()));
