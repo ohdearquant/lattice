@@ -76,7 +76,7 @@ else:
 
 #### GPU Path (feature `gpu`)
 
-`adapt_gpu(trainer: &mut GpuTrainer, examples)` delegates each step to `trainer.train_batch(&batch)` (returning loss as `f32`) and `trainer.validate(&dataset)` after the loop for final accuracy. This is the same `GpuTrainer` used by the offline `TrainingLoop`, so the GPU path gets full optimizer shader support (SGD momentum, Adam, AdamW).
+`adapt_gpu(trainer: &mut GpuTrainer, examples)` delegates each step to `trainer.train_batch(&batch)` (returning loss as `f32`) and `trainer.validate(&dataset)` after the loop for final accuracy. This is the same `GpuTrainer` used by the offline `TrainingLoop`. Note its current limitation: `train_batch` returns an error for every optimizer choice because the weight-update step is not yet wired (issue #797), and no optimizer compute shader exists — `lattice-fann`'s former `SgdMomentum`/`Adam`/`AdamW` `ShaderType` variants never had a dispatch path and were removed as dead code (issue #852). Forward pass and `validate` work correctly.
 
 #### Current CPU Training Step
 
