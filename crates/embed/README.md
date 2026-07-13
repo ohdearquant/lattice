@@ -58,7 +58,19 @@ All operations use runtime feature detection with automatic scalar fallback.
 | -------- | ---------------------------------- |
 | x86_64   | AVX-512 VNNI > AVX2 + FMA > scalar |
 | aarch64  | ARM NEON (mandatory)               |
+| wasm32   | SIMD128 (compile-time) > scalar    |
 | Other    | Scalar fallback                    |
+
+### wasm32 (SIMD128)
+
+Unlike the x86_64/aarch64 rows above, wasm32 has no runtime CPU-feature detection: a given
+`.wasm` binary either was or wasn't compiled with `-C target-feature=+simd128`, and that
+choice is fixed for the whole artifact. `SimdConfig::simd128_enabled()` mirrors this
+directly (`cfg!(target_feature = "simd128")`) rather than reading a field, so it is not
+something a config value can override -- a force-scalar-style `SimdConfig` cannot re-route a
+simd128-compiled wasm build back to the scalar kernels. To get scalar dispatch on wasm32,
+build without the `simd128` target feature; there is no runtime override for a build that
+has it.
 
 ### Performance (384-dim vectors)
 

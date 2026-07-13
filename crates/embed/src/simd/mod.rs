@@ -160,6 +160,19 @@ impl SimdConfig {
     /// codepaths inside one binary). Mirrors `cfg!(target_feature =
     /// "simd128")` and is always false on non-wasm32 targets. A method rather
     /// than a field so existing `SimdConfig` struct literals keep compiling.
+    ///
+    /// Because this ignores `self` entirely, no `SimdConfig` value -- not
+    /// `SimdConfig::scalar_only` (the existing test-only force-scalar
+    /// helper), not a hypothetical future runtime override -- can flip it
+    /// back to `false` on a simd128-compiled wasm artifact: it always
+    /// re-derives the same compile-time `cfg!` regardless of which instance
+    /// calls it. The four dispatch resolvers that gate on
+    /// this method (`resolve_dot_product_kernel` in `dot_product.rs`,
+    /// `resolve_cosine_kernel` in `cosine.rs`, `dispatch_squared` in
+    /// `distance.rs`, and `normalize`'s inline dispatch in `normalize.rs`)
+    /// inherit the same property. The only way to get scalar dispatch on
+    /// wasm32 is to build without the `simd128` target feature in the first
+    /// place; there is no runtime escape hatch.
     #[inline]
     pub fn simd128_enabled(&self) -> bool {
         cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
