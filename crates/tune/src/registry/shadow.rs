@@ -160,7 +160,7 @@ pub struct ShadowSession {
 
 impl ShadowSession {
     /// Creates a running session for a production/candidate pair and its configuration.
-    /// See [`docs/registry.md`] (§`ShadowSession` public methods) for sampling and transition rules.
+    /// See `docs/registry.md` (§`ShadowSession` public methods) for sampling and transition rules.
     pub fn new(production_model_id: Uuid, candidate_model_id: Uuid, config: ShadowConfig) -> Self {
         Self {
             id: Uuid::new_v4(),
@@ -189,7 +189,7 @@ impl ShadowSession {
 
     /// Records a comparison while the session is running.
     /// `latency_diff_ms` is candidate minus production latency; positive means slower.
-    /// See [`docs/registry.md`] (§`ShadowSession` public methods) for sampling rules.
+    /// See `docs/registry.md` (§`ShadowSession` public methods) for sampling rules.
     pub fn record_sample(&mut self, agreed: bool, latency_diff_ms: f64) {
         if let ShadowState::Running {
             samples_collected, ..
@@ -202,7 +202,7 @@ impl ShadowSession {
 
     /// Evaluates a running session after its minimum sample count and returns its state.
     /// Both agreement and latency thresholds must pass for [`ShadowState::Passed`].
-    /// See [`docs/registry.md`] (§`ShadowSession` public methods) for transition rules.
+    /// See `docs/registry.md` (§`ShadowSession` public methods) for transition rules.
     pub fn evaluate(&mut self) -> &ShadowState {
         if let ShadowState::Running { .. } = &self.state
             && self.samples.len() >= self.config.min_samples

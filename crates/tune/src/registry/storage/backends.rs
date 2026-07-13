@@ -98,7 +98,7 @@ fn migrate_models_metadata_json_to_metadata(
 
 /// Upgrades legacy timestamp columns to INTEGER epoch microseconds.
 /// It is a no-op for an INTEGER schema and fails initialization on SQLite errors.
-/// See [`docs/registry.md`] (§SQLite migration helpers) for conversion and transaction details.
+/// See `docs/registry.md` (§SQLite migration helpers) for conversion and transaction details.
 // Called from SqliteStorage::new() which is cfg(feature = "sqlite");
 // the compiler cannot trace the call site when checking without that feature.
 #[cfg(feature = "sqlite")]
