@@ -55,6 +55,11 @@ pub(crate) use generation::check_logprobs_not_set;
 // Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
 // paths (ADR-080 C3, #783).
 pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
+// Shared empty-prompt preflight (#856): every CPU forward path (cpu_q8,
+// cpu_f16, neon_forward) and every Metal generation entry point
+// (forward::metal_qwen35) calls this instead of its own inline
+// `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
+pub(crate) use generation::check_prompt_not_empty;
 // Shared backend-neutral decode-policy struct (reasoning-budget accounting +
 // logprobs formatting), consumed by the Metal streaming loops in
 // `crate::forward::metal_qwen35` so the same bookkeeping isn't re-duplicated

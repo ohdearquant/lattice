@@ -900,11 +900,10 @@ pub fn generate_q8_neon(
     let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
     let prompt_len = prompt_ids.len();
 
-    if prompt_len == 0 {
-        return Err(crate::error::InferenceError::Inference(
-            "empty prompt".into(),
-        ));
-    }
+    // #856: single shared preflight, unified with the Metal paths (which
+    // used to accept an empty prompt and return an empty Ok) — see
+    // `check_prompt_not_empty` (model::qwen35::generation).
+    crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
 
     // max_new_tokens == 0 means "generate nothing": return before sampling so
     // we never emit a token the caller did not ask for. Mirrors the guard in
@@ -2706,6 +2705,52 @@ mod tests {
         assert!(
             out.stopped,
             "generate_q8_neon must set stopped=true when the decode-loop stop fires"
+        );
+    }
+
+    /// `generate_q8_neon` must reject an empty prompt with a typed
+    /// `Err(Inference("empty prompt"))` before any weight dereference or
+    /// state allocation (#856): this is one of the three CPU forward paths
+    /// the shared `check_prompt_not_empty` preflight unifies with the four
+    /// Metal paths, which used to silently accept an empty prompt and
+    /// return an empty `Ok`. See docs/generation-entrypoint-matrix.md row 2.
+    ///
+    /// Mutation sensitivity: reverting the `check_prompt_not_empty` call at
+    /// this call site makes the function proceed past the guard with a
+    /// zero-length prompt, either panicking in the prefill/decode loop or
+    /// producing a non-`Inference` error — this assert fails either way.
+    #[test]
+    fn generate_q8_neon_rejects_empty_prompt() {
+        use crate::error::InferenceError;
+        use std::collections::HashMap;
+
+        let mut vocab: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o"].iter().enumerate() {
+            vocab.insert((*c).to_string(), i as u32);
+        }
+        let merges = vec![
+            ("h".to_string(), "e".to_string()),
+            ("he".to_string(), "l".to_string()),
+        ];
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap();
+
+        let cfg = Qwen35Config::qwen35_2b();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let model = Q8NeonModel {
+            embed_tokens: vec![],
+            final_norm: vec![],
+            lm_head_packed: vec![],
+            lm_head_rows: 0,
+            lm_head_cols: 0,
+            layers: vec![],
+        };
+        let gen_cfg = GenerateConfig::default();
+
+        let result = generate_q8_neon(&model, &cfg, &tokenizer, &rope, "", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(ref msg)) if msg.contains("empty prompt")),
+            "generate_q8_neon must reject an empty prompt with Err(Inference(\"empty \
+             prompt\")) (#856); got {result:?}"
         );
     }
 
