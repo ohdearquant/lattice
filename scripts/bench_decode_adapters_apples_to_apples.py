@@ -27,13 +27,29 @@ harness's separate "native tok/s" diagnostic column -- this is exactly the
 distinction `Observation.elapsed_ns` vs `Observation.engine_native_ns` exists
 for. Closing this gap fully would need a persistent/server mode for
 `bench_decode_ab`, which is out of scope for this migration (no Rust source
-under `crates/inference/` is touched here). Ollama and MLX do not have this
-issue: ollama's harness call is a single HTTP round trip (methodology-
-identical to the legacy script's `curl` call), and MLX's model is loaded and
-quantized once, in-process, lazily on this module's first call for a given
-(model, quantization) pair -- reproducing the legacy script's one-load-per-
-tier shape exactly, since `generate()` alone is timed per call, same as the
-legacy script's own `t0 = time.time(); generate(...); dt = ...`.
+under `crates/inference/` is touched here).
+
+Duration-boundary parity for ollama and MLX (declared, post-hardening):
+the harness's PRIMARY reported slope always uses its own wall-clock
+`elapsed_ns` around the whole `adapter.run()` call -- this is a fixed,
+intentional harness invariant (`AdapterRunResult.native_ns` is a diagnostic,
+"never a replacement" for it), not something an adapter can override, so the
+primary slope column is NOT claimed to be byte-for-byte identical to the
+legacy script's per-engine self-timed metric. MLX's primary metric IS an
+exact match regardless: this adapter times nothing beyond `generate()`
+itself (no post-generation retokenization happens inside `run()` at all, see
+`MlxAdapter.run()`), so the harness's wall-clock window equals the legacy
+script's own `t0 = time.time(); generate(...); dt = ...` window exactly,
+model load amortized identically via the same first-call warmup shape.
+Ollama's primary metric is NOT byte-identical to the legacy script's
+`total_duration`-based figure -- the harness's wall clock additionally
+includes the local HTTP round trip's connection/JSON marshalling overhead,
+which the legacy script's own duration source did not -- but the
+legacy-equivalent number is not lost: ollama's `total_duration` (exactly the
+field the legacy script used for its own primary slope, NOT the decode-only
+`eval_duration`) is preserved losslessly via `AdapterRunResult.native_ns`,
+reported as the harness's "native tok/s" diagnostic column, same mechanism
+as lattice's entry above.
 
 Run with (from repo root): `uv run --quiet --with mlx-lm python3
 scripts/bench_decode_adapters_apples_to_apples.py run --profile
@@ -45,7 +61,9 @@ matching the legacy script's own `uv run --with mlx-lm` invocation).
 
 from __future__ import annotations
 
+import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -76,17 +94,20 @@ _LATTICE_MODEL_DIRS: dict[str, Path] = {
 # -- ollama: exactly bench_apples_to_apples.sh's model_tag / API shape --
 OLLAMA_BASE_URL = os.environ.get("LATTICE_BENCH_OLLAMA_URL", "http://localhost:11434")
 
-_RESULT_RE = re.compile(r"RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)")
+_RESULT_RE = re.compile(r"^RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)$")
 
 
 def parse_lattice_result_line(line: str) -> tuple[int, int, float] | None:
-    """Parse one `bench_decode_ab` stdout line. Returns `(n_req, completion,
-    total_ms)` or `None` if the line is not a RESULT line (the binary also
-    prints `[bench] ...` progress lines to stderr, and may print other
-    stdout noise -- callers scan all stdout lines and use the last match,
-    mirroring the legacy awk filter `/^RESULT/`).
+    """Parse one `bench_decode_ab` stdout line as a full-line RESULT record.
+    Returns `(n_req, completion, total_ms)`, or `None` if the line is not an
+    EXACT `RESULT n_req=<int> completion=<int> total_ms=<float>` match -- no
+    prefix or suffix noise tolerated. The legacy script's awk filter
+    (`/^RESULT/`) matched a RESULT-bearing SUBSTRING anywhere in the line;
+    this adapter invokes with `BENCH_RUNS=1` (one clean line expected per
+    call), so a stricter full-line anchor rejects a stale/prefixed/noisy
+    line outright instead of scavenging a match out of it.
     """
-    m = _RESULT_RE.search(line)
+    m = _RESULT_RE.match(line)
     if m is None:
         return None
     return int(m.group(1)), int(m.group(2)), float(m.group(3))
@@ -94,6 +115,54 @@ def parse_lattice_result_line(line: str) -> tuple[int, int, float] | None:
 
 class LatticeUnavailableError(RuntimeError):
     """`bench_decode_ab` is not built, or the requested model dir is missing."""
+
+
+class LatticeResultError(RuntimeError):
+    """`bench_decode_ab` ran and exited 0, but its RESULT output failed
+    validation: not exactly one full-line RESULT record, a `n_req` that
+    does not match the window actually requested, or a non-finite/negative
+    measurement. Distinct from `LatticeUnavailableError` (binary/model not
+    present, a registration-time condition) -- this is a data-integrity
+    failure from an engine that DID run, and must crash loud rather than
+    silently become a fabricated or mislabeled observation.
+    """
+
+
+def extract_single_result(stdout: str, *, n_tokens: int) -> tuple[int, int, float]:
+    """Scan `stdout` for full-line RESULT records (see
+    `parse_lattice_result_line`) and return the single one expected for a
+    `BENCH_RUNS=1` invocation, as `(n_req, completion, total_ms)`.
+
+    Raises `LatticeResultError` if there is not EXACTLY one RESULT line (zero
+    -- no output; more than one -- a stale/duplicated line, since one
+    `BENCH_RUNS=1` call must print exactly one), if the line's `n_req` does
+    not equal the `n_tokens` window that was actually requested (a stale or
+    wrong binary emitting a RESULT line for a different window must not
+    silently become an observation labeled as the requested window), or if
+    `completion`/`total_ms` are not finite and non-negative.
+    """
+    matches = [
+        parsed
+        for parsed in (parse_lattice_result_line(line) for line in stdout.splitlines())
+        if parsed is not None
+    ]
+    if len(matches) == 0:
+        raise LatticeResultError(f"lattice: no full-line RESULT record found in stdout: {stdout[-500:]!r}")
+    if len(matches) > 1:
+        raise LatticeResultError(
+            f"lattice: expected exactly one RESULT record for BENCH_RUNS=1, found {len(matches)}: {matches!r}"
+        )
+    n_req, completion, total_ms = matches[0]
+    if n_req != n_tokens:
+        raise LatticeResultError(
+            f"lattice: RESULT n_req={n_req} does not match the requested window "
+            f"n_tokens={n_tokens} (stale or wrong binary?)"
+        )
+    if completion < 0:
+        raise LatticeResultError(f"lattice: RESULT completion={completion} is negative")
+    if not math.isfinite(total_ms) or total_ms < 0:
+        raise LatticeResultError(f"lattice: RESULT total_ms={total_ms} is not finite and non-negative")
+    return n_req, completion, total_ms
 
 
 class LatticeAdapter:
@@ -136,17 +205,10 @@ class LatticeAdapter:
             raise LatticeUnavailableError(
                 f"lattice: bench_decode_ab exited {proc.returncode}: {proc.stderr.strip()[-2000:]}"
             )
-        parsed = None
-        for out_line in proc.stdout.splitlines():
-            result = parse_lattice_result_line(out_line)
-            if result is not None:
-                parsed = result
-        if parsed is None:
-            raise LatticeUnavailableError(
-                "lattice: no RESULT line in bench_decode_ab stdout "
-                f"(stderr: {proc.stderr.strip()[-500:]})"
-            )
-        _n_req, completion, total_ms = parsed
+        try:
+            _n_req, completion, total_ms = extract_single_result(proc.stdout, n_tokens=n_tokens)
+        except LatticeResultError as exc:
+            raise LatticeResultError(f"{exc} (stderr: {proc.stderr.strip()[-500:]})") from exc
         return harness.AdapterRunResult(
             actual_completion_tokens=completion,
             native_ns=round(total_ms * 1e6),
@@ -158,26 +220,140 @@ def lattice_available(bin_path: Path = LAT_BIN) -> bool:
     return bin_path.is_file() and os.access(bin_path, os.X_OK)
 
 
+def _lattice_required_model_dirs(profile: harness.ProfileConfig) -> tuple[Path, ...]:
+    """Every local model directory the profile's `lattice` engine group(s)
+    will need, resolved via `_LATTICE_MODEL_DIRS`. Empty if the profile has
+    no `lattice` engine group.
+    """
+    dirs: list[Path] = []
+    for group in profile.engine_groups:
+        if group.name != "lattice":
+            continue
+        model_dir = _LATTICE_MODEL_DIRS.get(group.model)
+        if model_dir is not None:
+            dirs.append(model_dir)
+    return tuple(dirs)
+
+
+def lattice_registration_status(
+    profile: harness.ProfileConfig | None, *, bin_path: Path = LAT_BIN
+) -> tuple[bool, tuple[Path, ...]]:
+    """Whether the lattice adapter should be registered for `profile`, and
+    which of the profile's required model directories (if any) are missing.
+
+    Binary presence alone is NOT sufficient: a binary present with a
+    profile-required model directory absent must reproduce the legacy
+    script's per-engine graceful skip (`bench_lattice`'s own
+    `[[ ! -d "$model_dir" ]] && echo MODEL MISSING && return`) at
+    REGISTRATION time, not surface as a `LatticeUnavailableError` raised
+    mid-run that `--allow-missing-engine` cannot catch (the harness only
+    treats an engine as "missing" when its name is absent from the adapter
+    registry entirely -- see `bench_decode_harness.run_profile`).
+
+    `profile=None` (the requested profile could not be determined, e.g. no
+    `--profile` argument was found while peeking argv) falls back to
+    binary-only availability -- the pre-fix behavior, so an unrecognized
+    invocation shape still registers lattice and lets the harness's
+    `MissingEngineError` / this module's `LatticeUnavailableError` surface
+    any problem, rather than silently never registering lattice at all.
+    """
+    bin_ok = bin_path.is_file() and os.access(bin_path, os.X_OK)
+    if not bin_ok:
+        return False, ()
+    if profile is None:
+        return True, ()
+    required = _lattice_required_model_dirs(profile)
+    missing = tuple(d for d in required if not d.is_dir())
+    return (len(missing) == 0), missing
+
+
+def _peek_requested_profile(argv: list[str]) -> harness.ProfileConfig | None:
+    """Best-effort peek at the `--profile`/`--profiles-file` arguments
+    `bench_decode_harness.main()` will parse, so lattice's model-dir
+    availability can be checked for the SPECIFIC profile about to run.
+    Registration happens at module-import time (`register_available_adapters`
+    runs before `harness.main()` parses `argv`), so this module has to do its
+    own lightweight peek rather than wait for the harness's own parse.
+
+    Returns `None` (never raises) on anything unexpected: no `--profile`
+    found, an unknown profile name, or a profiles file that fails to load --
+    `lattice_registration_status` treats `None` as "fall back to binary-only
+    availability", matching this module's pre-fix behavior.
+    """
+    peek = argparse.ArgumentParser(add_help=False)
+    peek.add_argument("--profile", default=None)
+    peek.add_argument("--profiles-file", type=Path, default=harness.DEFAULT_PROFILES_FILE)
+    try:
+        known, _ignored = peek.parse_known_args(argv)
+    except SystemExit:
+        return None
+    if known.profile is None:
+        return None
+    try:
+        _schema_version, profiles = harness.load_profiles_file(known.profiles_file)
+    except harness.ProfileConfigError:
+        return None
+    return profiles.get(known.profile)
+
+
 # --------------------------------------------------------------------------
 # ollama
 # --------------------------------------------------------------------------
 
 
-def ollama_response_to_result(data: dict, *, requested_tokens: int) -> harness.AdapterRunResult:
-    """Pure translation of one `/api/generate` JSON body into an
-    `AdapterRunResult`, mirroring the legacy script's
-    `ec=d.get('eval_count',0); ed=d.get('eval_duration',1)/1e9; ec/ed` native
-    rate. `eval_duration` is already nanoseconds in ollama's response, so it
-    is used directly as `native_ns` (no unit conversion needed, unlike the
-    legacy script's own `/1e9` which converts to seconds only for its
-    printed ratio).
+class OllamaResponseError(RuntimeError):
+    """An ollama `/api/generate` response is an error body, or is missing a
+    required field, or has a required field of the wrong type. A
+    structurally-valid-JSON error response (e.g. a proxy or an overloaded
+    server returning `{"error": "..."}` with HTTP 200) must never be
+    silently translated into a fabricated measurement -- it must crash the
+    call loud instead.
     """
-    eval_count = data.get("eval_count", 0) or 0
-    eval_duration = data.get("eval_duration")
-    native_ns = eval_duration if eval_duration else None
+
+
+_REQUIRED_OLLAMA_FIELDS = ("eval_count", "eval_duration", "total_duration")
+
+
+def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
+    """Pure translation of one `/api/generate` JSON body into an
+    `AdapterRunResult`.
+
+    `native_ns` mirrors the legacy script's PRIMARY slope metric exactly:
+    `tot = d.get('total_duration',0)/1e9`, the field the legacy script fed
+    directly into its own slope calculation -- NOT the decode-only
+    `eval_duration` (that was the legacy script's separate `ec/ed`
+    reference-only "native tok/s" column, a different number). Requires and
+    type-checks `eval_count`/`eval_duration`/`total_duration`; rejects an
+    error body (a top-level `"error"` key) or any missing/non-numeric
+    required field by raising `OllamaResponseError` rather than substituting
+    a default -- a `0` or an absent field must never quietly become a fake
+    "successful" observation. `eval_duration` is required and type-checked
+    for response-shape integrity even though it is not the field this
+    function extracts into `native_ns`.
+    """
+    if "error" in data:
+        raise OllamaResponseError(f"ollama: response is an error body: {data['error']!r}")
+    for field in _REQUIRED_OLLAMA_FIELDS:
+        if field not in data:
+            raise OllamaResponseError(f"ollama: response missing required field {field!r}: {data!r}")
+        value = data[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise OllamaResponseError(
+                f"ollama: response field {field!r} has non-numeric type "
+                f"{type(value).__name__}: {data!r}"
+            )
+    eval_count = data["eval_count"]
+    eval_duration = data["eval_duration"]
+    total_duration = data["total_duration"]
+    if eval_count < 0:
+        raise OllamaResponseError(f"ollama: eval_count={eval_count!r} is negative: {data!r}")
+    if eval_duration < 0:
+        raise OllamaResponseError(f"ollama: eval_duration={eval_duration!r} is negative: {data!r}")
+    if total_duration <= 0:
+        raise OllamaResponseError(f"ollama: total_duration={total_duration!r} must be positive: {data!r}")
     return harness.AdapterRunResult(
-        actual_completion_tokens=eval_count or requested_tokens,
-        native_ns=native_ns,
+        actual_completion_tokens=int(eval_count),
+        native_ns=int(total_duration),
         engine_version="ollama",
     )
 
@@ -210,7 +386,7 @@ class OllamaAdapter:
         )
         with urllib.request.urlopen(req, timeout=600) as resp:
             data = json.loads(resp.read())
-        return ollama_response_to_result(data, requested_tokens=n_tokens)
+        return ollama_response_to_result(data)
 
 
 def ollama_available(
@@ -267,11 +443,25 @@ class MlxAdapter:
     reproducing the legacy script's one-load-per-tier shape (a fresh
     process per profile run keeps Q8 and Q4 tiers independent, matching the
     legacy script's separate `uv run` invocation per tier).
+
+    `run()` does no work after `generate()` returns (no retokenization, no
+    length verification): the legacy script never verified actual token
+    count either (`generate(..., max_tokens=N, ...)` under `temp=0.0`, its
+    printed row always used the REQUESTED `N`, never a verified count), and
+    the harness's wall-clock `elapsed_ns` wraps the entire `run()` call --
+    any work added after `generate()` returns would silently inflate the
+    harness's primary timing beyond decode alone. Trusting `n_tokens`
+    verbatim, exactly like the legacy script did, keeps that window equal to
+    `generate()`'s own duration.
     """
 
     def __init__(self, source_model_dir: Path = Q8_MODEL_DIR):
         self.source_model_dir = source_model_dir
-        self._cache: dict[tuple[str, str], tuple[object, object, object]] = {}
+        # (mlx_model, tok, sampler, fallback_model_id) -- fallback_model_id
+        # is None when the requested source_model_dir loaded successfully,
+        # else the Hub identifier that was actually loaded instead (see
+        # `run()`'s `actual_model` below).
+        self._cache: dict[tuple[str, str], tuple[object, object, object, str | None]] = {}
 
     def _load(self, model: str, quantization: str):
         key = (model, quantization)
@@ -284,28 +474,35 @@ class MlxAdapter:
         from mlx_lm.sample_utils import make_sampler
 
         bits = 4 if quantization == "q4" else 8
+        fallback_model_id: str | None = None
         try:
             mlx_model, tok = load(str(self.source_model_dir))
         except Exception:  # noqa: BLE001 -- legacy script's own bare except fallback
             mlx_model, tok = load("Qwen/Qwen3.5-0.8B")
+            fallback_model_id = "Qwen/Qwen3.5-0.8B"
         nn.quantize(mlx_model, bits=bits, group_size=64)
         mx.eval(mlx_model.parameters())
         sampler = make_sampler(temp=0.0)
-        self._cache[key] = (mlx_model, tok, sampler)
-        return mlx_model, tok, sampler
+        entry = (mlx_model, tok, sampler, fallback_model_id)
+        self._cache[key] = entry
+        return entry
 
     def run(
         self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
     ) -> harness.AdapterRunResult:
         from mlx_lm import generate
 
-        mlx_model, tok, sampler = self._load(model, quantization)
-        result = generate(
-            mlx_model, tok, prompt=prompt, max_tokens=n_tokens, sampler=sampler, verbose=False
-        )
-        actual_tokens = len(tok.encode(result)) if isinstance(result, str) else n_tokens
+        mlx_model, tok, sampler, fallback_model_id = self._load(model, quantization)
+        generate(mlx_model, tok, prompt=prompt, max_tokens=n_tokens, sampler=sampler, verbose=False)
         return harness.AdapterRunResult(
-            actual_completion_tokens=actual_tokens, engine_version="mlx_lm"
+            actual_completion_tokens=n_tokens,
+            engine_version="mlx_lm",
+            # Provenance: a fallback load means the observation actually
+            # measured Qwen/Qwen3.5-0.8B from the Hub, not the requested
+            # local artifact -- record what really ran (see
+            # AdapterRunResult.actual_model's contract) instead of letting
+            # the raw observation silently mislabel it as the local model.
+            actual_model=fallback_model_id,
         )
 
 
@@ -322,15 +519,30 @@ def mlx_available() -> bool:
 # --------------------------------------------------------------------------
 
 
-def register_available_adapters() -> None:
+def register_available_adapters(argv: list[str] | None = None) -> None:
     """Registers whichever of lattice/ollama/mlx are actually available,
     printing a legacy-style message for each -- mirroring
     `bench_apples_to_apples.sh`'s per-engine graceful skip (missing binary /
     missing model dir / ollama not installed all print-and-continue rather
-    than aborting the whole run)."""
-    if lattice_available():
+    than aborting the whole run).
+
+    Lattice's registration is MODEL-aware, not just binary-aware: the binary
+    can be present while the specific profile about to run needs a model
+    directory that is not (e.g. Q8 weights present, Q4 weights absent). A
+    `LatticeUnavailableError` raised mid-run for that case is not caught
+    anywhere `--allow-missing-engine` can act on, so it must not be
+    registered in the first place -- see `lattice_registration_status` and
+    `_peek_requested_profile`.
+    """
+    argv = sys.argv[1:] if argv is None else argv
+    profile = _peek_requested_profile(argv)
+    should_register, missing_model_dirs = lattice_registration_status(profile)
+    if should_register:
         harness.register_adapter("lattice", LatticeAdapter())
         print("  lattice: adapter registered")
+    elif missing_model_dirs:
+        joined = ", ".join(str(d) for d in missing_model_dirs)
+        print(f"  lattice: MODEL MISSING ({joined}) — build/download first — skipping")
     else:
         print(
             f"  lattice: BIN MISSING ({LAT_BIN}) — build first "

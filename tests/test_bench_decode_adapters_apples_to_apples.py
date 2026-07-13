@@ -268,35 +268,131 @@ class LatticeResultParsingTest(unittest.TestCase):
         self.assertIsNone(adapters.parse_lattice_result_line("[bench] prompt_tokens=42"))
         self.assertIsNone(adapters.parse_lattice_result_line(""))
 
-    def test_uses_last_result_line_on_multiple(self):
+    def test_rejects_prefixed_noise(self):
+        # A RESULT-bearing SUBSTRING is no longer good enough: the legacy
+        # awk filter (`/^RESULT/`, matches anywhere) would have accepted
+        # this; the stricter BENCH_RUNS=1 contract requires a full-line
+        # match and must not scavenge a match out of a noisy line.
+        line = "[stale-cache] RESULT n_req=32 completion=32 total_ms=812.345"
+        self.assertIsNone(adapters.parse_lattice_result_line(line))
+
+    def test_rejects_suffixed_noise(self):
+        line = "RESULT n_req=32 completion=32 total_ms=812.345 (cached)"
+        self.assertIsNone(adapters.parse_lattice_result_line(line))
+
+
+class ExtractSingleResultTest(unittest.TestCase):
+    """`extract_single_result` is the BENCH_RUNS=1 contract: exactly one
+    full-line RESULT record, whose n_req matches what was actually
+    requested, with finite/non-negative fields -- anything else raises
+    `LatticeResultError` rather than silently accepting a stale, mismatched,
+    or duplicated measurement.
+    """
+
+    def test_happy_path(self):
+        stdout = "[bench] loading model\nRESULT n_req=32 completion=32 total_ms=812.345\n"
+        result = adapters.extract_single_result(stdout, n_tokens=32)
+        self.assertEqual(result, (32, 32, 812.345))
+
+    def test_rejects_no_result_lines(self):
+        with self.assertRaises(adapters.LatticeResultError):
+            adapters.extract_single_result("[bench] loading model\n[bench] done\n", n_tokens=32)
+
+    def test_rejects_duplicate_result_lines(self):
+        # BENCH_RUNS=1 means exactly one RESULT line is expected; two
+        # (e.g. a stale binary that ignored BENCH_RUNS, or leaked output
+        # from a prior invocation) must fail loud, never silently resolve
+        # to "the last one" the way the pre-fix scan did.
         stdout = (
             "RESULT n_req=32 completion=32 total_ms=100.0\n"
             "RESULT n_req=32 completion=32 total_ms=200.0\n"
         )
-        parsed = None
-        for line in stdout.splitlines():
-            result = adapters.parse_lattice_result_line(line)
-            if result is not None:
-                parsed = result
-        self.assertEqual(parsed, (32, 32, 200.0))
+        with self.assertRaises(adapters.LatticeResultError):
+            adapters.extract_single_result(stdout, n_tokens=32)
+
+    def test_rejects_wrong_n_req(self):
+        # A stale/wrong binary emitting a RESULT line for a DIFFERENT
+        # window than the one just requested must not silently become an
+        # observation labeled as the requested window.
+        stdout = "RESULT n_req=256 completion=256 total_ms=1900.0\n"
+        with self.assertRaises(adapters.LatticeResultError):
+            adapters.extract_single_result(stdout, n_tokens=32)
+
+    def test_rejects_prefixed_noise_end_to_end(self):
+        stdout = "[stale-cache] RESULT n_req=32 completion=32 total_ms=812.345\n"
+        with self.assertRaises(adapters.LatticeResultError):
+            adapters.extract_single_result(stdout, n_tokens=32)
 
 
 class OllamaResponseParsingTest(unittest.TestCase):
-    def test_translates_eval_count_and_duration_to_native_ns(self):
+    """`ollama_response_to_result` mirrors the legacy script's PRIMARY slope
+    field exactly (`total_duration`, not the decode-only `eval_duration`),
+    and requires+type-checks the response shape rather than substituting
+    defaults for missing/invalid fields -- a structurally-valid-JSON error
+    body must crash the call loud, never become a fake measurement.
+    """
+
+    def test_translates_total_duration_to_native_ns(self):
         data = {"eval_count": 256, "eval_duration": 2_000_000_000, "total_duration": 2_500_000_000}
-        result = adapters.ollama_response_to_result(data, requested_tokens=256)
+        result = adapters.ollama_response_to_result(data)
         self.assertEqual(result.actual_completion_tokens, 256)
-        self.assertEqual(result.native_ns, 2_000_000_000)
+        # native_ns is total_duration (the legacy script's own primary slope
+        # field), NOT eval_duration (that was the legacy script's separate
+        # decode-only reference column).
+        self.assertEqual(result.native_ns, 2_500_000_000)
 
-    def test_falls_back_to_requested_tokens_when_eval_count_absent(self):
-        result = adapters.ollama_response_to_result({}, requested_tokens=32)
-        self.assertEqual(result.actual_completion_tokens, 32)
-        self.assertIsNone(result.native_ns)
+    def test_error_body_raises(self):
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result({"error": "model not found"})
 
-    def test_zero_eval_duration_yields_no_native_ns(self):
-        data = {"eval_count": 10, "eval_duration": 0}
-        result = adapters.ollama_response_to_result(data, requested_tokens=10)
-        self.assertIsNone(result.native_ns)
+    def test_empty_dict_raises(self):
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result({})
+
+    def test_missing_eval_count_raises(self):
+        data = {"eval_duration": 1, "total_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_missing_eval_duration_raises(self):
+        data = {"eval_count": 32, "total_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_missing_total_duration_raises(self):
+        data = {"eval_count": 32, "eval_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_non_numeric_field_type_raises(self):
+        data = {"eval_count": "32", "eval_duration": 1, "total_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_bool_field_type_raises(self):
+        # bool is an int subclass in Python -- must not sneak past the
+        # numeric-type check.
+        data = {"eval_count": True, "eval_duration": 1, "total_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_negative_eval_count_raises(self):
+        data = {"eval_count": -1, "eval_duration": 1, "total_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_zero_total_duration_raises(self):
+        data = {"eval_count": 10, "eval_duration": 1, "total_duration": 0}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_eval_count_zero_is_trusted_not_substituted(self):
+        # A real, validly-typed zero must be reported as-is -- never
+        # silently replaced with the requested token count (that would be
+        # exactly the kind of fabrication this hardening pass closes).
+        data = {"eval_count": 0, "eval_duration": 1, "total_duration": 1}
+        result = adapters.ollama_response_to_result(data)
+        self.assertEqual(result.actual_completion_tokens, 0)
 
 
 class AvailabilityCheckTest(unittest.TestCase):
@@ -320,6 +416,156 @@ class AvailabilityCheckTest(unittest.TestCase):
         # mlx_lm is a declared project dependency (pyproject.toml); this
         # documents the expectation rather than mocking import machinery.
         self.assertTrue(adapters.mlx_available())
+
+
+# --------------------------------------------------------------------------
+# Model-aware --allow-missing-engine: binary present + model dir absent must
+# reproduce the legacy per-engine graceful skip, not raise mid-run.
+# --------------------------------------------------------------------------
+
+
+class LatticeModelAwareAvailabilityTest(unittest.TestCase):
+    """Real-adapter coverage: a present, executable binary with a missing
+    model directory must (a) make the real `LatticeAdapter.run()` raise
+    cleanly (defense in depth, unchanged), and (b) make the REGISTRATION
+    decision skip lattice entirely for the profile that needs that model,
+    so `--allow-missing-engine` actually engages instead of a
+    `LatticeUnavailableError` aborting the tier mid-run.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        _, cls.profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)
+
+    def test_lattice_adapter_run_raises_when_model_dir_missing(self):
+        # The literal "binary present, model dir absent" scenario, exercised
+        # against the REAL LatticeAdapter (not a fake).
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "bench_decode_ab"
+            bin_path.write_text("#!/bin/sh\necho should-not-run\n")
+            bin_path.chmod(0o755)
+            adapter = adapters.LatticeAdapter(bin_path=bin_path, tokenizer_dir=Path(tmp))
+            missing_dir = Path(tmp) / "does-not-exist"
+            with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": missing_dir}):
+                with self.assertRaises(adapters.LatticeUnavailableError):
+                    adapter.run(
+                        prompt="p", n_tokens=32, warmup=False, model="qwen3.5-0.8b", quantization="q8"
+                    )
+
+    def test_registration_status_skips_when_profile_model_dir_missing(self):
+        profile = self.profiles["apples_to_apples_q8"]
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "bench_decode_ab"
+            bin_path.write_text("#!/bin/sh\n")
+            bin_path.chmod(0o755)
+            missing_dir = Path(tmp) / "does-not-exist"
+            with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": missing_dir}):
+                should_register, missing = adapters.lattice_registration_status(profile, bin_path=bin_path)
+        self.assertFalse(should_register)
+        self.assertEqual(missing, (missing_dir,))
+
+    def test_registration_status_registers_when_binary_and_model_dir_present(self):
+        profile = self.profiles["apples_to_apples_q8"]
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "bench_decode_ab"
+            bin_path.write_text("#!/bin/sh\n")
+            bin_path.chmod(0o755)
+            model_dir = Path(tmp) / "model"
+            model_dir.mkdir()
+            with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": model_dir}):
+                should_register, missing = adapters.lattice_registration_status(profile, bin_path=bin_path)
+        self.assertTrue(should_register)
+        self.assertEqual(missing, ())
+
+    def test_registration_status_false_when_binary_missing_even_if_model_present(self):
+        profile = self.profiles["apples_to_apples_q8"]
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "bench_decode_ab"  # never created
+            model_dir = Path(tmp) / "model"
+            model_dir.mkdir()
+            with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": model_dir}):
+                should_register, missing = adapters.lattice_registration_status(profile, bin_path=bin_path)
+        self.assertFalse(should_register)
+        self.assertEqual(missing, ())  # binary check fails before model dirs are even inspected
+
+    def test_registration_status_falls_back_to_binary_only_when_profile_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "bench_decode_ab"
+            bin_path.write_text("#!/bin/sh\n")
+            bin_path.chmod(0o755)
+            should_register, missing = adapters.lattice_registration_status(None, bin_path=bin_path)
+        self.assertTrue(should_register)
+        self.assertEqual(missing, ())
+
+    def test_end_to_end_missing_model_dir_yields_graceful_skip_via_harness(self):
+        # Closes the loop: when registration correctly declines to register
+        # lattice, harness.run_profile's own --allow-missing-engine path
+        # (not a mid-run exception) is what handles it, with other engines
+        # still producing observations.
+        profile = self.profiles["apples_to_apples_q8"]
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "bench_decode_ab"
+            bin_path.write_text("#!/bin/sh\n")
+            bin_path.chmod(0o755)
+            missing_dir = Path(tmp) / "does-not-exist"
+            with mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"qwen3.5-0.8b": missing_dir}):
+                should_register, _missing = adapters.lattice_registration_status(profile, bin_path=bin_path)
+        self.assertFalse(should_register)
+        result = harness.run_profile(
+            profile,
+            {"ollama": _FakeAdapter(), "mlx": _FakeAdapter()},  # lattice deliberately NOT registered
+            allow_missing_engine=True,
+            clock=_FakeClock(),
+        )
+        self.assertIn("lattice", result.missing_engines)
+        self.assertTrue(any(o.engine in ("ollama", "mlx") for o in result.observations))
+
+
+class MlxFallbackProvenanceTest(unittest.TestCase):
+    """A missing/corrupt local model dir makes `MlxAdapter` fall back to the
+    Hub artifact -- the raw observation must record that via `actual_model`,
+    never silently label it as the requested local artifact.
+    """
+
+    def test_fallback_load_reports_hub_identifier_via_actual_model(self):
+        fake_model, fake_tok, fake_sampler = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
+        fake_model.parameters.return_value = mock.MagicMock()
+
+        def fake_load(path):
+            if path == "Qwen/Qwen3.5-0.8B":
+                return fake_model, fake_tok
+            raise OSError(f"no such local model: {path}")
+
+        adapter = adapters.MlxAdapter(source_model_dir=Path("/nonexistent/local/model"))
+        with (
+            mock.patch("mlx_lm.load", side_effect=fake_load),
+            mock.patch("mlx.nn.quantize"),
+            mock.patch("mlx.core.eval"),
+            mock.patch("mlx_lm.sample_utils.make_sampler", return_value=fake_sampler),
+            mock.patch("mlx_lm.generate", return_value="irrelevant generated text"),
+        ):
+            result = adapter.run(
+                prompt="p", n_tokens=32, warmup=False, model="qwen3.5-0.8b", quantization="q8"
+            )
+        self.assertEqual(result.actual_model, "Qwen/Qwen3.5-0.8B")
+        self.assertEqual(result.actual_completion_tokens, 32)
+
+    def test_local_load_success_reports_no_fallback(self):
+        fake_model, fake_tok, fake_sampler = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
+        fake_model.parameters.return_value = mock.MagicMock()
+
+        adapter = adapters.MlxAdapter(source_model_dir=Path("/some/local/model"))
+        with (
+            mock.patch("mlx_lm.load", return_value=(fake_model, fake_tok)),
+            mock.patch("mlx.nn.quantize"),
+            mock.patch("mlx.core.eval"),
+            mock.patch("mlx_lm.sample_utils.make_sampler", return_value=fake_sampler),
+            mock.patch("mlx_lm.generate", return_value="irrelevant generated text"),
+        ):
+            result = adapter.run(
+                prompt="p", n_tokens=32, warmup=False, model="qwen3.5-0.8b", quantization="q8"
+            )
+        self.assertIsNone(result.actual_model)
 
 
 if __name__ == "__main__":
