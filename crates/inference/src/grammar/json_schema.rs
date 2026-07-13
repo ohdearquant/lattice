@@ -2669,6 +2669,84 @@ mod tests {
         assert!(rejects(&g, b"\"\xC0\xAF\""));
     }
 
+    /// Regression for issue #931: exercises the E0/ED/F0/F4 restricted
+    /// second-byte sub-rules (`e0_second_id`/`ed_second_id`/`f0_second_id`/
+    /// `f4_second_id`) end-to-end through the same PDA path constrained
+    /// decoding uses (`simulate_token` via `accepts`/`rejects`), plus the
+    /// control-byte and escape-body boundaries in the same string grammar.
+    #[test]
+    fn string_utf8_boundary_and_control_escape_table() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+
+        // Minimal/maximal well-formed forms for each restricted lead byte.
+        let accept_cases: &[(&str, &[u8])] = &[
+            ("2-byte min", &[0xC2, 0x80]),
+            ("2-byte max", &[0xDF, 0xBF]),
+            ("3-byte E0 min", &[0xE0, 0xA0, 0x80]),
+            ("3-byte ED max", &[0xED, 0x9F, 0xBF]),
+            ("4-byte F0 min", &[0xF0, 0x90, 0x80, 0x80]),
+            ("4-byte F4 max", &[0xF4, 0x8F, 0xBF, 0xBF]),
+        ];
+        for (name, bytes) in accept_cases {
+            let mut input = vec![b'"'];
+            input.extend_from_slice(bytes);
+            input.push(b'"');
+            assert!(
+                accepts(&g, &input),
+                "expected ACCEPT for {name}: {bytes:02X?}"
+            );
+        }
+
+        // Boundary violations: overlong encodings, a UTF-16 surrogate, and a
+        // code point above the U+10FFFF Unicode maximum.
+        let reject_cases: &[(&str, &[u8])] = &[
+            ("E0 overlong", &[0xE0, 0x80, 0x80]),
+            ("F0 overlong", &[0xF0, 0x80, 0x80, 0x80]),
+            ("ED surrogate", &[0xED, 0xA0, 0x80]),
+            ("F4 above U+10FFFF", &[0xF4, 0x90, 0x80, 0x80]),
+            ("C0 overlong 2-byte", &[0xC0, 0x80]),
+            ("lone continuation byte", &[0x80]),
+        ];
+        for (name, bytes) in reject_cases {
+            let mut input = vec![b'"'];
+            input.extend_from_slice(bytes);
+            input.push(b'"');
+            assert!(
+                rejects(&g, &input),
+                "expected REJECT for {name}: {bytes:02X?}"
+            );
+        }
+
+        // Raw control bytes 0x00-0x1F must be escaped; 0x20 (space) is the
+        // first legal unescaped byte.
+        for byte in 0x00u8..=0x1F {
+            assert!(
+                rejects(&g, &[b'"', byte, b'"']),
+                "expected REJECT for raw control byte {byte:#04x}"
+            );
+        }
+        assert!(
+            accepts(&g, &[b'"', 0x20, b'"']),
+            "expected ACCEPT for raw space (0x20)"
+        );
+
+        // Escaped controls (valid \u escapes) are accepted.
+        assert!(accepts(&g, b"\"\\u0000\""));
+        assert!(accepts(&g, b"\"\\u001F\""));
+
+        // Every one-byte escape body outside the RFC 8259 set is rejected.
+        let legal_escape_bodies: &[u8] = b"\"\\/bfnrtu";
+        for byte in 0x00u8..=0xFF {
+            if legal_escape_bodies.contains(&byte) {
+                continue;
+            }
+            assert!(
+                rejects(&g, &[b'"', b'\\', byte, b'"']),
+                "expected REJECT for illegal escape body {byte:#04x}"
+            );
+        }
+    }
+
     #[test]
     fn string_accepts_legal_escapes() {
         let g = compile_ok(r#"{"type":"string"}"#);
