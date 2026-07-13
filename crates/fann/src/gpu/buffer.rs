@@ -1,61 +1,17 @@
-//! GPU Buffer Pool - 3-tier memory management with lifecycle tracking
+//! GPU buffer pool: 3-tier size-categorized pooling (see [`BufferCategory`]) with
+//! per-buffer lifecycle tracking, to avoid the ~100-500us cost of a fresh GPU
+//! allocation on every call. Integrates with [`CircuitBreaker`] to throttle
+//! pooling and force CPU fallback under memory pressure.
 //!
-//! # Memory Management Strategy
+//! GPU deallocation is asynchronous even though Rust's `Drop` runs synchronously,
+//! so a training loop that repeatedly allocates without releasing can hit an
+//! out-of-memory condition despite buffers appearing freed on the Rust side.
+//! Call [`BufferPool::flush`] (and then poll the device) periodically — e.g. once
+//! per epoch — to force pending GPU deallocations through before the next batch.
 //!
-//! This module implements a production-grade GPU buffer pooling system designed
-//! to address key challenges in GPU memory management:
-//!
-//! ## Problem
-//!
-//! 1. **Allocation Overhead**: GPU buffer allocation is expensive (~100-500μs per call)
-//! 2. **Fragmentation**: Frequent alloc/dealloc leads to memory fragmentation
-//! 3. **Async Deallocation**: Rust's `Drop` is synchronous but GPU dealloc is async,
-//!    causing OOM during training loops despite "freeing" memory
-//!
-//! ## Solution: 3-Tier Buffer Pool
-//!
-//! Buffers are categorized by size and managed in separate pools:
-//!
-//! | Tier   | Size Range | Max Pooled | Max Age | Use Case |
-//! |--------|------------|------------|---------|----------|
-//! | Small  | < 1MB      | 256        | 5 min   | Biases, small activations |
-//! | Medium | 1-10MB     | 64         | 3 min   | Layer weights |
-//! | Large  | > 10MB     | 16         | 1 min   | Batch data, large layers |
-//!
-//! ## Lifecycle Management
-//!
-//! Each buffer tracks:
-//! - **Creation time**: For age-based eviction
-//! - **Last used time**: For idle-based cleanup
-//! - **Use count**: For reuse efficiency metrics
-//!
-//! ## Memory Pressure Handling
-//!
-//! The pool integrates with [`CircuitBreaker`] to handle memory pressure:
-//!
-//! - **Normal**: Regular pooling and reuse
-//! - **Low/Medium**: Aggressive cleanup of idle buffers
-//! - **High/Critical**: Block new allocations, force CPU fallback
-//!
-//! ## Explicit Flush
-//!
-//! For training loops, call [`BufferPool::flush`] periodically to:
-//! 1. Release all cached buffers immediately
-//! 2. Prevent OOM from async deallocation lag
-//!
-//! ## Example
-//!
-//! ```ignore
-//! // During training loop
-//! for epoch in 0..epochs {
-//!     for batch in dataset.batches() {
-//!         train_step(&mut network, batch);
-//!     }
-//!     // Flush every epoch to prevent memory buildup
-//!     ctx.buffer_pool().flush();
-//!     ctx.poll(); // Process pending deallocations
-//! }
-//! ```
+//! Tier sizing/capacity and the full memory-pressure handling design: see
+//! ADR-025 and
+//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/fann/docs/design.md).
 
 use super::apple_silicon::BUFFER_ALIGNMENT;
 use super::circuit_breaker::{CircuitBreaker, MemoryPressure};

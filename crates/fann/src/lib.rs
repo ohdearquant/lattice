@@ -1,19 +1,19 @@
-//! lattice-fann: Fast neural network primitives for Lattice
+//! lattice-fann: fast neural network primitives for sub-5ms CPU inference.
 //!
-//! This crate provides lightweight neural network building blocks optimized
-//! for fast CPU inference (<5ms). Designed for tiny models that need to run
-//! quickly without GPU acceleration.
+//! Lightweight building blocks for tiny models — knowledge-distillation students
+//! rather than full transformers — that need to run without GPU acceleration:
+//! pre-allocated layer buffers so the forward pass makes no allocations (see
+//! ADR-021), a fluent [`NetworkBuilder`], the common activations (ReLU, Sigmoid,
+//! Tanh, Softmax, LeakyReLU), and basic backpropagation training with momentum
+//! (`BackpropTrainer`, gradient guards per ADR-022). Batch inference (`parallel`),
+//! serialization (`serde`), and GPU acceleration via wgpu (`gpu`, see ADR-025) are
+//! optional features.
 //!
-//! # Features
+//! For the network/training architecture and the GPU backend's buffer-pool and
+//! circuit-breaker design, see
+//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/fann/docs/design.md).
 //!
-//! - **Fast inference**: Pre-allocated buffers, no allocations during forward pass
-//! - **Fluent API**: `NetworkBuilder` for easy network construction
-//! - **Common activations**: ReLU, Sigmoid, Tanh, Softmax, LeakyReLU
-//! - **Training support**: Basic backpropagation with momentum
-//! - **Optional parallelism**: Feature-gated batch inference
-//! - **Serialization**: Optional serde support
-//!
-//! # Quick Start
+//! # Example
 //!
 //! ```
 //! use lattice_fann::{Network, NetworkBuilder, Activation};
@@ -34,48 +34,6 @@
 //! assert_eq!(output.len(), 3);
 //! let sum: f32 = output.iter().sum();
 //! assert!((sum - 1.0).abs() < 1e-5);
-//! ```
-//!
-//! # Architecture
-//!
-//! ```text
-//! NetworkBuilder --> Network --> [Layer, Layer, ...] --> output
-//!                      |
-//!                      +-- pre-allocated buffers (no alloc during inference)
-//! ```
-//!
-//! # Training
-//!
-//! ```
-//! use lattice_fann::{NetworkBuilder, Activation, BackpropTrainer, TrainingConfig, Trainer};
-//!
-//! let mut network = NetworkBuilder::new()
-//!     .input(2)
-//!     .hidden(4, Activation::Tanh)
-//!     .output(1, Activation::Tanh)
-//!     .build()
-//!     .unwrap();
-//!
-//! // XOR training data
-//! let inputs = vec![
-//!     vec![0.0, 0.0],
-//!     vec![0.0, 1.0],
-//!     vec![1.0, 0.0],
-//!     vec![1.0, 1.0],
-//! ];
-//! let targets = vec![
-//!     vec![0.0],
-//!     vec![1.0],
-//!     vec![1.0],
-//!     vec![0.0],
-//! ];
-//!
-//! let mut trainer = BackpropTrainer::new();
-//! let config = TrainingConfig::new()
-//!     .learning_rate(0.5)
-//!     .max_epochs(1000);
-//!
-//! let result = trainer.train(&mut network, &inputs, &targets, &config);
 //! ```
 //!
 //! # Feature Flags
