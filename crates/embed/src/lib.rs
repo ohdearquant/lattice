@@ -12,8 +12,7 @@
 //! distance; SIMD is not bit-identical to scalar and promises no exact ordering of near-ties).
 //! The rest of `simd/` remains unstable.
 //!
-//! The 21 `unsafe` blocks are gated SIMD intrinsic calls (AVX512/AVX2/NEON); the
-//! 1 `dead_code_allows` retains a superseded dot-product fallback for reference.
+//! The 21 `unsafe` blocks are gated SIMD intrinsic calls (AVX512/AVX2/NEON).
 //! See `foundation/STABILITY.md` for the full policy.
 //!
 //! # lattice-embed

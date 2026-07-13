@@ -330,7 +330,7 @@ fn bench_kv_cache_paged(c: &mut Criterion) {
         );
     }
 
-    // TODO(i2): kv_append_q8/seq{N} — identical harness with cache_type_k=CacheType::Q8
+    // TODO(#808): kv_append_q8/seq{N} — identical harness with cache_type_k=CacheType::Q8
     //   and cache_type_v=CacheType::Q8.  Uncomment once paged.rs has CacheType + Q8 PagePool.
     //
     // for &seq_len in &[1024usize, 4096, 16384] {
@@ -375,7 +375,7 @@ fn bench_kv_cache_paged(c: &mut Criterion) {
         );
     }
 
-    // TODO(i2): kv_gather_q8/seq{N} — identical harness with Q8 cache; dst is f32
+    // TODO(#808): kv_gather_q8/seq{N} — identical harness with Q8 cache; dst is f32
     //   (dequantized on gather). Throughput bytes = same K+V f32 output size.
     //
     // for &seq_len in &[1024usize, 4096, 16384] {
@@ -1768,7 +1768,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
         // Uses the same forward_scratch_decode (0-alloc warm path) as scratch_dispatch.
         // Context lengths: seq1024, seq4096, seq16384.
         //
-        // TODO(i2): decode_q8/seq{N} — same structure with PagedKVCache + CacheType::Q8.
+        // TODO(#808): decode_q8/seq{N} — same structure with PagedKVCache + CacheType::Q8.
         //   Requires: q8 page storage in paged.rs, gather dequant kernels, and
         //   apply_gqa_attention_paged in gqa.rs wired through forward_scratch_decode.
         let decode_contexts: &[(&str, usize)] =
@@ -1824,272 +1824,6 @@ fn bench_forward_with_cache(c: &mut Criterion) {
         }
 
         group.finish();
-    }
-    #[cfg(not(feature = "bench-internals"))]
-    let _ = c;
-}
-
-// ---------------------------------------------------------------------------
-// MTP speculative decode mock benchmark
-//
-// NOTE: These are MOCK baselines only. Real numbers require model weights and
-//   the MTP implementation that i2 adds to speculative.rs
-//   (MtpTargetVerifier + mtp_verify_draft).
-//
-// Mock forward: deterministic random logits via xorshift32 (no model weights).
-// Acceptance: xorshift32(draft_seq_pos) % 100 < accept_pct.
-//
-// Run (mock only, <30 s):
-//   cargo bench -p lattice-inference --bench inference_perf \
-//     --features bench-internals -- mtp_speculative_decode
-//
-// TODO(i2): When speculative::{MtpTargetVerifier, mtp_verify_draft} land,
-//   replace BenchMtpTarget and mock_mtp_decode_loop with the real types.
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-const MOCK_MTP_VOCAB: usize = 8_192; // smaller than real (248 320) for <30 s
-#[allow(dead_code)]
-const MOCK_MTP_PROMPT_LEN: usize = 16;
-#[allow(dead_code)]
-const MOCK_MTP_GEN_TOKENS: usize = 64;
-
-// Deterministic forward: generates MOCK_MTP_VOCAB f32 logits.
-// seed_hi selects "model" (target=0xA000_0000, draft=0xD000_0000).
-#[cfg(feature = "bench-internals")]
-fn mtp_mock_forward(seed_hi: u32, step: usize) -> Vec<f32> {
-    rand_f32_vec(
-        MOCK_MTP_VOCAB,
-        seed_hi ^ (step as u32).wrapping_mul(0x1000_0007),
-    )
-}
-
-// Deterministic per-position acceptance: xorshift32 maps position to bool.
-// accept_pct=100 → always, 75 → ~75%, 50 → ~50%.
-#[cfg(feature = "bench-internals")]
-fn mtp_mock_accept(accept_pct: u32, draft_seq_pos: u32) -> bool {
-    let mut x = draft_seq_pos.wrapping_add(0x9E37_79B9);
-    if x == 0 {
-        x = 1;
-    }
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    (x % 100) < accept_pct
-}
-
-// Local mirror of the planned speculative::MtpTargetVerifier trait.
-// TODO(i2): Replace with `use lattice_inference::speculative::MtpTargetVerifier`
-//   once the trait is added to speculative.rs.
-#[cfg(feature = "bench-internals")]
-trait BenchMtpTarget {
-    fn cache_position(&self) -> usize;
-    fn rollback_cache_to(&mut self, seq_len: usize);
-    /// Returns one logit vec per token (exercises Vec<Vec<f32>> allocation).
-    fn verify_tokens(&mut self, tokens: &[u32], start_pos: usize) -> Vec<Vec<f32>>;
-}
-
-#[cfg(feature = "bench-internals")]
-struct MockBenchTarget {
-    cache_pos: usize,
-}
-
-#[cfg(feature = "bench-internals")]
-impl BenchMtpTarget for MockBenchTarget {
-    fn cache_position(&self) -> usize {
-        self.cache_pos
-    }
-    fn rollback_cache_to(&mut self, seq_len: usize) {
-        self.cache_pos = seq_len;
-    }
-    fn verify_tokens(&mut self, tokens: &[u32], start_pos: usize) -> Vec<Vec<f32>> {
-        let result = tokens
-            .iter()
-            .enumerate()
-            .map(|(i, _)| black_box(mtp_mock_forward(0xE000_0000, start_pos + i)))
-            .collect();
-        self.cache_pos += tokens.len();
-        result
-    }
-}
-
-#[cfg(feature = "bench-internals")]
-fn new_mock_target() -> MockBenchTarget {
-    MockBenchTarget {
-        cache_pos: MOCK_MTP_PROMPT_LEN,
-    }
-}
-
-#[cfg(feature = "bench-internals")]
-#[derive(Default, Clone, Copy)]
-struct MockDecodeStats {
-    generated_tokens: usize,
-    target_forwards: usize,
-    mtp_forwards: usize,
-    accepted_tokens: usize,
-}
-
-#[cfg(feature = "bench-internals")]
-impl MockDecodeStats {
-    fn accepted_tokens_per_forward(self) -> f64 {
-        if self.target_forwards == 0 {
-            0.0
-        } else {
-            self.accepted_tokens as f64 / self.target_forwards as f64
-        }
-    }
-    fn acceptance_rate(self) -> f64 {
-        if self.mtp_forwards == 0 {
-            0.0
-        } else {
-            self.accepted_tokens as f64 / self.mtp_forwards as f64
-        }
-    }
-}
-
-// Simulates MTP speculative decode loop with deterministic acceptance.
-// Each "forward" call generates random logits to simulate allocation cost.
-// target.verify_tokens exercises Vec<Vec<f32>> allocation matching the real trait.
-//
-// TODO(i2): When mtp_verify_draft lands, the round body should call:
-//   speculative::mtp_verify_draft(verifier, current_token, pos, main_hidden,
-//     &initial_logits, eos_token, &mut target)
-#[cfg(feature = "bench-internals")]
-fn mock_mtp_decode_loop(
-    gen_tokens: usize,
-    draft_len: usize,
-    accept_pct: u32,
-    target: &mut impl BenchMtpTarget,
-) -> MockDecodeStats {
-    let mut stats = MockDecodeStats::default();
-    let mut draft_seq_pos: u32 = 0;
-    // scratch token slice reused per round (avoid per-round allocation)
-    let mut round_draft_tokens = Vec::with_capacity(draft_len);
-
-    while stats.generated_tokens < gen_tokens {
-        // Draft phase: up to draft_len MTP forwards; stop at first rejection.
-        let mut round_accepted = 0usize;
-        round_draft_tokens.clear();
-        for _d in 0..draft_len {
-            let _draft = black_box(mtp_mock_forward(0xD000_0000, stats.mtp_forwards));
-            stats.mtp_forwards += 1;
-
-            if mtp_mock_accept(accept_pct, draft_seq_pos) {
-                draft_seq_pos = draft_seq_pos.wrapping_add(1);
-                round_draft_tokens.push(draft_seq_pos); // mock token id
-                round_accepted += 1;
-                stats.accepted_tokens += 1;
-                stats.generated_tokens += 1;
-                if stats.generated_tokens >= gen_tokens {
-                    break;
-                }
-            } else {
-                draft_seq_pos = draft_seq_pos.wrapping_add(1);
-                break;
-            }
-        }
-
-        // Target verify: calls target.verify_tokens to exercise Vec<Vec<f32>> alloc.
-        let start_pos = target.cache_position();
-        let verify_tokens = if round_accepted > 0 {
-            &round_draft_tokens[..round_accepted]
-        } else {
-            &round_draft_tokens[..0]
-        };
-        let _logits_vec = if !verify_tokens.is_empty() {
-            black_box(target.verify_tokens(verify_tokens, start_pos))
-        } else {
-            // Full rejection: simulate one target forward for fallback token.
-            let fallback = [0u32];
-            black_box(target.verify_tokens(&fallback, start_pos))
-        };
-        target.rollback_cache_to(start_pos + round_accepted);
-        stats.target_forwards += 1;
-
-        // Full rejection emits one fallback token from target logits.
-        if round_accepted == 0 && stats.generated_tokens < gen_tokens {
-            stats.generated_tokens += 1;
-        }
-    }
-
-    stats
-}
-
-fn bench_mtp_mock_speculative_decode(c: &mut Criterion) {
-    #[cfg(feature = "bench-internals")]
-    {
-        let mut group = c.benchmark_group("mtp_speculative_decode");
-        group.sample_size(20);
-        group.warm_up_time(Duration::from_secs(1));
-        group.measurement_time(Duration::from_secs(5));
-        group.throughput(Throughput::Elements(MOCK_MTP_GEN_TOKENS as u64));
-
-        // Greedy baseline: MOCK_MTP_GEN_TOKENS target forwards, no draft phase.
-        group.bench_function("greedy_64tok", |b| {
-            b.iter(|| {
-                let mut n = 0u32;
-                for step in 0..MOCK_MTP_GEN_TOKENS {
-                    let _logits = black_box(mtp_mock_forward(0xA000_0000, step));
-                    n += 1;
-                }
-                black_box(n)
-            });
-        });
-
-        // MTP mock at draft_length × acceptance_rate.
-        // TODO(i2): Replace mock_mtp_decode_loop with real mtp_verify_draft.
-        for draft_len in [2usize, 4, 8] {
-            for (label_suffix, accept_pct) in [("50pct", 50u32), ("75pct", 75), ("100pct", 100)] {
-                let label = format!("mtp_draft{draft_len}_{label_suffix}");
-                group.bench_function(&label, |b| {
-                    b.iter(|| {
-                        let mut target = new_mock_target();
-                        black_box(mock_mtp_decode_loop(
-                            MOCK_MTP_GEN_TOKENS,
-                            black_box(draft_len),
-                            black_box(accept_pct),
-                            &mut target,
-                        ))
-                    });
-                });
-            }
-        }
-
-        group.finish();
-
-        // Summary table (outside Criterion timing).
-        // NOTE: tok/s from Criterion above are mock baselines only.
-        //   Real numbers require weights + speculative::mtp_verify_draft from i2.
-        println!(
-            "\n-- MTP Mock Baseline Summary \
-             (mock_vocab={MOCK_MTP_VOCAB}, gen_tokens={MOCK_MTP_GEN_TOKENS}) --"
-        );
-        println!(
-            "scenario,draft_length,acceptance_rate,accepted_tokens_per_forward,target_forwards,mtp_forwards,generated_tokens"
-        );
-        println!(
-            "greedy,0,1.00,1.00,{},{},{}",
-            MOCK_MTP_GEN_TOKENS, 0, MOCK_MTP_GEN_TOKENS
-        );
-        for draft_len in [2usize, 4, 8] {
-            for (_, accept_pct) in [("50pct", 50u32), ("75pct", 75), ("100pct", 100)] {
-                let s = mock_mtp_decode_loop(
-                    MOCK_MTP_GEN_TOKENS,
-                    draft_len,
-                    accept_pct,
-                    &mut new_mock_target(),
-                );
-                println!(
-                    "mtp_mock,{draft_len},{:.2},{:.3},{},{},{}",
-                    s.acceptance_rate(),
-                    s.accepted_tokens_per_forward(),
-                    s.target_forwards,
-                    s.mtp_forwards,
-                    s.generated_tokens,
-                );
-            }
-        }
-        println!("NOTE: Mock baselines. Real numbers require model weights + MTP implementation.");
     }
     #[cfg(not(feature = "bench-internals"))]
     let _ = c;
@@ -2157,7 +1891,6 @@ criterion_group!(
         bench_q8_neon_forward_allocations,
         bench_logits_projection,
         bench_forward_with_cache,
-        bench_mtp_mock_speculative_decode,
         bench_rope_apply_decode,
 );
 criterion_main!(perf_benches);

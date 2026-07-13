@@ -130,7 +130,9 @@ mod inner {
     /// A single `MTLCommandBuffer` encodes all 28 layers per forward call.
     pub struct MetalForwardPass {
         #[allow(dead_code)]
-        // TODO(#1958): Metal roadmap — device handle kept alive for GPU lifetime management
+        // Device handle kept alive for GPU lifetime management (the MTLDevice must
+        // outlive the command queue/pipelines it created). Not yet tracked by a
+        // filed issue.
         device: Device,
         queue: CommandQueue,
         matmul_pipeline: ComputePipelineState,

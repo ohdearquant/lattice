@@ -323,7 +323,7 @@ impl Activation {
     /// (`J[i,j] = s_i * (δ_ij − s_j)`) is required for mathematically correct
     /// Softmax gradients; it is implemented for the output layer in
     /// `backprop.rs::compute_gradients`.  Hidden-layer Softmax uses only the
-    /// diagonal approximation (tracked as FP-095).
+    /// diagonal approximation (accepted limitation, see ADR-023).
     #[inline]
     pub fn derivative(&self, output: f32) -> f32 {
         match self {
@@ -344,7 +344,8 @@ impl Activation {
                     *alpha
                 }
             }
-            // TODO(FP-095): diagonal approximation of Softmax Jacobian; full Jacobian would be more accurate.
+            // Diagonal approximation of the Softmax Jacobian; accepted
+            // limitation, see ADR-023.
             Activation::Softmax => output * (1.0 - output),
         }
     }
