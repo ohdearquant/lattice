@@ -73,7 +73,50 @@ wall-clock nanoseconds since epoch, itself remapped `0 → 1` in the pathologica
 
 ### 2. Empty prompt
 
-| Path               | Location                      | Outcome                                                                                                                                                                          |
+**RESOLVED (#856, unified on `Err`):** all seven entry points now reject an empty
+prompt with the same typed `Err(InferenceError::Inference("empty prompt"))`, via one
+shared preflight, `check_prompt_not_empty` (`model/qwen35/generation.rs:2227`). This
+replaced each CPU path's own inline copy of the check and added the equivalent call to
+the four Metal paths, which previously accepted an empty prompt and returned a normal
+empty `Ok` completion (see "Original divergence" below for what that looked like and
+why maintainer sign-off ruled the CPU behavior as the contract to keep).
+
+| Path               | Location                                                                                        | Outcome                                                                             |
+| ------------------ | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| CPU f16            | `cpu_f16.rs:868` (call site)                                                                    | `Err(InferenceError::Inference("empty prompt"))`                                    |
+| CPU q8             | `cpu_q8.rs:721` (call site)                                                                     | `Err(InferenceError::Inference("empty prompt"))`                                    |
+| CPU q8 NEON        | `neon_forward.rs:906` (call site)                                                               | `Err(InferenceError::Inference("empty prompt"))`                                    |
+| Metal direct       | `metal_qwen35.rs:8711` (call site)                                                              | `Err(InferenceError::Inference("empty prompt"))`                                    |
+| Metal streaming    | `metal_qwen35.rs:13250` (call site, in `generate_streaming_with_cancel`)                        | `Err(InferenceError::Inference("empty prompt"))`; `on_token` never invoked          |
+| Metal prefix-cache | `metal_qwen35.rs:15985` (call site, in the public wrapper, _before_ `_inner` -- see note below) | `Err(InferenceError::Inference("empty prompt"))`; no cache entry created or evicted |
+
+Note on the prefix-cache path: the guard had to land in the public wrapper
+(`generate_streaming_with_prefix_cache_and_cancel`), not in `_inner`, alongside the
+existing `check_logprobs_not_set`/`check_mtp_not_requested` preflights (row 5/8's
+"CONTRACT, preserve" pattern) — `_inner`'s caller unconditionally evicts the cache slot
+on any `Err` it returns, so a preflight-only rejection has to return before `_inner` is
+even called, exactly like those two guards. `_inner` no longer carries its own
+empty-prompt early-return at all (dead code once the wrapper always rejects first);
+removing rather than duplicating it as an `Err` avoided reintroducing the same
+destructive-eviction hazard those two existing guards were already routed around.
+
+**Scope note:** "unified" above means the seven `MetalQwen35State`/CPU-forward paths
+this document tracks (eight physical call sites once the CPU dispatcher/streaming
+entry points that call into the three CPU forward functions are counted separately —
+see #915's PR body). It does **not** cover
+`lattice_inference::speculative::generate_with_speculation`
+(`crates/inference/src/speculative.rs`) — a separate, model-agnostic, non-`Result`
+public helper outside this issue's original scope. That function has its own
+documented empty-input exception (see its doc comment) and is tracked for a fallible
+signature at <https://github.com/ohdearquant/lattice/issues/916> (targets 0.7.0).
+
+Re-verify these line numbers before relying on them; `metal_qwen35.rs` changes
+frequently (see the file-level warning at the top of this document).
+
+<details>
+<summary>Original divergence (pre-#856), preserved for history</summary>
+
+| Path               | Location (pre-#856)           | Outcome (pre-#856)                                                                                                                                                               |
 | ------------------ | ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | CPU f16            | `cpu_f16.rs:865-869`          | `Err(InferenceError::Inference("empty prompt"))`                                                                                                                                 |
 | CPU q8             | `cpu_q8.rs:718-722`           | `Err(InferenceError::Inference("empty prompt"))`                                                                                                                                 |
@@ -82,11 +125,15 @@ wall-clock nanoseconds since epoch, itself remapped `0 → 1` in the pathologica
 | Metal streaming    | `metal_qwen35.rs:12982-12995` | Same `Ok` shape as Metal direct; `on_token` never invoked                                                                                                                        |
 | Metal prefix-cache | `metal_qwen35.rs:15422-15448` | `Ok(CachedGenerateOutput{ output: GenerateOutput{ stopped:false, stop_reason:None, .. }, cache: CrossTurnCacheStats{ prompt_tokens:0, reused_tokens:0, mode:FullRefill, .. } })` |
 
-**Divergence (CONTRACT, preserve):** all three CPU paths reject an empty prompt with a
-typed `Err`; all three Metal paths accept it and return a normal empty `Ok` completion
-with `stop_reason: None`. Any consolidation must decide which contract wins, or thread
-this as an explicit parameter — it is currently a real, live difference in what a
-caller observes for the same input.
+**Divergence (was CONTRACT, preserve; now RESOLVED, see above):** all three CPU paths
+rejected an empty prompt with a typed `Err`; all three Metal paths accepted it and
+returned a normal empty `Ok` completion with `stop_reason: None` -- itself an
+invariant-violating result shape (a "completed" generation that neither stopped nor
+gives a reason). Question 2 in "Questions for maintainer sign-off" below flagged this
+split explicitly; the maintainer ruling (recorded on #856) was to unify on the CPU
+`Err` behavior in the shared preflight rather than preserve the split.
+
+</details>
 
 ### 3. Zero-budget (`max_new_tokens == 0`)
 
@@ -302,13 +349,15 @@ here; they are recorded for explicit maintainer judgment on whether each is CONT
    direct intentional, or should an unmet-precondition MTP request surface some signal
    to the caller (as it does, hard, on Metal prefix-cache)?
 
-2. **Empty-prompt contract split (row 2) is a hard `Err` vs `Ok` divergence,
-   independent of the already-tracked over-context split (row 9).** All three CPU
-   paths reject an empty prompt; all three Metal paths accept it and return an empty
-   completion. Is this intentional (e.g. CPU paths are more commonly called with
-   programmatically-assembled prompts where empty is always a caller bug, while Metal
-   paths serve interactive/streaming callers where an empty turn is a normal no-op)?
-   If so, worth stating explicitly so a consolidation doesn't quietly unify it.
+2. **RESOLVED (#856).** Empty-prompt contract split (row 2) was a hard `Err` vs `Ok`
+   divergence, independent of the already-tracked over-context split (row 9): all
+   three CPU paths rejected an empty prompt; all three Metal paths accepted it and
+   returned an empty completion. Maintainer ruling (recorded on #856): not
+   intentional -- unify on the CPU `Err` behavior via a shared preflight, since the
+   Metal `Ok` shape (`stopped: false, stop_reason: None`) is itself
+   invariant-violating (a "completed" generation that neither stopped nor gives a
+   reason), not a deliberate no-op contract for interactive callers. See row 2 above
+   for the resulting shared guard and the caller audit performed before landing it.
 
 3. **Stale-looking doc comment at `metal_qwen35.rs:15710-15712`** (row 7): claims the
    reasoning-budget policy is "shared ... with the CPU `model::qwen35::generation`
@@ -337,7 +386,7 @@ here; they are recorded for explicit maintainer judgment on whether each is CONT
 | Behavior                | CPU f16                              | CPU q8          | CPU q8 NEON     | Metal direct                                                    | Metal streaming (wrapper)                                        | Metal streaming (impl) | Metal prefix-cache                                                                                                                 |
 | ----------------------- | ------------------------------------ | --------------- | --------------- | --------------------------------------------------------------- | ---------------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | Seed 0/nonzero/unset    | remap 0→1, time fallback             | same            | same            | same                                                            | same                                                             | same                   | same                                                                                                                               |
-| Empty prompt            | `Err`                                | `Err`           | `Err`           | `Ok` empty                                                      | `Ok` empty                                                       | `Ok` empty             | `Ok` empty                                                                                                                         |
+| Empty prompt (#856)     | `Err`                                | `Err`           | `Err`           | `Err`                                                           | `Err`                                                            | `Err`                  | `Err`                                                                                                                              |
 | Zero budget             | `Ok` Length                          | `Ok` Length     | `Ok` Length     | `Ok` Length                                                     | `Ok` Length                                                      | `Ok` Length            | `Ok` Length                                                                                                                        |
 | Grammar                 | `Err`                                | `Err`           | `Err`           | supported, route needs `grammar.is_none()`                      | supported, route needs `grammar.is_none() && logprobs.is_none()` | same as wrapper        | supported, route needs `grammar.is_none() && logprobs.is_none()`                                                                   |
 | Logprobs                | `Err`                                | `Err`           | `Err`           | `Err`                                                           | **supported**                                                    | **supported**          | `Err`                                                                                                                              |

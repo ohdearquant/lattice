@@ -2191,6 +2191,27 @@ where
 /// # Returns
 ///
 /// The generated token IDs (excluding the prompt).
+///
+/// # Empty-prompt exception (#856/#915)
+///
+/// Every Qwen3.5 generation entry point rejects an empty prompt with a
+/// typed `Err(InferenceError::Inference("empty prompt"))` via a shared
+/// preflight (`model::qwen35::generation::check_prompt_not_empty`,
+/// see `docs/generation-entrypoint-matrix.md`). **This function is an
+/// intentional, documented exception to that unified contract**: it
+/// returns `Vec<u32>`, not a `Result`, so it cannot reject anything --
+/// an empty `prompt_tokens` returns `Vec::new()` (a vacuous success, not
+/// an error), locked in by
+/// `generate_with_speculation_empty_prompt_returns_empty` below.
+///
+/// This is not the intended long-term shape: it is kept as-is here only
+/// because `lattice-inference` v0.6.1 just shipped, and turning this
+/// public free function fallible (`Result<Vec<u32>, InferenceError>`) is
+/// a breaking signature change that does not belong in a same-version
+/// bugfix. Tracked for the next semver-major-eligible release in
+/// <https://github.com/ohdearquant/lattice/issues/916> (targets 0.7.0),
+/// which will change this to reject an empty `prompt_tokens` the same
+/// way every other entry point does.
 pub fn generate_with_speculation<F>(
     prompt_tokens: &[u32],
     max_new_tokens: usize,
@@ -4511,6 +4532,14 @@ mod tests {
     fn generate_with_speculation_empty_prompt_returns_empty() {
         // Empty prompt cannot seed speculation; must return empty, not panic on
         // `all_tokens.last()` in the first decode step.
+        //
+        // This locks in the *documented* empty-input -> empty-output
+        // sentinel described on `generate_with_speculation` above (the
+        // one intentional exception to the #856/#915 unified
+        // empty-prompt-Err contract, tracked for a fallible signature at
+        // https://github.com/ohdearquant/lattice/issues/916, targets
+        // 0.7.0). If/when that issue lands, this assertion flips to
+        // expect `Err(InferenceError::Inference("empty prompt"))`.
         let out = generate_with_speculation(&[], 8, 999, |_tok, _pos| vec![0.0; 4], 3, 4);
         assert!(out.is_empty());
     }

@@ -62,9 +62,9 @@ impl Qwen35Model {
         let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
         let prompt_len = prompt_ids.len();
 
-        if prompt_len == 0 {
-            return Err(InferenceError::Inference("empty prompt".into()));
-        }
+        // #856: single shared preflight, see `check_prompt_not_empty` (same
+        // module) for the full CPU/Metal unification rationale.
+        check_prompt_not_empty(prompt_len)?;
 
         // max_new_tokens == 0 means "generate nothing": return before sampling so
         // we never emit a token the caller did not ask for. Mirrors the identical
@@ -467,9 +467,9 @@ impl Qwen35Model {
         let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
         let prompt_len = prompt_ids.len();
 
-        if prompt_len == 0 {
-            return Err(InferenceError::Inference("empty prompt".into()));
-        }
+        // #856: single shared preflight, see `check_prompt_not_empty` (same
+        // module) for the full CPU/Metal unification rationale.
+        check_prompt_not_empty(prompt_len)?;
 
         // max_new_tokens == 0 means "generate nothing": return before sampling so
         // we never emit a token the caller did not ask for.
@@ -2197,6 +2197,36 @@ pub(crate) fn check_mtp_not_requested(gen_cfg: &GenerateConfig) -> Result<(), In
     Ok(())
 }
 
+/// Preflight guard unifying the empty-prompt contract across every Qwen3.5
+/// generation entry point (#856).
+///
+/// Before this fix, `docs/generation-entrypoint-matrix.md` row 2 recorded a
+/// hard behavior split: the three CPU forward paths (`generate_f16`,
+/// `generate_q8`, `generate_q8_neon`) rejected an empty prompt with this
+/// same typed `Err`, inline and duplicated per file, while the four Metal
+/// paths (`MetalQwen35State::generate`, `generate_streaming` /
+/// `generate_streaming_with_cancel`, and
+/// `generate_streaming_with_prefix_cache_and_cancel`) silently accepted it
+/// and returned a normal-looking empty `Ok(GenerateOutput { stopped: false,
+/// stop_reason: None, .. })` — a result shape that is itself
+/// invariant-violating (a "completed" generation that neither stopped nor
+/// gives a reason). Maintainer sign-off on the matrix (PR #855) ruled this
+/// unify on the CPU behavior; this function is that shared preflight, and
+/// every one of the seven entry points now calls it instead of carrying its
+/// own inline `if prompt_len == 0` copy.
+///
+/// Unlike the `check_*_not_set` siblings above (which reject an unsupported
+/// *config field*), this guard rejects the *input*: `prompt_len` is the
+/// tokenized prompt length every call site already computes before any
+/// state allocation, so this call replaces each site's own inline check
+/// rather than adding a new one alongside it.
+pub(crate) fn check_prompt_not_empty(prompt_len: usize) -> Result<(), InferenceError> {
+    if prompt_len == 0 {
+        return Err(InferenceError::Inference("empty prompt".into()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2592,6 +2622,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // check_prompt_not_empty (#856) — the shared empty-prompt preflight every
+    // one of the seven CPU/Metal generation entry points now calls instead of
+    // its own inline `if prompt_len == 0` copy. Pure-function unit tests
+    // here; per-entry-point production-seam tests live alongside each real
+    // call site (cpu_f16.rs, cpu_q8.rs, neon_forward.rs,
+    // forward/metal_qwen35.rs) and `qwen35_model_generate_rejects_empty_prompt`
+    // below, which exercises this exact function through `Qwen35Model::generate`.
+    // -----------------------------------------------------------------------
+
+    /// Mutation sensitivity: change `check_prompt_not_empty` to always return
+    /// `Ok(())` → this assertion fails, catching a regression that would let
+    /// an empty prompt silently pass through every entry point that calls it
+    /// (the CPU-vs-Metal split #856 fixes).
+    #[test]
+    fn check_prompt_not_empty_rejects_zero() {
+        let result = check_prompt_not_empty(0);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(ref msg)) if msg.contains("empty prompt")),
+            "prompt_len == 0 must be rejected with Err(Inference(\"empty prompt\")); got {result:?}"
+        );
+    }
+
+    /// Mutation sensitivity: change the guard to always return `Err(..)` →
+    /// this assertion fails, catching a regression that would reject every
+    /// non-empty-prompt caller too.
+    #[test]
+    fn check_prompt_not_empty_allows_nonzero() {
+        assert!(
+            check_prompt_not_empty(1).is_ok(),
+            "prompt_len == 1 (a real prompt) must be allowed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // StopReason mutation-sensitive tests (#456)
     // -----------------------------------------------------------------------
     //
@@ -2772,6 +2836,35 @@ mod tests {
         assert_eq!(
             result.generated_tokens, 0,
             "zero max_new_tokens must produce no tokens"
+        );
+    }
+
+    /// `Qwen35Model::generate` must reject an empty prompt with a typed
+    /// `Err` via the shared `check_prompt_not_empty` guard (#856) -- this is
+    /// a bonus dedup alongside the seven audited entry points: this
+    /// function already had this exact behavior before #856 (it is not one
+    /// of the CPU-vs-Metal divergent paths), but its inline check is now
+    /// routed through the same shared preflight rather than carrying its
+    /// own duplicate copy, so this test also proves that wiring.
+    ///
+    /// Mutation sensitivity: reverting this call site back to a no-op (or
+    /// removing it) lets an empty prompt reach `all_ids.last()` in the
+    /// decode loop with a zero-length prompt, which either panics or
+    /// silently generates from no context -- `result.is_err()` fails either
+    /// way.
+    #[test]
+    fn qwen35_model_generate_rejects_empty_prompt() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 4,
+            temperature: 0.0,
+            ..Default::default()
+        };
+        let result = model.generate("", &gen_cfg);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(ref msg)) if msg.contains("empty prompt")),
+            "Qwen35Model::generate must reject an empty prompt with \
+             Err(Inference(\"empty prompt\")); got {result:?}"
         );
     }
 
