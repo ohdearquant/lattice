@@ -48,7 +48,7 @@ pub mod utils {
     ///
     /// Computes cosine similarity through the SIMD dispatcher.
     /// Returns `0.0` for empty, unequal-length, or zero-norm vectors.
-    /// See [`docs/design.md`] (§Vector utility facade) for dispatch and performance details.
+    /// See `docs/design.md` (§Vector utility facade) for dispatch and performance details.
     #[inline]
     pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         simd::cosine_similarity(a, b)
@@ -58,7 +58,7 @@ pub mod utils {
     ///
     /// Computes the dot product of two vectors through the SIMD dispatcher.
     /// Returns `0.0` for unequal-length vectors; for unit vectors it equals cosine similarity.
-    /// See [`docs/design.md`] (§Vector utility facade) for dispatch and performance details.
+    /// See `docs/design.md` (§Vector utility facade) for dispatch and performance details.
     #[inline]
     pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
         simd::dot_product(a, b)
@@ -68,7 +68,7 @@ pub mod utils {
     ///
     /// L2-normalizes a vector in place through the SIMD dispatcher.
     /// Leaves zero- or NaN-norm vectors unchanged.
-    /// See [`docs/design.md`] (§Vector utility facade) for dispatch and examples.
+    /// See `docs/design.md` (§Vector utility facade) for dispatch and examples.
     #[inline]
     pub fn normalize(vector: &mut [f32]) {
         simd::normalize(vector)
@@ -78,7 +78,7 @@ pub mod utils {
     ///
     /// Computes Euclidean distance between two vectors through the SIMD dispatcher.
     /// Returns `f32::MAX` for unequal-length vectors.
-    /// See [`docs/design.md`] (§Vector utility facade) for dispatch and examples.
+    /// See `docs/design.md` (§Vector utility facade) for dispatch and examples.
     #[inline]
     pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
         simd::euclidean_distance(a, b)
@@ -87,7 +87,7 @@ pub mod utils {
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
     /// Computes cosine similarities for vector pairs in input order.
-    /// See [`docs/design.md`] (§Vector utility facade) for batch-dispatch behavior.
+    /// See `docs/design.md` (§Vector utility facade) for batch-dispatch behavior.
     #[inline]
     pub fn batch_cosine_similarity(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
         simd::batch_cosine_similarity(pairs)
@@ -96,7 +96,7 @@ pub mod utils {
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
     /// Computes dot products for vector pairs in input order.
-    /// See [`docs/design.md`] (§Vector utility facade) for batch-dispatch behavior.
+    /// See `docs/design.md` (§Vector utility facade) for batch-dispatch behavior.
     #[inline]
     pub fn batch_dot_product(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
         simd::batch_dot_product(pairs)

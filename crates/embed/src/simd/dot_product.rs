@@ -185,7 +185,7 @@ fn dot_product_simd128_kernel(a: &[f32], b: &[f32]) -> f32 {
 
 /// Computes the float dot product, returning `0.0` for a dimensional mismatch.
 ///
-/// See [`docs/simd.md`] (§Public API contracts) for ANN and normalization semantics.
+/// See `docs/simd.md` (§Public API contracts) for ANN and normalization semantics.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     // Runtime length check to prevent UB in release builds
@@ -206,7 +206,7 @@ pub(crate) fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX-512F and equal slices; chunked unaligned loads stay in bounds.
-/// See [`docs/simd.md`] (§Kernel safety boundary) for the shared kernel invariant.
+/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn dot_product_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -291,7 +291,7 @@ pub(crate) unsafe fn horizontal_sum_avx512(v: __m512) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX2/FMA and equal slices; chunked unaligned loads stay in bounds.
-/// See [`docs/simd.md`] (§Kernel safety boundary) for the shared kernel invariant.
+/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
@@ -387,7 +387,7 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX2/FMA and two 384-element slices.
-/// See [`docs/simd.md`] (§Dot product) for the specialization rationale.
+/// See `docs/simd.md` (§Dot product) for the specialization rationale.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_384_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -509,7 +509,7 @@ fn dot_product_batch4_avx2_kernel(
 ///
 /// # Safety
 /// Caller must provide AVX2/FMA and five 384-element slices.
-/// See [`docs/simd.md`] (§Dot product) for the batch-kernel layout.
+/// See `docs/simd.md` (§Dot product) for the batch-kernel layout.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_384_batch4_avx2(
@@ -561,7 +561,7 @@ unsafe fn dot_product_384_batch4_avx2(
 ///
 /// # Safety
 /// Caller must provide AVX2/FMA and five equal-length slices; bounds are chunked.
-/// See [`docs/simd.md`] (§Dot product) for the reuse and accumulator strategy.
+/// See `docs/simd.md` (§Dot product) for the reuse and accumulator strategy.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_batch4_avx2(
@@ -624,7 +624,7 @@ unsafe fn dot_product_batch4_avx2(
 ///
 /// # Safety
 /// Caller must run on aarch64 with equal slices; chunked loads stay in bounds.
-/// See [`docs/simd.md`] (§Kernel safety boundary) for the shared kernel invariant.
+/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -707,7 +707,7 @@ pub(crate) unsafe fn horizontal_sum_neon(v: float32x4_t) -> f32 {
 ///
 /// # Safety
 /// This function requires compile-time SIMD128 and equal slices; bounds are chunked.
-/// See [`docs/simd.md`] (§Kernel safety boundary) for wasm and reassociation semantics.
+/// See `docs/simd.md` (§Kernel safety boundary) for wasm and reassociation semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn dot_product_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -814,7 +814,7 @@ fn dot_product_batch4_neon_kernel(
 ///
 /// # Safety
 /// Caller must run on aarch64 with five equal-length slices; bounds are chunked.
-/// See [`docs/simd.md`] (§Dot product) for the reuse and accumulator strategy.
+/// See `docs/simd.md` (§Dot product) for the reuse and accumulator strategy.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_product_batch4_neon(

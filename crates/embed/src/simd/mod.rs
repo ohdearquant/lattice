@@ -64,7 +64,7 @@ pub struct SimdConfig {
     pub neon_enabled: bool,
     /// **Unstable**: whether aarch64 FEAT_DotProd is available for SDOT/UDOT dispatch.
     ///
-    /// Always false off aarch64. See [`docs/simd.md`] (§Dispatch model) for availability rules.
+    /// Always false off aarch64. See `docs/simd.md` (§Dispatch model) for availability rules.
     pub dotprod_enabled: bool,
 }
 
@@ -141,7 +141,7 @@ impl SimdConfig {
 
     /// **Unstable**: reports whether this wasm32 artifact was built with SIMD128.
     ///
-    /// See [`docs/simd.md`] (§Dispatch model) for the compile-time dispatch model.
+    /// See `docs/simd.md` (§Dispatch model) for the compile-time dispatch model.
     #[inline]
     pub fn simd128_enabled(&self) -> bool {
         cfg!(all(target_arch = "wasm32", target_feature = "simd128"))
