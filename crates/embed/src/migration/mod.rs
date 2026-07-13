@@ -1,7 +1,7 @@
-//! Migration module: state machine for embedding model migration.
-//!
-//! Provides the [`MigrationController`] state machine, migration plan types,
-//! and progress tracking for embedding model migrations.
+//! Migration module: state machine for embedding model migration. Provides the
+//! [`MigrationController`] state machine, migration plan types, and progress tracking. See
+//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/embed/docs/design.md)
+//! for how this fits into the wider [`crate::backfill`] workflow.
 //!
 //! # Quick Start
 //!
