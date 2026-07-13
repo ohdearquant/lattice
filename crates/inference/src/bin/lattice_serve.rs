@@ -1633,6 +1633,23 @@ mod imp {
             .cloned()
     }
 
+    /// Parses `--max-pending`, rejecting a malformed or negative value
+    /// outright instead of silently substituting the default (issue #939):
+    /// the prior `.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT)` chain
+    /// could not distinguish "flag omitted" from "flag given garbage" --
+    /// `--max-pending -1` silently became `32`. Range validation (zero, or
+    /// above `Semaphore::MAX_PERMITS`) is deliberately NOT duplicated here:
+    /// it happens once, downstream, in `MetalWorker::spawn`
+    /// (`StartupError::InvalidMaxPending`), shared with `lattice.rs`.
+    fn parse_max_pending(args: &[String]) -> Result<usize, String> {
+        match parse_arg(args, "--max-pending") {
+            Some(raw) => raw.parse::<usize>().map_err(|_| {
+                format!("--max-pending: invalid value {raw:?} (expected a positive integer)")
+            }),
+            None => Ok(lattice_inference::serve::metal_worker::DEFAULT_MAX_PENDING_JOBS),
+        }
+    }
+
     fn default_model_cache() -> std::path::PathBuf {
         std::env::var("LATTICE_MODEL_CACHE")
             .map(std::path::PathBuf::from)
@@ -1734,9 +1751,7 @@ mod imp {
         // `metal_worker::DEFAULT_MAX_PENDING_JOBS`'s doc comment for why a
         // conservative default is correct even though this binary only ever
         // runs one generation at a time.
-        let max_pending: usize = parse_arg(&args, "--max-pending")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(lattice_inference::serve::metal_worker::DEFAULT_MAX_PENDING_JOBS);
+        let max_pending: usize = parse_max_pending(&args)?;
 
         eprintln!(
             "[lattice_serve] loading model from {} ({}) ...",
@@ -1790,6 +1805,11 @@ mod imp {
             // exited/panicked before ever sending a readiness signal.
             Err(StartupError::ThreadExited) => {
                 return Err("worker thread exited during model load".into());
+            }
+            // #939: zero, or above `Semaphore::MAX_PERMITS` -- a
+            // configuration error caught before `Semaphore::new` panics.
+            Err(err @ StartupError::InvalidMaxPending { .. }) => {
+                return Err(err.to_string().into());
             }
         };
         // Retains the worker thread's `JoinHandle` for the life of the
@@ -2087,6 +2107,67 @@ mod imp {
         #[test]
         fn model_context_falls_back_to_4096_when_absent() {
             assert_eq!(model_context_from_config(None), FALLBACK_MODEL_MAX_CONTEXT);
+        }
+
+        // ── #939 `--max-pending` daemon-arg boundary tests ────────────────
+        //
+        // `parse_max_pending` only rejects a MALFORMED string here (this
+        // binary's own hand-rolled argv parser, unlike `lattice.rs`'s clap
+        // `value_parser`); zero and above-`Semaphore::MAX_PERMITS` are valid
+        // `usize`s that parse fine and are instead caught once, downstream,
+        // by `MetalWorker::spawn`'s own `StartupError::InvalidMaxPending`
+        // (covered by that module's own boundary tests).
+
+        #[test]
+        fn max_pending_omitted_defaults_to_32() {
+            let args: Vec<String> = vec![];
+            assert_eq!(
+                parse_max_pending(&args).expect("no --max-pending flag"),
+                lattice_inference::serve::metal_worker::DEFAULT_MAX_PENDING_JOBS,
+            );
+        }
+
+        #[test]
+        fn max_pending_valid_override_is_accepted() {
+            let args: Vec<String> = vec!["--max-pending".to_string(), "8".to_string()];
+            assert_eq!(parse_max_pending(&args).expect("8 is well-formed"), 8);
+        }
+
+        #[test]
+        fn max_pending_negative_is_rejected_not_silently_defaulted() {
+            let args: Vec<String> = vec!["--max-pending".to_string(), "-1".to_string()];
+            let err = parse_max_pending(&args)
+                .expect_err("-1 must be rejected, not silently replaced by the default");
+            assert!(
+                err.contains("-1"),
+                "error must name the offending value: {err}"
+            );
+        }
+
+        #[test]
+        fn max_pending_malformed_is_rejected_not_silently_defaulted() {
+            let args: Vec<String> = vec!["--max-pending".to_string(), "not-a-number".to_string()];
+            let err = parse_max_pending(&args)
+                .expect_err("a non-numeric value must be rejected, not silently replaced");
+            assert!(
+                err.contains("not-a-number"),
+                "error must name the offending value: {err}"
+            );
+        }
+
+        #[test]
+        fn max_pending_zero_parses_ok_and_is_left_to_metal_worker_spawn_to_reject() {
+            // Zero is a syntactically valid `usize` -- `parse_max_pending`
+            // itself does not range-check it (that check lives once, in
+            // `MetalWorker::spawn`, shared with `lattice.rs`). This test
+            // pins that division of responsibility down: it must NOT start
+            // rejecting zero itself without `MetalWorker::spawn`'s own
+            // boundary tests changing too.
+            let args: Vec<String> = vec!["--max-pending".to_string(), "0".to_string()];
+            assert_eq!(
+                parse_max_pending(&args).expect("0 parses as a valid usize"),
+                0
+            );
         }
 
         // ── HTTP-level 400 tests ──────────────────────────────────────────

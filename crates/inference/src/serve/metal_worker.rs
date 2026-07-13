@@ -131,12 +131,21 @@ enum WorkerFailure {
 }
 
 /// Worker startup failure: either the `loader` itself returned `Err`
-/// (model/tokenizer load failure), or the worker thread exited/panicked
-/// before ever sending a readiness signal.
+/// (model/tokenizer load failure), the worker thread exited/panicked
+/// before ever sending a readiness signal, or the requested admission cap
+/// (issue #939) was outside `Semaphore::new`'s valid range.
 #[derive(Debug)]
 pub enum StartupError {
     Load(String),
     ThreadExited,
+    /// `max_pending` was `0` (admits nothing -- every request would fail
+    /// admission before any generation work could ever run) or greater
+    /// than `Semaphore::MAX_PERMITS` (`Semaphore::new` panics outright on
+    /// such a value). Caught here, before `Semaphore::new` is ever called,
+    /// as an ordinary configuration error instead of a startup panic.
+    InvalidMaxPending {
+        max_pending: usize,
+    },
 }
 
 impl std::fmt::Display for StartupError {
@@ -146,6 +155,11 @@ impl std::fmt::Display for StartupError {
             StartupError::ThreadExited => {
                 write!(f, "worker thread exited before loading finished")
             }
+            StartupError::InvalidMaxPending { max_pending } => write!(
+                f,
+                "--max-pending must be between 1 and {} (got {max_pending})",
+                Semaphore::MAX_PERMITS
+            ),
         }
     }
 }
@@ -420,6 +434,12 @@ impl MetalWorker {
         + 'static,
         max_pending: usize,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
+        // #939: validate BEFORE `Semaphore::new`, which panics outright for
+        // `max_pending > Semaphore::MAX_PERMITS` and would otherwise let
+        // `max_pending == 0` silently build a worker that admits nothing.
+        if max_pending == 0 || max_pending > Semaphore::MAX_PERMITS {
+            return Err(StartupError::InvalidMaxPending { max_pending });
+        }
         let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
         let admission = Arc::new(Semaphore::new(max_pending));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WorkerMetadata, String>>();
@@ -1173,6 +1193,52 @@ mod tests {
             StartupError::ThreadExited.to_string(),
             "worker thread exited before loading finished"
         );
+        assert_eq!(
+            StartupError::InvalidMaxPending { max_pending: 0 }.to_string(),
+            format!(
+                "--max-pending must be between 1 and {} (got 0)",
+                Semaphore::MAX_PERMITS
+            )
+        );
+    }
+
+    // ── #939 max_pending boundary tests ───────────────────────────────────
+    //
+    // Validated BEFORE `Semaphore::new` in `MetalWorker::spawn`, so -- like
+    // `loader_failure_before_readiness_is_reported_without_touching_a_device`
+    // above -- these never construct a real `MetalQwen35State` and need no
+    // GPU: an out-of-range `max_pending` returns `Err` before `loader` would
+    // even be called (a loader that panics if invoked proves that).
+
+    #[test]
+    fn max_pending_zero_is_rejected_before_semaphore_new() {
+        let result = MetalWorker::spawn(
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> {
+                panic!("loader must not run: max_pending=0 must be rejected first")
+            },
+            0,
+        );
+        match result {
+            Err(StartupError::InvalidMaxPending { max_pending: 0 }) => {}
+            other => panic!("expected InvalidMaxPending{{max_pending: 0}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_pending_above_max_permits_is_rejected_before_semaphore_new() {
+        let too_big = Semaphore::MAX_PERMITS + 1;
+        let result = MetalWorker::spawn(
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> {
+                panic!("loader must not run: max_pending above MAX_PERMITS must be rejected first")
+            },
+            too_big,
+        );
+        match result {
+            Err(StartupError::InvalidMaxPending { max_pending }) => {
+                assert_eq!(max_pending, too_big);
+            }
+            other => panic!("expected InvalidMaxPending, got {other:?}"),
+        }
     }
 
     // ── check_prompt_fits_window, ported from lattice_serve.rs's
@@ -1502,28 +1568,44 @@ mod tests {
             other => panic!("expected job 2's exactly-one Cancelled event, got {other:?}"),
         }
 
-        // The slot must now be free: a 4th submission must succeed without
-        // needing job 1 (already finished) or anything else to release
-        // more capacity.
-        let mut admitted = false;
+        // The slot must now be free -- and specifically BOTH slots, not
+        // just one. A single successful 4th admission (the original form
+        // of this assertion) does not distinguish "job 2's queued-cancel
+        // path correctly released its own permit" from "only job 1's
+        // ordinary completion released a permit and job 2's leaked": at
+        // this point job 1 has already finished (releasing one permit
+        // unconditionally, regression or not), so a leak confined to job
+        // 2's queued-cancel path still leaves exactly one usable permit --
+        // enough for one admission to spuriously succeed. Poll the
+        // semaphore's own count directly (this test module is a child of
+        // `metal_worker`, so `client.admission` -- private outside this
+        // file -- is visible here) rather than relying on dequeue timing
+        // for a second, indirect proof.
+        let mut permits_restored = false;
         for _ in 0..50 {
-            let (_guard4, cancel4) = crate::serve::cancel_pair();
-            match client.submit(
+            if client.admission.available_permits() == cap {
+                permits_restored = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            permits_restored,
+            "both permits (job 1's own release AND job 2's queued-cancel release) must be \
+             free once job 2's Cancelled event has fired, got {} of {cap}",
+            client.admission.available_permits()
+        );
+
+        // And the caller-observable contract still holds: a fresh
+        // admission at full cap succeeds.
+        let (_guard4, cancel4) = crate::serve::cancel_pair();
+        client
+            .submit(
                 vec![ChatMessage::user("hi")],
                 GenerateConfig::default(),
                 cancel4,
-            ) {
-                Ok(_rx4) => {
-                    admitted = true;
-                    break;
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(5)),
-            }
-        }
-        assert!(
-            admitted,
-            "job 2's slot must be released after its Cancelled event, not leaked"
-        );
+            )
+            .expect("job 2's slot must be released after its Cancelled event, not leaked");
 
         drop(rx1);
         drop(client);

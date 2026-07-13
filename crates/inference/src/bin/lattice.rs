@@ -66,7 +66,17 @@ enum Command {
         /// no shared worker queue to bound. Conservative default: this
         /// worker serializes all generation onto one dedicated thread, so a
         /// deep queue just means memory growth with no throughput benefit.
-        #[arg(long, default_value = "32")]
+        /// Must be between 1 and `tokio::sync::Semaphore::MAX_PERMITS`
+        /// (issue #939): zero would admit nothing (every request fails
+        /// admission), and clap rejects anything larger here instead of
+        /// deferring to `MetalWorker::spawn`'s own
+        /// `Semaphore::new`-precondition panic.
+        #[arg(
+            long,
+            default_value = "32",
+            value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+                .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
+        )]
         max_pending: usize,
     },
     /// Preflight check: memory fit and artifact compatibility, without
@@ -86,6 +96,78 @@ enum Command {
         #[arg(long)]
         tokenizer_dir: Option<String>,
     },
+}
+
+// ─── #939 CLI boundary tests: `--max-pending` range validation ────────────
+//
+// clap's own `value_parser!(usize).range(1..=Semaphore::MAX_PERMITS)` on the
+// `Serve::max_pending` field (above) is the ONLY validation this binary
+// needs for zero / too-large values -- unlike `lattice_serve.rs`'s hand
+// rolled argv parser, clap already rejects a malformed string (`abc`,
+// `-1`) itself, before this range check ever runs. These tests exercise
+// that `value_parser` wiring directly through `Cli::try_parse_from`,
+// rather than duplicating the range logic anywhere in this binary.
+#[cfg(test)]
+mod max_pending_cli_tests {
+    use super::*;
+
+    fn parse_max_pending(args: &[&str]) -> Result<usize, clap::Error> {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.command {
+            Command::Serve { max_pending, .. } => Ok(max_pending),
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    #[test]
+    fn max_pending_omitted_defaults_to_32() {
+        assert_eq!(parse_max_pending(&[]).expect("no --max-pending"), 32);
+    }
+
+    #[test]
+    fn max_pending_zero_is_rejected() {
+        parse_max_pending(&["--max-pending", "0"])
+            .expect_err("0 admits nothing and must be rejected, not silently accepted");
+    }
+
+    #[test]
+    fn max_pending_one_above_max_permits_is_rejected() {
+        let too_big = (tokio::sync::Semaphore::MAX_PERMITS as u128 + 1).to_string();
+        parse_max_pending(&["--max-pending", &too_big]).expect_err(
+            "Semaphore::MAX_PERMITS + 1 must be rejected before it can panic Semaphore::new",
+        );
+    }
+
+    #[test]
+    fn max_pending_at_max_permits_is_accepted() {
+        let at_max = tokio::sync::Semaphore::MAX_PERMITS.to_string();
+        assert_eq!(
+            parse_max_pending(&["--max-pending", &at_max])
+                .expect("Semaphore::MAX_PERMITS itself is the inclusive upper bound"),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+    }
+
+    #[test]
+    fn max_pending_negative_is_rejected() {
+        parse_max_pending(&["--max-pending", "-1"])
+            .expect_err("a negative value must be rejected, not silently defaulted");
+    }
+
+    #[test]
+    fn max_pending_malformed_is_rejected() {
+        parse_max_pending(&["--max-pending", "not-a-number"])
+            .expect_err("a non-numeric value must be rejected, not silently defaulted");
+    }
+
+    #[test]
+    fn max_pending_valid_override_is_accepted() {
+        assert_eq!(
+            parse_max_pending(&["--max-pending", "8"]).expect("8 is a valid cap"),
+            8
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2535,16 +2617,56 @@ mod serve {
             &self,
             messages: Vec<ChatMessage>,
             gen_cfg: GenerateConfig,
-            mut on_token: impl FnMut(&str) -> bool + Send + 'static,
+            on_token: impl FnMut(&str) -> bool + Send + 'static,
             cancel: tokio::sync::watch::Receiver<bool>,
         ) -> Result<GenerateOutput, ApiError> {
-            use lattice_inference::serve::metal_worker::WorkerEvent;
-
             // #932: the ONE way `MetalWorkerClient::submit` fails outwardly
             // -- the shared worker's outstanding-job admission cap is full.
             // Surfaces as an ordinary `ApiError::ServiceUnavailable` (503),
             // exactly like any other `Err` this method already returns.
-            let mut rx = self.client.submit(messages, gen_cfg, cancel)?;
+            let mut rx = self.submit(messages, gen_cfg, cancel)?;
+            Self::drain(&mut rx, on_token).await
+        }
+
+        /// Admission-only half of [`Self::generate_streaming_with_cancel`]
+        /// (#939): runs `MetalWorkerClient::submit`'s synchronous admission
+        /// check (issue #932's `Semaphore::try_acquire_owned`) and returns
+        /// immediately, before any event is drained from the worker.
+        ///
+        /// Split out so `chat_completions`'s streaming arm can call this
+        /// directly -- and propagate `Err(ApiError::ServiceUnavailable)`
+        /// with `?` -- BEFORE building and returning the SSE response,
+        /// instead of discovering admission failure only after a detached
+        /// `tokio::spawn` task (which may not even have started running
+        /// yet) reaches this call. Draining is [`Self::drain`], called
+        /// separately once the response has been committed.
+        fn submit(
+            &self,
+            messages: Vec<ChatMessage>,
+            gen_cfg: GenerateConfig,
+            cancel: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<
+            tokio::sync::mpsc::UnboundedReceiver<
+                lattice_inference::serve::metal_worker::WorkerEvent,
+            >,
+            ApiError,
+        > {
+            self.client.submit(messages, gen_cfg, cancel)
+        }
+
+        /// Drains a receiver obtained from [`Self::submit`], forwarding
+        /// token deltas to `on_token` and normalizing
+        /// `WorkerEvent::Cancelled` -- exactly the loop
+        /// `generate_streaming_with_cancel` ran inline before admission was
+        /// split out of it (#939).
+        async fn drain(
+            rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+                lattice_inference::serve::metal_worker::WorkerEvent,
+            >,
+            mut on_token: impl FnMut(&str) -> bool + Send + 'static,
+        ) -> Result<GenerateOutput, ApiError> {
+            use lattice_inference::serve::metal_worker::WorkerEvent;
+
             let mut deliver_deltas = true;
             loop {
                 let Some(ev) = rx.recv().await else {
@@ -2733,6 +2855,12 @@ mod serve {
                 StartupError::ThreadExited => {
                     "Metal worker thread exited before loading finished".to_string()
                 }
+                // #939: clap's own `value_parser` range already rejects an
+                // out-of-range `--max-pending` before this call, so this
+                // arm is unreachable in practice through the CLI -- kept
+                // for exhaustiveness and as defense in depth against any
+                // other future `spawn_metal` caller.
+                err @ StartupError::InvalidMaxPending { .. } => err.to_string(),
             })?;
             // `owner` (and the `JoinHandle` it carries) is dropped here,
             // immediately: this binary's prior `MetalHandle::spawn` never
@@ -3804,20 +3932,23 @@ mod serve {
                 }
                 #[cfg(feature = "metal-gpu")]
                 ModelBackend::Metal { handle, .. } => {
+                    // #939: submit synchronously, before any SSE response is
+                    // built. `handle.submit` runs `MetalWorkerClient::submit`'s
+                    // admission check (#932) directly on this task -- not
+                    // inside the `tokio::spawn` below -- so an admission
+                    // rejection propagates via `?` as an ordinary
+                    // `ApiError::ServiceUnavailable` (503) before this
+                    // handler ever returns `Sse::new(...)`. Only draining the
+                    // already-admitted job happens in the detached task.
+                    let mut rx = handle.submit(chat_messages, gen_cfg, cancel_rx)?;
                     tokio::spawn(async move {
                         let tx_delta = tx.clone();
-                        let result = handle
-                            .generate_streaming_with_cancel(
-                                chat_messages,
-                                gen_cfg,
-                                move |delta| {
-                                    tx_delta
-                                        .unbounded_send(StreamMsg::Delta(delta.to_string()))
-                                        .is_ok()
-                                },
-                                cancel_rx,
-                            )
-                            .await;
+                        let result = MetalHandle::drain(&mut rx, move |delta| {
+                            tx_delta
+                                .unbounded_send(StreamMsg::Delta(delta.to_string()))
+                                .is_ok()
+                        })
+                        .await;
                         match result {
                             Ok(output) => finish_streaming(output),
                             Err(e) => {
@@ -3981,10 +4112,20 @@ mod serve {
                 ModelBackend::Metal { handle, .. } => handle
                     .generate_streaming(chat_messages, gen_cfg, |_delta| true)
                     .await
-                    .map_err(|e| {
-                        eprintln!("generation error (metal): {e:?}");
-                        ApiError::Internal {
-                            message: "inference failed".to_string(),
+                    .map_err(|e| match e {
+                        // #939: admission rejection (#932's outstanding-job
+                        // cap) must surface as the shared 503 `server_busy`
+                        // envelope unchanged -- collapsing it into
+                        // `ApiError::Internal` here made every non-streaming
+                        // Metal admission rejection an indistinguishable 500.
+                        ApiError::ServiceUnavailable { message } => {
+                            ApiError::ServiceUnavailable { message }
+                        }
+                        other => {
+                            eprintln!("generation error (metal): {other:?}");
+                            ApiError::Internal {
+                                message: "inference failed".to_string(),
+                            }
                         }
                     })?,
                 // ADR-080 C2 added
@@ -4114,6 +4255,219 @@ mod serve {
             }
             let (client, _jobs_rx) = lattice_inference::serve::metal_worker::test_client_and_jobs();
             let _handle: MetalHandle = build_from_shared_client(client);
+        }
+
+        /// #939 regression coverage: the unified `lattice serve` HTTP
+        /// adapter's admission ordering. Before this fix, the Metal
+        /// streaming arm called `MetalWorkerClient::submit` (the ONE way
+        /// admission (#932) can reject a request) INSIDE a detached
+        /// `tokio::spawn` task, after `chat_completions` had already
+        /// returned `Sse::new(...).into_response()` -- so an admission
+        /// rejection surfaced as a normal-looking stream that immediately
+        /// ended, never as HTTP 503. The non-streaming arm separately
+        /// collapsed `ApiError::ServiceUnavailable` into a generic 500. Both
+        /// arms are driven here through the REAL `router()` + a real
+        /// worker thread (`spawn_fake_with_cap`, cap=1, `generate` blocked
+        /// on a channel so exactly one request is provably "in flight"),
+        /// mirroring `lattice_serve.rs`'s own
+        /// `real_router_admission_cap::chat_completions_returns_503_json_envelope_when_admission_cap_reached`
+        /// -- that test alone did not catch this bug because it only
+        /// covers the daemon's separate, already-correct adapter.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        mod admission_cap_939 {
+            use super::*;
+            use axum::body::Body;
+            use axum::http::StatusCode;
+            use lattice_inference::serve::metal_worker::{
+                ContextWindowPolicy, spawn_fake_with_cap,
+            };
+            use std::sync::mpsc as std_mpsc;
+            use tower::ServiceExt as _;
+
+            /// A real (if tiny) tokenizer -- NOT a hand-rolled minimal
+            /// vocab. `lattice_serve.rs`'s equivalent
+            /// `real_router_admission_cap::single_slot_blocking_state` uses
+            /// the same `test_support::tiny_zero_model` tokenizer for
+            /// exactly this reason: a hand-rolled single-entry vocab (e.g.
+            /// just `{"hi": 0}`) lacks the byte-level fallback tokens a
+            /// real BPE tokenizer's byte-encoder table relies on, so
+            /// tokenizing the full rendered ChatML prompt against it can
+            /// silently misbehave in ways a real tokenizer never does.
+            fn tiny_tokenizer() -> lattice_inference::tokenizer::bpe::BpeTokenizer {
+                lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone()
+            }
+
+            /// A real worker thread (cap=1) whose `generate` blocks on
+            /// `unblock_rx.recv()` until the test releases it, so exactly
+            /// one request can be "in flight" for as long as the test
+            /// needs -- long enough to prove a second concurrent request is
+            /// rejected by admission rather than racing to observe an
+            /// already-freed slot. Mirrors `lattice_serve.rs`'s
+            /// `real_router_admission_cap::single_slot_blocking_state`.
+            fn single_slot_blocking_state()
+            -> (AppState, std_mpsc::Sender<()>, std_mpsc::Receiver<()>) {
+                let (unblock_tx, unblock_rx) = std_mpsc::channel::<()>();
+                let unblock_rx = std::sync::Mutex::new(unblock_rx);
+                let (started_tx, started_rx) = std_mpsc::channel::<()>();
+                let client = spawn_fake_with_cap(
+                    1,
+                    ContextWindowPolicy::PromptAndMaxTokens,
+                    4096,
+                    tiny_tokenizer(),
+                    move |_messages, _cfg, prompt_tokens, _on_token, _should_cancel| {
+                        let _ = started_tx.send(());
+                        // Blocks the dedicated fake-worker OS thread (not
+                        // the tokio runtime) until the test explicitly lets
+                        // it proceed.
+                        let _ = unblock_rx.lock().unwrap().recv();
+                        Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: None,
+                            token_logprobs: vec![],
+                        })
+                    },
+                );
+                let state = AppState {
+                    model: ModelBackend::Metal {
+                        handle: MetalHandle { client },
+                        tokenizer: Arc::new(tiny_tokenizer()),
+                        max_context: 4096,
+                    },
+                    default_max_tokens: 16,
+                    max_tokens_cap: 4096,
+                    model_id: "test-model".to_string(),
+                    request_counter: Arc::new(AtomicU64::new(0)),
+                };
+                (state, unblock_tx, started_rx)
+            }
+
+            fn chat_request(stream: bool) -> axum::http::Request<Body> {
+                let body = if stream {
+                    r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stream":true}"#
+                } else {
+                    r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#
+                };
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("fixture request must build")
+            }
+
+            /// Asserts the shared 503 `server_busy` JSON envelope, AND that
+            /// no SSE response was ever committed (issue #939's exact
+            /// regression for the streaming arm: a 200 SSE response whose
+            /// body happened to end immediately would previously slip past
+            /// a status-code-only assertion).
+            async fn assert_503_server_busy_no_sse(
+                response: axum::http::Response<Body>,
+                case: &str,
+            ) {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{case}: a request submitted while the admission cap is full must be \
+                     rejected with HTTP 503, fail-fast, before any response -- streaming \
+                     or not -- is committed"
+                );
+                let content_type = response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    !content_type.contains("text/event-stream"),
+                    "{case}: a 503 rejection must never carry an SSE content-type -- that \
+                     would mean a streaming response had already committed before \
+                     admission was checked: {content_type}"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("503 response body must be readable");
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                    panic!("{case}: 503 response must be JSON, not an SSE body: {e}")
+                });
+                assert_eq!(value["error"]["code"], "server_busy", "{case}: {value}");
+                assert_eq!(value["error"]["type"], "server_error", "{case}: {value}");
+                assert!(value["error"]["param"].is_null(), "{case}: {value}");
+                assert!(
+                    !value["error"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .is_empty(),
+                    "{case}: 503 envelope must carry a human-readable message: {value}"
+                );
+            }
+
+            #[tokio::test]
+            async fn chat_completions_streaming_returns_503_before_sse_commit_at_cap() {
+                let (state, unblock_tx, started_rx) = single_slot_blocking_state();
+                let app = router(state);
+
+                let app1 = app.clone();
+                let handle1 = tokio::spawn(async move { app1.oneshot(chat_request(false)).await });
+                tokio::task::spawn_blocking(move || started_rx.recv())
+                    .await
+                    .expect("blocking wait must not panic")
+                    .expect("request 1's worker-thread generate() must signal it started");
+
+                let response2 = app
+                    .clone()
+                    .oneshot(chat_request(true))
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_503_server_busy_no_sse(response2, "stream:true").await;
+
+                unblock_tx.send(()).expect("unblock send must succeed");
+                let response1 = handle1
+                    .await
+                    .expect("request 1's task must not panic")
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(
+                    response1.status(),
+                    StatusCode::OK,
+                    "request 1 itself was never over any cap and must succeed normally"
+                );
+            }
+
+            #[tokio::test]
+            async fn chat_completions_non_streaming_returns_503_server_busy_not_500_at_cap() {
+                let (state, unblock_tx, started_rx) = single_slot_blocking_state();
+                let app = router(state);
+
+                let app1 = app.clone();
+                let handle1 = tokio::spawn(async move { app1.oneshot(chat_request(false)).await });
+                tokio::task::spawn_blocking(move || started_rx.recv())
+                    .await
+                    .expect("blocking wait must not panic")
+                    .expect("request 1's worker-thread generate() must signal it started");
+
+                let response2 = app
+                    .clone()
+                    .oneshot(chat_request(false))
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_503_server_busy_no_sse(response2, "non-streaming").await;
+
+                unblock_tx.send(()).expect("unblock send must succeed");
+                let response1 = handle1
+                    .await
+                    .expect("request 1's task must not panic")
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(
+                    response1.status(),
+                    StatusCode::OK,
+                    "request 1 itself was never over any cap and must succeed normally"
+                );
+            }
         }
 
         #[test]
