@@ -25,6 +25,15 @@ set -euo pipefail
 INFO_GROUPS_ALLOWLIST=(
   "simd_dot_product"
   "simd_cosine_similarity"
+  # Added 2026-07-13: two same-commit A/A runs, each inside an exclusive
+  # machine-wide bench window (/tmp/lion-bench-window.lock), still produced
+  # confirmed-CI FAIL rows (>7%) in these embed micro-groups — with DISJOINT
+  # failing groups across the two runs, the signature of a noise floor above
+  # the quick-mode gate rather than a regression. Evidence tables in the PR
+  # that added these entries.
+  "int8_batch_cosine"
+  "int4_cosine_distance"
+  "simd_batch_cosine_non_normalized_query"
 )
 
 input="${1:-/dev/stdin}"

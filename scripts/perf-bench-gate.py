@@ -425,7 +425,7 @@ def run_selftest() -> int:
         # bench-compare.sh sources for production runs) against a
         # controlled Criterion `--list`-shaped listing, feed its emitted
         # file into the Python classifier, and assert the full
-        # pipeline: only the two approved names come out of the shell step,
+        # pipeline: only the approved names come out of the shell step,
         # and an unapproved embed group, an inference group, and a
         # similarly-prefixed-but-distinct embed group all still gate.
         helper = Path(__file__).resolve().parent / "lib" / "bench-informational-groups.sh"
@@ -443,6 +443,9 @@ def run_selftest() -> int:
                 "simd_normalize/scalar/384: benchmark\n"
                 "simd_dot_product_extra/scalar/384: benchmark\n"
                 "rms_norm/4096: benchmark\n"
+                "int8_batch_cosine/float32_simd/100: benchmark\n"
+                "int4_cosine_distance/int4/768: benchmark\n"
+                "simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c: benchmark\n"
             )
             proc = subprocess.run(
                 ["bash", str(helper), str(listing_file)],
@@ -455,11 +458,17 @@ def run_selftest() -> int:
                 failures.append(
                     f"allowlist-handoff: shell helper exited {proc.returncode}: {proc.stderr}"
                 )
-            elif shell_emitted != {"simd_dot_product", "simd_cosine_similarity"}:
+            elif shell_emitted != {
+                "simd_dot_product",
+                "simd_cosine_similarity",
+                "int8_batch_cosine",
+                "int4_cosine_distance",
+                "simd_batch_cosine_non_normalized_query",
+            }:
                 failures.append(
                     "allowlist-handoff: shell helper emitted "
-                    f"{sorted(shell_emitted)}, expected exactly "
-                    "['simd_cosine_similarity', 'simd_dot_product']"
+                    f"{sorted(shell_emitted)}, expected the five approved "
+                    "allowlist groups"
                 )
             else:
                 allowlist_dir = root / "allowlist"
