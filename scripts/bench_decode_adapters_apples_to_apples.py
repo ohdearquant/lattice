@@ -35,21 +35,27 @@ the harness's PRIMARY reported slope always uses its own wall-clock
 intentional harness invariant (`AdapterRunResult.native_ns` is a diagnostic,
 "never a replacement" for it), not something an adapter can override, so the
 primary slope column is NOT claimed to be byte-for-byte identical to the
-legacy script's per-engine self-timed metric. MLX's primary metric IS an
-exact match regardless: this adapter times nothing beyond `generate()`
-itself (no post-generation retokenization happens inside `run()` at all, see
-`MlxAdapter.run()`), so the harness's wall-clock window equals the legacy
-script's own `t0 = time.time(); generate(...); dt = ...` window exactly,
-model load amortized identically via the same first-call warmup shape.
-Ollama's primary metric is NOT byte-identical to the legacy script's
-`total_duration`-based figure -- the harness's wall clock additionally
-includes the local HTTP round trip's connection/JSON marshalling overhead,
-which the legacy script's own duration source did not -- but the
-legacy-equivalent number is not lost: ollama's `total_duration` (exactly the
-field the legacy script used for its own primary slope, NOT the decode-only
-`eval_duration`) is preserved losslessly via `AdapterRunResult.native_ns`,
-reported as the harness's "native tok/s" diagnostic column, same mechanism
-as lattice's entry above.
+legacy script's per-engine self-timed metric for EITHER engine. MLX has had
+its MATERIAL divergence removed, not all divergence: this adapter times
+nothing beyond `generate()` itself -- no post-generation retokenization
+happens inside `run()` at all (see `MlxAdapter.run()`), which was the
+significant gap (a real, output-length-dependent cost) -- but the harness's
+wall-clock window still additionally covers the cached `_load()`
+lookup/tuple-unpacking immediately before `generate()` and the
+`AdapterRunResult` construction immediately after, neither of which the
+legacy script's own `t0 = time.time(); generate(...); dt = ...` window
+included. That residual is ordinary adapter/harness call overhead (a cache
+dict lookup and a dataclass construction, not a variable, output-dependent
+cost like retokenization was), not claimed to be zero. Ollama's primary
+metric is NOT byte-identical to the legacy script's `total_duration`-based
+figure either -- the harness's wall clock additionally includes the local
+HTTP round trip's connection/JSON marshalling overhead, which the legacy
+script's own duration source did not -- but the legacy-equivalent number is
+not lost: ollama's `total_duration` (exactly the field the legacy script
+used for its own primary slope, NOT the decode-only `eval_duration`) is
+preserved losslessly via `AdapterRunResult.native_ns`, reported as the
+harness's "native tok/s" diagnostic column, same mechanism as lattice's
+entry above.
 
 Run with (from repo root): `uv run --quiet --with mlx-lm python3
 scripts/bench_decode_adapters_apples_to_apples.py run --profile
@@ -330,6 +336,14 @@ def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
     "successful" observation. `eval_duration` is required and type-checked
     for response-shape integrity even though it is not the field this
     function extracts into `native_ns`.
+
+    All three fields must be non-boolean `int` -- ollama's own API
+    documents `eval_count`/`eval_duration`/`total_duration` as integers
+    (nanosecond counts / token counts), so a `float` (e.g. `31.9`) is
+    rejected too, not just a missing or wrong-type field: silently
+    truncating a fractional value via `int(31.9) == 31` would be the same
+    fake-observation class this function exists to close, just reached
+    through a technically-numeric value instead of a missing one.
     """
     if "error" in data:
         raise OllamaResponseError(f"ollama: response is an error body: {data['error']!r}")
@@ -337,9 +351,9 @@ def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
         if field not in data:
             raise OllamaResponseError(f"ollama: response missing required field {field!r}: {data!r}")
         value = data[field]
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, int):
             raise OllamaResponseError(
-                f"ollama: response field {field!r} has non-numeric type "
+                f"ollama: response field {field!r} must be a non-boolean int, got "
                 f"{type(value).__name__}: {data!r}"
             )
     eval_count = data["eval_count"]
@@ -451,8 +465,13 @@ class MlxAdapter:
     the harness's wall-clock `elapsed_ns` wraps the entire `run()` call --
     any work added after `generate()` returns would silently inflate the
     harness's primary timing beyond decode alone. Trusting `n_tokens`
-    verbatim, exactly like the legacy script did, keeps that window equal to
-    `generate()`'s own duration.
+    verbatim, exactly like the legacy script did, removes that
+    output-length-dependent divergence from the harness's timing window.
+    The window is not claimed to equal `generate()`'s own duration exactly:
+    it still includes the cached `_load()` lookup/unpacking immediately
+    before `generate()` and the `AdapterRunResult` construction immediately
+    after -- ordinary, near-fixed adapter/harness call overhead, not a
+    variable cost like retokenization was.
     """
 
     def __init__(self, source_model_dir: Path = Q8_MODEL_DIR):
@@ -536,7 +555,13 @@ def register_available_adapters(argv: list[str] | None = None) -> None:
     """
     argv = sys.argv[1:] if argv is None else argv
     profile = _peek_requested_profile(argv)
-    should_register, missing_model_dirs = lattice_registration_status(profile)
+    # Pass the module-level LAT_BIN explicitly (looked up fresh here, at
+    # call time) rather than relying on lattice_registration_status's own
+    # `bin_path` default -- a keyword-only default is bound ONCE when the
+    # function is defined, so a test (or any caller) that reassigns the
+    # module-level LAT_BIN after import would silently keep hitting the
+    # original path if this call omitted it.
+    should_register, missing_model_dirs = lattice_registration_status(profile, bin_path=LAT_BIN)
     if should_register:
         harness.register_adapter("lattice", LatticeAdapter())
         print("  lattice: adapter registered")

@@ -371,8 +371,29 @@ class OllamaResponseParsingTest(unittest.TestCase):
 
     def test_bool_field_type_raises(self):
         # bool is an int subclass in Python -- must not sneak past the
-        # numeric-type check.
+        # int-only check.
         data = {"eval_count": True, "eval_duration": 1, "total_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_fractional_field_values_raise(self):
+        # The API documents eval_count/eval_duration/total_duration as
+        # integers; a float (even a "clean" one like 1.0) must be rejected
+        # outright rather than silently truncated via int(31.9) == 31 --
+        # that truncation is exactly the fake-observation class this
+        # function exists to close, reached through a technically-numeric
+        # value instead of a missing one.
+        data = {"eval_count": 31.9, "eval_duration": 1.0, "total_duration": 2.9}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_fractional_eval_count_alone_raises(self):
+        data = {"eval_count": 31.9, "eval_duration": 1, "total_duration": 1}
+        with self.assertRaises(adapters.OllamaResponseError):
+            adapters.ollama_response_to_result(data)
+
+    def test_fractional_total_duration_alone_raises(self):
+        data = {"eval_count": 32, "eval_duration": 1, "total_duration": 2.9}
         with self.assertRaises(adapters.OllamaResponseError):
             adapters.ollama_response_to_result(data)
 
@@ -519,6 +540,153 @@ class LatticeModelAwareAvailabilityTest(unittest.TestCase):
         )
         self.assertIn("lattice", result.missing_engines)
         self.assertTrue(any(o.engine in ("ollama", "mlx") for o in result.observations))
+
+
+class RegisterAvailableAdaptersEndToEndTest(unittest.TestCase):
+    """End-to-end coverage for the ACTUAL registration entry points --
+    `_peek_requested_profile` and `register_available_adapters` -- not just
+    `lattice_registration_status` called directly. A bug in the argv-peeking
+    path itself (the `--profile name` / `--profile=name` / `--profiles-file`
+    / omitted-`--profile` forms) would not fail any of
+    `LatticeModelAwareAvailabilityTest`'s tests, since those call
+    `lattice_registration_status` directly with an already-resolved profile
+    object -- this class drives the real argv shape
+    `bench_decode_adapters_apples_to_apples.py run --profile ... [...]`
+    produces through the module-global entry point instead.
+    """
+
+    def _write_solo_lattice_profile(self, tmp: Path) -> Path:
+        # A minimal single-engine profile: only "lattice" is declared, so
+        # the registration decision under test is isolated from ollama/mlx.
+        profiles_file = tmp / "profiles.toml"
+        profiles_file.write_text(
+            "schema_version = 1\n"
+            "\n"
+            "[profiles.solo_lattice]\n"
+            "windows = [8, 16]\n"
+            "measured_repeats = 1\n"
+            'prompt = "hello"\n'
+            'aggregation = "median"\n'
+            "\n"
+            "[[profiles.solo_lattice.engines]]\n"
+            'name = "lattice"\n'
+            "warmup_repeats = 0\n"
+            'model = "test-model"\n'
+            'quantization = "q8"\n'
+        )
+        return profiles_file
+
+    def _make_binary(self, tmp: Path) -> Path:
+        bin_path = tmp / "bench_decode_ab"
+        bin_path.write_text("#!/bin/sh\n")
+        bin_path.chmod(0o755)
+        return bin_path
+
+    def setUp(self):
+        # register_available_adapters() mutates the module-global registry
+        # -- isolate this test class from it and from every other test.
+        self._registry_backup = dict(harness.ADAPTER_REGISTRY)
+        harness.ADAPTER_REGISTRY.clear()
+        self.addCleanup(self._restore_registry)
+        # Real ollama/mlx probing does real subprocess/import work that is
+        # unrelated to what this class covers (the lattice argv-peek path)
+        # -- stub both out so this stays fast and hermetic, matching this
+        # file's own no-binary/no-network design (see module docstring).
+        patcher_ollama = mock.patch.object(adapters, "ollama_available", return_value=False)
+        patcher_mlx = mock.patch.object(adapters, "mlx_available", return_value=False)
+        patcher_ollama.start()
+        patcher_mlx.start()
+        self.addCleanup(patcher_ollama.stop)
+        self.addCleanup(patcher_mlx.stop)
+
+    def _restore_registry(self):
+        harness.ADAPTER_REGISTRY.clear()
+        harness.ADAPTER_REGISTRY.update(self._registry_backup)
+
+    def test_skips_lattice_when_selected_profile_model_dir_missing(self):
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            profiles_file = self._write_solo_lattice_profile(tmp)
+            bin_path = self._make_binary(tmp)
+            missing_dir = tmp / "does-not-exist"
+            with (
+                mock.patch.object(adapters, "LAT_BIN", bin_path),
+                mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": missing_dir}),
+            ):
+                adapters.register_available_adapters(
+                    ["run", "--profile", "solo_lattice", "--profiles-file", str(profiles_file)]
+                )
+        self.assertNotIn("lattice", harness.ADAPTER_REGISTRY)
+
+    def test_registers_lattice_when_selected_profile_model_dir_present(self):
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            profiles_file = self._write_solo_lattice_profile(tmp)
+            bin_path = self._make_binary(tmp)
+            model_dir = tmp / "model"
+            model_dir.mkdir()
+            with (
+                mock.patch.object(adapters, "LAT_BIN", bin_path),
+                mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": model_dir}),
+            ):
+                adapters.register_available_adapters(
+                    ["run", "--profile", "solo_lattice", "--profiles-file", str(profiles_file)]
+                )
+        self.assertIn("lattice", harness.ADAPTER_REGISTRY)
+
+    def test_peek_handles_profile_equals_name_form(self):
+        # `--profile=solo_lattice` (single-token `=` form), not the
+        # two-token `--profile solo_lattice` form the other tests use.
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            profiles_file = self._write_solo_lattice_profile(tmp)
+            bin_path = self._make_binary(tmp)
+            missing_dir = tmp / "does-not-exist"
+            with (
+                mock.patch.object(adapters, "LAT_BIN", bin_path),
+                mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": missing_dir}),
+            ):
+                adapters.register_available_adapters(
+                    ["run", "--profile=solo_lattice", "--profiles-file", str(profiles_file)]
+                )
+        self.assertNotIn("lattice", harness.ADAPTER_REGISTRY)
+
+    def test_peek_handles_profiles_file_flag_before_profile_flag(self):
+        # Argument order independence: --profiles-file appears BEFORE
+        # --profile on the command line (argparse doesn't care, but the
+        # hand-rolled peek must not assume a fixed order either).
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            profiles_file = self._write_solo_lattice_profile(tmp)
+            bin_path = self._make_binary(tmp)
+            model_dir = tmp / "model"
+            model_dir.mkdir()
+            with (
+                mock.patch.object(adapters, "LAT_BIN", bin_path),
+                mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": model_dir}),
+            ):
+                adapters.register_available_adapters(
+                    ["run", "--profiles-file", str(profiles_file), "--profile", "solo_lattice"]
+                )
+        self.assertIn("lattice", harness.ADAPTER_REGISTRY)
+
+    def test_peek_falls_back_to_binary_only_when_profile_omitted(self):
+        # No --profile at all: _peek_requested_profile can't resolve a
+        # profile (harness.main() itself would later fail closed on the
+        # missing required argument), so registration falls back to
+        # binary-only availability -- the pre-fix behavior -- rather than
+        # silently never registering lattice for an unrecognized invocation.
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            profiles_file = self._write_solo_lattice_profile(tmp)
+            bin_path = self._make_binary(tmp)
+            missing_dir = tmp / "does-not-exist"
+            with (
+                mock.patch.object(adapters, "LAT_BIN", bin_path),
+                mock.patch.object(adapters, "_LATTICE_MODEL_DIRS", {"test-model": missing_dir}),
+            ):
+                adapters.register_available_adapters(["run", "--profiles-file", str(profiles_file)])
+        self.assertIn("lattice", harness.ADAPTER_REGISTRY)
 
 
 class MlxFallbackProvenanceTest(unittest.TestCase):
