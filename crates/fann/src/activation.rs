@@ -216,7 +216,7 @@ impl Activation {
     /// Applies this activation in place to `values`.
     ///
     /// Softmax operates on the complete slice; ReLU variants use supported SIMD paths.
-    /// See [`docs/network.md`](../docs/network.md) (§Activation::forward_batch) for semantics.
+    /// See [`docs/network.md`](../docs/network.md#activationforward_batch) for semantics.
     #[inline]
     pub fn forward_batch(&self, values: &mut [f32]) {
         match self {
@@ -316,7 +316,7 @@ impl Activation {
     /// Computes a derivative from an activation output value.
     ///
     /// Softmax returns its Jacobian diagonal only.
-    /// See [`docs/network.md`](../docs/network.md) (§Activation derivatives) for derivative scope.
+    /// See [`docs/network.md`](../docs/network.md#activation-derivatives) for derivative scope.
     #[inline]
     pub fn derivative(&self, output: f32) -> f32 {
         match self {

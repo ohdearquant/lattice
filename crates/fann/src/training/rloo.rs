@@ -280,8 +280,8 @@ impl RlooTrainer {
     /// Backpropagate the output-layer delta through hidden layers and apply
     /// a plain SGD update (no momentum, no weight decay).
     ///
-    /// Mirrors `backprop.rs::compute_gradients` lines 94–152 (hidden-layer
-    /// backprop) and `apply_gradients` lines 170–191 (simplified, batch_size=1).
+    /// Mirrors the hidden-layer backprop in `backprop.rs::compute_gradients`
+    /// and `apply_gradients` (simplified: `batch_size = 1`, plain SGD).
     fn backprop_and_apply(
         &self,
         gate: &mut Network,

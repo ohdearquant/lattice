@@ -57,7 +57,7 @@ fn forward_into_buffers(
 ///
 /// `forward` allocates no activation buffers; its output borrow remains valid
 /// until the next mutable use of the network.
-/// See [`docs/network.md`](../docs/network.md) (§Network) for execution and usage details.
+/// See [`docs/network.md`](../../docs/network.md#network) for execution and usage details.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "NetworkData"))]
@@ -119,7 +119,7 @@ impl Network {
     /// Runs `input` through all layers and borrows the final activation buffer.
     ///
     /// Returns an error when the input width is invalid or a layer output is non-finite.
-    /// See [`docs/network.md`](../docs/network.md) (§Network) for buffer lifetime details.
+    /// See [`docs/network.md`](../../docs/network.md#network) for buffer lifetime details.
     #[inline]
     pub fn forward(&mut self, input: &[f32]) -> FannResult<&[f32]> {
         let expected_inputs = self.num_inputs();
@@ -137,7 +137,7 @@ impl Network {
     /// Runs the CPU forward pass behind the async GPU-compatible interface.
     ///
     /// Returns an owned copy of the output and propagates `forward` validation errors.
-    /// See [`docs/network.md`](../docs/network.md) (§Network::forward_async) for interface rationale.
+    /// See [`docs/network.md`](../../docs/network.md#networkforward_async) for interface rationale.
     pub async fn forward_async(&mut self, input: &[f32]) -> FannResult<Vec<f32>> {
         // CPU forward is synchronous, just wrap in async for API consistency
         self.forward(input).map(<[f32]>::to_vec)
@@ -215,7 +215,7 @@ impl Network {
     /// Runs a forward pass for each input in parallel.
     ///
     /// Shares layer parameters and allocates independent activation buffers per input.
-    /// See [`docs/network.md`](../docs/network.md) (§Network::forward_batch) for concurrency details.
+    /// See [`docs/network.md`](../../docs/network.md#networkforward_batch) for concurrency details.
     pub fn forward_batch(&self, inputs: &[Vec<f32>]) -> FannResult<Vec<Vec<f32>>> {
         use rayon::prelude::*;
 

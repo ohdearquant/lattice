@@ -70,7 +70,7 @@ pub enum CircuitBreakerState {
 
 /// Circuit breaker for GPU memory operations.
 ///
-/// See [`docs/gpu.md`] (§CircuitBreaker) for its recovery state machine.
+/// See [`docs/gpu.md`](../../docs/gpu.md#circuitbreaker) for its recovery state machine.
 pub struct CircuitBreaker {
     state: Mutex<CircuitBreakerState>,
     failure_threshold: usize,

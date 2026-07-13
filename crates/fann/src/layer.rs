@@ -269,7 +269,7 @@ unsafe fn simd_dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Dense affine layer with an activation and output-major weight storage.
-/// See [`docs/network.md`](../docs/network.md) (§Layer) for layout and evaluation details.
+/// See [`docs/network.md`](../docs/network.md#layer) for layout and evaluation details.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "LayerData"))]
@@ -316,7 +316,7 @@ impl Layer {
     /// Creates a layer with Xavier/Glorot weights and zero biases.
     ///
     /// Returns an error for zero or oversized dimensions, or invalid distribution parameters.
-    /// See [`docs/network.md`](../docs/network.md) (§Layer) for initialization details.
+    /// See [`docs/network.md`](../docs/network.md#layer) for initialization details.
     pub fn new(num_inputs: usize, num_outputs: usize, activation: Activation) -> FannResult<Self> {
         // Validate dimensions and allocation size
         validate_layer_dimensions(num_inputs, num_outputs)?;
@@ -352,7 +352,7 @@ impl Layer {
     /// Creates a layer from output-major weights and one bias per output.
     ///
     /// Returns an error for invalid or oversized dimensions, or mismatched weight or bias lengths.
-    /// See [`docs/network.md`](../docs/network.md) (§Layer) for storage and validation invariants.
+    /// See [`docs/network.md`](../docs/network.md#layer) for storage and validation invariants.
     pub fn with_weights(
         num_inputs: usize,
         num_outputs: usize,
@@ -390,7 +390,7 @@ impl Layer {
     /// Creates a zero-parameter layer, useful for deterministic tests.
     ///
     /// Returns an error for zero or oversized dimensions.
-    /// See [`docs/network.md`](../docs/network.md) (§Layer) for construction invariants.
+    /// See [`docs/network.md`](../docs/network.md#layer) for construction invariants.
     pub fn zeros(
         num_inputs: usize,
         num_outputs: usize,
@@ -411,7 +411,7 @@ impl Layer {
     /// Creates a layer with Xavier/Glorot weights drawn from `rng`.
     ///
     /// Returns an error for zero or oversized dimensions, or invalid distribution parameters.
-    /// See [`docs/network.md`](../docs/network.md) (§Layer) for initialization details.
+    /// See [`docs/network.md`](../docs/network.md#layer) for initialization details.
     pub fn new_with_rng<R: rand::Rng>(
         num_inputs: usize,
         num_outputs: usize,
@@ -450,7 +450,7 @@ impl Layer {
     /// Writes `activation(weights * input + bias)` to `output`.
     ///
     /// Returns an error unless `input` and `output` match the configured widths.
-    /// See [`docs/network.md`](../docs/network.md) (§Layer) for row layout and execution.
+    /// See [`docs/network.md`](../docs/network.md#layer) for row layout and execution.
     #[inline]
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> FannResult<()> {
         if input.len() != self.num_inputs {

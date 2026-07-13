@@ -8,14 +8,14 @@ persistence. For training and the optional GPU path, see
 ## Mathematical model
 
 `Network` is an ordered, nonempty sequence of `Layer` values. A layer maps an
-input vector of width *I* to an output vector of width *O*:
+input vector of width _I_ to an output vector of width _O_:
 
 ```text
 z[o] = bias[o] + sum(input[i] * weight[o, i], i = 0..I)
 output[o] = activation(z[o])
 ```
 
-The output width of layer *k* must equal the input width of layer *k + 1*.
+The output width of layer _k_ must equal the input width of layer _k + 1_.
 `Network::new` checks this whether layers originate from a builder, binary data,
 Serde, or direct construction. There is no input-layer object: the first layer
 consumes the slice given to `Network::forward`, and the final layer buffer is the
@@ -25,13 +25,13 @@ network result.
 
 `Layer` owns the data below.
 
-| Field | Shape | Meaning |
-| --- | --- | --- |
-| `num_inputs` | scalar | Width of a vector accepted by the layer. |
-| `num_outputs` | scalar | Width written by the layer. |
-| `weights` | `num_outputs * num_inputs` `f32`s | Dense matrix in output-major row order. |
-| `biases` | `num_outputs` `f32`s | One additive bias for each output. |
-| `activation` | `Activation` | Function applied after the affine calculation. |
+| Field         | Shape                             | Meaning                                        |
+| ------------- | --------------------------------- | ---------------------------------------------- |
+| `num_inputs`  | scalar                            | Width of a vector accepted by the layer.       |
+| `num_outputs` | scalar                            | Width written by the layer.                    |
+| `weights`     | `num_outputs * num_inputs` `f32`s | Dense matrix in output-major row order.        |
+| `biases`      | `num_outputs` `f32`s              | One additive bias for each output.             |
+| `activation`  | `Activation`                      | Function applied after the affine calculation. |
 
 The row for output `o` begins at `o * num_inputs`. A two-output, three-input
 layer stores its matrix as:
@@ -127,7 +127,7 @@ accepted limitation.
 ## Preallocated forward execution
 
 When a network is constructed, it allocates exactly one activation `Vec<f32>`
-for every layer. Buffer *i* has `layers[i].num_outputs()` values. The user input
+for every layer. Buffer _i_ has `layers[i].num_outputs()` values. The user input
 is borrowed by the first layer rather than copied.
 
 ```text
@@ -178,14 +178,14 @@ derivatives calculated from an activation output `y`. `forward` is useful for
 pointwise functions. A scalar Softmax evaluates to `1.0`; use `forward_batch` to
 normalize an actual output vector.
 
-| Variant | Forward rule | Derivative from output | Range |
-| --- | --- | --- | --- |
-| `Linear` | `x` | `1` | unbounded |
-| `Sigmoid` | `1 / (1 + exp(-x))` | `y * (1 - y)` | `(0, 1)` for finite input |
-| `Tanh` | `tanh(x)` | `1 - y²` | `[-1, 1]` |
-| `ReLU` | `max(0, x)` | `1` when `y > 0`, else `0` | `[0, infinity)` |
-| `LeakyReLU(a)` | `x` if `x > 0`, else `a*x` | `1` when `y > 0`, else `a` | usually unbounded |
-| `Softmax` | normalized exponentials over the slice | diagonal only: `y * (1 - y)` | finite results sum to `1` |
+| Variant        | Forward rule                           | Derivative from output       | Range                     |
+| -------------- | -------------------------------------- | ---------------------------- | ------------------------- |
+| `Linear`       | `x`                                    | `1`                          | unbounded                 |
+| `Sigmoid`      | `1 / (1 + exp(-x))`                    | `y * (1 - y)`                | `(0, 1)` for finite input |
+| `Tanh`         | `tanh(x)`                              | `1 - y²`                     | `[-1, 1]`                 |
+| `ReLU`         | `max(0, x)`                            | `1` when `y > 0`, else `0`   | `[0, infinity)`           |
+| `LeakyReLU(a)` | `x` if `x > 0`, else `a*x`             | `1` when `y > 0`, else `a`   | usually unbounded         |
+| `Softmax`      | normalized exponentials over the slice | diagonal only: `y * (1 - y)` | finite results sum to `1` |
 
 `ReLU` is the default. `Activation::DEFAULT_LEAKY_ALPHA` is `0.01`, while a
 `LeakyReLU` value stores its chosen alpha. `is_bounded` is true for Sigmoid,
@@ -221,12 +221,12 @@ general full-Softmax-Jacobian API.
 
 The `simd` feature changes implementation strategy, not layer semantics.
 
-| Target | Dot-product path | Vector work | Scalar tail |
-| --- | --- | --- | --- |
-| AArch64 | NEON | Four 4-lane FMA accumulators: 16 values | 0–3 values |
-| x86_64 with AVX-512F | AVX-512 | Four 16-lane FMA accumulators: 64 values | 0–15 values |
-| x86_64 with AVX2 + FMA | AVX2/FMA | Four 8-lane FMA accumulators: 32 values | 0–7 values |
-| Other or unsupported runtime | Scalar | One value at a time | not applicable |
+| Target                       | Dot-product path | Vector work                              | Scalar tail    |
+| ---------------------------- | ---------------- | ---------------------------------------- | -------------- |
+| AArch64                      | NEON             | Four 4-lane FMA accumulators: 16 values  | 0–3 values     |
+| x86_64 with AVX-512F         | AVX-512          | Four 16-lane FMA accumulators: 64 values | 0–15 values    |
+| x86_64 with AVX2 + FMA       | AVX2/FMA         | Four 8-lane FMA accumulators: 32 values  | 0–7 values     |
+| Other or unsupported runtime | Scalar           | One value at a time                      | not applicable |
 
 On x86, runtime feature checks choose AVX-512F first, then AVX2 plus FMA, then
 the scalar loop. AArch64 relies on mandatory NEON. The independent accumulators
@@ -246,10 +246,10 @@ the bytes specified below.
 
 ### Header
 
-| Bytes | Encoding | Value |
-| --- | --- | --- |
-| `0..4` | four ASCII bytes | Magic `FANN` |
-| `4..8` | little-endian `u32` | Version `1` |
+| Bytes   | Encoding            | Value           |
+| ------- | ------------------- | --------------- |
+| `0..4`  | four ASCII bytes    | Magic `FANN`    |
+| `4..8`  | little-endian `u32` | Version `1`     |
 | `8..12` | little-endian `u32` | Layer count `L` |
 
 `L` cannot be zero. The first layer begins at byte 12.
@@ -258,23 +258,23 @@ the bytes specified below.
 
 Each layer is written in network order:
 
-| Field | Encoding | Notes |
-| --- | --- | --- |
-| input width | little-endian `u32` | `I`, nonzero when decoded |
-| output width | little-endian `u32` | `O`, nonzero when decoded |
-| activation tag | `u8` | Listed below |
-| LeakyReLU alpha | little-endian `f32` | Present only for tag `4` |
-| weights | `I * O` little-endian `f32`s | Output-major row layout |
-| biases | `O` little-endian `f32`s | Output order |
+| Field           | Encoding                     | Notes                     |
+| --------------- | ---------------------------- | ------------------------- |
+| input width     | little-endian `u32`          | `I`, nonzero when decoded |
+| output width    | little-endian `u32`          | `O`, nonzero when decoded |
+| activation tag  | `u8`                         | Listed below              |
+| LeakyReLU alpha | little-endian `f32`          | Present only for tag `4`  |
+| weights         | `I * O` little-endian `f32`s | Output-major row layout   |
+| biases          | `O` little-endian `f32`s     | Output order              |
 
-| Tag | Activation | Extra bytes |
-| --- | --- | --- |
-| `0` | `Linear` | none |
-| `1` | `Sigmoid` | none |
-| `2` | `Tanh` | none |
-| `3` | `ReLU` | none |
+| Tag | Activation         | Extra bytes |
+| --- | ------------------ | ----------- |
+| `0` | `Linear`           | none        |
+| `1` | `Sigmoid`          | none        |
+| `2` | `Tanh`             | none        |
+| `3` | `ReLU`             | none        |
 | `4` | `LeakyReLU(alpha)` | alpha `f32` |
-| `5` | `Softmax` | none |
+| `5` | `Softmax`          | none        |
 
 A non-LeakyReLU record is `9 + 4*I*O + 4*O` bytes. LeakyReLU adds four alpha
 bytes. The total serialized size is the 12-byte header plus all layer records.
@@ -319,17 +319,17 @@ pass with empty buffers or malformed row storage.
 `FannResult<T>` is `Result<T, FannError>`. Core error variants identify the
 failed boundary:
 
-| Error | Typical source |
-| --- | --- |
-| `InputSizeMismatch` / `OutputSizeMismatch` | Forward slice has the wrong width. |
-| `WeightCountMismatch` / `BiasCountMismatch` | Parameter vectors disagree with a declared shape. |
-| `InvalidLayerDimensions` | A width is zero or adjacent layers do not connect. |
-| `ShapeTooLarge` | A tensor exceeds the cap or its product overflows. |
-| `EmptyNetwork` | Construction or decoding has no layers. |
-| `InvalidBuilder` | Builder setup or binary input is malformed. |
-| `NumericInstability` | A layer output contains `NaN` or infinity. |
-| `InvalidDistributionParams` | Xavier/Glorot distribution setup failed. |
-| `SerializationError` | Serde-specific failure when that feature is enabled. |
+| Error                                       | Typical source                                       |
+| ------------------------------------------- | ---------------------------------------------------- |
+| `InputSizeMismatch` / `OutputSizeMismatch`  | Forward slice has the wrong width.                   |
+| `WeightCountMismatch` / `BiasCountMismatch` | Parameter vectors disagree with a declared shape.    |
+| `InvalidLayerDimensions`                    | A width is zero or adjacent layers do not connect.   |
+| `ShapeTooLarge`                             | A tensor exceeds the cap or its product overflows.   |
+| `EmptyNetwork`                              | Construction or decoding has no layers.              |
+| `InvalidBuilder`                            | Builder setup or binary input is malformed.          |
+| `NumericInstability`                        | A layer output contains `NaN` or infinity.           |
+| `InvalidDistributionParams`                 | Xavier/Glorot distribution setup failed.             |
+| `SerializationError`                        | Serde-specific failure when that feature is enabled. |
 
 For `TrainingError` and `GradientError`, see [training.md](training.md).
 

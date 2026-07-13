@@ -13,7 +13,7 @@ use crate::network::Network;
 
 impl Network {
     /// Serializes this network in the version-1 little-endian binary format.
-    /// See [`docs/network.md`](../../docs/network.md) (§Network serialization) for the wire format.
+    /// See [`docs/network.md`](../../docs/network.md#network-serialization) for the wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -62,7 +62,7 @@ impl Network {
     /// Deserializes an exact-length version-1 network blob.
     ///
     /// Returns an error for malformed headers, records, dimensions, or trailing data.
-    /// See [`docs/network.md`](../../docs/network.md) (§Network serialization) for validation rules.
+    /// See [`docs/network.md`](../../docs/network.md#network-serialization) for validation rules.
     pub fn from_bytes(bytes: &[u8]) -> FannResult<Self> {
         let mut pos = 0;
 

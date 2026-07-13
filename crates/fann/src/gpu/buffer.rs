@@ -364,7 +364,7 @@ impl BufferPool {
 
     /// Drops all cached buffers and returns their accounted byte total.
     ///
-    /// See [`docs/gpu.md`] (§BufferPool::flush) for asynchronous-release guidance.
+    /// See [`docs/gpu.md`](../../docs/gpu.md#bufferpoolflush) for asynchronous-release guidance.
     pub fn flush(&self) -> u64 {
         let mut total_freed = 0u64;
 

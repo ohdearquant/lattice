@@ -178,7 +178,7 @@ impl GpuContext {
 
     /// Drops pooled buffers, waits for pending work, and returns freed pool bytes.
     ///
-    /// See [`docs/gpu.md`] (§GpuContext::flush_memory) for release ordering.
+    /// See [`docs/gpu.md`](../../docs/gpu.md#gpucontextflush_memory) for release ordering.
     pub fn flush_memory(&self) -> u64 {
         let freed = self.buffer_pool.flush();
         self.wait();
@@ -201,7 +201,7 @@ impl GpuContext {
 
     /// Sets the callback invoked by explicit memory-pressure notifications.
     ///
-    /// See [`docs/gpu.md`] (§GpuContext::set_memory_pressure_handler) for usage guidance.
+    /// See [`docs/gpu.md`](../../docs/gpu.md#gpucontextset_memory_pressure_handler) for usage guidance.
     pub fn set_memory_pressure_handler<F>(&self, handler: F)
     where
         F: Fn(MemoryPressureLevel, u64) + Send + Sync + 'static,

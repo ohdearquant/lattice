@@ -12,7 +12,7 @@ use crate::layer::Layer;
 use crate::network::Network;
 
 /// Fluent builder for a dense feedforward network.
-/// See [`docs/network.md`](../../docs/network.md) (§NetworkBuilder) for construction examples.
+/// See [`docs/network.md`](../../docs/network.md#networkbuilder) for construction examples.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkBuilder {
     input_size: Option<usize>,
@@ -107,7 +107,7 @@ impl NetworkBuilder {
     /// Builds the configured network with deterministic initialization from `seed`.
     ///
     /// The same architecture and seed produce identical parameters.
-    /// See [`docs/network.md`](../../docs/network.md) (§NetworkBuilder) for reproducibility details.
+    /// See [`docs/network.md`](../../docs/network.md#networkbuilder) for reproducibility details.
     pub fn build_with_seed(self, seed: u64) -> FannResult<Network> {
         use rand::SeedableRng;
 

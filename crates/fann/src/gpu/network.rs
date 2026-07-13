@@ -390,7 +390,7 @@ impl GpuNetwork {
 
     /// Re-uploads weights from this wrapper's owned CPU network.
     ///
-    /// See [`docs/gpu.md`] (§GpuNetwork::sync_weights) for the public update path.
+    /// See [`docs/gpu.md`](../../docs/gpu.md#gpunetworksync_weights) for the public update path.
     pub fn sync_weights(&mut self) -> GpuResult<()> {
         for (layer_data, cpu_layer) in self.layers.iter().zip(self.cpu_network.layers()) {
             self.ctx.queue.write_buffer(
@@ -414,7 +414,7 @@ impl GpuNetwork {
 
     /// Drops pooled buffers, waits for GPU work, and returns freed pool bytes.
     ///
-    /// See [`docs/gpu.md`] (§GpuNetwork::flush) for the memory-release boundary.
+    /// See [`docs/gpu.md`](../../docs/gpu.md#gpunetworkflush) for the memory-release boundary.
     pub fn flush(&self) -> u64 {
         self.ctx.flush_memory()
     }

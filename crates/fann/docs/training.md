@@ -29,17 +29,17 @@ modules, are compiled only with the `online-router` feature.
 its builder methods simply replace the corresponding field and return the
 configuration. The defaults are:
 
-| Field | Default | Meaning |
-| --- | ---: | --- |
-| `learning_rate` | `0.01` | Base step size before batch-size scaling. |
-| `momentum` | `0.9` | Coefficient applied to the prior weight and bias velocities. |
-| `weight_decay` | `0.0001` | L2 coefficient applied to weights, not biases. |
-| `max_epochs` | `1000` | Maximum completed epoch count. |
-| `target_error` | `0.001` | Strict early-stop threshold for mean squared error. |
-| `batch_size` | `32` | Samples accumulated before an update; `1` is SGD. |
-| `shuffle` | `true` | Shuffle sample indices before each epoch. |
-| `gradient_guard` | `Error` | Response to a non-finite accumulated gradient. |
-| `seed` | `None` | Entropy-seeded shuffle RNG; `Some(seed)` makes its shuffle sequence reproducible. |
+| Field            |  Default | Meaning                                                                           |
+| ---------------- | -------: | --------------------------------------------------------------------------------- |
+| `learning_rate`  |   `0.01` | Base step size before batch-size scaling.                                         |
+| `momentum`       |    `0.9` | Coefficient applied to the prior weight and bias velocities.                      |
+| `weight_decay`   | `0.0001` | L2 coefficient applied to weights, not biases.                                    |
+| `max_epochs`     |   `1000` | Maximum completed epoch count.                                                    |
+| `target_error`   |  `0.001` | Strict early-stop threshold for mean squared error.                               |
+| `batch_size`     |     `32` | Samples accumulated before an update; `1` is SGD.                                 |
+| `shuffle`        |   `true` | Shuffle sample indices before each epoch.                                         |
+| `gradient_guard` |  `Error` | Response to a non-finite accumulated gradient.                                    |
+| `seed`           |   `None` | Entropy-seeded shuffle RNG; `Some(seed)` makes its shuffle sequence reproducible. |
 
 The builder does not normalize hyperparameters or impose ranges on learning
 rate, momentum, weight decay, epoch count, or target error. Callers therefore
@@ -55,7 +55,7 @@ each target must have `network.num_outputs()` values; a mismatch returns a
 
 `TrainingResult` records the final per-sample mean squared error,
 `epochs_trained`, an `error_history` entry for every completed epoch, and the
-`converged` flag. An epoch converges only when its average error is *strictly*
+`converged` flag. An epoch converges only when its average error is _strictly_
 less than `target_error`. If `max_epochs` is zero, no epoch runs: the result is
 non-converged, has an empty history, and reports `f32::MAX` as its final error.
 
@@ -90,7 +90,7 @@ backward:
 
 1. **Output-layer delta.** The implementation uses the derivative of the
    unscaled half-squared-error term, while it reports separately normalized MSE.
-   For a Softmax output layer, the *full* Jacobian is used (not the diagonal
+   For a Softmax output layer, the _full_ Jacobian is used (not the diagonal
    approximation — see [Activation reference](network.md#activation-reference)):
    `delta[i] = Σ_j (output[j] − target[j]) · J[j,i]` where `J[j,i] = output[j]·(δ_ij − output[i])`.
    For every other output activation, `delta[i] = (output[i] − target[i]) · f'(output[i])`.
@@ -103,10 +103,8 @@ backward:
    accumulated over every sample in the batch before the update step runs.
 
 Both `BackpropTrainer::compute_gradients` and `RlooTrainer::backprop_and_apply`
-(below) implement the *same* backward recursion independently — the RLOO
-trainer's comment block explicitly cites the `backprop.rs` line numbers it
-mirrors. A bug found in one hidden-layer backward loop should be checked
-against the other.
+(below) implement the _same_ backward recursion independently. A bug found in
+one hidden-layer backward loop should be checked against the other.
 
 ### Momentum + weight decay update
 
@@ -146,11 +144,11 @@ result.
 Every batch's accumulated gradients are checked for NaN/Inf before the update
 is applied (`GradientGuardStrategy`, in `training/gradient.rs`):
 
-| Strategy | Behavior |
-|---|---|
-| `Error` (default) | Abort the whole `train()` call with `NumericInstability` |
-| `Sanitize` | Zero out NaN/Inf entries and apply the update anyway; batch error is still counted |
-| `SkipBatch` | Discard the batch's gradients *and* its error contribution, continue to the next batch |
+| Strategy          | Behavior                                                                               |
+| ----------------- | -------------------------------------------------------------------------------------- |
+| `Error` (default) | Abort the whole `train()` call with `NumericInstability`                               |
+| `Sanitize`        | Zero out NaN/Inf entries and apply the update anyway; batch error is still counted     |
+| `SkipBatch`       | Discard the batch's gradients _and_ its error contribution, continue to the next batch |
 
 If every batch in an epoch is skipped under `SkipBatch`, `train()` returns
 `NumericInstability` rather than a division-by-zero-derived `NaN` `final_error`
@@ -190,11 +188,11 @@ A-GEM", ICLR 2019 (the EWC++ online variant this module implements).
 
 `DiagonalFisher` contains two same-length vectors and an EMA decay:
 
-| State | Role |
-| --- | --- |
-| `values` | The diagonal Fisher estimate `F`, one importance value per parameter. |
+| State    | Role                                                                       |
+| -------- | -------------------------------------------------------------------------- |
+| `values` | The diagonal Fisher estimate `F`, one importance value per parameter.      |
 | `anchor` | The parameter snapshot `θ*` that a later task is discouraged from leaving. |
-| `decay` | The fraction of the previous importance retained by the next observation. |
+| `decay`  | The fraction of the previous importance retained by the next observation.  |
 
 The caller owns the parameter layout because the guard intentionally has no
 `Network` dependency. Use the same flat ordering for every gradient, parameter
@@ -241,7 +239,7 @@ remain finite.
 ### Anchor + penalty gradient
 
 At a task boundary, `set_anchor(params)` snapshots the current parameter
-vector `θ*` as the reference point for the *next* task's training. The EWC
+vector `θ*` as the reference point for the _next_ task's training. The EWC
 regularization loss is:
 
 ```text
@@ -249,7 +247,7 @@ L_ewc = (λ/2) · Σ_i F_i · (θ_i − θ*_i)²
 ```
 
 `penalty_gradient` computes `∂L_ewc/∂θ_i = λ · F_i · (θ_i − θ*_i)` and
-*adds* it into the caller's gradient buffer (the caller is expected to combine
+_adds_ it into the caller's gradient buffer (the caller is expected to combine
 it with the task loss's own gradient and then subtract the combined vector in
 its own descent step — this module never mutates network weights directly).
 Because the gradient is proportional to `F_i`, parameters that were unimportant
@@ -304,14 +302,14 @@ prefix so a guard can be applied to a parameter sub-slice.
 
 ## REINFORCE with Leave-One-Out (RLOO)
 
-`training::rloo::RlooTrainer` (feature `online-router`) trains a *selector gate*
+`training::rloo::RlooTrainer` (feature `online-router`) trains a _selector gate_
 — a small `Network` whose job is to output logits over a set of discrete
 choices (e.g. which adapter/expert to route to) — via policy gradient. It is
 intentionally decoupled from EWC: `DiagonalFisher` can protect
 caller-controlled parameter updates when forgetting protection is needed, while
 this trainer implements only the policy-gradient update.
 
-**Gate contract**: the gate network's *output* layer activation must be
+**Gate contract**: the gate network's _output_ layer activation must be
 `Activation::Linear` (raw logits). Softmax is applied inside this module's loss
 computation, not baked into the network, because the policy-gradient formulas
 below need direct access to both the logits (for the log-sum-exp z-loss term)
@@ -321,11 +319,11 @@ and the softmax probabilities.
 
 `RlooConfig` has deliberately small, direct settings:
 
-| Field | Default | Effect |
-| --- | ---: | --- |
-| `learning_rate` | `0.001` | Plain-SGD step size for all gate weights and biases. |
-| `aux_loss_coeff` | `0.01` | Multiplier for the load-balance gradient. |
-| `z_loss_coeff` | `0.001` | Multiplier for the router z-loss gradient. |
+| Field            | Default | Effect                                               |
+| ---------------- | ------: | ---------------------------------------------------- |
+| `learning_rate`  | `0.001` | Plain-SGD step size for all gate weights and biases. |
+| `aux_loss_coeff` |  `0.01` | Multiplier for the load-balance gradient.            |
+| `z_loss_coeff`   | `0.001` | Multiplier for the router z-loss gradient.           |
 
 The trainer does not use `TrainingConfig`: it updates one policy-gradient
 example at a time, with neither momentum nor weight decay. `new` seeds its
@@ -360,7 +358,7 @@ policy-gradient update:
         + z_coeff   · 2 · LSE · p[j]                                    (z-loss)
    ```
    where `c = Σ p_i² − 1/K` and `LSE = log Σ exp(logits)`. Because the output
-   activation is `Linear` (derivative 1), this *is* the pre-activation error —
+   activation is `Linear` (derivative 1), this _is_ the pre-activation error —
    no extra derivative multiply, unlike the general backprop path.
 3. `backprop_and_apply` propagates this delta through hidden layers (mirroring
    `backprop.rs`'s hidden-layer recursion and plain-SGD apply, batch size 1,
@@ -376,16 +374,16 @@ the gradient formula used for the update.
 `reward · (p[j] − onehot[j])` naturally flips sign with `reward`: a positive
 reward pulls `p[action]` up (standard cross-entropy-style gradient toward the
 action), a negative reward pushes it down. There is deliberately no
-special-casing for negative reward — a regression test
-(`rloo_negative_reward_decreases_action_score`) pins this polarity, because a
-plausible-looking bug here (e.g. accidentally taking `reward.abs()`) would
-silently convert "push this down" feedback into "pull this up" feedback.
+special-casing for negative reward, and the sign must be preserved: a
+plausible-looking bug here (for example accidentally taking `reward.abs()`)
+would silently convert "push this down" feedback into "pull this up" feedback.
 
 **Auxiliary losses**, always added regardless of reward sign:
-- *Load-balance loss* `(1/K) Σ_i (p_i − 1/K)²` penalizes routing collapse
+
+- _Load-balance loss_ `(1/K) Σ_i (p_i − 1/K)²` penalizes routing collapse
   (one action absorbing all probability mass) — pulls the distribution toward
   uniform.
-- *Router z-loss* `(log Σ exp(logits))²` penalizes logit magnitude explosion,
+- _Router z-loss_ `(log Σ exp(logits))²` penalizes logit magnitude explosion,
   which otherwise makes the softmax increasingly saturated/overconfident over
   training.
 
@@ -412,15 +410,12 @@ advantage_m = R_m − baseline_m
 g[j] += −(1/M) · advantage_m · (count(j ∈ subset_m) − k · p[j])
 ```
 
-This is not the default training path — it exists for the bench harness that
-compares its convergence against Phase 1. **Invariant for any future
-activation of this path**: it only consumes preferred-known (positive) events,
-so it must always be paired with the Phase-1 negative path; a positive-only
-convergence run collapses to near-zero policy entropy (mass piles onto a
-single output) because there's no signal pushing a wrongly-selected output
-back down. This was verified empirically in the convergence bench, not just
-reasoned about — treat it as a correctness requirement for any caller, not a
-tuning knob.
+This is not the default training path. **Invariant for any future activation
+of this path**: it only consumes preferred-known (positive) events, so it must
+always be paired with the Phase-1 negative path. A positive-only convergence
+run collapses to near-zero policy entropy (mass piles onto a single output)
+because there's no signal pushing a wrongly-selected output back down. Treat
+this as a correctness requirement for any caller, not a tuning knob.
 
 Both `m_samples` and `m_samples * k` (the aggregate retained-subset storage)
 are bounds-checked against `MAX_ALLOWED_ELEMENTS` before any allocation, since

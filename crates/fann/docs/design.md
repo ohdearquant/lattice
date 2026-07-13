@@ -31,13 +31,13 @@ BackpropTrainer ──updates──> Network::layers_mut() / Layer parameters
 GpuContext + GpuNetwork (feature = "gpu") ──optional accelerated path──> CPU model
 ```
 
-| Component | Owns | Responsibility |
-| --- | --- | --- |
-| `NetworkBuilder` | Input width and ordered layer specifications | Validates an architecture and initializes layers. |
-| `Layer` | Shape, row-major weights, biases, activation | Writes one dense affine transform and activation into a supplied buffer. |
-| `Network` | Layers and preallocated activation buffers | Checks connectivity, sequences CPU inference, and provides inspection APIs. |
-| Training types | Optimizer and gradient state | Update a network's existing parameter storage. |
-| GPU types | Device-facing context and acceleration state | Provide an optional execution route while retaining the CPU model. |
+| Component        | Owns                                         | Responsibility                                                              |
+| ---------------- | -------------------------------------------- | --------------------------------------------------------------------------- |
+| `NetworkBuilder` | Input width and ordered layer specifications | Validates an architecture and initializes layers.                           |
+| `Layer`          | Shape, row-major weights, biases, activation | Writes one dense affine transform and activation into a supplied buffer.    |
+| `Network`        | Layers and preallocated activation buffers   | Checks connectivity, sequences CPU inference, and provides inspection APIs. |
+| Training types   | Optimizer and gradient state                 | Update a network's existing parameter storage.                              |
+| GPU types        | Device-facing context and acceleration state | Provide an optional execution route while retaining the CPU model.          |
 
 A `Layer` does not allocate an output vector for `forward`. A `Network` owns the
 mutable buffers that carry a sample through its layers. This separates immutable
@@ -89,7 +89,7 @@ limitation.
 ## CPU inference lifecycle
 
 Construction performs the allocations normal inference needs. `Network::new`
-creates one zero-filled activation buffer per layer; buffer *i* has exactly
+creates one zero-filled activation buffer per layer; buffer _i_ has exactly
 `layers[i].num_outputs()` elements. The caller's input is borrowed directly and
 is not copied into the buffer set.
 
@@ -154,13 +154,13 @@ fallback behavior.
 
 ## Features and portability
 
-| Feature | Effect |
-| --- | --- |
-| `std` | Default standard-library support. |
-| `simd` | Enables target-specific CPU matrix-vector and activation kernels with scalar fallback. |
-| `parallel` | Adds Rayon-backed batch inference with shared weights and per-input buffers. |
-| `serde` | Enables structured persistence that reconstructs transient buffers during load. |
-| `gpu` | Adds the WGPU-based acceleration interface without changing CPU availability. |
+| Feature    | Effect                                                                                 |
+| ---------- | -------------------------------------------------------------------------------------- |
+| `std`      | Default standard-library support.                                                      |
+| `simd`     | Enables target-specific CPU matrix-vector and activation kernels with scalar fallback. |
+| `parallel` | Adds Rayon-backed batch inference with shared weights and per-input buffers.           |
+| `serde`    | Enables structured persistence that reconstructs transient buffers during load.        |
+| `gpu`      | Adds the WGPU-based acceleration interface without changing CPU availability.          |
 
 SIMD is an optimization, not a different numerical model. Unsupported
 architectures and unavailable x86 capabilities fall back to scalar code.
@@ -170,14 +170,14 @@ architectures and unavailable x86 capabilities fall back to scalar code.
 Validation occurs at boundaries where invalid data could otherwise create an
 oversized allocation, an out-of-bounds parameter access, or a misleading result.
 
-| Boundary | Check | Failure |
-| --- | --- | --- |
-| Layer construction | Nonzero dimensions, checked product, 100,000,000-element cap | `InvalidLayerDimensions` or `ShapeTooLarge` |
-| Explicit parameters | Exact weights and biases for the declared shape | Count-mismatch error |
-| Network construction | Nonempty stack and matching adjacent dimensions | `EmptyNetwork` or `InvalidLayerDimensions` |
-| CPU forward | Input/output widths and finite layer results | Size mismatch or `NumericInstability` |
-| Binary loading | Header, version, bounds before allocation, exact payload length | `InvalidBuilder`, `InvalidLayerDimensions`, `ShapeTooLarge`, or `EmptyNetwork` |
-| Serde loading | Constructor validation and buffer reconstruction | Deserialization error rather than unusable state |
+| Boundary             | Check                                                           | Failure                                                                        |
+| -------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Layer construction   | Nonzero dimensions, checked product, 100,000,000-element cap    | `InvalidLayerDimensions` or `ShapeTooLarge`                                    |
+| Explicit parameters  | Exact weights and biases for the declared shape                 | Count-mismatch error                                                           |
+| Network construction | Nonempty stack and matching adjacent dimensions                 | `EmptyNetwork` or `InvalidLayerDimensions`                                     |
+| CPU forward          | Input/output widths and finite layer results                    | Size mismatch or `NumericInstability`                                          |
+| Binary loading       | Header, version, bounds before allocation, exact payload length | `InvalidBuilder`, `InvalidLayerDimensions`, `ShapeTooLarge`, or `EmptyNetwork` |
+| Serde loading        | Constructor validation and buffer reconstruction                | Deserialization error rather than unusable state                               |
 
 The 100,000,000-element guard applies to a single requested tensor allocation.
 At four bytes per `f32`, that is approximately 400 MB. It is both a practical
