@@ -25,20 +25,6 @@ pub enum ShaderType {
     Sigmoid,
     /// Tanh activation
     Tanh,
-
-    /// Softmax pass 1: find maximum value
-    SoftmaxMax,
-    /// Softmax pass 2: compute exp(x - max) and sum
-    SoftmaxExpSum,
-    /// Softmax pass 3: normalize by sum
-    SoftmaxNorm,
-
-    /// SGD optimizer with momentum
-    SgdMomentum,
-    /// Adam optimizer
-    Adam,
-    /// AdamW optimizer with weight decay
-    AdamW,
 }
 
 impl ShaderType {
@@ -51,12 +37,6 @@ impl ShaderType {
             ShaderType::LeakyReLU => shaders::LEAKY_RELU_SHADER,
             ShaderType::Sigmoid => shaders::SIGMOID_SHADER,
             ShaderType::Tanh => shaders::TANH_SHADER,
-            ShaderType::SoftmaxMax => shaders::SOFTMAX_MAX_SHADER,
-            ShaderType::SoftmaxExpSum => shaders::SOFTMAX_EXP_SUM_SHADER,
-            ShaderType::SoftmaxNorm => shaders::SOFTMAX_NORM_SHADER,
-            ShaderType::SgdMomentum => shaders::SGD_MOMENTUM_SHADER,
-            ShaderType::Adam => shaders::ADAM_SHADER,
-            ShaderType::AdamW => shaders::ADAMW_SHADER,
         }
     }
 
@@ -79,12 +59,6 @@ impl ShaderType {
             ShaderType::LeakyReLU => "leaky_relu",
             ShaderType::Sigmoid => "sigmoid",
             ShaderType::Tanh => "tanh",
-            ShaderType::SoftmaxMax => "softmax_max",
-            ShaderType::SoftmaxExpSum => "softmax_exp_sum",
-            ShaderType::SoftmaxNorm => "softmax_norm",
-            ShaderType::SgdMomentum => "sgd_momentum",
-            ShaderType::Adam => "adam",
-            ShaderType::AdamW => "adamw",
         }
     }
 }
@@ -266,7 +240,6 @@ mod tests {
                 .contains("@compute")
         );
         assert!(ShaderType::Sigmoid.source().contains("clamp"));
-        assert!(ShaderType::Adam.source().contains("beta1"));
     }
 
     #[test]
