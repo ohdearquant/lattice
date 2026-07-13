@@ -27,10 +27,14 @@
 //! # Design
 //!
 //! `MetalQwen35State` owns raw `metal::*` objects and is `!Send`, so it lives on
-//! one dedicated worker thread for the whole process lifetime. The async axum
-//! handlers never touch Metal directly: each request ships a `Job` (messages +
-//! sampling config + a reply channel) to the worker over a tokio mpsc, and the
-//! worker drives `chat_completion_streaming`, forwarding each token delta back.
+//! one dedicated worker thread for the whole process lifetime, owned by
+//! `lattice_inference::serve::metal_worker::MetalWorker` (issue #832: the
+//! same shared owner module `lattice.rs`'s Metal backend uses). The async
+//! axum handlers never touch Metal directly: each request is submitted via
+//! `MetalWorkerClient::submit`, which ships a job (messages + sampling
+//! config + a cancellation watch) to the worker over a tokio mpsc and
+//! returns a `WorkerEvent` receiver; the worker drives cache-aware
+//! generation, forwarding each token delta back as `WorkerEvent::Delta`.
 //! Generation is therefore serialized — correct for a single-GPU local engine
 //! (the same default ollama uses). The ChatML template and `<|im_end|>` stop
 //! handling are reused verbatim from the engine; this binary only translates the
@@ -65,95 +69,68 @@ mod imp {
         },
         routing::{get, post},
     };
-    use lattice_inference::forward::metal_qwen35::{
-        ChatMessage, MetalQwen35State, format_chat_template,
-    };
+    use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{
-        GenerateConfig, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
+        GenerateConfig, GenerateOutput, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
     };
     use lattice_inference::model_format::{self, ModelFormat};
+    use lattice_inference::serve::metal_worker::{
+        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
+        WorkerMetadata,
+    };
+    /// Only used by the test module's `.tokenize(..)` calls on a real (tiny)
+    /// tokenizer; production code never tokenizes outside the shared worker
+    /// (`lattice_inference::serve::metal_worker`), hence the test feature gate.
+    #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use lattice_inference::tokenizer::Tokenizer as _;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use serde::Deserialize;
     use serde_json::{Value, json};
     use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
-    use tokio::sync::{mpsc, watch};
+    /// Only used by the test module's raw job-channel helpers
+    /// (`mpsc::UnboundedReceiver<WorkerJob>` etc. -- see
+    /// `lattice_inference::serve::metal_worker`'s `test-utils`-gated
+    /// surface); production code only ever holds a `MetalWorkerClient`.
+    #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
+    use tokio::sync::mpsc;
 
-    // ─── worker protocol ─────────────────────────────────────────────────────
-
-    /// One token-stream event from the worker back to a request handler.
-    enum Ev {
-        Delta(String),
-        Done {
-            prompt_tokens: usize,
-            completion_tokens: usize,
-            /// The engine's actual stop cause (ADR-080 C2, #746): `true` when
-            /// generation ended via an explicit stop condition (EOS,
-            /// stop-token-id, or stop-string match), `false` when the token
-            /// budget was exhausted or the caller cancelled. Previously
-            /// discarded entirely here -- both the SSE and non-streaming
-            /// handlers below hardcoded `finish_reason: "stop"`
-            /// unconditionally, so a length-capped completion was
-            /// misreported as an explicit stop. Fed through
-            /// `lattice_inference::serve::finish_reason` at both call sites.
-            stopped: bool,
-        },
-        /// Generation failed closed instead of completing (#611: e.g. a
-        /// grammar mask that blocks every candidate token, mirroring the
-        /// CPU/`lattice.rs` fail-closed contract). Carries the underlying
-        /// error message for server-side logging; the streaming and
-        /// non-streaming handlers below decide separately how much (if any)
-        /// of it is safe to surface to the HTTP client.
-        Failed {
-            message: String,
-        },
-        /// The request itself cannot fit the model's KV window (#656: prompt
-        /// length was unknown to `build_cfg`, so this is only checked once
-        /// the worker tokenizes the prompt). Client-caused, so it maps to
-        /// HTTP 400 rather than the 500 `Failed` uses -- distinct from a
-        /// generation-time failure, never a server-side problem.
-        Rejected {
-            message: String,
-        },
-    }
-
-    /// A generation request handed to the single GPU worker thread.
+    /// Normalizes [`WorkerEvent::Cancelled`] (the job was skipped at dequeue
+    /// time: the client's `cancel` watch flag was already `true`, or this
+    /// job's own event receiver was already closed) into an ordinary, empty
+    /// [`WorkerEvent::Complete`] -- zero tokens, `stopped: false`
+    /// ("length"-shaped termination). This is the exact observable shape
+    /// `lattice.rs`'s prior `MetalJob` dequeue-cancellation path already
+    /// produced (an empty interrupted `GenerateOutput` flowing through the
+    /// normal completion path); #832 unifies this binary onto the same
+    /// shape instead of its own prior silent "zero events, channel closes"
+    /// behavior.
     ///
-    /// `cancel` reflects whether the client that submitted this job is still
-    /// there. It starts `false` and flips to `true` the moment the matching
-    /// [`CancelOnDrop`] guard is dropped -- i.e. the instant axum drops the
-    /// response future/stream, which is exactly what happens on client
-    /// disconnect (browser tab closed, `curl` killed, request future
-    /// cancelled). The worker checks it (a) once at dequeue, before doing any
-    /// work, and (b) independently of token emission, via
-    /// `chat_completion_streaming_with_cancel`'s `should_cancel` predicate --
-    /// before prefill, immediately after prefill returns, and at the top of
-    /// every decode iteration -- so an abandoned job is skipped entirely,
-    /// stopped before paying for prefill, or stopped within one decode step
-    /// of the client leaving.
-    struct Job {
-        messages: Vec<ChatMessage>,
-        cfg: GenerateConfig,
-        tx: mpsc::UnboundedSender<Ev>,
-        cancel: watch::Receiver<bool>,
+    /// In practice this is defensive only: the `cancel` guard paired with
+    /// any given job is owned by the very same async task that is awaiting
+    /// this job's events (moved into the SSE stream state for the streaming
+    /// path, held in local scope for non-streaming), so a live HTTP request
+    /// can never actually observe `Cancelled` -- if the guard had dropped,
+    /// axum would have already dropped the observing task along with it.
+    /// Exists so every match below stays exhaustive and well-defined even
+    /// if that invariant ever changes, exactly like the pre-existing
+    /// `WorkerEvent::Rejected`-inside-`Phase::Body` defensive arm this refactor also
+    /// preserves. Leaves every other event unchanged.
+    fn normalize_cancelled(ev: WorkerEvent) -> WorkerEvent {
+        match ev {
+            WorkerEvent::Cancelled => WorkerEvent::Complete(GenerateOutput {
+                text: String::new(),
+                token_ids: vec![],
+                prompt_tokens: 0,
+                generated_tokens: 0,
+                stopped: false,
+                stop_reason: Some(lattice_inference::StopReason::Interrupt),
+                token_logprobs: vec![],
+            }),
+            other => other,
+        }
     }
-
-    /// Flips the paired `cancel` receiver to `true` when dropped. Held inside
-    /// the per-request SSE stream state (streaming) or the handler's local
-    /// scope (non-streaming) so it drops exactly when axum stops caring about
-    /// the response — on client disconnect, or harmlessly after the request
-    /// already finished normally (by then the worker has moved on anyway).
-    ///
-    /// ADR-080 C2 (#782): this used to be a private copy of the exact same
-    /// struct; it is now `lattice_inference::serve::CancelOnDrop`, the single
-    /// shared definition `lattice.rs`'s CPU streaming path also uses.
-    /// Production code below only ever calls `cancel_pair()` (never names
-    /// the guard type directly); the `use` is needed for the test helper's
-    /// return-type annotation, hence `#[cfg(test)]`.
-    #[cfg(test)]
-    use lattice_inference::serve::CancelOnDrop;
 
     /// Server-side sampling defaults, overridable per-request.
     #[derive(Clone)]
@@ -168,7 +145,7 @@ mod imp {
 
     #[derive(Clone)]
     pub struct AppState {
-        jobs: mpsc::UnboundedSender<Job>,
+        jobs: MetalWorkerClient,
         model_id: Arc<str>,
         defaults: Defaults,
         /// Runtime context window derived from the loaded model (#551): the
@@ -977,241 +954,17 @@ mod imp {
         })
     }
 
-    /// Prefix marker used only by the KV-window pre-check in `spawn_worker`'s
-    /// `generate` closure: distinguishes a client-caused window-overflow
-    /// rejection (HTTP 400, `Ev::Rejected`) from a genuine generation
-    /// failure (HTTP 500, `Ev::Failed`) without changing `run_worker_loop`'s
-    /// generic `Result<(usize, usize), String>` contract, which every other
-    /// caller and test fake still uses unchanged.
-    const PROMPT_EXCEEDS_WINDOW_PREFIX: &str = "prompt-exceeds-window: ";
-
-    /// #656: `build_cfg` only clamps `max_new_tokens`/`reasoning_budget`
-    /// against `model_max_context` *in isolation* -- it has no visibility
-    /// into `prompt_len` (unknown until the worker tokenizes the prompt).
-    /// The invariant that must actually hold is the full-window one:
-    /// `prompt_len + max_new_tokens + reasoning_budget + 1 <= model_max_context`.
-    /// Called by the worker right after tokenizing, before generation
-    /// starts, so a request that would overrun the KV cache is rejected up
-    /// front instead of silently hitting `StopReason::KvFull` mid-generation
-    /// while the response still claims `finish_reason: "stop"`.
-    fn check_prompt_fits_window(
-        model_max_context: usize,
-        prompt_len: usize,
-        cfg: &GenerateConfig,
-    ) -> Result<(), String> {
-        let decode_cap = cfg
-            .max_new_tokens
-            .saturating_add(cfg.reasoning_budget.unwrap_or(0));
-        let required = prompt_len.saturating_add(decode_cap).saturating_add(1);
-        if required > model_max_context {
-            let available = model_max_context.saturating_sub(prompt_len);
-            return Err(format!(
-                "prompt has {prompt_len} tokens, leaving {available} of the \
-                 {model_max_context}-token context window for generation, but this \
-                 request needs {decode_cap} generated tokens plus 1 (total {required}); \
-                 reduce max_tokens/reasoning_budget or shorten the prompt"
-            ));
-        }
-        Ok(())
-    }
-
-    /// Tokenizes `messages` and enforces the full KV-window invariant
-    /// (`check_prompt_fits_window`) before any generation work starts.
-    ///
-    /// ADR-080 C2: `spawn_worker`'s
-    /// real Metal closure below and the real-router streaming
-    /// context-overflow parity test in this module's test suite both call
-    /// this EXACT function -- not two independently-written copies of the
-    /// same check -- so a mutation that guts the window enforcement here is
-    /// observed by production's own worker closure AND by the test's worker
-    /// seam identically. There is no separate test-only reimplementation of
-    /// `check_prompt_fits_window` for such a mutation to leave unmutated.
-    fn enforce_prompt_window(
-        tokenizer: &BpeTokenizer,
-        model_max_context: usize,
-        messages: &[ChatMessage],
-        cfg: &GenerateConfig,
-    ) -> Result<usize, String> {
-        let prompt_len = tokenizer
-            .tokenize(&format_chat_template(messages))
-            .real_length;
-        if let Err(msg) = check_prompt_fits_window(model_max_context, prompt_len, cfg) {
-            return Err(format!("{PROMPT_EXCEEDS_WINDOW_PREFIX}{msg}"));
-        }
-        Ok(prompt_len)
-    }
-
     // ─── GPU worker thread ───────────────────────────────────────────────────
-
-    /// Spawn the dedicated thread that owns the `!Send` Metal state. Loads the
-    /// model, signals readiness (or a load error) over `ready`, then serves jobs
-    /// serially until all `Job` senders drop.
-    /// Worker readiness payload (#551): carries the actual KV context the
-    /// worker allocated so `run()` can store it in `AppState` instead of a
-    /// hard-coded constant.
-    struct WorkerReady {
-        format: String,
-        model_max_context: usize,
-    }
-
-    fn spawn_worker(
-        model_dir: std::path::PathBuf,
-        tokenizer_path: std::path::PathBuf,
-        format: ModelFormat,
-        ready: std::sync::mpsc::Sender<Result<WorkerReady, String>>,
-    ) -> mpsc::UnboundedSender<Job> {
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
-        std::thread::spawn(move || {
-            let loaded = load_model(&model_dir, &tokenizer_path, format);
-            let LoadedModel {
-                mut metal,
-                tokenizer,
-                format,
-                model_max_context,
-            } = match loaded {
-                Ok(t) => t,
-                Err(e) => {
-                    let _ = ready.send(Err(e));
-                    return;
-                }
-            };
-            let _ = ready.send(Ok(WorkerReady {
-                format,
-                model_max_context,
-            }));
-
-            run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
-                // #656: verify the FULL window invariant (prompt included)
-                // before doing any GPU work -- `cfg` alone was already
-                // clamped by `build_cfg`, but only against the window in
-                // isolation, not against this specific prompt's length.
-                enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
-                // Cache-aware + cancellation-aware call (#462): reuses the
-                // previous turn's shared token prefix instead of the old
-                // unconditional `reset_state()` + full re-prefill on every
-                // request, while still observing client disconnect exactly
-                // like the old `chat_completion_streaming_with_cancel` call
-                // did (see `Job::cancel`'s doc comment above for what
-                // `should_cancel` observes). This is a single-worker,
-                // single-model binary sharing one Metal state across every
-                // request, so `CrossTurnSlotId::DEFAULT` is the only slot
-                // that exists and correctness does not depend on
-                // distinguishing clients: the planner token-verifies the
-                // retained prefix against this request's messages on every
-                // call and falls back to `PrefixReuseMode::FullRefill`
-                // whenever they diverge (a new conversation, edited history,
-                // or a second client's unrelated prompt interleaved on the
-                // same slot). Multi-client interleaving through one slot
-                // only forfeits the reuse speedup for whichever turn loses
-                // the shared prefix — it can never corrupt output, since the
-                // engine never trusts the cache without re-verifying it.
-                match metal.chat_completion_streaming_with_prefix_cache_and_cancel(
-                    lattice_inference::kv_cache::CrossTurnSlotId::DEFAULT,
-                    messages,
-                    &tokenizer,
-                    cfg,
-                    on_token,
-                    should_cancel,
-                ) {
-                    Ok(cached) => {
-                        eprintln!(
-                            "[lattice_serve] cross-turn cache: mode={:?} reused={} prefetched={} prompt={}",
-                            cached.cache.mode,
-                            cached.cache.reused_tokens,
-                            cached.cache.prefetched_tokens,
-                            cached.cache.prompt_tokens,
-                        );
-                        Ok((
-                            cached.output.prompt_tokens,
-                            cached.output.completion_tokens,
-                            cached.output.stopped,
-                        ))
-                    }
-                    // Fail-closed at the engine level already (live KV/GDN
-                    // state and the retained prefix entry are both reset
-                    // before this error is returned), so the worker is left
-                    // clean for the next job.
-                    Err(e) => Err(e.to_string()),
-                }
-            });
-        });
-        job_tx
-    }
-
-    /// Dequeue -> cancel-check -> generate -> reply, serialized on whatever
-    /// thread calls this (the dedicated Metal worker thread in production).
-    ///
-    /// `generate` is injected so tests can swap in a fake, GPU-free generator
-    /// while exercising the exact same queue/cancellation logic production
-    /// uses. It must call `on_token` for each generated delta and stop as
-    /// soon as `on_token` returns `false`; it must also poll `should_cancel`
-    /// independently of `on_token` -- including during any phase that never
-    /// calls `on_token` at all (a prefill-like section, or a run of
-    /// empty-delta steps) -- and stop as soon as `should_cancel` returns
-    /// `true`. Either way, return
-    /// `Ok((prompt_tokens, completion_tokens, stopped))` for whatever was
-    /// actually produced before stopping (early or at the cap) -- `stopped`
-    /// is the engine's actual stop cause (ADR-080 C2, #746: `true` for an
-    /// explicit stop condition, `false` for a length cap or cancellation),
-    /// fed through `Ev::Done` instead of being discarded -- or
-    /// `Err(message)` if generation itself failed closed (#611: e.g. a
-    /// grammar mask that blocks every candidate token) rather than
-    /// completing or being cancelled.
-    fn run_worker_loop(
-        mut job_rx: mpsc::UnboundedReceiver<Job>,
-        mut generate: impl FnMut(
-            &[ChatMessage],
-            &GenerateConfig,
-            &mut dyn FnMut(&str, u32) -> bool,
-            &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize, bool), String>,
-    ) {
-        while let Some(job) = job_rx.blocking_recv() {
-            if *job.cancel.borrow() {
-                // The client was already gone before we ever got to this job:
-                // skip it entirely, no prefill, no decode, no reply.
-                continue;
-            }
-            let cb_tx = job.tx.clone();
-            let cancel_for_token = job.cancel.clone();
-            let mut on_token = move |delta: &str, _id: u32| {
-                if *cancel_for_token.borrow() {
-                    return false;
-                }
-                // `send` also fails once the client hangs up; kept as a
-                // second, independent check so a job whose cancellation
-                // notification is somehow delayed still stops the instant
-                // its reply channel is gone.
-                cb_tx.send(Ev::Delta(delta.to_string())).is_ok()
-            };
-            // Separate from `on_token`: this is what reaches the generator's
-            // prefill gap and its empty-delta decode iterations, neither of
-            // which ever calls `on_token` (see
-            // `MetalQwen35State::generate_streaming_with_cancel`).
-            let cancel_for_predicate = job.cancel.clone();
-            let mut should_cancel = move || *cancel_for_predicate.borrow();
-            match generate(&job.messages, &job.cfg, &mut on_token, &mut should_cancel) {
-                Ok((prompt_tokens, completion_tokens, stopped)) => {
-                    let _ = job.tx.send(Ev::Done {
-                        prompt_tokens,
-                        completion_tokens,
-                        stopped,
-                    });
-                }
-                Err(message) => {
-                    if let Some(client_message) = message.strip_prefix(PROMPT_EXCEEDS_WINDOW_PREFIX)
-                    {
-                        let _ = job.tx.send(Ev::Rejected {
-                            message: client_message.to_string(),
-                        });
-                    } else {
-                        eprintln!("generation error: {message}");
-                        let _ = job.tx.send(Ev::Failed { message });
-                    }
-                }
-            }
-        }
-    }
+    //
+    // The dedicated thread that owns the `!Send` Metal state, the shared
+    // FIFO/cancellation job loop, and the shared KV-window invariant check
+    // all now live in `lattice_inference::serve::metal_worker` (issue #832),
+    // replacing this binary's previous private `spawn_worker`/
+    // `run_worker_loop`/`check_prompt_fits_window`/`enforce_prompt_window`.
+    // `load_model`/`LoadedModel` below are unchanged: `run()` wraps
+    // `load_model` in a loader closure passed to `MetalWorker::spawn`, which
+    // runs it ON the worker thread it creates (the `!Send` `MetalQwen35State`
+    // this function returns never crosses a thread boundary).
 
     /// Everything the worker thread needs after a successful model load,
     /// including the actual KV context (#551) so request clamping never
@@ -1440,53 +1193,37 @@ mod imp {
         let id = format!("chatcmpl-{}", unix_nanos());
         let created = unix_secs();
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
         let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
-        if s.jobs
-            .send(Job {
-                messages,
-                cfg,
-                tx,
-                cancel: cancel_rx,
-            })
-            .is_err()
-        {
-            emit_serve_event(
-                "POST",
-                "/v1/chat/completions",
-                500,
-                None,
-                timer.elapsed().as_secs_f64() * 1000.0,
-                streaming,
-            );
-            return err_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "inference worker unavailable",
-                "internal_error",
-            );
-        }
+        // `MetalWorkerClient::submit` (issue #832) never fails outwardly --
+        // if the worker thread is no longer running, the returned receiver
+        // simply closes with zero events, which both branches below detect
+        // via their own first-event peek (`rx.recv()` returning `None`) and
+        // report identically to this binary's prior up-front
+        // `jobs.send(..).is_err()` check.
+        let mut rx = s.jobs.submit(messages, cfg, cancel_rx);
         // Dropped when nobody cares about the response anymore: at the end of
         // this SSE stream (moved in below) or at the end of this function for
         // the non-streaming branch. Either way that's the client disconnect
-        // signal the worker checks in `run_worker_loop`.
+        // signal the worker checks in the shared FIFO loop
+        // (`lattice_inference::serve::metal_worker::run_worker_loop`).
         if streaming {
             // ADR-080 C2: without this
             // preflight, a prompt-plus-budget overflow was only discoverable
             // AFTER the HTTP response had already committed to 200 SSE (the
-            // worker's `Ev::Rejected` arrived mid-stream, terminating with
-            // `finish_reason: "length"` instead of the 400
+            // worker's `WorkerEvent::Rejected` arrived mid-stream, terminating
+            // with `finish_reason: "length"` instead of the 400
             // `context_length_exceeded` the non-streaming path and
             // `lattice.rs`'s `check_context_window` preflight both return for
             // the identical request body). Await the worker's FIRST event
             // before deciding the status code at all -- exactly the
             // non-streaming branch's own ordering below, just not looping to
-            // drain every event yet. `Ev::Rejected`/`Ev::Failed` on this first
-            // event get the same un-committed 400/500 treatment as
-            // non-streaming; anything else (`Ev::Delta`/`Ev::Done`) means the
+            // drain every event yet. `WorkerEvent::Rejected`/`Failed` on this
+            // first event get the same un-committed 400/500 treatment as
+            // non-streaming; anything else (`Delta`/`Complete`) means the
             // request passed the worker's checks, so NOW commit to 200 SSE --
             // carrying that already-consumed first event into the stream's
             // state machine (`pending`) so it isn't silently dropped.
-            let Some(first_ev) = rx.recv().await else {
+            let Some(first_ev) = rx.recv().await.map(normalize_cancelled) else {
                 emit_serve_event(
                     "POST",
                     "/v1/chat/completions",
@@ -1502,7 +1239,7 @@ mod imp {
                 );
             };
             let first_ev = match first_ev {
-                Ev::Rejected { message } => {
+                WorkerEvent::Rejected(api_err) => {
                     emit_serve_event(
                         "POST",
                         "/v1/chat/completions",
@@ -1511,13 +1248,9 @@ mod imp {
                         timer.elapsed().as_secs_f64() * 1000.0,
                         true,
                     );
-                    return err_response(
-                        StatusCode::BAD_REQUEST,
-                        &message,
-                        "context_length_exceeded",
-                    );
+                    return api_err.into_response();
                 }
-                Ev::Failed { message } => {
+                WorkerEvent::Failed(message) => {
                     eprintln!("generation error (streaming): {message}");
                     emit_serve_event(
                         "POST",
@@ -1533,7 +1266,10 @@ mod imp {
                         "internal_error",
                     );
                 }
-                ev @ (Ev::Delta(_) | Ev::Done { .. }) => ev,
+                ev @ (WorkerEvent::Delta(_) | WorkerEvent::Complete(_)) => ev,
+                WorkerEvent::Cancelled => {
+                    unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
+                }
             };
             let stream = futures::stream::unfold(
                 (rx, Phase::Start, cancel_guard, Some(first_ev)),
@@ -1558,8 +1294,10 @@ mod imp {
                             Phase::Body => match match pending.take() {
                                 Some(ev) => Some(ev),
                                 None => rx.recv().await,
-                            } {
-                                Some(Ev::Delta(d)) => {
+                            }
+                            .map(normalize_cancelled)
+                            {
+                                Some(WorkerEvent::Delta(d)) => {
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
                                         "created": created, "model": model,
@@ -1570,11 +1308,7 @@ mod imp {
                                         (rx, Phase::Body, cancel_guard, None),
                                     ))
                                 }
-                                Some(Ev::Done {
-                                    completion_tokens: ct,
-                                    stopped,
-                                    ..
-                                }) => {
+                                Some(WorkerEvent::Complete(output)) => {
                                     // ADR-080 C2, #746: the engine's actual
                                     // stop cause, not a hardcoded "stop" --
                                     // `finish_reason` is "length" whenever
@@ -1582,7 +1316,7 @@ mod imp {
                                     // cancellation), matching `lattice.rs`'s
                                     // contract exactly.
                                     let finish_reason =
-                                        lattice_inference::serve::finish_reason(stopped);
+                                        lattice_inference::serve::finish_reason(output.stopped);
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
                                         "created": created, "model": model,
@@ -1590,10 +1324,15 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(ct), cancel_guard, None),
+                                        (
+                                            rx,
+                                            Phase::Done(output.generated_tokens),
+                                            cancel_guard,
+                                            None,
+                                        ),
                                     ))
                                 }
-                                Some(Ev::Failed { message }) => {
+                                Some(WorkerEvent::Failed(message)) => {
                                     // The HTTP response was already committed as
                                     // 200 + text/event-stream when this SSE stream
                                     // started, so an error mid-stream cannot change
@@ -1614,19 +1353,23 @@ mod imp {
                                         (rx, Phase::Done(0), cancel_guard, None),
                                     ))
                                 }
-                                Some(Ev::Rejected { message }) => {
+                                Some(WorkerEvent::Rejected(api_err)) => {
                                     // Structurally unreachable at this point:
-                                    // `run_worker_loop`'s `check_prompt_fits_window`
-                                    // call happens before any `Ev::Delta`/`Ev::Done`
-                                    // is ever sent for a job, so `Ev::Rejected` can
-                                    // only ever be the FIRST event a job produces --
-                                    // and the preflight above (ADR-080 C2) already
-                                    // intercepts that one before committing to 200
-                                    // SSE. Kept as a defensive fallback (same
-                                    // graceful-termination shape as before) in case
-                                    // that invariant ever changes rather than
-                                    // deleting the arm outright.
-                                    eprintln!("request rejected (streaming): {message}");
+                                    // the shared worker's window check runs
+                                    // before any `Delta`/`Complete` is ever
+                                    // sent for a job, so `Rejected` can only
+                                    // ever be the FIRST event a job produces
+                                    // -- and the preflight above (ADR-080 C2)
+                                    // already intercepts that one before
+                                    // committing to 200 SSE. Kept as a
+                                    // defensive fallback (same
+                                    // graceful-termination shape as before)
+                                    // in case that invariant ever changes
+                                    // rather than deleting the arm outright.
+                                    eprintln!(
+                                        "request rejected (streaming): {}",
+                                        api_err.message()
+                                    );
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
                                         "created": created, "model": model,
@@ -1637,6 +1380,9 @@ mod imp {
                                         (rx, Phase::Done(0), cancel_guard, None),
                                     ))
                                 }
+                                Some(WorkerEvent::Cancelled) => unreachable!(
+                                    "normalize_cancelled already rewrote Cancelled into Complete"
+                                ),
                                 None => {
                                     let chunk = json!({
                                         "id": id, "object": "chat.completion.chunk",
@@ -1672,23 +1418,49 @@ mod imp {
                 .keep_alive(KeepAlive::default())
                 .into_response()
         } else {
+            // ADR-080 C2 / #832: mirrors the streaming branch's own
+            // first-event peek above -- previously this binary's up-front
+            // `jobs.send(..).is_err()` check was the ONLY thing catching a
+            // dead/unavailable worker for this path; now that
+            // `MetalWorkerClient::submit` never fails outwardly, a worker
+            // that is gone before this job is even dequeued shows up here as
+            // `rx.recv()` returning `None` on the very first poll, same as
+            // streaming's preflight. Without this peek the loop below would
+            // exit immediately with all-zero/empty fields and silently
+            // return a 200 JSON completion with empty content instead of the
+            // 500 this binary has always returned for that condition.
+            let Some(first_ev) = rx.recv().await.map(normalize_cancelled) else {
+                emit_serve_event(
+                    "POST",
+                    "/v1/chat/completions",
+                    500,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                );
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "inference worker unavailable",
+                    "internal_error",
+                );
+            };
             let mut content = String::new();
             let mut prompt_tokens = 0usize;
             let mut completion_tokens = 0usize;
             let mut stopped = false;
-            while let Some(ev) = rx.recv().await {
+            let mut pending = Some(first_ev);
+            while let Some(ev) = match pending.take() {
+                Some(ev) => Some(ev),
+                None => rx.recv().await.map(normalize_cancelled),
+            } {
                 match ev {
-                    Ev::Delta(d) => content.push_str(&d),
-                    Ev::Done {
-                        prompt_tokens: pt,
-                        completion_tokens: ct,
-                        stopped: s,
-                    } => {
-                        prompt_tokens = pt;
-                        completion_tokens = ct;
-                        stopped = s;
+                    WorkerEvent::Delta(d) => content.push_str(&d),
+                    WorkerEvent::Complete(output) => {
+                        prompt_tokens = output.prompt_tokens;
+                        completion_tokens = output.generated_tokens;
+                        stopped = output.stopped;
                     }
-                    Ev::Failed { message } => {
+                    WorkerEvent::Failed(message) => {
                         // Unlike streaming, the response has not been committed
                         // yet, so a generation failure (#611: e.g. a grammar mask
                         // that blocks every candidate token) can still surface as
@@ -1710,13 +1482,13 @@ mod imp {
                             "internal_error",
                         );
                     }
-                    Ev::Rejected { message } => {
+                    WorkerEvent::Rejected(api_err) => {
                         // #656: client-caused request-contract violation (the
                         // prompt plus requested generation does not fit the
                         // model's KV window), caught before any generation
-                        // ran -- unlike `Ev::Failed`, the response has not
-                        // been committed yet, so this surfaces as a real 400
-                        // with the specific reason, not a generic 500.
+                        // ran -- unlike `Failed`, the response has not been
+                        // committed yet, so this surfaces as a real 400 with
+                        // the specific reason, not a generic 500.
                         emit_serve_event(
                             "POST",
                             "/v1/chat/completions",
@@ -1728,11 +1500,10 @@ mod imp {
                         // Matches lattice.rs's `check_context_window` code
                         // for the analogous prompt-plus-budget-exceeds-window
                         // condition (ADR-080 C2).
-                        return err_response(
-                            StatusCode::BAD_REQUEST,
-                            &message,
-                            "context_length_exceeded",
-                        );
+                        return api_err.into_response();
+                    }
+                    WorkerEvent::Cancelled => {
+                        unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
                     }
                 }
             }
@@ -1952,16 +1723,56 @@ mod imp {
                 ModelFormat::Unknown => "unknown",
             }
         );
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let jobs = spawn_worker(model_dir.clone(), tokenizer_path, format, ready_tx);
-        let WorkerReady {
-            format: fmt,
-            model_max_context,
-        } = match ready_rx.recv() {
-            Ok(Ok(ready)) => ready,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => return Err("worker thread exited during model load".into()),
+        // #832: `load_model` (unchanged) runs INSIDE this loader closure, on
+        // the dedicated worker thread `MetalWorker::spawn` creates -- the
+        // `!Send` `MetalQwen35State` it returns never crosses a thread
+        // boundary. Blocks here until loading finishes (or fails), exactly
+        // like this binary's prior `spawn_worker` + separate `ready` channel
+        // did.
+        let model_dir_for_loader = model_dir.clone();
+        let (
+            owner,
+            jobs,
+            WorkerMetadata {
+                format: fmt,
+                model_max_context,
+                ..
+            },
+        ) = match MetalWorker::spawn(move || {
+            let LoadedModel {
+                metal,
+                tokenizer,
+                format,
+                model_max_context,
+            } = load_model(&model_dir_for_loader, &tokenizer_path, format)?;
+            Ok((
+                metal,
+                tokenizer,
+                WorkerMetadata {
+                    format,
+                    model_max_context,
+                    context_window_policy: ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                },
+            ))
+        }) {
+            Ok(triple) => triple,
+            Err(StartupError::Load(e)) => return Err(e.into()),
+            // Preserves this binary's exact prior wording (distinct from
+            // `MetalWorker::spawn`'s own generic `StartupError::ThreadExited`
+            // `Display` text) for the same condition: the worker thread
+            // exited/panicked before ever sending a readiness signal.
+            Err(StartupError::ThreadExited) => {
+                return Err("worker thread exited during model load".into());
+            }
         };
+        // Retains the worker thread's `JoinHandle` for the life of the
+        // server (issue #833's seam: a future graceful-shutdown path has an
+        // obvious place to join it). Neither this binary's prior bare
+        // `mpsc::UnboundedSender<Job>` nor `lattice.rs`'s prior `MetalHandle`
+        // ever joined or explicitly shut down their worker thread either --
+        // the process exits and the OS reaps the detached thread -- so
+        // today's behavior is unchanged.
+        let _owner = owner;
 
         let model_id: Arc<str> = model_dir
             .file_name()
@@ -2003,426 +1814,69 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        use lattice_inference::serve::ApiError;
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        use lattice_inference::serve::metal_worker::{WorkerJob, spawn_fake, test_client_and_jobs};
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::time::Duration;
 
-        /// A GPU-free stand-in for `MetalQwen35State::chat_completion_streaming_with_cancel`:
-        /// "generates" up to `cap` fake tokens, sleeping briefly between each so
-        /// a cancelled job has many opportunities to be observed running past
-        /// where it should have stopped. Counts how many times it was entered
-        /// (`started`) and how many fake tokens actually ran (`ran_tokens`), so
-        /// tests can assert a cancelled queued job's generator was never called
-        /// at all. Checks `should_cancel` at the top of each iteration in
-        /// addition to `on_token`'s own check, mirroring the production
-        /// contract; existing tests here only rely on the `on_token` path, so
-        /// this addition does not change their outcomes.
-        #[allow(clippy::type_complexity)]
-        fn fake_generate(
-            cap: usize,
-            started: Arc<AtomicUsize>,
-            ran_tokens: Arc<AtomicUsize>,
-        ) -> impl FnMut(
-            &[ChatMessage],
-            &GenerateConfig,
-            &mut dyn FnMut(&str, u32) -> bool,
-            &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize, bool), String> {
-            move |_messages, _cfg, on_token, should_cancel| {
-                started.fetch_add(1, Ordering::SeqCst);
-                let mut n = 0usize;
-                for i in 0..cap {
-                    std::thread::sleep(Duration::from_millis(5));
-                    if should_cancel() {
-                        break;
-                    }
-                    if !on_token("x", i as u32) {
-                        break;
-                    }
-                    n += 1;
-                    ran_tokens.fetch_add(1, Ordering::SeqCst);
-                }
-                Ok((1, n, false))
-            }
-        }
+        // NOTE (issue #832): the FIFO/cancellation/window-check worker-loop
+        // test suite that used to live here (`fake_generate`,
+        // `fake_generate_with_prefill_gap`, `make_job`,
+        // `queued_job_cancelled_before_dequeue_is_skipped_entirely`,
+        // `running_job_cancelled_midstream_stops_early_and_worker_survives`,
+        // `running_job_cancelled_during_prefill_like_phase_never_calls_on_token`,
+        // `fake_generate_fails_once_then_succeeds`,
+        // `generation_failure_is_reported_as_ev_failed_not_ev_done`, and the
+        // three `check_prompt_fits_window_*` tests further below) exercised
+        // this binary's private `Job`/`Ev`/`run_worker_loop`/
+        // `check_prompt_fits_window`, all of which moved to the shared
+        // `lattice_inference::serve::metal_worker` module and are covered by
+        // that module's own `#[cfg(test)] mod tests` instead (ported
+        // verbatim, same assertions, same fake generators -- see
+        // `crates/inference/src/serve/metal_worker.rs`). The HTTP-level
+        // tests below still exercise THIS binary's real `chat_completions`,
+        // now routed through `MetalWorkerClient`/`WorkerEvent` via the
+        // `metal_worker` `test-utils` seam (`test_client_and_jobs`/
+        // `spawn_fake`) instead of this binary's own private job channel.
 
-        /// A GPU-free fake with an explicit prefill-like phase *before* any
-        /// `on_token` call -- mirroring the real gap this fix closes:
-        /// production prefill has no callback point at all, so only
-        /// `should_cancel` (never `on_token`) can observe a disconnect that
-        /// happens during it. `entered_decode` flips only if the prefill-like
-        /// phase runs to completion uncancelled, so tests can assert it never
-        /// does.
-        #[allow(clippy::type_complexity)]
-        fn fake_generate_with_prefill_gap(
-            prefill_steps: usize,
-            decode_cap: usize,
-            entered_decode: Arc<AtomicBool>,
-        ) -> impl FnMut(
-            &[ChatMessage],
-            &GenerateConfig,
-            &mut dyn FnMut(&str, u32) -> bool,
-            &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize, bool), String> {
-            move |_messages, _cfg, on_token, should_cancel| {
-                for _ in 0..prefill_steps {
-                    std::thread::sleep(Duration::from_millis(5));
-                    if should_cancel() {
-                        return Ok((1, 0, false));
-                    }
-                }
-                entered_decode.store(true, Ordering::SeqCst);
-                let mut n = 0usize;
-                for i in 0..decode_cap {
-                    std::thread::sleep(Duration::from_millis(5));
-                    if should_cancel() {
-                        break;
-                    }
-                    if !on_token("x", i as u32) {
-                        break;
-                    }
-                    n += 1;
-                }
-                Ok((1, n, false))
-            }
-        }
-
-        /// Builds a `Job` plus the receiver its worker replies on and the guard
-        /// that cancels it when dropped (the same guard `chat_completions`
-        /// moves into the SSE stream / keeps local for non-streaming, standing
-        /// in here for "the client is still connected").
-        fn make_job() -> (Job, mpsc::UnboundedReceiver<Ev>, CancelOnDrop) {
-            let (tx, rx) = mpsc::unbounded_channel::<Ev>();
-            let (cancel_guard, cancel_rx) = lattice_inference::serve::cancel_pair();
-            let job = Job {
-                messages: vec![ChatMessage::user("hi")],
-                cfg: GenerateConfig::default(),
-                tx,
-                cancel: cancel_rx,
-            };
-            (job, rx, cancel_guard)
-        }
-
+        /// #832 checklist: "Add a Metal-feature test asserting an explicit
+        /// common-worker marker, so a silently-reintroduced per-binary
+        /// fallback cannot pass green." `AppState.jobs`'s field type is
+        /// private, so this test can only be written from inside `mod imp`
+        /// (same module as `AppState`, so private-field access is allowed)
+        /// -- it constructs an `AppState` directly from a
+        /// `lattice_inference::serve::metal_worker::MetalWorkerClient`,
+        /// which only type-checks if `AppState.jobs` still holds that exact
+        /// shared type. A private per-binary fallback job channel (any type
+        /// other than the shared `MetalWorkerClient`) would fail to compile
+        /// here, not just fail some behavioral assertion at runtime. See
+        /// `lattice.rs`'s
+        /// `metal_handle_is_backed_by_the_shared_metal_worker_client` for
+        /// the sibling marker on the other binary.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[test]
-        fn queued_job_cancelled_before_dequeue_is_skipped_entirely() {
-            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
-            let started = Arc::new(AtomicUsize::new(0));
-            let ran_tokens = Arc::new(AtomicUsize::new(0));
-
-            // Job 1 occupies the worker (50 fake tokens, 5ms apart = ~250ms)
-            // long enough that job 2 is still sitting in the queue, untouched,
-            // when we cancel it a few lines down.
-            let (job1, rx1, _guard1) = make_job();
-            job_tx.send(job1).unwrap();
-
-            // Job 2: cancelled client-side (guard dropped) immediately, while
-            // it is still queued behind job 1.
-            let (job2, mut rx2, guard2) = make_job();
-            job_tx.send(job2).unwrap();
-            drop(guard2);
-
-            // Job 3: submitted after the cancelled one, to prove the worker
-            // moves on and keeps serving correctly afterward.
-            let (job3, rx3, _guard3) = make_job();
-            job_tx.send(job3).unwrap();
-            drop(job_tx);
-
-            let started2 = started.clone();
-            let ran2 = ran_tokens.clone();
-            let handle = std::thread::spawn(move || {
-                run_worker_loop(job_rx, fake_generate(50, started2, ran2))
-            });
-
-            let completion_tokens_of = |mut rx: mpsc::UnboundedReceiver<Ev>| -> Option<usize> {
-                let mut ct = None;
-                while let Some(ev) = rx.blocking_recv() {
-                    if let Ev::Done {
-                        completion_tokens, ..
-                    } = ev
-                    {
-                        ct = Some(completion_tokens);
-                    }
-                }
-                ct
-            };
-
-            assert_eq!(
-                completion_tokens_of(rx1),
-                Some(50),
-                "job 1 should run to completion undisturbed"
-            );
-
-            // Job 2 must produce NOTHING: no Delta, no Done -- the worker
-            // `continue`d past it without ever touching `generate`, so its
-            // `tx` is simply dropped with the rest of the `Job`.
-            assert!(
-                rx2.blocking_recv().is_none(),
-                "cancelled queued job must be skipped entirely: no events at all"
-            );
-
-            assert_eq!(
-                completion_tokens_of(rx3),
-                Some(50),
-                "worker must survive cancelling job 2 and serve job 3 normally afterward"
-            );
-
-            handle.join().expect("worker thread must not panic");
-
-            assert_eq!(
-                started.load(Ordering::SeqCst),
-                2,
-                "generate() must run exactly twice (job 1, job 3) -- never for cancelled job 2"
-            );
-            assert_eq!(
-                ran_tokens.load(Ordering::SeqCst),
-                100,
-                "50 real fake-tokens each for job 1 and job 3, zero for cancelled job 2"
-            );
-        }
-
-        #[test]
-        fn running_job_cancelled_midstream_stops_early_and_worker_survives() {
-            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
-            let started = Arc::new(AtomicUsize::new(0));
-            let ran_tokens = Arc::new(AtomicUsize::new(0));
-
-            // Job 1: a long fake generation (2000 tokens, 5ms apart) that we
-            // cancel partway through -- it must stop well short of the cap.
-            let (job1, mut rx1, guard1) = make_job();
-            job_tx.send(job1).unwrap();
-            // `Option` so it can be moved-out-and-dropped at most once from
-            // inside the loop below; the borrow checker cannot see that the
-            // `seen == 5` runtime condition only ever holds on one iteration,
-            // so a bare `drop(guard1)` there is rejected as a repeated move.
-            let mut guard1 = Some(guard1);
-
-            let (job2, mut rx2, _guard2) = make_job();
-            job_tx.send(job2).unwrap();
-            drop(job_tx);
-
-            let started2 = started.clone();
-            let ran2 = ran_tokens.clone();
-            let handle = std::thread::spawn(move || {
-                run_worker_loop(job_rx, fake_generate(2000, started2, ran2))
-            });
-
-            let mut seen = 0;
-            loop {
-                match rx1.blocking_recv() {
-                    Some(Ev::Delta(_)) => {
-                        seen += 1;
-                        if seen == 5 {
-                            // "Client disconnects" mid-stream.
-                            guard1.take();
-                        }
-                    }
-                    Some(Ev::Done {
-                        completion_tokens, ..
-                    }) => {
-                        assert!(
-                            completion_tokens < 2000,
-                            "job 1 must stop well short of its 2000-token cap after \
-                             cancellation, got {completion_tokens}"
-                        );
-                        assert!(
-                            completion_tokens < 100,
-                            "job 1 must stop within a handful of tokens of the client \
-                             disconnecting, not run on regardless; got {completion_tokens}"
-                        );
-                        break;
-                    }
-                    Some(Ev::Failed { message }) => {
-                        panic!("fake_generate never fails; unexpected Ev::Failed: {message}")
-                    }
-                    Some(Ev::Rejected { message }) => {
-                        panic!("fake_generate never rejects; unexpected Ev::Rejected: {message}")
-                    }
-                    None => panic!("job 1's reply channel closed before a Done event"),
+        fn app_state_is_backed_by_the_shared_metal_worker_client() {
+            fn build_from_shared_client(jobs: MetalWorkerClient) -> AppState {
+                AppState {
+                    jobs,
+                    model_id: Arc::from("marker-test-model"),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
+                    model_max_context: 4096,
                 }
             }
-
-            // Job 2 must still complete in full: the worker thread did not
-            // panic or wedge when job 1 was cancelled mid-generation.
-            let mut n2 = None;
-            while let Some(ev) = rx2.blocking_recv() {
-                if let Ev::Done {
-                    completion_tokens, ..
-                } = ev
-                {
-                    n2 = Some(completion_tokens);
-                }
-            }
-            assert_eq!(
-                n2,
-                Some(2000),
-                "worker must survive mid-stream cancellation and serve the next job to completion"
-            );
-
-            handle.join().expect("worker thread must not panic");
-        }
-
-        /// PR #606: cancellation was only observed through the
-        /// `on_token` callback, so a generator phase that never calls it -- the
-        /// real prefill pass has no callback point at all -- could run
-        /// unbounded after the client already disconnected. This proves
-        /// `run_worker_loop` threads an independent `should_cancel` signal
-        /// through to `generate` and that a fake generator honoring only that
-        /// signal (never `on_token`) still gets stopped promptly, well short
-        /// of its prefill-like phase's natural end.
-        #[test]
-        fn running_job_cancelled_during_prefill_like_phase_never_calls_on_token() {
-            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
-            let entered_decode = Arc::new(AtomicBool::new(false));
-
-            let (job1, mut rx1, guard1) = make_job();
-            job_tx.send(job1).unwrap();
-            drop(job_tx);
-
-            // 400 * 5ms = up to 2s of "prefill" if never cancelled -- the test
-            // cancels at 20ms in, ~100x margin, so reaching Done quickly is
-            // only possible if should_cancel actually stopped it early.
-            let entered2 = entered_decode.clone();
-            let handle = std::thread::spawn(move || {
-                run_worker_loop(job_rx, fake_generate_with_prefill_gap(400, 50, entered2))
-            });
-
-            std::thread::sleep(Duration::from_millis(20));
-            drop(guard1);
-
-            match rx1.blocking_recv() {
-                Some(Ev::Delta(_)) => panic!(
-                    "on_token must never be called: cancellation happened while the \
-                     fake generator was still in its prefill-like phase, which does \
-                     not call on_token at all"
-                ),
-                Some(Ev::Done {
-                    completion_tokens, ..
-                }) => {
-                    assert_eq!(
-                        completion_tokens, 0,
-                        "job cancelled during the prefill-like phase must produce \
-                         zero tokens, got {completion_tokens}"
-                    );
-                }
-                Some(Ev::Failed { message }) => panic!(
-                    "fake_generate_with_prefill_gap never fails; unexpected Ev::Failed: {message}"
-                ),
-                Some(Ev::Rejected { message }) => panic!(
-                    "fake_generate_with_prefill_gap never rejects; unexpected Ev::Rejected: {message}"
-                ),
-                None => panic!("job 1's reply channel closed before a Done event"),
-            }
-
-            handle.join().expect("worker thread must not panic");
-
-            assert!(
-                !entered_decode.load(Ordering::SeqCst),
-                "should_cancel alone (on_token is never called during this phase) \
-                 must stop the job before the decode phase is ever reached -- this \
-                 is the exact blind spot #606 fixed, where production \
-                 prefill has no on_token callback point and so could run to \
-                 completion after the client already disconnected"
-            );
-        }
-
-        /// A GPU-free fake that fails closed on its first call (mirroring the
-        /// #611 contract: `chat_completion_streaming_with_cancel` now returns
-        /// `Err` instead of silently sampling when a grammar mask blocks every
-        /// candidate token) and succeeds normally on every call after that, so
-        /// a single test can prove both halves of the contract: the failure is
-        /// reported honestly, and the worker thread survives it.
-        #[allow(clippy::type_complexity)]
-        fn fake_generate_fails_once_then_succeeds(
-            message: &'static str,
-            call_count: Arc<AtomicUsize>,
-        ) -> impl FnMut(
-            &[ChatMessage],
-            &GenerateConfig,
-            &mut dyn FnMut(&str, u32) -> bool,
-            &mut dyn FnMut() -> bool,
-        ) -> Result<(usize, usize, bool), String> {
-            move |_messages, _cfg, on_token, _should_cancel| {
-                if call_count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return Err(message.to_string());
-                }
-                let _ = on_token("x", 0);
-                Ok((1, 1, true))
-            }
-        }
-
-        /// #611: a generation failure must reach the HTTP layer as
-        /// `Ev::Failed` carrying the real error, never as `Ev::Done` with a
-        /// fabricated token count -- the latter is exactly the fail-open shape
-        /// this issue closes (a blocked grammar silently reported as a normal
-        /// zero/short completion instead of an error). The worker thread must
-        /// also survive the failure and keep serving subsequent jobs, exactly
-        /// as it survives a cancelled job in the tests above.
-        #[test]
-        fn generation_failure_is_reported_as_ev_failed_not_ev_done() {
-            let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
-
-            let (job1, mut rx1, _guard1) = make_job();
-            job_tx.send(job1).unwrap();
-            let (job2, mut rx2, _guard2) = make_job();
-            job_tx.send(job2).unwrap();
-            drop(job_tx);
-
-            let call_count = Arc::new(AtomicUsize::new(0));
-            let handle = std::thread::spawn({
-                let call_count = call_count.clone();
-                move || {
-                    run_worker_loop(
-                        job_rx,
-                        fake_generate_fails_once_then_succeeds(
-                            "grammar constraint blocked every token; no legal \
-                             continuation exists in the current grammar state",
-                            call_count,
-                        ),
-                    )
-                }
-            });
-
-            match rx1.blocking_recv() {
-                Some(Ev::Failed { message }) => {
-                    assert!(
-                        message.contains("grammar constraint blocked every token"),
-                        "Ev::Failed must carry the underlying error message, got: {message}"
-                    );
-                }
-                Some(Ev::Done { .. }) => panic!(
-                    "a failed generation must never be reported as Ev::Done -- that \
-                     would silently hand the HTTP layer a fabricated token count for \
-                     a request that produced no legal output, which is the #611 \
-                     fail-open failure mode this test guards against"
-                ),
-                Some(Ev::Delta(_)) => {
-                    panic!("a generator that fails on its first call must never emit a Delta first")
-                }
-                Some(Ev::Rejected { message }) => {
-                    panic!("this fake generator never rejects; unexpected Ev::Rejected: {message}")
-                }
-                None => panic!("job 1's reply channel closed with no event at all"),
-            }
-
-            let mut done = None;
-            while let Some(ev) = rx2.blocking_recv() {
-                if let Ev::Done {
-                    completion_tokens, ..
-                } = ev
-                {
-                    done = Some(completion_tokens);
-                }
-            }
-            assert_eq!(
-                done,
-                Some(1),
-                "worker thread must survive a failed generation and serve the next \
-                 job normally afterward"
-            );
-
-            handle
-                .join()
-                .expect("worker thread must not panic on a generation error");
+            let (jobs, _rx) = test_client_and_jobs();
+            let _state: AppState = build_from_shared_client(jobs);
         }
 
         // ── #641 / #649 request parsing and clamp tests ──────────────────
@@ -2580,139 +2034,21 @@ mod imp {
             assert!(reasoning_budget + cfg.max_new_tokens < 8);
         }
 
-        // ── #656: prompt-aware KV-window invariant ────────────────────────
-        //
-        // `build_cfg` alone only clamps `max_new_tokens`/`reasoning_budget`
-        // against the window in isolation; `check_prompt_fits_window` is the
-        // second half that accounts for `prompt_len`, which is only known
-        // once the worker tokenizes the prompt (see `spawn_worker`).
-
-        #[test]
-        fn check_prompt_fits_window_rejects_when_prompt_plus_decode_overflows() {
-            // model_max_context=8, prompt_len=2, max_tokens=7, reasoning_budget=None:
-            // build_cfg clamps max_new_tokens to min(7, 8-1)=7 in isolation, but
-            // 2 (prompt) + 7 (decode) + 1 (delimiter) = 10 > 8 -- must reject.
-            let defaults = Defaults {
-                max_tokens: 7,
-                temperature: 0.7,
-                top_k: 50,
-                top_p: 0.9,
-                repetition_penalty: 1.1,
-                reasoning_budget: None,
-            };
-            let req = ChatReq {
-                model: None,
-                messages: vec![],
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                max_tokens: Some(7),
-                seed: None,
-                stream: None,
-                repetition_penalty: None,
-                reasoning_budget: None,
-                max_completion_tokens: None,
-                tools: None,
-                tool_choice: None,
-                response_format: None,
-                n: None,
-                logprobs: None,
-                top_logprobs: None,
-                stop: None,
-            };
-            let cfg = build_cfg(&req, &defaults, 8).unwrap();
-            let err = check_prompt_fits_window(8, 2, &cfg).unwrap_err();
-            assert!(
-                err.contains("2 tokens") && err.contains("8-token"),
-                "error must name the actual prompt length and window: {err}"
-            );
-        }
-
-        #[test]
-        fn check_prompt_fits_window_accepts_exact_boundary_no_needless_truncation() {
-            // model_max_context=8, prompt_len=1, max_tokens=6, reasoning_budget=1:
-            // build_cfg clamps max_new_tokens to min(6, 7)=6, reasoning_room=8-6-1=1,
-            // reasoning_budget=min(1,1)=1. 1 (prompt) + 6 (max_new_tokens) +
-            // 1 (reasoning_budget) + 1 (delimiter) = 9 > 8 -- the "+1 delimiter"
-            // edge case still overflows by exactly one slot,
-            // so it must ALSO reject, proving the check catches the boundary
-            // exactly rather than off-by-one under-rejecting.
-            let defaults = Defaults {
-                max_tokens: 6,
-                temperature: 0.7,
-                top_k: 50,
-                top_p: 0.9,
-                repetition_penalty: 1.1,
-                reasoning_budget: None,
-            };
-            let req = ChatReq {
-                model: None,
-                messages: vec![],
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                max_tokens: Some(6),
-                seed: None,
-                stream: None,
-                repetition_penalty: None,
-                reasoning_budget: Some(1),
-                max_completion_tokens: None,
-                tools: None,
-                tool_choice: None,
-                response_format: None,
-                n: None,
-                logprobs: None,
-                top_logprobs: None,
-                stop: None,
-            };
-            let cfg = build_cfg(&req, &defaults, 8).unwrap();
-            assert!(check_prompt_fits_window(8, 1, &cfg).is_err());
-
-            // Same request, but the window has one more slot of room (9):
-            // 1 + 6 + 1 + 1 = 9 <= 9 -- must be ACCEPTED, and `max_new_tokens`
-            // must be the full requested 6, not needlessly truncated.
-            let cfg2 = build_cfg(&req, &defaults, 9).unwrap();
-            assert_eq!(cfg2.max_new_tokens, 6, "must not needlessly truncate");
-            assert!(check_prompt_fits_window(9, 1, &cfg2).is_ok());
-        }
-
-        #[test]
-        fn check_prompt_fits_window_accepts_ordinary_prompt_unclamped() {
-            // A near-window but comfortably-fitting prompt must generate its
-            // full requested budget -- no needless truncation in the common case.
-            let defaults = Defaults {
-                max_tokens: 50,
-                temperature: 0.7,
-                top_k: 50,
-                top_p: 0.9,
-                repetition_penalty: 1.1,
-                reasoning_budget: None,
-            };
-            let req = ChatReq {
-                model: None,
-                messages: vec![],
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                max_tokens: Some(50),
-                seed: None,
-                stream: None,
-                repetition_penalty: None,
-                reasoning_budget: None,
-                max_completion_tokens: None,
-                tools: None,
-                tool_choice: None,
-                response_format: None,
-                n: None,
-                logprobs: None,
-                top_logprobs: None,
-                stop: None,
-            };
-            let cfg = build_cfg(&req, &defaults, 4096).unwrap();
-            assert_eq!(cfg.max_new_tokens, 50);
-            // prompt_len=100: 100 + 50 + 0 + 1 = 151 <= 4096.
-            assert!(check_prompt_fits_window(4096, 100, &cfg).is_ok());
-        }
+        // NOTE (issue #832): the three `check_prompt_fits_window_*` tests
+        // that used to live here (`build_cfg`-clamped `GenerateConfig`
+        // values fed into this binary's private `check_prompt_fits_window`)
+        // no longer compile: the check moved to
+        // `lattice_inference::serve::metal_worker`, which does not expose it
+        // (it is a private implementation detail of the shared worker loop,
+        // not part of that module's public/test-utils surface). The same
+        // math is covered by `check_prompt_fits_window`'s own pure unit
+        // tests, ported verbatim to `metal_worker.rs`'s test suite; the same
+        // `build_cfg` -> worker -> window-check composition this file's
+        // deleted tests exercised is covered end to end, through a REAL
+        // worker and a real request, by `real_router_overflow_parity` and
+        // `parity_table` below. `build_cfg`'s own clamping arithmetic (the
+        // half of the invariant that stays in THIS file) keeps its direct
+        // coverage in `build_cfg_clamps_to_runtime_context` above.
 
         #[test]
         fn model_context_uses_config_max_position_embeddings() {
@@ -2730,11 +2066,14 @@ mod imp {
         //
         // All three failure modes below (`#641` unknown role, `#649` image
         // part, `#649` oversized part) return from `chat_completions` before
-        // a `Job` is ever sent to `s.jobs`, so a fake unbounded sender with no
-        // running worker is a faithful stand-in: no GPU, no model load.
+        // a job is ever submitted to `s.jobs`, so a `MetalWorkerClient` with
+        // no running worker behind it (issue #832's `test_client_and_jobs`
+        // seam, receiver half discarded) is a faithful stand-in: no GPU, no
+        // model load.
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn test_app_state() -> AppState {
-            let (jobs, _rx) = mpsc::unbounded_channel::<Job>();
+            let (jobs, _rx) = test_client_and_jobs();
             AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
@@ -2750,6 +2089,7 @@ mod imp {
             }
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         async fn error_message_of(response: Response) -> (StatusCode, String) {
             let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2764,6 +2104,7 @@ mod imp {
             (status, message)
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_unknown_role_400() {
             // A role string that is not an OpenAI chat role at all (as
@@ -2782,6 +2123,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_tool_and_developer_role_400_unsupported_feature() {
             for role in ["tool", "developer"] {
@@ -2802,6 +2144,7 @@ mod imp {
             }
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_image_url_400() {
             let body = Body::from(
@@ -2816,6 +2159,7 @@ mod imp {
             assert_eq!(message, IMAGE_REQUIRES_VISION_MESSAGE);
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_oversized_part_400() {
             let big_text = "x".repeat(MAX_CONTENT_PART_BYTES + 1);
@@ -2837,6 +2181,7 @@ mod imp {
         // unsupported field instead of a plain-text completion that quietly
         // ignored the request's actual contract.
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_tools_400() {
             let body = Body::from(
@@ -2853,6 +2198,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_tool_choice_400() {
             let body = Body::from(
@@ -2867,6 +2213,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_json_response_format_400() {
             let body = Body::from(
@@ -2883,6 +2230,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_n_greater_than_one_400() {
             let body =
@@ -2893,6 +2241,7 @@ mod imp {
             assert_eq!(message, "n > 1 is not supported");
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_logprobs_400() {
             let body = Body::from(
@@ -2907,6 +2256,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_stop_400() {
             let body = Body::from(
@@ -2918,6 +2268,7 @@ mod imp {
             assert_eq!(message, "stop is not supported by this server");
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_conflicting_max_tokens_400() {
             let body = Body::from(
@@ -2936,6 +2287,7 @@ mod imp {
 
         // ── ADR-080 C2 (#782): max_tokens=0 rejection + finish_reason round-trip ──
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_max_tokens_zero_400() {
             // #745: previously clamped straight through into a zero-budget
@@ -2949,11 +2301,14 @@ mod imp {
             assert_eq!(message, "max_tokens must be at least 1");
         }
 
-        /// Builds an `AppState` wired to a fresh `jobs` channel plus the
-        /// receiving half, so tests can stand in for the worker: reply with
-        /// whatever `Ev` sequence the test wants without a real GPU/model.
-        fn test_app_state_with_jobs() -> (AppState, mpsc::UnboundedReceiver<Job>) {
-            let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
+        /// Builds an `AppState` wired to a fresh raw job channel plus the
+        /// receiving half (issue #832's `test_client_and_jobs` seam), so
+        /// tests can stand in for the worker: reply with whatever
+        /// `WorkerEvent` sequence the test wants (via `WorkerJob::reply`,
+        /// also `test-utils`-gated) without a real GPU/model.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        fn test_app_state_with_jobs() -> (AppState, mpsc::UnboundedReceiver<WorkerJob>) {
+            let (jobs, jobs_rx) = test_client_and_jobs();
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
@@ -2973,17 +2328,23 @@ mod imp {
         /// #746 (ADR-080 C2): the non-streaming JSON response's
         /// `finish_reason` must reflect the engine's actual `stopped` flag,
         /// not a hardcoded `"stop"`. A fake worker task stands in for the
-        /// GPU, replying with a crafted `Ev::Done { stopped }` directly.
+        /// GPU, replying with a crafted `WorkerEvent::Complete` (`stopped`)
+        /// directly.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         async fn non_streaming_finish_reason_for(stopped: bool) -> String {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
                 if let Some(job) = jobs_rx.recv().await {
-                    let _ = job.tx.send(Ev::Delta("hi".to_string()));
-                    let _ = job.tx.send(Ev::Done {
+                    let _ = job.reply(WorkerEvent::Delta("hi".to_string()));
+                    let _ = job.reply(WorkerEvent::Complete(GenerateOutput {
+                        text: "hi".to_string(),
+                        token_ids: vec![0],
                         prompt_tokens: 1,
-                        completion_tokens: 1,
+                        generated_tokens: 1,
                         stopped,
-                    });
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    }));
                 }
             });
             let body = Body::from(r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string());
@@ -3000,11 +2361,13 @@ mod imp {
                 .to_string()
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_non_streaming_finish_reason_stop_when_engine_stopped() {
             assert_eq!(non_streaming_finish_reason_for(true).await, "stop");
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_non_streaming_finish_reason_length_when_not_stopped() {
             // Previously this hardcoded "stop" unconditionally, so a
@@ -3016,16 +2379,21 @@ mod imp {
         /// Same round-trip as above, but through the SSE streaming path
         /// (`Phase::Body`'s `Ev::Done` arm) instead of the non-streaming
         /// JSON body.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         async fn streaming_finish_reason_for(stopped: bool) -> String {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
                 if let Some(job) = jobs_rx.recv().await {
-                    let _ = job.tx.send(Ev::Delta("hi".to_string()));
-                    let _ = job.tx.send(Ev::Done {
+                    let _ = job.reply(WorkerEvent::Delta("hi".to_string()));
+                    let _ = job.reply(WorkerEvent::Complete(GenerateOutput {
+                        text: "hi".to_string(),
+                        token_ids: vec![0],
                         prompt_tokens: 1,
-                        completion_tokens: 1,
+                        generated_tokens: 1,
                         stopped,
-                    });
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    }));
                 }
             });
             let body = Body::from(
@@ -3039,6 +2407,7 @@ mod imp {
             String::from_utf8(bytes.to_vec()).expect("SSE body must be valid UTF-8")
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_streaming_finish_reason_stop_when_engine_stopped() {
             let text = streaming_finish_reason_for(true).await;
@@ -3048,6 +2417,7 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_streaming_finish_reason_length_when_not_stopped() {
             let text = streaming_finish_reason_for(false).await;
@@ -3062,24 +2432,24 @@ mod imp {
         /// true` request whose prompt overflows the model's context window
         /// must return HTTP 400 `context_length_exceeded` BEFORE any SSE
         /// stream is committed -- not silently commit to a 200 SSE response
-        /// that only discovers the overflow later via `Ev::Rejected`
+        /// that only discovers the overflow later via `WorkerEvent::Rejected`
         /// mid-stream and terminates with `finish_reason: "length"` (the
         /// exact drift this test catches). This fakes the worker side of
-        /// the `Ev::Rejected` contract (production code sends it from
-        /// `enforce_prompt_window` inside `run_worker_loop`, prefixed with
-        /// `PROMPT_EXCEEDS_WINDOW_PREFIX`) so the composition under test is
-        /// purely `chat_completions`'s streaming branch: does it await the
-        /// worker's first event and inspect it for `Ev::Rejected` BEFORE
-        /// calling `Sse::new(..).into_response()`, or does it commit
+        /// the `WorkerEvent::Rejected` contract (production code sends it
+        /// via `metal_worker::check_prompt_fits_window`'s typed `ApiError`,
+        /// issue #832) so the composition under test is purely
+        /// `chat_completions`'s streaming branch: does it await the
+        /// worker's first event and inspect it for `WorkerEvent::Rejected`
+        /// BEFORE calling `Sse::new(..).into_response()`, or does it commit
         /// unconditionally?
         ///
         /// ADR-080 C2: this test
         /// pins ONLY that response-mapping contract with a request that
         /// would NOT genuinely overflow in production (`max_tokens`
         /// defaults to 100 against a 4096-token `model_max_context`) and a
-        /// fake task that manufactures `Ev::Rejected` directly -- it does
-        /// NOT exercise the real worker's `enforce_prompt_window` call, so
-        /// it is not, by itself, same-input real-router parity with
+        /// fake task that manufactures `WorkerEvent::Rejected` directly --
+        /// it does NOT exercise the real worker's `check_prompt_fits_window`
+        /// call, so it is not, by itself, same-input real-router parity with
         /// `lattice.rs`'s equivalent test (an earlier version of this
         /// comment incorrectly claimed "identical request body"; it is not
         /// -- `real_router_overflow_parity` below is the test that actually
@@ -3089,23 +2459,25 @@ mod imp {
         /// Mutation-sensitive: reverting the pre-`Sse::new()` `first_ev`
         /// preflight (going back to building `stream::unfold` and
         /// returning `Sse::new(stream).into_response()` unconditionally,
-        /// discovering `Ev::Rejected` only inside `Phase::Body`) makes this
-        /// fail -- the response status would be 200 with an SSE body
+        /// discovering `WorkerEvent::Rejected` only inside `Phase::Body`)
+        /// makes this fail -- the response status would be 200 with an SSE body
         /// carrying a `finish_reason: "length"` terminal chunk instead of a
         /// 400 error envelope. Verified by reverting the preflight and
         /// re-running: see the PR body's mutation log.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse() {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
                 if let Some(job) = jobs_rx.recv().await {
-                    let _ = job.tx.send(Ev::Rejected {
+                    let _ = job.reply(WorkerEvent::Rejected(ApiError::BadRequest {
                         message: "prompt has 4090 tokens, leaving 6 of the 4096-token \
                                   context window for generation, but this request needs \
                                   100 generated tokens plus 1 (total 4191); reduce \
                                   max_tokens/reasoning_budget or shorten the prompt"
                             .to_string(),
-                    });
+                        code: "context_length_exceeded",
+                    }));
                 }
             });
             let body = Body::from(
@@ -3140,8 +2512,9 @@ mod imp {
         /// -- the SAME fixture `lattice.rs`'s `streaming_context_overflow`
         /// module drives through its own real `Router` -- through THIS
         /// binary's real `router()`, backed by a REAL worker thread running
-        /// the actual `run_worker_loop` + `enforce_prompt_window` production
-        /// code (a real `BpeTokenizer` from
+        /// the actual `run_worker_loop` + `check_prompt_fits_window`
+        /// production code (via `metal_worker::spawn_fake`, issue #832's
+        /// cross-binary test seam; a real `BpeTokenizer` from
         /// `test_support::tiny_zero_model`, no Metal engine involved since
         /// the request is expected to be rejected before any generation
         /// call). `AppState.model_max_context` is set to
@@ -3150,26 +2523,26 @@ mod imp {
         /// -- so both sides genuinely share the same input AND the same
         /// effective context limit, not just the same JSON body.
         ///
-        /// Mutation-sensitive: removing `enforce_prompt_window`'s call to
-        /// `check_prompt_fits_window` (i.e. having it unconditionally
-        /// return `Ok(prompt_len)`) makes this fail -- the real worker
-        /// would accept the request, `chat_completions` would commit a 200
-        /// SSE response, and this test's `StatusCode::BAD_REQUEST`
-        /// assertion would fail. This is the exact production worker-side
-        /// check that removing `spawn_worker`'s reliance on it would leave
-        /// undetected ("removing the production worker closure's
-        /// check_prompt_fits_window call ... would leave both the direct
-        /// handler test and the pure helper test green") -- `spawn_worker`'s
-        /// real Metal closure and this test's worker seam both call
-        /// `enforce_prompt_window`, not two independent copies of the
-        /// check, so a mutation to the shared function is observed here too.
+        /// Mutation-sensitive: removing `check_prompt_fits_window`'s
+        /// overflow check (i.e. having it unconditionally return `Ok(())`)
+        /// makes this fail -- the real worker would accept the request,
+        /// `chat_completions` would commit a 200 SSE response, and this
+        /// test's `StatusCode::BAD_REQUEST` assertion would fail. This is
+        /// the exact production worker-side check that removing
+        /// `MetalWorker::spawn`'s reliance on it would leave undetected --
+        /// `MetalWorker::spawn`'s real Metal closure and this test's
+        /// `spawn_fake` seam both route through the SAME `run_worker_loop`
+        /// wrapper (`metal_worker::run_worker_loop`, private to that
+        /// module) that calls `check_prompt_fits_window`, not two
+        /// independent copies of the check, so a mutation to the shared
+        /// function is observed here too.
         ///
         /// Gated behind `test-utils` (see
         /// `lattice_inference::model::qwen35::test_support`) for the same
         /// reason as `lattice.rs`'s equivalent test modules: this needs a
         /// real (tiny) `BpeTokenizer`, which is only constructible outside
         /// this crate's own `#[cfg(test)]` build via that feature.
-        #[cfg(feature = "test-utils")]
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod real_router_overflow_parity {
             use super::*;
             use lattice_inference::serve::{
@@ -3178,22 +2551,32 @@ mod imp {
             use tower::ServiceExt as _;
 
             /// A real worker thread running the actual `run_worker_loop` +
-            /// `enforce_prompt_window` production code, with a real (tiny)
-            /// tokenizer and NO Metal engine -- the generate closure is
-            /// never reached by an overflowing request, so it only needs a
-            /// trivial success stand-in for a non-overflowing one.
+            /// `check_prompt_fits_window` production code (via
+            /// `metal_worker::spawn_fake`, issue #832's cross-binary test
+            /// seam), with a real (tiny) tokenizer and NO Metal engine --
+            /// the generate closure is never reached by an overflowing
+            /// request, so it only needs a trivial success stand-in for a
+            /// non-overflowing one.
             fn real_worker_state(model_max_context: usize) -> AppState {
                 let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
                     .tokenizer()
                     .clone();
-                let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
-                std::thread::spawn(move || {
-                    run_worker_loop(jobs_rx, move |messages, cfg, _on_token, _should_cancel| {
-                        let prompt_len =
-                            enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
-                        Ok((prompt_len, 0, true))
-                    });
-                });
+                let jobs = spawn_fake(
+                    ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                    model_max_context,
+                    tokenizer,
+                    |_messages, _cfg, prompt_tokens, _on_token, _should_cancel| {
+                        Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: None,
+                            token_logprobs: vec![],
+                        })
+                    },
+                );
                 AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
@@ -3285,6 +2668,7 @@ mod imp {
         // that no longer exists here.
         // -----------------------------------------------------------------------
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn cm_lattice_serve_model_mismatch_accepted_expected_deviation() {
             // Expected-deviation fixture, not a bug fix: `lattice serve` (the
@@ -3298,9 +2682,9 @@ mod imp {
             // -- tracked in #663 -- by proving a mismatched `model` reaches the
             // job queue rather than being rejected up front. If #663 ships a
             // `model_not_found` check here, this fixture starts failing
-            // (`jobs_rx` never receives a `Job`), which is the intended signal
+            // (`jobs_rx` never receives a `WorkerJob`), which is the intended signal
             // to update it rather than a silent pass either way.
-            let (jobs, mut jobs_rx) = mpsc::unbounded_channel::<Job>();
+            let (jobs, mut jobs_rx) = test_client_and_jobs();
             let state = AppState {
                 jobs,
                 model_id: Arc::from("served-model"),
@@ -3349,12 +2733,12 @@ mod imp {
         // Issue #828's `Json`/`Sse` rows need a REAL tiny tokenizer (via
         // `test_support::tiny_zero_model`, gated behind the `test-utils`
         // feature -- see that module's own doc comment) to drive
-        // `enforce_prompt_window` for real, so this whole module now
+        // `check_prompt_fits_window` for real, so this whole module now
         // requires `test-utils`, matching `lattice.rs`'s own
         // `parity_table` module gating. CI's "serve-surface capability-
         // matrix fixtures" step adds `test-utils` alongside `f16,metal-gpu`
         // for this binary to keep running it (see `.github/workflows/ci.yml`).
-        #[cfg(feature = "test-utils")]
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod parity_table {
             use super::*;
             use lattice_inference::serve::{
@@ -3365,39 +2749,46 @@ mod imp {
 
             /// Deterministic worker-thread generation seam for every
             /// `Json`/`Sse` row (issue #828): a REAL background thread runs
-            /// the actual `run_worker_loop` + `enforce_prompt_window`
-            /// production code (real tiny tokenizer, no Metal engine) --
-            /// only the terminal generation call itself is replaced with a
-            /// canned deterministic completion. Content deltas are pushed
-            /// through `on_token` (what both the streaming and
-            /// non-streaming arms of `chat_completions` read content from
-            /// on this binary -- see its `Ev::Delta` accumulation), so one
-            /// seam serves both response shapes.
+            /// the actual `run_worker_loop` + `check_prompt_fits_window`
+            /// production code (via `metal_worker::spawn_fake`, issue
+            /// #832's cross-binary test seam; real tiny tokenizer, no Metal
+            /// engine) -- only the terminal generation call itself is
+            /// replaced with a canned deterministic completion. Content
+            /// deltas are pushed through `on_token` (what both the
+            /// streaming and non-streaming arms of `chat_completions` read
+            /// content from on this binary -- see its `WorkerEvent::Delta`
+            /// accumulation), so one seam serves both response shapes.
             fn baseline_fake_worker_state(model_max_context: usize) -> AppState {
                 let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
                     .tokenizer()
                     .clone();
-                let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
-                std::thread::spawn(move || {
-                    run_worker_loop(jobs_rx, move |messages, cfg, on_token, _should_cancel| {
-                        // Real production check (mutation-sensitive to
-                        // `enforce_prompt_window`/`check_prompt_fits_window`
-                        // exactly like `real_router_overflow_parity` above);
-                        // its measured length is intentionally NOT what
-                        // gets reported below -- the returned usage counts
-                        // are the fixed canned figures both binaries' field
-                        // checks assert against (`BASELINE_CANNED_*`).
-                        enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
+                let jobs = spawn_fake(
+                    ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                    model_max_context,
+                    tokenizer,
+                    |_messages, _cfg, _prompt_tokens, on_token, _should_cancel| {
+                        // The real `check_prompt_fits_window` (mutation-sensitive
+                        // exactly like `real_router_overflow_parity` above) has
+                        // already run inside `spawn_fake` by the time this
+                        // closure is called; its measured `_prompt_tokens` is
+                        // intentionally NOT what gets reported below -- the
+                        // returned usage counts are the fixed canned figures
+                        // both binaries' field checks assert against
+                        // (`BASELINE_CANNED_*`).
                         for (chunk, id) in [("hello", 1u32), (" world", 2u32)] {
                             on_token(chunk, id);
                         }
-                        Ok((
-                            BASELINE_CANNED_PROMPT_TOKENS as usize,
-                            BASELINE_CANNED_COMPLETION_TOKENS as usize,
-                            true,
-                        ))
-                    });
-                });
+                        Ok(GenerateOutput {
+                            text: "hello world".to_string(),
+                            token_ids: vec![1, 2],
+                            prompt_tokens: BASELINE_CANNED_PROMPT_TOKENS as usize,
+                            generated_tokens: BASELINE_CANNED_COMPLETION_TOKENS as usize,
+                            stopped: true,
+                            stop_reason: None,
+                            token_logprobs: vec![],
+                        })
+                    },
+                );
                 AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
@@ -3505,7 +2896,7 @@ mod imp {
         // `&[ChatMessage]`/`&GenerateConfig` it was called with, then
         // returns a canned result; it never recomputes `build_cfg` itself.
         // -----------------------------------------------------------------------
-        #[cfg(feature = "test-utils")]
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod production_adapter_observation {
             use super::*;
             use lattice_inference::serve::{
@@ -3519,14 +2910,15 @@ mod imp {
             /// fires the fixed `{"messages":[{"role":"user","content":"hi
             /// there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}`
             /// request through a REAL background thread running the actual
-            /// `run_worker_loop` + `enforce_prompt_window` production code (real
-            /// tiny tokenizer, no Metal engine) -- only the terminal generation
-            /// call is replaced with a canned completion. `stopped` is threaded
-            /// through a single local variable into both the recorded
-            /// observation and the returned tuple's third element, and the
-            /// real `enforce_prompt_window` return value is the ONLY source for
-            /// `prompt_tokens` -- this fixed the prior
-            /// `prompt_tokens: 3` / `stopped: true` independent literals.
+            /// `run_worker_loop` + `check_prompt_fits_window` production code
+            /// (via `metal_worker::spawn_fake`, issue #832's cross-binary test
+            /// seam; real tiny tokenizer, no Metal engine) -- only the terminal
+            /// generation call is replaced with a canned completion. `stopped`
+            /// is threaded through a single local variable into both the
+            /// recorded observation and the returned `GenerateOutput`, and the
+            /// real `check_prompt_fits_window` measured length -- surfaced by
+            /// `spawn_fake` as the closure's `prompt_tokens` argument -- is the
+            /// ONLY source for `prompt_tokens` here.
             async fn run_observed(
                 model_max_context: usize,
                 stopped: bool,
@@ -3537,9 +2929,11 @@ mod imp {
                 let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> =
                     Arc::new(Mutex::new(None));
                 let observed_for_worker = Arc::clone(&observed);
-                let (jobs, jobs_rx) = mpsc::unbounded_channel::<Job>();
-                std::thread::spawn(move || {
-                    run_worker_loop(jobs_rx, move |messages, cfg, on_token, _should_cancel| {
+                let jobs = spawn_fake(
+                    ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                    model_max_context,
+                    tokenizer,
+                    move |messages, cfg, prompt_tokens, on_token, _should_cancel| {
                         let normalized: Vec<(String, String)> = messages
                             .iter()
                             .map(|m| {
@@ -3558,12 +2952,11 @@ mod imp {
                             })
                             .collect();
                         // Real production check (mutation-sensitive to
-                        // `enforce_prompt_window`/`check_prompt_fits_window`
-                        // exactly like `real_router_overflow_parity`/
-                        // `baseline_fake_worker_state` above); its measured
-                        // length IS what gets reported below.
-                        let prompt_tokens =
-                            enforce_prompt_window(&tokenizer, model_max_context, messages, cfg)?;
+                        // `check_prompt_fits_window` exactly like
+                        // `real_router_overflow_parity`/`baseline_fake_worker_state`
+                        // above) has already run inside `spawn_fake` by the
+                        // time this closure is called; its measured
+                        // `prompt_tokens` IS what gets reported below.
                         *observed_for_worker
                             .lock()
                             .expect("observation mutex poisoned") =
@@ -3575,9 +2968,17 @@ mod imp {
                                 stopped,
                             });
                         on_token("ok", 1);
-                        Ok((prompt_tokens, 1, stopped))
-                    });
-                });
+                        Ok(GenerateOutput {
+                            text: "ok".to_string(),
+                            token_ids: vec![1],
+                            prompt_tokens,
+                            generated_tokens: 1,
+                            stopped,
+                            stop_reason: None,
+                            token_logprobs: vec![],
+                        })
+                    },
+                );
                 let state = AppState {
                     jobs,
                     model_id: Arc::from("test-model"),

@@ -1,9 +1,10 @@
 #!/bin/sh
 # Cross-checks docs/capability-matrix.md's Fixture manifest section against
 # the actual #[test]/#[tokio::test] fns in the three serve-surface binaries
-# (#654). A row that cites a fixture ID whose test function has been
-# renamed, removed, or never existed fails this check closed instead of
-# silently going stale.
+# plus the shared Metal worker module they both route through (#654, #832).
+# A row that cites a fixture ID whose test function has been renamed,
+# removed, or never existed fails this check closed instead of silently
+# going stale.
 #
 # Wired into `make lint-docs`. See docs/capability-matrix.md's "Fixture
 # manifest (#654)" section for the human-readable row-by-row mapping this
@@ -18,6 +19,10 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 lattice_rs="$repo_root/crates/inference/src/bin/lattice.rs"
 lattice_serve_rs="$repo_root/crates/inference/src/bin/lattice_serve.rs"
 chat_metal_rs="$repo_root/crates/inference/src/bin/chat_metal.rs"
+# Shared Metal worker owner (#832): the cancellation/window-check fixtures
+# that used to live in lattice_serve.rs's own #[cfg(test)] mod now live here
+# instead, ported verbatim and shared by both `lattice` and `lattice_serve`.
+metal_worker_rs="$repo_root/crates/inference/src/serve/metal_worker.rs"
 
 # Fixture IDs always start with one of these prefixes (the naming convention
 # every `#[test] fn` added for #654, plus the pre-existing per-surface test
@@ -47,6 +52,7 @@ all_test_fns="$(
         extract_test_fn_names "$lattice_rs"
         extract_test_fn_names "$lattice_serve_rs"
         extract_test_fn_names "$chat_metal_rs"
+        extract_test_fn_names "$metal_worker_rs"
     } | sort -u
 )"
 
@@ -103,7 +109,7 @@ check_doc() {
         cited="$cited $tok"
 
         if ! is_real_test_fn "$tok"; then
-            [ "$quiet" = "1" ] || echo "check-capability-matrix: fixture '$tok' is cited in $doc but no #[test]/#[tokio::test] fn named '$tok' exists in lattice.rs, lattice_serve.rs, or chat_metal.rs" >&2
+            [ "$quiet" = "1" ] || echo "check-capability-matrix: fixture '$tok' is cited in $doc but no #[test]/#[tokio::test] fn named '$tok' exists in lattice.rs, lattice_serve.rs, chat_metal.rs, or serve/metal_worker.rs" >&2
             fail=1
         fi
     done
@@ -165,7 +171,7 @@ fi
 # families added before #654's Fixture manifest section don't need every
 # single test enumerated by name on day one. Reuses $tokens, set by the
 # check_doc call above.
-for f in "$lattice_rs" "$lattice_serve_rs" "$chat_metal_rs"; do
+for f in "$lattice_rs" "$lattice_serve_rs" "$chat_metal_rs" "$metal_worker_rs"; do
     extract_test_fn_names "$f" | while read -r name; do
         matched_prefix=0
         for p in $prefixes; do
