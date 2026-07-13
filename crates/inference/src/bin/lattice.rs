@@ -2384,7 +2384,13 @@ mod serve {
     use futures::StreamExt as _;
     use lattice_inference::Tokenizer;
     #[cfg(feature = "metal-gpu")]
-    use lattice_inference::forward::metal_qwen35::{ChatMessage, format_chat_template};
+    use lattice_inference::forward::metal_qwen35::ChatMessage;
+    /// Only used by the test module's `render_prompt_matches_shared_chat_template`
+    /// fixture; production code never renders ChatML directly in this file
+    /// (#832: that now happens exactly once per request inside the shared
+    /// `lattice_inference::serve::metal_worker` worker loop).
+    #[cfg(all(feature = "metal-gpu", test))]
+    use lattice_inference::forward::metal_qwen35::format_chat_template;
     #[cfg(feature = "metal-gpu")]
     use lattice_inference::model::qwen35_config::GenerateConfig;
     use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
@@ -2404,176 +2410,80 @@ mod serve {
     // Model backend: CPU (safetensors) or Metal GPU (native Q4)
     // -----------------------------------------------------------------------
 
-    /// One generation request handed to the Metal GPU worker thread.
+    /// Handle to the shared Metal GPU worker thread
+    /// (`lattice_inference::serve::metal_worker::MetalWorker`, issue #832:
+    /// the single shared owner module that replaces this binary's prior
+    /// private `MetalJob`/`MetalHandle` loop and `lattice_serve.rs`'s prior
+    /// private `Job`/`spawn_worker`/`run_worker_loop` loop). Cheaply `Clone`
+    /// (wraps a `MetalWorkerClient`, itself backed by an `mpsc` sender),
+    /// `Send + Sync`, so it can live in `AppState` like the CPU
+    /// `Arc<Qwen35Model>` does — only the underlying `MetalQwen35State`
+    /// inside the shared worker thread is confined to that thread.
     ///
-    /// `MetalQwen35State` owns raw `metal::*` FFI objects and is `!Send`, so it
-    /// cannot be moved into a `tokio::task::spawn_blocking` closure the way the
-    /// CPU model is (`Arc<Qwen35Model>` is `Send + Sync`; `MetalQwen35State` is
-    /// neither). Instead the Metal state lives on ONE dedicated OS thread for
-    /// the whole process lifetime, and async handlers ship it a `MetalJob` over
-    /// an unbounded `tokio::sync::mpsc` channel — the same design already
-    /// shipped in `lattice_serve.rs`. `on_token` is called synchronously from
-    /// the worker thread for each streamed delta; returning `false` stops
-    /// generation early (client disconnected).
-    ///
-    /// This serializes ALL Metal generation onto one thread: two concurrent
-    /// requests to a Q4-backed `lattice serve` run back-to-back, not in
-    /// parallel. That is correct for a single-GPU local engine (the same
-    /// default ollama uses) and is documented here rather than hidden behind
-    /// an innocuous-looking channel send.
-    #[cfg(feature = "metal-gpu")]
-    struct MetalJob {
-        /// Validated conversation, rendered into a ChatML prompt by the
-        /// worker via the engine's `format_chat_template` (#661) — the same
-        /// renderer `lattice_serve.rs` and `chat_metal` use, so there is one
-        /// ChatML implementation behind every entry point instead of a
-        /// second one local to this file.
-        messages: Vec<ChatMessage>,
-        gen_cfg: GenerateConfig,
-        on_token: Box<dyn FnMut(&str) -> bool + Send>,
-        /// Disconnect-cancellation signal (ADR-080 C2, #744): starts `false`,
-        /// flips to `true` the moment the request's
-        /// `lattice_inference::serve::CancelOnDrop` guard is dropped. Checked
-        /// by the worker independently of `on_token`, mirroring
-        /// `lattice_serve.rs`'s existing `Job::cancel` contract exactly.
-        cancel: tokio::sync::watch::Receiver<bool>,
-        /// `Err` when the worker's `generate_streaming` call fails closed
-        /// (#611: e.g. a grammar mask that blocks every token). Carries the
-        /// same `InferenceError` the CPU path already returns from `generate`.
-        reply: tokio::sync::oneshot::Sender<
-            Result<GenerateOutput, lattice_inference::error::InferenceError>,
-        >,
-    }
-
-    /// Handle to the Metal GPU worker thread. Cheaply `Clone` (an `mpsc`
-    /// sender), `Send + Sync`, so it can live in `AppState` like the CPU
-    /// `Arc<Qwen35Model>` does — only the underlying `MetalQwen35State` is
-    /// confined to the worker thread.
+    /// This still serializes ALL Metal generation onto one thread: two
+    /// concurrent requests to a Q4-backed `lattice serve` run back-to-back,
+    /// not in parallel. That is correct for a single-GPU local engine (the
+    /// same default ollama uses) and is documented here rather than hidden
+    /// behind an innocuous-looking channel send.
     #[cfg(feature = "metal-gpu")]
     #[derive(Clone)]
     pub struct MetalHandle {
-        jobs: tokio::sync::mpsc::UnboundedSender<MetalJob>,
+        client: lattice_inference::serve::metal_worker::MetalWorkerClient,
     }
 
     #[cfg(feature = "metal-gpu")]
     impl MetalHandle {
-        /// Load the Q4 model on a new dedicated worker thread and return a
-        /// handle once loading succeeds. Loading happens synchronously (the
-        /// caller blocks until the model is ready or loading fails) so that
-        /// `lattice serve`'s startup sequence keeps its existing "load, then
-        /// bind, then listen" ordering and fails closed before ever binding
-        /// the socket.
-        fn spawn(
-            model_dir: std::path::PathBuf,
-            tokenizer_path: std::path::PathBuf,
-            tokenizer: Arc<lattice_inference::tokenizer::bpe::BpeTokenizer>,
-        ) -> Result<Self, String> {
-            let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<MetalJob>();
-            let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-
-            std::thread::spawn(move || {
-                let cfg = match super::load_q4_config(&model_dir) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
-                let mut state =
-                    match lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
-                        &model_dir,
-                        &tokenizer_path,
-                        &cfg,
-                        super::MetalChatBackend::MAX_CACHE_LEN,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = ready_tx.send(Err(format!("Q4 model load failed: {e}")));
-                            return;
-                        }
-                    };
-                let _ = ready_tx.send(Ok(()));
-
-                while let Some(job) = job_rx.blocking_recv() {
-                    // Dequeue-time cancel check (#744): a client that
-                    // disconnected while this job was still queued behind an
-                    // earlier one must not pay for prefill at all. Mirrors
-                    // `lattice_serve.rs`'s `run_worker_loop` dequeue check.
-                    if *job.cancel.borrow() {
-                        let _ = job.reply.send(Ok(GenerateOutput {
-                            text: String::new(),
-                            token_ids: vec![],
-                            prompt_tokens: 0,
-                            generated_tokens: 0,
-                            stopped: false,
-                            stop_reason: Some(lattice_inference::StopReason::Interrupt),
-                            token_logprobs: vec![],
-                        }));
-                        continue;
-                    }
-                    let mut on_token = job.on_token;
-                    let cancel = job.cancel;
-                    // Render via the engine's canonical ChatML template
-                    // (#661) rather than a second, hand-rolled builder local
-                    // to this file — see the `MetalJob::messages` doc.
-                    let prompt = format_chat_template(&job.messages);
-                    // Cache-aware call (#462): reuses the previous turn's
-                    // shared token prefix instead of a full re-prefill on
-                    // every request. This worker thread owns one
-                    // `MetalQwen35State` for the whole process lifetime (one
-                    // thread = one session), so `CrossTurnSlotId::DEFAULT` is
-                    // the only slot that exists; the planner re-verifies the
-                    // retained prefix against this request's prompt on every
-                    // call and falls back to `PrefixReuseMode::FullRefill`
-                    // whenever they diverge, so correctness never depends on
-                    // distinguishing clients. Mirrors the wiring already
-                    // shipped in `lattice_serve.rs`.
-                    //
-                    // Cancellation-aware (#744): `should_cancel` is checked
-                    // before prefill, immediately after prefill, and at the
-                    // top of every decode iteration, independent of
-                    // `on_token` -- see
-                    // `generate_streaming_with_prefix_cache_and_cancel`'s doc.
-                    let cached = state.generate_streaming_with_prefix_cache_and_cancel(
-                        lattice_inference::kv_cache::CrossTurnSlotId::DEFAULT,
-                        &prompt,
-                        &tokenizer,
-                        &job.gen_cfg,
-                        |delta, _token_id| on_token(delta),
-                        move || *cancel.borrow(),
-                    );
-                    if let Ok(c) = &cached {
-                        eprintln!(
-                            "[lattice serve] cross-turn cache: mode={:?} reused={} prefetched={} prompt={}",
-                            c.cache.mode,
-                            c.cache.reused_tokens,
-                            c.cache.prefetched_tokens,
-                            c.cache.prompt_tokens,
-                        );
-                    }
-                    let _ = job.reply.send(cached.map(|c| c.output));
-                }
-            });
-
-            match ready_rx.recv() {
-                Ok(Ok(())) => Ok(Self { jobs: job_tx }),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err("Metal worker thread exited before loading finished".to_string()),
+        /// Normalizes
+        /// [`lattice_inference::serve::metal_worker::WorkerEvent::Cancelled`]
+        /// (the job was skipped at dequeue time: the client's `cancel`
+        /// watch flag was already `true`, or this job's own event receiver
+        /// was already closed) into the exact empty, interrupted
+        /// `GenerateOutput` this binary's prior dequeue-cancellation reply
+        /// already produced (#832: preserves this binary's own pre-existing
+        /// observable shape — the shared `WorkerEvent::Cancelled` contract
+        /// itself was modeled on it; see the shared module's own doc
+        /// comment).
+        fn normalize_cancelled(
+            ev: lattice_inference::serve::metal_worker::WorkerEvent,
+        ) -> lattice_inference::serve::metal_worker::WorkerEvent {
+            use lattice_inference::serve::metal_worker::WorkerEvent;
+            match ev {
+                WorkerEvent::Cancelled => WorkerEvent::Complete(GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: 0,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(lattice_inference::StopReason::Interrupt),
+                    token_logprobs: vec![],
+                }),
+                other => other,
             }
         }
 
-        /// Run one generation on the worker thread, forwarding each token
-        /// delta to `on_token`. Returns the full `GenerateOutput` (including
-        /// `stopped`/`stop_reason`) so callers can compute `finish_reason`
-        /// with the exact same `finish_reason_for` helper the CPU path uses.
+        /// Run one generation on the shared worker thread, forwarding each
+        /// token delta to `on_token`. Returns the full `GenerateOutput`
+        /// (including `stopped`/`stop_reason`) so callers can compute
+        /// `finish_reason` with the exact same `finish_reason_for` helper
+        /// the CPU path uses.
         ///
-        /// Returns `Err` if the worker thread is unreachable, or if the
+        /// Returns `Err` if the worker thread is unreachable
+        /// (`ApiError::Internal`, "inference worker unavailable" — the same
+        /// wording `lattice_serve.rs` uses for the identical condition on
+        /// this shared worker contract, #832; this binary's prior distinct
+        /// "not running" vs "dropped the request" phrasing collapses into
+        /// one message here, since `MetalWorkerClient::submit` no longer
+        /// exposes that distinction to callers), if the request cannot fit
+        /// the model's context window (`ApiError::BadRequest`, surfaced by
+        /// the shared worker's `check_prompt_fits_window` — new coverage
+        /// for this binary; the HTTP-layer `check_context_window` preflight
+        /// in `prepare_chat_request` already rejects the overwhelming
+        /// majority of these before this call is ever reached), or if the
         /// underlying `generate_streaming` call itself fails closed (#611:
-        /// e.g. a grammar mask that blocks every candidate token). Both
-        /// cases collapse to `ApiError::Internal` here; the HTTP handlers
-        /// below re-wrap that into the same generic "inference failed" 500
-        /// the CPU path already returns for any `generate()` error, so
-        /// Metal's HTTP error contract matches CPU's exactly.
+        /// e.g. a grammar mask that blocks every candidate token) —
+        /// collapsed to `ApiError::Internal` here, matching the same
+        /// generic "inference failed" 500 the CPU path already returns for
+        /// any `generate()` error.
         async fn generate_streaming(
             &self,
             messages: Vec<ChatMessage>,
@@ -2592,38 +2502,62 @@ mod serve {
         /// (ADR-080 C2, #744): `cancel` starts `false` and flips to `true`
         /// the moment the caller's paired
         /// `lattice_inference::serve::CancelOnDrop` guard is dropped (client
-        /// disconnect). The worker checks it once at dequeue (before paying
-        /// for prefill on an already-abandoned job) and independently of
-        /// `on_token` via `generate_streaming_with_prefix_cache_and_cancel`'s
-        /// `should_cancel` predicate — before prefill, immediately after
-        /// prefill, and at the top of every decode iteration. Mirrors
-        /// `lattice_serve.rs`'s `Job::cancel` contract exactly.
+        /// disconnect). The shared worker (issue #832) checks it
+        /// independently of `on_token`'s return value — before prefill,
+        /// immediately after prefill, and at the top of every decode
+        /// iteration — via
+        /// `generate_streaming_with_prefix_cache_and_cancel`'s
+        /// `should_cancel` predicate, and once more at dequeue time before
+        /// paying for prefill on an already-abandoned job.
+        ///
+        /// `on_token`'s return value is still honored (this method stops
+        /// calling it the first time it returns `false`, e.g. a
+        /// disconnected `tx_delta`), but can no longer stop the worker
+        /// thread directly the way it did when `MetalJob` embedded the
+        /// callback inside the worker itself — the shared worker now lives
+        /// behind a `WorkerEvent` channel this method drains from a
+        /// separate async task, and `cancel` (checked independently by the
+        /// worker) is the only signal that can reach across that boundary.
+        /// In practice this is not a behavior change: `tx_delta` and the
+        /// `cancel_guard` pairing `cancel` are dropped by the exact same
+        /// axum stream-drop event at every call site, so `cancel` already
+        /// catches a disconnect at essentially the same moment `on_token`
+        /// would have.
         async fn generate_streaming_with_cancel(
             &self,
             messages: Vec<ChatMessage>,
             gen_cfg: GenerateConfig,
-            on_token: impl FnMut(&str) -> bool + Send + 'static,
+            mut on_token: impl FnMut(&str) -> bool + Send + 'static,
             cancel: tokio::sync::watch::Receiver<bool>,
         ) -> Result<GenerateOutput, ApiError> {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let job = MetalJob {
-                messages,
-                gen_cfg,
-                on_token: Box::new(on_token),
-                cancel,
-                reply: reply_tx,
-            };
-            self.jobs.send(job).map_err(|_| ApiError::Internal {
-                message: "inference worker is not running".to_string(),
-            })?;
-            reply_rx
-                .await
-                .map_err(|_| ApiError::Internal {
-                    message: "inference worker dropped the request".to_string(),
-                })?
-                .map_err(|e| ApiError::Internal {
-                    message: format!("generation failed: {e}"),
-                })
+            use lattice_inference::serve::metal_worker::WorkerEvent;
+
+            let mut rx = self.client.submit(messages, gen_cfg, cancel);
+            let mut deliver_deltas = true;
+            loop {
+                let Some(ev) = rx.recv().await else {
+                    return Err(ApiError::Internal {
+                        message: "inference worker unavailable".to_string(),
+                    });
+                };
+                match Self::normalize_cancelled(ev) {
+                    WorkerEvent::Delta(delta) => {
+                        if deliver_deltas && !on_token(&delta) {
+                            deliver_deltas = false;
+                        }
+                    }
+                    WorkerEvent::Complete(output) => return Ok(output),
+                    WorkerEvent::Rejected(api_err) => return Err(api_err),
+                    WorkerEvent::Failed(message) => {
+                        return Err(ApiError::Internal {
+                            message: format!("generation failed: {message}"),
+                        });
+                    }
+                    WorkerEvent::Cancelled => {
+                        unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
+                    }
+                }
+            }
         }
     }
 
@@ -2708,14 +2642,20 @@ mod serve {
             }
         }
 
-        /// Load a native Q4 checkpoint on a dedicated Metal worker thread and
-        /// return the `ModelBackend::Metal` handle plus the resolved context
+        /// Load a native Q4 checkpoint on the shared Metal worker thread
+        /// (`lattice_inference::serve::metal_worker::MetalWorker`, issue
+        /// #832 — the same shared owner `lattice_serve.rs` uses) and return
+        /// the `ModelBackend::Metal` handle plus the resolved context
         /// window, for `main()`'s `Command::Serve` startup sequence.
         #[cfg(feature = "metal-gpu")]
         pub fn spawn_metal(
             model_dir: std::path::PathBuf,
             tokenizer_dir: Option<std::path::PathBuf>,
         ) -> Result<(Self, usize), String> {
+            use lattice_inference::serve::metal_worker::{
+                MetalWorker, StartupError, WorkerMetadata,
+            };
+
             let tokenizer_path = tokenizer_dir
                 .as_deref()
                 .unwrap_or(&model_dir)
@@ -2728,11 +2668,73 @@ mod serve {
                     format!("tokenizer load failed ({}): {e}", tokenizer_path.display())
                 })?,
             );
+            // #832: the shared worker's loader needs its own owned
+            // tokenizer (it renders + tokenizes the prompt once per request
+            // for the KV-window check, `check_prompt_fits_window`).
+            // Cloned from the `Arc` above rather than re-read from disk, so
+            // `tokenizer.json` is still parsed exactly once; this is a
+            // single, one-time, startup-only in-memory clone, not a
+            // per-request cost.
+            let tokenizer_for_worker = (*tokenizer).clone();
+            // Preserves this binary's pre-existing behavior exactly: the
+            // context window is this fixed cap, not re-derived from
+            // `state.max_context()` after loading (unlike
+            // `lattice_serve.rs`'s `load_model`). Passed to the shared
+            // worker's `WorkerMetadata` too, so its internal
+            // `check_prompt_fits_window` invariant agrees with the
+            // HTTP-layer `check_context_window` preflight that already runs
+            // first in `prepare_chat_request`.
             let max_context = super::MetalChatBackend::MAX_CACHE_LEN;
-            let handle = MetalHandle::spawn(model_dir, tokenizer_path, Arc::clone(&tokenizer))?;
+            let model_dir_for_loader = model_dir.clone();
+            let tokenizer_path_for_loader = tokenizer_path.clone();
+            let (owner, client, _meta) = MetalWorker::spawn(move || {
+                let cfg = super::load_q4_config(&model_dir_for_loader)?;
+                let state =
+                    lattice_inference::forward::metal_qwen35::MetalQwen35State::from_q4_dir(
+                        &model_dir_for_loader,
+                        &tokenizer_path_for_loader,
+                        &cfg,
+                        max_context,
+                    )
+                    .map_err(|e| format!("Q4 model load failed: {e}"))?;
+                Ok((
+                    state,
+                    tokenizer_for_worker,
+                    WorkerMetadata {
+                        format: "q4".to_string(),
+                        model_max_context: max_context,
+                    },
+                ))
+            })
+            .map_err(|e| match e {
+                StartupError::Load(msg) => msg,
+                // Preserves this binary's exact prior wording (distinct
+                // from `MetalWorker::spawn`'s own generic
+                // `StartupError::ThreadExited` `Display` text) for the same
+                // condition: the worker thread exited/panicked before ever
+                // sending a readiness signal.
+                StartupError::ThreadExited => {
+                    "Metal worker thread exited before loading finished".to_string()
+                }
+            })?;
+            // `owner` (and the `JoinHandle` it carries) is dropped here,
+            // immediately: this binary's prior `MetalHandle::spawn` never
+            // captured `std::thread::spawn`'s return value either, so the
+            // worker thread was already detached rather than joined.
+            // Dropping a `JoinHandle` only detaches it (does not stop the
+            // thread), so the worker keeps running until process exit
+            // either way -- today's behavior is unchanged. Unlike
+            // `lattice_serve.rs`'s `run()` (which blocks for the server's
+            // whole lifetime and so has a natural place to hold the owner
+            // for issue #833's future join-on-shutdown seam), this function
+            // returns before `lattice serve`'s listener ever binds; #833
+            // would need to thread `owner` into `AppState`/
+            // `ModelBackend::Metal` instead if it wants an explicit join
+            // point on this binary.
+            drop(owner);
             Ok((
                 ModelBackend::Metal {
-                    handle,
+                    handle: MetalHandle { client },
                     tokenizer,
                     max_context,
                 },
