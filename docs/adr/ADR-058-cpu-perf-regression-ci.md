@@ -267,19 +267,23 @@ samples per run, better runner isolation, or an explicitly raised threshold.
 
 Two further findings compound the problem as specified:
 
-- Criterion's within-run CI measures sampling noise inside one runner session. True
-  cross-runner variance on shared CI hardware is far larger (the review's worked example
-  put the understatement above an order of magnitude), so a "statistically confident"
-  within-run bound is not confidence about the run-to-run distribution the gate actually
-  faces; bimodal shared-runner latency can produce confident false failures at zero true
-  regression.
-- Updating the baseline on every push to main can ratchet a real regression into the
-  baseline before any gate observes it.
+- Criterion's change CI is bootstrapped from the observed baseline and candidate benchmark
+  sessions; it does not model between-session or runner-pool variance. On shared CI
+  hardware, run-to-run variance can be substantially larger than what one observed pair of
+  sessions shows, so a "statistically confident" bound from that pair is not confidence
+  about the distribution the gate actually faces; a bimodal runner pool can hand the
+  bootstrap two internally stable sessions from different modes, yielding a narrow,
+  confidently wrong comparison and false failures at zero true regression.
+- Refreshing the baseline on each qualifying main update (path-filtered pushes, plus
+  scheduled and manual refreshes) can ratchet a real regression into the baseline before
+  any gate observes it.
 
-Status: the D2/D3 hard merge gate described here was never armed. Merge gating shipped
-instead as same-runner end-to-end token parity against a reference implementation plus a
-relative perplexity-delta gate, both of which sidestep cross-runner variance by comparing
-within a single run. Criterion micro-benchmarks are collected as trend data only
+Status: the D2/D3 hard merge gate described here was never armed (an advisory-mode
+workflow was implemented, then removed). Merge gating shipped instead as same-run
+end-to-end greedy-token parity against a reference implementation (a within-run
+comparison), plus an absolute Q4 perplexity golden captured on the CI runner class and
+enforced with a fixed tolerance (a cross-run comparison by construction, carrying its own
+environment-drift risk). Criterion micro-benchmarks are collected as trend data only
 (`bench-update.yml` / `perf-baselines`). Any future revival of a hard Criterion gate needs
 a cross-run variance model measured on the actual runner pool, not the escalation path in
 this document.
