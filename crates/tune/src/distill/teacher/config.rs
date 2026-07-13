@@ -196,7 +196,7 @@ Respond ONLY with the JSON object, no other text."#.to_string()
     /// Verify the effective endpoint against the configured local security policy.
     ///
     /// This performs no network I/O and only validates the format of a configured
-    /// certificate fingerprint. See [`docs/distill.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/distill.md#teacherconfigverify_endpoint) (§TeacherConfig::verify_endpoint) for the client-side checks that remain.
+    /// certificate fingerprint. See [`docs/distill.md`](../../../docs/distill.md#teacherconfigverify_endpoint) for the client-side checks that remain.
     pub fn verify_endpoint(&self) -> Result<(), String> {
         // Resolve the provider default before applying local policy.
         let endpoint = self.get_endpoint();

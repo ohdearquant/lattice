@@ -186,7 +186,7 @@ fn bf16_to_f32(bits: u16) -> f32 {
 
 /// Parse raw PEFT or MLX safetensors bytes into a complete LoRA adapter.
 /// The caller supplies file-path and integrity context when needed.
-/// See `docs/lora-io.md` (§load_peft_safetensors_bytes) for parsing invariants.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#load_peft_safetensors_bytes) for parsing invariants.
 pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, TuneError> {
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|e| TuneError::Serialization(format!("failed to parse safetensors: {e}")))?;
@@ -391,7 +391,7 @@ pub(crate) fn read_peft_header_adapter_id(data: &[u8]) -> Option<String> {
 
 /// Provenance metadata embeddable in an adapter safetensors header.
 /// Whole-file integrity remains manifest-owned because a file cannot embed its own digest.
-/// See `docs/lora-io.md` (§AdapterGovernance) for header and integrity boundaries.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#adaptergovernance) for header and integrity boundaries.
 #[derive(Debug, Clone)]
 pub struct AdapterGovernance {
     /// Human-readable name for logging and debugging.
@@ -428,7 +428,7 @@ impl AdapterGovernance {
 
 /// Read optional, advisory governance metadata from a safetensors header.
 /// `gov_name` is the presence sentinel for a writer-produced six-field set.
-/// See `docs/lora-io.md` (§AdapterGovernance) for advisory-read semantics.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#adaptergovernance) for advisory-read semantics.
 #[allow(dead_code)]
 pub(crate) fn read_peft_header_governance(data: &[u8]) -> Option<AdapterGovernance> {
     let (_, meta) = SafeTensors::read_metadata(data).ok()?;
@@ -444,12 +444,12 @@ pub(crate) fn read_peft_header_governance(data: &[u8]) -> Option<AdapterGovernan
 }
 
 /// Maximum in-memory adapter file size (10 GiB).
-/// See `docs/lora-io.md` (§read_lora_file_bounded) for the allocation bound.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#read_lora_file_bounded) for the allocation bound.
 pub(crate) const MAX_LORA_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Read an adapter file into memory without exceeding `max_bytes`.
 /// Returns I/O errors for metadata, over-limit, open, or read failures.
-/// See `docs/lora-io.md` (§read_lora_file_bounded) for the two-stage bound.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#read_lora_file_bounded) for the two-stage bound.
 pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, TuneError> {
     // Reject a known-oversized file before allocation.
     let file_size = std::fs::metadata(path)
@@ -498,7 +498,7 @@ pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<
 
 /// Load and validate a PEFT or MLX safetensors LoRA adapter from `path`.
 /// Rejects unreadable, malformed, incomplete, or shape-inconsistent files.
-/// See `docs/lora-io.md` (§load_peft_safetensors) for parser checks.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#load_peft_safetensors) for parser checks.
 pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
     let data = read_lora_file_bounded(path, MAX_LORA_SIZE)?;
     load_peft_safetensors_bytes(&data)
@@ -506,7 +506,7 @@ pub fn load_peft_safetensors(path: &Path) -> Result<LoraAdapter, TuneError> {
 
 /// Save an adapter as PEFT safetensors, optionally embedding provenance metadata.
 /// Returns errors for invalid tensor views or file writes.
-/// See `docs/lora-io.md` (§save_peft_safetensors) for keys and header fields.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#save_peft_safetensors) for keys and header fields.
 pub fn save_peft_safetensors(
     adapter: &LoraAdapter,
     path: &Path,

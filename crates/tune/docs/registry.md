@@ -92,14 +92,14 @@ fields explicitly.
 
 The status vocabulary is:
 
-| Status | Meaning |
-| --- | --- |
-| `Pending` | Registered but not yet validated. |
-| `Validated` | Validation has passed. |
-| `Staged` | Prepared for deployment. |
-| `Production` | The selected production version. |
-| `Archived` | Superseded or retained for history. |
-| `Deprecated` | Not for further use. |
+| Status       | Meaning                             |
+| ------------ | ----------------------------------- |
+| `Pending`    | Registered but not yet validated.   |
+| `Validated`  | Validation has passed.              |
+| `Staged`     | Prepared for deployment.            |
+| `Production` | The selected production version.    |
+| `Archived`   | Superseded or retained for history. |
+| `Deprecated` | Not for further use.                |
 
 The conventional lifecycle is `Pending -> Validated -> Staged -> Production`,
 with old versions later archived or deprecated. This is convention, not a
@@ -215,12 +215,12 @@ either UUID currently denotes a registry record.
 
 `ShadowConfig` contains four acceptance inputs:
 
-| Field | Interpretation | Default | `quick()` | `strict()` |
-| --- | --- | ---: | ---: | ---: |
-| `sample_rate` | Fraction of traffic the caller intends to sample. | 0.10 | 0.20 | 0.10 |
-| `min_samples` | Observations required before a terminal evaluation. | 1,000 | 100 | 10,000 |
-| `min_agreement` | Minimum agreeing-output fraction. | 0.95 | 0.90 | 0.99 |
-| `max_latency_increase_ms` | Largest allowed mean candidate-minus-production latency. | 50.0 | 100.0 | 20.0 |
+| Field                     | Interpretation                                           | Default | `quick()` | `strict()` |
+| ------------------------- | -------------------------------------------------------- | ------: | --------: | ---------: |
+| `sample_rate`             | Fraction of traffic the caller intends to sample.        |    0.10 |      0.20 |       0.10 |
+| `min_samples`             | Observations required before a terminal evaluation.      |   1,000 |       100 |     10,000 |
+| `min_agreement`           | Minimum agreeing-output fraction.                        |    0.95 |      0.90 |       0.99 |
+| `max_latency_increase_ms` | Largest allowed mean candidate-minus-production latency. |    50.0 |     100.0 |       20.0 |
 
 `validate` requires `sample_rate` and `min_agreement` to lie in `[0, 1]`,
 requires a nonzero sample count, and rejects a negative latency allowance.
@@ -426,11 +426,11 @@ runs two fail-closed, idempotent migrations before exposing the storage:
 The timestamp copy handles three legacy representations for both timestamp
 columns:
 
-| Stored value | Detection | Result |
-| --- | --- | --- |
-| Native integer | `typeof(value) = 'integer'` | Preserve it unchanged. |
+| Stored value                       | Detection                     | Result                                                                       |
+| ---------------------------------- | ----------------------------- | ---------------------------------------------------------------------------- |
+| Native integer                     | `typeof(value) = 'integer'`   | Preserve it unchanged.                                                       |
 | Parseable RFC 3339 / ISO 8601 text | `datetime(value) IS NOT NULL` | Convert `strftime('%s', value)` to microseconds by multiplying by 1,000,000. |
-| Numeric text | Neither condition | Cast directly to `INTEGER`. |
+| Numeric text                       | Neither condition             | Cast directly to `INTEGER`.                                                  |
 
 The third case matters because SQLite's old `TEXT` affinity could convert
 integer microseconds into digit strings. RFC 3339 conversion is based on epoch

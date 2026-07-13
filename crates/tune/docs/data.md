@@ -57,14 +57,14 @@ dataset filtering uses; it does not inspect the embedding contents.
 `IntentLabels` is a six-field record. Its vector representation and class
 order are fixed:
 
-| Index | Field | Class name | Meaning |
-| ---: | --- | --- | --- |
-| 0 | `continuation` | `continuation` | Natural conversational continuation |
-| 1 | `topic_shift` | `topic_shift` | A change of subject |
-| 2 | `explicit_query` | `explicit_query` | Direct request or question |
-| 3 | `person_lookup` | `person_lookup` | Looking up a person or contact |
-| 4 | `health_check` | `health_check` | Health or wellness inquiry |
-| 5 | `task_status` | `task_status` | Checking a task or todo status |
+| Index | Field            | Class name       | Meaning                             |
+| ----: | ---------------- | ---------------- | ----------------------------------- |
+|     0 | `continuation`   | `continuation`   | Natural conversational continuation |
+|     1 | `topic_shift`    | `topic_shift`    | A change of subject                 |
+|     2 | `explicit_query` | `explicit_query` | Direct request or question          |
+|     3 | `person_lookup`  | `person_lookup`  | Looking up a person or contact      |
+|     4 | `health_check`   | `health_check`   | Health or wellness inquiry          |
+|     5 | `task_status`    | `task_status`    | Checking a task or todo status      |
 
 This order is used by `from_vec`, `to_vec`, `class_names`, batch label
 matrices, distillation statistics, and dataset statistics. It is a
@@ -102,14 +102,14 @@ conversion is intended. The distillation pipeline enables it by default; see
 
 `ExampleMetadata` is optional provenance attached to an example:
 
-| Field | Meaning |
-| --- | --- |
-| `source_id` | Source conversation or session identifier |
-| `timestamp` | UTC time of the original message |
-| `teacher_model` | Teacher display name that generated labels |
-| `labeled_at` | UTC time at which labeling occurred |
-| `teacher_confidence` | Teacher confidence, conventionally 0–1 |
-| `extra` | Additional application metadata |
+| Field                | Meaning                                    |
+| -------------------- | ------------------------------------------ |
+| `source_id`          | Source conversation or session identifier  |
+| `timestamp`          | UTC time of the original message           |
+| `teacher_model`      | Teacher display name that generated labels |
+| `labeled_at`         | UTC time at which labeling occurred        |
+| `teacher_confidence` | Teacher confidence, conventionally 0–1     |
+| `extra`              | Additional application metadata            |
 
 With `serde` enabled, `extra` is `Option<serde_json::Value>`; without it,
 `extra` is `Option<String>`. The constructors are intentionally additive:
@@ -126,14 +126,14 @@ source ID should preserve it in its own metadata flow before conversion.
 
 `DatasetConfig` controls selection and iteration:
 
-| Field | Default | Effect |
-| --- | ---: | --- |
-| `batch_size` | 32 | Number of examples in a full batch; must be nonzero. |
-| `shuffle` | true | Whether `reset_epoch` permutes example indices. |
-| `seed` | none | Fixed seed for a repeatable permutation; absent uses current system time when available. |
-| `drop_last` | false | Whether a final partial batch is discarded. |
-| `min_context_size` | 1 | Minimum number of context vectors accepted by `with_config`. |
-| `max_context_size` | none | Maximum number accepted by `with_config`. |
+| Field              | Default | Effect                                                                                   |
+| ------------------ | ------: | ---------------------------------------------------------------------------------------- |
+| `batch_size`       |      32 | Number of examples in a full batch; must be nonzero.                                     |
+| `shuffle`          |    true | Whether `reset_epoch` permutes example indices.                                          |
+| `seed`             |    none | Fixed seed for a repeatable permutation; absent uses current system time when available. |
+| `drop_last`        |   false | Whether a final partial batch is discarded.                                              |
+| `min_context_size` |       1 | Minimum number of context vectors accepted by `with_config`.                             |
+| `max_context_size` |    none | Maximum number accepted by `with_config`.                                                |
 
 Despite the field comment's shorthand, `max_context_size` does **not** truncate
 a longer context sequence. `Dataset::with_config` filters out examples outside
@@ -209,13 +209,13 @@ returns a `Batch` with a zero-based `batch_idx` and the epoch's
 
 A `Batch` is an owned collection:
 
-| Member or method | Behavior |
-| --- | --- |
-| `examples` | Cloned `TrainingExample` values selected for that batch |
-| `batch_idx` / `total_batches` | Position and expected count within the epoch |
-| `len()` / `is_empty()` | Inspect the owned example vector |
-| `message_embeddings()` | Allocates a matrix of cloned message vectors |
-| `labels()` | Allocates a matrix of six-element label vectors |
+| Member or method              | Behavior                                                |
+| ----------------------------- | ------------------------------------------------------- |
+| `examples`                    | Cloned `TrainingExample` values selected for that batch |
+| `batch_idx` / `total_batches` | Position and expected count within the epoch            |
+| `len()` / `is_empty()`        | Inspect the owned example vector                        |
+| `message_embeddings()`        | Allocates a matrix of cloned message vectors            |
+| `labels()`                    | Allocates a matrix of six-element label vectors         |
 
 `Batch::from_examples` is a convenience constructor for a standalone batch. It
 sets `total_batches` to one; an epoch-produced batch gets its actual epoch

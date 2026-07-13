@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 /// Serializes `weights` as a named one-dimensional `F32` safetensors tensor.
 /// Returns serialization errors from the safetensors container.
-/// See `docs/registry.md` (§`safetensors_io` helpers) for the tensor contract.
+/// See [`docs/registry.md`](../../docs/registry.md#safetensors_io-helpers) for the tensor contract.
 pub fn save_weights(weights: &[f32], name: &str) -> Result<Vec<u8>> {
     // Convert f32 to bytes
     let bytes: Vec<u8> = weights.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -34,7 +34,7 @@ pub fn save_weights(weights: &[f32], name: &str) -> Result<Vec<u8>> {
 
 /// Loads a named `F32` safetensors tensor as flat `f32` values.
 /// Returns errors for malformed data, a missing tensor, a non-`F32` tensor, or unaligned bytes.
-/// See `docs/registry.md` (§`safetensors_io` helpers) for format and integrity boundaries.
+/// See [`docs/registry.md`](../../docs/registry.md#safetensors_io-helpers) for format and integrity boundaries.
 pub fn load_weights(data: &[u8], name: &str) -> Result<Vec<f32>> {
     // Parse safetensors (validates format, no code execution)
     let tensors = SafeTensors::deserialize(data)
@@ -70,7 +70,7 @@ pub fn load_weights(data: &[u8], name: &str) -> Result<Vec<f32>> {
 }
 
 /// Serializes named flat `f32` vectors as one-dimensional `F32` tensors.
-/// See `docs/registry.md` (§`safetensors_io` helpers) for the multi-tensor contract.
+/// See [`docs/registry.md`](../../docs/registry.md#safetensors_io-helpers) for the multi-tensor contract.
 pub fn save_tensors(tensors: &HashMap<String, Vec<f32>>) -> Result<Vec<u8>> {
     // Convert all tensors to byte views
     let byte_data: HashMap<String, Vec<u8>> = tensors
@@ -99,7 +99,7 @@ pub fn save_tensors(tensors: &HashMap<String, Vec<f32>>) -> Result<Vec<u8>> {
 
 /// Loads all `F32` safetensors tensors as flat `f32` vectors.
 /// Skips non-`F32` tensors and rejects malformed `F32` byte lengths or shapes.
-/// See `docs/registry.md` (§`safetensors_io` helpers) for validation behavior.
+/// See [`docs/registry.md`](../../docs/registry.md#safetensors_io-helpers) for validation behavior.
 pub fn load_tensors(data: &[u8]) -> Result<HashMap<String, Vec<f32>>> {
     let tensors = SafeTensors::deserialize(data)
         .map_err(|e| TuneError::Storage(format!("Failed to deserialize tensors: {e}")))?;

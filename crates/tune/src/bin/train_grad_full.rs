@@ -95,7 +95,7 @@ fn strided_probes(len: usize, count: usize, seed: u64) -> Vec<usize> {
 }
 
 /// Initialize every GDN LoRA factor with nonzero noise for finite-difference checks.
-/// See [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md#train_grad_full-details) (§train_grad_full details) for shape and non-vacuity invariants.
+/// See [`docs/design.md`](../../docs/design.md#train_grad_full-details) for shape and non-vacuity invariants.
 fn gradcheck_gdn_loras(
     num_gdn_slots: usize,
     rank: usize,
@@ -130,7 +130,7 @@ fn gradcheck_gdn_loras(
 }
 
 /// Initialize GDN LoRA with random A factors and zero B factors for training.
-/// See [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md#train_grad_full-details) (§train_grad_full details) for shape and initialization invariants.
+/// See [`docs/design.md`](../../docs/design.md#train_grad_full-details) for shape and initialization invariants.
 fn zero_b_gdn_loras(
     num_gdn_slots: usize,
     rank: usize,
@@ -1034,7 +1034,7 @@ mod gdn_lora_ctor_tests {
     use super::*;
 
     /// Use asymmetric head counts to expose GDN B-factor sizing drift.
-    /// See [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md#train_grad_full-details) (§train_grad_full details) for the value-head invariant.
+    /// See [`docs/design.md`](../../docs/design.md#train_grad_full-details) for the value-head invariant.
     fn asymmetric_gdn_dims() -> GdnDims {
         let key_dim = 8;
         let value_dim = 8;

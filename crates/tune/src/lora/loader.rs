@@ -40,13 +40,13 @@ pub struct LoadedAdapter {
     pub adapter: LoraAdapter,
     /// Whether an allowed serving-revision mismatch bypassed the admission check.
     /// This is `false` when revisions matched or enforcement was not requested.
-    /// See `docs/lora-io.md` (§RunningRevisions) for serving implications.
+    /// See [`docs/lora-io.md`](../../docs/lora-io.md#runningrevisions) for serving implications.
     pub rev_mismatch_overridden: bool,
 }
 
 /// Revisions of the base model and tokenizer currently serving an adapter.
 /// They are compared literally with each manifest entry when supplied to the loader.
-/// See `docs/lora-io.md` (§RunningRevisions) for strict and migration behavior.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#runningrevisions) for strict and migration behavior.
 #[derive(Debug, Clone, Copy)]
 pub struct RunningRevisions<'a> {
     /// Revision of the base model weights currently loaded for serving.
@@ -84,7 +84,7 @@ impl<'a> RunningRevisions<'a> {
 
 /// Load every approved manifest adapter or reject the entire manifest.
 /// Validates confinement, integrity, format, manifest claims, and optional live-serving context.
-/// See `docs/lora-io.md` (§load_adapters_from_manifest) for the ordered admission checks.
+/// See [`docs/lora-io.md`](../../docs/lora-io.md#load_adapters_from_manifest) for the ordered admission checks.
 pub fn load_adapters_from_manifest(
     manifest: &LoraManifest,
     base_dir: &Path,

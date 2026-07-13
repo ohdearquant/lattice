@@ -109,7 +109,7 @@ pub struct LoraLayer {
 }
 
 /// A validated collection of LoRA layers keyed by transformer layer and module.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) (§Adapter validation) for serving-time validation.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for serving-time validation.
 #[derive(Debug, Clone)]
 pub struct LoraAdapter {
     /// Adapter configuration.
@@ -122,7 +122,7 @@ pub struct LoraAdapter {
 impl LoraAdapter {
     /// Load a LoRA adapter from a PEFT-format safetensors file.
     /// Returns an error for invalid tensors, pairs, or ranks.
-    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) (§Adapter validation) for the loading boundary.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for the loading boundary.
     #[cfg(feature = "safetensors")]
     pub fn from_safetensors(path: &Path) -> crate::error::Result<Self> {
         safetensors::load_peft_safetensors(path)
@@ -132,7 +132,7 @@ impl LoraAdapter {
     ///
     /// `governance` optionally adds provenance metadata to the file header.
     /// Returns an error when serialization or writing fails.
-    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) (§Adapter validation) for the metadata boundary.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for the metadata boundary.
     #[cfg(feature = "safetensors")]
     pub fn save_safetensors(
         &self,
@@ -172,7 +172,7 @@ impl LoraAdapter {
 
     /// Add this adapter's correction to one projection output in place.
     /// A missing `(layer_idx, module)` layer is a no-op; slices must match its shape.
-    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-representation-and-inference) (§Adapter representation and inference) for the matrix layout.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-representation-and-inference) for the matrix layout.
     pub fn apply(&self, layer_idx: usize, module: &str, x: &[f32], base_output: &mut [f32]) {
         let key = (layer_idx, module.to_string());
         if let Some(lora_layer) = self.layers().get(&key) {
@@ -215,7 +215,7 @@ impl LoraAdapter {
     /// Returns the first invalid layer, module, or projection-shape mismatch.
     /// Call it after loading and before
     /// [`set_lora`](lattice_inference::model::qwen35::Qwen35Model::set_lora).
-    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) (§Adapter validation) for projection shape rules.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for projection shape rules.
     pub fn validate_against(
         &self,
         config: &lattice_inference::model::qwen35_config::Qwen35Config,

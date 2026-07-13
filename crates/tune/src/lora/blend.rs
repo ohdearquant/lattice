@@ -20,7 +20,7 @@ pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 ele
 ///
 /// Folds each source's mixture weight and scale into B; absent projections are
 /// omitted. Returns an error for invalid inputs, shapes, or resource limits.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#blend_lora_adapters) (§blend_lora_adapters) for the derivation and allocation limits.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#blend_lora_adapters) for the derivation and allocation limits.
 pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapter> {
     if adapters.is_empty() {
         return Err(TuneError::Validation(

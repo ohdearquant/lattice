@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// In-memory checkpoint state, including metadata, metrics, and serialized bytes.
 ///
 /// With `serde`, this type serializes as JSON.
-/// See [`docs/train.md`](§checkpoint-byte-layout) for byte layouts and resume limits.
+/// See [`docs/train.md`](../../../docs/train.md#checkpoint-byte-layout) for byte layouts and resume limits.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Checkpoint {

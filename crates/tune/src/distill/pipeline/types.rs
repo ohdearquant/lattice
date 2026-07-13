@@ -197,7 +197,7 @@ impl RawExample {
     }
 
     /// Format the context and current message as a bounded, sanitized teacher prompt.
-    /// See [`docs/distill.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/distill.md#rawexampletoprompt) (§RawExample::to_prompt) for its layout and limits.
+    /// See [`docs/distill.md`](../../../docs/distill.md#rawexampleto_prompt) for its layout and limits.
     pub fn to_prompt(&self) -> String {
         let mut prompt = String::new();
 

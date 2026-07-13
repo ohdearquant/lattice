@@ -18,7 +18,7 @@ pub struct Sample {
 /// Load up to `max_samples` valid `prompt`/`completion` JSONL rows.
 ///
 /// Each sample stores full token IDs and the completion boundary; invalid or
-/// over-length rows are skipped. See [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md#shared-jsonl-samples) (§Shared JSONL samples) for acceptance rules.
+/// over-length rows are skipped. See [`docs/design.md`](../../../docs/design.md#shared-jsonl-samples) for acceptance rules.
 pub fn load_jsonl(
     path: &Path,
     tokenizer: &dyn Tokenizer,
@@ -82,7 +82,7 @@ pub fn default_data_dir() -> PathBuf {
 }
 
 /// Provides the shared permissive lookup semantics for gradient-training arguments.
-/// See [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md#argview) (§ArgView) for compatibility and validation boundaries.
+/// See [`docs/design.md`](../../../docs/design.md#argview) for compatibility and validation boundaries.
 pub struct ArgView<'a> {
     args: &'a [String],
 }
@@ -125,7 +125,7 @@ pub struct TbvObservation {
 /// Compare candidate and reference masked NLL values and return their observation.
 ///
 /// Fails closed for non-finite values or a difference above [`TBV_MAX_ABS_DIFF`].
-/// See [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md#verify_tbv) (§verify_tbv) for gate behavior and diagnostics.
+/// See [`docs/design.md`](../../../docs/design.md#verify_tbv) for gate behavior and diagnostics.
 pub fn verify_tbv(
     context: &str,
     reference_nll: f32,

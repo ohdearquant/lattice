@@ -51,43 +51,43 @@ that alignment has been supplied.
 endpoint controls explicit. It derives serialization only with the `serde`
 feature.
 
-| Field | Meaning | Validation or behavior |
-| --- | --- | --- |
-| `provider` | `Claude`, `OpenAI`, `Gemini`, `Local`, or `Custom(String)` | Controls default endpoint and display name. |
-| `model_id` | Provider-specific model identifier | Must not be empty. |
-| `endpoint` | Optional custom base endpoint | When absent, `get_endpoint` chooses a provider default. A custom endpoint is checked by `validate`. |
-| `api_key_env` | Environment-variable name for credentials | Configuration only; the current pipeline never reads it. |
-| `temperature` | Generation temperature | Must lie in `0.0..=2.0`. |
-| `max_tokens` | Response-token budget | Must be nonzero. |
-| `timeout_ms` | Per-request timeout | Must be nonzero. |
-| `max_retries` / `retry_delay_ms` | Retry policy | Stored for a future client; currently not executed. |
-| `system_prompt` | Optional classification instruction | Presets use the built-in intent-classification prompt; the builder can replace or clear it. |
-| `security` | `EndpointSecurity` policy | Validates a custom endpoint during `validate`. |
+| Field                            | Meaning                                                    | Validation or behavior                                                                              |
+| -------------------------------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `provider`                       | `Claude`, `OpenAI`, `Gemini`, `Local`, or `Custom(String)` | Controls default endpoint and display name.                                                         |
+| `model_id`                       | Provider-specific model identifier                         | Must not be empty.                                                                                  |
+| `endpoint`                       | Optional custom base endpoint                              | When absent, `get_endpoint` chooses a provider default. A custom endpoint is checked by `validate`. |
+| `api_key_env`                    | Environment-variable name for credentials                  | Configuration only; the current pipeline never reads it.                                            |
+| `temperature`                    | Generation temperature                                     | Must lie in `0.0..=2.0`.                                                                            |
+| `max_tokens`                     | Response-token budget                                      | Must be nonzero.                                                                                    |
+| `timeout_ms`                     | Per-request timeout                                        | Must be nonzero.                                                                                    |
+| `max_retries` / `retry_delay_ms` | Retry policy                                               | Stored for a future client; currently not executed.                                                 |
+| `system_prompt`                  | Optional classification instruction                        | Presets use the built-in intent-classification prompt; the builder can replace or clear it.         |
+| `security`                       | `EndpointSecurity` policy                                  | Validates a custom endpoint during `validate`.                                                      |
 
 ### Provider defaults and presets
 
 The default configuration is `TeacherConfig::claude_sonnet()`. The convenience
 constructors select the following values:
 
-| Constructor | Provider | Model ID | Endpoint | Key variable | Timeout | Retries / delay |
-| --- | --- | --- | --- | --- | ---: | --- |
-| `claude_sonnet()` | Claude | `claude-sonnet-4-20250514` | Claude default | `ANTHROPIC_API_KEY` | 30 s | 3 / 1 s |
-| `claude_haiku()` | Claude | `claude-3-5-haiku-20241022` | Claude default | `ANTHROPIC_API_KEY` | 15 s | 3 / 500 ms |
-| `gpt4()` | OpenAI | `gpt-4-turbo-preview` | OpenAI default | `OPENAI_API_KEY` | 30 s | 3 / 1 s |
-| `gemini_pro()` | Gemini | `gemini-pro` | Gemini default | `GOOGLE_API_KEY` | 30 s | 3 / 1 s |
-| `local(model, endpoint)` | Local | Caller supplied | Caller supplied | empty | 60 s | 2 / 500 ms |
+| Constructor              | Provider | Model ID                    | Endpoint        | Key variable        | Timeout | Retries / delay |
+| ------------------------ | -------- | --------------------------- | --------------- | ------------------- | ------: | --------------- |
+| `claude_sonnet()`        | Claude   | `claude-sonnet-4-20250514`  | Claude default  | `ANTHROPIC_API_KEY` |    30 s | 3 / 1 s         |
+| `claude_haiku()`         | Claude   | `claude-3-5-haiku-20241022` | Claude default  | `ANTHROPIC_API_KEY` |    15 s | 3 / 500 ms      |
+| `gpt4()`                 | OpenAI   | `gpt-4-turbo-preview`       | OpenAI default  | `OPENAI_API_KEY`    |    30 s | 3 / 1 s         |
+| `gemini_pro()`           | Gemini   | `gemini-pro`                | Gemini default  | `GOOGLE_API_KEY`    |    30 s | 3 / 1 s         |
+| `local(model, endpoint)` | Local    | Caller supplied             | Caller supplied | empty               |    60 s | 2 / 500 ms      |
 
 All presets use temperature `0.3`, a 1,024-token response budget, the default
 system prompt, and a security preset appropriate to a remote or local
 endpoint. The endpoint defaults returned by `get_endpoint` are:
 
-| Provider | Default endpoint |
-| --- | --- |
-| Claude | `https://api.anthropic.com/v1` |
-| OpenAI | `https://api.openai.com/v1` |
-| Gemini | `https://generativelanguage.googleapis.com/v1` |
-| Local | `http://localhost:11434` |
-| Custom | empty string |
+| Provider | Default endpoint                               |
+| -------- | ---------------------------------------------- |
+| Claude   | `https://api.anthropic.com/v1`                 |
+| OpenAI   | `https://api.openai.com/v1`                    |
+| Gemini   | `https://generativelanguage.googleapis.com/v1` |
+| Local    | `http://localhost:11434`                       |
+| Custom   | empty string                                   |
 
 `TeacherProvider` displays as `claude`, `openai`, `gemini`, `local`, or
 `custom:<name>`. `TeacherConfig::display_name` combines that display form with
@@ -131,12 +131,12 @@ live parsing guarantee.
 `EndpointSecurity` expresses endpoint policy independently of a concrete HTTP
 client:
 
-| Control | Purpose | What the current code checks |
-| --- | --- | --- |
-| `require_tls` | Disallow non-HTTPS remote endpoints | `verify_endpoint` rejects endpoints whose lowercased string does not start with `https://`. |
-| `allowed_domains` | Host allowlist | The extracted host must exactly equal one configured domain. |
+| Control                     | Purpose                                  | What the current code checks                                                                   |
+| --------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `require_tls`               | Disallow non-HTTPS remote endpoints      | `verify_endpoint` rejects endpoints whose lowercased string does not start with `https://`.    |
+| `allowed_domains`           | Host allowlist                           | The extracted host must exactly equal one configured domain.                                   |
 | `expected_cert_fingerprint` | Expected SHA-256 certificate fingerprint | `validate_cert_fingerprint` checks only that the configured value has 64 ASCII-hex characters. |
-| `model_checksum` | Expected checksum for local weights | `verify_model_checksum` compares an actual checksum provided by its caller. |
+| `model_checksum`            | Expected checksum for local weights      | `verify_model_checksum` compares an actual checksum provided by its caller.                    |
 
 `EndpointSecurity::default_secure()` requires TLS and allows only
 `api.anthropic.com`, `api.openai.com`, and
@@ -151,7 +151,7 @@ the corresponding optional expectations.
 timeout. It applies `security.verify_endpoint` only when an explicit custom
 endpoint is present. `TeacherConfig::verify_endpoint` resolves either a custom
 or provider-default endpoint, applies the endpoint policy, and validates the
-*format* of a configured certificate fingerprint.
+_format_ of a configured certificate fingerprint.
 
 Neither method opens a network connection. In particular, certificate
 fingerprint comparison must happen in the future HTTP/TLS client after it has
@@ -221,15 +221,15 @@ provider client.
 of 10, concurrency of 5, softmax normalization enabled, no confidence
 threshold, no intermediate persistence, and a progress interval of 100.
 
-| Field | Default | Current use |
-| --- | ---: | --- |
-| `batch_size` | 10 | Validated nonzero; not used to schedule the synchronous loop. |
-| `concurrency` | 5 | Validated nonzero; not used to run parallel requests yet. |
-| `normalize_labels` | true | Applies `IntentLabels::softmax_normalize` to the simulated scores. |
-| `min_confidence` | none | Rejects a result whose confidence is below the threshold. |
-| `save_intermediate` | false | Stored only. |
-| `output_dir` | none | `output_dir(...)` sets this and enables `save_intermediate`; no files are written yet. |
-| `progress_interval` | 100 | Stored only. |
+| Field               | Default | Current use                                                                            |
+| ------------------- | ------: | -------------------------------------------------------------------------------------- |
+| `batch_size`        |      10 | Validated nonzero; not used to schedule the synchronous loop.                          |
+| `concurrency`       |       5 | Validated nonzero; not used to run parallel requests yet.                              |
+| `normalize_labels`  |    true | Applies `IntentLabels::softmax_normalize` to the simulated scores.                     |
+| `min_confidence`    |    none | Rejects a result whose confidence is below the threshold.                              |
+| `save_intermediate` |   false | Stored only.                                                                           |
+| `output_dir`        |    none | `output_dir(...)` sets this and enables `save_intermediate`; no files are written yet. |
+| `progress_interval` |     100 | Stored only.                                                                           |
 
 `fast()` selects a 20-item batch, concurrency 10, and progress every 50
 examples. `quality()` selects a 5-item batch, concurrency 3, a `0.5` minimum

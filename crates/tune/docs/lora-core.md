@@ -18,10 +18,10 @@ the core contract.
 For a base linear projection with input width `d_in` and output width `d_out`,
 a `LoraLayer` stores two row-major `f32` matrices:
 
-| Matrix | Logical shape | Flat storage | Role |
-| --- | --- | --- | --- |
-| `A` | `(rank, d_in)` | `rank * d_in` values | Projects the activation into the low-rank space. |
-| `B` | `(d_out, rank)` | `d_out * rank` values | Projects the low-rank activation back to output width. |
+| Matrix | Logical shape   | Flat storage          | Role                                                   |
+| ------ | --------------- | --------------------- | ------------------------------------------------------ |
+| `A`    | `(rank, d_in)`  | `rank * d_in` values  | Projects the activation into the low-rank space.       |
+| `B`    | `(d_out, rank)` | `d_out * rank` values | Projects the low-rank activation back to output width. |
 
 With adapter configuration `(rank, alpha)`, inference adds the following
 update to the base projection output:
@@ -47,10 +47,10 @@ running the tape.
 The adapter layer itself is intentionally model-neutral. Typical target names
 are:
 
-| Model family | Attention targets | Feed-forward targets |
-| --- | --- | --- |
+| Model family           | Attention targets                      | Feed-forward targets                |
+| ---------------------- | -------------------------------------- | ----------------------------------- |
 | Qwen-style transformer | `q_proj`, `k_proj`, `v_proj`, `o_proj` | `gate_proj`, `up_proj`, `down_proj` |
-| BERT or cross-encoder | `query`, `key`, `value`, `attn_output` | `ffn_intermediate`, `ffn_output` |
+| BERT or cross-encoder  | `query`, `key`, `value`, `attn_output` | `ffn_intermediate`, `ffn_output`    |
 
 When the `inference-hook` feature is available, `validate_against` checks a
 Qwen3.5 adapter before installation. It verifies every layer index and each
@@ -79,14 +79,14 @@ last token the context for the first completion token.
 
 `MicroLoraConfig` has these defaults:
 
-| Field | Default | Meaning |
-| --- | ---: | --- |
-| `rank` | `4` | Low-rank dimension for each trained projection. |
-| `alpha` | `8.0` | LoRA alpha; execution scale is `alpha / rank`. |
-| `first_layer` | `19` | First model layer included in the materialized suffix. |
-| `steps` | `25` | Number of Adam updates. |
-| `learning_rate` | `1e-3` | Adam learning rate. |
-| `max_seq_len` | `64` | Per-pair sequence length ceiling. |
+| Field           | Default | Meaning                                                |
+| --------------- | ------: | ------------------------------------------------------ |
+| `rank`          |     `4` | Low-rank dimension for each trained projection.        |
+| `alpha`         |   `8.0` | LoRA alpha; execution scale is `alpha / rank`.         |
+| `first_layer`   |    `19` | First model layer included in the materialized suffix. |
+| `steps`         |    `25` | Number of Adam updates.                                |
+| `learning_rate` |  `1e-3` | Adam learning rate.                                    |
+| `max_seq_len`   |    `64` | Per-pair sequence length ceiling.                      |
 
 The trainer fails before model access when any caller-controlled condition
 would make tape indexing or allocation unsafe:
@@ -129,10 +129,10 @@ the weight vectors, cache selection, and optimizer keys aligned.
 
 Every GQA slot contains parameters for both `q_proj` and `v_proj`:
 
-| Projection | A shape | B shape |
-| --- | --- | --- |
-| `q_proj` | `(rank, hidden)` | `(2 * q_dim, rank)` |
-| `v_proj` | `(rank, hidden)` | `(kv_dim, rank)` |
+| Projection | A shape          | B shape             |
+| ---------- | ---------------- | ------------------- |
+| `q_proj`   | `(rank, hidden)` | `(2 * q_dim, rank)` |
+| `v_proj`   | `(rank, hidden)` | `(kv_dim, rank)`    |
 
 The trainer initializes A with a deterministic uniform sample in
 `[-1 / sqrt(hidden), +1 / sqrt(hidden)]` and initializes B to zero. Zero B
@@ -187,13 +187,13 @@ caller, yields gradients for all five of its LoRA projections.
 
 The optional GDN parameter container has ten arrays per slot:
 
-| Projection | A shape | B shape |
-| --- | --- | --- |
-| `in_proj_qkv` | `(rank, hidden)` | `(qkv_dim, rank)` |
-| `in_proj_z` | `(rank, hidden)` | `(output_dim, rank)` |
-| `in_proj_b` (beta) | `(rank, hidden)` | `(value_heads, rank)` |
-| `in_proj_a` (alpha) | `(rank, hidden)` | `(value_heads, rank)` |
-| `out_proj` | `(rank, output_dim)` | `(hidden, rank)` |
+| Projection          | A shape              | B shape               |
+| ------------------- | -------------------- | --------------------- |
+| `in_proj_qkv`       | `(rank, hidden)`     | `(qkv_dim, rank)`     |
+| `in_proj_z`         | `(rank, hidden)`     | `(output_dim, rank)`  |
+| `in_proj_b` (beta)  | `(rank, hidden)`     | `(value_heads, rank)` |
+| `in_proj_a` (alpha) | `(rank, hidden)`     | `(value_heads, rank)` |
+| `out_proj`          | `(rank, output_dim)` | `(hidden, rank)`      |
 
 The beta and alpha B matrices are indexed by **value heads**, not key heads.
 That shape must agree with the shipping GDN forward implementation and its
@@ -337,20 +337,20 @@ parsing.
 
 Each `ManifestEntry` requires these fields:
 
-| Field | Meaning | Enforced by governed load? |
-| --- | --- | --- |
-| `id` | Opaque adapter ID; a UUID is conventional. | Yes, if the safetensors header has `adapter_id`. |
-| `name` | Human-readable identifier. | Provenance only. |
-| `owner` | Responsible team or person. | Provenance only. |
-| `uri` | Relative path to the adapter file. | Yes; must remain under the supplied base directory. |
-| `integrity_sha256` | SHA-256 of the complete adapter file. | Yes. |
-| `base_model_rev` | Base model revision used for training, or `"none"`. | Yes when running revisions are supplied. |
-| `tokenizer_rev` | Tokenizer revision used for training, or `"none"`. | Yes when running revisions are supplied. |
-| `rank` | Adapter's LoRA rank. | Yes; must equal the parsed adapter rank. |
-| `alpha` | Adapter's LoRA alpha. | Yes; compared with `1e-4` tolerance. |
-| `target_modules` | Declared module allow-list. | Yes; actual adapter modules must be a subset. |
-| `dtype` | Training/save dtype label. | Provenance only; tensor parsing validates real data separately. |
-| `status` | `approved`, `quarantined`, or `revoked`. | Yes; only `approved` is allowed. |
+| Field              | Meaning                                             | Enforced by governed load?                                      |
+| ------------------ | --------------------------------------------------- | --------------------------------------------------------------- |
+| `id`               | Opaque adapter ID; a UUID is conventional.          | Yes, if the safetensors header has `adapter_id`.                |
+| `name`             | Human-readable identifier.                          | Provenance only.                                                |
+| `owner`            | Responsible team or person.                         | Provenance only.                                                |
+| `uri`              | Relative path to the adapter file.                  | Yes; must remain under the supplied base directory.             |
+| `integrity_sha256` | SHA-256 of the complete adapter file.               | Yes.                                                            |
+| `base_model_rev`   | Base model revision used for training, or `"none"`. | Yes when running revisions are supplied.                        |
+| `tokenizer_rev`    | Tokenizer revision used for training, or `"none"`.  | Yes when running revisions are supplied.                        |
+| `rank`             | Adapter's LoRA rank.                                | Yes; must equal the parsed adapter rank.                        |
+| `alpha`            | Adapter's LoRA alpha.                               | Yes; compared with `1e-4` tolerance.                            |
+| `target_modules`   | Declared module allow-list.                         | Yes; actual adapter modules must be a subset.                   |
+| `dtype`            | Training/save dtype label.                          | Provenance only; tensor parsing validates real data separately. |
+| `status`           | `approved`, `quarantined`, or `revoked`.            | Yes; only `approved` is allowed.                                |
 
 For example:
 

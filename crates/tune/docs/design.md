@@ -57,14 +57,14 @@ invoke a teacher or an embedding service.
 
 ## Module ownership and hand-offs
 
-| Module | Owns | Receives | Produces | Guide |
-| --- | --- | --- | --- | --- |
-| `data` | `TrainingExample`, labels, metadata, in-memory datasets, batches | Embeddings and labels from a caller | Filtered datasets and cloned batches | [data.md](data.md) |
-| `distill` | Teacher configuration, endpoint policy, raw prompt handling, labeling result accounting | Raw conversational text | Results; training examples only after caller supplies embeddings | [distill.md](distill.md) |
-| `train` | Generic training config, loop state, callbacks, checkpointing, and optional GPU surface | `Dataset` batches | Metrics, checkpoints, and trained model state | [train.md](train.md) |
-| `lora` | Low-rank adapter representation, application, persistence, online/router work, and optional backward utilities | Base-projection context and adapter inputs | Adapter weights or inference-time deltas | [lora-core.md](lora-core.md), [lora-router.md](lora-router.md), [lora-io.md](lora-io.md) |
-| `registry` | Registered model records, storage/query interfaces, live swaps, shadow evaluation, and rollback | Model metadata and weight artifacts | Versioned, deployable model records | [registry.md](registry.md) |
-| `error` | `TuneError` and `Result` | Failures from every subsystem | A common, domain-specific error vocabulary | This page |
+| Module     | Owns                                                                                                           | Receives                                   | Produces                                                         | Guide                                                                                    |
+| ---------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------ | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `data`     | `TrainingExample`, labels, metadata, in-memory datasets, batches                                               | Embeddings and labels from a caller        | Filtered datasets and cloned batches                             | [data.md](data.md)                                                                       |
+| `distill`  | Teacher configuration, endpoint policy, raw prompt handling, labeling result accounting                        | Raw conversational text                    | Results; training examples only after caller supplies embeddings | [distill.md](distill.md)                                                                 |
+| `train`    | Generic training config, loop state, callbacks, checkpointing, and optional GPU surface                        | `Dataset` batches                          | Metrics, checkpoints, and trained model state                    | [train.md](train.md)                                                                     |
+| `lora`     | Low-rank adapter representation, application, persistence, online/router work, and optional backward utilities | Base-projection context and adapter inputs | Adapter weights or inference-time deltas                         | [lora-core.md](lora-core.md), [lora-router.md](lora-router.md), [lora-io.md](lora-io.md) |
+| `registry` | Registered model records, storage/query interfaces, live swaps, shadow evaluation, and rollback                | Model metadata and weight artifacts        | Versioned, deployable model records                              | [registry.md](registry.md)                                                               |
+| `error`    | `TuneError` and `Result`                                                                                       | Failures from every subsystem              | A common, domain-specific error vocabulary                       | This page                                                                                |
 
 Each subsystem has a deliberately small data boundary:
 
@@ -181,17 +181,17 @@ crate is optional and only enters through feature-gated adapter injection or
 backward training. That direction matters: training may consume inference
 capabilities, while inference remains usable without `lattice-tune`.
 
-| Feature | Adds or enables | Boundary it affects |
-| --- | --- | --- |
-| `std` | Standard-library support; enabled by default | Base crate |
-| `serde` | Serialization derives and JSON support | Data, config, checkpoints, metadata |
-| `safetensors` | Safe adapter/artifact serialization support | LoRA I/O |
-| `sqlite` | SQLite-backed registry storage; enabled by default | Registry |
-| `gpu` | WGPU-backed GPU training surface | Train |
-| `gpu-tests` | Hardware-dependent GPU tests | Train testing |
-| `inference-hook` | `LoraHook` implementation for `LoraAdapter` | LoRA → inference bridge |
-| `train-backward` | Inference backward/f16 support plus safetensors and serde | Exact-gradient LoRA binaries |
-| `mixture` | Experimental online adapter-selector refit | LoRA routing |
+| Feature          | Adds or enables                                           | Boundary it affects                 |
+| ---------------- | --------------------------------------------------------- | ----------------------------------- |
+| `std`            | Standard-library support; enabled by default              | Base crate                          |
+| `serde`          | Serialization derives and JSON support                    | Data, config, checkpoints, metadata |
+| `safetensors`    | Safe adapter/artifact serialization support               | LoRA I/O                            |
+| `sqlite`         | SQLite-backed registry storage; enabled by default        | Registry                            |
+| `gpu`            | WGPU-backed GPU training surface                          | Train                               |
+| `gpu-tests`      | Hardware-dependent GPU tests                              | Train testing                       |
+| `inference-hook` | `LoraHook` implementation for `LoraAdapter`               | LoRA → inference bridge             |
+| `train-backward` | Inference backward/f16 support plus safetensors and serde | Exact-gradient LoRA binaries        |
+| `mixture`        | Experimental online adapter-selector refit                | LoRA routing                        |
 
 Feature gates select integrations; they do not erase the ownership
 boundaries above. For example, enabling `safetensors` enables an artifact
@@ -204,14 +204,14 @@ Every public subsystem can return the crate alias
 `Result<T> = std::result::Result<T, TuneError>`. `TuneError` keeps failures
 classified by the boundary that detected them:
 
-| Family | Examples |
-| --- | --- |
-| Data | Dataset errors, missing examples, invalid batches, dimensions |
-| Teacher | Provider failures and request timeouts |
-| Training | Training errors and non-convergence |
-| Configuration and validation | Invalid configuration or user/input validation |
-| Registry and storage | Missing/duplicate models and backing storage failures |
-| Artifact integrity | Serialization, I/O, weight checksum, and memory-budget failures |
+| Family                       | Examples                                                        |
+| ---------------------------- | --------------------------------------------------------------- |
+| Data                         | Dataset errors, missing examples, invalid batches, dimensions   |
+| Teacher                      | Provider failures and request timeouts                          |
+| Training                     | Training errors and non-convergence                             |
+| Configuration and validation | Invalid configuration or user/input validation                  |
+| Registry and storage         | Missing/duplicate models and backing storage failures           |
+| Artifact integrity           | Serialization, I/O, weight checksum, and memory-budget failures |
 
 Callers should add context while preserving the variant whenever possible.
 This lets a UI or orchestration layer distinguish an invalid local data record

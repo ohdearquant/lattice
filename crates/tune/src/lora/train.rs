@@ -20,17 +20,17 @@ use crate::lora::{AdamState, LoraAdapter, LoraConfig, LoraLayer};
 
 /// Upper bound on LoRA rank accepted by [`train_micro_lora`].
 /// Limits caller-controlled buffer-size products.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the safety-bound rationale.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) for the safety-bound rationale.
 const MAX_LORA_RANK: usize = 512;
 
 /// Upper bound on training steps accepted by [`train_micro_lora`].
 /// Limits unbounded caller-controlled work.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the safety-bound rationale.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) for the safety-bound rationale.
 const MAX_TRAIN_STEPS: usize = 100_000;
 
 /// Upper bound on `max_seq_len` accepted by [`train_micro_lora`].
 /// Limits tape allocation; the model context window remains authoritative.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the safety-bound rationale.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) for the safety-bound rationale.
 const MAX_TRAIN_SEQ_LEN: usize = 8_192;
 
 /// A single training example: tokenized text plus the index at which the
@@ -75,7 +75,7 @@ impl Default for MicroLoraConfig {
 
 /// Validate `train_micro_lora` inputs before model access or allocation.
 /// Returns the first [`TuneError::Validation`] failure.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the preflight boundary.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) for the preflight boundary.
 pub(crate) fn validate_micro_lora_inputs(
     vocab_size: usize,
     num_hidden_layers: usize,
@@ -170,7 +170,7 @@ pub(crate) fn validate_micro_lora_inputs(
 /// Train GQA `q_proj` and `v_proj` LoRA weights with exact CPU gradients.
 /// GDN layers in the selected suffix remain frozen but propagate gradients.
 /// Returns validation errors for invalid data, incompatible models, or unsafe sizes.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) (§train_micro_lora) for the tape, limits, and implementation rationale.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) for the tape, limits, and implementation rationale.
 pub fn train_micro_lora(
     model: &Qwen35Model,
     pairs: &[TrainingPair],

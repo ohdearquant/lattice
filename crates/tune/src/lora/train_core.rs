@@ -139,7 +139,7 @@ pub type Grads = LoraParams;
 
 /// Parameters or gradients for the five GDN LoRA projections.
 /// Its fields mirror inference's `GdnGrads` for direct gradient transfer.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#gdnloraparams) (§GdnLoraParams) for all shapes and the value-head invariant.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#gdnloraparams) for all shapes and the value-head invariant.
 #[derive(Clone)]
 pub struct GdnLoraParams {
     pub a_qkv: Vec<f32>,
@@ -157,7 +157,7 @@ pub struct GdnLoraParams {
 impl GdnLoraParams {
     /// Build GDN LoRA arrays from checked shapes and caller-provided fillers.
     /// `zeros` delegates here so every initializer shares the same dimensions.
-    /// See [`docs/lora-core.md`](../../docs/lora-core.md#gdnloraparams) (§GdnLoraParams) for the drift-prevention rationale.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#gdnloraparams) for the drift-prevention rationale.
     pub fn shaped(
         rank: usize,
         hidden: usize,
@@ -265,7 +265,7 @@ pub struct TrainCtx<'a> {
 impl<'a> TrainCtx<'a> {
     /// Construct a context after validating tape geometry, slots, and Adam values.
     /// Derives and stores execution scale from `alpha / rank`.
-    /// See [`docs/lora-core.md`](../../docs/lora-core.md#trainctx-try_new) (§TrainCtx::try_new) for every validation invariant.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#trainctxtry_new) for every validation invariant.
     pub fn try_new(
         geometry: TapeGeometry<'a>,
         rank: usize,
@@ -738,7 +738,7 @@ pub fn eval_chain_nll(
 
 /// Compute reverse-mode NLL and gradients for the assembled tape.
 /// Returns separate GQA and GDN slot gradients; either collection may be empty.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#nll_and_grads) (§nll_and_grads) for reverse-pass ordering.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#nll_and_grads) for reverse-pass ordering.
 pub fn nll_and_grads(
     fwd: &FullFwd,
     layers: &[LayerW<'_>],
@@ -961,7 +961,7 @@ pub fn apply_adam_updates(
 }
 
 /// Apply Adam updates to all ten factor arrays in each GDN LoRA slot.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#nll_and_grads) (§nll_and_grads) for the GDN slot layout.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#nll_and_grads) for the GDN slot layout.
 pub fn apply_gdn_adam_updates(
     adam: &mut AdamState,
     gdn_loras: &mut [GdnLoraParams],

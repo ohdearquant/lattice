@@ -12,13 +12,13 @@ This module is available only with the `mixture` feature.
 
 `update_router` operates on four persistent inputs plus a feedback batch:
 
-| Input | Role | Mutated by refit? |
-| --- | --- | --- |
-| `gate_bytes` | Current FANN gate, serialized by `Network::to_bytes()` | No; decoded into a working gate |
-| `events` | Non-empty current feedback batch | No |
-| `ReplayBuffer` | Bounded FIFO history of known-good routes | Yes |
-| `DiagonalFisher` | Per-parameter importance EMA and parameter anchor | Yes |
-| `RouterUpdateConfig` | RLOO, replay, and EWC settings | No |
+| Input                | Role                                                   | Mutated by refit?               |
+| -------------------- | ------------------------------------------------------ | ------------------------------- |
+| `gate_bytes`         | Current FANN gate, serialized by `Network::to_bytes()` | No; decoded into a working gate |
+| `events`             | Non-empty current feedback batch                       | No                              |
+| `ReplayBuffer`       | Bounded FIFO history of known-good routes              | Yes                             |
+| `DiagonalFisher`     | Per-parameter importance EMA and parameter anchor      | Yes                             |
+| `RouterUpdateConfig` | RLOO, replay, and EWC settings                         | No                              |
 
 The returned `RouterDelta::network_bytes` is a full `Network::to_bytes()`
 payload, not a parameter diff. It can be passed back as `gate_bytes` to a later
@@ -36,12 +36,12 @@ decision than the one being judged.
 
 `PreferenceSignal` maps to a fixed signed reward:
 
-| Signal | Reward | Meaning for the named adapter |
-| --- | ---: | --- |
-| `Positive` | `+1.0` | Strong evidence it should be selected |
-| `ImplicitPositive` | `+0.5` | Weak evidence it should be selected |
-| `ImplicitNegative` | `-0.5` | Weak evidence it should be selected less often |
-| `Negative` | `-1.0` | Strong evidence it should be selected less often |
+| Signal             | Reward | Meaning for the named adapter                    |
+| ------------------ | -----: | ------------------------------------------------ |
+| `Positive`         | `+1.0` | Strong evidence it should be selected            |
+| `ImplicitPositive` | `+0.5` | Weak evidence it should be selected              |
+| `ImplicitNegative` | `-0.5` | Weak evidence it should be selected less often   |
+| `Negative`         | `-1.0` | Strong evidence it should be selected less often |
 
 The reward sign is the only polarity mechanism. Every event calls
 `RlooTrainer::step(gate, context, action_idx, reward)`; there is no separate
@@ -66,14 +66,14 @@ be zero to disable their respective auxiliary term.
 
 `RouterUpdateConfig::default()` is intended as a conservative starting point:
 
-| Setting | Default | Accepted values | Effect |
-| --- | ---: | --- | --- |
-| `learning_rate` | `1e-3` | Finite and `> 0` | SGD step magnitude |
-| `aux_loss_coeff` | `0.01` | Finite and `>= 0` | Load-balancing penalty weight |
-| `z_loss_coeff` | `0.001` | Finite and `>= 0` | Logit-growth penalty weight |
-| `epochs` | `5` | Integer `> 0` | Complete passes over new plus sampled replay data |
-| `ewc_lambda` | `0.1` | Finite and `>= 0` | Reserved anchor-penalty coefficient; inactive in v1 |
-| `replay_mix_fraction` | `0.5` | Finite in `[0, 1]` | Fraction of stored replay entries sampled per refit |
+| Setting               | Default | Accepted values    | Effect                                              |
+| --------------------- | ------: | ------------------ | --------------------------------------------------- |
+| `learning_rate`       |  `1e-3` | Finite and `> 0`   | SGD step magnitude                                  |
+| `aux_loss_coeff`      |  `0.01` | Finite and `>= 0`  | Load-balancing penalty weight                       |
+| `z_loss_coeff`        | `0.001` | Finite and `>= 0`  | Logit-growth penalty weight                         |
+| `epochs`              |     `5` | Integer `> 0`      | Complete passes over new plus sampled replay data   |
+| `ewc_lambda`          |   `0.1` | Finite and `>= 0`  | Reserved anchor-penalty coefficient; inactive in v1 |
+| `replay_mix_fraction` |   `0.5` | Finite in `[0, 1]` | Fraction of stored replay entries sampled per refit |
 
 The replay fraction is converted to a count with `ceil`, so any positive
 fraction selects at least one entry when the buffer is non-empty. A fraction of
@@ -172,18 +172,18 @@ the metric calculation.
 All of the following reject the call with `TuneError::Validation` before the
 training loop begins:
 
-| Value | Required condition |
-| --- | --- |
-| `events` | Non-empty |
-| Event context | Exactly the gate input length; every value finite |
-| Event adapter index | Less than the gate output count |
-| `learning_rate` | Finite and `> 0` |
-| `aux_loss_coeff`, `z_loss_coeff`, `ewc_lambda` | Finite and `>= 0` |
-| `replay_mix_fraction` | Finite and in `[0, 1]` |
-| `epochs` | Greater than zero |
-| Fisher decay | Finite and strictly in `(0, 1)` |
-| Empty Fisher | Auto-initialized to the gate parameter count |
-| Non-empty Fisher | Importance and anchor lengths equal parameter count; importance entries finite and non-negative; anchor entries finite |
+| Value                                          | Required condition                                                                                                     |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `events`                                       | Non-empty                                                                                                              |
+| Event context                                  | Exactly the gate input length; every value finite                                                                      |
+| Event adapter index                            | Less than the gate output count                                                                                        |
+| `learning_rate`                                | Finite and `> 0`                                                                                                       |
+| `aux_loss_coeff`, `z_loss_coeff`, `ewc_lambda` | Finite and `>= 0`                                                                                                      |
+| `replay_mix_fraction`                          | Finite and in `[0, 1]`                                                                                                 |
+| `epochs`                                       | Greater than zero                                                                                                      |
+| Fisher decay                                   | Finite and strictly in `(0, 1)`                                                                                        |
+| Empty Fisher                                   | Auto-initialized to the gate parameter count                                                                           |
+| Non-empty Fisher                               | Importance and anchor lengths equal parameter count; importance entries finite and non-negative; anchor entries finite |
 
 Gate deserialization, RLOO stepping, Fisher observation, and anchor updates
 that fail are surfaced as `TuneError::Training`. The validation boundary is

@@ -110,7 +110,7 @@ pub struct RouterUpdateConfig {
     pub epochs: usize,
     /// EWC++ Fisher regularisation strength.
     /// Reserved for the inactive anchor-penalty path; v1 uses Fisher projection instead.
-    /// See `docs/lora-router.md` (§RouterUpdateConfig::ewc_lambda) for the phase boundary.
+    /// See [`docs/lora-router.md`](../../docs/lora-router.md#routerupdateconfigewc_lambda) for the phase boundary.
     pub ewc_lambda: f32,
     /// Fraction of the replay buffer to include in each refit epoch.
     ///
@@ -155,7 +155,7 @@ pub struct RouterDelta {
 
 /// Bounded FIFO of positive `(context_vector, adapter index)` feedback.
 /// Refit replays its entries with reward `+1.0` and evicts the oldest at capacity.
-/// See `docs/lora-router.md` (§ReplayBuffer) for replay-polarity rationale.
+/// See [`docs/lora-router.md`](../../docs/lora-router.md#replaybuffer) for replay-polarity rationale.
 #[derive(Clone, Debug, Default)]
 pub struct ReplayBuffer {
     inner: VecDeque<ReplayEntry>,
@@ -237,7 +237,7 @@ struct ReplayEntry {
 /// Refit a serialized adapter-selector gate from a non-empty feedback batch.
 /// Updates `replay` and `fisher` in place, then returns complete replacement gate bytes.
 /// Returns validation errors for invalid input/state and training errors for gate or Fisher failures.
-/// See `docs/lora-router.md` (§update_router) for the refit algorithm and invariants.
+/// See [`docs/lora-router.md`](../../docs/lora-router.md#update_router) for the refit algorithm and invariants.
 pub fn update_router(
     gate_bytes: &[u8],
     events: &[FeedbackEvent],

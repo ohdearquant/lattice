@@ -12,7 +12,7 @@ use super::LoraAdapter;
 use crate::error::TuneError;
 
 /// Stateful Adam/AdamW moments and per-tensor bias-correction counts.
-/// See [`docs/lora-core.md`](../../docs/lora-core.md#adamstate-step) (§AdamState::step) for the timestep invariant.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#adamstatestep) for the timestep invariant.
 pub struct AdamState {
     /// First moment estimates (exponential moving average of gradients).
     m: HashMap<String, Vec<f32>>,
@@ -39,7 +39,7 @@ impl AdamState {
     /// # Panics
     ///
     /// Panics when `params` and `grads` have different lengths.
-    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adamstate-step) (§AdamState::step) for the update and per-key timestep policy.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adamstatestep) for the update and per-key timestep policy.
     #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,

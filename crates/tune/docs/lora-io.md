@@ -18,10 +18,10 @@ output += (alpha / rank) * B @ (A @ input)
 
 The in-memory `LoraLayer` stores both matrices as row-major `f32` values:
 
-| Factor | Shape | Purpose |
-| --- | --- | --- |
-| A | `(rank, d_in)` | Projects the base input down to the low-rank space |
-| B | `(d_out, rank)` | Projects low-rank values up to the base output dimension |
+| Factor | Shape           | Purpose                                                  |
+| ------ | --------------- | -------------------------------------------------------- |
+| A      | `(rank, d_in)`  | Projects the base input down to the low-rank space       |
+| B      | `(d_out, rank)` | Projects low-rank values up to the base output dimension |
 
 Each pair is identified by `(layer_idx, module)`, where `layer_idx` is
 zero-based and `module` is the final key segment such as `q_proj`, `v_proj`,
@@ -36,11 +36,11 @@ The parser recognizes PEFT uppercase suffixes and MLX lowercase suffixes. It
 does not require one fixed leading prefix: it finds the `.layers.{index}.`
 segment and uses the final preceding key component as the module name.
 
-| Producer | A key | B key | Stored shape before normalization |
-| --- | --- | --- | --- |
-| PEFT | `...layers.{i}.self_attn.{module}.lora_A.weight` | `...layers.{i}.self_attn.{module}.lora_B.weight` | A `(rank, d_in)`, B `(d_out, rank)` |
-| PEFT MLP | `...layers.{i}.mlp.{module}.lora_A.weight` | `...layers.{i}.mlp.{module}.lora_B.weight` | A `(rank, d_in)`, B `(d_out, rank)` |
-| MLX | `...layers.{i}.{block}.{module}.lora_a` | `...layers.{i}.{block}.{module}.lora_b` | A `(d_in, rank)`, B `(rank, d_out)` |
+| Producer | A key                                            | B key                                            | Stored shape before normalization   |
+| -------- | ------------------------------------------------ | ------------------------------------------------ | ----------------------------------- |
+| PEFT     | `...layers.{i}.self_attn.{module}.lora_A.weight` | `...layers.{i}.self_attn.{module}.lora_B.weight` | A `(rank, d_in)`, B `(d_out, rank)` |
+| PEFT MLP | `...layers.{i}.mlp.{module}.lora_A.weight`       | `...layers.{i}.mlp.{module}.lora_B.weight`       | A `(rank, d_in)`, B `(d_out, rank)` |
+| MLX      | `...layers.{i}.{block}.{module}.lora_a`          | `...layers.{i}.{block}.{module}.lora_b`          | A `(d_in, rank)`, B `(rank, d_out)` |
 
 The trailing `.weight` is optional. Non-LoRA tensors and keys that do not fit
 this grammar are ignored; a file with no recognized `lora_A` or `lora_B`
@@ -87,10 +87,10 @@ dimension against the active model configuration.
 The writer serializes F32 factor tensors and includes these normal adapter
 metadata entries in the safetensors header:
 
-| Key | Value |
-| --- | --- |
-| `rank` | `LoraConfig::rank` as text |
-| `alpha` | `LoraConfig::alpha` as text |
+| Key              | Value                           |
+| ---------------- | ------------------------------- |
+| `rank`           | `LoraConfig::rank` as text      |
+| `alpha`          | `LoraConfig::alpha` as text     |
 | `target_modules` | Comma-joined target-module list |
 
 The loader uses `alpha` if it is present. It must parse as a finite `f32`.
@@ -158,18 +158,18 @@ read first. The per-entry status check is repeated as defense in depth.
 
 For each approved entry, these checks run in order:
 
-| Check | Requirement |
-| ---: | --- |
-| 1 | Status is `Approved`. |
-| 2 | `uri` is relative, contains no `..` component, canonicalizes successfully, and its canonical target remains under the canonical base directory. This rejects absolute paths and symlink escapes. |
-| 3–4 | The proven in-base file can be read under the 10 GiB cap, and the SHA-256 of those exact bytes equals `integrity_sha256`. Existence is folded into this guarded read to avoid a separate check/open race. |
-| 5 | The bytes parse as a complete PEFT or normalized MLX LoRA adapter. |
-| 6 | Parsed rank equals manifest `rank`. |
-| 7 | Parsed alpha and manifest alpha are finite and differ by at most `1e-4`. If the file omits alpha, its synthesized `rank` value is still compared. |
-| 8 | Every parsed target module is listed in manifest `target_modules`; the parser's set must be a subset of the manifest declaration. |
-| 9 | When `inference-hook` is active and a model configuration is supplied, the adapter dimensions and layer indices validate against that model. |
-| 10 | If a safetensors header has `adapter_id`, it equals the manifest `id`. |
-| 11 | When running revisions are supplied, both base-model and tokenizer revisions exactly match unless the caller explicitly allows a mismatch. |
+| Check | Requirement                                                                                                                                                                                               |
+| ----: | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+|     1 | Status is `Approved`.                                                                                                                                                                                     |
+|     2 | `uri` is relative, contains no `..` component, canonicalizes successfully, and its canonical target remains under the canonical base directory. This rejects absolute paths and symlink escapes.          |
+|   3–4 | The proven in-base file can be read under the 10 GiB cap, and the SHA-256 of those exact bytes equals `integrity_sha256`. Existence is folded into this guarded read to avoid a separate check/open race. |
+|     5 | The bytes parse as a complete PEFT or normalized MLX LoRA adapter.                                                                                                                                        |
+|     6 | Parsed rank equals manifest `rank`.                                                                                                                                                                       |
+|     7 | Parsed alpha and manifest alpha are finite and differ by at most `1e-4`. If the file omits alpha, its synthesized `rank` value is still compared.                                                         |
+|     8 | Every parsed target module is listed in manifest `target_modules`; the parser's set must be a subset of the manifest declaration.                                                                         |
+|     9 | When `inference-hook` is active and a model configuration is supplied, the adapter dimensions and layer indices validate against that model.                                                              |
+|    10 | If a safetensors header has `adapter_id`, it equals the manifest `id`.                                                                                                                                    |
+|    11 | When running revisions are supplied, both base-model and tokenizer revisions exactly match unless the caller explicitly allows a mismatch.                                                                |
 
 Canonicalization is a proof step, not a convenience. A target that cannot be
 canonicalized is refused rather than read lexically, because the loader has not
