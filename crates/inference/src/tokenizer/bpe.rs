@@ -467,18 +467,19 @@ impl BpeTokenizer {
         self.inner.special_tokens.get(name).copied()
     }
 
-    /// **Unstable**: return the byte representation of every token in the vocabulary.
+    /// **Unstable**: return the byte representation of every model token ID.
     ///
-    /// `vocab_bytes()[i]` is the UTF-8 byte sequence that token `i` decodes to,
-    /// after applying the GPT-2 byte-level encoding reversal.
-    /// The table includes added-token IDs; skipped control-token slots are empty.
+    /// `vocab_bytes(vocab_size)?[i]` is the byte sequence that token `i` decodes
+    /// to. Base BPE entries use GPT-2 byte-level reversal; renderable added tokens
+    /// use their literal UTF-8 bytes. Unknown and skipped control-token slots are
+    /// empty so grammar masking fails closed across the model's full logit space.
     ///
     /// Used by [`GrammarEngine::new`](crate::grammar::GrammarEngine::new) to build
     /// the precomputed vocabulary partition for grammar-constrained decoding (ADR-046).
     ///
     /// Cost: O(vocab_size) — called once at engine initialisation.
-    pub fn vocab_bytes(&self) -> Vec<Vec<u8>> {
-        let max_added_id = self
+    pub fn vocab_bytes(&self, vocab_size: usize) -> Result<Vec<Vec<u8>>, InferenceError> {
+        let required_vocab_size = self
             .inner
             .special_tokens
             .values()
@@ -486,14 +487,51 @@ impl BpeTokenizer {
             .copied()
             .max()
             .map_or(0usize, |id| id as usize + 1);
-        let model_vocab_size = self.inner.id_to_token.len().max(max_added_id);
-        (0..model_vocab_size)
-            .map(|id| {
-                self.token_for_id(id as u32)
-                    .map(byte_decode_token_bytes)
-                    .unwrap_or_default()
-            })
-            .collect()
+        let required_vocab_size = self.inner.id_to_token.len().max(required_vocab_size);
+        if vocab_size < required_vocab_size {
+            return Err(InferenceError::Tokenizer(format!(
+                "model vocabulary size {vocab_size} cannot represent tokenizer token ID {}",
+                required_vocab_size - 1
+            )));
+        }
+
+        let byte_decoder = byte_decoder();
+        let mut vocab_bytes = Vec::with_capacity(vocab_size);
+        for id in 0..vocab_size {
+            let mut bytes = Vec::new();
+            self.append_token_bytes(id as u32, &byte_decoder, &mut bytes);
+            vocab_bytes.push(bytes);
+        }
+        Ok(vocab_bytes)
+    }
+
+    /// **Unstable**: resolve one token ID to the exact bytes it emits.
+    ///
+    /// Base BPE entries are GPT-2 byte-decoded. Added tokens with `special=false`
+    /// are returned as literal UTF-8, while unknown and skipped special IDs return
+    /// `None`.
+    pub fn token_bytes_for_id(&self, id: u32) -> Option<Vec<u8>> {
+        let byte_decoder = byte_decoder();
+        let mut bytes = Vec::new();
+        self.append_token_bytes(id, &byte_decoder, &mut bytes)
+            .then_some(bytes)
+    }
+
+    pub(crate) fn append_token_bytes(
+        &self,
+        id: u32,
+        byte_decoder: &HashMap<char, u8>,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        if let Some(content) = self.inner.added_render.get(&id) {
+            out.extend_from_slice(content.as_bytes());
+            return true;
+        }
+        let Some(token_str) = self.inner.id_to_token.get(id as usize) else {
+            return false;
+        };
+        append_byte_decoded_token_bytes(token_str, byte_decoder, out);
+        true
     }
 
     fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
@@ -769,8 +807,12 @@ impl Tokenizer for BpeTokenizer {
     }
 
     fn decode(&self, ids: &[u32]) -> Option<String> {
-        let encoded: String = ids.iter().filter_map(|&id| self.token_for_id(id)).collect();
-        Some(byte_decode_token(&encoded))
+        let byte_decoder = byte_decoder();
+        let mut bytes = Vec::new();
+        for &id in ids {
+            self.append_token_bytes(id, &byte_decoder, &mut bytes);
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     fn vocab_size(&self) -> usize {
@@ -868,15 +910,30 @@ fn bytes_to_unicode() -> Vec<char> {
 /// text). Used by the `logprobs`/`top_logprobs` response `bytes` field
 /// (#585), where callers reconstruct the original output byte-for-byte.
 pub fn byte_decode_token_bytes(token_str: &str) -> Vec<u8> {
-    let table = bytes_to_unicode();
-    let mut decoder = std::collections::HashMap::new();
-    for (byte_val, &ch) in table.iter().enumerate() {
-        decoder.insert(ch, byte_val as u8);
-    }
-    token_str
-        .chars()
-        .filter_map(|ch| decoder.get(&ch).copied())
+    let decoder = byte_decoder();
+    let mut bytes = Vec::new();
+    append_byte_decoded_token_bytes(token_str, &decoder, &mut bytes);
+    bytes
+}
+
+fn byte_decoder() -> HashMap<char, u8> {
+    bytes_to_unicode()
+        .into_iter()
+        .enumerate()
+        .map(|(byte, ch)| (ch, byte as u8))
         .collect()
+}
+
+fn append_byte_decoded_token_bytes(
+    token_str: &str,
+    byte_decoder: &HashMap<char, u8>,
+    out: &mut Vec<u8>,
+) {
+    out.extend(
+        token_str
+            .chars()
+            .filter_map(|ch| byte_decoder.get(&ch).copied()),
+    );
 }
 
 /// **Unstable**: byte-decode helper; encoding table and fallback behavior may change.
@@ -1517,7 +1574,7 @@ mod tests {
         vocab.insert(byte_encoder[0xA5].to_string(), 1);
         vocab.insert(byte_encoder[0xBD].to_string(), 2);
         let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new()).unwrap();
-        let vocab_bytes = tokenizer.vocab_bytes();
+        let vocab_bytes = tokenizer.vocab_bytes(3).unwrap();
         assert_eq!(vocab_bytes, vec![vec![0xE5], vec![0xA5], vec![0xBD]]);
 
         let spec = GrammarSpec::Gbnf("root ::= \"好\"\n".to_string());
@@ -1546,7 +1603,7 @@ mod tests {
             ]
         }"#;
         let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
-        let vocab_bytes = tokenizer.vocab_bytes();
+        let vocab_bytes = tokenizer.vocab_bytes(101).unwrap();
         assert_eq!(vocab_bytes.len(), 101);
         assert!(vocab_bytes[99].is_empty());
         assert_eq!(vocab_bytes[100], b"<extra>");
@@ -1558,6 +1615,92 @@ mod tests {
         engine.mask_logits(&mut state, &mut logits);
         assert_eq!(logits[99], f32::NEG_INFINITY);
         assert_eq!(logits[100], f32::NEG_INFINITY);
+    }
+
+    fn non_ascii_added_tokenizer() -> BpeTokenizer {
+        let json = r#"{
+            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "added_tokens":[
+                {"id":100,"content":"好","special":false},
+                {"id":101,"content":"café","special":false}
+            ]
+        }"#;
+        BpeTokenizer::from_tokenizer_json_str(json).unwrap()
+    }
+
+    #[test]
+    fn grammar_vocab_fail_closes_qwen_reserved_tail() {
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use crate::model::qwen35_config::Qwen35Config;
+
+        let json = r#"{
+            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
+            "added_tokens":[
+                {"id":248069,"content":"<control>","special":true}
+            ]
+        }"#;
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(json).unwrap();
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let vocab_bytes = tokenizer.vocab_bytes(cfg.vocab_size).unwrap();
+        let table_len = vocab_bytes.len();
+        let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab_bytes).unwrap();
+        let mut state = engine.initial_state();
+        let mut logits = vec![0.0; cfg.vocab_size];
+
+        engine.mask_logits(&mut state, &mut logits);
+
+        assert!(
+            logits[248_070..]
+                .iter()
+                .all(|logit| *logit == f32::NEG_INFINITY),
+            "reserved logits above the tokenizer maximum must be masked"
+        );
+        assert_eq!(table_len, cfg.vocab_size);
+    }
+
+    #[test]
+    fn grammar_vocab_uses_literal_non_ascii_added_token_bytes() {
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+
+        let tokenizer = non_ascii_added_tokenizer();
+        let err = tokenizer.vocab_bytes(101).unwrap_err();
+        assert!(err.to_string().contains("token ID 101"));
+        let vocab_bytes = tokenizer.vocab_bytes(102).unwrap();
+        assert_eq!(vocab_bytes[100], "好".as_bytes());
+        assert_eq!(vocab_bytes[101], "café".as_bytes());
+
+        let spec = GrammarSpec::Gbnf("root ::= \"好\" | \"café\"\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab_bytes).unwrap();
+        let mut state = engine.initial_state();
+        let mut logits = vec![0.0; 102];
+        engine.mask_logits(&mut state, &mut logits);
+        assert!(logits[100].is_finite());
+        assert!(logits[101].is_finite());
+    }
+
+    #[test]
+    fn decode_and_incremental_detokenize_render_non_ascii_added_tokens() {
+        use crate::model::qwen35::detokenize::IncrementalDetokenizer;
+
+        let tokenizer = non_ascii_added_tokenizer();
+        assert_eq!(
+            tokenizer.token_bytes_for_id(100).as_deref(),
+            Some("好".as_bytes())
+        );
+        assert_eq!(
+            tokenizer.token_bytes_for_id(101).as_deref(),
+            Some("café".as_bytes())
+        );
+        assert_eq!(tokenizer.decode(&[100, 101]), Some("好café".to_string()));
+
+        let mut detok = IncrementalDetokenizer::new();
+        let mut text = String::new();
+        for id in [100, 101] {
+            text.push_str(&detok.push(&tokenizer, id));
+        }
+        text.push_str(&detok.finish());
+        assert_eq!(text, "好café");
     }
 
     #[test]
@@ -1620,7 +1763,7 @@ mod tests {
         // ids and special flags from the shipped qwen tokenizer.json (verified identical
         // on both qwen3.5-0.8b and qwen3.6-27b): `<think>`=248068, `</think>`=248069 are
         // special=false and live FAR above the base vocab max (248043). This exercises
-        // the full wiring parse_rendered_added_tokens → added_render → token_for_id →
+        // the full wiring parse_rendered_added_tokens → added_render → append_token_bytes →
         // decode; a token-level parity gate (e2e-parity compares token IDS) is BLIND to
         // this class because the ids matched while the rendered text dropped the tag.
         let json = r#"{

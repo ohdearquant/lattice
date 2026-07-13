@@ -22,14 +22,7 @@ fn append_token_bytes(
     byte_decoder: &HashMap<char, u8>,
     out: &mut Vec<u8>,
 ) {
-    if let Some(token_str) = tokenizer.token_for_id(id) {
-        for ch in token_str.chars() {
-            if let Some(&b) = byte_decoder.get(&ch) {
-                out.push(b);
-            }
-            // Skip characters not in byte_decoder (e.g., special tokens)
-        }
-    }
+    tokenizer.append_token_bytes(id, byte_decoder, out);
 }
 
 /// Decode token IDs back to text using the BPE tokenizer's reverse lookup.

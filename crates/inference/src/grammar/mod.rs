@@ -26,7 +26,7 @@
 //! use lattice_inference::generate::GenerateConfig;
 //!
 //! let spec = GrammarSpec::json_schema_str(r#"{"type":"object","properties":{"name":{"type":"string"}}}"#)?;
-//! let vocab_bytes: Vec<Vec<u8>> = tokenizer.vocab_bytes();
+//! let vocab_bytes: Vec<Vec<u8>> = tokenizer.vocab_bytes(model.config().vocab_size)?;
 //! let engine = Arc::new(GrammarEngine::new(&spec, vocab_bytes)?);
 //!
 //! let config = GenerateConfig {
