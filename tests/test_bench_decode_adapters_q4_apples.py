@@ -279,6 +279,55 @@ class LatticeAdapterQ4IdentityOSErrorTest(unittest.TestCase):
             self.assertIn("could not inspect", str(ctx.exception))
 
 
+class LatticeIsDirPreflightOSErrorTest(unittest.TestCase):
+    """codex round-2 finding (medium): Python 3.11's `Path.is_dir()`
+    propagates `OSError` subclasses like `PermissionError` rather than
+    swallowing them, so the `is_dir()` preflight in `run()` and the
+    `is_dir()` check in `lattice_available()` must both fail closed
+    instead of letting a raw `PermissionError` escape past the typed
+    `LatticeUnavailableError` boundary."""
+
+    def test_run_fails_closed_when_is_dir_raises_permission_error(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp) / "q4model"
+            model_dir.mkdir()
+            (model_dir / "weights.q4").write_bytes(b"stub")
+            adapter = adapters.LatticeAdapter(
+                bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+            )
+
+            def _raise_permission(self):
+                raise PermissionError(f"[Errno 13] Permission denied: '{self}'")
+
+            with mock.patch.object(Path, "is_dir", _raise_permission), self.assertRaises(
+                adapters.LatticeUnavailableError
+            ) as ctx:
+                adapter.run(prompt="hi", n_tokens=32, warmup=False, model="m", quantization="q4")
+            self.assertIn("could not stat", str(ctx.exception))
+
+    def test_lattice_available_returns_false_when_is_dir_raises_permission_error(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = Path(tmp) / "bin_stub"
+            bin_path.write_bytes(b"#!/bin/sh\n")
+            bin_path.chmod(0o755)
+            model_dir = Path(tmp) / "q4model"
+            model_dir.mkdir()
+
+            def _raise_permission(self):
+                raise PermissionError(f"[Errno 13] Permission denied: '{self}'")
+
+            with mock.patch.object(Path, "is_dir", _raise_permission):
+                self.assertFalse(
+                    adapters.lattice_available(bin_path=bin_path, model_dir=model_dir)
+                )
+
+
 class LatticeResultParsingTest(unittest.TestCase):
     def test_parses_result_line(self):
         self.assertEqual(

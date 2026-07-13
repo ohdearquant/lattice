@@ -19,8 +19,10 @@ independently wall-clock-timed by the harness), so each `elapsed_ns` here
 additionally includes one subprocess spawn + model load that the legacy
 script's own `BENCH_RUNS=$RUNS` single-process loop never paid per
 observation. The engine's own decode-only `total_ms` is preserved
-losslessly via `AdapterRunResult.native_ns` (the harness's "native tok/s"
-diagnostic column).
+losslessly via `AdapterRunResult.native_ns`, which the harness treats as
+the primary aggregated duration (`engine_native_ns`) when present, not
+merely a diagnostic column -- later adapters must not treat this field as
+non-comparable across engines.
 
 Run with (from repo root): `uv run --quiet --with mlx-lm python3
 scripts/bench_decode_adapters_apples_precise.py run --profile apples_precise

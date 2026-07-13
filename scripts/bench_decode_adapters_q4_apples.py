@@ -141,7 +141,13 @@ class LatticeAdapter:
     def run(
         self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
     ) -> harness.AdapterRunResult:
-        if not self.model_dir.is_dir():
+        try:
+            is_dir = self.model_dir.is_dir()
+        except OSError as exc:
+            raise LatticeUnavailableError(
+                f"lattice: could not stat Q4 model dir {self.model_dir}: {exc}"
+            ) from exc
+        if not is_dir:
             raise LatticeUnavailableError(f"lattice: Q4 model dir missing ({self.model_dir})")
         self._assert_q4_identity()
         env = os.environ.copy()
@@ -168,7 +174,12 @@ class LatticeAdapter:
 
 
 def lattice_available(bin_path: Path = LAT_BIN, model_dir: Path = Q4_MODEL_DIR) -> bool:
-    return bin_path.is_file() and os.access(bin_path, os.X_OK) and model_dir.is_dir()
+    if not (bin_path.is_file() and os.access(bin_path, os.X_OK)):
+        return False
+    try:
+        return model_dir.is_dir()
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------

@@ -814,8 +814,10 @@ class AdapterRunResult:
 
     Adapters own invocation and parsing only: they must not choose repeat
     counts, discard samples, or compute verdicts. `native_ns`, when present,
-    is surfaced as a diagnostic field alongside the harness-measured timing,
-    never as a replacement for it.
+    becomes the primary aggregated duration (`engine_native_ns` on the
+    resulting `Observation`, see `_primary_elapsed_seconds`); the
+    harness-measured wall-clock timing is the fallback used only when no
+    native duration was reported.
 
     `actual_model`/`actual_quantization` report the identity the adapter
     actually invoked. They default to `None`, meaning "the requested

@@ -221,10 +221,6 @@ class CallScheduleEquivalenceTest(unittest.TestCase):
         self.assertTrue(all(o.engine == "mlx" for o in result.observations))
 
 
-def math_isfinite_or_nan_ok(value: float) -> bool:
-    return value == value  # NaN != NaN; both finite and NaN are acceptable here
-
-
 class OllamaResponseParsingTest(unittest.TestCase):
     def test_valid_response(self):
         result = adapters.ollama_response_to_result(
