@@ -2,39 +2,18 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 #![allow(clippy::field_reassign_with_default)]
 
-//! Training infrastructure for Lattice neural models: knowledge distillation, dataset
-//! management, the training loop, LoRA adapters, and a model registry with lineage.
+//! Training infrastructure for Lattice neural models.
 //!
-//! The pipeline runs data -> teacher (LLM) -> soft labels -> dataset -> training -> model
-//! -> registry. [`data`] holds training examples and batching, [`distill`] drives knowledge
-//! distillation from teacher models (Claude, GPT, Gemini), [`train`] is the training loop,
-//! optimizer, and checkpointing, and [`registry`] versions, stores, and tracks deployment of
-//! trained models. [`lora`] adapters can be trained here and, via the `inference-hook`
-//! feature, applied directly to a running `lattice-inference` forward pass.
+//! The crate connects data preparation, teacher-label distillation, training,
+//! LoRA adaptation, and versioned model registration. The public modules
+//! retain those boundaries: [`data`], [`distill`], [`train`], [`lora`], and
+//! [`registry`].
 //!
-//! # Quick start
-//!
-//! ```rust
-//! use lattice_tune::data::{TrainingExample, IntentLabels, Dataset, DatasetConfig};
-//!
-//! // Create training examples
-//! let examples = vec![
-//!     TrainingExample::new(
-//!         vec![vec![0.1, 0.2, 0.3]],  // context embeddings
-//!         vec![0.4, 0.5, 0.6],        // message embedding
-//!         IntentLabels::continuation(0.8),
-//!     ),
-//! ];
-//!
-//! // Create a dataset
-//! let dataset = Dataset::from_examples(examples);
-//! let stats = dataset.stats();
-//! println!("Dataset has {} examples", stats.num_examples);
-//! ```
+//! Optional features add serialization, GPU paths, registry storage, LoRA
+//! inference integration, and backward-training support.
 //!
 //! See [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md)
-//! for the distillation, training, and registry walkthroughs, the `inference-hook` bridge in
-//! full, and the `Checkpoint` JSON schema.
+//! for architecture, lifecycle boundaries, and links to the subsystem guides.
 
 #![warn(missing_docs)]
 

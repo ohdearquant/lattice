@@ -1,13 +1,8 @@
-//! Binary-private support shared by `train_grad`, `train_grad_full`, and
-//! `train_grad_layer23` (issue #845): the loader, the CLI arg-lookup
-//! semantics, and the fail-closed TBV (trust-but-verify) check.
+//! Binary-private support shared by the gradient-training executables.
 //!
-//! Deliberately narrow. Each bin keeps its own typed config and usage text —
-//! defaults and supported flags genuinely differ between bins (see the flag
-//! table in issue #845) — so this module holds only the pieces that were
-//! byte-identical across all three: `Sample`/`load_jsonl`, the
-//! `parse_arg`/`parse_flag` lookup semantics (as `ArgView`), the shared
-//! path defaults, and `verify_tbv`.
+//! It owns JSONL sample loading, raw argument lookup, path defaults, and the
+//! fail-closed trust-but-verify comparison. Each binary owns its typed options
+//! and usage contract. See `docs/design.md` for the CLI data and TBV flow.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};

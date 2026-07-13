@@ -1,37 +1,10 @@
-//! LoRA (Low-Rank Adaptation) adapter loading and inference integration.
+//! LoRA adapters, lightweight training helpers, and inference integration.
 //!
-//! This module implements the Rust side of a LoRA fine-tuning pipeline:
-//! **train (Python/PEFT) -> export safetensors -> load in Rust -> apply during inference**.
+//! A layer stores row-major `A: (rank, d_in)` and `B: (d_out, rank)` and adds
+//! `(alpha / rank) * B @ (A @ x)` to a base projection. The adapter constructor
+//! rejects non-finite alpha values; a zero rank has an effective scale of zero.
 //!
-//! LoRA decomposes weight updates into low-rank matrices:
-//! `dW = B @ A` where A is `(rank, d_in)` and B is `(d_out, rank)`.
-//! During inference, the output is modified as:
-//! `output += (alpha / rank) * B @ (A @ x)`
-//!
-//! # Supported target modules
-//!
-//! For Qwen3.5-2B (and similar transformer architectures):
-//! - **Attention**: `q_proj`, `k_proj`, `v_proj`, `o_proj`
-//! - **MLP**: `gate_proj`, `up_proj`, `down_proj`
-//!
-//! For BERT/CrossEncoder models:
-//! - **Attention**: `query`, `key`, `value`, `attn_output`
-//! - **FFN**: `ffn_intermediate`, `ffn_output`
-//!
-//! # Example
-//!
-//! ```ignore
-//! use lattice_tune::lora::LoraAdapter;
-//! use std::path::Path;
-//!
-//! // Load a PEFT-exported adapter
-//! let adapter = LoraAdapter::from_safetensors(Path::new("adapter.safetensors"))?;
-//!
-//! // Apply to a projection output during inference
-//! let x = vec![0.1f32; 2048];         // input activation
-//! let mut output = vec![0.0f32; 2048]; // base projection output
-//! adapter.apply(5, "q_proj", &x, &mut output);
-//! ```
+//! See `docs/lora-core.md` for the training, blending, and manifest design.
 
 mod apply;
 pub mod blend;

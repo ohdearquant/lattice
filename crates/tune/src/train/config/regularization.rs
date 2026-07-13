@@ -1,4 +1,7 @@
-//! Regularization configuration
+//! Regularization settings and gradient-norm clipping.
+//!
+//! Values are validated before training; clipping rescales an over-limit vector
+//! uniformly and preserves its direction. See `docs/train.md` for usage details.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -44,29 +47,11 @@ impl RegularizationConfig {
         }
     }
 
-    /// Clip gradients by their L2 norm
+    /// Clip gradients to `max_norm` by their L2 norm, returning the original norm.
     ///
-    /// If the L2 norm of gradients exceeds `max_norm`, scale them down
-    /// proportionally so that the norm equals `max_norm`.
-    ///
-    /// # Arguments
-    /// * `gradients` - Mutable slice of gradient values to clip
-    /// * `max_norm` - Maximum allowed L2 norm
-    ///
-    /// # Returns
-    /// The original gradient norm (before clipping)
-    ///
-    /// # Example
-    /// ```
-    /// use lattice_tune::train::RegularizationConfig;
-    ///
-    /// let mut grads = vec![3.0, 4.0]; // Norm = 5.0
-    /// let original_norm = RegularizationConfig::clip_grad_norm(&mut grads, 1.0);
-    /// assert!((original_norm - 5.0).abs() < 1e-6);
-    /// // After clipping, norm should be 1.0
-    /// let new_norm: f32 = grads.iter().map(|x| x * x).sum::<f32>().sqrt();
-    /// assert!((new_norm - 1.0).abs() < 1e-6);
-    /// ```
+    /// A zero or already-in-range vector is unchanged; otherwise every component
+    /// is scaled by `max_norm / norm`, leaving the gradient direction unchanged.
+    /// See `docs/train.md` for regularization behavior.
     pub fn clip_grad_norm(gradients: &mut [f32], max_norm: f32) -> f32 {
         // Compute L2 norm
         let norm_sq: f32 = gradients.iter().map(|g| g * g).sum();

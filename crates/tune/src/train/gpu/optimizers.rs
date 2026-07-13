@@ -1,11 +1,9 @@
-//! GPU optimizer implementations
+//! GPU optimizer dispatch.
 //!
-//! Every `GpuOptimizer` arm (Adam, AdamW, SGD-momentum, plain SGD, RMSprop)
-//! currently fails loudly with `TuneError::Training` rather than performing a
-//! real weight update: the shader-based arms have no buffer bindings wired
-//! to the network's weight/gradient buffers, and the CPU-side plain-SGD arm
-//! has neither real gradient plumbing nor a mutable weight write-back path.
-//! See #797. Wiring the real dispatch/write-back is tracked follow-up work.
+//! All optimizer choices return `TuneError::Training` until real gradient
+//! bindings and a mutable network weight write-back path exist. This is
+//! intentional: a no-effect optimizer step must never report success. See
+//! `docs/train.md` for the current backend contract.
 
 use super::state::LayerGradients;
 use crate::error::{Result, TuneError};
@@ -13,18 +11,14 @@ use crate::train::config::{Optimizer, TrainingConfig};
 use lattice_fann::gpu::GpuContext;
 use std::sync::Arc;
 
-/// Optimizer update methods
+/// GPU optimizer dispatcher.
+///
+/// Every update arm currently returns an error rather than performing a
+/// no-effect update. See `docs/train.md` for implementation status.
 pub struct GpuOptimizer;
 
 impl GpuOptimizer {
-    /// Adam optimizer update using GPU shader
-    ///
-    /// # Errors
-    ///
-    /// Always returns `TuneError::Training`: the GPU dispatch has no buffer
-    /// bindings wired to the network's weight/gradient buffers (#797). Wiring
-    /// the real dispatch is tracked as follow-up work; until then this arm
-    /// fails loudly instead of silently performing a zero-effect update.
+    /// Return an error because GPU Adam buffer bindings are not implemented.
     pub fn update_adam(
         _ctx: &Arc<GpuContext>,
         _layer_gradients: &[LayerGradients],
@@ -38,11 +32,7 @@ impl GpuOptimizer {
         ))
     }
 
-    /// AdamW optimizer update using GPU shader
-    ///
-    /// # Errors
-    ///
-    /// Always returns `TuneError::Training`: see [`Self::update_adam`] (#797).
+    /// Return an error because GPU AdamW buffer bindings are not implemented.
     pub fn update_adamw(
         _ctx: &Arc<GpuContext>,
         _layer_gradients: &[LayerGradients],
@@ -56,11 +46,7 @@ impl GpuOptimizer {
         ))
     }
 
-    /// SGD with momentum update using GPU shader
-    ///
-    /// # Errors
-    ///
-    /// Always returns `TuneError::Training`: see [`Self::update_adam`] (#797).
+    /// Return an error because GPU SGD-momentum bindings are not implemented.
     pub fn update_sgd_momentum(
         _ctx: &Arc<GpuContext>,
         _layer_gradients: &[LayerGradients],
@@ -112,20 +98,7 @@ impl GpuOptimizer {
         Ok(())
     }
 
-    /// Plain SGD update (CPU fallback - no shader for plain SGD)
-    ///
-    /// # Errors
-    ///
-    /// Always returns `TuneError::Training`: this is not real SGD (#797).
-    /// The previous body used a constant placeholder gradient magnitude
-    /// (`grad_scale = 0.01`) instead of the actual per-layer gradients
-    /// accumulated in `LayerGradients`, and had no mutable write-back path
-    /// from `GpuNetwork` (only the immutable `cpu_network()` accessor
-    /// exists) even if it had used real gradients — so the computed values
-    /// were always discarded. A working plain-SGD arm needs both real
-    /// gradient plumbing and a mutable weight-write path on `GpuNetwork`;
-    /// until then it fails loudly like every other arm rather than
-    /// reporting success for a step that changed nothing.
+    /// Return an error because plain SGD has no gradient or weight write-back path.
     fn update_sgd(_network: &lattice_fann::gpu::GpuNetwork, _current_lr: f32) -> Result<()> {
         Err(TuneError::Training(
             "GPU SGD optimizer update not implemented: no real gradient plumbing or mutable \

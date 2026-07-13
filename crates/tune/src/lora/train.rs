@@ -1,8 +1,10 @@
-//! Micro-LoRA training: CPU backward pass for a configurable layer range.
+//! CPU micro-LoRA training over a bounded Qwen3.5 layer suffix.
 //!
-//! Provides a self-contained training loop over caller-supplied token pairs.
-//! Callers that need full training infrastructure (data loading, gradcheck,
-//! validation) should use the `train_grad_full` binary instead.
+//! The public helper trains GQA `q_proj` and `v_proj` weights with exact
+//! gradients; GatedDeltaNet layers remain frozen while preserving gradient flow.
+//! It validates all caller-controlled shape, range, and sequence bounds first.
+//!
+//! See `docs/lora-core.md` for the tape, loop, and configuration details.
 
 use std::collections::HashMap;
 

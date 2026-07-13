@@ -1,43 +1,9 @@
-//! Shadow evaluation for safe model deployment.
+//! Candidate-versus-production comparison for deployment decisions.
 //!
-//! Runs candidate models in parallel with production to compare outputs
-//! before promotion. This enables data-driven deployment decisions based
-//! on real traffic rather than synthetic benchmarks.
+//! Callers select traffic, run both models, and record observations. A session
+//! transitions only after its sample minimum; it never promotes a candidate.
 //!
-//! # Workflow
-//!
-//! 1. Create a [`ShadowSession`] with production and candidate model IDs
-//! 2. For each sampled request, run both models and call [`record_sample`]
-//! 3. Call [`evaluate`] periodically to check if criteria are met
-//! 4. If [`passed`] returns true, promote the candidate to production
-//!
-//! # Example
-//!
-//! ```
-//! use lattice_tune::registry::{ShadowSession, ShadowConfig, ShadowState};
-//! use uuid::Uuid;
-//!
-//! let production_id = Uuid::new_v4();
-//! let candidate_id = Uuid::new_v4();
-//!
-//! let config = ShadowConfig {
-//!     sample_rate: 0.1,      // Sample 10% of traffic
-//!     min_samples: 100,      // Need at least 100 samples
-//!     min_agreement: 0.95,   // 95% agreement threshold
-//!     max_latency_increase_ms: 50.0,
-//! };
-//!
-//! let mut session = ShadowSession::new(production_id, candidate_id, config);
-//!
-//! // Record samples (in real usage, from actual inference)
-//! for _ in 0..100 {
-//!     session.record_sample(true, 5.0); // agreed, 5ms slower
-//! }
-//!
-//! // Evaluate
-//! let state = session.evaluate();
-//! assert!(session.passed());
-//! ```
+//! See `docs/registry.md` for shadow configuration, state transitions, and metrics.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;

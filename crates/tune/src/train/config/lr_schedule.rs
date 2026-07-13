@@ -1,4 +1,7 @@
-//! Learning rate schedule configuration
+//! Learning-rate schedule definitions and evaluation.
+//!
+//! Schedules combine a base optimizer rate with the current step and epoch.
+//! See `docs/train.md` for formulas, validation rules, and edge cases.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
