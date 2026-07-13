@@ -254,3 +254,32 @@ Bench wall time (~5-10 min on shared runners) would double the CI duration for e
 - ARM runner availability: <https://github.blog/2024-09-03-arm64-on-github-actions-powering-faster-more-efficient-build-systems/>
 - Issue #77 — GPU contention variance (M2 Max local bench noise)
 - PR #76 — context for catastrophic-cancellation revert (layer_norm two-pass)
+
+## Post-acceptance note (2026-07-12): the 95% → 99% escalation is unsound — do not arm it
+
+A subsequent adversarial statistical review of this design found the confidence-escalation
+path (D3 "Why 7% on CI-lower-bound" and Rollout step 5: on persistent false positives,
+tighten the CI confidence from 95% to 99% "rather than weakening the 7% sensitivity")
+to be backwards. At a fixed threshold, requiring higher confidence widens the margin the
+lower bound must clear before tripping, which *reduces* power against genuine regressions;
+it does not preserve sensitivity. If observed flake is high, the honest levers are more
+samples per run, better runner isolation, or an explicitly raised threshold.
+
+Two further findings compound the problem as specified:
+
+- Criterion's within-run CI measures sampling noise inside one runner session. True
+  cross-runner variance on shared CI hardware is far larger (the review's worked example
+  put the understatement above an order of magnitude), so a "statistically confident"
+  within-run bound is not confidence about the run-to-run distribution the gate actually
+  faces; bimodal shared-runner latency can produce confident false failures at zero true
+  regression.
+- Updating the baseline on every push to main can ratchet a real regression into the
+  baseline before any gate observes it.
+
+Status: the D2/D3 hard merge gate described here was never armed. Merge gating shipped
+instead as same-runner end-to-end token parity against a reference implementation plus a
+relative perplexity-delta gate, both of which sidestep cross-runner variance by comparing
+within a single run. Criterion micro-benchmarks are collected as trend data only
+(`bench-update.yml` / `perf-baselines`). Any future revival of a hard Criterion gate needs
+a cross-run variance model measured on the actual runner pool, not the escalation path in
+this document.
