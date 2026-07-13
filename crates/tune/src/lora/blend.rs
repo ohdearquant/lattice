@@ -165,7 +165,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         target_modules,
     };
 
-    Ok(LoraAdapter::new(config, blended_layers))
+    LoraAdapter::new(config, blended_layers)
 }
 
 /// Blend multiple `(LoraLayer, effective_weight)` entries for a single
@@ -309,6 +309,7 @@ mod tests {
             },
             layers,
         )
+        .expect("valid adapter config")
     }
 
     // Apply a LoraAdapter to x and return the delta (excludes base output).
@@ -496,7 +497,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(
             result.is_err(),
@@ -533,7 +535,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(
             result.is_err(),
@@ -570,7 +573,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(
             result.is_err(),
@@ -612,7 +616,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
 
         let blended = blend_lora_adapters(&[(&adapter, w)]).unwrap();
         let blended_layer = blended.layers.get(&(0, "q_proj".to_string())).unwrap();
@@ -716,7 +721,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
         // per-entry checked_mul is defense-in-depth for the same class.
@@ -795,7 +801,8 @@ mod tests {
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        );
+        )
+        .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(result.is_err(), "aggregate budget exceeded must return Err");
         let msg = result.unwrap_err().to_string();

@@ -188,8 +188,16 @@ impl LoraAdapter {
 
     /// Construct an adapter from pre-built components (for testing or
     /// when loading from a custom format).
-    pub fn new(config: LoraConfig, layers: HashMap<(usize, String), LoraLayer>) -> Self {
-        Self { config, layers }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the adapter configuration is invalid.
+    pub fn new(
+        config: LoraConfig,
+        layers: HashMap<(usize, String), LoraLayer>,
+    ) -> crate::error::Result<Self> {
+        config.validate()?;
+        Ok(Self { config, layers })
     }
 
     /// Apply the LoRA adapter to a single projection output.
@@ -344,7 +352,7 @@ mod tests {
             },
         );
 
-        LoraAdapter::new(config, layers)
+        LoraAdapter::new(config, layers).expect("valid adapter config")
     }
 
     #[test]
@@ -376,6 +384,23 @@ mod tests {
             let err = config.validate().unwrap_err();
             assert!(err.to_string().contains("alpha must be finite"));
             assert_eq!(config.scale(), 0.0);
+        }
+    }
+
+    #[test]
+    fn test_adapter_construction_rejects_non_finite_alpha() {
+        for alpha in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result = LoraAdapter::new(
+                LoraConfig {
+                    rank: 8,
+                    alpha,
+                    target_modules: vec![],
+                },
+                HashMap::new(),
+            );
+
+            let err = result.expect_err("non-finite alpha must reject adapter construction");
+            assert!(err.to_string().contains("alpha must be finite"));
         }
     }
 
@@ -469,7 +494,7 @@ mod tests {
                 rank: 2,
             },
         );
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
         let unknown = adapter.validate_modules(&["q_proj", "v_proj"]);
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0], (0, "q_porj".to_string()));
@@ -482,7 +507,7 @@ mod tests {
             alpha: 4.0,
             target_modules: vec![],
         };
-        let adapter = LoraAdapter::new(config, HashMap::new());
+        let adapter = LoraAdapter::new(config, HashMap::new()).expect("valid adapter config");
         let unknown = adapter.validate_modules(&["q_proj"]);
         assert!(unknown.is_empty());
     }
@@ -518,6 +543,7 @@ mod tests {
                 },
                 layers,
             )
+            .expect("valid adapter config")
         }
 
         #[test]

@@ -942,14 +942,14 @@ mod tests {
 
     #[test]
     fn loader_rejects_nan_adapter_alpha_against_finite_manifest_alpha() {
-        let adapter = LoraAdapter::new(
-            super::super::LoraConfig {
+        let adapter = LoraAdapter {
+            config: super::super::LoraConfig {
                 rank: 4,
                 alpha: f32::NAN,
                 target_modules: vec!["q_proj".to_string()],
             },
-            std::collections::HashMap::new(),
-        );
+            layers: std::collections::HashMap::new(),
+        };
         let entry = make_entry(
             "nan-alpha",
             "adapter.safetensors",

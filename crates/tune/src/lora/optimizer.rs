@@ -289,7 +289,7 @@ mod tests {
                 rank: 2,
             },
         );
-        LoraAdapter::new(config, layers)
+        LoraAdapter::new(config, layers).expect("valid adapter config")
     }
 
     // ─── gradient computation tests ────────────────────────────────────────

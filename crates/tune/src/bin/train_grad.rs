@@ -205,6 +205,7 @@ fn nll_and_grad(
 /// Typed CLI config for `train_grad`. Field defaults are the documented
 /// contract in `usage()` and issue #845's flag table — the snapshot tests
 /// below pin them.
+#[derive(Debug)]
 struct Config {
     model_dir: PathBuf,
     data_dir: PathBuf,
@@ -217,8 +218,21 @@ struct Config {
     log_every: usize,
 }
 
-fn parse_config(argv: &ArgView) -> Config {
-    Config {
+fn parse_alpha(argv: &ArgView) -> Result<f32, String> {
+    let Some(value) = argv.arg("--alpha") else {
+        return Ok(16.0);
+    };
+    let alpha = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid --alpha '{value}': expected a finite number"))?;
+    if !alpha.is_finite() {
+        return Err(format!("invalid --alpha '{value}': value must be finite"));
+    }
+    Ok(alpha)
+}
+
+fn parse_config(argv: &ArgView) -> Result<Config, String> {
+    Ok(Config {
         model_dir: argv
             .arg("--model-dir")
             .map(PathBuf::from)
@@ -236,10 +250,7 @@ fn parse_config(argv: &ArgView) -> Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1e-3),
         rank: argv.arg("--rank").and_then(|s| s.parse().ok()).unwrap_or(8),
-        alpha: argv
-            .arg("--alpha")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(16.0),
+        alpha: parse_alpha(argv)?,
         seq_len: argv
             .arg("--seq-len")
             .and_then(|s| s.parse().ok())
@@ -252,7 +263,7 @@ fn parse_config(argv: &ArgView) -> Config {
             .arg("--log-every")
             .and_then(|s| s.parse().ok())
             .unwrap_or(10),
-    }
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -273,7 +284,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         seq_len,
         max_train,
         log_every,
-    } = parse_config(&argv);
+    } = parse_config(&argv)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
 
     println!("=== exact-gradient LoRA trainer (lm_head) ===");
     println!("model-dir:  {}", model_dir.display());
@@ -440,7 +452,7 @@ mod cli_contract_tests {
     #[test]
     fn defaults_match_documented_table() {
         let a = args(&[]);
-        let cfg = parse_config(&ArgView::new(&a));
+        let cfg = parse_config(&ArgView::new(&a)).expect("default config must parse");
         assert_eq!(cfg.data_dir, PathBuf::from("data/lora-train"));
         assert_eq!(cfg.steps, 150);
         assert_eq!(cfg.lr, 1e-3);
@@ -474,7 +486,7 @@ mod cli_contract_tests {
             "--log-every",
             "1",
         ]);
-        let cfg = parse_config(&ArgView::new(&a));
+        let cfg = parse_config(&ArgView::new(&a)).expect("explicit config must parse");
         assert_eq!(cfg.model_dir, PathBuf::from("/tmp/m"));
         assert_eq!(cfg.data_dir, PathBuf::from("/tmp/d"));
         assert_eq!(cfg.steps, 5);
@@ -484,6 +496,16 @@ mod cli_contract_tests {
         assert_eq!(cfg.seq_len, 32);
         assert_eq!(cfg.max_train, 2);
         assert_eq!(cfg.log_every, 1);
+    }
+
+    #[test]
+    fn rejects_invalid_alpha_values() {
+        for alpha in ["nan", "inf", "-inf", "invalid"] {
+            let a = args(&["--alpha", alpha]);
+            let err = parse_config(&ArgView::new(&a))
+                .expect_err("invalid --alpha must fail parsing before training");
+            assert!(err.contains("--alpha"));
+        }
     }
 
     #[test]

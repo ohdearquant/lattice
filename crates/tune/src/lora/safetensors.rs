@@ -393,9 +393,7 @@ pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, T
         alpha,
         target_modules: target_modules.into_iter().collect(),
     };
-    config.validate()?;
-
-    Ok(LoraAdapter { config, layers })
+    LoraAdapter::new(config, layers)
 }
 
 /// Read the `adapter_id` metadata key from a PEFT safetensors byte slice.
@@ -1182,7 +1180,7 @@ mod tests {
             },
         );
 
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
 
         let temp = NamedTempFile::new().unwrap();
         save_peft_safetensors(&adapter, temp.path(), None).unwrap();
@@ -1239,7 +1237,7 @@ mod tests {
                 rank,
             },
         );
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
 
         let governance = AdapterGovernance {
             name: "test-adapter".to_string(),
@@ -1286,7 +1284,7 @@ mod tests {
                 rank,
             },
         );
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
 
         let temp = NamedTempFile::new().unwrap();
         save_peft_safetensors(&adapter, temp.path(), None).unwrap();
@@ -1354,7 +1352,7 @@ mod tests {
             },
         );
 
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
         let temp = NamedTempFile::new().unwrap();
         save_peft_safetensors(&adapter, temp.path(), None).unwrap();
         let loaded = load_peft_safetensors(temp.path()).unwrap();
@@ -1503,7 +1501,7 @@ mod tests {
             },
         );
 
-        let adapter = LoraAdapter::new(config, layers);
+        let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
 
         let temp = NamedTempFile::new().unwrap();
         // This was the regression: pre-fix this call returned Err(InvalidTensorView).
