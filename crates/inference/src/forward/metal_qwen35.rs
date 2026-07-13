@@ -8827,6 +8827,24 @@ mod inner {
                 });
             }
 
+            // #922: the check above only bounds the prompt alone; a prompt
+            // that fits by itself can still overflow the window once its
+            // decode budget is added (this loop reaches at most position
+            // `prompt_len + max_new_tokens - 1`; `reasoning_budget` is
+            // already rejected above by `check_reasoning_budget_not_set`, so
+            // `decode_cap` reduces to `max_new_tokens` here). Mirrors the CPU
+            // `generate()` total-context bound (model::qwen35::generation)
+            // via the shared `check_context_budget` helper, closing the gap
+            // `docs/generation-entrypoint-matrix.md` and issue #922 describe
+            // for direct/`chat_metal` callers that bypass
+            // `serve::metal_worker::check_prompt_fits_window`.
+            crate::model::qwen35::check_context_budget(
+                prompt_len,
+                gen_cfg.reasoning_budget,
+                gen_cfg.max_new_tokens,
+                self.max_context(),
+            )?;
+
             // Reset state for new generation
             self.reset_state();
 
@@ -9205,6 +9223,24 @@ mod inner {
                     "generate_multimodal: total sequence length ({}) exceeds KV cache capacity ({}); \
                      rebuild the session with a larger max_cache_len",
                     total_len, self.session.kv_cache.max_cache_len
+                )));
+            }
+
+            // #922: the check above only bounds the visual+text prompt alone.
+            // `multimodal_generate_preflight` already rejects `reasoning_budget`
+            // above, so `decode_cap` reduces to `max_new_tokens` here; the bound
+            // still mirrors the shared `check_context_budget` helper (CPU
+            // `generate`/`generate_streaming`, model::qwen35::generation) so a
+            // prompt that fits alone but overflows once its decode budget is
+            // added is rejected up front instead of failing mid-decode.
+            if let Err(e) = crate::model::qwen35::check_context_budget(
+                total_len,
+                gen_cfg.reasoning_budget,
+                gen_cfg.max_new_tokens,
+                self.max_context(),
+            ) {
+                return Err(InferenceError::InvalidInput(format!(
+                    "generate_multimodal: {e}"
                 )));
             }
 
@@ -13368,6 +13404,25 @@ mod inner {
                 });
             }
 
+            // #922: the check above only bounds the prompt alone. Unlike
+            // `generate` above, this path applies `reasoning_budget` (its
+            // decode loop force-closes `</think>` and keeps decoding past
+            // `max_new_tokens` for the budget-extended cap, see
+            // `decode_cap`) and self-limits mid-decode on
+            // `seq_len >= max_cache_len` rather than panicking — but that
+            // self-limit means a request whose true reach
+            // (`prompt_len + decode_cap(..)`) exceeds the window today gets
+            // silently truncated instead of cleanly rejected up front.
+            // Mirrors the CPU `generate_streaming()` total-context bound
+            // (model::qwen35::generation) via the shared
+            // `check_context_budget` helper.
+            crate::model::qwen35::check_context_budget(
+                prompt_len,
+                gen_cfg.reasoning_budget,
+                gen_cfg.max_new_tokens,
+                self.max_context(),
+            )?;
+
             self.reset_state();
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
@@ -16226,6 +16281,26 @@ mod inner {
                     },
                 });
             }
+
+            // #922: the check above only bounds the prompt alone; this path
+            // applies `reasoning_budget` the same as `generate_streaming_with_cancel`
+            // and self-limits mid-decode on `seq_len >= max_cache_len` rather than
+            // panicking, so a request whose true reach
+            // (`prompt_len + decode_cap(..)`) exceeds the window would otherwise be
+            // silently truncated instead of cleanly rejected. Mirrors the CPU
+            // `generate_streaming()` total-context bound (model::qwen35::generation)
+            // via the shared `check_context_budget` helper. Runs before any state
+            // mutation (`cross_turn_metadata`/`plan_cross_turn_reuse` below are
+            // read-only), and an `Err` returned here flows through the public
+            // wrapper's blanket eviction match exactly like every other `Err` this
+            // function can produce, so it fails closed correctly even though no
+            // cache/session state has been touched yet.
+            crate::model::qwen35::check_context_budget(
+                prompt_len,
+                gen_cfg.reasoning_budget,
+                gen_cfg.max_new_tokens,
+                self.max_context(),
+            )?;
 
             let metadata = self.cross_turn_metadata(tokenizer);
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
