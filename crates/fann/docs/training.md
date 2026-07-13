@@ -103,8 +103,10 @@ backward:
    accumulated over every sample in the batch before the update step runs.
 
 Both `BackpropTrainer::compute_gradients` and `RlooTrainer::backprop_and_apply`
-(below) implement the _same_ backward recursion independently. A bug found in
-one hidden-layer backward loop should be checked against the other.
+(below) implement the _same_ backward recursion independently — the RLOO
+trainer's comment block explicitly cites the `backprop.rs` line numbers it
+mirrors. A bug found in one hidden-layer backward loop should be checked
+against the other.
 
 ### Momentum + weight decay update
 
@@ -374,9 +376,10 @@ the gradient formula used for the update.
 `reward · (p[j] − onehot[j])` naturally flips sign with `reward`: a positive
 reward pulls `p[action]` up (standard cross-entropy-style gradient toward the
 action), a negative reward pushes it down. There is deliberately no
-special-casing for negative reward, and the sign must be preserved: a
-plausible-looking bug here (for example accidentally taking `reward.abs()`)
-would silently convert "push this down" feedback into "pull this up" feedback.
+special-casing for negative reward — a regression test
+(`rloo_negative_reward_decreases_action_score`) pins this polarity, because a
+plausible-looking bug here (e.g. accidentally taking `reward.abs()`) would
+silently convert "push this down" feedback into "pull this up" feedback.
 
 **Auxiliary losses**, always added regardless of reward sign:
 
@@ -410,12 +413,15 @@ advantage_m = R_m − baseline_m
 g[j] += −(1/M) · advantage_m · (count(j ∈ subset_m) − k · p[j])
 ```
 
-This is not the default training path. **Invariant for any future activation
-of this path**: it only consumes preferred-known (positive) events, so it must
-always be paired with the Phase-1 negative path. A positive-only convergence
-run collapses to near-zero policy entropy (mass piles onto a single output)
-because there's no signal pushing a wrongly-selected output back down. Treat
-this as a correctness requirement for any caller, not a tuning knob.
+This is not the default training path — it exists for the bench harness that
+compares its convergence against Phase 1. **Invariant for any future
+activation of this path**: it only consumes preferred-known (positive) events,
+so it must always be paired with the Phase-1 negative path; a positive-only
+convergence run collapses to near-zero policy entropy (mass piles onto a
+single output) because there's no signal pushing a wrongly-selected output
+back down. This was verified empirically in the convergence bench, not just
+reasoned about — treat it as a correctness requirement for any caller, not a
+tuning knob.
 
 Both `m_samples` and `m_samples * k` (the aggregate retained-subset storage)
 are bounds-checked against `MAX_ALLOWED_ELEMENTS` before any allocation, since
