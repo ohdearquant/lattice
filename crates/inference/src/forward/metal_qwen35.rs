@@ -1767,7 +1767,9 @@ mod inner {
     /// single-session entry point.
     pub struct MetalQwen35Engine {
         #[allow(dead_code)]
-        // TODO(#1958): Metal roadmap — device handle kept alive for GPU lifetime management
+        // Device handle kept alive for GPU lifetime management (the MTLDevice must
+        // outlive the command queue/pipelines it created). Not yet tracked by a
+        // filed issue.
         pub(crate) device: Device,
         pub(crate) queue: CommandQueue,
         pub(crate) pipelines: MetalQwen35Pipelines,
@@ -1798,7 +1800,8 @@ mod inner {
         pub(crate) activations: MetalQwen35Activations,
         pub(crate) gdn_states: Vec<GatedDeltaNetState>,
         #[allow(dead_code)]
-        // TODO(#1958): Metal roadmap — GDN GPU scratch buffer, wired in future GPU-GDN pass
+        // GDN GPU scratch buffer, to be wired in a future GPU-GDN pass. Not yet
+        // tracked by a filed issue.
         pub(crate) gdn_scratch: GatedDeltaNetFusedScratch,
         pub(crate) gdn_gpu_conv_bufs: Vec<Buffer>, // [num_linear_layers] each [qkv_dim * buf_len]
         pub(crate) gdn_gpu_s_matrices: Vec<Buffer>, // [num_linear_layers] each [num_heads * vd * kd]

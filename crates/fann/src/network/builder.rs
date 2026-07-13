@@ -35,7 +35,8 @@ pub struct NetworkBuilder {
 ///
 /// Softmax normalises over the simplex — meaningful only at the output.
 /// On hidden layers the gradient degrades to the diagonal approximation
-/// `s_i*(1-s_i)`, producing silently wrong gradients (tracked as FP-095).
+/// `s_i*(1-s_i)`, producing silently wrong gradients (accepted limitation,
+/// see ADR-023).
 fn validate_no_hidden_softmax(layers: &[(usize, Activation)]) -> FannResult<()> {
     if layers.len() < 2 {
         return Ok(());
