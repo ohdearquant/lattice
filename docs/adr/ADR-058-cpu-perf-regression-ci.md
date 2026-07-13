@@ -254,3 +254,36 @@ Bench wall time (~5-10 min on shared runners) would double the CI duration for e
 - ARM runner availability: <https://github.blog/2024-09-03-arm64-on-github-actions-powering-faster-more-efficient-build-systems/>
 - Issue #77 — GPU contention variance (M2 Max local bench noise)
 - PR #76 — context for catastrophic-cancellation revert (layer_norm two-pass)
+
+## Post-acceptance note (2026-07-12): the 95% → 99% escalation is unsound — do not arm it
+
+A subsequent adversarial statistical review of this design found the confidence-escalation
+path (D3 "Why 7% on CI-lower-bound" and Rollout step 5: on persistent false positives,
+tighten the CI confidence from 95% to 99% "rather than weakening the 7% sensitivity")
+to be backwards. At a fixed threshold, requiring higher confidence widens the margin the
+lower bound must clear before tripping, which *reduces* power against genuine regressions;
+it does not preserve sensitivity. If observed flake is high, the honest levers are more
+samples per run, better runner isolation, or an explicitly raised threshold.
+
+Two further findings compound the problem as specified:
+
+- Criterion's change CI is bootstrapped from the observed baseline and candidate benchmark
+  sessions; it does not model between-session or runner-pool variance. On shared CI
+  hardware, run-to-run variance can be substantially larger than what one observed pair of
+  sessions shows, so a "statistically confident" bound from that pair is not confidence
+  about the distribution the gate actually faces; a bimodal runner pool can hand the
+  bootstrap two internally stable sessions from different modes, yielding a narrow,
+  confidently wrong comparison and false failures at zero true regression.
+- Refreshing the baseline on each qualifying main update (path-filtered pushes, plus
+  scheduled and manual refreshes) can ratchet a real regression into the baseline before
+  any gate observes it.
+
+Status: the D2/D3 hard merge gate described here was never armed (an advisory-mode
+workflow was implemented, then removed). Merge gating shipped instead as same-run
+end-to-end greedy-token parity against a reference implementation (a within-run
+comparison), plus an absolute Q4 perplexity golden captured on the CI runner class and
+enforced with a fixed tolerance (a cross-run comparison by construction, carrying its own
+environment-drift risk). Criterion micro-benchmarks are collected as trend data only
+(`bench-update.yml` / `perf-baselines`). Any future revival of a hard Criterion gate needs
+a cross-run variance model measured on the actual runner pool, not the escalation path in
+this document.
