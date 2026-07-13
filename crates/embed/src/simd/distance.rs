@@ -55,7 +55,7 @@ fn dispatch_squared(a: &[f32], b: &[f32]) -> f32 {
 
 /// Computes Euclidean (L2) distance, returning [`f32::MAX`] for a dimensional mismatch.
 ///
-/// See `docs/simd.md` (§Public API contracts) for ranking guidance.
+/// See [`docs/simd.md`](../../docs/simd.md#public-api-contracts) for ranking guidance.
 #[inline]
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
@@ -68,7 +68,7 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
 /// Computes squared Euclidean distance without a square root.
 ///
 /// Returns [`f32::MAX`] for a mismatch; it preserves L2 ordering for valid inputs.
-/// See `docs/simd.md` (§Euclidean distance) for ANN ranking and precision semantics.
+/// See [`docs/simd.md`](../../docs/simd.md#euclidean-distance) for ANN ranking and precision semantics.
 #[inline]
 pub fn squared_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
@@ -99,7 +99,7 @@ pub(crate) fn euclidean_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX-512F and equal slices; chunked unaligned loads stay in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn squared_euclidean_distance_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -173,7 +173,7 @@ unsafe fn squared_euclidean_distance_avx512_unrolled(a: &[f32], b: &[f32]) -> f3
 ///
 /// # Safety
 /// Caller must provide AVX2/FMA and equal slices; chunked unaligned loads stay in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn squared_euclidean_distance_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -229,7 +229,7 @@ unsafe fn squared_euclidean_distance_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 
 ///
 /// # Safety
 /// Caller must run on aarch64 with equal slices; chunked loads stay in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn squared_euclidean_distance_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -285,7 +285,7 @@ unsafe fn squared_euclidean_distance_neon_unrolled(a: &[f32], b: &[f32]) -> f32 
 ///
 /// # Safety
 /// This function requires compile-time SIMD128 and equal slices; bounds are chunked.
-/// See `docs/simd.md` (§Kernel safety boundary) for wasm and reassociation semantics.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for wasm and reassociation semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn squared_euclidean_distance_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {

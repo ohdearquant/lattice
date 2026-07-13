@@ -37,16 +37,16 @@ the cache avoids repeated production; SIMD compares vectors after they exist; an
 and backfill coordinate a change from one vector space to another. Neither the cache nor a
 service itself decides when an index may cut over to a different model.
 
-| Area | Module | Responsibility | Detailed reference |
-| --- | --- | --- | --- |
-| Model identity and configuration | `model` | Supported variants, provenance, native and MRL output dimensions, model prompts, pooling selection | [model.md](model.md) |
-| In-memory reuse | `cache` | Sharded LRU and cache-key construction | This document and [service.md](service.md) |
-| Vector arithmetic | `simd` | Runtime/compile-time dispatch and exact public operation contracts | [simd.md](simd.md) |
-| Embedding production | `service` | Async API, prompt application, native model lifecycle, and cache wrapper | [service.md](service.md) |
-| Migration state | `migration` | Model-swap state machine and progress tracking | [migration.md](migration.md) |
-| Migration execution policy | `backfill` | Request/query routing, dual writes, and backfill batches | [backfill.md](backfill.md) |
-| Browser boundary | `wasm` | In-memory BERT bindings and wasm SIMD utility exports | [WebAssembly bindings](#webassembly-bindings) |
-| Shared values | `types`, `error` | Embedding metadata and typed operational failures | [service.md#error-boundaries](service.md#error-boundaries) |
+| Area                             | Module           | Responsibility                                                                                     | Detailed reference                                         |
+| -------------------------------- | ---------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Model identity and configuration | `model`          | Supported variants, provenance, native and MRL output dimensions, model prompts, pooling selection | [model.md](model.md)                                       |
+| In-memory reuse                  | `cache`          | Sharded LRU and cache-key construction                                                             | This document and [service.md](service.md)                 |
+| Vector arithmetic                | `simd`           | Runtime/compile-time dispatch and exact public operation contracts                                 | [simd.md](simd.md)                                         |
+| Embedding production             | `service`        | Async API, prompt application, native model lifecycle, and cache wrapper                           | [service.md](service.md)                                   |
+| Migration state                  | `migration`      | Model-swap state machine and progress tracking                                                     | [migration.md](migration.md)                               |
+| Migration execution policy       | `backfill`       | Request/query routing, dual writes, and backfill batches                                           | [backfill.md](backfill.md)                                 |
+| Browser boundary                 | `wasm`           | In-memory BERT bindings and wasm SIMD utility exports                                              | [WebAssembly bindings](#webassembly-bindings)              |
+| Shared values                    | `types`, `error` | Embedding metadata and typed operational failures                                                  | [service.md#error-boundaries](service.md#error-boundaries) |
 
 ## Embedding flow and identity
 
@@ -197,11 +197,11 @@ does not relax the input contract.
 The historical benchmark snapshot that accompanied the facade illustrates why this boundary
 exists; actual timing depends on the host ISA and vector shape.
 
-| Dimension | Scalar | SIMD |
-| --- | --- | --- |
-| 384 | ~650ns | ~90ns |
-| 768 | ~1300ns | ~180ns |
-| 1024 | ~1700ns | ~240ns |
+| Dimension | Scalar  | SIMD   |
+| --------- | ------- | ------ |
+| 384       | ~650ns  | ~90ns  |
+| 768       | ~1300ns | ~180ns |
+| 1024      | ~1700ns | ~240ns |
 
 ```rust
 use lattice_embed::utils::{cosine_similarity, dot_product, euclidean_distance, normalize};

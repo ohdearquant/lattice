@@ -12,7 +12,7 @@ use std::time::SystemTime;
 ///
 /// Records the model source and metadata for a load event.
 ///
-/// See [`docs/model.md`](../docs/model.md) (§ModelProvenance source behavior) for hash semantics and verification boundaries.
+/// See [`docs/model.md`](../docs/model.md#modelprovenance-source-behavior) for hash semantics and verification boundaries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProvenance {
     /// **Stable**: model variant that was loaded.
@@ -64,7 +64,7 @@ impl ModelProvenance {
 ///
 /// Registry of supported local and remote embedding models.
 ///
-/// See [`docs/model.md`](../docs/model.md) (§EmbeddingModel source behavior) for model capabilities and identity rules.
+/// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for model capabilities and identity rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -132,7 +132,7 @@ impl EmbeddingModel {
 
     /// **Stable**: get this model's native output dimension.
     ///
-    /// See [`docs/model.md`](../docs/model.md) (§EmbeddingModel source behavior) for active-dimension selection.
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for active-dimension selection.
     #[inline]
     pub const fn dimensions(&self) -> usize {
         self.native_dimensions()
@@ -163,7 +163,7 @@ impl EmbeddingModel {
 
     /// **Stable**: conservative maximum input tokens for chunking and truncation.
     ///
-    /// See [`docs/model.md`](../docs/model.md) (§EmbeddingModel source behavior) for per-model limits.
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for per-model limits.
     #[inline]
     pub const fn max_input_tokens(&self) -> usize {
         match self {
@@ -183,7 +183,7 @@ impl EmbeddingModel {
 
     /// **Stable**: query instruction prefix for asymmetric retrieval, when required.
     ///
-    /// See [`docs/model.md`](../docs/model.md) (§EmbeddingModel source behavior) for prompt policy and vector-space implications.
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for prompt policy and vector-space implications.
     #[inline]
     pub const fn query_instruction(&self) -> Option<&'static str> {
         match self {
@@ -204,7 +204,7 @@ impl EmbeddingModel {
 
     /// **Stable**: document instruction prefix for asymmetric retrieval, when required.
     ///
-    /// See [`docs/model.md`](../docs/model.md) (§EmbeddingModel source behavior) for prompt policy and vector-space implications.
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for prompt policy and vector-space implications.
     #[inline]
     pub const fn document_instruction(&self) -> Option<&'static str> {
         match self {
@@ -245,7 +245,7 @@ impl EmbeddingModel {
 
     /// **Stable**: BERT pooling strategy for this model, or `None` for non-BERT paths.
     ///
-    /// See [`docs/model.md`](../docs/model.md) (§EmbeddingModel source behavior) for pooling routing.
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for pooling routing.
     #[cfg(feature = "native")]
     #[inline]
     pub const fn bert_pooling(&self) -> Option<lattice_inference::BertPooling> {
@@ -304,7 +304,7 @@ impl std::str::FromStr for EmbeddingModel {
 
     /// **Stable**: parse a normalized canonical name, alias, or supported provider identifier.
     ///
-    /// See [`docs/model.md`](../docs/model.md) (§EmbeddingModel source behavior) for accepted forms and persistence guidance.
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for accepted forms and persistence guidance.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let lower = s.to_lowercase();
         let normalized = lower.trim().replace("_", "-").replace("baai/", "");
@@ -360,7 +360,7 @@ pub const MIN_MRL_OUTPUT_DIM: usize = 32;
 
 /// Runtime model configuration with an optional MRL truncation dimension.
 ///
-/// See [`docs/model.md`](../docs/model.md) (§ModelConfig source behavior) for validation and namespace requirements.
+/// See [`docs/model.md`](../docs/model.md#modelconfig-source-behavior) for validation and namespace requirements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// The underlying embedding model.

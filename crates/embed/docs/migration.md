@@ -22,14 +22,14 @@ that a transition exists; it cannot make an application's index layout safe by i
 
 <code>MigrationPlan</code> is the immutable input used to construct a controller:
 
-| Field | Meaning |
-| --- | --- |
-| <code>id</code> | Caller-provided migration identifier. No uniqueness check is performed. |
-| <code>source_model</code> | The model version being replaced. |
-| <code>target_model</code> | The model version being introduced. |
-| <code>total_embeddings</code> | Initial historical-work budget. |
-| <code>batch_size</code> | Descriptive preferred processing batch size. The controller does not schedule batches. |
-| <code>created_at</code> | Caller-supplied ISO 8601 timestamp string. It is stored without parsing or validation. |
+| Field                         | Meaning                                                                                |
+| ----------------------------- | -------------------------------------------------------------------------------------- |
+| <code>id</code>               | Caller-provided migration identifier. No uniqueness check is performed.                |
+| <code>source_model</code>     | The model version being replaced.                                                      |
+| <code>target_model</code>     | The model version being introduced.                                                    |
+| <code>total_embeddings</code> | Initial historical-work budget.                                                        |
+| <code>batch_size</code>       | Descriptive preferred processing batch size. The controller does not schedule batches. |
+| <code>created_at</code>       | Caller-supplied ISO 8601 timestamp string. It is stored without parsing or validation. |
 
 The plan does not prove that source and target differ, that their dimensions are compatible
 with any existing index, or that total_embeddings matches a live dataset. Perform those
@@ -41,14 +41,14 @@ checks before constructing the controller.
 a wildcard case when matching it so future states can be added without making integrations
 invalid.
 
-| State | Stored information | Interpretation |
-| --- | --- | --- |
-| <code>Planned</code> | none | Created but not started. |
-| <code>InProgress</code> | processed, total, skipped | Active work budget. |
-| <code>Paused</code> | processed, total, skipped, reason | Stopped intentionally; may resume. |
-| <code>Failed</code> | processed, total, skipped, error | Stopped due to a failure; may resume. |
-| <code>Completed</code> | processed, skipped, duration_secs | Work was reported complete. |
-| <code>Cancelled</code> | processed, total, skipped | Abandoned by the caller. |
+| State                   | Stored information                | Interpretation                        |
+| ----------------------- | --------------------------------- | ------------------------------------- |
+| <code>Planned</code>    | none                              | Created but not started.              |
+| <code>InProgress</code> | processed, total, skipped         | Active work budget.                   |
+| <code>Paused</code>     | processed, total, skipped, reason | Stopped intentionally; may resume.    |
+| <code>Failed</code>     | processed, total, skipped, error  | Stopped due to a failure; may resume. |
+| <code>Completed</code>  | processed, skipped, duration_secs | Work was reported complete.           |
+| <code>Cancelled</code>  | processed, total, skipped         | Abandoned by the caller.              |
 
 <code>Completed</code> and <code>Cancelled</code> are terminal according to
 <code>is_terminal()</code>. A failure is not terminal: <code>is_resumable()</code> is true
@@ -78,7 +78,7 @@ must not assume this is the only possible error category.
 
 The controller accepts only these lifecycle operations:
 
-~~~text
+```text
 Planned ── start ──> InProgress ── progress reaches effective total ──> Completed
    │                       │  │
    │ cancel                │  └── fail ──> Failed ── resume ─┐
@@ -86,19 +86,19 @@ Planned ── start ──> InProgress ── progress reaches effective total 
 Cancelled <── cancel ──────┼── pause ──> Paused ── resume ────┘
                            │
                            └── cancel ──> Cancelled
-~~~
+```
 
 The allowed calls are:
 
-| Method | Accepted source state | Result |
-| --- | --- | --- |
-| <code>start</code> | Planned | InProgress with zero processed and skipped counts. |
-| <code>record_progress</code> | InProgress | Updates processed count or completes the migration. |
-| <code>record_skip</code> | InProgress | Adds one permanent skip when capacity remains. |
-| <code>pause</code> | InProgress | Paused, retaining all counts and a reason. |
-| <code>fail</code> | InProgress | Failed, retaining all counts and an error string. |
-| <code>resume</code> | Paused or Failed | InProgress, retaining all counts. |
-| <code>cancel</code> | Planned, InProgress, Paused, or Failed | Cancelled, retaining counts available in that state. |
+| Method                       | Accepted source state                  | Result                                               |
+| ---------------------------- | -------------------------------------- | ---------------------------------------------------- |
+| <code>start</code>           | Planned                                | InProgress with zero processed and skipped counts.   |
+| <code>record_progress</code> | InProgress                             | Updates processed count or completes the migration.  |
+| <code>record_skip</code>     | InProgress                             | Adds one permanent skip when capacity remains.       |
+| <code>pause</code>           | InProgress                             | Paused, retaining all counts and a reason.           |
+| <code>fail</code>            | InProgress                             | Failed, retaining all counts and an error string.    |
+| <code>resume</code>          | Paused or Failed                       | InProgress, retaining all counts.                    |
+| <code>cancel</code>          | Planned, InProgress, Paused, or Failed | Cancelled, retaining counts available in that state. |
 
 Starting twice, progressing while inactive, pausing an inactive migration, resuming planned
 or terminal work, and cancelling a completed or already cancelled migration all return an

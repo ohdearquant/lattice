@@ -75,15 +75,15 @@ from `EmbeddingModel`, prepends it to every supplied text when present, then del
 `embed`. They are not interchangeable with generic `embed`: a model trained for asymmetric
 retrieval expects its query and document vectors to be placed correctly in the shared space.
 
-| Model family | `embed_query` prefix | `embed_passage` prefix | Pooling on native BERT path |
-| --- | --- | --- | --- |
-| BGE v1.5 | `Represent this sentence for searching relevant passages: ` | none | CLS |
-| Multilingual E5 | `query: ` | `passage: ` | masked mean |
-| Qwen3-Embedding | retrieval instruction followed by `Query: ` | none | not a BERT path |
-| MiniLM variants | none | none | masked mean |
+| Model family    | `embed_query` prefix                                       | `embed_passage` prefix | Pooling on native BERT path |
+| --------------- | ---------------------------------------------------------- | ---------------------- | --------------------------- |
+| BGE v1.5        | `Represent this sentence for searching relevant passages:` | none                   | CLS                         |
+| Multilingual E5 | `query:`                                                   | `passage:`             | masked mean                 |
+| Qwen3-Embedding | retrieval instruction followed by `Query:`                 | none                   | not a BERT path             |
+| MiniLM variants | none                                                       | none                   | masked mean                 |
 
 The Qwen query instruction currently reads: `Instruct: Given a web search query, retrieve
-relevant passages that answer the query\nQuery: `. The library's model API owns these values; use
+relevant passages that answer the query\nQuery:`. The library's model API owns these values; use
 the role methods rather than duplicating prompt strings in an application.
 
 The caching wrapper overrides the two role methods instead of relying only on the trait defaults.
@@ -97,12 +97,12 @@ The cache wrapper validates empty batches, batch size, and text length before an
 native service enforces those same limits when it is called and additionally verifies that the
 requested model matches its configured model:
 
-| Rule | Failure |
-| --- | --- |
-| Batch must contain at least one text | `EmbedError::InvalidInput` |
-| Batch may contain at most `DEFAULT_MAX_BATCH_SIZE` (1,000) texts | `EmbedError::InvalidInput` |
-| Each text must be at most `MAX_TEXT_CHARS` (32,768) according to the implementation's `String::len()` check | `EmbedError::TextTooLong` |
-| Native request model must equal that service's configured model | `EmbedError::InvalidInput` |
+| Rule                                                                                                        | Failure                    |
+| ----------------------------------------------------------------------------------------------------------- | -------------------------- |
+| Batch must contain at least one text                                                                        | `EmbedError::InvalidInput` |
+| Batch may contain at most `DEFAULT_MAX_BATCH_SIZE` (1,000) texts                                            | `EmbedError::InvalidInput` |
+| Each text must be at most `MAX_TEXT_CHARS` (32,768) according to the implementation's `String::len()` check | `EmbedError::TextTooLong`  |
+| Native request model must equal that service's configured model                                             | `EmbedError::InvalidInput` |
 
 `String::len()` measures UTF-8 bytes, so the present implementation can reject fewer than
 32,768 non-ASCII characters. Prefixes are applied before validation in role-specific calls, so
@@ -124,11 +124,11 @@ there is no ONNX runtime, C++ FFI, or external embedding process.
 
 ### Construction and configuration
 
-| Constructor | Configuration |
-| --- | --- |
-| `new` / `default` | The crate's default embedding model at its native dimension |
-| `with_model` | One selected `EmbeddingModel` at its native dimension |
-| `with_model_config` | A model plus validated optional MRL output dimension |
+| Constructor           | Configuration                                                                     |
+| --------------------- | --------------------------------------------------------------------------------- |
+| `new` / `default`     | The crate's default embedding model at its native dimension                       |
+| `with_model`          | One selected `EmbeddingModel` at its native dimension                             |
+| `with_model_config`   | A model plus validated optional MRL output dimension                              |
 | `with_model_from_env` | A selected model with `LATTICE_EMBED_DIM` parsed as its optional output dimension |
 
 An absent or blank `LATTICE_EMBED_DIM` means native dimension. A nonnumeric environment value or
@@ -241,19 +241,19 @@ All service methods use `crate::Result<T>`, an alias for `Result<T, EmbedError>`
 also serves model configuration and prepared SIMD APIs, so not every variant originates in a
 native embedding call.
 
-| Error | Meaning at this boundary | Typical caller action |
-| --- | --- | --- |
-| `ModelNotLoaded` | A service requires initialization before use | Initialize/preload the service or surface the configuration issue |
-| `WrongModelLoaded` | The loaded model differs from the expected model during a concurrent switch | Retry with backoff after coordinating the model selection |
-| `ModelInitialization` | Model discovery, download/load, or blocking initialization failed | Inspect model configuration/files; construct a fresh service after correcting it |
-| `InferenceFailed` | The inference backend failed, including a cache-wrapper result-count violation | Surface the backend failure; do not accept a partial batch |
-| `TaskFailed` | A background task was cancelled or panicked | Treat the current call as failed and check service state before retrying |
-| `InvalidInput` | Empty/oversized batch, wrong model, invalid configuration, or other invalid request | Correct the request without retrying unchanged input |
-| `TextTooLong` | A text exceeded the service's length check | Chunk or shorten the prompted input |
-| `DimensionMismatch` | An operation received vectors of different expected and actual dimensions | Keep model/config/index namespaces consistent |
-| `UnsupportedModel` | The selected service cannot provide that model | Select a capable service or model |
-| `Internal` | An invariant failed, such as a missing single-item result | Treat as a bug report; do not synthesize a vector |
-| `TierMismatch` | Prepared SIMD quantization data used a different tier than the operation expects | Reprepare/query with matching quantization metadata |
+| Error                 | Meaning at this boundary                                                            | Typical caller action                                                            |
+| --------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `ModelNotLoaded`      | A service requires initialization before use                                        | Initialize/preload the service or surface the configuration issue                |
+| `WrongModelLoaded`    | The loaded model differs from the expected model during a concurrent switch         | Retry with backoff after coordinating the model selection                        |
+| `ModelInitialization` | Model discovery, download/load, or blocking initialization failed                   | Inspect model configuration/files; construct a fresh service after correcting it |
+| `InferenceFailed`     | The inference backend failed, including a cache-wrapper result-count violation      | Surface the backend failure; do not accept a partial batch                       |
+| `TaskFailed`          | A background task was cancelled or panicked                                         | Treat the current call as failed and check service state before retrying         |
+| `InvalidInput`        | Empty/oversized batch, wrong model, invalid configuration, or other invalid request | Correct the request without retrying unchanged input                             |
+| `TextTooLong`         | A text exceeded the service's length check                                          | Chunk or shorten the prompted input                                              |
+| `DimensionMismatch`   | An operation received vectors of different expected and actual dimensions           | Keep model/config/index namespaces consistent                                    |
+| `UnsupportedModel`    | The selected service cannot provide that model                                      | Select a capable service or model                                                |
+| `Internal`            | An invariant failed, such as a missing single-item result                           | Treat as a bug report; do not synthesize a vector                                |
+| `TierMismatch`        | Prepared SIMD quantization data used a different tier than the operation expects    | Reprepare/query with matching quantization metadata                              |
 
 Errors are descriptive but not a transaction protocol: if a batch fails after an inner service
 has done work, a caller should assume no usable batch result was returned and decide whether its

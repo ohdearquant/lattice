@@ -15,7 +15,7 @@ use tracing::debug;
 /// LRU-caching wrapper around an embedding service.
 ///
 /// It preserves input order while reusing embeddings with matching model configuration and role.
-/// See [`docs/service.md`](../../docs/service.md) (§CachedEmbeddingService cache-hit behavior) for the lookup and fill algorithm.
+/// See [`docs/service.md`](../../docs/service.md#cachedembeddingservice-cache-hit-behavior) for the lookup and fill algorithm.
 pub struct CachedEmbeddingService<S> {
     inner: Arc<S>,
     cache: crate::cache::EmbeddingCache,

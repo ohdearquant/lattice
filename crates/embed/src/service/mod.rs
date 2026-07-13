@@ -37,7 +37,7 @@ pub const MAX_TEXT_CHARS: usize = 32768;
 /// **Stable**: role of text in asymmetric retrieval.
 ///
 /// Selects query, passage, or generic preparation and cache-key namespace.
-/// See [`docs/service.md`](../../docs/service.md) (§Trait API details) for retrieval-role semantics.
+/// See [`docs/service.md`](../../docs/service.md#trait-api-details) for retrieval-role semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbeddingRole {
     /// Query / question text — may receive a query-side prompt prefix.
@@ -64,7 +64,7 @@ impl EmbeddingRole {
 ///
 /// Async interface for producing one embedding per input text.
 ///
-/// See [`docs/service.md`](../../docs/service.md) (§Trait API details) for role handling and implementation requirements.
+/// See [`docs/service.md`](../../docs/service.md#trait-api-details) for role handling and implementation requirements.
 #[async_trait]
 pub trait EmbeddingService: Send + Sync {
     /// **Stable**: generate embeddings for multiple texts.
@@ -88,7 +88,7 @@ pub trait EmbeddingService: Send + Sync {
 
     /// **Stable**: embed query texts after applying the model's query instruction.
     ///
-    /// See [`docs/service.md`](../../docs/service.md) (§Trait API details) for role and cache behavior.
+    /// See [`docs/service.md`](../../docs/service.md#trait-api-details) for role and cache behavior.
     async fn embed_query(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
         let prefix = model.query_instruction();
         let prompted = apply_prefix(texts, prefix);
@@ -97,7 +97,7 @@ pub trait EmbeddingService: Send + Sync {
 
     /// **Stable**: embed passages after applying the model's document instruction.
     ///
-    /// See [`docs/service.md`](../../docs/service.md) (§Trait API details) for role and cache behavior.
+    /// See [`docs/service.md`](../../docs/service.md#trait-api-details) for role and cache behavior.
     async fn embed_passage(
         &self,
         texts: &[String],
@@ -110,7 +110,7 @@ pub trait EmbeddingService: Send + Sync {
 
     /// **Unstable**: returns the effective configuration used for this model's cache keys.
     ///
-    /// See [`docs/service.md`](../../docs/service.md) (§Trait API details) for output-dimension behavior.
+    /// See [`docs/service.md`](../../docs/service.md#trait-api-details) for output-dimension behavior.
     fn model_config(&self, model: EmbeddingModel) -> ModelConfig {
         ModelConfig::new(model)
     }

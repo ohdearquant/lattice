@@ -9,7 +9,7 @@ use wasm_bindgen::prelude::*;
 
 /// Installs console-backed panic diagnostics for browser embeddings.
 /// This optional, idempotent hook should run before constructing a [`LatticeEmbedder`].
-/// See `docs/design.md` (§WebAssembly API details) for browser failure behavior.
+/// See [`docs/design.md`](../docs/design.md#webassembly-api-details) for browser failure behavior.
 #[wasm_bindgen(js_name = initPanicHook)]
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
@@ -17,7 +17,7 @@ pub fn init_panic_hook() {
 
 /// An in-memory BERT-family embedding model for browser use.
 /// It defaults to mean pooling; BGE v1.5 callers must select CLS pooling before embedding.
-/// See `docs/design.md` (§WebAssembly API details) for model and pooling requirements.
+/// See [`docs/design.md`](../docs/design.md#webassembly-api-details) for model and pooling requirements.
 #[wasm_bindgen]
 pub struct LatticeEmbedder {
     model: BertModel,
@@ -27,7 +27,7 @@ pub struct LatticeEmbedder {
 impl LatticeEmbedder {
     /// Loads a supported BERT-family model from safetensors, config, and tokenizer bytes.
     /// Returns a JavaScript exception for invalid JSON text, parsing failures, or unsupported models.
-    /// See `docs/design.md` (§WebAssembly API details) for the in-memory loading boundary.
+    /// See [`docs/design.md`](../docs/design.md#webassembly-api-details) for the in-memory loading boundary.
     #[wasm_bindgen(constructor)]
     pub fn new(
         model_bytes: &[u8],
@@ -47,7 +47,7 @@ impl LatticeEmbedder {
 
     /// Selects CLS-token pooling for BGE v1.5 models.
     /// Call this before embedding; mean pooling remains the default for E5 and MiniLM.
-    /// See `docs/design.md` (§WebAssembly API details) for pooling selection.
+    /// See [`docs/design.md`](../docs/design.md#webassembly-api-details) for pooling selection.
     #[wasm_bindgen(js_name = useClsPooling)]
     pub fn use_cls_pooling(&mut self) {
         self.model.set_pooling(BertPooling::CLS);
@@ -111,7 +111,7 @@ pub fn simd_normalize(v: &mut [f32]) {
 
 /// Reports whether the vector bindings use this artifact's SIMD128 dispatch path.
 /// Reads the dispatcher decision rather than independently re-deriving the build feature.
-/// See `docs/design.md` (§WebAssembly API details) for parity-harness semantics.
+/// See [`docs/design.md`](../docs/design.md#webassembly-api-details) for parity-harness semantics.
 #[wasm_bindgen(js_name = simdSimd128Dispatch)]
 pub fn simd_simd128_dispatch() -> bool {
     crate::simd::simd_config().simd128_enabled()

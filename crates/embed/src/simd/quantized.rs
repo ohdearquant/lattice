@@ -139,7 +139,7 @@ impl QuantizedVector {
 
     /// **Unstable**: dequantizes this vector using its stored scale.
     ///
-    /// See `docs/simd.md` (§INT8 vectors) for the encoding and error bounds.
+    /// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for the encoding and error bounds.
     pub fn to_f32(&self) -> Vec<f32> {
         let scale = if self.params.scale.is_finite() && self.params.scale != 0.0 {
             self.params.scale
@@ -166,7 +166,7 @@ impl QuantizedVector {
 /// **Unstable**: computes an approximate float dot product, returning `0.0` for a mismatch.
 ///
 /// Inputs satisfy the constructor-owned `[-127, 127]` invariant.
-/// See `docs/simd.md` (§Raw INT8 input invariant) for its SIMD requirement.
+/// See [`docs/simd.md`](../../docs/simd.md#raw-int8-input-invariant) for its SIMD requirement.
 #[inline]
 pub fn dot_product_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
     debug_assert!(a.data.iter().all(|&v| v != -128i8));
@@ -216,7 +216,7 @@ pub fn cosine_similarity_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
 
 /// Computes INT8 cosine similarity for constructor-owned vectors without a release scan.
 ///
-/// See `docs/simd.md` (§Raw INT8 input invariant) for the trusted-path precondition.
+/// See [`docs/simd.md`](../../docs/simd.md#raw-int8-input-invariant) for the trusted-path precondition.
 #[inline]
 pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
     let denom = a.norm * b.norm;
@@ -230,7 +230,7 @@ pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVec
 ///
 /// # Safety
 /// Caller must provide FEAT_DotProd, equal `[-127, 127]` slices, and bounded prefetches.
-/// See `docs/simd.md` (§INT8 vectors) for dispatch and implementation details.
+/// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for dispatch and implementation details.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
@@ -354,7 +354,7 @@ unsafe fn mm512_sign_epi8(b: __m512i, a: __m512i) -> __m512i {
 ///
 /// # Safety
 /// Caller must provide AVX-512F/VNNI/BW and equal `[-127, 127]` slices; bounds are chunked.
-/// See `docs/simd.md` (§INT8 vectors) for signed-product transformation details.
+/// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for signed-product transformation details.
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 #[target_feature(enable = "avx512f", enable = "avx512vnni", enable = "avx512bw")]
 unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
@@ -426,7 +426,7 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX2 and equal `[-127, 127]` slices; bounds and prefetch are guarded.
-/// See `docs/simd.md` (§INT8 vectors) for signed-product transformation details.
+/// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for signed-product transformation details.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
@@ -593,7 +593,7 @@ fn dot_product_i8_dispatch(a: &[i8], b: &[i8]) -> f32 {
 /// **Unstable**: computes an unscaled raw INT8 dot product, returning `0.0` for a mismatch.
 ///
 /// Every value must lie in `[-127, 127]`; `i8::MIN` is numerically invalid.
-/// See `docs/simd.md` (§Raw INT8 input invariant) for the release-mode precondition.
+/// See [`docs/simd.md`](../../docs/simd.md#raw-int8-input-invariant) for the release-mode precondition.
 #[inline]
 pub fn dot_product_i8_raw(a: &[i8], b: &[i8]) -> f32 {
     if a.len() != b.len() {

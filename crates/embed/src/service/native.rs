@@ -47,7 +47,7 @@ impl LoadedModel {
 /// Pure-Rust local embedding service for one BERT-family or Qwen model configuration.
 ///
 /// It memoizes the load result independently of cancellation.
-/// See [`docs/service.md`](../../docs/service.md) (§NativeEmbeddingService implementation notes) for loading and architecture details.
+/// See [`docs/service.md`](../../docs/service.md#nativeembeddingservice-implementation-notes) for loading and architecture details.
 pub struct NativeEmbeddingService {
     model: Arc<OnceLock<std::result::Result<LoadedModel, String>>>,
     model_config: ModelConfig,
@@ -143,14 +143,14 @@ impl NativeEmbeddingService {
     /// **Unstable**: preload the model without performing an encode pass.
     ///
     /// Returns the same loading errors as the first `embed` call.
-    /// See [`docs/service.md`](../../docs/service.md) (§NativeEmbeddingService implementation notes) for preload behavior.
+    /// See [`docs/service.md`](../../docs/service.md#nativeembeddingservice-implementation-notes) for preload behavior.
     pub async fn ensure_loaded(&self) -> Result<()> {
         self.ensure_model().await.map(|_| ())
     }
 
     /// Ensures the shared model load has completed.
     ///
-    /// See [`docs/service.md`](../../docs/service.md) (§NativeEmbeddingService implementation notes) for the cancellation invariant.
+    /// See [`docs/service.md`](../../docs/service.md#nativeembeddingservice-implementation-notes) for the cancellation invariant.
     async fn ensure_model(&self) -> Result<&LoadedModel> {
         // Fast path: already loaded.
         if let Some(result) = self.model.get() {

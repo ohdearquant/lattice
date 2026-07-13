@@ -64,7 +64,7 @@ impl BackfillCoordinator {
     /// Routes an embedding write request according to migration state.
     ///
     /// `is_new_document` distinguishes initial indexing from ordinary re-embedding.
-    /// See [docs/backfill.md](../../docs/backfill.md) (§`BackfillCoordinator::route_request`) for dual-write semantics.
+    /// See [`docs/backfill.md`](../../docs/backfill.md#backfillcoordinatorroute_request) for dual-write semantics.
     pub fn route_request(&self, is_new_document: bool) -> EmbeddingRoute {
         match self.controller.state() {
             MigrationState::Planned => EmbeddingRoute::Legacy,
@@ -116,7 +116,7 @@ impl BackfillCoordinator {
     ///
     /// Returns [`MigrationError::InvalidTransition`] outside `InProgress`.
     ///
-    /// See [docs/backfill.md](../../docs/backfill.md) (§`BackfillCoordinator::record_batch`) for accounting and cutover timing.
+    /// See [`docs/backfill.md`](../../docs/backfill.md#backfillcoordinatorrecord_batch) for accounting and cutover timing.
     pub fn record_batch(&mut self, count: usize) -> Result<(), MigrationError> {
         let was_in_progress = matches!(self.controller.state(), MigrationState::InProgress { .. });
         self.backfilled_count += count;
@@ -268,7 +268,7 @@ impl BackfillCoordinator {
     /// Returns the number of items that may be processed in the next batch.
     ///
     /// Returns zero outside `InProgress` and caps effective remaining work at the configured size.
-    /// See [docs/backfill.md](../../docs/backfill.md) (§`BackfillCoordinator::next_batch_size`) for its accounting rule.
+    /// See [`docs/backfill.md`](../../docs/backfill.md#backfillcoordinatornext_batch_size) for its accounting rule.
     pub fn next_batch_size(&self) -> usize {
         match self.controller.state() {
             MigrationState::InProgress {

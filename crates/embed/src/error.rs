@@ -71,7 +71,7 @@ pub enum EmbedError {
     Internal(String),
 
     /// A prepared SIMD operation received data at a different quantization tier.
-    /// See `docs/design.md` (§Prepared-dispatch errors) for recovery and failure semantics.
+    /// See [`docs/design.md`](../docs/design.md#prepared-dispatch-errors) for recovery and failure semantics.
     #[error("tier mismatch in {op}: expected {expected:?}, got {actual:?}")]
     TierMismatch {
         /// Name of the operation where the mismatch was detected.

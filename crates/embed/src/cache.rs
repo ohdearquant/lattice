@@ -92,7 +92,7 @@ impl CacheShard {
 ///
 /// Thread-safe, sharded LRU cache for computed embeddings.
 /// A capacity of zero disables storage operations.
-/// See `docs/design.md` (§EmbeddingCache) for key identity, locking, and capacity semantics.
+/// See [`docs/design.md`](../docs/design.md#embeddingcache) for key identity, locking, and capacity semantics.
 pub struct EmbeddingCache {
     shards: Vec<CacheShard>,
     enabled: bool,
@@ -111,7 +111,7 @@ impl EmbeddingCache {
     ///
     /// Creates a cache with the requested capacity; zero disables storage.
     /// Nonzero capacity is rounded up independently across its fixed shards.
-    /// See `docs/design.md` (§EmbeddingCache) for sharding and eviction behavior.
+    /// See [`docs/design.md`](../docs/design.md#embeddingcache) for sharding and eviction behavior.
     pub fn new(capacity: usize) -> Self {
         let enabled = capacity != 0;
 
@@ -144,7 +144,7 @@ impl EmbeddingCache {
     /// **Unstable**: the key scheme may change; do not persist keys across sessions.
     ///
     /// Hashes text, model identity, active dimension, and retrieval role into a cache key.
-    /// See `docs/design.md` (§EmbeddingCache) for identity and collision-isolation details.
+    /// See [`docs/design.md`](../docs/design.md#embeddingcache) for identity and collision-isolation details.
     pub fn compute_key(
         &self,
         text: &str,

@@ -80,7 +80,7 @@ pub(crate) fn normalize_scalar(vector: &mut [f32]) {
 ///
 /// # Safety
 /// Caller must provide AVX-512F; chunked unaligned access stays in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
@@ -194,7 +194,7 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
 ///
 /// # Safety
 /// Caller must provide AVX2 and FMA; chunked unaligned access stays in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
@@ -284,7 +284,7 @@ unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
 ///
 /// # Safety
 /// Caller must run on aarch64; chunked unaligned access stays in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for convergence and fallback semantics.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for convergence and fallback semantics.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
@@ -386,7 +386,7 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
 ///
 /// # Safety
 /// This function requires the compile-time `simd128` target feature; bounds are chunked.
-/// See `docs/simd.md` (§Kernel safety boundary) for wasm alignment semantics.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for wasm alignment semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn normalize_simd128_unrolled(vector: &mut [f32]) {

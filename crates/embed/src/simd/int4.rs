@@ -110,7 +110,7 @@ impl Int4Vector {
 
     /// **Unstable**: dequantizes packed INT4 data, or returns empty for a malformed buffer.
     ///
-    /// See `docs/simd.md` (§INT4 vectors) for format and precision bounds.
+    /// See [`docs/simd.md`](../../docs/simd.md#int4-vectors) for format and precision bounds.
     pub fn to_f32(&self) -> Vec<f32> {
         let required_bytes = self.dims.div_ceil(2);
         if self.data.len() < required_bytes {

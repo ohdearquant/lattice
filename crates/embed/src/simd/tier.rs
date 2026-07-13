@@ -267,7 +267,7 @@ pub fn prepare_query_with_norm(
 /// **Unstable**: computes prepared cosine distance in `[0, 2]` for matching tiers.
 ///
 /// Returns [`EmbedError::TierMismatch`] for a different stored tier.
-/// See `docs/simd.md` (§Prepared queries and tier matching) for the per-tier paths.
+/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for the per-tier paths.
 #[inline]
 pub fn approximate_cosine_distance_prepared(
     query: &PreparedQuery,
@@ -309,7 +309,7 @@ pub fn try_approximate_dot_product_prepared(
 /// Computes prepared cosine distance, using the `Full` unit-norm fast path when asserted.
 ///
 /// Returns [`EmbedError::TierMismatch`] for a tier mismatch.
-/// See `docs/simd.md` (§Prepared queries and tier matching) for hint semantics.
+/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for hint semantics.
 #[inline]
 pub fn approximate_cosine_distance_prepared_with_meta(
     meta: &PreparedQueryWithMeta,
@@ -329,7 +329,7 @@ pub fn approximate_cosine_distance_prepared_with_meta(
 /// **Unstable**: computes a prepared dot product for matching non-binary tiers.
 ///
 /// Returns [`EmbedError::TierMismatch`] for different tiers or [`EmbedError::Internal`] for binary.
-/// See `docs/simd.md` (§Prepared queries and tier matching) for supported paths.
+/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for supported paths.
 #[inline]
 pub fn approximate_dot_product_prepared(
     query: &PreparedQuery,
@@ -367,7 +367,7 @@ pub fn batch_approximate_cosine_distance_prepared(
 /// Writes prepared-query distances into a reusable buffer, clearing it on error.
 ///
 /// Returns [`EmbedError::TierMismatch`] if any stored tier differs.
-/// See `docs/simd.md` (§Prepared queries and tier matching) for buffer semantics.
+/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for buffer semantics.
 #[inline]
 pub fn batch_approximate_cosine_distance_prepared_into(
     query: &PreparedQuery,
@@ -485,7 +485,7 @@ pub fn approximate_int4_batch_prepared_into(
 /// **Unstable**: quantizes an `f32` query and computes tiered cosine distance.
 ///
 /// `query_f32.len()` must match stored dimensionality.
-/// See `docs/simd.md` (§Prepared queries and tier matching) for hot-loop guidance.
+/// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for hot-loop guidance.
 pub fn approximate_cosine_distance(query_f32: &[f32], stored: &QuantizedData) -> f32 {
     debug_assert_eq!(
         query_f32.len(),

@@ -19,13 +19,13 @@ INT8 dot-product dispatch also cache their chosen function pointers. This keeps
 feature checks and `OnceLock` initialization out of inner batch loops. Distance
 and normalization reuse the cached configuration when they choose a kernel.
 
-| Operation family | x86_64 priority | aarch64 priority | wasm32 | fallback |
-| --- | --- | --- | --- | --- |
-| Float dot, cosine, squared L2, normalize | AVX-512F, then AVX2 + FMA | NEON | SIMD128 when compiled in | scalar |
-| Batch-four float dot | AVX2 + FMA | NEON | none | scalar |
-| INT8 dot | AVX-512 VNNI + BW when the `avx512` feature is built, then AVX2 | NEON only with FEAT_DotProd | none | scalar |
-| Binary Hamming | none | NEON `vcnt` | none | scalar |
-| INT4 dot | none | NEON | none | scalar |
+| Operation family                         | x86_64 priority                                                 | aarch64 priority            | wasm32                   | fallback |
+| ---------------------------------------- | --------------------------------------------------------------- | --------------------------- | ------------------------ | -------- |
+| Float dot, cosine, squared L2, normalize | AVX-512F, then AVX2 + FMA                                       | NEON                        | SIMD128 when compiled in | scalar   |
+| Batch-four float dot                     | AVX2 + FMA                                                      | NEON                        | none                     | scalar   |
+| INT8 dot                                 | AVX-512 VNNI + BW when the `avx512` feature is built, then AVX2 | NEON only with FEAT_DotProd | none                     | scalar   |
+| Binary Hamming                           | none                                                            | NEON `vcnt`                 | none                     | scalar   |
+| INT4 dot                                 | none                                                            | NEON                        | none                     | scalar   |
 
 On `wasm32`, SIMD128 is a build property rather than a runtime capability. A
 module compiled with `-C target-feature=+simd128` contains the SIMD kernels;
@@ -144,12 +144,12 @@ part of the safety boundary for changes to the kernels.
 uses ceiling division for packed formats, so it is authoritative for odd
 dimensions.
 
-| Tier | Representation | Bytes per dimension | Compression vs. `f32` | Typical role |
-| --- | --- | ---: | ---: | --- |
-| `Full` | `Vec<f32>` | 4 | 1x | Hot data and exact search |
-| `Int8` | signed byte plus parameters | 1 | 4x | Warm data and HNSW search |
-| `Int4` | two unsigned nibbles per byte | 0.5 | 8x | Cool data and pre-filtering |
-| `Binary` | one sign bit per dimension | 0.125 | 32x | Cold data and coarse filtering |
+| Tier     | Representation                | Bytes per dimension | Compression vs. `f32` | Typical role                   |
+| -------- | ----------------------------- | ------------------: | --------------------: | ------------------------------ |
+| `Full`   | `Vec<f32>`                    |                   4 |                    1x | Hot data and exact search      |
+| `Int8`   | signed byte plus parameters   |                   1 |                    4x | Warm data and HNSW search      |
+| `Int4`   | two unsigned nibbles per byte |                 0.5 |                    8x | Cool data and pre-filtering    |
+| `Binary` | one sign bit per dimension    |               0.125 |                   32x | Cold data and coarse filtering |
 
 `QuantizationTier::from_age_seconds` is a simple recency heuristic, not a
 measurement of vector quality: under one hour selects `Full`; one hour through
@@ -167,12 +167,12 @@ Quantizing a query inside every candidate comparison repeats work and can
 allocate. `PreparedQuery` quantizes once at the candidate tier, then is reused
 against a homogeneous list. The prepared and stored tiers must match:
 
-| Prepared query and stored data | Cosine-distance path | Dot-product path |
-| --- | --- | --- |
-| `Full` / `Full` | `1 - cosine_similarity` | float dot product |
-| `Int8` / `Int8` | `1 - cosine_similarity_i8_trusted` | trusted INT8 dot product |
-| `Int4` / `Int4` | INT4 cosine distance | INT4 dequantized dot product |
-| `Binary` / `Binary` | Hamming-derived approximation | no meaningful prepared dot product |
+| Prepared query and stored data | Cosine-distance path               | Dot-product path                   |
+| ------------------------------ | ---------------------------------- | ---------------------------------- |
+| `Full` / `Full`                | `1 - cosine_similarity`            | float dot product                  |
+| `Int8` / `Int8`                | `1 - cosine_similarity_i8_trusted` | trusted INT8 dot product           |
+| `Int4` / `Int4`                | INT4 cosine distance               | INT4 dequantized dot product       |
+| `Binary` / `Binary`            | Hamming-derived approximation      | no meaningful prepared dot product |
 
 The prepared distance and dot-product APIs return `EmbedError::TierMismatch`
 for a mixed tier. A prepared binary dot product returns `EmbedError::Internal`;
@@ -350,14 +350,14 @@ distance.
 
 Use the operation that matches the data and search stage:
 
-| Situation | Recommended operation |
-| --- | --- |
-| Unit-normalized float embeddings | `dot_product` or `batch_dot_product` |
-| Float embeddings with unknown norms | `cosine_similarity_fused` or `cosine_similarity` |
-| ANN ranking where only L2 ordering matters | `squared_euclidean_distance` |
-| One query against many same-tier compressed candidates | prepare once, then use a prepared batch API |
-| Coarse candidate filter with maximum compression | binary Hamming/cosine approximation, followed by a higher-fidelity rerank |
-| Reusing a caller-owned result buffer | a `*_into` prepared batch API |
+| Situation                                              | Recommended operation                                                     |
+| ------------------------------------------------------ | ------------------------------------------------------------------------- |
+| Unit-normalized float embeddings                       | `dot_product` or `batch_dot_product`                                      |
+| Float embeddings with unknown norms                    | `cosine_similarity_fused` or `cosine_similarity`                          |
+| ANN ranking where only L2 ordering matters             | `squared_euclidean_distance`                                              |
+| One query against many same-tier compressed candidates | prepare once, then use a prepared batch API                               |
+| Coarse candidate filter with maximum compression       | binary Hamming/cosine approximation, followed by a higher-fidelity rerank |
+| Reusing a caller-owned result buffer                   | a `*_into` prepared batch API                                             |
 
 Do not compare float SIMD output for bit equality with the scalar reference, do
 not feed `i8::MIN` to an INT8 SIMD raw path, and do not count padding bits in

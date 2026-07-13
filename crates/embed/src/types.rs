@@ -152,7 +152,7 @@ impl EmbeddingKey {
     }
 
     /// Returns deterministic bytes that identify this exact embedding space.
-    /// See `docs/design.md` (§Vector-space identity wire format) for the byte layout.
+    /// See [`docs/design.md`](../docs/design.md#vector-space-identity-wire-format) for the byte layout.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 

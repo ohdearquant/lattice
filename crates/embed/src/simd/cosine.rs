@@ -93,7 +93,7 @@ fn cosine_simd128_kernel(a: &[f32], b: &[f32]) -> f32 {
 
 /// Computes cosine similarity, returning `0.0` for a mismatch, empty input, or zero norm.
 ///
-/// See `docs/simd.md` (§Cosine similarity) for fused reduction and normalized-input use.
+/// See [`docs/simd.md`](../../docs/simd.md#cosine-similarity) for fused reduction and normalized-input use.
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
@@ -121,7 +121,7 @@ pub(crate) fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX-512F and equal, non-empty slices; chunked loads stay in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn cosine_similarity_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -230,7 +230,7 @@ unsafe fn cosine_similarity_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must provide AVX2/FMA and equal, non-empty slices; chunked loads stay in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn cosine_similarity_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -323,7 +323,7 @@ unsafe fn cosine_similarity_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// Caller must run on aarch64 with equal, non-empty slices; chunked loads stay in bounds.
-/// See `docs/simd.md` (§Kernel safety boundary) for the shared kernel invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn cosine_similarity_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -412,7 +412,7 @@ unsafe fn cosine_similarity_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 /// This function requires compile-time SIMD128 and equal, non-empty slices; bounds are chunked.
-/// See `docs/simd.md` (§Kernel safety boundary) for wasm and reassociation semantics.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for wasm and reassociation semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn cosine_similarity_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
