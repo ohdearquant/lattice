@@ -1,8 +1,10 @@
-//! Fail-closed manifest-driven loader for LoRA adapters.
+//! Fail-closed manifest-driven loading for LoRA adapters.
 //!
-//! `load_adapters_from_manifest` validates every approved adapter through
-//! eleven ordered checks, returning `Err` on the first anomaly encountered.
-//! There is no partial success and no silent skip.
+//! Every manifest entry must be approved and pass path, size, integrity,
+//! format, metadata, and optional serving-revision checks before any adapter
+//! list is returned. The loader never silently skips a failed entry or returns
+//! a partial result.
+//! See docs/lora-io.md.
 
 use super::LoraAdapter;
 use super::manifest::{AdapterId, AdapterStatus, LoraManifest, ManifestEntry};

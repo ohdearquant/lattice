@@ -1,4 +1,8 @@
-//! Dataset loading and batching
+//! In-memory dataset filtering, batching, splitting, and statistics.
+//!
+//! Dataset configuration controls eligibility and epoch iteration; batches own
+//! cloned examples. See `docs/data.md` for filtering, shuffle, and split
+//! semantics.
 
 use super::TrainingExample;
 use crate::error::{Result, TuneError};
@@ -26,7 +30,7 @@ pub struct DatasetConfig {
     /// Minimum context size required (filter out shorter examples)
     pub min_context_size: usize,
 
-    /// Maximum context size (truncate longer sequences)
+    /// Maximum context size accepted when filtering at construction
     pub max_context_size: Option<usize>,
 }
 

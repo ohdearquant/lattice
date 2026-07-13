@@ -1,15 +1,10 @@
-//! Load PEFT-format LoRA adapters from safetensors files.
+//! PEFT/MLX safetensors import and PEFT-compatible export for LoRA adapters.
 //!
-//! PEFT (Parameter-Efficient Fine-Tuning) saves LoRA weights with keys like:
-//! ```text
-//! base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.weight  -> (rank, d_in)
-//! base_model.model.model.layers.{i}.self_attn.q_proj.lora_B.weight  -> (d_out, rank)
-//! base_model.model.model.layers.{i}.mlp.gate_proj.lora_A.weight     -> (rank, d_in)
-//! base_model.model.model.layers.{i}.mlp.gate_proj.lora_B.weight     -> (d_out, rank)
-//! ```
-//!
-//! This module parses those keys, extracts layer index and module name,
-//! and loads the A/B matrix pairs into [`LoraLayer`] structs.
+//! A factor pair is keyed by transformer layer and projection: A is
+//! `(rank, d_in)` and B is `(d_out, rank)` after MLX normalization. Parsing
+//! rejects incomplete, malformed, non-finite, or rank-inconsistent pairs.
+//! File reads are bounded before parsing.
+//! See docs/lora-io.md.
 
 use super::{LoraAdapter, LoraConfig, LoraLayer};
 use crate::error::TuneError;

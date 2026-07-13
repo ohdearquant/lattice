@@ -1,4 +1,8 @@
-//! Checkpoint management
+//! In-memory training checkpoint representation.
+//!
+//! Checkpoints carry metadata, metrics, weights, and optimizer bytes; this
+//! module does not perform persistence. See `docs/train.md` for the format and
+//! resume limitations.
 
 use super::metrics::TrainingMetrics;
 use chrono::{DateTime, Utc};
@@ -9,17 +13,10 @@ use serde::{Deserialize, Serialize};
 
 /// Checkpoint of training state.
 ///
-/// # Serialization format (load-bearing)
-///
-/// With the `serde` feature, checkpoints serialize to JSON. See
-/// [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md)
-/// for the full JSON schema, a loading example, and the file naming convention. Two fields
-/// carry a byte-level contract that is not visible from their `Vec<u8>` type:
-///
-/// - `weights`: little-endian `f32` values, concatenated layer-by-layer (each layer's weight
-///   matrix in row-major order, then its biases; input-to-output order across layers).
-/// - `optimizer_state`: optimizer-specific — SGD-with-momentum stores one velocity vector per
-///   parameter; Adam stores first (`m`) and second (`v`) moment vectors per parameter.
+/// With `serde`, the representation is JSON. `weights` are little-endian `f32`
+/// values ordered layer-by-layer (row-major weights, then biases, input to
+/// output); `optimizer_state` stores momentum or Adam moment vectors per
+/// parameter. See `docs/train.md` for the full format and persistence contract.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Checkpoint {

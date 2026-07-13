@@ -1,74 +1,35 @@
-//! Weighted blending of multiple LoRA adapters into a single rank-Σr adapter.
+//! Exact CPU blending of adapters into one higher-rank adapter.
 //!
-//! # Why blend instead of loading multiple adapters
+//! The blend vertically concatenates A blocks and horizontally concatenates B
+//! blocks after folding in each mixture weight and `alpha / rank` scale. Its
+//! returned configuration sets `alpha == rank_total`, so its scale is exactly 1.
 //!
-//! The Metal inference path holds exactly one `Option<MetalLoraAdapter>` slot.
-//! Rather than adding a Metal kernel that dispatches across N adapters,
-//! we pre-blend on the CPU once per request: the result is a standard single
-//! adapter loaded through the existing single-slot path with no kernel changes.
-//!
-//! # Blend math (exact, not approximate)
-//!
-//! For adapter `e` with effective scale `s_e = alpha_e / rank_e` and mixture
-//! weight `w_e`:
-//!
-//! ```text
-//! Δ_e x = s_e · B_e @ (A_e @ x)
-//! blend  = Σ_e  w_e · Δ_e x
-//!        = B_blend @ (A_blend @ x)
-//! ```
-//!
-//! where
-//! - `A_blend = vconcat[A_1; …; A_N]`          shape `(Σr_e) × d_in`
-//! - `B_blend = hconcat[(w_1·s_1)·B_1 | …]`    shape `d_out × (Σr_e)`
-//!
-//! The `w_e · s_e` coefficient is folded into the B column block so the
-//! blended adapter's effective scale is exactly **1.0** (`alpha = rank_total`).
+//! See `docs/lora-core.md` for the derivation, limits, and failure behavior.
 
 use crate::error::{Result, TuneError};
 use crate::lora::{LoraAdapter, LoraConfig, LoraLayer};
 use std::collections::HashMap;
 
-/// Maximum total rank allowed across all adapters in a single blend.
-///
-/// The GEMV kernels that consume the blended adapter assume a modest rank budget
-/// (≤ ~64 per adapter in a typical mixture).  This cap allows a generous mixture
-/// while bounding allocations and rejecting adversarially large adapter pools.
+/// Maximum summed rank for one blended projection.
 pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
 
-/// Aggregate cap on a blended adapter's total element count, summed across
-/// every (layer_idx, module) projection: Σ rank_total·(d_in + d_out). At f32
-/// this bounds the blended-adapter allocation to ~4 GiB. MAX_BLEND_RANK_TOTAL
-/// bounds one projection; this bounds the whole blend, so a full-model adapter
-/// that keeps every projection near the per-group cap cannot drive a multi-GiB
-/// aggregate allocation. A realistic micro-LoRA mixture is far below this; a
-/// large-model mixture at modest summed rank stays within budget, while a
-/// rank-4096-everywhere adapter (tens of GiB) is rejected before any allocation.
+/// Aggregate cap on all blended A and B elements (about 4 GiB of f32 storage).
 pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
 
 /// Blend a set of `(adapter, mixture_weight)` pairs into one rank-Σr adapter.
 ///
-/// Each adapter in `adapters` contributes to the blended result with its
-/// corresponding weight `w_e`.  The per-adapter `alpha/rank` scale is folded
-/// into the B column block, so the returned adapter's effective scale is 1.0
-/// (i.e., `LoraConfig { alpha: rank_total, rank: rank_total }`).
-///
-/// # Target-module semantics
-///
-/// For each `(layer_idx, module)` pair that appears in **any** of the input
-/// adapters, a blended layer is produced.  An adapter that does not cover a
-/// given pair contributes zero (it is simply absent from the vertical/horizontal
-/// concatenation for that pair).
+/// Each adapter contributes with its corresponding mixture weight. Its
+/// `alpha/rank` scale is folded into B, and the returned adapter has scale 1.
+/// Every projection present in any input is included; inputs missing that
+/// projection contribute nothing to its blended layer.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - `adapters` is empty
 /// - Any weight is not finite
-/// - Two adapters share a `(layer_idx, module)` pair but disagree on `d_in` or `d_out`
-/// - The summed rank for a single projection exceeds `MAX_BLEND_RANK_TOTAL`
-/// - The aggregate blend size across all projections exceeds `MAX_BLEND_TOTAL_ELEMENTS`
-/// - A layer's A or B buffer length does not match its declared `rank`, `d_in`, or `d_out`
+/// - Shared projections disagree on dimensions or have malformed buffers
+/// - A rank, allocation budget, or size calculation exceeds its limit
 /// - Rank accumulation or a size product overflows `usize`
 pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapter> {
     if adapters.is_empty() {

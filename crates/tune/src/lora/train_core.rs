@@ -1,5 +1,12 @@
 #![allow(missing_docs)]
 
+//! Private backward tape for micro-LoRA training.
+//!
+//! The tape materializes a Qwen3.5 suffix, preserves mixer and FFN activations,
+//! and uses a validated context to bind geometry, slots, rank/scale, and Adam.
+//!
+//! See `docs/lora-core.md` for the forward/backward walk and shape invariants.
+
 use lattice_inference::attention::gdn::GatedDeltaNetWeights;
 use lattice_inference::attention::gdn_backward::{GdnSaved, gdn_backward, gdn_forward_save};
 use lattice_inference::backward::attention_gqa::{AttnCache, gqa_backward, gqa_forward_with_cache};
@@ -283,22 +290,10 @@ impl AdamConfig {
     }
 }
 
-/// Validated, immutable run context for the training tape's core entry
-/// points (`forward_full`, `eval_chain_nll`, `nll_and_grads`,
-/// `apply_adam_updates`, `apply_gdn_adam_updates`).
+/// Validated, immutable context for the training tape's core entry points.
 ///
-/// `TrainCtx::try_new` is the only constructor: it validates rank and
-/// hyperparameter finiteness, checks that `geometry`'s `Dims`/`GdnDims` agree
-/// with `geometry.model`, and checks that `slots`' GQA/GDN layer indices are
-/// each unique, in-range for `geometry.model`, and never claim the same layer
-/// index for both mixer kinds. A `TrainCtx` cannot exist unless all of that
-/// holds, so callers of the narrowed entry points no longer have to
-/// reconstruct — or get wrong — the positional-argument agreement the old
-/// ten-argument signatures relied on.
-///
-/// Non-goal: `TrainCtx` owns geometry, layout, and optimizer policy only — it
-/// never owns weights, caches, gradients, LoRA vectors, or optimizer state
-/// (see issue #844's Non-goals).
+/// It binds geometry, layer slots, execution scale, and Adam policy, but never
+/// owns weights, caches, gradients, LoRA vectors, or optimizer state.
 pub struct TrainCtx<'a> {
     geometry: TapeGeometry<'a>,
     lora: LoraExecution,

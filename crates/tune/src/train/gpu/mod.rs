@@ -1,6 +1,8 @@
-//! GPU-accelerated training infrastructure
+//! GPU forward, loss, validation, and training-step infrastructure.
 //!
-//! Uses lattice-fann's wgpu-based GPU backend for accelerated training.
+//! The backend uses lattice-fann's WGPU network and rejects non-finite outputs.
+//! Its optimizer update path intentionally fails until buffer binding and weight
+//! write-back are implemented, so validation is forward-only. See `docs/train.md`.
 
 mod builder;
 mod optimizers;
@@ -17,23 +19,11 @@ use lattice_fann::gpu::{GpuContext, GpuNetwork};
 use state::{LayerGradients, OptimizerState};
 use std::sync::Arc;
 
-/// GPU-accelerated trainer
+/// GPU-backed trainer using lattice-fann's WGPU network.
 ///
-/// Provides GPU-accelerated forward/backward passes and weight updates
-/// using lattice-fann's wgpu backend.
-///
-/// # Current limitation
-///
-/// [`Self::train_batch`] returns `Err(TuneError::Training(_))` for every
-/// optimizer choice (Adam, AdamW, SGD-momentum, plain SGD, RMSprop): the
-/// GPU-shader optimizer dispatch has no buffer bindings wired to the
-/// network's weight/gradient buffers, and the CPU-side plain-SGD arm has
-/// neither real gradient plumbing nor a mutable weight write-back path.
-/// Forward pass and loss computation work correctly — [`Self::validate`] is
-/// a forward-only path that does not touch the optimizer. Only the
-/// weight-update step is unimplemented. See
-/// <https://github.com/ohdearquant/lattice/issues/797>. This note will be
-/// removed once that wiring lands.
+/// [`Self::train_batch`] currently returns `TuneError::Training` for every
+/// optimizer instead of reporting a no-effect update. [`Self::validate`] is a
+/// usable forward-only path. See `docs/train.md` for the backend status.
 pub struct GpuTrainer {
     /// GPU context (device, queue, shader manager)
     ctx: Arc<GpuContext>,

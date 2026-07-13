@@ -1,37 +1,10 @@
-// Multi-layer reverse-mode (exact) gradient LoRA trainer for Qwen3.5-0.8B.
+// Exact reverse-mode LoRA trainer for a Qwen3.5 layer range ending at layer 23.
 //
-// Generalises train_grad_layer23 from a single GQA layer to a layer RANGE
-// [first_layer ..= 23], dispatching per layer kind and propagating dx through
-// the frozen GatedDeltaNet layers via gdn_backward. This is the full-depth
-// backward tape: gradient from the CE loss flows back through the head, through
-// every materialised layer's FFN + mixer + norms, accumulating LoRA grads at the
-// GQA layers and threading dx through the frozen GDN layers in between.
-//
-//   h_in (frozen prefix 0..first_layer)  ── captured once per sample
-//   for L in first_layer ..= 23:
-//     normed_pre = rms_norm(h, pre_norm[L])
-//     mixer_out  = GQA(normed_pre; LoRA)  | GDN(normed_pre)   (frozen if GDN)
-//     h_mid      = h + mixer_out
-//     ffn_out    = swiglu(rms_norm(h_mid, post_norm[L]))
-//     h          = h_mid + ffn_out
-//   logits = lm_head · rms_norm(h, final_norm)
-//   loss   = CE(logits, next_token) over completion positions
-//
-// Default first_layer = 19, so the materialised stack is
-//   19 (GQA+LoRA) → 20,21,22 (GDN, frozen) → 23 (GQA+LoRA).
-// Layer-19's LoRA gradient is only correct if dx propagated correctly back
-// through the three frozen GDN layers, so the finite-difference gradcheck on
-// layer-19's params is the integration test for gdn_backward + the assembled
-// residual/norm chain — exactly the gap the per-block self-consistent
-// gradchecks cannot see.
-//
-// Qwen3.5 RMSNorm is SHIFTED (x·inv·(1+gamma)); rms_norm_forward/rmsnorm_backward
-// take plain gamma, so layer/final norms get (1+gamma) precomputed weights.
-// q_norm/k_norm are shifted inside gqa_forward_with_cache, so they stay raw.
-//
-// Usage: train_grad_full --model-dir <path> --data-dir <path> [--first-layer 19]
-//        [--steps 25] [--lr 1e-3] [--rank 8] [--alpha 16] [--max-train 3]
-//        [--seq-len 64] [--gradcheck]
+// It caches the frozen prefix, backpropagates through materialized GQA and
+// frozen GDN layers, and uses trust-but-verify before training or gradcheck.
+// Shifted RMSNorm weights are prepared for layer and final norms; GQA q/k
+// normalization remains owned by the GQA forward path. See docs/design.md for
+// the tape, JSONL contract, validation strategy, and command-line workflow.
 
 use std::path::PathBuf;
 use std::time::Instant;

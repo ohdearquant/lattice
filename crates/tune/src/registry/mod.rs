@@ -1,52 +1,10 @@
-//! Model registry module
+//! Versioned model records, artifact storage, and deployment helpers.
 //!
-//! Provides versioned model storage and retrieval with deployment features.
+//! [`ModelRegistry`] provides lock-free record reads and serialized writes;
+//! [`LiveModel`] atomically swaps a serving record. Shadow evaluation and
+//! rollback recording are explicit workflow helpers, not automatic deployment.
 //!
-//! # Architecture
-//!
-//! ```text
-//! Training → Model → Registry → Shadow → Deployment
-//!                  ↓              ↓           ↓
-//!              Storage     Evaluation    Rollback
-//! ```
-//!
-//! # Concurrency
-//!
-//! [`ModelRegistry`] uses `ArcSwap` for lock-free reads during concurrent
-//! updates. All read methods return owned snapshots; write methods are
-//! serialized internally. See [`LiveModel`] for atomic model hot-swap.
-//!
-//! # Safe Deployment
-//!
-//! The registry includes two features for safe model deployment:
-//!
-//! - **Shadow Evaluation** ([`ShadowSession`]): Run candidate models in parallel
-//!   with production to compare outputs before promotion.
-//! - **Rollback** ([`RollbackController`]): Quickly revert to a previous model
-//!   version when issues are detected, with full audit history.
-//!
-//! # Security
-//!
-//! When the `safetensors` feature is enabled, model weights can be serialized
-//! using the safetensors format which prevents arbitrary code execution attacks.
-//! This is **strongly recommended** for production deployments.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use lattice_tune::registry::{ModelRegistry, RegisteredModel, ModelMetadata};
-//!
-//! // Create a registry
-//! let mut registry = ModelRegistry::new("/path/to/models");
-//!
-//! // Register a model
-//! let model = RegisteredModel::new("intent_classifier", "1.0.0")
-//!     .with_metadata(metadata);
-//! registry.register(model)?;
-//!
-//! // Load a model
-//! let model = registry.get("intent_classifier", "1.0.0")?;
-//! ```
+//! See `docs/registry.md` for the registry design, storage formats, and lifecycle.
 
 mod live_model;
 mod model;

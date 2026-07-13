@@ -1,4 +1,7 @@
-//! Training metrics
+//! Per-epoch and aggregate training metrics.
+//!
+//! Metrics retain history, best validation loss, final values, and simple trend
+//! queries. See `docs/train.md` for update order and interpretation caveats.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
