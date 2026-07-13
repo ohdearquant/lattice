@@ -101,11 +101,31 @@ class LatticeAdapter:
         self.model_dir = model_dir
         self.tokenizer_dir = tokenizer_dir
 
+    def _assert_q4_identity(self) -> None:
+        """Refuse to run unless the resolved dir is what `bench_decode_ab`'s
+        `detect_format` will actually load as Q4. Mirrors
+        `crates/inference/src/model_format.rs::detect_format` precedence:
+        safetensors markers win over `.q4` files, so their presence means the
+        binary would silently benchmark the full-precision checkpoint under a
+        Q4 label -- exactly the historical bench_q4_apples.sh failure mode."""
+        for marker in ("model.safetensors", "model.safetensors.index.json"):
+            if (self.model_dir / marker).exists():
+                raise LatticeUnavailableError(
+                    f"lattice: {self.model_dir} contains {marker}; detect_format would "
+                    "load safetensors, not Q4 -- refusing to mislabel the run"
+                )
+        if not any(p.suffix == ".q4" for p in self.model_dir.iterdir()):
+            raise LatticeUnavailableError(
+                f"lattice: {self.model_dir} has no .q4 files; detect_format would not "
+                "load it as Q4 -- refusing to mislabel the run"
+            )
+
     def run(
         self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str
     ) -> harness.AdapterRunResult:
         if not self.model_dir.is_dir():
             raise LatticeUnavailableError(f"lattice: Q4 model dir missing ({self.model_dir})")
+        self._assert_q4_identity()
         env = os.environ.copy()
         env["BENCH_N"] = str(n_tokens)
         env["BENCH_RUNS"] = "1"

@@ -167,18 +167,60 @@ class LatticeAdapterEnvVarCorrectionTest(unittest.TestCase):
                 cmd, 0, stdout="RESULT n_req=32 completion=32 total_ms=100.0\n", stderr=""
             )
 
-        adapter = adapters.LatticeAdapter(
-            bin_path=Path("/bin/true"), model_dir=Path("/tmp"), tokenizer_dir=Path("/tmp")
-        )
-        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(
-            subprocess, "run", side_effect=fake_run
-        ):
-            adapter.run(prompt="hi", n_tokens=32, warmup=False, model="qwen3.5-0.8b-q4", quantization="q4")
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            (model_dir / "weights.q4").write_bytes(b"stub")
+            adapter = adapters.LatticeAdapter(
+                bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+            )
+            with mock.patch.object(subprocess, "run", side_effect=fake_run):
+                adapter.run(
+                    prompt="hi", n_tokens=32, warmup=False, model="qwen3.5-0.8b-q4", quantization="q4"
+                )
 
         self.assertIn("LATTICE_MODEL_DIR", captured)
         self.assertIn("LATTICE_TOKENIZER_DIR", captured)
         self.assertNotIn("BENCH_Q4_DIR", captured)
         self.assertNotIn("BENCH_TOKENIZER_DIR", captured)
+
+
+class LatticeAdapterModelIdentityTest(unittest.TestCase):
+    """The adapter must refuse to run when the resolved dir is not what
+    `detect_format` would load as Q4 (safetensors markers take precedence in
+    the binary, so their presence means a mislabeled full-precision run --
+    the historical bench_q4_apples.sh failure mode)."""
+
+    def _adapter_for(self, model_dir):
+        return adapters.LatticeAdapter(
+            bin_path=Path("/bin/true"), model_dir=model_dir, tokenizer_dir=model_dir
+        )
+
+    def test_refuses_safetensors_shaped_dir_even_with_q4_files(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            (model_dir / "weights.q4").write_bytes(b"stub")
+            (model_dir / "model.safetensors").write_bytes(b"stub")
+            with self.assertRaises(adapters.LatticeUnavailableError) as ctx:
+                self._adapter_for(model_dir).run(
+                    prompt="hi", n_tokens=32, warmup=False, model="m", quantization="q4"
+                )
+            self.assertIn("safetensors", str(ctx.exception))
+
+    def test_refuses_dir_without_q4_files(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            (model_dir / "config.json").write_bytes(b"{}")
+            with self.assertRaises(adapters.LatticeUnavailableError) as ctx:
+                self._adapter_for(model_dir).run(
+                    prompt="hi", n_tokens=32, warmup=False, model="m", quantization="q4"
+                )
+            self.assertIn("no .q4 files", str(ctx.exception))
 
 
 class LatticeResultParsingTest(unittest.TestCase):
