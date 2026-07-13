@@ -420,18 +420,54 @@ def run_selftest() -> int:
         # end. An earlier fixture kept its own hardcoded `shell_allowlist`
         # set instead of reading it from the actual shell code — a
         # regression that added a group only to bench-compare.sh's array
-        # (e.g. simd_normalize) stayed invisible. Run the real helper
-        # (scripts/lib/bench-informational-groups.sh, the same file
-        # bench-compare.sh sources for production runs) against a
-        # controlled Criterion `--list`-shaped listing, feed its emitted
-        # file into the Python classifier, and assert the full
-        # pipeline: only the two approved names come out of the shell step,
+        # (e.g. simd_normalize) stayed invisible. Two probes against the
+        # real helper (scripts/lib/bench-informational-groups.sh, the same
+        # file bench-compare.sh invokes for production runs): first dump
+        # the raw array (--print-allowlist) and require it to equal the
+        # reviewed expectation set — this is what catches an array-only
+        # addition — then run the intersection against a controlled
+        # Criterion `--list`-shaped listing, feed its emitted file into
+        # the Python classifier, and assert the full
+        # pipeline: only the approved names come out of the shell step,
         # and an unapproved embed group, an inference group, and a
         # similarly-prefixed-but-distinct embed group all still gate.
         helper = Path(__file__).resolve().parent / "lib" / "bench-informational-groups.sh"
+        # The reviewed allowlist, duplicated here on purpose: the selftest
+        # compares this set against the shell array itself (via
+        # --print-allowlist below), so a name added to only ONE side —
+        # shell array or this expectation — fails the selftest. The
+        # listing-intersection test alone cannot catch an array-only
+        # addition (a fixed listing never contains the new name, so the
+        # intersection output is unchanged).
+        approved_allowlist = frozenset({
+            "simd_dot_product",
+            "simd_cosine_similarity",
+            "int8_batch_cosine",
+            "int4_cosine_distance",
+            "simd_batch_cosine_non_normalized_query",
+        })
         if not helper.exists():
             failures.append(f"allowlist-handoff: shell helper missing at {helper}")
         else:
+            raw_proc = subprocess.run(
+                ["bash", str(helper), "--print-allowlist"],
+                capture_output=True, text=True, timeout=30,
+            )
+            raw_array = frozenset(
+                ln.strip() for ln in raw_proc.stdout.splitlines() if ln.strip()
+            )
+            if raw_proc.returncode != 0:
+                failures.append(
+                    f"allowlist-handoff: --print-allowlist exited "
+                    f"{raw_proc.returncode}: {raw_proc.stderr}"
+                )
+            elif raw_array != approved_allowlist:
+                failures.append(
+                    "allowlist-handoff: shell array and selftest expectation "
+                    f"disagree — array-only: {sorted(raw_array - approved_allowlist)}, "
+                    f"expectation-only: {sorted(approved_allowlist - raw_array)}. "
+                    "Every allowlist change must update both sides in one PR."
+                )
             listing_dir = root / "allowlist-listing"
             listing_dir.mkdir(parents=True, exist_ok=True)
             listing_file = listing_dir / "list.txt"
@@ -443,6 +479,9 @@ def run_selftest() -> int:
                 "simd_normalize/scalar/384: benchmark\n"
                 "simd_dot_product_extra/scalar/384: benchmark\n"
                 "rms_norm/4096: benchmark\n"
+                "int8_batch_cosine/float32_simd/100: benchmark\n"
+                "int4_cosine_distance/int4/768: benchmark\n"
+                "simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c: benchmark\n"
             )
             proc = subprocess.run(
                 ["bash", str(helper), str(listing_file)],
@@ -455,11 +494,11 @@ def run_selftest() -> int:
                 failures.append(
                     f"allowlist-handoff: shell helper exited {proc.returncode}: {proc.stderr}"
                 )
-            elif shell_emitted != {"simd_dot_product", "simd_cosine_similarity"}:
+            elif shell_emitted != approved_allowlist:
                 failures.append(
                     "allowlist-handoff: shell helper emitted "
-                    f"{sorted(shell_emitted)}, expected exactly "
-                    "['simd_cosine_similarity', 'simd_dot_product']"
+                    f"{sorted(shell_emitted)}, expected the approved "
+                    "allowlist groups"
                 )
             else:
                 allowlist_dir = root / "allowlist"

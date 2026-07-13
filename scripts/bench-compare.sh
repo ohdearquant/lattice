@@ -16,11 +16,14 @@
 #   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
 #
-# lattice#714: two of the lattice-embed `simd` bench target's groups
-# (simd_dot_product, simd_cosine_similarity) are confirmed noise-dominated in
-# --quick mode by a same-toolchain A/A reproduction on identical refs
-# (FAIL/WARN sign flipped across dozens of entries in those groups run to
-# run). In --quick mode (the default), only those two named groups are
+# lattice#714: five of the lattice-embed bench targets' groups
+# (simd_dot_product, simd_cosine_similarity, int8_batch_cosine,
+# int4_cosine_distance, simd_batch_cosine_non_normalized_query) are confirmed
+# noise-dominated in --quick mode by same-toolchain A/A reproductions on
+# identical refs (the original pair: FAIL/WARN sign flipped across dozens of
+# entries run to run; the 2026-07-13 additions: confirmed-CI FAIL rows inside
+# exclusive bench windows with DISJOINT failing groups across two same-commit
+# runs). In --quick mode (the default), only those named groups are
 # measured and reported but excluded from the FAIL/WARN gate and exit code —
 # see the "informational" section of the report and INFO_GROUPS_ALLOWLIST
 # below. Every other group in the target, including any added later, gates
@@ -120,10 +123,11 @@ fi
 
 # --- Quick-mode informational-groups (lattice#714) ---
 # Fixed, reviewed allowlist of the issue-evidenced noisy groups only — NOT a
-# target-wide dump. lattice#714's quantitative reproduction (same-toolchain
-# A/A runs on identical refs, --quick mode) confined every flip-signed FAIL/
-# WARN to two lattice-embed `simd` groups; no other group in that target has
-# issue-backed noise evidence, so no other group is exempted here. The
+# target-wide dump. Every entry carries same-toolchain A/A evidence on
+# identical refs in --quick mode (lattice#714's original reproduction for
+# the first two; isolated bench-window A/A runs for the 2026-07-13
+# additions); no other group in that target has that evidence, so no other
+# group is exempted here. The
 # allowlist itself and the intersection-with-the-real-listing logic live in
 # scripts/lib/bench-informational-groups.sh, invoked below — kept in its own
 # file (rather than inline here) so scripts/perf-bench-gate.py --selftest can
@@ -135,7 +139,7 @@ fi
 # if that ever becomes a concern, namespace by target (e.g. "embed:<group>")
 # on both sides of the handoff instead of trusting name uniqueness. Adding a
 # group requires the same kind of same-toolchain A/A quantitative evidence
-# that justified the current two, reviewed in a PR — never derived
+# that justified every current entry, reviewed in a PR — never derived
 # automatically from `--list`, which would silently exempt every future
 # group added to the target.
 INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
