@@ -1,4 +1,6 @@
-//! SIMD-accelerated distance operations.
+//! SIMD Euclidean and squared-Euclidean distance kernels.
+//!
+//! See docs/simd.md for distance semantics and ranking guidance.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;

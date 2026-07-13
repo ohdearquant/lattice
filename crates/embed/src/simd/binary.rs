@@ -1,19 +1,8 @@
-//! Binary quantization for ultra-fast pre-filtering.
+//! Binary sign quantization and Hamming-distance operations.
 //!
-//! Sign-bit quantization: 1 bit per dimension (32x compression vs f32).
-//! Distance via Hamming distance using hardware popcount.
+//! Packed format and partial-byte handling remain part of the API contract.
 //!
-//! ## Format
-//!
-//! `b[i] = 1 if v[i] >= 0 else 0`. Pack 8 dimensions into one byte
-//! (bit 7 = dimension 0, bit 6 = dimension 1, etc.).
-//! For D dimensions, storage is `ceil(D / 8)` bytes.
-//!
-//! ## Distance
-//!
-//! Hamming distance counts differing bits between two binary vectors.
-//! Approximate cosine distance: `1.0 - (1.0 - 2.0 * hamming / dims)`
-//! i.e. `2.0 * hamming / dims`.
+//! See docs/simd.md for the format and cosine approximation.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;

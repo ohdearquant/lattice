@@ -1,4 +1,7 @@
-//! Caching wrapper for embedding services.
+//! Native-only LRU wrapper for an [`EmbeddingService`].
+//!
+//! It preserves caller order across partial cache hits and uses role-aware keys for asymmetric
+//! retrieval. See `docs/service.md` for the lookup and fill algorithm.
 
 use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_CHARS};
 use crate::error::Result;

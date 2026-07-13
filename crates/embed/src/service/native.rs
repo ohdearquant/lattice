@@ -1,4 +1,7 @@
-//! Native embedding service using lattice-inference (pure Rust, no C++ FFI).
+//! Native, pure-Rust embedding service backed by `lattice-inference`.
+//!
+//! Model loading is lazy and cancellation-safe; BERT-family and Qwen models take different
+//! loading and batching paths. See `docs/service.md` for lifecycle and persistence details.
 
 use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingService, MAX_TEXT_CHARS};
 use crate::error::{EmbedError, Result};

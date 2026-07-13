@@ -1,37 +1,9 @@
-//! Backfill coordinator for embedding migration: routes new requests to the target model
-//! while backfilling old embeddings in batches. See
-//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/embed/docs/design.md)
-//! for the four-stage migration workflow and how [`BackfillCoordinator`] layers routing on
-//! top of [`crate::migration::MigrationController`].
+//! Public API for model-migration backfills.
 //!
-//! # Example
+//! The coordinator layers read/write routing and batch sizing over the migration
+//! controller while callers execute the actual embedding and index updates.
 //!
-//! ```rust
-//! use lattice_embed::backfill::{BackfillCoordinator, BackfillConfig, EmbeddingRoute};
-//! use lattice_embed::migration::MigrationPlan;
-//! use lattice_embed::EmbeddingModel;
-//!
-//! let plan = MigrationPlan {
-//!     id: "mig-001".to_string(),
-//!     source_model: EmbeddingModel::BgeSmallEnV15,
-//!     target_model: EmbeddingModel::BgeBaseEnV15,
-//!     total_embeddings: 1000,
-//!     batch_size: 100,
-//!     created_at: "2026-01-27T00:00:00Z".to_string(),
-//! };
-//!
-//! let mut coord = BackfillCoordinator::with_defaults(plan);
-//!
-//! // Before starting, all requests go to legacy
-//! assert_eq!(coord.route_request(true), EmbeddingRoute::Legacy);
-//!
-//! coord.start().unwrap();
-//!
-//! // During migration, new documents get dual-written
-//! assert_eq!(coord.route_request(true), EmbeddingRoute::DualWrite);
-//! // Existing documents still use legacy
-//! assert_eq!(coord.route_request(false), EmbeddingRoute::Legacy);
-//! ```
+//! See [docs/backfill.md](../../docs/backfill.md) for the complete operational model.
 
 mod coordinator;
 mod types;

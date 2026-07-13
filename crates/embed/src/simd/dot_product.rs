@@ -1,4 +1,8 @@
-//! SIMD-accelerated dot product operations.
+//! SIMD float dot-product kernels, including a one-query/four-candidate path.
+//!
+//! The public operations return zero for dimensional mismatches.
+//!
+//! See docs/simd.md for dispatch and batch-kernel design.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -993,11 +997,7 @@ fn same_query_batch4(chunk: &[(&[f32], &[f32])]) -> bool {
             .all(|(q, c)| q.as_ptr() == q_ptr && q.len() == q_len && c.len() == q_len)
 }
 
-/// **Unstable**: SIMD batch dispatch; use `lattice_embed::utils::batch_dot_product` for stable wrapper.
-///
-/// Uses the batch-4 SIMD kernel for consecutive same-query chunks (e.g., query-vs-N
-/// search pattern where the left-hand slice is the same borrowed reference for every pair).
-/// Falls back to the per-pair kernel for mixed or remainder inputs.
+/// **Unstable**: batched dot-product dispatch with a same-query fast path.
 pub fn batch_dot_product(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
     let pair_kernel = resolved_dot_product_kernel();
     let batch4_kernel = resolved_dot_product_batch4_kernel();

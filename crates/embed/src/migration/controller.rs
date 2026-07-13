@@ -1,4 +1,9 @@
-//! Migration controller: state machine executor.
+//! Executes lifecycle transitions and progress accounting for one migration.
+//!
+//! This layer tracks a plan and its work budget only; query/write routing belongs to the
+//! backfill coordinator.
+//!
+//! See [docs/migration.md](../../docs/migration.md) for the state machine and accounting rules.
 
 use std::time::Instant;
 
@@ -6,29 +11,8 @@ use super::types::{MigrationError, MigrationPlan, MigrationProgress, MigrationSt
 
 /// Manages the state machine for a single migration.
 ///
-/// # Example
-///
-/// ```rust
-/// use lattice_embed::migration::{MigrationController, MigrationPlan};
-/// use lattice_embed::EmbeddingModel;
-///
-/// let plan = MigrationPlan {
-///     id: "mig-001".to_string(),
-///     source_model: EmbeddingModel::BgeSmallEnV15,
-///     target_model: EmbeddingModel::BgeBaseEnV15,
-///     total_embeddings: 100,
-///     batch_size: 50,
-///     created_at: "2026-01-27T00:00:00Z".to_string(),
-/// };
-///
-/// let mut ctrl = MigrationController::new(plan);
-/// ctrl.start().unwrap();
-/// ctrl.record_progress(50).unwrap();
-///
-/// let report = ctrl.progress();
-/// assert!(report.state.is_active());
-/// assert_eq!(report.state.processed(), 50);
-/// ```
+/// It owns lifecycle transitions, progress, skips, and diagnostics but not model routing.
+/// See [docs/migration.md](../../docs/migration.md) for its transition and accounting rules.
 #[derive(Debug)]
 pub struct MigrationController {
     pub(super) plan: MigrationPlan,
@@ -112,26 +96,8 @@ impl MigrationController {
 
     /// Record an item that will be permanently skipped.
     ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use lattice_embed::migration::{MigrationController, MigrationPlan, SkipReason};
-    /// use lattice_embed::EmbeddingModel;
-    ///
-    /// let plan = MigrationPlan {
-    ///     id: "mig-001".to_string(),
-    ///     source_model: EmbeddingModel::BgeSmallEnV15,
-    ///     target_model: EmbeddingModel::BgeBaseEnV15,
-    ///     total_embeddings: 100,
-    ///     batch_size: 50,
-    ///     created_at: "2026-01-27T00:00:00Z".to_string(),
-    /// };
-    ///
-    /// let mut ctrl = MigrationController::new(plan);
-    /// ctrl.start().unwrap();
-    /// ctrl.record_skip(SkipReason::ContentTooLarge { size: 50000, max: 8192 }).unwrap();
-    /// assert_eq!(ctrl.state().skipped(), 1);
-    /// ```
+    /// Skips reduce the effective completion total but require a later progress call to
+    /// transition to completed. See [docs/migration.md](../../docs/migration.md).
     pub fn record_skip(&mut self, reason: SkipReason) -> Result<(), MigrationError> {
         match &self.state {
             MigrationState::InProgress {
@@ -171,7 +137,7 @@ impl MigrationController {
         &self.skip_reasons
     }
 
-    /// Returns the effective coverage fraction (0.0–1.0) of the migration.
+    /// Returns processed-to-effective-total coverage; a zero effective total returns 1.0.
     pub fn effective_coverage(&self) -> f64 {
         self.state.effective_coverage()
     }
