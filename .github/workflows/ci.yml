@@ -51,9 +51,10 @@ env:
   LATTICE_REQUIRE_FIXTURES: "1"
 
 jobs:
-  # Decide whether anything outside the docs set changed. A PR that only
-  # touches markdown, ADRs, LICENSE, or .gitignore cannot affect compilation,
-  # so it does not need the macOS/ARM compile matrix below.
+  # Decide whether any Rust code changed. A PR that only touches markdown,
+  # ADRs, LICENSE, .gitignore, or the Swift macOS app (apps/macos/**) cannot
+  # affect this workspace's compilation, so it does not need the macOS/ARM
+  # compile matrix below.
   changes:
     name: detect-code-changes
     runs-on: ubuntu-latest
@@ -72,15 +73,26 @@ jobs:
           CHANGED=$(./scripts/ci-changed-files.sh)
           echo "Changed files:"
           echo "$CHANGED"
-          # Docs set: **/*.md, docs/**, LICENSE*, .gitignore. Everything else
-          # counts as code, including workflow files, Cargo.*, Makefile*, and
-          # scripts/**. Conservative on purpose: when in doubt, run the matrix.
+          # Non-Rust set: **/*.md, docs/**, LICENSE*, .gitignore, and the
+          # macOS Studio app (apps/macos/**). Everything else counts as code,
+          # including workflow files, Cargo.*, Makefile*, and scripts/**.
+          # Conservative on purpose: when in doubt, run the matrix.
+          #
+          # apps/macos/** is the Swift app. It has no Rust surface, so it
+          # cannot affect this workspace's compilation, and there is no Swift
+          # job in this workflow that would validate it. The Rust binaries the
+          # app bundles are covered separately by app-binaries.yml, which
+          # triggers independently on every PR. So a Swift-only change should
+          # not drag the whole macOS/ARM Rust matrix. A PR that touches BOTH
+          # apps/macos and a Rust path still leaves the Rust file in NON_DOCS
+          # below, so code=true and the full matrix runs.
+          #
           # Two single greps against here-strings, not a `grep | grep -q` pipe:
           # a downstream `-q` can close its end of a pipe early and SIGPIPE the
           # upstream producer, and under `pipefail` that reports as the
           # pipeline's exit code instead of the match result (fail-open on a
           # large diff).
-          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$)' <<<"$CHANGED" || true)
+          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/)' <<<"$CHANGED" || true)
           if grep -q . <<<"$NON_DOCS"; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "→ non-docs files changed: full matrix REQUIRED"
