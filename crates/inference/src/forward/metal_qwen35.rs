@@ -17095,6 +17095,55 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     .collect()
             }
 
+            /// Builds `num_rows` rows of `row_len` elements each, with row 0 forced to
+            /// an exact all-near-zero constant and row 1 forced to the exact smallest
+            /// positive f32 subnormal (`f32::from_bits(1)`, ~1.4e-45) — two distinct
+            /// epsilon-floor edge cases a whole-row-of-ordinary-magnitude fixture
+            /// cannot exercise: the reduction's `rsqrt(sum_sq / width + eps)` is
+            /// dominated by `eps` only when `sum_sq` itself is vanishingly small
+            /// across the *whole* row, not just one lane. Remaining rows are ordinary
+            /// pseudo-random data (regression coverage).
+            fn row_batch(seed: u64, row_len: usize, num_rows: usize) -> Vec<f32> {
+                let mut v = Vec::with_capacity(row_len * num_rows);
+                for r in 0..num_rows {
+                    match r {
+                        0 => v.extend(std::iter::repeat_n(1e-20f32, row_len)),
+                        1 => v.extend(std::iter::repeat_n(f32::from_bits(1), row_len)),
+                        _ => v.extend(lcg_vec(seed + r as u64, row_len)),
+                    }
+                }
+                v
+            }
+
+            /// Confirms `row_batch`'s row 0 / row 1 actually landed as the exact
+            /// near-zero / subnormal constants (construction proof) and prints their
+            /// sum-of-squares so a test run makes the new coverage visible, not just
+            /// implicit in a later bit-identical comparison.
+            fn assert_edge_rows(label: &str, data: &[f32], row_len: usize) {
+                let near_zero = &data[0..row_len];
+                let subnormal = &data[row_len..2 * row_len];
+                assert!(
+                    near_zero.iter().all(|v| *v == 1e-20f32),
+                    "{label}: row 0 fixture must be the exact all-near-zero constant"
+                );
+                assert!(
+                    subnormal.iter().all(|v| v.to_bits() == 1),
+                    "{label}: row 1 fixture must be the exact f32 subnormal (from_bits(1))"
+                );
+                eprintln!(
+                    "[RMS_854_FIXTURE] {label}: row0(near_zero) sum_sq={:.3e} \
+                     row1(subnormal) sum_sq={:.3e}",
+                    near_zero
+                        .iter()
+                        .map(|v| (*v as f64) * (*v as f64))
+                        .sum::<f64>(),
+                    subnormal
+                        .iter()
+                        .map(|v| (*v as f64) * (*v as f64))
+                        .sum::<f64>(),
+                );
+            }
+
             fn pipeline_for(device: &Device, lib: &Library, name: &str) -> ComputePipelineState {
                 let func = lib
                     .get_function(name, None)
@@ -17360,10 +17409,22 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             #[test]
             fn qwen35_rms_kernels_match_pre_854_oracle_on_finite_input() {
+                // Fail-closed device probe (matches `metal::inner::tests::metal_test_device`'s
+                // convention): a runner with no Metal device reports a distinct skip, unless
+                // LATTICE_METAL_TEST_ENFORCE=1 is set, in which case a missing device is a
+                // hard failure rather than a silent pass. Without this, a CI runner that lost
+                // its Metal device would report this parity gate as `ok` without ever
+                // compiling or comparing either library.
+                let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
                 let Some(device) = Device::system_default() else {
                     eprintln!(
-                        "skipping qwen35_rms_kernels_match_pre_854_oracle_on_finite_input: \
-                         no Metal device"
+                        "[METAL_TEST_SKIP] context=qwen35_rms_kernels_match_pre_854_oracle_on_finite_input \
+                         reason=no_metal_device"
+                    );
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                         (qwen35_rms_kernels_match_pre_854_oracle_on_finite_input)"
                     );
                     return;
                 };
@@ -17388,8 +17449,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
                 // 1. rms_norm_qwen35
                 {
-                    let mut x = lcg_vec(11, (row_len * num_rows) as usize);
-                    x[0] = 1e-6;
+                    let x = row_batch(11, row_len as usize, num_rows as usize);
+                    assert_edge_rows("rms_norm_qwen35", &x, row_len as usize);
                     let gamma = lcg_vec(12, row_len as usize);
                     let oracle = run_rms_norm_qwen35(
                         &device,
@@ -17421,7 +17482,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
                 // 2. per_head_rms_norm
                 {
-                    let x = lcg_vec(21, (head_dim * num_heads) as usize);
+                    let x = row_batch(21, head_dim as usize, num_heads as usize);
+                    assert_edge_rows("per_head_rms_norm", &x, head_dim as usize);
                     let gamma = lcg_vec(22, head_dim as usize);
                     let oracle = run_per_head_rms_norm(
                         &device,
@@ -17451,10 +17513,26 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     );
                 }
 
-                // 3. fused_residual_add_norm
-                {
-                    let base = lcg_vec(31, row_len as usize);
-                    let delta = lcg_vec(32, row_len as usize);
+                // 3. fused_residual_add_norm — single threadgroup, no row/head batch
+                // dimension, so near-zero/subnormal residual-input coverage runs as
+                // separate dispatches instead of dedicated rows within one dispatch.
+                for (label, base, delta) in [
+                    (
+                        "normal",
+                        lcg_vec(31, row_len as usize),
+                        lcg_vec(32, row_len as usize),
+                    ),
+                    (
+                        "near_zero_residual",
+                        vec![1e-20f32; row_len as usize],
+                        vec![1e-20f32; row_len as usize],
+                    ),
+                    (
+                        "subnormal_residual",
+                        vec![f32::from_bits(1); row_len as usize],
+                        vec![f32::from_bits(1); row_len as usize],
+                    ),
+                ] {
                     let gamma = lcg_vec(33, row_len as usize);
                     let oracle = run_fused_residual_add_norm(
                         &device,
@@ -17480,13 +17558,24 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     );
                     assert_eq!(
                         oracle, live,
-                        "fused_residual_add_norm diverged from pre-#854 oracle"
+                        "fused_residual_add_norm ({label} fixture) diverged from pre-#854 oracle"
+                    );
+                    eprintln!(
+                        "[RMS_854_FIXTURE] fused_residual_add_norm: {label} fixture executed"
                     );
                 }
 
-                // 4. copy_and_rms_norm
-                {
-                    let src = lcg_vec(41, row_len as usize);
+                // 4. copy_and_rms_norm — single threadgroup, no row/head batch
+                // dimension, so near-zero/subnormal coverage runs as separate
+                // dispatches instead of dedicated rows within one dispatch.
+                for (label, src) in [
+                    ("normal", lcg_vec(41, row_len as usize)),
+                    ("near_zero_residual", vec![1e-20f32; row_len as usize]),
+                    (
+                        "subnormal_residual",
+                        vec![f32::from_bits(1); row_len as usize],
+                    ),
+                ] {
                     let gamma = lcg_vec(42, row_len as usize);
                     let oracle = run_copy_and_rms_norm(
                         &device,
@@ -17510,13 +17599,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     );
                     assert_eq!(
                         oracle, live,
-                        "copy_and_rms_norm diverged from pre-#854 oracle"
+                        "copy_and_rms_norm ({label} fixture) diverged from pre-#854 oracle"
                     );
+                    eprintln!("[RMS_854_FIXTURE] copy_and_rms_norm: {label} fixture executed");
                 }
 
                 // 5. copy_and_rms_norm_batch
                 {
-                    let src = lcg_vec(51, (row_len * num_rows) as usize);
+                    let src = row_batch(51, row_len as usize, num_rows as usize);
+                    assert_edge_rows("copy_and_rms_norm_batch", &src, row_len as usize);
                     let gamma = lcg_vec(52, row_len as usize);
                     let oracle = run_copy_and_rms_norm_batch(
                         &device,
@@ -17546,10 +17637,23 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     );
                 }
 
-                // 6. fused_residual_add_norm_batch
+                // 6. fused_residual_add_norm_batch — both residual inputs (base and
+                // delta) get dedicated near-zero/subnormal rows, since this kernel's
+                // reduction runs over the post-add residual sum, not either input
+                // alone.
                 {
-                    let base = lcg_vec(61, (row_len * num_rows) as usize);
-                    let delta = lcg_vec(62, (row_len * num_rows) as usize);
+                    let base = row_batch(61, row_len as usize, num_rows as usize);
+                    assert_edge_rows(
+                        "fused_residual_add_norm_batch/base",
+                        &base,
+                        row_len as usize,
+                    );
+                    let delta = row_batch(62, row_len as usize, num_rows as usize);
+                    assert_edge_rows(
+                        "fused_residual_add_norm_batch/delta",
+                        &delta,
+                        row_len as usize,
+                    );
                     let gamma = lcg_vec(63, row_len as usize);
                     let oracle = run_fused_residual_add_norm_batch(
                         &device,
@@ -17581,9 +17685,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     );
                 }
 
-                // 7. per_head_rms_norm_batch
+                // 7. per_head_rms_norm_batch — row-major layout is
+                // base = t*(num_heads*head_dim) + head*head_dim, so a batch of
+                // num_heads*num_tokens rows of width head_dim lines up exactly
+                // with row_batch's row-major ordering.
                 {
-                    let x = lcg_vec(71, (head_dim * num_heads * num_tokens) as usize);
+                    let x = row_batch(71, head_dim as usize, (num_heads * num_tokens) as usize);
+                    assert_edge_rows("per_head_rms_norm_batch", &x, head_dim as usize);
                     let gamma = lcg_vec(72, head_dim as usize);
                     let oracle = run_per_head_rms_norm_batch(
                         &device,

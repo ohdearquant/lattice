@@ -1009,6 +1009,55 @@ kernel void rms_norm_pre_854_oracle(
                     .collect()
             }
 
+            /// Builds `num_rows` rows of `row_len` elements each, with row 0 forced to
+            /// an exact all-near-zero constant and row 1 forced to the exact smallest
+            /// positive f32 subnormal (`f32::from_bits(1)`, ~1.4e-45) — two distinct
+            /// epsilon-floor edge cases a whole-row-of-ordinary-magnitude fixture
+            /// cannot exercise: the reduction's `rsqrt(sum_sq / width + eps)` is
+            /// dominated by `eps` only when `sum_sq` itself is vanishingly small
+            /// across the *whole* row, not just one lane. Remaining rows are ordinary
+            /// pseudo-random data (regression coverage).
+            fn row_batch(seed: u64, row_len: usize, num_rows: usize) -> Vec<f32> {
+                let mut v = Vec::with_capacity(row_len * num_rows);
+                for r in 0..num_rows {
+                    match r {
+                        0 => v.extend(std::iter::repeat_n(1e-20f32, row_len)),
+                        1 => v.extend(std::iter::repeat_n(f32::from_bits(1), row_len)),
+                        _ => v.extend(lcg_vec(seed + r as u64, row_len)),
+                    }
+                }
+                v
+            }
+
+            /// Confirms `row_batch`'s row 0 / row 1 actually landed as the exact
+            /// near-zero / subnormal constants (construction proof) and prints their
+            /// sum-of-squares so a test run makes the new coverage visible, not just
+            /// implicit in a later bit-identical comparison.
+            fn assert_edge_rows(label: &str, data: &[f32], row_len: usize) {
+                let near_zero = &data[0..row_len];
+                let subnormal = &data[row_len..2 * row_len];
+                assert!(
+                    near_zero.iter().all(|v| *v == 1e-20f32),
+                    "{label}: row 0 fixture must be the exact all-near-zero constant"
+                );
+                assert!(
+                    subnormal.iter().all(|v| v.to_bits() == 1),
+                    "{label}: row 1 fixture must be the exact f32 subnormal (from_bits(1))"
+                );
+                eprintln!(
+                    "[RMS_854_FIXTURE] {label}: row0(near_zero) sum_sq={:.3e} \
+                     row1(subnormal) sum_sq={:.3e}",
+                    near_zero
+                        .iter()
+                        .map(|v| (*v as f64) * (*v as f64))
+                        .sum::<f64>(),
+                    subnormal
+                        .iter()
+                        .map(|v| (*v as f64) * (*v as f64))
+                        .sum::<f64>(),
+                );
+            }
+
             fn run(
                 device: &Device,
                 lib: &metal::Library,
@@ -1046,15 +1095,14 @@ kernel void rms_norm_pre_854_oracle(
                 read_f32(&x_buf, x.len())
             }
 
-            // Finite fixture: 3 rows x 130 elements (non-multiple-of-256, exercises
-            // the strided accumulation loop's tail), includes small/negative/near-zero
-            // values.
+            // Finite fixture: 4 rows x 130 elements (non-multiple-of-256, exercises the
+            // strided accumulation loop's tail). Row 0 = all-near-zero, row 1 =
+            // all-f32-subnormal (both dedicated epsilon-floor edge cases), rows 2-3 =
+            // ordinary pseudo-random data (includes negative lanes).
             let row_len = 130u32;
-            let num_rows = 3u32;
-            let n = (row_len * num_rows) as usize;
-            let mut x = lcg_vec(42, n);
-            x[0] = 1e-6; // near-zero lane, exercises the `+ eps` floor
-            x[row_len as usize] = -3.5;
+            let num_rows = 4u32;
+            let x = row_batch(42, row_len as usize, num_rows as usize);
+            assert_edge_rows("rms_norm (flash)", &x, row_len as usize);
             let gamma = lcg_vec(7, row_len as usize);
             let eps = 1e-6f32;
 
