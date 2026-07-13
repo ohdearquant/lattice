@@ -119,8 +119,8 @@ fn main() {
                 println!(
                     "  Adapter: {} pairs, rank={}, scale={:.2}, {} parameters",
                     adapter.num_adapted_layers(),
-                    adapter.config.rank,
-                    adapter.config.scale(),
+                    adapter.config().rank,
+                    adapter.config().scale(),
                     adapter.num_parameters()
                 );
                 model.set_lora(Box::new(adapter));

@@ -12,16 +12,16 @@ use std::path::Path;
 
 const ALPHA_TOLERANCE: f32 = 1e-4;
 
-fn validate_manifest_alpha(adapter: &LoraAdapter, entry: &ManifestEntry) -> Result<()> {
-    let difference = (adapter.config.alpha - entry.alpha).abs();
-    if !adapter.config.alpha.is_finite()
+fn validate_manifest_alpha(adapter_alpha: f32, entry: &ManifestEntry) -> Result<()> {
+    let difference = (adapter_alpha - entry.alpha).abs();
+    if !adapter_alpha.is_finite()
         || !entry.alpha.is_finite()
         || !difference.is_finite()
         || difference > ALPHA_TOLERANCE
     {
         return Err(TuneError::Validation(format!(
             "alpha mismatch for '{}': manifest says {}, file has {}",
-            entry.id, entry.alpha, adapter.config.alpha
+            entry.id, entry.alpha, adapter_alpha
         )));
     }
     Ok(())
@@ -289,10 +289,12 @@ pub fn load_adapters_from_manifest(
             })?;
 
         // Check 6: Rank must match the manifest entry.
-        if adapter.config.rank != entry.rank {
+        if adapter.config().rank != entry.rank {
             return Err(TuneError::Validation(format!(
                 "rank mismatch for '{}': manifest says {}, file has {}",
-                entry.id, entry.rank, adapter.config.rank
+                entry.id,
+                entry.rank,
+                adapter.config().rank
             )));
         }
 
@@ -304,10 +306,10 @@ pub fn load_adapters_from_manifest(
         // whose header omits alpha — the synthesised 16 ≠ declared 64. The
         // synthesis fallback therefore cannot smuggle a mismatched alpha past the
         // governed loader.
-        validate_manifest_alpha(&adapter, entry)?;
+        validate_manifest_alpha(adapter.config().alpha, entry)?;
 
         // Check 8: target_modules in adapter must be a subset of entry's list.
-        for module in &adapter.config.target_modules {
+        for module in &adapter.config().target_modules {
             if !entry.target_modules.contains(module) {
                 return Err(TuneError::Validation(format!(
                     "target_modules mismatch for '{}': adapter module '{}' \
@@ -711,7 +713,7 @@ mod tests {
         let loaded = result.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "valid-adapter");
-        assert_eq!(loaded[0].adapter.config.rank, 4);
+        assert_eq!(loaded[0].adapter.config().rank, 4);
     }
 
     #[test]
@@ -942,14 +944,6 @@ mod tests {
 
     #[test]
     fn loader_rejects_nan_adapter_alpha_against_finite_manifest_alpha() {
-        let adapter = LoraAdapter {
-            config: super::super::LoraConfig {
-                rank: 4,
-                alpha: f32::NAN,
-                target_modules: vec!["q_proj".to_string()],
-            },
-            layers: std::collections::HashMap::new(),
-        };
         let entry = make_entry(
             "nan-alpha",
             "adapter.safetensors",
@@ -960,7 +954,7 @@ mod tests {
             vec!["q_proj".to_string()],
         );
 
-        let err = validate_manifest_alpha(&adapter, &entry).unwrap_err();
+        let err = validate_manifest_alpha(f32::NAN, &entry).unwrap_err();
         assert!(err.to_string().contains("alpha mismatch"));
     }
 

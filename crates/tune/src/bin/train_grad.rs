@@ -219,9 +219,12 @@ struct Config {
 }
 
 fn parse_alpha(argv: &ArgView) -> Result<f32, String> {
-    let Some(value) = argv.arg("--alpha") else {
+    if !argv.flag("--alpha") {
         return Ok(16.0);
-    };
+    }
+    let value = argv
+        .arg("--alpha")
+        .ok_or_else(|| "invalid --alpha: missing value".to_string())?;
     let alpha = value
         .parse::<f32>()
         .map_err(|_| format!("invalid --alpha '{value}': expected a finite number"))?;
@@ -506,6 +509,14 @@ mod cli_contract_tests {
                 .expect_err("invalid --alpha must fail parsing before training");
             assert!(err.contains("--alpha"));
         }
+    }
+
+    #[test]
+    fn rejects_missing_alpha_value() {
+        let a = args(&["--alpha"]);
+        let err = parse_config(&ArgView::new(&a))
+            .expect_err("--alpha without a value must fail parsing before training");
+        assert!(err.contains("--alpha"));
     }
 
     #[test]

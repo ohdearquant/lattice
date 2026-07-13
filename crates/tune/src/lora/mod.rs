@@ -143,13 +143,43 @@ pub struct LoraLayer {
 ///
 /// Loaded from a PEFT-format safetensors file and applied at inference time
 /// to modify the output of specific linear projections in the transformer.
+///
+/// ```compile_fail
+/// use lattice_tune::lora::{LoraAdapter, LoraConfig};
+/// use std::collections::HashMap;
+///
+/// let adapter = LoraAdapter {
+///     config: LoraConfig {
+///         rank: 8,
+///         alpha: f32::NAN,
+///         target_modules: Vec::new(),
+///     },
+///     layers: HashMap::new(),
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use lattice_tune::lora::{LoraAdapter, LoraConfig};
+/// use std::collections::HashMap;
+///
+/// let mut adapter = LoraAdapter::new(
+///     LoraConfig {
+///         rank: 8,
+///         alpha: 16.0,
+///         target_modules: Vec::new(),
+///     },
+///     HashMap::new(),
+/// )
+/// .unwrap();
+/// adapter.config.alpha = f32::NAN;
+/// ```
 #[derive(Debug, Clone)]
 pub struct LoraAdapter {
     /// Adapter configuration.
-    pub config: LoraConfig,
+    config: LoraConfig,
     /// Per-layer, per-module LoRA weights.
     /// Key: `(layer_idx, module_name)` e.g. `(5, "q_proj")`.
-    pub layers: HashMap<(usize, String), LoraLayer>,
+    layers: HashMap<(usize, String), LoraLayer>,
 }
 
 impl LoraAdapter {
@@ -200,6 +230,20 @@ impl LoraAdapter {
         Ok(Self { config, layers })
     }
 
+    /// Return the validated adapter configuration.
+    pub fn config(&self) -> &LoraConfig {
+        &self.config
+    }
+
+    /// Return the adapter weights keyed by transformer layer and module name.
+    pub fn layers(&self) -> &HashMap<(usize, String), LoraLayer> {
+        &self.layers
+    }
+
+    fn layers_mut(&mut self) -> &mut HashMap<(usize, String), LoraLayer> {
+        &mut self.layers
+    }
+
     /// Apply the LoRA adapter to a single projection output.
     ///
     /// Looks up the adapter for `(layer_idx, module)`. If no adapter exists
@@ -213,32 +257,32 @@ impl LoraAdapter {
     /// * `base_output` - Base projection output to modify in-place (length = d_out)
     pub fn apply(&self, layer_idx: usize, module: &str, x: &[f32], base_output: &mut [f32]) {
         let key = (layer_idx, module.to_string());
-        if let Some(lora_layer) = self.layers.get(&key) {
-            let scale = self.config.scale();
+        if let Some(lora_layer) = self.layers().get(&key) {
+            let scale = self.config().scale();
             apply_lora(lora_layer, scale, x, base_output);
         }
     }
 
     /// Check if the adapter has weights for a specific layer and module.
     pub fn has_adapter(&self, layer_idx: usize, module: &str) -> bool {
-        self.layers.contains_key(&(layer_idx, module.to_string()))
+        self.layers().contains_key(&(layer_idx, module.to_string()))
     }
 
     /// Return the number of adapted projection layers.
     pub fn num_adapted_layers(&self) -> usize {
-        self.layers.len()
+        self.layers().len()
     }
 
     /// Return the total number of LoRA parameters (A + B matrices).
     pub fn num_parameters(&self) -> usize {
-        self.layers.values().map(|l| l.a.len() + l.b.len()).sum()
+        self.layers().values().map(|l| l.a.len() + l.b.len()).sum()
     }
 
     /// Return `(layer_idx, module_name)` pairs whose module is not in `known`.
     ///
     /// Useful for detecting typos in adapter target modules before inference.
     pub fn validate_modules(&self, known: &[&str]) -> Vec<(usize, String)> {
-        self.layers
+        self.layers()
             .keys()
             .filter(|(_, m)| !known.iter().any(|k| k == m))
             .cloned()
@@ -262,8 +306,8 @@ impl LoraAdapter {
         &self,
         config: &lattice_inference::model::qwen35_config::Qwen35Config,
     ) -> crate::error::Result<()> {
-        self.config.validate()?;
-        for ((layer_idx, module), layer) in &self.layers {
+        self.config().validate()?;
+        for ((layer_idx, module), layer) in self.layers() {
             if *layer_idx >= config.num_hidden_layers {
                 return Err(crate::error::TuneError::Validation(format!(
                     "LoRA layer index {layer_idx} >= model num_hidden_layers {} (module: {module})",
