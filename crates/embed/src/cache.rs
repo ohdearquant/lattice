@@ -1,20 +1,11 @@
-//! Sharded embedding cache with LRU eviction.
+//! In-memory embedding cache with sharded LRU eviction.
 //!
-//! Caches embeddings to avoid re-computing for identical texts. Uses 16 independent
-//! shards to reduce write-lock contention — each `get()` on an LRU cache requires a
-//! write lock (to update access order), so a single `RwLock<LruCache>` serializes all
-//! reads under high QPS. Sharding reduces contention by a factor of `NUM_SHARDS`.
+//! A key selects one of 16 independent shards. Cache hits refresh LRU order and therefore
+//! take that shard's write lock; hit/miss counters stay local to the shard. A zero-capacity
+//! cache bypasses storage operations and locking. The power-of-two shard count is required
+//! by the masking-based shard selection.
 //!
-//! # Design
-//!
-//! - **Shard selection**: First byte of the Blake3 cache key, masked to `NUM_SHARDS - 1`.
-//!   Blake3 output is uniformly distributed, so shard load is balanced.
-//! - **Per-shard capacity**: `total_capacity / NUM_SHARDS`. Each shard independently
-//!   evicts its own LRU entries.
-//! - **Per-shard statistics**: Hit/miss counters are per-shard `AtomicU64`s, aggregated
-//!   in `stats()`. This eliminates cross-shard atomic contention on the hot path.
-//! - **Zero-capacity**: `capacity=0` disables caching entirely — all operations become
-//!   no-ops with no locking or hashing work.
+//! See docs/model.md for key construction, capacity semantics, and lifecycle details.
 
 use crate::model::ModelConfig;
 use crate::service::EmbeddingRole;

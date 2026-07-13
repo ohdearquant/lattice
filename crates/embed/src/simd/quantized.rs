@@ -1,6 +1,8 @@
-//! INT8 quantization for efficient embedding storage and similarity computation.
+//! INT8 vector quantization and approximate similarity kernels.
 //!
-//! Quantized vectors provide ~3x speedup and 4x memory reduction with 99%+ accuracy.
+//! Constructor-owned values preserve the SIMD range invariant.
+//!
+//! See docs/simd.md for the encoding, error model, and dispatch strategy.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -569,10 +571,7 @@ pub type I8DotKernel = fn(&[i8], &[i8]) -> f32;
 
 static I8_DOT_KERNEL: OnceLock<I8DotKernel> = OnceLock::new();
 
-/// Return the cached INT8 dot-product kernel.
-///
-/// Callers that invoke INT8 dot product in a tight loop can hoist this call
-/// outside the loop so the OnceLock check runs once, not per-iteration.
+/// Return the cached INT8 dot-product kernel for tight loops.
 #[inline]
 pub fn resolved_i8_dot_kernel() -> I8DotKernel {
     *I8_DOT_KERNEL.get_or_init(resolve_i8_dot_kernel)
@@ -635,41 +634,15 @@ fn dot_product_i8_scalar_kernel(a: &[i8], b: &[i8]) -> f32 {
         .sum::<i32>() as f32
 }
 
-/// **Unstable**: raw SIMD INT8 hot path; signature and scaling semantics may change.
-///
-/// This is the hot-path function for HNSW quantized search. Unlike `dot_product_i8`,
-/// it takes raw `&[i8]` slices and does NOT divide by scale factors -- the caller
-/// handles scaling. This avoids allocating `QuantizedVector` wrappers.
-///
-/// Returns 0.0 if slices have different lengths.
-///
-/// # Invariant
-///
-/// Both slices must satisfy the `[-127, 127]` range invariant. The value `-128`
-/// causes silent corruption on the AVX2 and AVX-512-VNNI paths, which apply an
-/// operand's sign by negating a byte (`_mm256_sign_epi8` / a `0 - b` emulation):
-/// negating `-128` wraps back to `-128` in two's complement instead of `+128`,
-/// so the kernel accumulates the wrong sign. The invariant is enforced with a
-/// **`debug_assert!`** (debug builds only); callers MUST guarantee it. The
-/// `QuantizedVector::from_f32` constructor satisfies it by clamping to `[-127, 127]`.
-/// Promoting this to a release `assert!` would add an O(n) scan to a documented hot
-/// path and is intentionally avoided.
-///
-/// # Performance
-///
+/// Dispatch a validated raw INT8 dot product.
 #[inline]
 fn dot_product_i8_dispatch(a: &[i8], b: &[i8]) -> f32 {
     resolved_i8_dot_kernel()(a, b)
 }
 
-/// **Unstable**: raw INT8 dot product on slices; SIMD strategy may change.
+/// **Unstable**: unscaled INT8 dot product over raw slices.
 ///
-/// Uses the same SIMD paths as `dot_product_i8`:
-/// - aarch64: NEON with 4x unrolling + tail SIMD chunks
-/// - x86_64: AVX-512 VNNI > AVX2 > scalar
-///
-/// The key difference is zero allocation overhead: no `Vec<i8>`, no
-/// `QuantizedVector`, no `QuantizationParams`. Just raw slices in, f32 out.
+/// The caller owns scaling; returns `0.0` for a length mismatch.
 ///
 /// # Invariant (caller-guaranteed)
 ///
@@ -678,7 +651,7 @@ fn dot_product_i8_dispatch(a: &[i8], b: &[i8]) -> f32 {
 /// an operand's sign by negating a byte (`_mm256_sign_epi8` / a `0 - b`
 /// emulation); negating `-128` wraps back to `-128` in two's complement instead
 /// of `+128`, so the kernel silently accumulates the wrong sign and the dispatch
-/// returns a wrong distance with no panic. The precondition is checked only by
+/// returns a wrong dot product with no panic. The precondition is checked only by
 /// `debug_assert!`, which is compiled out in release builds, so a release caller
 /// gets no diagnostic. `-128` is memory-safe (no UB), only numerically
 /// out-of-contract.

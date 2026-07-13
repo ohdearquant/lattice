@@ -1,4 +1,8 @@
-//! Embedding service trait and implementations.
+//! Async embedding-service contract and native implementations.
+//!
+//! The trait defines generic, query, and passage embedding; native builds additionally expose
+//! a lazy local-inference service and an LRU caching wrapper. See `docs/service.md` for the
+//! lifecycle, prompt handling, validation rules, and cache behavior.
 
 #[cfg(feature = "native")]
 mod cached;

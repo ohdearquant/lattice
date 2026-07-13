@@ -1,4 +1,6 @@
-//! Error types for embedding operations.
+//! Errors returned by embedding, model configuration, and prepared SIMD-dispatch operations.
+//!
+//! See `docs/service.md` for error boundaries and caller recovery guidance.
 
 use thiserror::Error;
 

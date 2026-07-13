@@ -1,17 +1,9 @@
-//! Quantization tier management and unified distance dispatch.
+//! Quantization tiers, prepared queries, and unified distance dispatch.
 //!
-//! Provides a `QuantizationTier` enum for selecting precision levels and
-//! a `QuantizedData` enum for storing vectors at any tier with unified
-//! distance computation.
+//! Tiers trade storage for fidelity; prepared queries avoid repeated
+//! quantization in homogeneous candidate searches.
 //!
-//! ## Tier hierarchy
-//!
-//! | Tier   | Precision | Bytes/dim | Compression | Use case                |
-//! |--------|-----------|-----------|-------------|-------------------------|
-//! | Full   | f32       | 4.0       | 1x          | Hot data, exact search   |
-//! | Int8   | 8-bit     | 1.0       | 4x          | Warm data, HNSW search   |
-//! | Int4   | 4-bit     | 0.5       | 8x          | Cool data, pre-filtering |
-//! | Binary | 1-bit     | 0.125     | 32x         | Cold data, coarse filter |
+//! See docs/simd.md for tier selection and dispatch semantics.
 
 use super::binary::BinaryVector;
 use super::int4::Int4Vector;
@@ -72,12 +64,7 @@ impl QuantizationTier {
         }
     }
 
-    /// **Unstable**: age-based tier heuristic; boundaries (HOUR/DAY/WEEK) may be tuned.
-    ///
-    /// - Hot (accessed in last hour): Full
-    /// - Warm (accessed in last day): Int8
-    /// - Cool (accessed in last week): Int4
-    /// - Cold (accessed in last month+): Binary
+    /// **Unstable**: maps recency to a storage tier; boundaries may be tuned.
     pub fn from_age_seconds(age_secs: u64) -> Self {
         const HOUR: u64 = 3600;
         const DAY: u64 = 86400;
@@ -162,12 +149,7 @@ impl QuantizedData {
         }
     }
 
-    /// **Unstable**: tier promotion; re-quantizes via f32; may be rethought.
-    ///
-    /// Dequantizes to f32 then re-quantizes at the target tier.
-    /// Note: this does NOT recover lost information -- it merely changes
-    /// the storage format. INT4 -> INT8 promotion fills in new bits
-    /// based on the dequantized approximation.
+    /// **Unstable**: re-quantizes through `f32`; lost information is not recovered.
     pub fn promote(&self, target: QuantizationTier) -> Self {
         let f32_data = self.to_f32();
         Self::from_f32(&f32_data, target)
@@ -179,10 +161,7 @@ impl QuantizedData {
     }
 }
 
-/// **Unstable**: pre-quantized query for repeated distance computation.
-///
-/// Quantize a query vector once and reuse it against a homogeneous candidate list,
-/// eliminating per-call `from_f32` overhead. The query tier must match the stored data tier.
+/// **Unstable**: pre-quantized query for repeated same-tier distance computation.
 #[derive(Debug, Clone)]
 pub enum PreparedQuery {
     /// Full f32 query.
@@ -236,11 +215,7 @@ pub fn prepare_query(query_f32: &[f32], tier: QuantizationTier) -> PreparedQuery
     PreparedQuery::from_f32(query_f32, tier)
 }
 
-/// A prepared query annotated with a normalization hint for fast-path dispatch.
-///
-/// When `norm == NormalizationHint::Unit` and the stored vector is also unit-normalized,
-/// `approximate_cosine_distance_prepared_with_meta` skips the norm division and uses
-/// `1.0 - dot_product(q, s)` directly — recovering ~26% at 384d on the Full tier.
+/// A prepared query with caller-provided normalization metadata.
 #[derive(Debug, Clone)]
 pub struct PreparedQueryWithMeta {
     /// The quantized query (owns the data).
@@ -317,11 +292,7 @@ pub fn approximate_cosine_distance_prepared(
     }
 }
 
-/// Alias for [`approximate_cosine_distance_prepared`], retained for API compatibility.
-///
-/// As of the tier-mismatch hardening fix (issue #210), the non-`try_` variant no
-/// longer panics and returns the same `Result` as this function. Prefer the
-/// non-`try_` name in new code.
+/// Alias for [`approximate_cosine_distance_prepared`] retained for compatibility.
 #[inline]
 pub fn try_approximate_cosine_distance_prepared(
     query: &PreparedQuery,
@@ -330,11 +301,7 @@ pub fn try_approximate_cosine_distance_prepared(
     approximate_cosine_distance_prepared(query, stored)
 }
 
-/// Alias for [`approximate_dot_product_prepared`], retained for API compatibility.
-///
-/// As of the tier-mismatch hardening fix (issue #210), the non-`try_` variant no
-/// longer panics and returns the same `Result` as this function. Prefer the
-/// non-`try_` name in new code.
+/// Alias for [`approximate_dot_product_prepared`] retained for compatibility.
 #[inline]
 pub fn try_approximate_dot_product_prepared(
     query: &PreparedQuery,
@@ -343,16 +310,10 @@ pub fn try_approximate_dot_product_prepared(
     approximate_dot_product_prepared(query, stored)
 }
 
-/// Cosine distance with unit-norm fast path.
+/// Cosine distance with a caller-asserted unit-norm fast path.
 ///
-/// When `meta.norm == NormalizationHint::Unit` and `stored` is a `QuantizedData::Full`
-/// vector whose squared norm is ≈ 1, skips the norm division and returns
-/// `1.0 - clamp(dot(q, s), -1, 1)`. For all other tier/norm combinations, falls
-/// back to `approximate_cosine_distance_prepared`.
-///
-/// The stored vector's unit claim is verified lazily via [`is_unit_norm`]; callers
-/// that batch many lookups against a fixed stored set should pre-check once and
-/// use the cheaper overload directly.
+/// Matching `Unit` hints on `Full` vectors use `1.0 - clamp(dot(q, s), -1, 1)`;
+/// all other combinations use [`approximate_cosine_distance_prepared`].
 ///
 /// # Errors
 ///
@@ -561,12 +522,7 @@ pub fn approximate_int4_batch_prepared_into(
     Ok(())
 }
 
-/// **Unstable**: tiered distance dispatch; tier mix and formula may change.
-///
-/// This is the primary distance function for HNSW search with tiered storage.
-/// The query is always f32; the stored data may be at any tier.
-///
-/// Returns a value in [0, 2] where 0 = identical, 2 = opposite.
+/// **Unstable**: approximate tiered cosine distance from an `f32` query.
 ///
 /// # Precondition
 ///
@@ -603,7 +559,7 @@ pub fn approximate_cosine_distance(query_f32: &[f32], stored: &QuantizedData) ->
     }
 }
 
-/// **Unstable**: tiered dot product dispatch; tier mix and formula may change.
+/// **Unstable**: approximate tiered dot-product dispatch.
 pub fn approximate_dot_product(query_f32: &[f32], stored: &QuantizedData) -> f32 {
     match stored {
         QuantizedData::Full(v) => dot_product(query_f32, v),

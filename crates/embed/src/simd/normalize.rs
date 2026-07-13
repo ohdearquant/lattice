@@ -1,4 +1,6 @@
-//! SIMD-accelerated vector normalization.
+//! SIMD in-place L2 normalization kernels.
+//!
+//! See docs/simd.md for the two-pass algorithm and backend differences.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -409,11 +411,6 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
 }
 
 /// wasm32 SIMD128-accelerated normalization with 4x unrolling.
-///
-/// Mirrors `normalize_avx2_unrolled` above (plain `sqrt` + scalar reciprocal,
-/// not the NEON kernel's `vrsqrteq_f32`+Newton-Raphson estimate -- wasm's
-/// `f32x4_sqrt` is already a single instruction, so there is no equivalent
-/// estimate-and-refine trick to apply here).
 ///
 /// # Safety
 ///
