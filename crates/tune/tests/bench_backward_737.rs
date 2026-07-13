@@ -1,6 +1,11 @@
-//! A/B measurement harness for issue #737 stage 1 (scalar backward-loop
-//! vectorization). Not run in CI: requires a real Qwen3.5-0.8B checkpoint on
-//! disk at `$HOME/.lattice/models/qwen3.5-0.8b` (or `LATTICE_MODEL_DIR`).
+//! Single-side wall-clock timer for issue #737 stage 1 (scalar backward-loop
+//! vectorization). Times the CURRENT source only — the "before" side of an A/B
+//! is obtained by manually reverse-applying the vectorization, rebuilding, and
+//! rerunning this same test, then restoring. It records no ratio itself; on a
+//! shared machine wall-clock is contention-sensitive, so treat the output as a
+//! direction/magnitude smoke, not a substantiated multiplier. Not run in CI:
+//! requires a real Qwen3.5-0.8B checkpoint on disk at
+//! `$HOME/.lattice/models/qwen3.5-0.8b` (or `LATTICE_MODEL_DIR`).
 //!
 //! Exercises the real production path (`train_micro_lora`, `first_layer=19`,
 //! `TOP_LAYER=23`), which materialises layers 19..=23 — a mix of GQA (19, 23)
