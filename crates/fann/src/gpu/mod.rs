@@ -1,37 +1,9 @@
-//! GPU compute backend for lattice-fann
-//!
-//! Production-grade GPU acceleration with:
-//! - 3-tier buffer pooling (Small/Medium/Large)
-//! - Circuit breaker for memory pressure
-//! - Pipeline caching
-//! - Intelligent GPU/CPU switching
-//! - Apple Silicon optimizations
-//!
-//! # Architecture
-//!
-//! ```text
-//! GpuContext (device/queue) ─┬─> BufferPool (3-tier, lifecycle tracking)
-//!                            ├─> ShaderManager (compiled pipelines)
-//!                            └─> CircuitBreaker (memory pressure)
-//!
-//! GpuNetwork (inference) ──> GpuContext
-//! GpuTrainer (training) ───> GpuContext
-//! ```
-//!
-//! # GPU/CPU Decision Heuristics
-//!
-//! | Operation | GPU Threshold | Rationale |
-//! |-----------|---------------|-----------|
-//! | Matrix-vector | >10K elements | GPU launch overhead dominates small ops |
-//! | Batch matmul | >100 batch size | Amortize kernel launch |
-//! | Activation | >1K elements | Element-wise is memory-bound |
-//!
-//! # Apple Silicon Specifics
-//!
-//! - 256-byte buffer alignment required
-//! - 128MB max buffer size
-//! - 2ms Metal watchdog (tile large dispatches)
-//! - 32-lane SIMD workgroups
+//! GPU compute backend for lattice-fann: buffer pooling, circuit-breaker memory
+//! pressure handling, pipeline caching, and Apple Silicon (Metal) tuning, with
+//! automatic CPU fallback below the size thresholds in [`thresholds`] where GPU
+//! launch overhead would dominate the computation (see ADR-025 for the full
+//! architecture, the GPU/CPU decision heuristics, and
+//! [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/fann/docs/design.md)).
 
 mod buffer;
 mod circuit_breaker;
