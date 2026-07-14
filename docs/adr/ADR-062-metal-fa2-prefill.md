@@ -11,10 +11,12 @@ The prefill bottleneck described in §Context was solved by a different mechanis
 Metal shader proposed here. The shipped solution is chunked batched prefill:
 `forward_prefill_batched_chunk` at `crates/inference/src/forward/metal_qwen35.rs:7878` (PR #228,
 1.78× TTFT improvement). Tiled Q4 GEMM landing on Apple7+ (PRs #265/#270/#283) further reduced
-prefill time. The full Metal FA2 kernel (new shader extraction into `crates/lattice-metal/`) and
-KV-cache quantization chain described in this ADR were not built; `prefix.rs:60` still stores
-`Arc<[f32]>` pages. The ADR remains as the historical design proposal; its KV-quant chain is an
-open future direction.
+prefill time. The full Metal FA2 kernel (new shader extraction into `crates/lattice-metal/`) and the
+int8/int4 KV-cache quantization chain described in this ADR were not built. F16 storage has partially
+shipped: `FlatKVCache` always stores f16, while the Qwen3.5 `MetalKvCache` has an opt-in f16 path
+selected by `LATTICE_KV_F16`. `PagedKVCache` and `PrefixPageCache` still store f32. The ADR remains
+as the historical design proposal; paged/prefix f16 storage and the int8/int4 chain are open future
+work.
 
 ---
 
@@ -52,9 +54,9 @@ Apple GPU Families 7-10 (M1-M4) share a binding constraint: **32 KiB threadgroup
 
 This constrains tile sizes. At f16, `BQ=32 BK=32 D=128` uses approximately 18.5 KiB -- safe. At f32, the same tile needs ~34.5 KiB -- exceeds the limit. Runtime selection via `supportsFamily` and `MTLComputePipelineState.maxTotalThreadsPerThreadgroup` is mandatory.
 
-### Existing KV cache: f32-only
+### Existing KV caches: mixed f16 and f32 storage
 
-Both `FlatKVCache` (flat.rs, 543 lines) and `PagedKVCache` (paged.rs, 1150 lines) store K and V as `Vec<f32>`. The Metal kernel reads f32 from KV buffers at full 32-bit bandwidth. Halving this to f16 is the single cheapest bandwidth win available, and is a prerequisite for the int8/int4 quantization chain.
+`FlatKVCache` stores K and V as `Vec<Vec<f16>>`, converting f32 inputs on write and dequantizing into caller-provided f32 buffers on read. `PagedKVCache` still stores its page pool as `Vec<f32>`. The Qwen3.5 Metal path defaults to f32 KV buffers but supports opt-in f16 buffers when `LATTICE_KV_F16=1` or `true`. Flat-cache f16 and opt-in Metal f16 are therefore shipped; the remaining storage work is paged/prefix f16 plus the proposed int8/int4 chain.
 
 `PrefixPageCache` (prefix.rs, 439 lines) is built and wired into `PagedKVCache` via `restore_prefix` / `promote_to_prefix`, but operates on `Arc<[f32]>` shared pages. The prefix cache design is format-agnostic -- it copies between page layouts at different page sizes -- but currently assumes f32 throughout.
 

@@ -3,7 +3,9 @@
 **Status**: Accepted (attention taxonomy superseded by ADR-059)\
 **Date**: 2026-05-13\
 **Crate**: `lattice-inference`\
-**Amendment (2026-05-27)**: ADR-059 expands the attention taxonomy from 4 variants (MHA, GQA, Flash, GDN) to 10 modules with a composable `AttentionKind` enum and `AttentionOp` trait. This ADR remains the authoritative reference for the primitive-level API contracts of MHA (`AttentionBuffers`), GQA (`GqaScratch`), Flash (tiled), and GDN (recurrent state). For dispatch/composition and the full taxonomy, see ADR-059.
+**Amendment (2026-05-27; implementation status updated 2026-07-14)**: ADR-059 proposes expanding the attention taxonomy from 4 variants (MHA, GQA, Flash, GDN) to 10 modules. The metadata-only `AttentionKind` enum has landed, but it does not implement an `AttentionOp` trait, allocate state, or dispatch kernels; that execution layer remains proposed P2+ work in ADR-059. This ADR remains the authoritative reference for the primitive-level API contracts of MHA (`AttentionBuffers`), GQA (`GqaScratch`), Flash (tiled), and GDN (recurrent state). For the proposed dispatch/composition architecture and the full taxonomy, see ADR-059.
+
+**Implementation correction (2026-07-14)**: The shipped standard-MHA path masks padding keys with `f32::NEG_INFINITY`, not a finite sentinel. `softmax_attention` zeros an all-masked row through its non-finite row-maximum guard. The old `-10,000.0` sentinel allowed a masked key to become the row maximum when every valid score was lower, leaking masked values into the output (#361). The original finite-sentinel decision is preserved below as historical rationale; it does not describe current behavior.
 
 ---
 
@@ -17,7 +19,7 @@ The crate supports three distinct attention algorithms, each suited to different
 - Bidirectional: no causal mask.
 - Equal Q, K, V head counts.
 - Pre-allocated `AttentionBuffers` (q/k/v/scores/context/concat/ffn_intermediate + per-head reshape buffers).
-- Padding positions masked with `-10,000.0` (not `-inf` to avoid NaN propagation).
+- Original decision: padding positions masked with `-10,000.0`; the implementation correction above documents the shipped `-inf` mask and all-masked-row guard.
 - Matmul convention: `matmul_bt` (computes A @ B^T; B is stored row-major, transposed logically).
 
 **Grouped Query Attention (GQA)** — `src/attention/gqa.rs`:
@@ -63,7 +65,7 @@ Implement **four attention variants** (MHA, GQA, CPU flash/tiled, GatedDeltaNet)
 ## Key Design Choices
 
 1. **Separate modules, not a single configurable attention function**: Each variant has distinct internal state (scratch buffers, stride patterns, normalization style). A unified function with a `mode: AttentionMode` parameter would share nothing meaningful between paths while obscuring which path is taken. Separate modules make each path independently testable and optimizable.
-2. **`-10,000.0` padding mask, not `-inf`**: Negative infinity can produce NaN in softmax when a row is fully masked (exp(-inf) = 0, sum = 0, 0/0 = NaN). A large negative value (-10,000.0) produces exp(-10,000) ≈ 0 without the NaN risk. This follows the HuggingFace BERT implementation convention.
+2. **Original finite-sentinel decision (not shipped)**: Negative infinity can produce NaN in softmax when a row is fully masked (exp(-inf) = 0, sum = 0, 0/0 = NaN). A large negative value (-10,000.0) produces exp(-10,000) ≈ 0 without the NaN risk. This follows the HuggingFace BERT implementation convention. The shipped path instead uses structural `-inf` masking plus an explicit all-masked-row guard, as recorded in the implementation correction above.
 3. **Zero-out causal mask in GQA (not additive before softmax)**: Standard causal masking adds a large negative value before softmax. The GQA path instead zeros the future-position probabilities after softmax scale but before normalization. This is equivalent for valid sequences but avoids the numerical risk of additive -inf.
 4. **`sgemm_bt_strided` on macOS**: Accelerate's BLAS handles strided K access without a copy. K is stored in the KV cache as `[seq_len, kv_dim]`; each KV head's slice is a stride away. On non-macOS, the GQA path copies K to a contiguous buffer before calling the generic BLAS. This is an OS-specific optimization, not a correctness difference.
 5. **48 KB L1 budget constant for flash tiling**: A conservative estimate (48 KB = 75% of the minimum 64 KB L1d on Apple Silicon). The constant is documented with its derivation in the source. Choosing too large a budget causes cache thrashing that nullifies the tiling benefit.
@@ -109,7 +111,7 @@ Implement **four attention variants** (MHA, GQA, CPU flash/tiled, GatedDeltaNet)
 
 ## References
 
-- `src/attention/standard.rs` — `multi_head_attention_in_place()`, `AttentionBuffers`, `-10,000.0` mask
+- `src/attention/standard.rs` — `multi_head_attention_in_place()`, `AttentionBuffers`, structural `f32::NEG_INFINITY` mask
 - `src/attention/gqa.rs` — `apply_gqa_attention()`, `GqaConfig`, `GqaScratch`, `apply_scaled_causal_softmax_fused()`
 - `src/attention/flash.rs` — `TiledAttentionConfig`, `TiledAttentionBuffers`, `optimal_tile_sizes()`, `TILED_SEQ_THRESHOLD`
 - `src/attention/gdn.rs` — `gated_delta_net_step()`, `GatedDeltaNetState`, `GatedDeltaNetScratch`

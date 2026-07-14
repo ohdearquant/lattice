@@ -4,6 +4,10 @@
 **Date**: 2026-05-19
 **Crate**: lattice-inference
 
+## Implementation status (2026-07-14)
+
+The shipped `vision` scaffold does not implement the Metal ViT path specified by the original v0 decision below. `vision::vit::ViT::forward` is a CPU reference implementation, and the `vision` module identifies a Metal ViT forward pass as future work. ADR-069 separately proposes an all-Metal vision path, but it remains Proposed. The accepted decision is preserved below as the historical design; this note records the current implementation gap without revising that decision.
+
 ## Context
 
 Lattice currently processes only text: `BpeTokenizer` converts strings to token IDs, and
