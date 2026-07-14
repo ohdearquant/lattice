@@ -2277,8 +2277,12 @@ pub(crate) fn check_context_budget(
 ) -> Result<(), InferenceError> {
     let effective_new = decode_cap(reasoning_budget, max_new_tokens);
     if prompt_len.saturating_add(effective_new) > max_context {
+        let reasoning_detail = reasoning_budget
+            .map(|budget| format!(", reasoning_budget={budget}"))
+            .unwrap_or_default();
         return Err(InferenceError::Inference(format!(
-            "prompt ({prompt_len} tokens) plus max_new_tokens ({max_new_tokens}) exceeds \
+            "prompt ({prompt_len} tokens) plus effective decode cap ({effective_new} tokens; \
+             max_new_tokens={max_new_tokens}{reasoning_detail}) exceeds \
              model context window ({max_context})"
         )));
     }
@@ -2786,9 +2790,15 @@ mod tests {
         // decode_cap(Some(3), 2) = 3 + 2 + 1 = 6; prompt 8 + 6 = 14 > 10.
         let result = check_context_budget(8, Some(3), 2, 10);
         assert!(
-            result.is_err(),
-            "prompt (8) + reasoning-extended decode cap (6) = 14 > max_context \
-             (10) must be rejected; got {result:?}"
+            matches!(
+                result,
+                Err(InferenceError::Inference(ref message))
+                    if message == "prompt (8 tokens) plus effective decode cap (6 tokens; \
+                                   max_new_tokens=2, reasoning_budget=3) exceeds model context \
+                                   window (10)"
+            ),
+            "reasoning-budget admission errors must report the effective cap and its inputs; \
+             got {result:?}"
         );
     }
 
