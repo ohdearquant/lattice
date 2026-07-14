@@ -1547,6 +1547,31 @@ class AggregateTest(unittest.TestCase):
         self.assertAlmostEqual(slopes[0].slope_tok_per_s, 10.0, places=6)
         self.assertIsNone(slopes[0].slope_ci95_legacy)
 
+    def test_slope_uses_native_duration_not_outer_wall_clock(self):
+        # issue #813 codex round-1 finding 1: the legacy per-process-loop
+        # scripts (bench_apples_precise.sh, bench_q4_apples.sh,
+        # bench_context_scaling.sh) time only the engine's own reported
+        # duration, never the harness's outer wall-clock wrapping a fresh
+        # subprocess spawn + model load per call. The adapter here reports
+        # a native duration implying an exact 100 tok/s, while the harness's
+        # own wall clock (driven independently by _StepClock) is deliberately
+        # unrelated -- if aggregate() aggregated `elapsed_ns` (the outer
+        # wall time) instead of `engine_native_ns`, the slope would come out
+        # 5.6 tok/s (224 tokens / 40s wall-clock delta), not 100.
+        profile = _profile(measured_repeats=1, windows=[32, 256])
+        wall_steps = [10.0e9, 50.0e9]  # unrelated to the native rate below
+        clock = _StepClock(wall_steps)
+        result = harness.run_profile(
+            profile,
+            {"fake": _FakeAdapter(native_ns_per_token=10_000_000)},  # 100 tok/s native
+            clock=clock,
+            git_sha_value="x",
+            hardware_id_value="h",
+        )
+        slopes = harness.aggregate(result)
+        self.assertEqual(len(slopes), 1)
+        self.assertAlmostEqual(slopes[0].slope_tok_per_s, 100.0, places=6)
+
     def test_trimmed_mean_stat_exact_with_asymmetric_outliers(self):
         # Direct unit test of the trimming primitive: a low and a high
         # outlier that trimming must remove for the trimmed mean to differ

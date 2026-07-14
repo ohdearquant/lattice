@@ -1,7 +1,10 @@
-//! Neural network layer implementation
+//! Dense feedforward-layer storage and inference.
 //!
-//! A layer consists of a weight matrix, bias vector, and activation function.
-//! Optimized for fast inference with pre-allocated buffers.
+//! A layer owns row-major weights, biases, and an activation, and writes its
+//! result into a caller-provided buffer. SIMD matrix-vector kernels are used
+//! when the enabled target supports them.
+//!
+//! See `docs/network.md` for layout, initialization, and dispatch details.
 
 use crate::activation::Activation;
 use crate::error::{FannError, FannResult, validate_layer_dimensions};
@@ -37,11 +40,7 @@ fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// NEON dot product — 4x4-wide FMA (16 elements/iter) with 4 independent accumulators.
-///
-/// Uses 4 independent accumulator registers to hide the 4-cycle FMA latency on
-/// typical ARM cores (Cortex-A76, Apple M-series). Each accumulator processes 4
-/// f32 elements per iteration = 16 elements total per loop body.
+/// NEON dot product with four independent FMA accumulators (16 elements/iteration).
 ///
 /// # Safety
 /// Caller must ensure `a.len() == b.len()`. NEON is mandatory on aarch64.
@@ -113,11 +112,7 @@ unsafe fn simd_dot_product_neon(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
-/// AVX2+FMA dot product — 4x8-wide FMA (32 elements/iter) with 4 independent accumulators.
-///
-/// Uses 4 independent __m256 accumulators to hide FMA latency (typically 4-5 cycles
-/// on Haswell/Skylake). Each accumulator processes 8 f32 elements per iteration =
-/// 32 elements total per loop body.
+/// AVX2+FMA dot product with four independent accumulators (32 elements/iteration).
 ///
 /// # Safety
 /// Caller must ensure AVX2+FMA are available and `a.len() == b.len()`.
@@ -198,10 +193,7 @@ unsafe fn simd_dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
-/// AVX-512 dot product — 4x16-wide FMA (64 elements/iter) with 4 independent accumulators.
-///
-/// Uses 512-bit registers (16 f32 lanes each) with 4 independent accumulators =
-/// 64 elements per loop iteration. Available on Skylake-X, Ice Lake, Zen 4+.
+/// AVX-512 dot product with four independent accumulators (64 elements/iteration).
 ///
 /// # Safety
 /// Caller must ensure AVX-512F is available and `a.len() == b.len()`.
@@ -276,13 +268,8 @@ unsafe fn simd_dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
-/// A single layer in a neural network
-///
-/// Computes: output = activation(input * weights + bias)
-///
-/// Memory layout:
-/// - weights: [num_outputs * num_inputs] in row-major order
-/// - biases: `[num_outputs]`
+/// Dense affine layer with an activation and output-major weight storage.
+/// See [`docs/network.md`](../docs/network.md#layer) for layout and evaluation details.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "LayerData"))]
@@ -299,11 +286,7 @@ pub struct Layer {
     activation: Activation,
 }
 
-/// Deserialization shadow for [`Layer`] that routes through [`Layer::with_weights`].
-///
-/// A corrupt or hand-crafted serialized layer whose `weights`/`biases` lengths
-/// disagree with its dimensions is rejected with a `FannError` instead of
-/// triggering an out-of-bounds panic during `forward`.
+/// Serde input that validates dimensions and tensor lengths through [`Layer::with_weights`].
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct LayerData {
@@ -330,14 +313,10 @@ impl TryFrom<LayerData> for Layer {
 }
 
 impl Layer {
-    /// Create a new layer with given dimensions and activation
+    /// Creates a layer with Xavier/Glorot weights and zero biases.
     ///
-    /// Initializes weights using Xavier/Glorot initialization and biases to zero.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FannError::InvalidLayerDimensions`] if dimensions are zero.
-    /// Returns [`FannError::ShapeTooLarge`] if the allocation would exceed safe limits.
+    /// Returns an error for zero or oversized dimensions, or invalid distribution parameters.
+    /// See [`docs/network.md`](../docs/network.md#layer) for initialization details.
     pub fn new(num_inputs: usize, num_outputs: usize, activation: Activation) -> FannResult<Self> {
         // Validate dimensions and allocation size
         validate_layer_dimensions(num_inputs, num_outputs)?;
@@ -370,21 +349,10 @@ impl Layer {
         })
     }
 
-    /// Create a layer with provided weights and biases
+    /// Creates a layer from output-major weights and one bias per output.
     ///
-    /// # Arguments
-    /// * `num_inputs` - Number of input neurons
-    /// * `num_outputs` - Number of output neurons
-    /// * `weights` - Weight matrix in row-major order (length: num_inputs * num_outputs)
-    /// * `biases` - Bias vector (length: num_outputs)
-    /// * `activation` - Activation function
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FannError::InvalidLayerDimensions`] if dimensions are zero.
-    /// Returns [`FannError::ShapeTooLarge`] if the allocation would exceed safe limits.
-    /// Returns [`FannError::WeightCountMismatch`] if weights length doesn't match dimensions.
-    /// Returns [`FannError::BiasCountMismatch`] if biases length doesn't match outputs.
+    /// Returns an error for invalid or oversized dimensions, or mismatched weight or bias lengths.
+    /// See [`docs/network.md`](../docs/network.md#layer) for storage and validation invariants.
     pub fn with_weights(
         num_inputs: usize,
         num_outputs: usize,
@@ -419,12 +387,10 @@ impl Layer {
         })
     }
 
-    /// Create a layer with zeros (useful for testing)
+    /// Creates a zero-parameter layer, useful for deterministic tests.
     ///
-    /// # Errors
-    ///
-    /// Returns [`FannError::InvalidLayerDimensions`] if dimensions are zero.
-    /// Returns [`FannError::ShapeTooLarge`] if the allocation would exceed safe limits.
+    /// Returns an error for zero or oversized dimensions.
+    /// See [`docs/network.md`](../docs/network.md#layer) for construction invariants.
     pub fn zeros(
         num_inputs: usize,
         num_outputs: usize,
@@ -442,20 +408,10 @@ impl Layer {
         })
     }
 
-    /// Create a new layer with seeded random initialization
+    /// Creates a layer with Xavier/Glorot weights drawn from `rng`.
     ///
-    /// Uses Xavier/Glorot initialization with a deterministic RNG for reproducibility.
-    ///
-    /// # Arguments
-    /// * `num_inputs` - Number of input neurons
-    /// * `num_outputs` - Number of output neurons
-    /// * `activation` - Activation function
-    /// * `rng` - Seeded random number generator
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FannError::InvalidLayerDimensions`] if dimensions are zero.
-    /// Returns [`FannError::ShapeTooLarge`] if the allocation would exceed safe limits.
+    /// Returns an error for zero or oversized dimensions, or invalid distribution parameters.
+    /// See [`docs/network.md`](../docs/network.md#layer) for initialization details.
     pub fn new_with_rng<R: rand::Rng>(
         num_inputs: usize,
         num_outputs: usize,
@@ -491,14 +447,10 @@ impl Layer {
         })
     }
 
-    /// Forward pass through the layer
+    /// Writes `activation(weights * input + bias)` to `output`.
     ///
-    /// Computes output = activation(input * weights + bias)
-    /// Result is written to the output buffer.
-    ///
-    /// # Arguments
-    /// * `input` - Input vector (length: num_inputs)
-    /// * `output` - Pre-allocated output buffer (length: num_outputs)
+    /// Returns an error unless `input` and `output` match the configured widths.
+    /// See [`docs/network.md`](../docs/network.md#layer) for row layout and execution.
     #[inline]
     pub fn forward(&self, input: &[f32], output: &mut [f32]) -> FannResult<()> {
         if input.len() != self.num_inputs {
@@ -570,17 +522,12 @@ impl Layer {
             let weights_ptr = self.weights.as_ptr();
             for out_idx in 0..num_outputs {
                 let row_start = out_idx * num_inputs;
-                // Prefetch next row's weights into L1 cache to hide memory latency.
-                // On the last row this prefetches slightly past the end, but
-                // _mm_prefetch on x86 is a hint — out-of-bounds addresses are
-                // silently ignored by the hardware.
+                // Prefetch the next in-bounds weight row to reduce cache latency.
                 if out_idx + 1 < num_outputs {
                     let next_row_start = (out_idx + 1) * num_inputs;
                     debug_assert!(next_row_start < self.weights.len());
                     debug_assert_eq!((weights_ptr as usize) % core::mem::align_of::<f32>(), 0);
-                    // SAFETY: _mm_prefetch is a hint; invalid addresses are
-                    // silently discarded by the CPU. We only issue this when
-                    // there is a next row.
+                    // SAFETY: next_row_start is the first element of an existing row.
                     unsafe {
                         use std::arch::x86_64::*;
                         _mm_prefetch(weights_ptr.add(next_row_start) as *const i8, _MM_HINT_T0);

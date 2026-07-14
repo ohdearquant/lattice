@@ -4,8 +4,8 @@ name: e2e-parity
 # Gates on greedy token agreement, reports speed informationally.
 #
 # Required-check shape: the workflow ALWAYS triggers (no `paths:` filter on the
-# PR event), but the expensive macOS `parity` job only runs when engine files
-# actually change. A cheap always-running `parity-gate` job is the *required*
+# PR or merge-group event), but the expensive macOS `parity` job only runs when
+# engine files actually change. A cheap always-running `parity-gate` job is the *required*
 # status context — it passes when there is nothing to check and mirrors the
 # parity result when there is. This avoids the classic trap where a required
 # check is path-filtered, never reports on unrelated PRs, and wedges them on
@@ -19,9 +19,13 @@ on:
     paths:
       - 'crates/inference/src/**'
       - 'crates/embed/src/**'
+      - 'scripts/ci-changed-files.sh'
   schedule:
     - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
   workflow_dispatch:
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
 
 # Cancel a PR's own superseded runs so they stop occupying the shared macOS
 # runner pool (~5 concurrent, account-wide) while a newer push on the same PR
@@ -56,15 +60,17 @@ jobs:
         with:
           fetch-depth: 0
       - id: filter
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin "${{ github.base_ref }}" --depth=1 2>/dev/null || true
-            CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
-              || git diff --name-only "HEAD~1...HEAD")
-          else
-            CHANGED=$(git diff --name-only "HEAD~1...HEAD" 2>/dev/null || true)
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] || [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            echo "engine=true" >> "$GITHUB_OUTPUT"
+            echo "→ $GITHUB_EVENT_NAME trigger: full parity suite REQUIRED"
+            exit 0
           fi
+          CHANGED=$(./scripts/ci-changed-files.sh)
           echo "Changed files:"
           echo "$CHANGED"
           # here-string, not `echo | grep -q`: -q exits at first match, echo gets
@@ -75,7 +81,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/e2e_parity_check\.py$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -186,11 +192,13 @@ jobs:
   #
   # Deliberately NOT added to parity-gate.needs below: this is an informational
   # signal only. Making it required is a maintainer decision (repo branch
-  # protection), out of scope for this change.
+  # protection), out of scope for this change. It is also skipped on merge-group
+  # events so this non-required macOS work cannot delay the required queue jobs;
+  # the PR run remains its observation point.
   metal-parity:
     name: metal attention parity (informational)
     needs: changes
-    if: needs.changes.outputs.engine == 'true' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: macos-latest
     timeout-minutes: 25
     steps:

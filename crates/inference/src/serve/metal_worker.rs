@@ -55,7 +55,19 @@ use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
-use tokio::sync::{mpsc, watch};
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+
+/// Default cap on outstanding (queued + in-flight) jobs a [`MetalWorkerClient`]
+/// admits before rejecting new submissions (issue #932). Conservative on
+/// purpose: this worker serializes ALL generation onto one dedicated thread
+/// (see the module docs), so a queue depth in the hundreds/thousands under
+/// bursty load just means O(N * request_size) memory growth (retained
+/// messages, sampling config, and an open SSE/event channel per queued job)
+/// with no matching throughput benefit — the extra jobs cannot run any
+/// sooner. Both binaries expose this as an overridable `--max-pending` flag;
+/// this constant is only the default when that flag is omitted.
+pub const DEFAULT_MAX_PENDING_JOBS: usize = 32;
 
 /// Selects the context-window formula enforced before Metal generation.
 /// Each serve adapter supplies the policy matching its pre-worker contract.
@@ -119,12 +131,21 @@ enum WorkerFailure {
 }
 
 /// Worker startup failure: either the `loader` itself returned `Err`
-/// (model/tokenizer load failure), or the worker thread exited/panicked
-/// before ever sending a readiness signal.
+/// (model/tokenizer load failure), the worker thread exited/panicked
+/// before ever sending a readiness signal, or the requested admission cap
+/// (issue #939) was outside `Semaphore::new`'s valid range.
 #[derive(Debug)]
 pub enum StartupError {
     Load(String),
     ThreadExited,
+    /// `max_pending` was `0` (admits nothing -- every request would fail
+    /// admission before any generation work could ever run) or greater
+    /// than `Semaphore::MAX_PERMITS` (`Semaphore::new` panics outright on
+    /// such a value). Caught here, before `Semaphore::new` is ever called,
+    /// as an ordinary configuration error instead of a startup panic.
+    InvalidMaxPending {
+        max_pending: usize,
+    },
 }
 
 impl std::fmt::Display for StartupError {
@@ -134,6 +155,11 @@ impl std::fmt::Display for StartupError {
             StartupError::ThreadExited => {
                 write!(f, "worker thread exited before loading finished")
             }
+            StartupError::InvalidMaxPending { max_pending } => write!(
+                f,
+                "--max-pending must be between 1 and {} (got {max_pending})",
+                Semaphore::MAX_PERMITS
+            ),
         }
     }
 }
@@ -152,6 +178,17 @@ pub struct WorkerJob {
     cfg: GenerateConfig,
     tx: mpsc::UnboundedSender<WorkerEvent>,
     cancel: watch::Receiver<bool>,
+    /// Admission slot for this job (issue #932), held from
+    /// [`MetalWorkerClient::submit`] until `run_worker_loop` finishes with
+    /// this job (whatever the outcome — `Complete`, `Rejected`, `Failed`, or
+    /// a dequeue-time `Cancelled`) and drops it, exactly once, via ordinary
+    /// struct-field `Drop` — never released early, never released twice,
+    /// and never forgotten on any of those paths because nothing in
+    /// `run_worker_loop` ever moves it out of `job` or calls
+    /// `mem::forget`/`mem::drop` on it directly. The leading underscore
+    /// silences "field is never read" (this field's only job is to exist
+    /// and be dropped) without needing `#[allow(dead_code)]`.
+    _admission_permit: OwnedSemaphorePermit,
 }
 
 /// Owns the dedicated worker thread's `JoinHandle`. See the module docs'
@@ -171,32 +208,59 @@ pub struct MetalWorkerOwner {
 #[derive(Debug, Clone)]
 pub struct MetalWorkerClient {
     jobs: mpsc::UnboundedSender<WorkerJob>,
+    /// Bounded-admission cap (issue #932): `Semaphore::new(max_pending)`, one
+    /// permit per outstanding job (queued + in-flight, i.e. from `submit`
+    /// until `run_worker_loop` is done with it). `Arc`-shared with every
+    /// clone of this client so the cap is process-wide, not per-clone.
+    admission: Arc<Semaphore>,
 }
 
 impl MetalWorkerClient {
     /// Submit one generation request; the worker thread processes jobs
-    /// strictly FIFO. Returns immediately with the event receiver -- if the
+    /// strictly FIFO. Returns the event receiver on success -- if the
     /// worker thread is no longer running, the returned receiver closes
     /// with zero events (`recv()` resolves to `None` on the first poll).
     /// Callers must treat that the same as an explicit "worker unavailable"
     /// error, mirroring each binary's prior `jobs.send(..).is_err()` check.
+    ///
+    /// Returns `Err(ApiError::ServiceUnavailable)` -- the ONE way this
+    /// method is allowed to fail outwardly -- when the outstanding-job cap
+    /// (issue #932) is already full: `max_pending` jobs are currently
+    /// either queued or in-flight on the shared worker thread. This check
+    /// runs synchronously, before the job is enqueued at all, so a caller
+    /// rejected here has done zero tokenization/model work and the worker
+    /// thread never sees the request -- admission is a pure "should this
+    /// job exist at all" gate, never a mid-stream failure. Every other
+    /// `MetalWorkerClient::submit` failure mode (worker gone, context
+    /// window overflow, generation error) still flows through the
+    /// zero-events-on-`rx`/`WorkerEvent::Rejected`/`WorkerEvent::Failed`
+    /// contract unchanged.
     pub fn submit(
         &self,
         messages: Vec<ChatMessage>,
         gen_cfg: GenerateConfig,
         cancel: watch::Receiver<bool>,
-    ) -> mpsc::UnboundedReceiver<WorkerEvent> {
+    ) -> Result<mpsc::UnboundedReceiver<WorkerEvent>, ApiError> {
+        let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
+            ApiError::ServiceUnavailable {
+                message: "too many outstanding requests; the inference worker's pending-job \
+                          queue is full, retry shortly"
+                    .to_string(),
+            }
+        })?;
         let (tx, rx) = mpsc::unbounded_channel();
         let job = WorkerJob {
             messages,
             cfg: gen_cfg,
             tx,
             cancel,
+            _admission_permit: permit,
         };
-        // On failure `job` (including `tx`) is simply dropped here, closing
-        // `rx` with zero events -- see the doc comment above.
+        // On failure `job` (including `tx` and the admission permit) is
+        // simply dropped here, closing `rx` with zero events and freeing
+        // the slot immediately -- see the doc comment above.
         let _ = self.jobs.send(job);
-        rx
+        Ok(rx)
     }
 }
 
@@ -358,12 +422,26 @@ impl MetalWorker {
     /// a caller never binds its HTTP listener before the model is confirmed
     /// ready, and never gets a `MetalWorkerClient` it could submit jobs to
     /// before that point either.
+    ///
+    /// `max_pending` (issue #932) is the returned `MetalWorkerClient`'s
+    /// outstanding-job admission cap -- see [`MetalWorkerClient::submit`].
+    /// Both binaries pass their own `--max-pending`-derived value (default
+    /// [`DEFAULT_MAX_PENDING_JOBS`]); this function applies no default of
+    /// its own.
     pub fn spawn(
         loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
         + Send
         + 'static,
+        max_pending: usize,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
+        // #939: validate BEFORE `Semaphore::new`, which panics outright for
+        // `max_pending > Semaphore::MAX_PERMITS` and would otherwise let
+        // `max_pending == 0` silently build a worker that admits nothing.
+        if max_pending == 0 || max_pending > Semaphore::MAX_PERMITS {
+            return Err(StartupError::InvalidMaxPending { max_pending });
+        }
         let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let admission = Arc::new(Semaphore::new(max_pending));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WorkerMetadata, String>>();
 
         let join_handle = std::thread::spawn(move || match loader() {
@@ -430,7 +508,10 @@ impl MetalWorker {
                 MetalWorkerOwner {
                     join_handle: Some(join_handle),
                 },
-                MetalWorkerClient { jobs: job_tx },
+                MetalWorkerClient {
+                    jobs: job_tx,
+                    admission,
+                },
                 meta,
             )),
             Ok(Err(e)) => Err(StartupError::Load(e)),
@@ -454,7 +535,7 @@ impl MetalWorker {
 // `lattice_inference::model::qwen35::test_support`'s own doc comment for the
 // same reasoning spelled out in full).
 
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 impl WorkerJob {
     /// Reply to this job with one event, exactly as the production worker
     /// loop would via its own `job.tx.send(..)`. Returns `false` once the
@@ -473,11 +554,40 @@ impl WorkerJob {
 /// generalized so both binaries' test suites build on one shared seam
 /// instead of each rolling its own raw `mpsc::unbounded_channel::<Job>()`
 /// pair.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerJob>) {
-    let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
-    (MetalWorkerClient { jobs: job_tx }, job_rx)
+    // A large, effectively-unbounded cap: the overwhelming majority of
+    // existing callers of this seam predate the #932 admission cap and
+    // exercise request validation / routing / cancellation, not admission
+    // itself -- they must keep behaving as if the queue were unbounded.
+    // Tests that specifically exercise the cap use
+    // `test_client_and_jobs_with_cap` instead.
+    test_client_and_jobs_with_cap(TEST_EFFECTIVELY_UNBOUNDED_CAP)
 }
+
+/// Same as [`test_client_and_jobs`], with an explicit admission cap (issue
+/// #932) instead of the effectively-unbounded default -- for tests that
+/// exercise `MetalWorkerClient::submit`'s admission rejection itself.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn test_client_and_jobs_with_cap(
+    max_pending: usize,
+) -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerJob>) {
+    let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+    (
+        MetalWorkerClient {
+            jobs: job_tx,
+            admission: Arc::new(Semaphore::new(max_pending)),
+        },
+        job_rx,
+    )
+}
+
+/// See [`test_client_and_jobs`]'s doc comment: the cap
+/// `test_client_and_jobs`/`spawn_fake` (the two test-utils seams that predate
+/// issue #932) use so pre-existing callers keep seeing effectively-unbounded
+/// admission unless they opt into the `_with_cap` variant.
+#[cfg(any(test, feature = "test-utils"))]
+const TEST_EFFECTIVELY_UNBOUNDED_CAP: usize = 1_000_000;
 
 /// A [`MetalWorkerClient`] backed by a REAL background thread running the
 /// exact production FIFO/cancellation loop ([`run_worker_loop`]) and the
@@ -495,9 +605,42 @@ pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<Wor
 /// value the real window-check computed) alongside `messages`/`cfg`, so a
 /// caller can build a faithful `GenerateOutput`/observation without
 /// re-deriving that count independently.
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::type_complexity)]
 pub fn spawn_fake(
+    context_window_policy: ContextWindowPolicy,
+    model_max_context: usize,
+    tokenizer: BpeTokenizer,
+    generate: impl FnMut(
+        &[ChatMessage],
+        &GenerateConfig,
+        usize,
+        &mut dyn FnMut(&str, u32) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, String>
+    + Send
+    + 'static,
+) -> MetalWorkerClient {
+    // See `test_client_and_jobs`'s doc comment: effectively-unbounded so
+    // this seam's many pre-#932 callers (request validation / routing /
+    // cancellation fixtures, not admission itself) keep behaving as before.
+    spawn_fake_with_cap(
+        TEST_EFFECTIVELY_UNBOUNDED_CAP,
+        context_window_policy,
+        model_max_context,
+        tokenizer,
+        generate,
+    )
+}
+
+/// Same as [`spawn_fake`], with an explicit admission cap (issue #932)
+/// instead of the effectively-unbounded default -- for tests that exercise
+/// `MetalWorkerClient::submit`'s admission rejection at the real-router
+/// (HTTP) layer.
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::type_complexity)]
+pub fn spawn_fake_with_cap(
+    max_pending: usize,
     context_window_policy: ContextWindowPolicy,
     model_max_context: usize,
     tokenizer: BpeTokenizer,
@@ -522,7 +665,10 @@ pub fn spawn_fake(
                 .map_err(WorkerFailure::Failed)
         });
     });
-    MetalWorkerClient { jobs: job_tx }
+    MetalWorkerClient {
+        jobs: job_tx,
+        admission: Arc::new(Semaphore::new(max_pending)),
+    }
 }
 
 #[cfg(test)]
@@ -660,11 +806,20 @@ mod tests {
     ) {
         let (tx, rx) = mpsc::unbounded_channel::<WorkerEvent>();
         let (cancel_guard, cancel_rx) = crate::serve::cancel_pair();
+        // These FIFO/cancellation-loop tests drive `WorkerJob` directly
+        // (bypassing `MetalWorkerClient::submit`'s admission check
+        // entirely), so each job gets its own throwaway one-permit
+        // semaphore rather than sharing a real admission cap -- these tests
+        // are not exercising #932's admission behavior at all.
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("fresh single-permit semaphore must have a permit available");
         let job = WorkerJob {
             messages: vec![ChatMessage::user("hi")],
             cfg: GenerateConfig::default(),
             tx,
             cancel: cancel_rx,
+            _admission_permit: permit,
         };
         (job, rx, cancel_guard)
     }
@@ -758,11 +913,15 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel::<WorkerEvent>();
         drop(rx);
         let (_guard, cancel_rx) = crate::serve::cancel_pair();
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("fresh single-permit semaphore must have a permit available");
         let job = WorkerJob {
             messages: vec![ChatMessage::user("hi")],
             cfg: GenerateConfig::default(),
             tx,
             cancel: cancel_rx,
+            _admission_permit: permit,
         };
         job_tx.send(job).unwrap();
         drop(job_tx);
@@ -1015,7 +1174,10 @@ mod tests {
     fn loader_failure_before_readiness_is_reported_without_touching_a_device() {
         // The `Ok` arm's type (`MetalQwen35State`) is never constructed --
         // this typechecks and runs with zero GPU involvement.
-        let result = MetalWorker::spawn(|| Err("simulated load failure".to_string()));
+        let result = MetalWorker::spawn(
+            || Err("simulated load failure".to_string()),
+            DEFAULT_MAX_PENDING_JOBS,
+        );
         match result {
             Err(StartupError::Load(message)) => {
                 assert_eq!(message, "simulated load failure");
@@ -1031,6 +1193,52 @@ mod tests {
             StartupError::ThreadExited.to_string(),
             "worker thread exited before loading finished"
         );
+        assert_eq!(
+            StartupError::InvalidMaxPending { max_pending: 0 }.to_string(),
+            format!(
+                "--max-pending must be between 1 and {} (got 0)",
+                Semaphore::MAX_PERMITS
+            )
+        );
+    }
+
+    // ── #939 max_pending boundary tests ───────────────────────────────────
+    //
+    // Validated BEFORE `Semaphore::new` in `MetalWorker::spawn`, so -- like
+    // `loader_failure_before_readiness_is_reported_without_touching_a_device`
+    // above -- these never construct a real `MetalQwen35State` and need no
+    // GPU: an out-of-range `max_pending` returns `Err` before `loader` would
+    // even be called (a loader that panics if invoked proves that).
+
+    #[test]
+    fn max_pending_zero_is_rejected_before_semaphore_new() {
+        let result = MetalWorker::spawn(
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> {
+                panic!("loader must not run: max_pending=0 must be rejected first")
+            },
+            0,
+        );
+        match result {
+            Err(StartupError::InvalidMaxPending { max_pending: 0 }) => {}
+            other => panic!("expected InvalidMaxPending{{max_pending: 0}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn max_pending_above_max_permits_is_rejected_before_semaphore_new() {
+        let too_big = Semaphore::MAX_PERMITS + 1;
+        let result = MetalWorker::spawn(
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> {
+                panic!("loader must not run: max_pending above MAX_PERMITS must be rejected first")
+            },
+            too_big,
+        );
+        match result {
+            Err(StartupError::InvalidMaxPending { max_pending }) => {
+                assert_eq!(max_pending, too_big);
+            }
+            other => panic!("expected InvalidMaxPending, got {other:?}"),
+        }
     }
 
     // ── check_prompt_fits_window, ported from lattice_serve.rs's
@@ -1148,5 +1356,259 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    // ── admission cap / backpressure (issue #932) ─────────────────────────
+
+    /// Cap enforcement: with `max_pending=2`, job 1 (dequeued immediately,
+    /// running) plus job 2 (queued behind it) fill the cap; a 3rd submission
+    /// must be rejected with `ApiError::ServiceUnavailable` before it ever
+    /// reaches the job channel.
+    ///
+    /// Mutation-verified by hand (issue #932 implementation): temporarily
+    /// raising the cap passed to `test_client_and_jobs_with_cap` below from
+    /// 2 to 3 makes the 3rd submission succeed and this test's
+    /// `expect_err` panic -- confirming the assertion actually depends on
+    /// the cap value rather than trivially passing regardless.
+    #[test]
+    fn submit_rejects_once_admission_cap_reached() {
+        let cap = 2;
+        let (client, job_rx) = test_client_and_jobs_with_cap(cap);
+        let started = Arc::new(AtomicUsize::new(0));
+        let ran_tokens = Arc::new(AtomicUsize::new(0));
+        let started2 = started.clone();
+        let ran2 = ran_tokens.clone();
+        let handle = std::thread::spawn(move || {
+            run_worker_loop(job_rx, fake_generate(2000, started2, ran2))
+        });
+
+        // Job 1: admitted, immediately dequeued (nothing else queued yet),
+        // and running fake_generate's 2000-iteration/5ms-per-iteration
+        // loop -- long enough to stay in-flight for the rest of this test.
+        let (guard1, cancel1) = crate::serve::cancel_pair();
+        let rx1 = client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel1,
+            )
+            .expect("job 1 must be admitted: cap=2, 0 outstanding");
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Job 2: admitted (2nd of 2 permits); sits queued behind job 1
+        // since the single worker thread is still busy with it.
+        let (guard2, cancel2) = crate::serve::cancel_pair();
+        let rx2 = client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel2,
+            )
+            .expect("job 2 must be admitted: cap=2, 1 outstanding");
+
+        // Job 3: cap is now full (job 1 in-flight + job 2 queued == 2 ==
+        // cap) -- must be rejected, and must never reach the job channel
+        // (no tokenization/model work for a rejected admission).
+        let (_guard3, cancel3) = crate::serve::cancel_pair();
+        let err = client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel3,
+            )
+            .expect_err("job 3 must be rejected once the cap is reached");
+        match err {
+            ApiError::ServiceUnavailable { message } => {
+                assert!(
+                    message.contains("outstanding") || message.contains("pending"),
+                    "rejection message should explain admission capacity: {message}"
+                );
+            }
+            other => panic!("expected ServiceUnavailable, got {other:?}"),
+        }
+
+        // Cleanup: cancel jobs 1 and 2 so fake_generate's should_cancel
+        // check stops them quickly, then drain and join.
+        drop(guard1);
+        drop(guard2);
+        drop(rx1);
+        drop(rx2);
+        drop(client);
+        handle.join().expect("worker thread must not panic");
+    }
+
+    /// Slot release on NORMAL completion: a cap=1 client must admit a
+    /// second job only after the first job's terminal `Complete` event has
+    /// been delivered and `run_worker_loop` has moved past it (dropping the
+    /// `WorkerJob`, and with it the admission permit it owns).
+    #[test]
+    fn admission_slot_is_released_when_a_job_completes() {
+        let cap = 1;
+        let (client, job_rx) = test_client_and_jobs_with_cap(cap);
+        let started = Arc::new(AtomicUsize::new(0));
+        let ran_tokens = Arc::new(AtomicUsize::new(0));
+        let started2 = started.clone();
+        let ran2 = ran_tokens.clone();
+        let handle =
+            std::thread::spawn(move || run_worker_loop(job_rx, fake_generate(5, started2, ran2)));
+
+        let (_guard1, cancel1) = crate::serve::cancel_pair();
+        let mut rx1 = client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel1,
+            )
+            .expect("job 1 must be admitted");
+
+        // Drain job 1 to its terminal Complete event -- fake_generate(5, ..)
+        // runs to completion in ~25ms and is never cancelled.
+        let mut completed = false;
+        while let Some(ev) = rx1.blocking_recv() {
+            if matches!(ev, WorkerEvent::Complete(_)) {
+                completed = true;
+            }
+        }
+        assert!(completed, "job 1 must complete normally");
+
+        // The permit `run_worker_loop` held for job 1 is dropped along with
+        // `job` at the end of that loop iteration, essentially immediately
+        // after the `Complete` send above -- retry briefly rather than
+        // assume that has already happened on this exact instruction by the
+        // time this (different) thread observes the event.
+        let mut admitted = false;
+        for _ in 0..50 {
+            let (_guard2, cancel2) = crate::serve::cancel_pair();
+            match client.submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel2,
+            ) {
+                Ok(_rx2) => {
+                    admitted = true;
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert!(
+            admitted,
+            "slot must be released once job 1 completes, admitting job 2 at the same cap=1"
+        );
+
+        drop(client);
+        handle.join().expect("worker thread must not panic");
+    }
+
+    /// THE REGRESSION THIS TEST GUARDS (issue #932): a client-cancelled
+    /// job that is still sitting in the queue (not yet dequeued) must NOT
+    /// release its admission slot early -- it is still real, unprocessed
+    /// work occupying a place in the FIFO queue -- but once the worker
+    /// actually dequeues it and observes the cancellation (sending exactly
+    /// one `WorkerEvent::Cancelled`, the existing #832 dequeue-time-cancel
+    /// contract), its slot MUST be released, same as any other terminal
+    /// outcome. A permit leaked specifically on this path would let the
+    /// outstanding-job count only ever grow -- every cancelled queued
+    /// request would permanently cost one admission slot, eventually
+    /// wedging admission shut with zero real work outstanding.
+    #[test]
+    fn admission_slot_is_released_when_a_queued_job_is_cancelled() {
+        let cap = 2;
+        let (client, job_rx) = test_client_and_jobs_with_cap(cap);
+        let started = Arc::new(AtomicUsize::new(0));
+        let ran_tokens = Arc::new(AtomicUsize::new(0));
+        let started2 = started.clone();
+        let ran2 = ran_tokens.clone();
+        let handle = std::thread::spawn(move || {
+            run_worker_loop(job_rx, fake_generate(2000, started2, ran2))
+        });
+
+        // Job 1: admitted, immediately dequeued, running.
+        let (guard1, cancel1) = crate::serve::cancel_pair();
+        let rx1 = client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel1,
+            )
+            .expect("job 1 must be admitted");
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Job 2: admitted (2nd of 2 permits), queued behind job 1. Cancel
+        // it immediately, client-side, WHILE it is still sitting in the
+        // queue, unprocessed.
+        let (guard2, cancel2) = crate::serve::cancel_pair();
+        let mut rx2 = client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel2,
+            )
+            .expect("job 2 must be admitted");
+        drop(guard2);
+
+        // Cap is full (2/2) right now: a 3rd submit must be rejected --
+        // proving a client-cancelled-but-still-queued job legitimately
+        // still occupies its slot before it has actually been dequeued.
+        let (_guard3, cancel3) = crate::serve::cancel_pair();
+        client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel3,
+            )
+            .expect_err("cap must still be full: job 2's slot isn't released until dequeued");
+
+        // Let job 1 finish (cancel it too) so the worker dequeues job 2
+        // next, observes its cancel flag, and emits exactly one Cancelled
+        // event for it.
+        drop(guard1);
+        match rx2.blocking_recv() {
+            Some(WorkerEvent::Cancelled) => {}
+            other => panic!("expected job 2's exactly-one Cancelled event, got {other:?}"),
+        }
+
+        // The slot must now be free -- and specifically BOTH slots, not
+        // just one. A single successful 4th admission (the original form
+        // of this assertion) does not distinguish "job 2's queued-cancel
+        // path correctly released its own permit" from "only job 1's
+        // ordinary completion released a permit and job 2's leaked": at
+        // this point job 1 has already finished (releasing one permit
+        // unconditionally, regression or not), so a leak confined to job
+        // 2's queued-cancel path still leaves exactly one usable permit --
+        // enough for one admission to spuriously succeed. Poll the
+        // semaphore's own count directly (this test module is a child of
+        // `metal_worker`, so `client.admission` -- private outside this
+        // file -- is visible here) rather than relying on dequeue timing
+        // for a second, indirect proof.
+        let mut permits_restored = false;
+        for _ in 0..50 {
+            if client.admission.available_permits() == cap {
+                permits_restored = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            permits_restored,
+            "both permits (job 1's own release AND job 2's queued-cancel release) must be \
+             free once job 2's Cancelled event has fired, got {} of {cap}",
+            client.admission.available_permits()
+        );
+
+        // And the caller-observable contract still holds: a fresh
+        // admission at full cap succeeds.
+        let (_guard4, cancel4) = crate::serve::cancel_pair();
+        client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                cancel4,
+            )
+            .expect("job 2's slot must be released after its Cancelled event, not leaked");
+
+        drop(rx1);
+        drop(client);
+        handle.join().expect("worker thread must not panic");
     }
 }

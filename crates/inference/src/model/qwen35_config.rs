@@ -354,6 +354,34 @@ impl Qwen35Config {
         Self::from_config_json_str(&json)
     }
 
+    /// Resolve the architecture config for a model directory, requiring a
+    /// real `config.json`.
+    ///
+    /// This is the single fallback policy for every loader in this crate
+    /// (library and binaries alike; see issue #923). Every supported Qwen
+    /// checkpoint ships a `config.json` describing its exact geometry, so a
+    /// missing file is a hard, descriptive error naming the directory rather
+    /// than a silently-substituted architecture preset. Before this helper
+    /// existed, independent call sites each guessed a different preset
+    /// (`qwen35_2b`, `qwen36_27b`, `qwen35_0_8b`) on a missing file — pointing
+    /// the same config-less directory at different tools silently produced
+    /// different model geometries, and the wrong-preset case failed later at
+    /// tensor validation with an error that named the weights, not the
+    /// missing config. Callers that need directory-not-found context in a
+    /// different error type (e.g. the CLI binaries' `String` errors) should
+    /// wrap this with `.map_err(...)`, not reimplement the existence check.
+    pub fn from_model_dir(dir: &Path) -> Result<Self, InferenceError> {
+        let config_path = dir.join("config.json");
+        if !config_path.exists() {
+            return Err(InferenceError::ModelNotFound(format!(
+                "missing config.json in {} -- every supported Qwen checkpoint ships one; \
+                 no architecture preset is inferred from a config-less directory",
+                dir.display()
+            )));
+        }
+        Self::from_config_json(&config_path)
+    }
+
     /// Parse HF config.json text into a `Qwen35Config`.
     pub fn from_config_json_str(json: &str) -> Result<Self, InferenceError> {
         let parsed: HfQwenConfigFile = serde_json::from_str(json)
@@ -1743,6 +1771,55 @@ mod tests {
             force_close_think(Some(10), true, false, 0, Some(close_id)),
             None,
             "must not force when zero tokens generated"
+        );
+    }
+
+    // -- from_model_dir: the single shared config-resolution policy (#923) --
+
+    #[test]
+    fn from_model_dir_errors_on_missing_config_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Directory exists but has no config.json at all.
+        let err = Qwen35Config::from_model_dir(tmp.path())
+            .expect_err("a directory with no config.json must be a hard error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config.json"),
+            "error must name the missing file: {msg}"
+        );
+        assert!(
+            msg.contains(&tmp.path().display().to_string()),
+            "error must name the offending directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_model_dir_loads_a_real_config_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let json = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/qwen35_0_8b_config.json"
+        ));
+        std::fs::write(tmp.path().join("config.json"), json).unwrap();
+
+        let cfg = Qwen35Config::from_model_dir(tmp.path())
+            .expect("a directory with a valid config.json must load");
+        assert_eq!(
+            cfg.hidden_size, 1024,
+            "must parse the real 0.8B config, not a preset"
+        );
+    }
+
+    #[test]
+    fn from_model_dir_propagates_a_malformed_config_json_parse_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.json"), "not valid json {{{").unwrap();
+
+        let err = Qwen35Config::from_model_dir(tmp.path())
+            .expect_err("malformed config.json must still be a parse error, not a preset");
+        assert!(
+            err.to_string().contains("config.json") || err.to_string().contains("invalid Qwen"),
+            "error must reflect the parse failure: {err}"
         );
     }
 }

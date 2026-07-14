@@ -1,4 +1,8 @@
-//! Pipeline types: labeling results, statistics, and raw examples.
+//! Inputs, outputs, and accounting for the distillation pipeline.
+//!
+//! `RawExample` sanitizes and formats teacher input; `LabelingResult` carries
+//! one outcome, and `DistillationStats` aggregates outcomes. See
+//! `docs/distill.md` for prompt limits, result semantics, and statistics rules.
 
 use crate::data::{ExampleMetadata, IntentLabels};
 use uuid::Uuid;
@@ -192,12 +196,8 @@ impl RawExample {
         self
     }
 
-    /// Format for teacher prompt with input sanitization.
-    ///
-    /// Applies the following sanitization:
-    /// - Strips control characters (except newlines and tabs)
-    /// - Truncates individual messages to `MAX_MESSAGE_LENGTH`
-    /// - Truncates total prompt to `MAX_PROMPT_LENGTH`
+    /// Format the context and current message as a bounded, sanitized teacher prompt.
+    /// See [`docs/distill.md`](../../../docs/distill.md#rawexampleto_prompt) for its layout and limits.
     pub fn to_prompt(&self) -> String {
         let mut prompt = String::new();
 
@@ -224,7 +224,7 @@ impl RawExample {
         prompt
     }
 
-    /// Sanitize user input to prevent prompt injection.
+    /// Sanitize user input before embedding it in a prompt.
     ///
     /// - Strips control characters (except \n, \t, \r)
     /// - Truncates to [`MAX_MESSAGE_LENGTH`]

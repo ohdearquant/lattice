@@ -72,6 +72,15 @@ pub enum ApiError {
     PayloadTooLarge { message: String },
     /// Server-side failure — HTTP 500.
     Internal { message: String },
+    /// Admission rejected: the shared Metal worker's outstanding-job cap
+    /// (queued + in-flight) is already full — HTTP 503 (issue #932). This is
+    /// the ONE place `MetalWorkerClient::submit` is allowed to fail
+    /// outwardly (see that method's doc comment): every other failure mode
+    /// on that path still closes the returned receiver with zero events
+    /// instead. Deliberately 503 ("server busy, try again"), not 429: this
+    /// is a shared, single-GPU capacity limit on the server as a whole, not
+    /// a per-caller rate limit — the request itself was perfectly fine.
+    ServiceUnavailable { message: String },
 }
 
 impl ApiError {
@@ -82,6 +91,7 @@ impl ApiError {
             ApiError::BadRequest { message, .. } => message,
             ApiError::PayloadTooLarge { message } => message,
             ApiError::Internal { message } => message,
+            ApiError::ServiceUnavailable { message } => message,
         }
     }
 }
@@ -134,6 +144,17 @@ impl IntoResponse for ApiError {
                     },
                 });
                 (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
+            }
+            ApiError::ServiceUnavailable { message } => {
+                let body = Json(ErrorBody {
+                    error: ErrorDetail {
+                        message,
+                        r#type: "server_error",
+                        code: "server_busy".to_string(),
+                        param: None,
+                    },
+                });
+                (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
             }
         }
     }

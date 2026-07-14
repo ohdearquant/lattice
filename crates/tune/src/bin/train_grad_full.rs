@@ -1,37 +1,4 @@
-// Multi-layer reverse-mode (exact) gradient LoRA trainer for Qwen3.5-0.8B.
-//
-// Generalises train_grad_layer23 from a single GQA layer to a layer RANGE
-// [first_layer ..= 23], dispatching per layer kind and propagating dx through
-// the frozen GatedDeltaNet layers via gdn_backward. This is the full-depth
-// backward tape: gradient from the CE loss flows back through the head, through
-// every materialised layer's FFN + mixer + norms, accumulating LoRA grads at the
-// GQA layers and threading dx through the frozen GDN layers in between.
-//
-//   h_in (frozen prefix 0..first_layer)  ── captured once per sample
-//   for L in first_layer ..= 23:
-//     normed_pre = rms_norm(h, pre_norm[L])
-//     mixer_out  = GQA(normed_pre; LoRA)  | GDN(normed_pre)   (frozen if GDN)
-//     h_mid      = h + mixer_out
-//     ffn_out    = swiglu(rms_norm(h_mid, post_norm[L]))
-//     h          = h_mid + ffn_out
-//   logits = lm_head · rms_norm(h, final_norm)
-//   loss   = CE(logits, next_token) over completion positions
-//
-// Default first_layer = 19, so the materialised stack is
-//   19 (GQA+LoRA) → 20,21,22 (GDN, frozen) → 23 (GQA+LoRA).
-// Layer-19's LoRA gradient is only correct if dx propagated correctly back
-// through the three frozen GDN layers, so the finite-difference gradcheck on
-// layer-19's params is the integration test for gdn_backward + the assembled
-// residual/norm chain — exactly the gap the per-block self-consistent
-// gradchecks cannot see.
-//
-// Qwen3.5 RMSNorm is SHIFTED (x·inv·(1+gamma)); rms_norm_forward/rmsnorm_backward
-// take plain gamma, so layer/final norms get (1+gamma) precomputed weights.
-// q_norm/k_norm are shifted inside gqa_forward_with_cache, so they stay raw.
-//
-// Usage: train_grad_full --model-dir <path> --data-dir <path> [--first-layer 19]
-//        [--steps 25] [--lr 1e-3] [--rank 8] [--alpha 16] [--max-train 3]
-//        [--seq-len 64] [--gradcheck]
+// Exact multi-layer LoRA trainer — see docs/design.md (§train_grad_full details).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -127,14 +94,8 @@ fn strided_probes(len: usize, count: usize, seed: u64) -> Vec<usize> {
     out
 }
 
-/// Gradcheck-mode GDN LoRA initialization: every array (A and B) filled with
-/// small non-zero random noise, so both `grad_A` and the gate path are
-/// non-vacuous for the finite-difference probe.
-///
-/// Extracted into a standalone, testable function (#792): this is the exact
-/// constructor that had drifted to `gdn_dims.num_kh` for `b_b`/`b_a` while
-/// `GdnLoraParams::zeros` used the correct `value_heads`. Now routes through
-/// `GdnLoraParams::shaped`, the single shape source of truth.
+/// Initialize every GDN LoRA factor with nonzero noise for finite-difference checks.
+/// See [`docs/design.md`](../../docs/design.md#train_grad_full-details) for shape and non-vacuity invariants.
 fn gradcheck_gdn_loras(
     num_gdn_slots: usize,
     rank: usize,
@@ -142,10 +103,7 @@ fn gradcheck_gdn_loras(
     gdn_dims: &GdnDims,
     seed: u64,
 ) -> Vec<GdnLoraParams> {
-    // rand_fill takes `&mut u64`; two closures can't each hold that mutable
-    // borrow as separate `shaped` arguments, so thread it through a `Cell`
-    // (each closure captures `&rng_cell`, a shared reference, so both can
-    // coexist as separate arguments).
+    // `Cell` lets both `shaped` initializers advance one deterministic RNG state.
     let rng_cell = std::cell::Cell::new(seed);
     (0..num_gdn_slots)
         .map(|_| {
@@ -171,13 +129,8 @@ fn gradcheck_gdn_loras(
         .collect()
 }
 
-/// Training-mode GDN LoRA initialization: A ~ U(-init_amp, +init_amp), B
-/// zero (delta=0 at init reproduces the base; grad_B != 0 so B moves first).
-///
-/// Extracted into a standalone, testable function (#792): see
-/// [`gradcheck_gdn_loras`] for why this must route through
-/// `GdnLoraParams::shaped` rather than re-deriving `b_b`/`b_a`'s length
-/// inline (the same drift existed at this call site independently).
+/// Initialize GDN LoRA with random A factors and zero B factors for training.
+/// See [`docs/design.md`](../../docs/design.md#train_grad_full-details) for shape and initialization invariants.
 fn zero_b_gdn_loras(
     num_gdn_slots: usize,
     rank: usize,
@@ -276,10 +229,7 @@ fn parse_config(argv: &ArgView) -> Result<Config, String> {
             .arg("--probe")
             .and_then(|s| s.parse().ok())
             .unwrap_or(6),
-        // Central-difference step. On the real f32 model (hidden 1024, vocab
-        // 248320, multi-layer GDN recurrence) the NLL carries ~1e-6 roundoff,
-        // so too-small a step is roundoff-dominated. Optimal central-FD step
-        // ≈ cbrt(roundoff) ≈ 4e-3.
+        // 4e-3 avoids roundoff-dominated finite differences — see docs/design.md.
         fd_eps: argv
             .arg("--fd-eps")
             .and_then(|s| s.parse().ok())
@@ -363,11 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         final_shift: &final_shift,
     };
 
-    // Build the materialised layer stack [first_layer ..= 23], assigning a LoRA
-    // slot to every layer: GQA layers get a slot into `loras` (surface-A,
-    // q_proj/v_proj), GDN layers get a slot into `gdn_loras` (surface-B, the
-    // 5 GDN projections — ported from lattice PR #202). All weight slices are
-    // borrowed from `model`.
+    // Assign GQA and GDN LoRA slots across the materialized range — see docs/design.md.
     let mut layers: Vec<LayerW> = Vec::new();
     let mut slot_layers: Vec<usize> = Vec::new(); // global layer index per GQA slot
     let mut gdn_slot_layers: Vec<usize> = Vec::new(); // global layer index per GDN slot
@@ -488,9 +434,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcache.elapsed().as_secs_f64()
     );
 
-    // Held-out validation caches (valid.jsonl) — eval-only, never trained on.
-    // The honest signal: train NLL falling while held-out NLL also falls is
-    // learning; train NLL falling while held-out rises is memorisation.
+    // Hold out valid.jsonl from training; compare its NLL to the training NLL.
     let valid_caches: Vec<SeqCtx> = if max_valid > 0 {
         match load_jsonl(
             &data_dir.join("valid.jsonl"),
@@ -515,9 +459,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Vec::new()
     };
 
-    // TBV: with zero LoRA (delta exactly 0), the chain NLL must match the real
-    // model's own compute_token_nlls — validates the whole assembled forward
-    // (every layer's shifted norms, GQA/GDN mixer, FFN, head) against the model.
+    // Fail closed unless the zero-adapter chain matches the real model NLL.
     let zero_loras: Vec<LoraParams> = (0..num_slots)
         .map(|_| LoraParams::zeros(rank, &dims))
         .collect::<Result<Vec<_>, _>>()?;
@@ -623,13 +565,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         arr[k] = val;
                     };
-                    // min-over-eps: central FD has an unknown optimal step.
-                    // If the analytic grad is correct, SOME step agrees well; if
-                    // it is a structural error, NONE do — the per-entry min stays
-                    // at the bug floor. Taking the min removes the arbitrary step
-                    // choice — the honest correct-vs-buggy discriminator on a deep
-                    // f32 backprop chain where any single step is roundoff- or
-                    // truncation-dominated.
+                    // Keep the best epsilon per entry to resist deep-f32 roundoff — see docs/design.md.
                     let eps_set = [fd_eps * 0.25, fd_eps * 0.5, fd_eps, fd_eps * 2.0];
                     let mut best = f64::INFINITY;
                     for &e in &eps_set {
@@ -794,9 +730,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ---- Training mode ----
-    // LoRA init: A ~ U(-1/sqrt(in), +1/sqrt(in)), B zero (delta=0 at init
-    // reproduces the base; grad_B != 0 so B moves first). The 1/sqrt(in)
-    // amplitude matches mlx_lm LoRALinear (tuner/lora.py) for on-par convergence.
+    // Zero B preserves the base; A uses the mlx_lm-compatible 1/sqrt(in) scale.
     let init_amp = 1.0 / (dims.hidden as f32).sqrt();
     let mut rng = 0xFEED_FACEu64;
     let mut loras: Vec<LoraParams> = (0..num_slots)
@@ -1099,13 +1033,8 @@ mod cli_contract_tests {
 mod gdn_lora_ctor_tests {
     use super::*;
 
-    /// Asymmetric fixture (num_kh=2, value_heads=4) — the only shape that can
-    /// distinguish "sized by key heads" from "sized by value heads"; a
-    /// symmetric config (e.g. num_kh == value_heads) would pass either way.
-    /// #792: `gradcheck_gdn_loras`/`zero_b_gdn_loras` (this binary's two GDN
-    /// LoRA initializers) had independently re-derived `b_b`/`b_a` as
-    /// `num_kh * rank` instead of `value_heads * rank`, breaking on exactly
-    /// this shape class.
+    /// Use asymmetric head counts to expose GDN B-factor sizing drift.
+    /// See [`docs/design.md`](../../docs/design.md#train_grad_full-details) for the value-head invariant.
     fn asymmetric_gdn_dims() -> GdnDims {
         let key_dim = 8;
         let value_dim = 8;

@@ -73,6 +73,11 @@ name = "train_grad_full"
 path = "src/bin/train_grad_full.rs"
 required-features = ["train-backward"]
 
+[[test]]
+name = "bench_backward_737"
+path = "tests/bench_backward_737.rs"
+required-features = ["train-backward"]
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true

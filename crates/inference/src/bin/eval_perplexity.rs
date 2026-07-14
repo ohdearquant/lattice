@@ -498,13 +498,8 @@ fn tokenize_with(
 }
 
 fn load_cfg_for_q4(dir: &std::path::Path) -> Result<Qwen35Config, ExitCode> {
-    let config_path = dir.join("config.json");
-    if !config_path.exists() {
-        eprintln!("ERROR: Q4 dir {} is missing config.json", dir.display());
-        return Err(ExitCode::FAILURE);
-    }
-    Qwen35Config::from_config_json(&config_path).map_err(|e| {
-        eprintln!("ERROR: failed to parse {}: {e}", config_path.display());
+    Qwen35Config::from_model_dir(dir).map_err(|e| {
+        eprintln!("ERROR: {e}");
         ExitCode::FAILURE
     })
 }
@@ -765,5 +760,37 @@ mod tests {
             100,
             "--max-tokens cap must still apply after uncap"
         );
+    }
+
+    // -- #923: load_cfg_for_q4 is fail-closed on a missing config.json ----
+    //
+    // This binary was already fail-closed before the fix (unlike the other
+    // three loaders named in the issue), just via its own inline check
+    // duplicating the same policy. It now goes through the single shared
+    // `Qwen35Config::from_model_dir` helper instead of its own copy.
+    // Reverting this call site back to the inline duplicate makes this test
+    // fail only if that duplicate ever silently regresses to a preset --
+    // the real value here is deleting the duplicate, verified by keeping
+    // the observable behavior (error on missing config.json) pinned.
+
+    #[test]
+    fn load_cfg_for_q4_errors_on_missing_config_json() {
+        let dir = std::env::temp_dir().join(format!(
+            "lattice_eval_ppl_q4_no_config_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("test setup: create model dir");
+        // Deliberately no config.json.
+
+        let result = load_cfg_for_q4(&dir);
+        assert!(
+            result.is_err(),
+            "a Q4 dir with no config.json must be a hard error, not a guessed preset"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

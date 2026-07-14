@@ -1,19 +1,8 @@
-//! Binary quantization for ultra-fast pre-filtering.
+//! Binary sign quantization and Hamming-distance operations.
 //!
-//! Sign-bit quantization: 1 bit per dimension (32x compression vs f32).
-//! Distance via Hamming distance using hardware popcount.
+//! Packed format and partial-byte handling remain part of the API contract.
 //!
-//! ## Format
-//!
-//! `b[i] = 1 if v[i] >= 0 else 0`. Pack 8 dimensions into one byte
-//! (bit 7 = dimension 0, bit 6 = dimension 1, etc.).
-//! For D dimensions, storage is `ceil(D / 8)` bytes.
-//!
-//! ## Distance
-//!
-//! Hamming distance counts differing bits between two binary vectors.
-//! Approximate cosine distance: `1.0 - (1.0 - 2.0 * hamming / dims)`
-//! i.e. `2.0 * hamming / dims`.
+//! See docs/simd.md for the format and cosine approximation.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -120,12 +109,9 @@ impl BinaryVector {
     }
 }
 
-/// **Unstable**: free function dispatches to NEON or scalar; may become private in a future cleanup.
+/// **Unstable**: returns packed-bit Hamming distance or `u32::MAX` for invalid inputs.
 ///
-/// Uses popcount on XOR of the packed bytes.
-///
-/// Returns `u32::MAX` if dimensions differ or if either packed buffer is shorter than
-/// `dims.div_ceil(8)` bytes (malformed public-field construction).
+/// See [`docs/simd.md`](../../docs/simd.md#binary-vectors) for packing, masking, and approximation semantics.
 #[inline]
 pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
     if a.dims != b.dims {
@@ -160,13 +146,9 @@ pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
     hamming_distance_scalar(&a.data[..required_bytes], &b.data[..required_bytes], a.dims)
 }
 
-/// Scalar Hamming distance using u64 chunks and count_ones().
+/// Computes Hamming distance with scalar popcount, masking a partial final byte.
 ///
-/// `dims` is the true dimension count; the slice `a`/`b` has length `dims.div_ceil(8)`.
-/// When `dims % 8 != 0` the final byte contains `8 - (dims % 8)` padding bits that must
-/// not be counted. Bit 7 (MSB) holds the first dimension of each byte (see
-/// `from_f32_with_threshold`), so the `r = dims % 8` valid bits are the top `r` bits:
-/// mask = `0xFF << (8 - r)`.
+/// See [`docs/simd.md`](../../docs/simd.md#binary-vectors) for the MSB-first padding invariant.
 fn hamming_distance_scalar(a: &[u8], b: &[u8], dims: usize) -> u32 {
     let mut total: u32 = 0;
 
@@ -217,19 +199,11 @@ fn hamming_distance_scalar(a: &[u8], b: &[u8], dims: usize) -> u32 {
     total
 }
 
-/// NEON Hamming distance using `vcnt` (per-byte population count).
-///
-/// `vcnt` counts set bits in each byte of a NEON register.
-/// We XOR the two vectors, apply vcnt, then horizontally sum.
-///
-/// `dims` is the true dimension count. When `dims % 8 != 0`, the final byte holds
-/// padding bits in its low bits; only the top `dims % 8` bits (MSB = first dim) are
-/// counted, matching the scalar path's masking logic.
+/// Computes Hamming distance with NEON `vcnt`, masking a partial final byte.
 ///
 /// # Safety
-///
-/// Caller must ensure running on aarch64 (NEON is mandatory).
-/// `a` and `b` must have equal length == `dims.div_ceil(8)`.
+/// Caller must run on aarch64 with equal packed slices for `dims` dimensions.
+/// See [`docs/simd.md`](../../docs/simd.md#binary-vectors) for the MSB-first padding invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn hamming_distance_neon(a: &[u8], b: &[u8], dims: usize) -> u32 {

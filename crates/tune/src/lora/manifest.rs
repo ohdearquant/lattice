@@ -1,8 +1,9 @@
-//! LoRA adapter manifest — governance and integrity tracking.
+//! Versioned LoRA manifest schema and bounded JSON I/O.
 //!
-//! The manifest is a human-reviewed JSON document that records every adapter
-//! produced by a training run. Loaders consult it to enforce approval status
-//! and integrity before materialising weights.
+//! A manifest records adapter provenance, integrity data, and one authoritative
+//! status. Only approved entries are admissible to the governed loader.
+//!
+//! See `docs/lora-core.md` for schema version 1 and fail-closed loading rules.
 
 use crate::error::{Result, TuneError};
 use serde::{Deserialize, Serialize};
@@ -10,11 +11,7 @@ use std::path::Path;
 
 /// Maximum on-disk size of the manifest JSON file, in bytes (64 MiB).
 ///
-/// A manifest is a small governance document (typically a few kilobytes). The
-/// adapter-file cap is 10 GiB, but that ceiling is inappropriate here: a file
-/// that large would be materialised entirely before parsing — an allocation-DoS
-/// regardless of legitimacy. 64 MiB is orders of magnitude larger than any real
-/// manifest while still blocking a trivially-oversized attacker-supplied path.
+/// This cap is enforced before parsing and again with a bounded read sentinel.
 const MAX_MANIFEST_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Opaque adapter identifier (arbitrary string; a UUID is conventional).
@@ -48,18 +45,9 @@ impl AdapterStatus {
 
 /// Metadata and governance state for one adapter in the manifest.
 ///
-/// Field set intentionally matches the #439 design intent
-/// `{name, owner, uri, base_model_rev, tokenizer_rev, integrity_sha256,
-/// dtype, approved}` (see issue #610), with one reconciliation:
-/// `status: AdapterStatus` is carried instead of a separate `approved: bool`.
-/// `AdapterStatus` is a strict superset of that boolean —
-/// `status == AdapterStatus::Approved` *is* `approved == true`, and the
-/// `Quarantined` / `Revoked` variants add fail-closed distinctions the
-/// loader already gives distinct error messages for (see
-/// `loader::load_adapters_from_manifest` Check 1). Adding a redundant
-/// `approved: bool` alongside `status` would create two sources of truth
-/// for the same governance decision with no defined precedence when they
-/// disagree; recorded in ADR-045.
+/// `status` is the sole approval authority; a separate `approved` boolean
+/// would create conflicting sources of truth. See ADR-045 and
+/// `docs/lora-core.md`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     /// Opaque identifier; matched against the `adapter_id` field in the
@@ -98,7 +86,8 @@ pub struct ManifestEntry {
 /// Governed manifest listing admissible adapters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoraManifest {
-    /// Manifest schema version. Current: 1.
+    /// Manifest schema version. New manifests use 1; parsing preserves the
+    /// supplied value without enforcing a supported-version set.
     pub version: u32,
     /// All adapter entries. The loader iterates this list; order is not significant.
     pub adapters: Vec<ManifestEntry>,

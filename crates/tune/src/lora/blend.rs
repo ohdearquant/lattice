@@ -1,75 +1,26 @@
-//! Weighted blending of multiple LoRA adapters into a single rank-Σr adapter.
+//! Exact CPU blending of adapters into one higher-rank adapter.
 //!
-//! # Why blend instead of loading multiple adapters
+//! The blend vertically concatenates A blocks and horizontally concatenates B
+//! blocks after folding in each mixture weight and `alpha / rank` scale. Its
+//! returned configuration sets `alpha == rank_total`, so its scale is exactly 1.
 //!
-//! The Metal inference path holds exactly one `Option<MetalLoraAdapter>` slot.
-//! Rather than adding a Metal kernel that dispatches across N adapters,
-//! we pre-blend on the CPU once per request: the result is a standard single
-//! adapter loaded through the existing single-slot path with no kernel changes.
-//!
-//! # Blend math (exact, not approximate)
-//!
-//! For adapter `e` with effective scale `s_e = alpha_e / rank_e` and mixture
-//! weight `w_e`:
-//!
-//! ```text
-//! Δ_e x = s_e · B_e @ (A_e @ x)
-//! blend  = Σ_e  w_e · Δ_e x
-//!        = B_blend @ (A_blend @ x)
-//! ```
-//!
-//! where
-//! - `A_blend = vconcat[A_1; …; A_N]`          shape `(Σr_e) × d_in`
-//! - `B_blend = hconcat[(w_1·s_1)·B_1 | …]`    shape `d_out × (Σr_e)`
-//!
-//! The `w_e · s_e` coefficient is folded into the B column block so the
-//! blended adapter's effective scale is exactly **1.0** (`alpha = rank_total`).
+//! See `docs/lora-core.md` for the derivation, limits, and failure behavior.
 
 use crate::error::{Result, TuneError};
 use crate::lora::{LoraAdapter, LoraConfig, LoraLayer};
 use std::collections::HashMap;
 
-/// Maximum total rank allowed across all adapters in a single blend.
-///
-/// The GEMV kernels that consume the blended adapter assume a modest rank budget
-/// (≤ ~64 per adapter in a typical mixture).  This cap allows a generous mixture
-/// while bounding allocations and rejecting adversarially large adapter pools.
+/// Maximum summed rank for one blended projection.
 pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
 
-/// Aggregate cap on a blended adapter's total element count, summed across
-/// every (layer_idx, module) projection: Σ rank_total·(d_in + d_out). At f32
-/// this bounds the blended-adapter allocation to ~4 GiB. MAX_BLEND_RANK_TOTAL
-/// bounds one projection; this bounds the whole blend, so a full-model adapter
-/// that keeps every projection near the per-group cap cannot drive a multi-GiB
-/// aggregate allocation. A realistic micro-LoRA mixture is far below this; a
-/// large-model mixture at modest summed rank stays within budget, while a
-/// rank-4096-everywhere adapter (tens of GiB) is rejected before any allocation.
+/// Aggregate cap on all blended A and B elements (about 4 GiB of f32 storage).
 pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
 
 /// Blend a set of `(adapter, mixture_weight)` pairs into one rank-Σr adapter.
 ///
-/// Each adapter in `adapters` contributes to the blended result with its
-/// corresponding weight `w_e`.  The per-adapter `alpha/rank` scale is folded
-/// into the B column block, so the returned adapter's effective scale is 1.0
-/// (i.e., `LoraConfig { alpha: rank_total, rank: rank_total }`).
-///
-/// # Target-module semantics
-///
-/// For each `(layer_idx, module)` pair that appears in **any** of the input
-/// adapters, a blended layer is produced.  An adapter that does not cover a
-/// given pair contributes zero (it is simply absent from the vertical/horizontal
-/// concatenation for that pair).
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - `adapters` is empty
-/// - Any weight is not finite
-/// - Two adapters share a `(layer_idx, module)` pair but disagree on `d_in` or `d_out`
-/// - The summed rank for a single projection exceeds `MAX_BLEND_RANK_TOTAL`
-/// - The aggregate blend size across all projections exceeds `MAX_BLEND_TOTAL_ELEMENTS`
-/// - A layer's A or B buffer length does not match its declared `rank`, `d_in`, or `d_out`
-/// - Rank accumulation or a size product overflows `usize`
+/// Folds each source's mixture weight and scale into B; absent projections are
+/// omitted. Returns an error for invalid inputs, shapes, or resource limits.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#blend_lora_adapters) for the derivation and allocation limits.
 pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapter> {
     if adapters.is_empty() {
         return Err(TuneError::Validation(
@@ -85,8 +36,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         }
     }
 
-    // Collect the union of all (layer_idx, module) keys, grouped by key.
-    // Value: list of (LoraLayer ref, effective_weight = w_e * s_e).
+    // Group the union of projection keys with their folded source scales.
     let mut grouped: HashMap<(usize, String), Vec<(&LoraLayer, f32)>> = HashMap::new();
     for (adapter, weight) in adapters {
         let s_e = adapter.config().scale();
@@ -99,11 +49,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         }
     }
 
-    // Bound the TOTAL planned allocation across every (layer_idx, module) group.
-    // The per-group MAX_BLEND_RANK_TOTAL cap bounds each projection, but a
-    // full-model adapter can keep every group near the cap and still drive a
-    // multi-GiB aggregate blend. Sum rank_total*(d_in+d_out) over all groups with
-    // checked arithmetic and fail closed before any allocation.
+    // Reject aggregate allocation overflow or budget excess before allocating.
     let mut planned_elems: usize = 0;
     for ((layer_idx, module), entries) in &grouped {
         let (first, _) = entries[0]; // each key was inserted with >=1 layer
@@ -145,8 +91,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         blended_layers.insert((*layer_idx, module.clone()), blended);
     }
 
-    // Collect total rank and target modules for the blended config.
-    // We set alpha = rank so scale() == 1.0 — weights+scale already folded into B.
+    // Set alpha = rank so the returned adapter's scale is one.
     let total_rank: usize = blended_layers.values().map(|l| l.rank).max().unwrap_or(0);
     let target_modules: Vec<String> = {
         let mut mods: Vec<String> = grouped
@@ -168,11 +113,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
     LoraAdapter::new(config, blended_layers)
 }
 
-/// Blend multiple `(LoraLayer, effective_weight)` entries for a single
-/// `(layer_idx, module)` projection into one higher-rank layer.
-///
-/// `effective_weight = mixture_weight * (alpha / rank)` has already been
-/// computed by the caller so this function is pure linear algebra.
+/// Blend one projection's layers after their effective weights were folded.
 fn blend_layer_entries(
     entries: &[(&LoraLayer, f32)],
     key: &(&usize, &String),
@@ -208,8 +149,7 @@ fn blend_layer_entries(
         )));
     }
 
-    // Validate source slice lengths before any allocation: a malformed adapter
-    // whose A or B buffer is the wrong size would cause out-of-bounds copies.
+    // Validate source buffers before copying their declared row-major shapes.
     for (idx, (layer, _)) in entries.iter().enumerate() {
         let expected_a = layer.rank.checked_mul(d_in).ok_or_else(|| {
             TuneError::Validation("blend_layer_entries: rank*d_in overflowed usize".into())
@@ -244,18 +184,13 @@ fn blend_layer_entries(
         TuneError::Validation("blend_layer_entries: d_out * rank_total overflowed usize".into())
     })?;
 
-    // A_blend: vertical stack of A blocks.
-    // Layout: rows [0..r_1] from adapter 1, then [r_1..r_1+r_2] from adapter 2, …
-    // Each row has `d_in` elements.
+    // Stack A blocks vertically in source order.
     let mut a_blend = Vec::with_capacity(a_buf_len);
     for (layer, _) in entries {
         a_blend.extend_from_slice(&layer.a);
     }
 
-    // B_blend: horizontal concatenation of scaled B column blocks.
-    // B is stored row-major (d_out × rank), so row r is `b[r*rank..(r+1)*rank]`.
-    // After blending, row r of B_blend is:
-    //   [eff_1 * B_1[r, :] | eff_2 * B_2[r, :] | …]
+    // Concatenate scaled B blocks horizontally in each row.
     let mut b_blend = vec![0.0f32; b_buf_len];
     let mut col_offset = 0usize;
     for (layer, eff_weight) in entries {

@@ -1,30 +1,9 @@
-//! Migration module: state machine for embedding model migration.
+//! Public API for the embedding-model migration state machine.
 //!
-//! Provides the [`MigrationController`] state machine, migration plan types,
-//! and progress tracking for embedding model migrations.
+//! It exposes plans, serializable lifecycle state, progress accounting, permanent skips,
+//! and transition errors without choosing application routing policy.
 //!
-//! # Quick Start
-//!
-//! ```rust
-//! use lattice_embed::migration::{MigrationController, MigrationPlan};
-//! use lattice_embed::EmbeddingModel;
-//!
-//! let plan = MigrationPlan {
-//!     id: "mig-001".to_string(),
-//!     source_model: EmbeddingModel::BgeSmallEnV15,
-//!     target_model: EmbeddingModel::BgeBaseEnV15,
-//!     total_embeddings: 10_000,
-//!     batch_size: 256,
-//!     created_at: "2026-01-27T00:00:00Z".to_string(),
-//! };
-//!
-//! let mut ctrl = MigrationController::new(plan);
-//! ctrl.start().unwrap();
-//! ctrl.record_progress(256).unwrap();
-//!
-//! let report = ctrl.progress();
-//! assert!(report.state.is_active());
-//! ```
+//! See [docs/migration.md](../../docs/migration.md) for the complete transition model.
 
 mod controller;
 mod types;

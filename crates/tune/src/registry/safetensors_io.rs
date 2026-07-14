@@ -1,51 +1,18 @@
-//! Safe checkpoint serialization using safetensors format.
+//! Safetensors serialization for flat `f32` weight vectors.
 //!
-//! This module provides secure model weight serialization that prevents
-//! arbitrary code execution vulnerabilities found in formats like Python pickle.
+//! Parsing accepts data only and validates the safetensors container, but it
+//! does not replace registry identity or checksum verification.
 //!
-//! # Security Guarantees
-//!
-//! The safetensors format provides:
-//! - **No code execution**: Pure data format, cannot contain executable code
-//! - **Memory safety**: Zero-copy deserialization with bounds checking
-//! - **Integrity**: Header contains tensor shapes and data types
-//!
-//! # Format
-//!
-//! ```text
-//! [8 bytes: header size (little-endian u64)]
-//! [header: JSON metadata + tensor info]
-//! [tensor data: raw bytes, aligned]
-//! ```
-//!
-//! # Example
-//!
-//! ```ignore
-//! use lattice_tune::registry::safetensors_io::{save_weights, load_weights};
-//!
-//! // Save weights securely
-//! let weights: Vec<f32> = vec![0.1, 0.2, 0.3];
-//! let bytes = save_weights(&weights, "layer0.weights")?;
-//!
-//! // Load weights safely (validates format, no code execution)
-//! let loaded: Vec<f32> = load_weights(&bytes, "layer0.weights")?;
-//! ```
+//! See `docs/registry.md` for the format, tensor contract, and security boundary.
 
 use crate::error::{Result, TuneError};
 use safetensors::Dtype;
 use safetensors::tensor::SafeTensors;
 use std::collections::HashMap;
 
-/// Save model weights to safetensors format.
-///
-/// # Arguments
-///
-/// * `weights` - Model weights as f32 slice
-/// * `name` - Tensor name (e.g., "layer0.weights")
-///
-/// # Returns
-///
-/// Serialized bytes in safetensors format
+/// Serializes `weights` as a named one-dimensional `F32` safetensors tensor.
+/// Returns serialization errors from the safetensors container.
+/// See [`docs/registry.md`](../../docs/registry.md#safetensors_io-helpers) for the tensor contract.
 pub fn save_weights(weights: &[f32], name: &str) -> Result<Vec<u8>> {
     // Convert f32 to bytes
     let bytes: Vec<u8> = weights.iter().flat_map(|f| f.to_le_bytes()).collect();
@@ -65,21 +32,9 @@ pub fn save_weights(weights: &[f32], name: &str) -> Result<Vec<u8>> {
         .map_err(|e| TuneError::Storage(format!("Failed to serialize weights: {e}")))
 }
 
-/// Load model weights from safetensors format.
-///
-/// # Arguments
-///
-/// * `data` - Serialized safetensors bytes
-/// * `name` - Tensor name to load
-///
-/// # Returns
-///
-/// Deserialized weights as Vec<f32>
-///
-/// # Security
-///
-/// This function safely deserializes weights without executing any code.
-/// The safetensors format only contains data, not executable code.
+/// Loads a named `F32` safetensors tensor as flat `f32` values.
+/// Returns errors for malformed data, a missing tensor, a non-`F32` tensor, or unaligned bytes.
+/// See [`docs/registry.md`](../../docs/registry.md#safetensors_io-helpers) for format and integrity boundaries.
 pub fn load_weights(data: &[u8], name: &str) -> Result<Vec<f32>> {
     // Parse safetensors (validates format, no code execution)
     let tensors = SafeTensors::deserialize(data)
@@ -114,15 +69,8 @@ pub fn load_weights(data: &[u8], name: &str) -> Result<Vec<f32>> {
     Ok(weights)
 }
 
-/// Save multiple named tensors to safetensors format.
-///
-/// # Arguments
-///
-/// * `tensors` - Map of tensor name to f32 data
-///
-/// # Returns
-///
-/// Serialized bytes in safetensors format
+/// Serializes named flat `f32` vectors as one-dimensional `F32` tensors.
+/// See [`docs/registry.md`](../../docs/registry.md#safetensors_io-helpers) for the multi-tensor contract.
 pub fn save_tensors(tensors: &HashMap<String, Vec<f32>>) -> Result<Vec<u8>> {
     // Convert all tensors to byte views
     let byte_data: HashMap<String, Vec<u8>> = tensors
@@ -149,15 +97,9 @@ pub fn save_tensors(tensors: &HashMap<String, Vec<f32>>) -> Result<Vec<u8>> {
         .map_err(|e| TuneError::Storage(format!("Failed to serialize tensors: {e}")))
 }
 
-/// Load all tensors from safetensors format.
-///
-/// # Arguments
-///
-/// * `data` - Serialized safetensors bytes
-///
-/// # Returns
-///
-/// Map of tensor names to f32 data
+/// Loads all `F32` safetensors tensors as flat `f32` vectors.
+/// Skips non-`F32` tensors and rejects malformed `F32` byte lengths or shapes.
+/// See [`docs/registry.md`](../../docs/registry.md#safetensors_io-helpers) for validation behavior.
 pub fn load_tensors(data: &[u8]) -> Result<HashMap<String, Vec<f32>>> {
     let tensors = SafeTensors::deserialize(data)
         .map_err(|e| TuneError::Storage(format!("Failed to deserialize tensors: {e}")))?;
@@ -272,11 +214,7 @@ mod tests {
 
     #[test]
     fn test_load_tensors_rejects_unaligned_f32_bytes() {
-        // The safetensors library validates shape * dtype_size == data_offsets range at
-        // deserialize time (TensorInvalidInfo).  We craft a payload where shape=[3] but
-        // data_offsets=[0,11] (11 bytes, not a multiple of 4).  The library rejects this
-        // before our alignment check fires; the important invariant is that the function
-        // returns Err instead of panicking or silently truncating.
+        // The parser rejects malformed ranges before this guard; loading must still fail safely.
         let header = r#"{"w":{"dtype":"F32","shape":[3],"data_offsets":[0,11]}}"#;
         let header_bytes = header.as_bytes();
         let mut raw: Vec<u8> = Vec::new();
@@ -290,9 +228,7 @@ mod tests {
 
     #[test]
     fn test_load_tensors_rejects_element_count_mismatch() {
-        // Shape declares 3 elements (12 bytes) but data_offsets claims 8 bytes (2 f32s).
-        // The library rejects this as TensorInvalidInfo; our shape-product guard provides
-        // defence-in-depth.  Assert Err, no panic.
+        // The parser rejects this mismatch; the shape guard remains defence in depth.
         let header = r#"{"w":{"dtype":"F32","shape":[3],"data_offsets":[0,8]}}"#;
         let header_bytes = header.as_bytes();
         let mut raw: Vec<u8> = Vec::new();
@@ -306,16 +242,7 @@ mod tests {
 
     #[test]
     fn test_load_tensors_alignment_guard_fires_when_library_cannot_catch() {
-        // Construct a scenario our guard catches that the library does not:
-        // F32 tensor with shape=[2] and data 8 bytes (correct for 2 f32s).
-        // Then call our validation logic directly with byte counts that mismatch.
-        // Since we cannot bypass the library via the public API, we test our guard
-        // by verifying that a well-formed file loads correctly — and that the
-        // guard code path is covered by checking our added conditions produce the
-        // right errors when invoked as isolated expressions.
-        //
-        // Concretely: show that 11 % 4 != 0 and that our formatting is correct.
-        // This is a compile-time + logic test that the guard expressions are sane.
+        // Exercise the arithmetic preconditions independently; malformed files fail in the parser.
         let bytes_len: usize = 11;
         assert_ne!(bytes_len % 4, 0, "alignment precondition");
         let shape: Vec<usize> = vec![3];

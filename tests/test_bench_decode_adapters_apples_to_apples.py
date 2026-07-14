@@ -442,6 +442,11 @@ class AvailabilityCheckTest(unittest.TestCase):
         with mock.patch.object(adapters.shutil, "which", return_value=None):
             self.assertFalse(adapters.ollama_available(model_tag="qwen3.5:0.8b"))
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("mlx_lm") is not None,
+        "asserts the import-success case, so mlx_lm must be installed "
+        "(macOS-only dependency; skipped on Linux CI)",
+    )
     def test_mlx_available_reflects_import_success(self):
         # mlx_lm is a declared project dependency (pyproject.toml); this
         # documents the expectation rather than mocking import machinery.
@@ -698,6 +703,11 @@ class RegisterAvailableAdaptersEndToEndTest(unittest.TestCase):
         self.assertIn("lattice", harness.ADAPTER_REGISTRY)
 
 
+@unittest.skipUnless(
+    importlib.util.find_spec("mlx_lm") is not None,
+    "mock.patch resolves 'mlx_lm.load' by import, so mlx_lm must be installed "
+    "(macOS-only dependency; skipped on Linux CI)",
+)
 class MlxFallbackProvenanceTest(unittest.TestCase):
     """A missing/corrupt local model dir makes `MlxAdapter` fall back to the
     Hub artifact -- the raw observation must record that via `actual_model`,

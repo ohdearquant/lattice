@@ -1,4 +1,8 @@
-//! Teacher model configuration and builder.
+//! Teacher selection, request policy, and endpoint-security configuration.
+//!
+//! Presets and the builder produce a `TeacherConfig`; validation checks its
+//! local invariants and custom endpoint policy before pipeline construction.
+//! See `docs/distill.md` for provider defaults, validation, and security limits.
 
 use super::TeacherProvider;
 use super::security::EndpointSecurity;
@@ -24,7 +28,7 @@ pub struct TeacherConfig {
     /// API key environment variable name
     pub api_key_env: String,
 
-    /// Temperature for generation (0.0 - 1.0)
+    /// Temperature for generation (0.0 - 2.0)
     pub temperature: f32,
 
     /// Maximum tokens in response
@@ -189,20 +193,16 @@ Respond ONLY with the JSON object, no other text."#.to_string()
         Ok(())
     }
 
-    /// Verify the teacher endpoint before use
+    /// Verify the effective endpoint against the configured local security policy.
     ///
-    /// This performs additional security checks that may require network access:
-    /// - TLS certificate validation (if fingerprint specified)
-    /// - Model checksum verification (for local models)
-    ///
-    /// Call this before starting distillation to ensure the endpoint is trusted.
+    /// This performs no network I/O and only validates the format of a configured
+    /// certificate fingerprint. See [`docs/distill.md`](../../../docs/distill.md#teacherconfigverify_endpoint) for the client-side checks that remain.
     pub fn verify_endpoint(&self) -> Result<(), String> {
-        // Get the actual endpoint
+        // Resolve the provider default before applying local policy.
         let endpoint = self.get_endpoint();
         self.security.verify_endpoint(&endpoint)?;
 
-        // If certificate fingerprint is specified, validate format
-        // (actual cert verification happens at connection time)
+        // A provider client must compare this format-validated value to its peer certificate.
         self.security.validate_cert_fingerprint("")?;
 
         Ok(())

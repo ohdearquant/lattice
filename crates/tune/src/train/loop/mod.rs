@@ -1,4 +1,8 @@
-//! Training loop implementation
+//! Training-loop orchestration, callbacks, metrics, and checkpoints.
+//!
+//! The current CPU loop validates and drives the run lifecycle but simulates
+//! loss and accuracy rather than optimizing network weights. See `docs/train.md`
+//! for lifecycle order, metric semantics, and checkpoint limitations.
 
 mod callbacks;
 mod checkpoint;
@@ -14,10 +18,10 @@ use super::config::{EarlyStopping, TrainingConfig};
 use crate::data::{Batch, Dataset};
 use crate::error::{Result, TuneError};
 
-/// Training loop orchestrator
+/// CPU training-loop orchestrator.
 ///
-/// This is a placeholder implementation. The actual neural network operations
-/// would be implemented via lattice-fann when it's available.
+/// This implementation simulates batch loss and accuracy; it does not update a
+/// neural network. See `docs/train.md` for the lifecycle and current contract.
 pub struct TrainingLoop {
     /// Training configuration
     config: TrainingConfig,

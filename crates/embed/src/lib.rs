@@ -1,89 +1,19 @@
-//! **Stability tier**: Unstable
-//!
-//! The SIMD dispatch layer (`simd/`) and model-loading API are actively evolving.
-//! Platform consumers should use this crate via `lattice-engine`, not directly.
-//!
-//! **Exception — stable khive ANN consumer contract:**
-//! `simd::{squared_euclidean_distance, euclidean_distance, dot_product, cosine_similarity}`
-//! are a stable consumer contract for khive's ANN indexes (`khive-hnsw`, `khive-vamana`;
-//! ADR-012): their `(&[f32], &[f32]) -> f32` signatures and documented degenerate-input
-//! behaviour are guaranteed across the 0.4.x line, as is the squared-L2 ordering invariant
-//! relative to this crate's Euclidean wrapper (both derive from the same accumulated squared
-//! distance; SIMD is not bit-identical to scalar and promises no exact ordering of near-ties).
-//! The rest of `simd/` remains unstable.
-//!
-//! The 25 `unsafe` blocks are gated SIMD intrinsic calls: 21 on the
-//! AVX512/AVX2/NEON paths plus 4 wasm32 SIMD128 dispatch sites.
-//! See `foundation/STABILITY.md` for the full policy.
-//!
 //! # lattice-embed
+//!
+//! Pure-Rust local embedding generation, caching, SIMD vector operations, and model migration.
+//! Most of the crate, including model loading and SIMD dispatch, is **Unstable**; consumers
+//! should normally use it through `lattice-engine`.
+//!
+//! The exception is the stable 0.4.x ANN contract in `simd`: squared/ordinary L2 distance,
+//! dot product, and cosine similarity retain their `(&[f32], &[f32]) -> f32` APIs and
+//! documented degenerate-input behavior. SIMD is not bit-identical to scalar, so near-tie
+//! ordering is not guaranteed.
+//!
+//! See `docs/design.md` for the architecture, service lifecycle, cache identity, and migration
+//! boundaries; use `docs/INDEX.md` to find subsystem references.
 
 #![warn(missing_docs)]
 #![allow(clippy::clone_on_copy)]
-//!
-//! Vector embedding generation with SIMD-accelerated operations for the lattice-runtime substrate.
-//!
-//! This crate provides embedding generation services that convert text into
-//! high-dimensional vector representations suitable for semantic search and
-//! similarity matching.
-//!
-//! ## Features
-//!
-//! - **Native Embeddings**: Generate embeddings locally using pure Rust inference (default)
-//! - **BGE Models**: Support for BGE family of models (small/base/large)
-//! - **Async API**: Full async/await support with tokio
-//! - **SIMD Acceleration**: AVX2/NEON optimized vector operations
-//!
-//! ## Quick Start
-//!
-//! ```rust,no_run
-//! use lattice_embed::{EmbeddingService, EmbeddingModel, NativeEmbeddingService};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let service = NativeEmbeddingService::default();
-//!
-//!     let embedding = service.embed_one(
-//!         "The quick brown fox jumps over the lazy dog",
-//!         EmbeddingModel::default(),
-//!     ).await?;
-//!
-//!     println!("Embedding dimension: {}", embedding.len());
-//!     // Output: Embedding dimension: 384
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Batch Processing
-//!
-//! ```rust,no_run
-//! use lattice_embed::{EmbeddingService, EmbeddingModel, NativeEmbeddingService};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let service = NativeEmbeddingService::default();
-//!
-//!     let texts = vec![
-//!         "First document".to_string(),
-//!         "Second document".to_string(),
-//!         "Third document".to_string(),
-//!     ];
-//!
-//!     let embeddings = service.embed(&texts, EmbeddingModel::BgeSmallEnV15).await?;
-//!     assert_eq!(embeddings.len(), 3);
-//!
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Available Models
-//!
-//! | Model | Dimensions | Use Case |
-//! |-------|------------|----------|
-//! | `BgeSmallEnV15` | 384 | Fast, general purpose (default) |
-//! | `BgeBaseEnV15` | 768 | Balanced quality/speed |
-//! | `BgeLargeEnV15` | 1024 | Highest quality |
 
 pub mod backfill;
 mod cache;
@@ -93,11 +23,7 @@ mod model;
 pub mod service;
 pub mod simd;
 pub mod types;
-// Gated on BOTH the `wasm` feature and the wasm32 target: `wasm-bindgen` is
-// only ever a dependency on the wasm32 target table (see Cargo.toml), so if
-// this module were feature-gated alone, enabling `--features wasm` on a
-// native build would fail to find the `wasm_bindgen` crate. Gating on both
-// makes enabling `wasm` on a non-wasm target a no-op instead of a build error.
+// Keep this gate aligned with wasm-bindgen's wasm32-only dependency — see docs/design.md.
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm;
 
@@ -120,34 +46,9 @@ pub mod utils {
 
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
-    /// Compute cosine similarity between two vectors.
-    ///
-    /// Uses SIMD acceleration (AVX2/NEON) when available, with automatic scalar fallback.
-    ///
-    /// Returns a value between -1.0 and 1.0, where 1.0 indicates
-    /// identical direction and -1.0 indicates opposite direction.
-    ///
-    /// # Performance
-    ///
-    /// | Dimension | Scalar | SIMD |
-    /// |-----------|--------|------|
-    /// | 384 | ~650ns | ~90ns |
-    /// | 768 | ~1300ns | ~180ns |
-    /// | 1024 | ~1700ns | ~240ns |
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use lattice_embed::utils::cosine_similarity;
-    ///
-    /// let a = vec![1.0, 0.0, 0.0];
-    /// let b = vec![1.0, 0.0, 0.0];
-    /// assert!((cosine_similarity(&a, &b) - 1.0).abs() < 0.0001);
-    ///
-    /// let c = vec![1.0, 0.0, 0.0];
-    /// let d = vec![0.0, 1.0, 0.0];
-    /// assert!((cosine_similarity(&c, &d) - 0.0).abs() < 0.0001);
-    /// ```
+    /// Computes cosine similarity through the SIMD dispatcher.
+    /// Returns `0.0` for empty, unequal-length, or zero-norm vectors.
+    /// See [`docs/design.md`](../docs/design.md#vector-utility-facade) for dispatch and performance details.
     #[inline]
     pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         simd::cosine_similarity(a, b)
@@ -155,21 +56,9 @@ pub mod utils {
 
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
-    /// Compute dot product between two vectors.
-    ///
-    /// For normalized vectors (like embeddings), this equals cosine similarity.
-    /// Using `dot_product` directly on pre-normalized vectors is faster than
-    /// `cosine_similarity` since it skips norm computation.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use lattice_embed::utils::dot_product;
-    ///
-    /// let a = vec![1.0, 2.0, 3.0];
-    /// let b = vec![4.0, 5.0, 6.0];
-    /// assert!((dot_product(&a, &b) - 32.0).abs() < 0.0001);
-    /// ```
+    /// Computes the dot product of two vectors through the SIMD dispatcher.
+    /// Returns `0.0` for unequal-length vectors; for unit vectors it equals cosine similarity.
+    /// See [`docs/design.md`](../docs/design.md#vector-utility-facade) for dispatch and performance details.
     #[inline]
     pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
         simd::dot_product(a, b)
@@ -177,22 +66,9 @@ pub mod utils {
 
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
-    /// Normalize a vector to unit length (L2 normalization).
-    ///
-    /// Modifies the vector in place. After normalization, the vector
-    /// will have magnitude 1.0.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use lattice_embed::utils::normalize;
-    ///
-    /// let mut v = vec![3.0, 4.0];
-    /// normalize(&mut v);
-    ///
-    /// let magnitude: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    /// assert!((magnitude - 1.0).abs() < 0.0001);
-    /// ```
+    /// L2-normalizes a vector in place through the SIMD dispatcher.
+    /// Leaves zero- or NaN-norm vectors unchanged.
+    /// See [`docs/design.md`](../docs/design.md#vector-utility-facade) for dispatch and examples.
     #[inline]
     pub fn normalize(vector: &mut [f32]) {
         simd::normalize(vector)
@@ -200,17 +76,9 @@ pub mod utils {
 
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
-    /// Compute Euclidean distance between two vectors.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use lattice_embed::utils::euclidean_distance;
-    ///
-    /// let a = vec![0.0, 0.0];
-    /// let b = vec![3.0, 4.0];
-    /// assert!((euclidean_distance(&a, &b) - 5.0).abs() < 0.0001);
-    /// ```
+    /// Computes Euclidean distance between two vectors through the SIMD dispatcher.
+    /// Returns `f32::MAX` for unequal-length vectors.
+    /// See [`docs/design.md`](../docs/design.md#vector-utility-facade) for dispatch and examples.
     #[inline]
     pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
         simd::euclidean_distance(a, b)
@@ -218,9 +86,8 @@ pub mod utils {
 
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
-    /// Compute cosine similarities for many vector pairs (batch operation).
-    ///
-    /// More efficient than calling `cosine_similarity` in a loop.
+    /// Computes cosine similarities for vector pairs in input order.
+    /// See [`docs/design.md`](../docs/design.md#vector-utility-facade) for batch-dispatch behavior.
     #[inline]
     pub fn batch_cosine_similarity(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
         simd::batch_cosine_similarity(pairs)
@@ -228,7 +95,8 @@ pub mod utils {
 
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
-    /// Compute dot products for many vector pairs (batch operation).
+    /// Computes dot products for vector pairs in input order.
+    /// See [`docs/design.md`](../docs/design.md#vector-utility-facade) for batch-dispatch behavior.
     #[inline]
     pub fn batch_dot_product(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
         simd::batch_dot_product(pairs)

@@ -1,4 +1,7 @@
-//! Error types for lattice-fann
+//! Error types and allocation-shape validation for `lattice-fann`.
+//!
+//! Dimension checks reject zero-sized or excessively large tensors before
+//! allocation. See `docs/network.md` for the limits and parser invariants.
 
 use thiserror::Error;
 

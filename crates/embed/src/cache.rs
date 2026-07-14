@@ -1,20 +1,11 @@
-//! Sharded embedding cache with LRU eviction.
+//! In-memory embedding cache with sharded LRU eviction.
 //!
-//! Caches embeddings to avoid re-computing for identical texts. Uses 16 independent
-//! shards to reduce write-lock contention — each `get()` on an LRU cache requires a
-//! write lock (to update access order), so a single `RwLock<LruCache>` serializes all
-//! reads under high QPS. Sharding reduces contention by a factor of `NUM_SHARDS`.
+//! A key selects one of 16 independent shards. Cache hits refresh LRU order and therefore
+//! take that shard's write lock; hit/miss counters stay local to the shard. A zero-capacity
+//! cache bypasses storage operations and locking. The power-of-two shard count is required
+//! by the masking-based shard selection.
 //!
-//! # Design
-//!
-//! - **Shard selection**: First byte of the Blake3 cache key, masked to `NUM_SHARDS - 1`.
-//!   Blake3 output is uniformly distributed, so shard load is balanced.
-//! - **Per-shard capacity**: `total_capacity / NUM_SHARDS`. Each shard independently
-//!   evicts its own LRU entries.
-//! - **Per-shard statistics**: Hit/miss counters are per-shard `AtomicU64`s, aggregated
-//!   in `stats()`. This eliminates cross-shard atomic contention on the hot path.
-//! - **Zero-capacity**: `capacity=0` disables caching entirely — all operations become
-//!   no-ops with no locking or hashing work.
+//! See docs/model.md for key construction, capacity semantics, and lifecycle details.
 
 use crate::model::ModelConfig;
 use crate::service::EmbeddingRole;
@@ -97,43 +88,11 @@ impl CacheShard {
     }
 }
 
-/// **Unstable**: internal LRU caching mechanism; shard count and eviction policy may change.
+/// **Unstable**: the sharding and eviction implementation may change.
 ///
-/// Embedding cache with sharded LRU eviction policy.
-///
-/// Thread-safe cache for storing computed embeddings. Uses Blake3 hashing
-/// for fast, collision-resistant cache keys. Internally sharded into 16
-/// independent LRU caches to reduce write-lock contention.
-///
-/// # Disabling
-///
-/// Pass `capacity=0` to disable caching. All cache operations become no-ops
-/// (no locking, no hashing work beyond key construction).
-///
-/// # Example
-///
-/// ```rust
-/// use lattice_embed::{EmbeddingCache, EmbeddingModel, ModelConfig};
-/// use lattice_embed::service::EmbeddingRole;
-///
-/// let cache = EmbeddingCache::new(1000);
-///
-/// // Cache miss - no embedding stored yet
-/// let key = cache.compute_key(
-///     "Hello, world!",
-///     ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
-///     EmbeddingRole::Generic,
-/// );
-/// assert!(cache.get(&key).is_none());
-///
-/// // Store embedding
-/// let embedding = vec![0.1, 0.2, 0.3];
-/// cache.put(key, embedding.clone());
-///
-/// // Cache hit — returns Arc<[f32]>
-/// let cached = cache.get(&key).unwrap();
-/// assert_eq!(&*cached, &embedding[..]);
-/// ```
+/// Thread-safe, sharded LRU cache for computed embeddings.
+/// A capacity of zero disables storage operations.
+/// See [`docs/design.md`](../docs/design.md#embeddingcache) for key identity, locking, and capacity semantics.
 pub struct EmbeddingCache {
     shards: Vec<CacheShard>,
     enabled: bool,
@@ -150,24 +109,18 @@ fn shard_index(key: &CacheKey) -> usize {
 impl EmbeddingCache {
     /// **Unstable**: constructor signature may change when shard count becomes configurable.
     ///
-    /// The capacity is divided equally across 16 internal shards. Each shard
-    /// independently manages its own LRU eviction.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - Maximum total number of embeddings to cache. Use 0 to disable caching.
+    /// Creates a cache with the requested capacity; zero disables storage.
+    /// Nonzero capacity is rounded up independently across its fixed shards.
+    /// See [`docs/design.md`](../docs/design.md#embeddingcache) for sharding and eviction behavior.
     pub fn new(capacity: usize) -> Self {
         let enabled = capacity != 0;
 
-        // Per-shard capacity: ceiling division ensures total actual capacity >= requested.
-        // E.g., capacity=4000, NUM_SHARDS=16 → 250/shard (exact).
-        // E.g., capacity=10, NUM_SHARDS=16 → 1/shard (at least 1).
+        // Round up per shard so the actual aggregate capacity meets the request.
         let per_shard = if enabled {
-            // Ceiling division: (capacity + NUM_SHARDS - 1) / NUM_SHARDS, minimum 1.
             let base = capacity.div_ceil(NUM_SHARDS);
             if base == 0 { 1 } else { base }
         } else {
-            1 // Dummy capacity for disabled cache
+            1 // Disabled caches still need a valid LRU capacity.
         };
 
         let per_shard_nz = NonZeroUsize::new(per_shard).expect("per_shard is always >= 1");
@@ -188,15 +141,10 @@ impl EmbeddingCache {
         Self::new(DEFAULT_CACHE_CAPACITY)
     }
 
-    /// **Unstable**: key scheme (Blake3 + EmbeddingKey canonical bytes) may change; don't store keys across sessions.
+    /// **Unstable**: the key scheme may change; do not persist keys across sessions.
     ///
-    /// Uses Blake3 hashing for fast, collision-resistant keys. The key includes the model
-    /// name, revision, and active dimension from the `ModelConfig`, so different MRL truncations
-    /// produce different cache keys.
-    ///
-    /// The role is also included so that `embed_query("hello")` and `embed_passage("hello")`
-    /// produce different cache entries even when the raw text and model config are identical.
-    /// Use `EmbeddingRole::Generic` for the backwards-compatible `embed()` path.
+    /// Hashes text, model identity, active dimension, and retrieval role into a cache key.
+    /// See [`docs/design.md`](../docs/design.md#embeddingcache) for identity and collision-isolation details.
     pub fn compute_key(
         &self,
         text: &str,
@@ -205,7 +153,7 @@ impl EmbeddingCache {
     ) -> CacheKey {
         let mut hasher = blake3::Hasher::new();
         hasher.update(text.as_bytes());
-        // Unique identifier for the model config: "model_name:version:dims"
+        // Deterministic model/role namespace for this cache key.
         let model_key = format!(
             "{}:{}:{}:{}",
             model_config.model,

@@ -1,37 +1,9 @@
-//! GPU compute backend for lattice-fann
+//! GPU compute backend: contexts, pooled memory, WGSL pipelines, and dense inference.
 //!
-//! Production-grade GPU acceleration with:
-//! - 3-tier buffer pooling (Small/Medium/Large)
-//! - Circuit breaker for memory pressure
-//! - Pipeline caching
-//! - Intelligent GPU/CPU switching
-//! - Apple Silicon optimizations
-//!
-//! # Architecture
-//!
-//! ```text
-//! GpuContext (device/queue) ─┬─> BufferPool (3-tier, lifecycle tracking)
-//!                            ├─> ShaderManager (compiled pipelines)
-//!                            └─> CircuitBreaker (memory pressure)
-//!
-//! GpuNetwork (inference) ──> GpuContext
-//! GpuTrainer (training) ───> GpuContext
-//! ```
-//!
-//! # GPU/CPU Decision Heuristics
-//!
-//! | Operation | GPU Threshold | Rationale |
-//! |-----------|---------------|-----------|
-//! | Matrix-vector | >10K elements | GPU launch overhead dominates small ops |
-//! | Batch matmul | >100 batch size | Amortize kernel launch |
-//! | Activation | >1K elements | Element-wise is memory-bound |
-//!
-//! # Apple Silicon Specifics
-//!
-//! - 256-byte buffer alignment required
-//! - 128MB max buffer size
-//! - 2ms Metal watchdog (tile large dispatches)
-//! - 32-lane SIMD workgroups
+//! CPU selection uses a 10,000 effective-element threshold; activation policy uses 1,000.
+//! Keep each dispatch at or below 100,000 elements to retain 1.5 ms headroom beneath Metal's
+//! 2 ms watchdog. Apple Silicon uses 256-byte pool-buffer alignment and 32-thread matmul /
+//! 256-thread element-wise workgroups. See ADR-025 and `docs/gpu.md`.
 
 mod buffer;
 mod circuit_breaker;

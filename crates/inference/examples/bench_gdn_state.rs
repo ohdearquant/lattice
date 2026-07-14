@@ -83,11 +83,7 @@ fn run() {
     );
 
     let mut state: MetalQwen35State = if is_q4 {
-        let cfg = if dir.join("config.json").exists() {
-            Qwen35Config::from_config_json(&dir.join("config.json")).expect("parse config.json")
-        } else {
-            Qwen35Config::qwen35_0_8b()
-        };
+        let cfg = Qwen35Config::from_model_dir(dir).expect("load model config.json");
         let tokenizer_path = dir.join("tokenizer.json");
         MetalQwen35State::from_q4_dir(dir, &tokenizer_path, &cfg, 512)
             .expect("from_q4_dir failed — MSL compile or weight load error")

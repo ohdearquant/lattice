@@ -763,13 +763,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 "[chat_metal] Detected Q4 model directory: {}",
                 dir.display()
             );
-            let cfg = if dir.join("config.json").exists() {
-                Qwen35Config::from_config_json(&dir.join("config.json"))
-                    .map_err(|e| format!("failed to parse config.json: {e}"))?
-            } else {
-                eprintln!("[chat_metal] No config.json; using qwen36_27b preset");
-                Qwen35Config::qwen36_27b()
-            };
+            let cfg = Qwen35Config::from_model_dir(dir)
+                .map_err(|e| format!("failed to load config.json: {e}"))?;
             eprintln!("[chat_metal] Loading Q4 model...");
             let t0 = std::time::Instant::now();
             metal = MetalQwen35State::from_q4_dir(

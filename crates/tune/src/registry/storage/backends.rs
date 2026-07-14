@@ -1,4 +1,9 @@
-//! Storage backend implementations.
+//! In-memory, filesystem, and optional SQLite artifact storage backends.
+//!
+//! Backends define artifact persistence; the registry maintains its own
+//! in-process indexes and checksum policy.
+//!
+//! See `docs/registry.md` for layouts, failure ordering, and SQLite upgrades.
 
 use super::{StorageBackend, validate_model_identity, validate_path};
 use crate::error::{Result, TuneError};
@@ -66,22 +71,10 @@ pub struct SqliteStorage {
     weights_dir: PathBuf,
 }
 
-/// Rename the `metadata_json` column in the `models` table to `metadata`.
+/// Idempotently rename legacy `metadata_json` to `metadata` when present.
 ///
-/// This is an idempotent upgrade migration (#1392): databases created before
-/// the column was renamed will have `metadata_json`; databases created after
-/// will already have `metadata`.  We attempt the rename and silently succeed
-/// if the old column no longer exists (already migrated or fresh schema).
-///
-/// Idempotency is implemented by checking the actual column list in
-/// `sqlite_master` before attempting the rename, which avoids relying on
-/// error-string matching across SQLite versions.
-///
-/// # Errors
-///
-/// Returns an error if the column exists but the rename fails for any
-/// unexpected reason.  Fail-closed: we never silently swallow unexpected
-/// errors.
+/// The actual column list decides whether a rename is needed; unexpected
+/// SQLite errors abort initialization. See `docs/registry.md` for upgrades.
 // Called from SqliteStorage::new() which is cfg(feature = "sqlite");
 // the compiler cannot trace the call site when checking without that feature.
 #[cfg(feature = "sqlite")]
@@ -103,50 +96,9 @@ fn migrate_models_metadata_json_to_metadata(
     Ok(())
 }
 
-/// Convert `registered_at` and `updated_at` columns from TEXT (RFC 3339) to
-/// INTEGER (epoch microseconds) in the `models` table.
-///
-/// This is an idempotent upgrade migration (#1389).  Databases created before
-/// the schema was corrected declare these columns as `TEXT NOT NULL` and store
-/// RFC 3339 strings (e.g. `"2024-01-15T10:30:00Z"`).  Databases created after
-/// the correction declare them as `INTEGER NOT NULL` and store epoch
-/// microseconds (i64).
-///
-/// SQLite does not support `ALTER TABLE … ALTER COLUMN … TYPE`, so the
-/// migration recreates the `models` table with the correct column types and
-/// converts existing rows using per-row `typeof()` guards so the migration is
-/// safe whether rows contain TEXT RFC 3339 values or INTEGER values already.
-///
-/// # Idempotency
-///
-/// The migration inspects `PRAGMA table_info(models)` to detect the declared
-/// type of `registered_at`.  If both columns already declare `INTEGER` the
-/// migration is a no-op and returns immediately.  Re-running it on an already-
-/// migrated database (or a fresh database) is safe.
-///
-/// # Conversion formula (per-row)
-///
-/// SQLite coerces all values to TEXT affinity in the old schema, so `typeof()`
-/// alone cannot distinguish an RFC 3339 string from a numeric string.  The
-/// migration uses a three-way CASE per timestamp column:
-///
-/// 1. `typeof(val) = 'integer'` → native integer (stored without coercion)
-///    → pass through unchanged.
-/// 2. `datetime(val) IS NOT NULL` → valid datetime string (RFC 3339 / ISO 8601)
-///    → convert: `CAST(strftime('%s', val) AS INTEGER) * 1_000_000`
-///    (epoch seconds → epoch microseconds, sub-second component zeroed).
-/// 3. Otherwise → numeric string already holding epoch microseconds
-///    → `CAST(val AS INTEGER)` to strip TEXT affinity.
-///
-/// This handles all real-world states: pure TEXT databases (case 2), databases
-/// where new code wrote integer micros to old TEXT columns (case 3 — the
-/// integer was coerced to a TEXT digit string by SQLite affinity rules), and
-/// fresh INTEGER-schema rows that somehow arrived in a migration path (case 1).
-///
-/// # Errors
-///
-/// Returns an error if the table recreation or data conversion fails for any
-/// unexpected reason.  Fail-closed: we never silently swallow unexpected errors.
+/// Upgrades legacy timestamp columns to INTEGER epoch microseconds.
+/// It is a no-op for an INTEGER schema and fails initialization on SQLite errors.
+/// See [`docs/registry.md`](../../../docs/registry.md#sqlite-migration-helpers) for conversion and transaction details.
 // Called from SqliteStorage::new() which is cfg(feature = "sqlite");
 // the compiler cannot trace the call site when checking without that feature.
 #[cfg(feature = "sqlite")]
@@ -154,11 +106,8 @@ fn migrate_models_metadata_json_to_metadata(
 fn migrate_models_timestamps_text_to_integer(
     conn: &rusqlite::Connection,
 ) -> std::result::Result<(), rusqlite::Error> {
-    // Check declared type of `registered_at` via PRAGMA table_info.
-    // Column indices: 0=cid, 1=name, 2=type, 3=notnull, 4=dflt_value, 5=pk.
-    // `|r| r.ok()` cannot be replaced with `Result::ok` here: the iterator
-    // yields `rusqlite::Result<_>` but the crate re-exports its own `Result`,
-    // so clippy's suggestion produces a type-mismatch compile error.
+    // `PRAGMA table_info` exposes column name/type at indices 1/2.
+    // The iterator yields `rusqlite::Result`, not this crate's `Result` alias.
     #[allow(clippy::redundant_closure_for_method_calls)]
     let registered_at_type: Option<String> = conn
         .prepare("PRAGMA table_info(models)")?
@@ -178,12 +127,8 @@ fn migrate_models_timestamps_text_to_integer(
         _ => {} // TEXT or any other type — proceed with migration
     }
 
-    // Recreate the table with INTEGER columns.  We use a backup + rename
-    // pattern which is the only portable way to change column types in SQLite.
-    // Wrapped in BEGIN IMMEDIATE so the 4-step recreation (CREATE backup →
-    // INSERT SELECT → DROP original → RENAME backup) is atomic.  Any failure
-    // in an intermediate step causes an automatic rollback, leaving the
-    // original table intact.
+    // SQLite needs backup-and-rename; `BEGIN IMMEDIATE` keeps the replacement atomic.
+    // See [`docs/registry.md`](../../../docs/registry.md#sqlite-migration-helpers).
     conn.execute_batch(
         "
         BEGIN IMMEDIATE;
@@ -546,9 +491,7 @@ impl StorageBackend for SqliteStorage {
         // Validate path to prevent path traversal
         validate_path(path)?;
 
-        // Remove the weights file first. If this fails, we do not delete the DB
-        // row so the registry remains consistent (no orphaned DB record pointing
-        // to a missing file, and no missing DB record for an existing file).
+        // Keep the database row when artifact removal fails; see docs/registry.md.
         let full_path = self.weights_dir.join(path);
         if full_path.exists() {
             std::fs::remove_file(&full_path)?;
