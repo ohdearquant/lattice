@@ -129,9 +129,13 @@ mod tests {
         // 4. Create training loop
         let mut trainer = TrainingLoop::new(train_config).unwrap();
 
-        // 5. Train (using placeholder implementation)
-        let metrics = trainer.train(&mut dataset).unwrap();
-        assert!(metrics.epochs_completed > 0);
+        // 5. The placeholder loop must fail instead of fabricating metrics
+        let error = trainer.train(&mut dataset).unwrap_err();
+        assert!(matches!(
+            error,
+            TuneError::Training(message) if message.contains("not implemented")
+        ));
+        let metrics = TrainingMetrics::default();
 
         // 6. Create model for registry
         let metadata = ModelMetadata::classifier(3, 6, 1000)

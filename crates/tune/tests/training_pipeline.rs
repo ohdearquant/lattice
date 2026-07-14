@@ -13,7 +13,7 @@
 use lattice_tune::{
     Checkpoint, Dataset, DatasetConfig, EarlyStopping, EpochMetrics, IntentLabels, LRSchedule,
     LoggingCallback, OptimizerConfig, RegularizationConfig, TrainingCallback, TrainingConfig,
-    TrainingExample, TrainingLoop, TrainingMetrics, TrainingState,
+    TrainingExample, TrainingLoop, TrainingMetrics, TrainingState, TuneError,
 };
 
 // ============================================================================
@@ -54,6 +54,13 @@ fn make_diverse_dataset(num_examples: usize, embedding_dim: usize) -> Dataset {
         })
         .collect();
     Dataset::from_examples(examples)
+}
+
+fn assert_training_unimplemented(result: lattice_tune::Result<TrainingMetrics>) {
+    assert!(matches!(
+        result,
+        Err(TuneError::Training(message)) if message.contains("not implemented")
+    ));
 }
 
 // ============================================================================
@@ -108,17 +115,13 @@ fn test_training_loop_creation_invalid_batch_size() {
 // ============================================================================
 
 #[test]
-fn test_training_basic_execution() {
+fn test_training_basic_execution_fails_closed() {
     let config = TrainingConfig::quick().epochs(5);
     let mut trainer = TrainingLoop::new(config).unwrap();
     let mut dataset = make_dataset(100, 3, 64);
 
-    let metrics = trainer.train(&mut dataset);
-    assert!(metrics.is_ok());
-
-    let metrics = metrics.unwrap();
-    assert_eq!(metrics.epochs_completed, 5);
-    assert!(metrics.final_train_loss > 0.0);
+    assert_training_unimplemented(trainer.train(&mut dataset));
+    assert_eq!(trainer.state().global_step, 0);
 }
 
 #[test]
@@ -132,46 +135,39 @@ fn test_training_empty_dataset_fails() {
 }
 
 #[test]
-fn test_training_with_validation_split() {
+fn test_training_with_validation_split_fails_closed() {
     let config = TrainingConfig::quick().epochs(3).val_split(0.2);
     let mut trainer = TrainingLoop::new(config).unwrap();
     let mut dataset = make_dataset(100, 3, 64);
 
-    let metrics = trainer.train(&mut dataset).unwrap();
-
-    assert!(metrics.final_val_loss.is_some());
-    assert!(metrics.best_val_loss.is_some());
+    assert_training_unimplemented(trainer.train(&mut dataset));
 }
 
 #[test]
-fn test_training_diverse_labels() {
+fn test_training_diverse_labels_fail_closed() {
     let config = TrainingConfig::quick().epochs(3);
     let mut trainer = TrainingLoop::new(config).unwrap();
     let mut dataset = make_diverse_dataset(120, 64);
 
-    let metrics = trainer.train(&mut dataset).unwrap();
-    assert!(metrics.epochs_completed > 0);
+    assert_training_unimplemented(trainer.train(&mut dataset));
 }
 
 #[test]
-fn test_training_single_example() {
+fn test_training_single_example_fails_closed() {
     let config = TrainingConfig::quick().epochs(2).batch_size(1);
     let mut trainer = TrainingLoop::new(config).unwrap();
     let mut dataset = make_dataset(1, 3, 64);
 
-    let metrics = trainer.train(&mut dataset).unwrap();
-    assert!(metrics.epochs_completed > 0);
+    assert_training_unimplemented(trainer.train(&mut dataset));
 }
 
 #[test]
-fn test_training_large_batch_size() {
+fn test_training_large_batch_size_fails_closed() {
     let config = TrainingConfig::quick().epochs(2).batch_size(64);
     let mut trainer = TrainingLoop::new(config).unwrap();
     let mut dataset = make_dataset(50, 3, 64);
 
-    // Batch size larger than dataset should still work
-    let metrics = trainer.train(&mut dataset).unwrap();
-    assert!(metrics.epochs_completed > 0);
+    assert_training_unimplemented(trainer.train(&mut dataset));
 }
 
 // ============================================================================
@@ -185,27 +181,13 @@ fn test_early_stopping_on_val_loss() {
         .val_split(0.2)
         .early_stopping(EarlyStopping::val_loss(2)); // Very short patience
 
-    let mut trainer = TrainingLoop::new(config).unwrap();
-    let mut dataset = make_dataset(100, 3, 64);
-
-    let metrics = trainer.train(&mut dataset).unwrap();
-
-    // Should stop before 100 epochs (simulated loss decreases slowly)
-    // Note: With placeholder implementation, early stopping may or may not trigger
-    assert!(metrics.epochs_completed > 0);
+    assert!(config.early_stopping.is_some());
 }
 
 #[test]
 fn test_early_stopping_disabled() {
     let config = TrainingConfig::quick().epochs(5).no_early_stopping();
-
-    let mut trainer = TrainingLoop::new(config).unwrap();
-    let mut dataset = make_dataset(100, 3, 64);
-
-    let metrics = trainer.train(&mut dataset).unwrap();
-
-    assert!(!metrics.early_stopped);
-    assert_eq!(metrics.epochs_completed, 5);
+    assert!(config.early_stopping.is_none());
 }
 
 #[test]
@@ -325,23 +307,16 @@ fn test_checkpoint_creation() {
 #[test]
 fn test_checkpoint_from_trainer() {
     let config = TrainingConfig::quick().epochs(3);
-    let mut trainer = TrainingLoop::new(config).unwrap();
-    let mut dataset = make_dataset(50, 3, 64);
-
-    trainer.train(&mut dataset).unwrap();
+    let trainer = TrainingLoop::new(config).unwrap();
 
     let checkpoint = trainer.checkpoint();
-    assert_eq!(checkpoint.epoch, 2); // 0-indexed, after 3 epochs
+    assert_eq!(checkpoint.epoch, 0);
+    assert_eq!(checkpoint.global_step, 0);
 }
 
 #[test]
 fn test_checkpoint_resume() {
-    let config = TrainingConfig::quick().epochs(2);
-    let mut trainer = TrainingLoop::new(config).unwrap();
-    let mut dataset = make_dataset(50, 3, 64);
-
-    trainer.train(&mut dataset).unwrap();
-    let checkpoint = trainer.checkpoint();
+    let checkpoint = Checkpoint::new(1, 7, TrainingMetrics::default());
 
     // Create new trainer and resume
     let config2 = TrainingConfig::quick().epochs(5);
@@ -414,7 +389,7 @@ fn test_callback_invocation() {
     trainer.add_callback(callback);
 
     let mut dataset = make_dataset(30, 3, 64);
-    trainer.train(&mut dataset).unwrap();
+    assert_training_unimplemented(trainer.train(&mut dataset));
 
     // Verify callbacks were called (we can't access internal state,
     // but this verifies no panics during callback invocation)
@@ -646,7 +621,7 @@ fn test_training_state_epoch_loss() {
 // ============================================================================
 
 #[test]
-fn test_training_with_custom_dataset_config() {
+fn test_training_with_custom_dataset_config_fails_closed() {
     let config = TrainingConfig::quick().epochs(2).batch_size(16);
     let mut trainer = TrainingLoop::new(config).unwrap();
 
@@ -657,12 +632,11 @@ fn test_training_with_custom_dataset_config() {
     )
     .unwrap();
 
-    let metrics = trainer.train(&mut dataset).unwrap();
-    assert!(metrics.epochs_completed > 0);
+    assert_training_unimplemented(trainer.train(&mut dataset));
 }
 
 #[test]
-fn test_training_reproducibility_with_seed() {
+fn test_training_reproducibility_with_seed_fails_closed() {
     let config1 = TrainingConfig::quick().epochs(3).seed(12345);
     let config2 = TrainingConfig::quick().epochs(3).seed(12345);
 
@@ -672,12 +646,9 @@ fn test_training_reproducibility_with_seed() {
     let mut dataset1 = make_dataset(50, 3, 64);
     let mut dataset2 = make_dataset(50, 3, 64);
 
-    let metrics1 = trainer1.train(&mut dataset1).unwrap();
-    let metrics2 = trainer2.train(&mut dataset2).unwrap();
-
-    // With same seed, training should produce similar results
-    // (Note: exact match depends on implementation details)
-    assert_eq!(metrics1.epochs_completed, metrics2.epochs_completed);
+    assert_training_unimplemented(trainer1.train(&mut dataset1));
+    assert_training_unimplemented(trainer2.train(&mut dataset2));
+    assert_eq!(trainer1.state().global_step, trainer2.state().global_step);
 }
 
 // ============================================================================
@@ -685,7 +656,7 @@ fn test_training_reproducibility_with_seed() {
 // ============================================================================
 
 #[test]
-fn test_full_training_pipeline() {
+fn test_full_training_pipeline_fails_closed() {
     // 1. Create diverse dataset
     let mut dataset = make_diverse_dataset(200, 32);
 
@@ -708,26 +679,18 @@ fn test_full_training_pipeline() {
     // 3. Create trainer
     let mut trainer = TrainingLoop::new(config).unwrap();
 
-    // 4. Train
-    let metrics = trainer.train(&mut dataset).unwrap();
+    // 4. Training must fail until the CPU optimizer is wired
+    assert_training_unimplemented(trainer.train(&mut dataset));
 
-    // 5. Verify results
-    assert!(metrics.epochs_completed > 0);
-    assert!(metrics.final_train_loss > 0.0);
-    assert!(metrics.final_val_loss.is_some());
-    assert!(!metrics.history.is_empty());
-
-    // 6. Create checkpoint
+    // 5. A failed step must not fabricate checkpoint metrics
     let checkpoint = trainer.checkpoint();
     assert!(!checkpoint.id.is_nil());
-    assert_eq!(
-        checkpoint.metrics.epochs_completed,
-        metrics.epochs_completed
-    );
+    assert_eq!(checkpoint.global_step, 0);
+    assert!(checkpoint.metrics.history.is_empty());
 }
 
 #[test]
-fn test_training_with_all_lr_schedules() {
+fn test_training_with_all_lr_schedules_fails_closed() {
     let schedules = vec![
         LRSchedule::Constant,
         LRSchedule::LinearWarmup { warmup_steps: 10 },
@@ -749,16 +712,12 @@ fn test_training_with_all_lr_schedules() {
         let mut trainer = TrainingLoop::new(config).unwrap();
         let mut dataset = make_dataset(50, 3, 32);
 
-        let result = trainer.train(&mut dataset);
-        assert!(
-            result.is_ok(),
-            "Training failed with schedule: {schedule:?}"
-        );
+        assert_training_unimplemented(trainer.train(&mut dataset));
     }
 }
 
 #[test]
-fn test_training_with_different_batch_sizes() {
+fn test_training_with_different_batch_sizes_fails_closed() {
     let batch_sizes = vec![1, 8, 32, 64, 128];
 
     for batch_size in batch_sizes {
@@ -766,11 +725,7 @@ fn test_training_with_different_batch_sizes() {
         let mut trainer = TrainingLoop::new(config).unwrap();
         let mut dataset = make_dataset(150, 3, 32);
 
-        let result = trainer.train(&mut dataset);
-        assert!(
-            result.is_ok(),
-            "Training failed with batch_size: {batch_size}"
-        );
+        assert_training_unimplemented(trainer.train(&mut dataset));
     }
 }
 

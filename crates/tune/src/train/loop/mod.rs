@@ -1,8 +1,8 @@
 //! Training-loop orchestration, callbacks, metrics, and checkpoints.
 //!
-//! The current CPU loop validates and drives the run lifecycle but simulates
-//! loss and accuracy rather than optimizing network weights. See `docs/train.md`
-//! for lifecycle order, metric semantics, and checkpoint limitations.
+//! The current CPU loop validates and drives the run lifecycle but fails when
+//! training reaches the unwired optimizer step. See `docs/train.md` for
+//! lifecycle order, metric semantics, and checkpoint limitations.
 
 mod callbacks;
 mod checkpoint;
@@ -20,8 +20,9 @@ use crate::error::{Result, TuneError};
 
 /// CPU training-loop orchestrator.
 ///
-/// This implementation simulates batch loss and accuracy; it does not update a
-/// neural network. See `docs/train.md` for the lifecycle and current contract.
+/// This implementation does not update a neural network and returns a training
+/// error when a batch reaches the unwired optimizer step. See `docs/train.md`
+/// for the lifecycle and current contract.
 pub struct TrainingLoop {
     /// Training configuration
     config: TrainingConfig,
@@ -77,8 +78,8 @@ impl TrainingLoop {
 
     /// Train on a dataset
     ///
-    /// This is a placeholder that simulates training. Real implementation
-    /// would use lattice-fann for actual neural network operations.
+    /// This returns a training error because CPU optimizer integration is not
+    /// implemented. Use the `train_grad_full` binary for LoRA SFT.
     pub fn train(&mut self, dataset: &mut Dataset) -> Result<TrainingMetrics> {
         if dataset.is_empty() {
             return Err(TuneError::Dataset("Dataset is empty".to_string()));
@@ -206,29 +207,11 @@ impl TrainingLoop {
 
     /// Train one batch
     ///
-    /// Placeholder: returns simulated loss. Real implementation would:
-    /// 1. Forward pass
-    /// 2. Compute loss
-    /// 3. Backward pass
-    /// 4. Update weights
-    fn train_batch(&mut self, batch: &Batch) -> Result<f32> {
-        self.state.step += 1;
-        self.state.global_step += 1;
-
-        // Simulate training
-        let batch_size = batch.len();
-        self.state.running_total += batch_size;
-
-        // Simulated loss (decreases over training)
-        let loss = 0.5 * (-0.01 * self.state.global_step as f32).exp() + 0.1;
-        self.state.running_loss += loss;
-
-        // Simulated accuracy (increases over training)
-        let accuracy_rate = 0.6 + 0.35 * (1.0 - (-0.005 * self.state.global_step as f32).exp());
-        let correct = (batch_size as f32 * accuracy_rate) as usize;
-        self.state.running_correct += correct;
-
-        Ok(loss)
+    /// Returns an error until the forward, backward, and optimizer steps are wired.
+    fn train_batch(&mut self, _batch: &Batch) -> Result<f32> {
+        Err(TuneError::Training(
+            "TrainingLoop CPU training is not implemented; use train_grad_full for LoRA SFT".into(),
+        ))
     }
 
     /// Validate on a dataset
@@ -285,27 +268,29 @@ mod tests {
     }
 
     #[test]
-    fn test_training_loop_train() {
+    fn test_training_loop_train_fails_closed() {
         let config = TrainingConfig::quick();
         let mut trainer = TrainingLoop::new(config).unwrap();
         let mut dataset = make_dataset(100);
 
-        let metrics = trainer.train(&mut dataset);
-        assert!(metrics.is_ok());
-
-        let metrics = metrics.unwrap();
-        assert!(metrics.epochs_completed > 0);
-        assert!(metrics.final_train_loss > 0.0);
+        let error = trainer.train(&mut dataset).unwrap_err();
+        assert!(matches!(
+            error,
+            TuneError::Training(message) if message.contains("not implemented")
+        ));
+        assert_eq!(trainer.state().global_step, 0);
+        assert!(trainer.metrics().history.is_empty());
     }
 
     #[test]
     fn test_training_with_validation() {
         let config = TrainingConfig::quick().val_split(0.2);
-        let mut trainer = TrainingLoop::new(config).unwrap();
-        let mut dataset = make_dataset(100);
+        let trainer = TrainingLoop::new(config).unwrap();
+        let dataset = make_dataset(100);
 
-        let metrics = trainer.train(&mut dataset).unwrap();
-        assert!(metrics.final_val_loss.is_some());
+        let (loss, accuracy) = trainer.validate(&dataset).unwrap();
+        assert_eq!(loss, 0.0);
+        assert_eq!(accuracy, 0.0);
     }
 
     #[test]
