@@ -4,13 +4,13 @@
 //! then runs retrieval queries and compares rankings side-by-side.
 //!
 //! Usage:
-//!   cargo run --release --features "backfill,metal-gpu" --bin bench_embed_quality -p lattice-inference
+//!   cargo run --release --features "backfill,metal-gpu" --example bench_embed_quality -p lattice-inference
 
 #[cfg(not(feature = "backfill"))]
 fn main() {
     eprintln!("This binary requires the `backfill` feature (for rusqlite).");
     eprintln!(
-        "Run with: cargo run --features backfill --bin bench_embed_quality -p lattice-inference"
+        "Run with: cargo run --features backfill --example bench_embed_quality -p lattice-inference"
     );
     std::process::exit(1);
 }
