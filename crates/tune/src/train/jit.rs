@@ -1,8 +1,8 @@
 //! Just-in-time adaptation configuration, control flow, and layer-selection helpers.
 //!
-//! CPU adaptation currently reports simulated loss; GPU adaptation delegates to
-//! the GPU trainer and therefore cannot complete a weight update yet. See
-//! `docs/train.md` for strategies, stopping rules, and current limitations.
+//! CPU adaptation currently fails at its unwired training step; GPU adaptation
+//! delegates to the GPU trainer and therefore cannot complete a weight update
+//! yet. See `docs/train.md` for strategies, stopping rules, and limitations.
 
 use crate::data::{Dataset, TrainingExample};
 use crate::error::{Result, TuneError};
@@ -248,7 +248,6 @@ impl JitAdapter {
                 break;
             }
 
-            // Simulate training step (placeholder)
             let loss = self.train_step_cpu(&mut dataset, step)?;
             loss_history.push(loss);
             steps_completed = step + 1;
@@ -365,23 +364,11 @@ impl JitAdapter {
         })
     }
 
-    /// Placeholder CPU training step
-    fn train_step_cpu(&self, dataset: &mut Dataset, step: usize) -> Result<f32> {
-        // Get batch (cycle through dataset)
-        let _batch = match dataset.next_batch() {
-            Some(b) => b,
-            None => {
-                dataset.reset_epoch();
-                dataset
-                    .next_batch()
-                    .ok_or_else(|| TuneError::Training("Dataset is empty".into()))?
-            }
-        };
-
-        // Simulate decreasing loss
-        let base_loss = 1.0 / (1.0 + step as f32 * 0.1);
-        let noise = (step as f32 * 0.1).sin() * 0.1;
-        Ok(base_loss + noise.abs())
+    /// Return an error until CPU adaptation has a real gradient update path.
+    fn train_step_cpu(&self, _dataset: &mut Dataset, _step: usize) -> Result<f32> {
+        Err(TuneError::Training(
+            "JIT CPU adaptation is not implemented; use train_grad_full for LoRA SFT".into(),
+        ))
     }
 }
 
@@ -498,8 +485,9 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_adapt_cpu() {
+    fn test_jit_low_rank_adapt_cpu_fails_closed() {
         let adapter = JitAdapter::with_config(JitConfig {
+            strategy: JitStrategy::LowRank { rank: 4 },
             steps: 10,
             timeout_secs: 1.0,
             ..JitConfig::fast()
@@ -507,13 +495,12 @@ mod tests {
         .unwrap();
 
         let examples = make_examples(20);
-        let result = adapter.adapt_cpu(examples);
+        let error = adapter.adapt_cpu(examples).unwrap_err();
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert!(result.is_success());
-        assert!(result.steps_completed > 0);
-        assert!(result.time_secs < 1.0);
+        assert!(matches!(
+            error,
+            TuneError::Training(message) if message.contains("not implemented")
+        ));
     }
 
     #[test]

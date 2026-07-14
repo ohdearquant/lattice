@@ -11,12 +11,12 @@
 //! # Output
 //!
 //! ```text
-//! BLEND_BENCH r=1 k=1 layers=28 blend_us=<f>
-//! BLEND_BENCH r=1 k=4 layers=28 blend_us=<f>
-//! BLEND_BENCH r=1 k=8 layers=28 blend_us=<f>
-//! BLEND_BENCH r=2 k=1 layers=28 blend_us=<f>
-//! BLEND_BENCH r=2 k=4 layers=28 blend_us=<f>
-//! BLEND_BENCH r=2 k=8 layers=28 blend_us=<f>
+//! BLEND_BENCH r=1 k=1 layers=12 blend_us=<f>
+//! BLEND_BENCH r=1 k=4 layers=12 blend_us=<f>
+//! BLEND_BENCH r=1 k=8 layers=12 blend_us=<f>
+//! BLEND_BENCH r=2 k=1 layers=12 blend_us=<f>
+//! BLEND_BENCH r=2 k=4 layers=12 blend_us=<f>
+//! BLEND_BENCH r=2 k=8 layers=12 blend_us=<f>
 //! ```
 //!
 //! When a model is available:
@@ -49,9 +49,25 @@ fn main() {
     }
 }
 
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn full_attention_layer_indices(
+    cfg: &lattice_inference::model::qwen35_config::Qwen35Config,
+) -> Vec<usize> {
+    use lattice_inference::model::qwen35_config::LayerType;
+
+    cfg.layer_types
+        .iter()
+        .enumerate()
+        .filter_map(|(layer_idx, layer_type)| {
+            (*layer_type == LayerType::FullAttention).then_some(layer_idx)
+        })
+        .collect()
+}
+
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::{LoraLayerData, blend_lora_layer_data};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use std::time::Instant;
 
     let warmup: usize = std::env::var("BENCH_WARMUP")
@@ -67,20 +83,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
-    // Qwen3.5-0.8b has 28 transformer layers; use q_proj for the projection.
-    // For a realistic mix we cover all 28 layers × 2 modules (q_proj + v_proj).
-    const NUM_LAYERS: usize = 28;
+    let cfg = Qwen35Config::qwen35_0_8b();
+    let layer_indices = full_attention_layer_indices(&cfg);
     const D_IN: usize = 1024;
     const D_OUT: usize = 4096;
 
     for &rank in &[1usize, 2] {
         for &k in &[1usize, 4, 8] {
-            // Build k synthetic adapters, each covering NUM_LAYERS layers.
+            // GDN layers have no q_proj or v_proj and are rejected by the runtime.
             let adapters: Vec<Vec<LoraLayerData>> = (0..k)
                 .map(|adapter_idx| {
-                    (0..NUM_LAYERS)
+                    layer_indices
+                        .iter()
+                        .copied()
                         .flat_map(|layer_idx| {
-                            let seed = (adapter_idx * NUM_LAYERS + layer_idx) as f32;
+                            let seed = (adapter_idx * cfg.num_hidden_layers + layer_idx) as f32;
                             // q_proj
                             let layer_q = LoraLayerData {
                                 layer_idx,
@@ -135,7 +152,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let elapsed = start.elapsed();
             let blend_us = elapsed.as_micros() as f64 / iters as f64;
 
-            let layers_count = NUM_LAYERS * 2; // q_proj + v_proj
+            let layers_count = layer_indices.len() * 2; // q_proj + v_proj
             println!("BLEND_BENCH r={rank} k={k} layers={layers_count} blend_us={blend_us:.1}");
         }
     }
@@ -187,13 +204,16 @@ fn run_gpu_decode_bench(
     const D_IN: usize = 1024;
     const D_OUT: usize = 4096;
     let num_layers = cfg.num_hidden_layers;
+    let layer_indices = full_attention_layer_indices(&cfg);
     let prompt = "Hello";
 
     for &rank in &[1usize, 2] {
         for &k in &[1usize, 4, 8] {
             let adapters: Vec<Vec<LoraLayerData>> = (0..k)
                 .map(|adapter_idx| {
-                    (0..num_layers)
+                    layer_indices
+                        .iter()
+                        .copied()
                         .map(|layer_idx| {
                             let seed = (adapter_idx * num_layers + layer_idx) as f32;
                             LoraLayerData {
@@ -238,4 +258,20 @@ fn run_gpu_decode_bench(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lattice_inference::model::qwen35_config::Qwen35Config;
+
+    #[test]
+    fn qwen35_0_8b_lora_layers_are_full_attention_only() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+
+        assert_eq!(
+            full_attention_layer_indices(&cfg),
+            vec![3, 7, 11, 15, 19, 23]
+        );
+    }
 }
