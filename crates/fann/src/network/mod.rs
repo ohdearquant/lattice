@@ -89,10 +89,23 @@ impl TryFrom<NetworkData> for Network {
 impl Network {
     /// Create a network from a list of layers
     ///
-    /// Validates that layer dimensions are compatible.
+    /// Validates that layer dimensions are compatible and Softmax appears only
+    /// on the output layer.
     pub fn new(layers: Vec<Layer>) -> FannResult<Self> {
         if layers.is_empty() {
             return Err(FannError::EmptyNetwork);
+        }
+
+        // Reject Softmax before the final layer: its derivative here is only diagonal (see ADR-023).
+        if layers[..layers.len() - 1]
+            .iter()
+            .any(|layer| layer.activation().is_softmax())
+        {
+            return Err(FannError::InvalidBuilder(
+                "Softmax is only valid as the output-layer activation; \
+                 hidden layers must use a pointwise activation"
+                    .into(),
+            ));
         }
 
         // Validate layer compatibility
@@ -295,6 +308,19 @@ mod tests {
             result,
             Err(FannError::NumericInstability(message)) if message.contains("NaN")
         ));
+    }
+
+    #[test]
+    fn network_new_rejects_hidden_softmax() {
+        let hidden = Layer::new(2, 4, Activation::Softmax).unwrap();
+        let output = Layer::new(4, 1, Activation::Linear).unwrap();
+
+        let result = Network::new(vec![hidden, output]);
+
+        assert!(
+            matches!(result, Err(FannError::InvalidBuilder(_))),
+            "expected InvalidBuilder, got {result:?}"
+        );
     }
 
     #[test]

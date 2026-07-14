@@ -19,24 +19,6 @@ pub struct NetworkBuilder {
     layers: Vec<(usize, Activation)>,
 }
 
-/// Reject Softmax before the final layer: its derivative here is only diagonal (see ADR-023).
-fn validate_no_hidden_softmax(layers: &[(usize, Activation)]) -> FannResult<()> {
-    if layers.len() < 2 {
-        return Ok(());
-    }
-    let last_hidden = layers.len() - 1;
-    for (_, activation) in &layers[..last_hidden] {
-        if activation.is_softmax() {
-            return Err(FannError::InvalidBuilder(
-                "Softmax is only valid as the output-layer activation; \
-                 hidden layers must use a pointwise activation"
-                    .into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 impl NetworkBuilder {
     /// Create a new network builder
     pub fn new() -> Self {
@@ -88,8 +70,6 @@ impl NetworkBuilder {
             return Err(FannError::InvalidBuilder("Input size cannot be 0".into()));
         }
 
-        validate_no_hidden_softmax(&self.layers)?;
-
         let mut layers = Vec::with_capacity(self.layers.len());
         let mut prev_size = input_size;
 
@@ -123,8 +103,6 @@ impl NetworkBuilder {
         if input_size == 0 {
             return Err(FannError::InvalidBuilder("Input size cannot be 0".into()));
         }
-
-        validate_no_hidden_softmax(&self.layers)?;
 
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
         let mut layers = Vec::with_capacity(self.layers.len());
