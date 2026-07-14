@@ -18,7 +18,8 @@ similarity matching.
 | `BgeBaseEnV15`  | 768        | Balanced quality/speed          | BAAI/bge-base-en-v1.5  |
 | `BgeLargeEnV15` | 1024       | Highest quality                 | BAAI/bge-large-en-v1.5 |
 
-All models have a 512 token input limit.
+The BGE models listed above have a 512-token input limit. See the
+[supported-model reference](../../docs/models.md) for every variant's limit and availability.
 
 ## Services
 
@@ -57,14 +58,14 @@ scalar fallback. On aarch64 the f32 kernels always use NEON (mandatory on that
 architecture, no runtime check), while the int8 kernel runtime-detects SDOT. On wasm32
 the SIMD choice is fixed at compile time and covers the f32 kernels only (see below).
 
-| Platform       | Instructions                                       |
-| -------------- | -------------------------------------------------- |
-| x86_64 (f32)   | AVX-512F > AVX2 + FMA > scalar                     |
-| x86_64 (int8)  | AVX-512 VNNI (`avx512` feature) > AVX2 > scalar    |
-| aarch64 (f32)  | ARM NEON (mandatory, always on)                    |
-| aarch64 (int8) | NEON SDOT (runtime-detected) > scalar              |
-| wasm32         | SIMD128 (compile-time, f32 kernels only) > scalar  |
-| Other          | Scalar fallback                                    |
+| Platform       | Instructions                                      |
+| -------------- | ------------------------------------------------- |
+| x86_64 (f32)   | AVX-512F > AVX2 + FMA > scalar                    |
+| x86_64 (int8)  | AVX-512 VNNI (`avx512` feature) > AVX2 > scalar   |
+| aarch64 (f32)  | ARM NEON (mandatory, always on)                   |
+| aarch64 (int8) | NEON SDOT (runtime-detected) > scalar             |
+| wasm32         | SIMD128 (compile-time, f32 kernels only) > scalar |
+| Other          | Scalar fallback                                   |
 
 ### wasm32 (SIMD128)
 
@@ -126,11 +127,15 @@ Blake3-based hashing with LRU eviction. Default capacity: 4000 entries (~6MB for
 vectors).
 
 ```rust
-use lattice_embed::{EmbeddingCache, EmbeddingModel};
+use lattice_embed::{EmbeddingCache, EmbeddingModel, EmbeddingRole, ModelConfig};
 
 let cache = EmbeddingCache::new(1000);
 
-let key = cache.compute_key("text", EmbeddingModel::BgeSmallEnV15);
+let key = cache.compute_key(
+    "text",
+    ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
+    EmbeddingRole::Generic,
+);
 cache.put(key, vec![0.1, 0.2, 0.3]);
 
 let stats = cache.stats();

@@ -49,15 +49,17 @@ The trade-off is that adding a new model requires touching the source.
 
 **Asymmetric retrieval instruction prefixes**
 
-Two model families require instruction prefixes that must be prepended at inference time:
+Three model families require instruction prefixes that must be prepended at inference time:
 
 - E5 models (`MultilingualE5Small`, `MultilingualE5Base`): `query_instruction()` returns `Some("query: ")`.
-  These models were fine-tuned with `"query: "` / `"passage: "` asymmetric prefixes; omitting them
-  degrades retrieval quality substantially. `document_instruction()` returns `None` — documents
-  are embedded with no prefix (by design in the original fine-tuning).
+  `document_instruction()` returns `Some("passage: ")`; `embed_query()` and `embed_passage()` apply
+  the corresponding asymmetric prefix before embedding.
 - Qwen3 models: `query_instruction()` returns the long instruction prompt `"Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "`.
-  Decoder-based embedding models require an explicit task description to orient the pooled representation.
-- BGE and MiniLM families: both return `None` — trained on raw contrastive pairs without prefixes.
+  Decoder-based embedding models require an explicit task description to orient the pooled representation;
+  `document_instruction()` returns `None`.
+- BGE models: `query_instruction()` returns `Some("Represent this sentence for searching relevant passages: ")`;
+  `document_instruction()` returns `None`.
+- MiniLM models: both instruction methods return `None`.
 
 **MRL (Matryoshka Representation Learning) for Qwen3 only**
 
