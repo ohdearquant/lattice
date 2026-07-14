@@ -47,6 +47,7 @@ merged artifact says so.
 | W5 | **The Q4 PPL quality gate is armed and required**: golden **16.589111** (q4-unrotated tier), tolerance 0.05, captured on CI paravirtual Metal; `q4-ppl-quality` → `parity-gate.needs` → repo required checks. | gate-pinned | `tests/fixtures/ppl_gate_v1/golden.json`; `.github/workflows/e2e-parity.yml:551-660` |
 | W6 | **A runtime Hadamard-rotation call-site already exists**: `quarot_rotation: Option<RandomizedHadamard>` on the Metal state counter-rotates MTP-head activations (ADR-051). Not general R3/R4, but a working runtime `RandomizedHadamard::apply` precedent — #703 is an extension, not a greenfield wire-up. | source-read | `forward/metal_qwen35.rs:1481` (field), `:4952,:4982,:5330` (uses) |
 | W7 | Decode is weight-bandwidth-bound; **MLP weight GEMMs are ≈35% of decode time**, GQA projections next, GDN cheapest. So MLP-weight bit-width is the decode-bandwidth lever. | internal profiling, no merged artifact | prior decode-bandwidth profiling; a `make bench-compare` on any W3 PR is the public gate |
+| W8 | **W3 MLP-only is a measured NET-NEGATIVE quality tier** (added by Amendment 2; measured 2026-07-02 — *before* this ADR — but omitted from the original table): full-corpus `eval_perplexity` decode-loop (M=1 teacher-forced NLL), `wiki.test.raw` 310,034 tokens, window 512 / stride 256, serialized idle-GPU legs, same harness for all three rows — f16 **15.198** (CPU), Q4 **15.731** (Metal), W3 MLP-only **18.097** (Metal): **+2.366 PPL vs Q4 (+15.0%)**, ~10× this ADR's own ≤0.2–0.25 W3 budget, for −25% MLP payload bytes. | runtime-measured | PR #515 (draft, closed — the measurement record); issue #420 |
 
 ## Prior / unvalidated on our hardware
 
@@ -164,9 +165,55 @@ suite; the PPL and bench gates bind at Stage 2.
 
 ## Follow-ups
 
-- #420 (W3 MLP-only) → **P1**; `Q3Block` at group-32 (Amendment 1) + the #616 `eval_perplexity` gate path + `make bench-compare`. Stage 1 (CPU format module) = #978; Stage 2 = Metal `gemm_q3`/`gemv_q3`.
-- #703 (online R3/R4 Hadamard) → **P2**; CPU/f16 equivalence gate first (W6 precedent), then the recovery PPL matrix.
-- #684 / #683 (FP8 / FP4 loaders) → **P3**, demand-gated on a target checkpoint shipping in-format.
+- #420 (W3 MLP-only) → ~~**P1**~~ **closed by measurement — see Amendment 2 (W8)**. Stage 1 (CPU format module) = #978, retained as dormant format infrastructure; Stage 2 (Metal kernels) not built.
+- #703 (online R3/R4 Hadamard) → ~~**P2**~~ **P1 per Amendment 2**; CPU/f16 equivalence gate first (W6 precedent), then the recovery PPL matrix.
+- #684 / #683 (FP8 / FP4 loaders) → ~~**P3**~~ **P2 per Amendment 2**, demand-gated on a target checkpoint shipping in-format.
 - #421 (SpinQuant) → deferred, gated on #703.
-- #423 (role-aware precision policy) → light framework, seeded by P1.
+- #423 (role-aware precision policy) → light framework; its seeding instance moves with Amendment 2 (rides whichever tier #703 proves out, or a future demand-gated format).
 - ADR-044 / 045 / 051 (QuaRot family) → offline v0's quality-tier conclusion amended by W4; this ADR records the amendment at the priority level.
+
+## Amendment 2 (2026-07-14): W3 closed by prior measurement; re-ranking
+
+**What was wrong.** The original Decision ranked MLP-only W3 (#420) as P1 *Build*, and both the
+Risk section and Amendment 1's pre-registered PPL gate treated a >0.2–0.25 PPL blowout as a future
+possibility the eval gate would catch. In fact the experiment had already been run, and had
+already failed, a week before this ADR was written: PR #515 (2026-07-02, draft, closed)
+implemented a W3 MLP-only path (KHW3 format) and measured it at **+2.366 PPL vs Q4** on the full
+corpus (evidence row W8, added by this amendment) — roughly ten times the tier's budget. The
+original evidence table omitted that result, so the P1 ranking rested on the leverage arithmetic
+(W7) without confronting the strongest available counter-evidence. This amendment corrects the
+record and the ranking.
+
+**Why the result transfers to `Q3Block` unchanged.** The `Q3Block` format merged in #978 (KHQ3,
+`weights/q3_weights.rs`, specified by Amendment 1) has the *same quantization semantics* as the
+KHW3 format #515 measured: group-32, 3-bit asymmetric min/max round-to-nearest (8 levels spanning
+`[min, max]`), f16 scale + f16 bias, 16-byte block. The two differ only in bit-packing layout
+(plane-split 2+1 vs sequential 3-bit fields) — packing changes neither the representable values
+nor the rounding, so per-weight quantization error is identical and the W8 PPL result applies to
+`Q3Block` as-measured. Re-running the experiment on `Q3Block` would not produce a materially
+different number.
+
+**Reopen conditions.** Any future W3 attempt must name a *quality mechanism that changes the
+error distribution* — calibration-based quantization (GPTQ/AWQ-family), a proven online rotation
+(#703) supplying outlier suppression, or finer groups at a bpw cost — and re-derive the byte
+arithmetic for it. Naive RTN W3 at group-32 is closed. Amendment 1's "miss routes to role-aware
+selective W3 (#423)" clause is narrowed the same way: selective W3 without a new quality
+mechanism inherits the same per-tensor error and is not a reopening path by itself.
+
+**Re-ranking.**
+
+1. **P1 — online R3/R4 Hadamard rotation (#703)** (was P2). Unchanged in substance: CPU/f16
+   rotation-equivalence gate first, then the recovery PPL matrix vs the 16.589 golden. Rotation
+   headroom — flattening outliers — is precisely the mechanism whose absence the W8 result
+   exposes at 3-bit, so #703 now also gates any W3 revival.
+2. **P2 — FP8 (E4M3) / FP4 (MXFP4/NVFP4) loaders (#684/#683)** (was P3). Still demand-gated on a
+   target checkpoint shipping in-format.
+3. **Closed by measurement — MLP-only W3 (#420)** (was P1), per W8, joining offline QuaRot v0
+   (W4) in the closed set. Reopen conditions above.
+
+**Status of shipped W3 artifacts.** The `Q3Block` format module (#978) stays merged as dormant
+format infrastructure: correct, tested, reachable from no engine path, and useful the day a
+quality mechanism justifies a 3-bit tier. No Metal kernels, quantizer emit, or loader support for
+it are to be built while #420 is closed. Amendment 1's format definition remains authoritative
+for the dormant module; its Stage-2 build plan and binding validation gates are suspended with
+the lane rather than repealed, so they re-arm as-written if the reopen conditions are ever met.
