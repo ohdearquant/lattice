@@ -145,14 +145,66 @@ impl LoraAdapter {
     /// Construct an adapter from pre-built components (for testing or
     /// when loading from a custom format).
     ///
+    /// Every non-empty layer's `a`/`b` buffers must be sized exactly
+    /// `rank * d_in` and `d_out * rank` (the layout `apply_lora` indexes
+    /// into); a layer with an empty `a` or `b` is an untrained/placeholder
+    /// module and is exempt (mirrors `save_peft_safetensors`, which skips
+    /// the same layers). This is the single construction chokepoint
+    /// (safetensors loading, blending, and training all route through it),
+    /// so downstream code — including
+    /// [`validate_against`](Self::validate_against) and `apply` — can rely
+    /// on the invariant without re-checking it.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the adapter configuration is invalid.
+    /// Returns an error when the adapter configuration is invalid, or when
+    /// any non-empty layer's `a`/`b` buffer length doesn't match its own
+    /// declared `rank`/`d_in`/`d_out`.
     pub fn new(
         config: LoraConfig,
         layers: HashMap<(usize, String), LoraLayer>,
     ) -> crate::error::Result<Self> {
         config.validate()?;
+        for ((layer_idx, module), layer) in &layers {
+            // An empty `a` or `b` denotes an untrained/not-yet-populated
+            // module (see `save_peft_safetensors`, which skips these the
+            // same way) and is exempt from the buffer/rank check below.
+            if layer.a.is_empty() || layer.b.is_empty() {
+                continue;
+            }
+            let expected_a = layer.rank.checked_mul(layer.d_in).ok_or_else(|| {
+                crate::error::TuneError::Validation(format!(
+                    "LoRA layer {layer_idx} module '{module}': rank*d_in overflowed usize \
+                     (rank={}, d_in={})",
+                    layer.rank, layer.d_in
+                ))
+            })?;
+            if layer.a.len() != expected_a {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA layer {layer_idx} module '{module}': A buffer length {} does not \
+                     match rank*d_in={expected_a} (rank={}, d_in={})",
+                    layer.a.len(),
+                    layer.rank,
+                    layer.d_in
+                )));
+            }
+            let expected_b = layer.d_out.checked_mul(layer.rank).ok_or_else(|| {
+                crate::error::TuneError::Validation(format!(
+                    "LoRA layer {layer_idx} module '{module}': d_out*rank overflowed usize \
+                     (d_out={}, rank={})",
+                    layer.d_out, layer.rank
+                ))
+            })?;
+            if layer.b.len() != expected_b {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA layer {layer_idx} module '{module}': B buffer length {} does not \
+                     match d_out*rank={expected_b} (d_out={}, rank={})",
+                    layer.b.len(),
+                    layer.d_out,
+                    layer.rank
+                )));
+            }
+        }
         Ok(Self { config, layers })
     }
 
@@ -216,6 +268,11 @@ impl LoraAdapter {
     /// Call it after loading and before
     /// [`set_lora`](lattice_inference::model::qwen35::Qwen35Model::set_lora).
     /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for projection shape rules.
+    ///
+    /// Per-layer `a`/`b` buffer lengths are not re-checked here: [`Self::new`]
+    /// already rejects any layer whose buffers don't match its own
+    /// `rank`/`d_in`/`d_out`, and it's the only way to construct a
+    /// `LoraAdapter`, so every instance already satisfies that invariant.
     pub fn validate_against(
         &self,
         config: &lattice_inference::model::qwen35_config::Qwen35Config,
@@ -473,6 +530,57 @@ mod tests {
         assert!(unknown.is_empty());
     }
 
+    /// Regression for the #972 follow-up finding: a layer with *correct*
+    /// `d_in`/`d_out` (what `validate_against` checked before this fix) but
+    /// a short `a` buffer must still be rejected at construction, not admitted
+    /// to later panic (slice-out-of-bounds) inside `apply_lora`.
+    #[test]
+    fn test_new_rejects_a_buffer_shorter_than_rank_times_d_in() {
+        let config = LoraConfig {
+            rank: 4,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".into()],
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".into()),
+            LoraLayer {
+                a: vec![0.0; 4 * 8 - 1], // one element short of rank(4) * d_in(8)
+                b: vec![0.0; 8 * 4],
+                d_in: 8,
+                d_out: 8,
+                rank: 4,
+            },
+        );
+        let err = LoraAdapter::new(config, layers)
+            .expect_err("A buffer shorter than rank*d_in must be rejected");
+        assert!(err.to_string().contains("A buffer length"));
+    }
+
+    /// Same as above for `b`, the other operand `apply_lora` slices by rank.
+    #[test]
+    fn test_new_rejects_b_buffer_longer_than_d_out_times_rank() {
+        let config = LoraConfig {
+            rank: 4,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".into()],
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".into()),
+            LoraLayer {
+                a: vec![0.0; 4 * 8],
+                b: vec![0.0; 8 * 4 + 3], // padded beyond d_out(8) * rank(4)
+                d_in: 8,
+                d_out: 8,
+                rank: 4,
+            },
+        );
+        let err = LoraAdapter::new(config, layers)
+            .expect_err("B buffer longer than d_out*rank must be rejected");
+        assert!(err.to_string().contains("B buffer length"));
+    }
+
     #[cfg(feature = "inference-hook")]
     mod validate_against_tests {
         use super::*;
@@ -671,6 +779,51 @@ mod tests {
                 LoraHook::validate_against(&matching, &cfg).is_ok(),
                 "the LoraHook trait method must accept an adapter with correct dims"
             );
+        }
+
+        /// Regression for the #972 follow-up finding: a layer whose
+        /// projection dims exactly match a real Qwen3.5 model's `q_proj`
+        /// (the only thing `validate_against` checked before this fix) but
+        /// whose `a` buffer is short must be rejected before it can ever
+        /// reach `validate_against` (and hence `Qwen35Model::set_lora`,
+        /// which calls it — see `test_lora_hook_trait_validate_against_delegates_to_inherent_method`
+        /// above). `LoraAdapter::new` is the sole construction path, so
+        /// rejecting it there is equivalent to rejecting it at the
+        /// `set_lora` gate: the malformed adapter never becomes an
+        /// installable `LoraAdapter` value at all.
+        #[test]
+        fn test_new_rejects_malformed_buffer_matching_real_model_projection_dims() {
+            // Layer 3 is full-attention in `Qwen35Config::qwen35_0_8b()`;
+            // q_proj there expects d_in=hidden=1024, d_out=2*full_q_dim=4096
+            // (see `test_validate_against_correct_dims_passes` above).
+            let (layer_idx, module, d_in, d_out) = (3usize, "q_proj", 1024usize, 4096usize);
+            let rank = 4;
+
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec![module.to_string()],
+            };
+            let mut layers = HashMap::new();
+            layers.insert(
+                (layer_idx, module.to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * d_in - 1], // one short of rank*d_in
+                    b: vec![0.0; d_out * rank],
+                    d_in,
+                    d_out,
+                    rank,
+                },
+            );
+
+            let err = LoraAdapter::new(config, layers).expect_err(
+                "a malformed A buffer must be rejected at construction, even when \
+                 d_in/d_out exactly match a real model's projection shape",
+            );
+            assert!(err.to_string().contains("A buffer length"));
+
+            // No `LoraAdapter` value exists to pass to `validate_against` or
+            // `set_lora` — construction itself is the gate here.
         }
     }
 }
