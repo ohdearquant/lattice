@@ -1329,6 +1329,14 @@ const MTP_VERIFY_DEFAULT_SEED: u64 = 0x853c_49e6_748f_ea9b;
 ///   [`mtp_verify_draft`], the reverse of the lower-level [`rejection_sample_draft`], whose
 ///   own `seed=None` is intentionally clock-seeded for non-reproducible standalone use.
 ///
+/// # Temperature contract (#388 / ADR-050)
+///
+/// `temperature` is threaded straight through to [`rejection_sample_draft`]'s `p`/`q`
+/// softmax — pass the caller's `GenerateConfig.temperature` here so the acceptance ratio
+/// `min(1, p(x)/q(x))` is computed under the same distribution the target decoder actually
+/// samples from. Must be finite and `> 0`; `rejection_sample_draft` fails closed on
+/// `InvalidInput` otherwise.
+///
 /// # Errors
 ///
 /// On `Err`, the verifier and target caches (and GDN state) are restored to their
@@ -1344,6 +1352,7 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
     initial_target_logits: &[f32],
     eos_token: Option<u32>,
     target: &mut T,
+    temperature: f32,
     seed: Option<u64>,
 ) -> Result<MtpVerifyResult, crate::error::InferenceError> {
     // Degenerate path: draft_length < 2 — use normal greedy decode
@@ -1450,6 +1459,7 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
         initial_target_logits,
         &target_logits,
         false,
+        temperature,
         rejection_seed,
     ) {
         Ok(r) => r,
@@ -1521,6 +1531,10 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
 /// `None` means here. Callers that want to thread a caller-controlled seed (e.g. a
 /// `GenerateConfig.seed`) should call [`mtp_verify_draft_with_seed`] directly.
 ///
+/// `temperature` (ADR-050 `T`) is forwarded unchanged — pass the caller's
+/// `GenerateConfig.temperature` so the acceptance ratio is computed under the same
+/// distribution the target decoder samples from (#388).
+///
 /// Returns an [`MtpVerifyResult`] with accepted tokens, optional fallback, metrics,
 /// and properly rolled-back caches.
 ///
@@ -1539,6 +1553,7 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
     initial_target_logits: &[f32],
     eos_token: Option<u32>,
     target: &mut T,
+    temperature: f32,
 ) -> Result<MtpVerifyResult, crate::error::InferenceError> {
     mtp_verify_draft_with_seed(
         verifier,
@@ -1548,6 +1563,7 @@ pub fn mtp_verify_draft<T: MtpTargetVerifier>(
         initial_target_logits,
         eos_token,
         target,
+        temperature,
         None,
     )
 }
@@ -1733,6 +1749,30 @@ fn softmax_into(logits: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Compute stable softmax over `logits / temperature` into `out` (ADR-050).
+///
+/// `scratch` and `out` must have the same length as `logits`; `scratch` is
+/// overwritten with the temperature-scaled logits. `temperature == 1.0` skips
+/// the scaling pass entirely. `temperature` must already be validated finite
+/// and `> 0` by the caller — a non-positive divisor would sign-flip or NaN the
+/// scaled logits.
+fn softmax_into_temperature(
+    logits: &[f32],
+    temperature: f32,
+    scratch: &mut [f32],
+    out: &mut [f32],
+) {
+    if temperature == 1.0 {
+        softmax_into(logits, out);
+        return;
+    }
+    let inv = 1.0 / temperature;
+    for (s, &l) in scratch.iter_mut().zip(logits.iter()) {
+        *s = l * inv;
+    }
+    softmax_into(scratch, out);
+}
+
 /// Validate that a logit row is usable for probabilistic softmax sampling.
 ///
 /// The probabilistic path turns every logit row into a probability distribution
@@ -1877,18 +1917,20 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 /// `p_i(x_i)`, not `p_{i+1}(x_i)`).
 ///
 /// For each position `i`:
-/// - Compute `p[x_i]` (target probability under the position-`i` distribution)
-///   and `q[x_i]` (draft probability).
+/// - Compute `p[x_i] = softmax(target_logits_i / T)[x_i]` (target probability
+///   under the position-`i` distribution) and `q[x_i] = softmax(draft_logits_i /
+///   T)[x_i]` (draft probability), per ADR-050.
 /// - Accept `x_i` with probability `min(1, p[x_i] / q[x_i])`.
 /// - On rejection, sample the bonus token from the adjusted distribution
 ///   `norm(max(0, p - q))`, which exactly recovers the target distribution.
 /// - After all tokens accepted, sample one bonus token from
-///   `softmax(target_logits[n - 1])` — the target's prediction for the position
-///   after the last accepted draft token.
+///   `softmax(target_logits[n - 1] / T)` — the target's prediction for the
+///   position after the last accepted draft token.
 ///
 /// When `greedy` is `true` (temperature = 0 / top_k = 1), the function skips
 /// probability computation entirely and falls back to argmax comparison, which is
 /// strictly faster and produces the same result as the standard greedy verifier.
+/// `temperature` is ignored in that case (argmax is invariant to positive scaling).
 ///
 /// # Arguments
 ///
@@ -1903,6 +1945,9 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 ///   i.e. the distribution over what comes *after* position `i`. Slot `n - 1` is
 ///   used for the bonus token on full acceptance, never for verification.
 /// - `greedy`: when `true`, use argmax comparison instead of probabilistic sampling.
+/// - `temperature`: sampling temperature (ADR-050 `T`) applied to both `p` and `q`
+///   before softmax in the probabilistic path. Must be finite and `> 0` when
+///   `greedy == false`; ignored when `greedy == true`.
 /// - `seed`: PRNG seed for reproducibility; pass `None` for non-deterministic.
 ///
 /// # Errors
@@ -1914,12 +1959,14 @@ fn sample_adjusted(p: &[f32], q: &[f32], r: f32) -> usize {
 ///   `&[]` (the argument is unused).
 /// - `initial_target_logits` is empty or has a vocabulary size that disagrees
 ///   with `target_logits` / `draft_logits` rows.
+/// - `temperature` is non-finite or `<= 0.0` — checked only when `greedy == false`.
 pub fn rejection_sample_draft(
     draft_tokens: &[u32],
     draft_logits: &[Vec<f32>],
     initial_target_logits: &[f32],
     target_logits: &[Vec<f32>],
     greedy: bool,
+    temperature: f32,
     seed: Option<u64>,
 ) -> Result<RejectionSampleResult, crate::error::InferenceError> {
     use crate::error::InferenceError;
@@ -1986,6 +2033,15 @@ pub fn rejection_sample_draft(
         for (i, dl) in draft_logits.iter().enumerate() {
             validate_probabilistic_logits(&format!("draft_logits[{i}]"), dl)?;
         }
+        // ADR-050 defines T as a caller-provided divisor of both p and q's logits;
+        // a non-finite or non-positive T would poison every softmax (NaN, or a
+        // negative-T sign flip that turns the max logit into the min), so fail
+        // closed rather than silently substituting some other value (#388).
+        if !temperature.is_finite() || temperature <= 0.0 {
+            return Err(InferenceError::InvalidInput(format!(
+                "probabilistic rejection sampling requires a finite temperature > 0, got {temperature}"
+            )));
+        }
     }
 
     // For verifying `draft_tokens[i]`, pick the target distribution at position
@@ -2037,9 +2093,11 @@ pub fn rejection_sample_draft(
         None => SpecRng::from_clock(),
     };
 
-    // Pre-allocate probability buffers for reuse across positions.
+    // Pre-allocate probability buffers for reuse across positions. `scaled` is
+    // scratch space for `softmax_into_temperature`'s temperature-divided logits.
     let mut p_buf = vec![0.0f32; vocab];
     let mut q_buf = vec![0.0f32; vocab];
+    let mut scaled = vec![0.0f32; vocab];
 
     let mut accepted_tokens: Vec<u32> = Vec::with_capacity(n);
     let mut had_rejection = false;
@@ -2053,8 +2111,8 @@ pub fn rejection_sample_draft(
             )));
         }
 
-        softmax_into(target_dist_for(i), &mut p_buf);
-        softmax_into(&draft_logits[i], &mut q_buf);
+        softmax_into_temperature(target_dist_for(i), temperature, &mut scaled, &mut p_buf);
+        softmax_into_temperature(&draft_logits[i], temperature, &mut scaled, &mut q_buf);
 
         let p_x = p_buf[tok];
         let q_x = q_buf[tok];
@@ -2089,7 +2147,12 @@ pub fn rejection_sample_draft(
     } else {
         let r = rng.next_f32();
         // Use target_logits[n-1] — the distribution over what comes after draft[n-1].
-        softmax_into(target_logits.last().expect("n > 0"), &mut p_buf);
+        softmax_into_temperature(
+            target_logits.last().expect("n > 0"),
+            temperature,
+            &mut scaled,
+            &mut p_buf,
+        );
         // Weighted sample from the full target distribution.
         let mut cumsum = 0.0f32;
         let mut sampled = argmax(target_logits.last().expect("n > 0")) as u32;
@@ -3186,7 +3249,8 @@ mod tests {
     #[test]
     fn rejection_empty_draft_returns_no_bonus() {
         let result =
-            rejection_sample_draft(&[], &[], &uniform_logits(8), &[], false, Some(42)).unwrap();
+            rejection_sample_draft(&[], &[], &uniform_logits(8), &[], false, 1.0, Some(42))
+                .unwrap();
         assert_eq!(result.accepted_count, 0);
         assert!(result.accepted_tokens.is_empty());
         assert_eq!(result.bonus_token, None);
@@ -3197,7 +3261,7 @@ mod tests {
     fn rejection_mismatched_lengths_returns_error() {
         let logits = vec![peaked_logits(10, 3, 5.0)];
         let initial = uniform_logits(10);
-        let err = rejection_sample_draft(&[3], &logits, &initial, &[], false, Some(1));
+        let err = rejection_sample_draft(&[3], &logits, &initial, &[], false, 1.0, Some(1));
         assert!(err.is_err());
     }
 
@@ -3245,6 +3309,7 @@ mod tests {
                 &initial_target,
                 &[peaked_logits(VOCAB, 2, 5.0)],
                 false,
+                1.0,
                 Some(7),
             )
             .expect_err(&format!(
@@ -3266,6 +3331,7 @@ mod tests {
             &nan_target,
             &[peaked_logits(VOCAB, 2, 5.0)],
             true,
+            1.0,
             Some(7),
         );
         assert!(
@@ -3283,6 +3349,7 @@ mod tests {
             &peaked_with_neg_inf,
             &[peaked_with_neg_inf.clone()],
             false,
+            1.0,
             Some(7),
         );
         assert!(
@@ -3311,6 +3378,7 @@ mod tests {
                 &initial_target,
                 &target_logits,
                 false,
+                1.0,
                 Some(seed),
             )
             .unwrap();
@@ -3351,6 +3419,7 @@ mod tests {
                 &initial_target,
                 &target_logits,
                 false,
+                1.0,
                 Some(seed),
             )
             .unwrap();
@@ -3395,6 +3464,7 @@ mod tests {
             &initial_target,
             &target_logits,
             true,
+            1.0,
             Some(1),
         )
         .unwrap();
@@ -3433,6 +3503,7 @@ mod tests {
             &initial_target,
             &target_logits,
             true,
+            1.0,
             Some(7),
         )
         .unwrap();
@@ -3459,6 +3530,7 @@ mod tests {
             &target_logit,
             std::slice::from_ref(&target_logit),
             false,
+            1.0,
             Some(99),
         )
         .unwrap();
@@ -3487,6 +3559,7 @@ mod tests {
             &initial_target,
             &target_logits,
             false,
+            1.0,
             Some(0),
         )
         .unwrap();
@@ -3562,6 +3635,7 @@ mod tests {
             &initial_target,
             &target_logits,
             false,
+            1.0,
             Some(7),
         )
         .unwrap();
@@ -3605,6 +3679,7 @@ mod tests {
                 &initial_target,
                 &target_logits,
                 false,
+                1.0,
                 Some(2024),
             )
             .unwrap()
@@ -3624,6 +3699,113 @@ mod tests {
         assert_eq!(
             first.bonus_token, second.bonus_token,
             "same seed must reproduce the same bonus_token"
+        );
+    }
+
+    /// #388 regression: the probabilistic path must compute `p`/`q` under the
+    /// caller-provided `temperature` (ADR-050), not a hardcoded `T = 1.0`. Uses a
+    /// 2-token vocab where token 1's accept probability `min(1, p(x)/q(x))` is a
+    /// genuinely fractional (non-clamped) value at both `T = 1.0` and `T = 4.0`,
+    /// and — because temperature scaling changes softmax sharpness non-uniformly —
+    /// the two accept probabilities differ. Both runs share the same seed, so the
+    /// RNG's first draw `u` is identical between them; the test scans seeds for one
+    /// where `u` lands strictly between the two accept probabilities, producing a
+    /// different accept/reject decision. If `temperature` is ever ignored (silently
+    /// hardcoded to `1.0` downstream, the #388 bug), both calls compute the exact
+    /// same `accept_prob` for every seed and `accepted_count` can never diverge —
+    /// this test is expected to fail under that mutation.
+    #[test]
+    fn rejection_sample_draft_temperature_changes_acceptance_decision() {
+        let draft_tokens = vec![1u32];
+        let draft_logits = vec![vec![0.0f32, 2.0]];
+        let target_logits = vec![vec![0.0f32, 0.5]];
+        let initial_target = vec![0.0f32, 0.5];
+
+        let run_at = |temperature: f32, seed: u64| {
+            rejection_sample_draft(
+                &draft_tokens,
+                &draft_logits,
+                &initial_target,
+                &target_logits,
+                false,
+                temperature,
+                Some(seed),
+            )
+            .unwrap()
+        };
+
+        // `SpecRng` is a raw xorshift64 seeded directly with `seed` and no avalanche,
+        // so small sequential seeds (0, 1, 2, …) all produce a near-zero *first* draw —
+        // and with a single draft token that first `next_f32()` is the decision-critical
+        // `u`. Scanning raw 0..200 therefore only ever samples `u ≈ 0`, which accepts at
+        // both temperatures and never lands in the accept-probability gap, so spread the
+        // seed across the u64 range (golden-ratio multiply) to sample `u` uniformly.
+        let mut saw_divergence = false;
+        for k in 0u64..200 {
+            let seed = k.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let low_t = run_at(1.0, seed);
+            let high_t = run_at(4.0, seed);
+            if low_t.accepted_count != high_t.accepted_count {
+                saw_divergence = true;
+                break;
+            }
+        }
+        assert!(
+            saw_divergence,
+            "varying temperature (T=1.0 vs T=4.0) with identical logits and seed must be \
+             able to flip the accept/reject decision — otherwise temperature is not reaching \
+             the p/q softmax (ADR-050 / #388)"
+        );
+    }
+
+    /// #388 regression: `mtp_verify_draft_with_seed` must forward its `temperature`
+    /// argument through to `rejection_sample_draft`'s `p`/`q` softmax rather than a
+    /// caller reverting just the plumbing (e.g. hardcoding `1.0` at the internal call
+    /// site) while `rejection_sample_draft` itself stays correct. Reuses
+    /// `probe_half_accept_prob_scenario`, whose two drafted positions are constructed
+    /// with a genuinely fractional (non one-hot) accept probability of exactly 0.5 at
+    /// `T = 1.0` — a non-degenerate distribution whose accept probability generically
+    /// changes under a different temperature. Scans seeds for one where the two
+    /// temperatures' `accepted_count` diverge; if the wrapper drops `temperature` on
+    /// the floor, every seed's outcome is identical between the two calls and the test
+    /// fails.
+    #[test]
+    fn mtp_verify_draft_with_seed_threads_temperature() {
+        let max_seq = 8usize;
+
+        let run_at = |temperature: f32, seed: u64| {
+            let s = probe_half_accept_prob_scenario();
+            let mut target = s.target;
+            let mut verifier =
+                MtpVerifier::new(s.cfg, &s.weights, &s.embed, &s.lm_head, max_seq).unwrap();
+            mtp_verify_draft_with_seed(
+                &mut verifier,
+                s.current_token_id,
+                s.current_position,
+                &s.prev_hidden,
+                &s.initial_target,
+                None,
+                &mut target,
+                temperature,
+                Some(seed),
+            )
+            .unwrap()
+        };
+
+        let mut saw_divergence = false;
+        for seed in 0u64..200 {
+            let low_t = run_at(1.0, seed);
+            let high_t = run_at(5.0, seed);
+            if low_t.accepted_count != high_t.accepted_count {
+                saw_divergence = true;
+                break;
+            }
+        }
+        assert!(
+            saw_divergence,
+            "varying temperature (T=1.0 vs T=5.0) through mtp_verify_draft_with_seed must be \
+             able to flip at least one seed's accept/reject decision — otherwise the wrapper \
+             is not forwarding temperature into rejection_sample_draft (#388)"
         );
     }
 
@@ -3693,6 +3875,7 @@ mod tests {
             &draft.logits[0],
             None,
             &mut target,
+            1.0,
         )
         .unwrap();
 
@@ -3846,6 +4029,7 @@ mod tests {
                 &s.initial_target,
                 None,
                 &mut target,
+                1.0,
                 Some(seed),
             )
             .unwrap()
@@ -3902,6 +4086,7 @@ mod tests {
                 &s.initial_target,
                 None,
                 &mut target,
+                1.0,
             )
             .unwrap()
         };
@@ -3945,6 +4130,7 @@ mod tests {
             &s1.initial_target,
             None,
             &mut target,
+            1.0,
             Some(1),
         );
         assert!(with_seed_a.is_ok(), "seed_a run must complete successfully");
@@ -3962,6 +4148,7 @@ mod tests {
             &s2.initial_target,
             None,
             &mut target,
+            1.0,
             Some(2),
         );
         assert!(with_seed_b.is_ok(), "seed_b run must complete successfully");
@@ -3983,6 +4170,7 @@ mod tests {
             &p_peak_1,
             &[p_peak_1.clone()],
             false,
+            1.0,
             Some(13),
         )
         .unwrap();
@@ -4018,6 +4206,7 @@ mod tests {
             &peak0,
             &[peak1.clone(), p_peak_5.clone(), bonus_peak_6.clone()],
             false,
+            1.0,
             Some(0),
         )
         .unwrap();
@@ -4112,6 +4301,7 @@ mod tests {
             &initial_target,
             &target_logits,
             true,
+            1.0,
             Some(1),
         )
         .unwrap();
@@ -4143,9 +4333,16 @@ mod tests {
         let target_logits = vec![peaked_logits(VOCAB, 11, 6.0)]; // full-accept bonus = 11
 
         // Accept: draft token == initial_target argmax (4) → accept, bonus = 11.
-        let accept =
-            rejection_sample_draft(&[4u32], &[], &initial_target, &target_logits, true, None)
-                .unwrap();
+        let accept = rejection_sample_draft(
+            &[4u32],
+            &[],
+            &initial_target,
+            &target_logits,
+            true,
+            1.0,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             accept.accepted_count, 1,
             "draft == initial argmax → accepted"
@@ -4158,9 +4355,16 @@ mod tests {
         );
 
         // Reject: draft token (7) != initial_target argmax (4) → reject, bonus = 4.
-        let reject =
-            rejection_sample_draft(&[7u32], &[], &initial_target, &target_logits, true, None)
-                .unwrap();
+        let reject = rejection_sample_draft(
+            &[7u32],
+            &[],
+            &initial_target,
+            &target_logits,
+            true,
+            1.0,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             reject.accepted_count, 0,
             "draft != initial argmax → rejected"

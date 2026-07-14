@@ -8300,12 +8300,17 @@ mod inner {
                 //   draft_logits          = [draft.logits]        (ignored in greedy mode)
                 //   initial_target_logits = verify_out.logits[0]  (predicts draft position)
                 //   target_logits         = [verify_out.logits[1]] (bonus on full accept)
+                // temperature is ignored on the greedy=true path (argmax is invariant to
+                // positive scaling), so any finite positive placeholder is safe here —
+                // this loop is entered only when gen_cfg.temperature <= 0.0 (see comment
+                // above), so the real config value cannot satisfy `> 0` validation anyway.
                 let Ok(rs) = crate::speculative::rejection_sample_draft(
                     &[draft.token_id],
                     std::slice::from_ref(&draft.logits),
                     &verify_out.logits[0],
                     std::slice::from_ref(&verify_out.logits[1]),
                     true,
+                    1.0,
                     None,
                 ) else {
                     // Fallback: accept pending, advance normally.
