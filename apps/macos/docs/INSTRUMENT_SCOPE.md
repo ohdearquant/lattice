@@ -39,7 +39,7 @@ processes, parses their output, and renders live readouts.
 | Screens/ | TrainScreen.swift | LoRA fine-tune config + live oscilloscope + control strip | EXISTS |
 | Screens/ | QuantizeScreen.swift | Q4 / QuaRot config + layer progress + mass comparison | EXISTS |
 | Screens/ | ModelsScreen.swift | Model DataTable + inspector + action row (Train/Quantize/Chat→) | EXISTS |
-| Screens/ | ChatScreen.swift | Config strip + single-variant transcript + generate_lora subprocess | PARTIAL |
+| Screens/ | ChatScreen.swift | Model/backend config + multi-turn transcript; persistent GPU chat, one-shot CPU chat | PARTIAL |
 | Screens/ | DataScreen.swift | Source dir scan, .jsonl inspector, builder-script copy buttons | EXISTS |
 | Screens/ | RunsScreen.swift | Run archive DataTable + live banner + inspector | EXISTS |
 | Screens/ | ScreenScaffold.swift | Shared header chrome (index / title / subtitle / trailing slot) | EXISTS |
@@ -47,7 +47,7 @@ processes, parses their output, and renders live readouts.
 | Components/ | StripChart.swift | Swift Charts oscilloscope: LineMark + AreaMark + scrub-to-freeze | EXISTS |
 | Components/ | HeroNumber.swift | 56pt tabular-mono hero with .contentTransition(.numericText()) | EXISTS |
 | Components/ | GatePill.swift | PASS/WARN/FAIL/RUN verdict pill, 6px radius, animated pulse on RUN | EXISTS |
-| Components/ | FaderToggle.swift | Console spring-fader for binary mode choices (Q4↔QuaRot, BASE↔+ADAPTER) | EXISTS |
+| Components/ | FaderToggle.swift | Unwired BASE↔+ADAPTER console fader; instantiated only by its SwiftUI preview | PARTIAL |
 | Components/ | ReadoutWell.swift | 15pt tabular-mono well: label + value + unit + delta caret | EXISTS |
 | Components/ | OpaquePanel.swift | Instrument panel surface (opaque, 1px hairline, 0px radius) + well surface | EXISTS |
 | Components/ | ParamRow.swift | Config param row variants used in TrainScreen/QuantizeScreen | EXISTS |
@@ -64,14 +64,15 @@ AppStore (@Observable @MainActor)
   ├── selection: Screen                    current nav screen
   ├── models: [ModelInfo]                  discovered on disk
   ├── runs: [RunRecord]                    JSON-persisted archive
-  ├── liveRun: LiveRun?                    the one active subprocess run
+  ├── liveRun: LiveRun?                    the one active logical run
   ├── workingModel: ModelInfo?             explicit cross-screen target
-  ├── handle: RunHandle?                   the one live Process wrapper
+  ├── handle: RunHandle?                   one-shot Process wrapper
+  ├── chatSessionHandle: RunHandle?        persistent GPU chat_metal --serve process
   └── binariesReady: Bool                  prebuilt .lattice binary present
 ```
 
-Only one subprocess runs at a time. `AppStore.launch()` calls `prior.stop()` before starting
-a new one (AppStore.swift line 108).
+`AppStore.launch()` replaces the prior one-shot process. GPU chat uses a separate persistent
+`chat_metal --json --serve` handle so the selected model can remain resident between turns.
 
 ### 2.3 What Works Today
 
@@ -85,7 +86,9 @@ a new one (AppStore.swift line 108).
 - DataScreen: .jsonl scan, summary stats, 5-example preview, builder-script copy buttons.
 - RunsScreen: persistent run archive (Application Support/LatticeStudio/runs.json), live banner.
 - CommandBar: ⌘K palette with 7 commands, fuzzy match.
-- ChatScreen config strip and transcript: functional for single-variant generation.
+- ChatScreen model/backend config and multi-turn transcript: functional for single-variant
+  generation. Completed turns are replayed in each prompt; GPU chat keeps the model resident,
+  while CPU chat launches a fresh process per turn.
 
 ---
 
@@ -112,6 +115,10 @@ AppStore.launch(bin, args)
 
 `Source: LatticeBridge.swift (RunHandle class) + AppStore.swift lines 96-120`
 
+CPU chat follows this one-shot launch path through `generate_lora`. GPU chat instead starts or
+reuses a `chat_metal --json --serve` process and writes one JSON request per turn to its stdin;
+the model remains resident, but the request still contains the full replayed conversation prompt.
+
 ### 3.2 Binary Path Resolution
 
 Resolution order (LatticeBridge.swift `launchSpec`):
@@ -123,7 +130,7 @@ Resolution order (LatticeBridge.swift `launchSpec`):
 
 `Source: LatticeBridge.swift + apps/macos/DISTRIBUTION.md`
 
-### 3.3 Bundled Binaries (6)
+### 3.3 Bundled Binaries (10)
 
 Defined in `apps/macos/scripts/package-app.sh`:
 
@@ -135,6 +142,10 @@ Defined in `apps/macos/scripts/package-app.sh`:
 | `qwen35_generate` | lattice-inference | (none) | Qwen3.5 generation |
 | `train_grad_full` | lattice-tune | `train-backward` | LoRA fine-tune |
 | `generate_lora` | lattice-tune | `safetensors,inference-hook` | LoRA chat generation |
+| `eval_perplexity` | lattice-inference | `f16,metal-gpu` | CPU BF16 and Metal Q4/QuaRot perplexity evaluation |
+| `embed` | lattice-embed | default | embedding CLI |
+| `chat_metal` | lattice-inference | `f16,metal-gpu` | persistent Metal chat session |
+| `lattice_serve` | lattice-inference | `f16,metal-gpu` | OpenAI-format HTTP daemon |
 
 ### 3.4 Event Protocol
 
@@ -207,14 +218,17 @@ the current binary (train_grad_full.rs line 743).
 --model-dir <PATH>
 --output-dir <PATH>
 --dry-run               (Q4 and QuaRot)
---seed <U64>            (QuaRot only, default 0xC0FFEE)
+--seed <U64>            (QuaRot only; required by the binary)
 ```
+
+The macOS `QuantConfig` wrapper always supplies this required flag, inserting `0xC0FFEE` when
+the UI leaves the seed unset. Direct `quantize_quarot` callers must choose and pass a seed.
 
 ### 3.6 ASCII Architecture Diagram
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                 LatticeStudio.app                   │
+│                    Lattice.app                      │
 │                                                     │
 │  ┌──────────┐    ┌───────────┐    ┌─────────────┐  │
 │  │ AppStore │←─→ │ LiveRun   │←── │ SwiftUI     │  │
@@ -247,6 +261,10 @@ the current binary (train_grad_full.rs line 743).
 │  quantize_quarot   (lattice-inference)           │
 │  lattice           (lattice-inference)           │
 │  qwen35_generate   (lattice-inference)           │
+│  eval_perplexity   (lattice-inference +Metal)    │
+│  embed             (lattice-embed)               │
+│  chat_metal        (lattice-inference +Metal)    │
+│  lattice_serve     (lattice-inference +Metal)    │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -309,15 +327,16 @@ the current binary (train_grad_full.rs line 743).
 
 | Feature | State | Notes |
 |---------|-------|-------|
-| Config strip (model + adapter pickers) | EXISTS | |
-| FaderToggle BASE↔+ADAPTER | EXISTS | changes adapterPath in next GenConfig only |
+| Config strip (model + CPU/GPU picker) | EXISTS | |
+| Adapter picker / FaderToggle | MISSING | `FaderToggle` is preview-only; live `GenConfig.adapterPath` is nil |
 | Sampling params (temperature, max-tokens, seed) | EXISTS | |
-| Single-variant transcript | EXISTS | ChatTurn model; streaming via genText accumulation |
-| generate_lora subprocess + `--json` | EXISTS | GenConfig → AppStore.runGenerate() |
+| Single-variant multi-turn transcript | EXISTS | `renderChatML` replays completed `ChatTurn` pairs into each prompt |
+| GPU `chat_metal --json --serve` session | EXISTS | one persistent process keeps the selected model resident |
+| CPU `generate_lora --json` subprocess | EXISTS | one fresh process per turn via `AppStore.runGenerate()` |
 | Streaming gen_token events | EXISTS | onChange on store.liveRun?.genText accumulates deltas |
 | Non-streaming fallback | EXISTS | filters log lines for non-"$ " prefix |
-| True A/B lockstep streaming | MISSING | FaderToggle flip is manual; two parallel subprocesses never run; "0 ms reload" text is hardcoded UI label (FaderToggle.swift line 137) |
-| Conversation history (multi-turn) | MISSING | each submission is a fresh subprocess invocation; no history passed |
+| True A/B lockstep streaming | MISSING | each send dispatches one backend run; no production adapter control is wired |
+| Conversation history (multi-turn) | EXISTS | completed turns are prompt-replayed; there is no cross-turn KV prefix cache |
 | Adapter hot-swap mid-conversation | MISSING | DESIGN.md arc_swap/LiveModel references are aspirational; no engine API exists |
 
 ---
@@ -326,11 +345,9 @@ the current binary (train_grad_full.rs line 743).
 
 ### G1 — No true A/B side-by-side (MISSING, HIGH)
 
-`ChatScreen.swift` comment: "We do NOT auto-run both variants — manual flip+resend is the v1
-A/B story." The FaderToggle label "0 ms reload" is hardcoded text (FaderToggle.swift line 137),
-not a live measurement. Running base and adapter in parallel requires two simultaneous `RunHandle`
-instances and a side-by-side transcript view. AppStore currently enforces one active run at a
-time (AppStore.swift line 108: `prior.stop()`).
+`ChatScreen` does not instantiate `FaderToggle`; its warm/send `GenConfig` construction sites pass
+a nil adapter path, and each send dispatches exactly one backend run. Running base and adapter in
+parallel still requires two independently tracked runs and a side-by-side transcript view.
 
 ### G2 — quantize bins have no `--json` (STRUCTURAL, HIGH)
 
@@ -347,11 +364,11 @@ parser silently degrades to `.status` passthrough.
 adapter file size and name only. Users cannot distinguish a rank-4 from a rank-64 adapter in
 the UI without inspecting the file manually.
 
-### G4 — Multi-turn conversation not supported (MISSING, MEDIUM)
+### G4 — Conversation history is prompt-replayed, not KV-cached (LIMITATION, MEDIUM)
 
-Each chat generation is a fresh subprocess invocation with a single `--prompt` string. There is
-no mechanism to pass prior turns to `generate_lora`. The binary interface has no `--history`
-flag.
+`ChatScreen.renderChatML` serializes completed user/assistant turns into every new prompt. GPU chat
+keeps a `chat_metal --serve` model process resident, while CPU chat starts `generate_lora` once per
+turn. Neither path retains a cross-turn KV prefix cache, so prior context is re-prefilled.
 
 ### G5 — Token count is approximate (MEDIUM)
 
@@ -413,10 +430,9 @@ Files: `LatticeBridge.swift` (`discoverAdapters` function only).
 Lift the single-run constraint for the Chat surface. Add `handle2: RunHandle?` and
 `liveRun2: LiveRun?` to AppStore (or introduce a `ChatSession` model that holds two
 `(RunHandle, LiveRun)` pairs). ChatScreen renders an HSplitView with two transcript columns.
-The FaderToggle becomes a "run both" trigger. The "0 ms reload" hardcoded label in
-FaderToggle.swift line 137 becomes a real measurement from the time between the two
-`gen_token done` events. This requires the binary to support a stable `--json` streaming
-interface (already true for generate_lora).
+Wire the currently preview-only `FaderToggle` as a "run both" trigger and report a real timing
+measurement from the two `gen_token done` events. This requires the binary to support a stable
+`--json` streaming interface (already true for `generate_lora`).
 
 Files: `AppStore.swift`, `ChatScreen.swift`, `FaderToggle.swift`, `DomainModels.swift`.
 
