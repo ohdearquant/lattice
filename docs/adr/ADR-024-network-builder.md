@@ -18,7 +18,7 @@ A fluent `NetworkBuilder` struct with consuming builder methods. The build step 
 
 #### Fluent API with Consuming Methods
 
-All builder methods take and return `Self` by value. This enables method chaining without holding a mutable reference and makes partial builders inexpressible at runtime (an `input(...)` call must precede any `hidden`/`output` call, enforced by the `input_size: Option<usize>` field).
+All builder methods take and return `Self` by value. This enables method chaining without holding a mutable reference. Partial builders remain representable: `hidden()` and `output()` may be called before `input()` because they append to the layer list independently of `input_size`. The `build()` and `build_with_seed()` methods require an input size and at least one layer, regardless of the order in which those values were supplied.
 
 ```
 NetworkBuilder::new()

@@ -1,9 +1,9 @@
 //! GPU compute backend: contexts, pooled memory, WGSL pipelines, and dense inference.
 //!
 //! CPU selection uses a 10,000 effective-element threshold; activation policy uses 1,000.
-//! Keep each dispatch at or below 100,000 elements to retain 1.5 ms headroom beneath Metal's
-//! 2 ms watchdog. Apple Silicon uses 256-byte pool-buffer alignment and 32-thread matmul /
-//! 256-thread element-wise workgroups. See ADR-025 and `docs/gpu.md`.
+//! Layers above the static 100,000-element dispatch heuristic fall back to CPU; dispatch time
+//! is not measured at runtime. Apple Silicon uses 256-byte pool-buffer alignment and 32-thread
+//! matmul / 256-thread element-wise workgroups. See ADR-025 and `docs/gpu.md`.
 
 mod buffer;
 mod circuit_breaker;
@@ -28,9 +28,9 @@ pub mod thresholds {
     pub const BATCH_MIN_SIZE: usize = 100;
     /// Minimum elements for GPU activation function benefit
     pub const ACTIVATION_MIN_ELEMENTS: usize = 1_000;
-    /// Max elements per dispatch to avoid Metal watchdog (2ms limit)
+    /// Static element cap that triggers CPU fallback for oversized layers
     pub const MAX_ELEMENTS_PER_DISPATCH: usize = 100_000;
-    /// Metal dispatch time headroom (stay under 2ms watchdog)
+    /// Documentation target only; dispatch time is not measured at runtime
     pub const MAX_DISPATCH_TIME_MS: f32 = 1.5;
 }
 
