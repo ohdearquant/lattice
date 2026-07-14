@@ -2612,11 +2612,11 @@ mod tests {
     /// Regression for issue #931: the built-in `json_string` rule used to
     /// accept any raw byte (including the C0 control range) unescaped, and
     /// any `\` followed by any byte as a valid escape. Both gaps let the
-    /// grammar accept output a strict RFC 8259 parser rejects. Verified red
-    /// on the unfixed code: the raw 0x07 case, the `\q` case, and the
-    /// truncated `\u12"` case all accepted before this fix (the escape
-    /// alternative was `'\\' + Symbol::AnyByte`, and the plain-byte
-    /// alternative ranged over all of `0u8..=255`).
+    /// grammar accept output a strict RFC 8259 parser rejects. Before this
+    /// fix the escape alternative was `'\\' + Symbol::AnyByte` and the
+    /// plain-byte alternative ranged over all of `0u8..=255`, so the raw
+    /// 0x07 case, the `\q` case, and the truncated `\u12"` case were all
+    /// accepted.
     #[test]
     fn string_rejects_raw_control_byte() {
         let g = compile_ok(r#"{"type":"string"}"#);
@@ -2632,17 +2632,15 @@ mod tests {
     }
 
     #[test]
-    fn string_rejects_truncated_unicode_escape() {
+    fn string_rejects_malformed_unicode_escape() {
         let g = compile_ok(r#"{"type":"string"}"#);
-        // `\u12` followed directly by the closing quote is only two hex
-        // digits; `\u` requires exactly four.
+        // `\u` requires exactly four hex digits. Two- and three-digit runs
+        // (closed by the quote) and a non-hex digit anywhere in the run must
+        // all reject; a mutation that accepted three digits or any byte would
+        // slip through `\u123` or `\u12g4` respectively.
         assert!(rejects(&g, b"\"\\u12\""));
-    }
-
-    #[test]
-    fn string_accepts_plain_ascii() {
-        let g = compile_ok(r#"{"type":"string"}"#);
-        assert!(accepts(&g, b"\"A\""));
+        assert!(rejects(&g, b"\"\\u123\""));
+        assert!(rejects(&g, b"\"\\u12g4\""));
     }
 
     #[test]
@@ -2759,6 +2757,10 @@ mod tests {
         assert!(accepts(&g, b"\"\\r\""));
         assert!(accepts(&g, b"\"\\t\""));
         assert!(accepts(&g, b"\"\\u0041\""));
+        // Surrogate-pair halves are syntactically valid `\uXXXX` per the
+        // RFC 8259 ABNF, even though unpaired they are not interoperable text.
+        assert!(accepts(&g, b"\"\\uD800\""));
+        assert!(accepts(&g, b"\"\\uDC00\""));
     }
 
     #[test]
