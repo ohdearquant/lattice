@@ -1519,23 +1519,174 @@ fn register_builtins(b: &mut GrammarBuilder) {
     b.set_alts(ws_id, vec![vec![Symbol::NonTerminal(ws_tail)]]);
 
     // json_string = '"' string_inner '"'
-    // string_inner = char* where char = any byte except '"' and '\'
-    //   plus '\\' followed by any byte (simplified escape handling).
+    // string_inner = char* where char is one of:
+    //   - an unescaped ASCII byte 0x20-0x7F excluding '"' and '\' (RFC 8259
+    //     requires the control range U+0000-U+001F to be escaped)
+    //   - a well-formed multi-byte UTF-8 sequence (2/3/4 bytes, restricted to
+    //     the valid lead/continuation ranges from the Unicode UTF-8 table,
+    //     issue #931)
+    //   - a legal RFC 8259 escape: \" \\ \/ \b \f \n \r \t, or \u followed by
+    //     exactly four hex digits.
     let str_id = b.reserve("json_string");
     let str_inner_id = b.reserve("json_string_inner");
     let str_char_id = b.reserve("json_string_char");
 
-    // json_string_char: any byte except '"' (0x22) and '\' (0x5c),
-    // or '\' followed by any byte.
+    // UTF-8 continuation byte: 0x80-0xBF.
+    let cont_id = b.reserve("json_utf8_cont");
+    b.set_alts(
+        cont_id,
+        (0x80u8..=0xBF)
+            .map(|byte| vec![Symbol::Terminal(byte)])
+            .collect(),
+    );
+
+    // Hex digit for \uXXXX escapes: 0-9, A-F, a-f.
+    let hex_id = b.reserve("json_hex_digit");
+    let hex_alts: Vec<Alt> = (b'0'..=b'9')
+        .chain(b'A'..=b'F')
+        .chain(b'a'..=b'f')
+        .map(|byte| vec![Symbol::Terminal(byte)])
+        .collect();
+    b.set_alts(hex_id, hex_alts);
+
+    // Legal escape body (the byte(s) following '\').
+    let escape_id = b.reserve("json_escape");
+    let mut escape_alts: Vec<Alt> = vec![
+        vec![Symbol::Terminal(b'"')],
+        vec![Symbol::Terminal(b'\\')],
+        vec![Symbol::Terminal(b'/')],
+        vec![Symbol::Terminal(b'b')],
+        vec![Symbol::Terminal(b'f')],
+        vec![Symbol::Terminal(b'n')],
+        vec![Symbol::Terminal(b'r')],
+        vec![Symbol::Terminal(b't')],
+    ];
+    escape_alts.push(vec![
+        Symbol::Terminal(b'u'),
+        Symbol::NonTerminal(hex_id),
+        Symbol::NonTerminal(hex_id),
+        Symbol::NonTerminal(hex_id),
+        Symbol::NonTerminal(hex_id),
+    ]);
+    b.set_alts(escape_id, escape_alts);
+
     let mut char_alts: Vec<Alt> = Vec::new();
-    // Escape sequence: '\' + any byte
-    char_alts.push(vec![Symbol::Terminal(b'\\'), Symbol::AnyByte]);
-    // Normal chars: all bytes except '"' (0x22) and '\' (0x5c)
-    for byte in 0u8..=255 {
+
+    // Escape sequence: '\' + a legal escape body.
+    char_alts.push(vec![
+        Symbol::Terminal(b'\\'),
+        Symbol::NonTerminal(escape_id),
+    ]);
+
+    // Unescaped ASCII: 0x20-0x7F excluding '"' (0x22) and '\' (0x5c). Bytes
+    // 0x00-0x1F are the RFC 8259 control range and MUST be escaped.
+    for byte in 0x20u8..=0x7F {
         if byte != b'"' && byte != b'\\' {
             char_alts.push(vec![Symbol::Terminal(byte)]);
         }
     }
+
+    // Well-formed 2-byte UTF-8: lead 0xC2-0xDF (0xC0-0xC1 would be an
+    // overlong encoding of a 1-byte code point) + one continuation byte.
+    // Each lead byte here is a distinct literal, so there is no shared-prefix
+    // ambiguity among these alternatives (see the note on `e0_second_id`
+    // below for why that distinction matters on this PDA).
+    for lead in 0xC2u8..=0xDF {
+        char_alts.push(vec![Symbol::Terminal(lead), Symbol::NonTerminal(cont_id)]);
+    }
+
+    // Well-formed 3-byte UTF-8 (Unicode Table 3-7), with the two lead bytes
+    // that need a restricted first continuation byte routed through their
+    // own sub-rule:
+    //   0xE0        -> first continuation 0xA0-0xBF (else overlong)
+    //   0xED        -> first continuation 0x80-0x9F (else a UTF-16 surrogate)
+    //   0xE1-0xEC,
+    //   0xEE-0xEF   -> first continuation 0x80-0xBF (the general case, cont_id)
+    //
+    // The restricted range MUST be its own `NonTerminal` rule rather than one
+    // `str_char_id` alt per allowed second byte (e.g. 32 alts all starting
+    // `Terminal(0xE0), Terminal(<second>), ...`). This PDA has no input
+    // rewind (`consumed`-gated, see `try_next_alt`): once the shared
+    // `Terminal(0xE0)` matches, the frame commits to whichever one of those
+    // 32 alternatives it happened to try first, and a second byte that
+    // matches a *different* alternative's literal is then rejected as a
+    // mismatch instead of retried against a sibling alt. Pushing a fresh
+    // frame for a sub-rule sidesteps this: the sub-rule frame has consumed
+    // nothing yet when it starts trying its own alternatives.
+    let e0_second_id = b.reserve("json_utf8_e0_second");
+    b.set_alts(
+        e0_second_id,
+        (0xA0u8..=0xBF)
+            .map(|byte| vec![Symbol::Terminal(byte)])
+            .collect(),
+    );
+    let ed_second_id = b.reserve("json_utf8_ed_second");
+    b.set_alts(
+        ed_second_id,
+        (0x80u8..=0x9F)
+            .map(|byte| vec![Symbol::Terminal(byte)])
+            .collect(),
+    );
+    char_alts.push(vec![
+        Symbol::Terminal(0xE0),
+        Symbol::NonTerminal(e0_second_id),
+        Symbol::NonTerminal(cont_id),
+    ]);
+    char_alts.push(vec![
+        Symbol::Terminal(0xED),
+        Symbol::NonTerminal(ed_second_id),
+        Symbol::NonTerminal(cont_id),
+    ]);
+    for lead in (0xE1u8..=0xEC).chain(0xEEu8..=0xEF) {
+        char_alts.push(vec![
+            Symbol::Terminal(lead),
+            Symbol::NonTerminal(cont_id),
+            Symbol::NonTerminal(cont_id),
+        ]);
+    }
+
+    // Well-formed 4-byte UTF-8, with the two lead bytes that need a
+    // restricted first continuation byte routed through their own sub-rule
+    // (same shared-prefix reasoning as the 3-byte E0/ED case above):
+    //   0xF0       -> first continuation 0x90-0xBF (else overlong)
+    //   0xF4       -> first continuation 0x80-0x8F (caps code points at
+    //                 U+10FFFF, the Unicode maximum)
+    //   0xF1-0xF3  -> first continuation 0x80-0xBF (the general case, cont_id)
+    let f0_second_id = b.reserve("json_utf8_f0_second");
+    b.set_alts(
+        f0_second_id,
+        (0x90u8..=0xBF)
+            .map(|byte| vec![Symbol::Terminal(byte)])
+            .collect(),
+    );
+    let f4_second_id = b.reserve("json_utf8_f4_second");
+    b.set_alts(
+        f4_second_id,
+        (0x80u8..=0x8F)
+            .map(|byte| vec![Symbol::Terminal(byte)])
+            .collect(),
+    );
+    char_alts.push(vec![
+        Symbol::Terminal(0xF0),
+        Symbol::NonTerminal(f0_second_id),
+        Symbol::NonTerminal(cont_id),
+        Symbol::NonTerminal(cont_id),
+    ]);
+    char_alts.push(vec![
+        Symbol::Terminal(0xF4),
+        Symbol::NonTerminal(f4_second_id),
+        Symbol::NonTerminal(cont_id),
+        Symbol::NonTerminal(cont_id),
+    ]);
+    for lead in 0xF1u8..=0xF3 {
+        char_alts.push(vec![
+            Symbol::Terminal(lead),
+            Symbol::NonTerminal(cont_id),
+            Symbol::NonTerminal(cont_id),
+            Symbol::NonTerminal(cont_id),
+        ]);
+    }
+
     b.set_alts(str_char_id, char_alts);
 
     // json_string_inner = (json_string_char json_string_inner) | ε
@@ -2456,6 +2607,160 @@ mod tests {
         let g = compile_ok(r#"{"type":"string"}"#);
         assert!(accepts(&g, b"\"hello\""));
         assert!(accepts(&g, b"\"\""));
+    }
+
+    /// Regression for issue #931: the built-in `json_string` rule used to
+    /// accept any raw byte (including the C0 control range) unescaped, and
+    /// any `\` followed by any byte as a valid escape. Both gaps let the
+    /// grammar accept output a strict RFC 8259 parser rejects. Before this
+    /// fix the escape alternative was `'\\' + Symbol::AnyByte` and the
+    /// plain-byte alternative ranged over all of `0u8..=255`, so the raw
+    /// 0x07 case, the `\q` case, and the truncated `\u12"` case were all
+    /// accepted.
+    #[test]
+    fn string_rejects_raw_control_byte() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+        // Raw BEL (0x07) unescaped inside the quotes must be rejected.
+        assert!(rejects(&g, b"\"\x07\""));
+    }
+
+    #[test]
+    fn string_rejects_invalid_escape() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+        // `\q` is not in the RFC 8259 escape set.
+        assert!(rejects(&g, b"\"\\q\""));
+    }
+
+    #[test]
+    fn string_rejects_malformed_unicode_escape() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+        // `\u` requires exactly four hex digits. Two- and three-digit runs
+        // (closed by the quote) and a non-hex digit anywhere in the run must
+        // all reject; a mutation that accepted three digits or any byte would
+        // slip through `\u123` or `\u12g4` respectively.
+        assert!(rejects(&g, b"\"\\u12\""));
+        assert!(rejects(&g, b"\"\\u123\""));
+        assert!(rejects(&g, b"\"\\u12g4\""));
+    }
+
+    #[test]
+    fn string_accepts_multibyte_utf8() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+        // "好" (U+597D, 3-byte), "é" (U+00E9, 2-byte), "😀" (U+1F600, 4-byte).
+        assert!(accepts(&g, "\"好\"".as_bytes()));
+        assert!(accepts(&g, "\"é\"".as_bytes()));
+        assert!(accepts(&g, "\"😀\"".as_bytes()));
+    }
+
+    #[test]
+    fn string_rejects_lone_continuation_byte() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+        // 0x80 alone is a UTF-8 continuation byte with no lead byte.
+        assert!(rejects(&g, b"\"\x80\""));
+    }
+
+    #[test]
+    fn string_rejects_overlong_encoding() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+        // 0xC0 0xAF is the canonical overlong encoding of '/' (U+002F);
+        // 0xC0/0xC1 are excluded from the valid 2-byte lead range entirely.
+        assert!(rejects(&g, b"\"\xC0\xAF\""));
+    }
+
+    /// Regression for issue #931: exercises the E0/ED/F0/F4 restricted
+    /// second-byte sub-rules (`e0_second_id`/`ed_second_id`/`f0_second_id`/
+    /// `f4_second_id`) end-to-end through the same PDA path constrained
+    /// decoding uses (`simulate_token` via `accepts`/`rejects`), plus the
+    /// control-byte and escape-body boundaries in the same string grammar.
+    #[test]
+    fn string_utf8_boundary_and_control_escape_table() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+
+        // Minimal/maximal well-formed forms for each restricted lead byte.
+        let accept_cases: &[(&str, &[u8])] = &[
+            ("2-byte min", &[0xC2, 0x80]),
+            ("2-byte max", &[0xDF, 0xBF]),
+            ("3-byte E0 min", &[0xE0, 0xA0, 0x80]),
+            ("3-byte ED max", &[0xED, 0x9F, 0xBF]),
+            ("4-byte F0 min", &[0xF0, 0x90, 0x80, 0x80]),
+            ("4-byte F4 max", &[0xF4, 0x8F, 0xBF, 0xBF]),
+        ];
+        for (name, bytes) in accept_cases {
+            let mut input = vec![b'"'];
+            input.extend_from_slice(bytes);
+            input.push(b'"');
+            assert!(
+                accepts(&g, &input),
+                "expected ACCEPT for {name}: {bytes:02X?}"
+            );
+        }
+
+        // Boundary violations: overlong encodings, a UTF-16 surrogate, and a
+        // code point above the U+10FFFF Unicode maximum.
+        let reject_cases: &[(&str, &[u8])] = &[
+            ("E0 overlong", &[0xE0, 0x80, 0x80]),
+            ("F0 overlong", &[0xF0, 0x80, 0x80, 0x80]),
+            ("ED surrogate", &[0xED, 0xA0, 0x80]),
+            ("F4 above U+10FFFF", &[0xF4, 0x90, 0x80, 0x80]),
+            ("C0 overlong 2-byte", &[0xC0, 0x80]),
+            ("lone continuation byte", &[0x80]),
+        ];
+        for (name, bytes) in reject_cases {
+            let mut input = vec![b'"'];
+            input.extend_from_slice(bytes);
+            input.push(b'"');
+            assert!(
+                rejects(&g, &input),
+                "expected REJECT for {name}: {bytes:02X?}"
+            );
+        }
+
+        // Raw control bytes 0x00-0x1F must be escaped; 0x20 (space) is the
+        // first legal unescaped byte.
+        for byte in 0x00u8..=0x1F {
+            assert!(
+                rejects(&g, &[b'"', byte, b'"']),
+                "expected REJECT for raw control byte {byte:#04x}"
+            );
+        }
+        assert!(
+            accepts(&g, &[b'"', 0x20, b'"']),
+            "expected ACCEPT for raw space (0x20)"
+        );
+
+        // Escaped controls (valid \u escapes) are accepted.
+        assert!(accepts(&g, b"\"\\u0000\""));
+        assert!(accepts(&g, b"\"\\u001F\""));
+
+        // Every one-byte escape body outside the RFC 8259 set is rejected.
+        let legal_escape_bodies: &[u8] = b"\"\\/bfnrtu";
+        for byte in 0x00u8..=0xFF {
+            if legal_escape_bodies.contains(&byte) {
+                continue;
+            }
+            assert!(
+                rejects(&g, &[b'"', b'\\', byte, b'"']),
+                "expected REJECT for illegal escape body {byte:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_accepts_legal_escapes() {
+        let g = compile_ok(r#"{"type":"string"}"#);
+        assert!(accepts(&g, b"\"\\\"\""));
+        assert!(accepts(&g, b"\"\\\\\""));
+        assert!(accepts(&g, b"\"\\/\""));
+        assert!(accepts(&g, b"\"\\b\""));
+        assert!(accepts(&g, b"\"\\f\""));
+        assert!(accepts(&g, b"\"\\n\""));
+        assert!(accepts(&g, b"\"\\r\""));
+        assert!(accepts(&g, b"\"\\t\""));
+        assert!(accepts(&g, b"\"\\u0041\""));
+        // Surrogate-pair halves are syntactically valid `\uXXXX` per the
+        // RFC 8259 ABNF, even though unpaired they are not interoperable text.
+        assert!(accepts(&g, b"\"\\uD800\""));
+        assert!(accepts(&g, b"\"\\uDC00\""));
     }
 
     #[test]
