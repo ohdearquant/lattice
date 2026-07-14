@@ -1,10 +1,4 @@
-//! Core balanced Sinkhorn solver.
-//!
-//! Implements a numerically stable, log-domain Sinkhorn iteration with
-//! preallocated work buffers, configurable convergence checks, progress
-//! callbacks, and batch solving against a shared cost matrix.
-//!
-//! See: Cuturi, "Sinkhorn Distances: Lightspeed Computation of Optimal Transport", NeurIPS 2013.
+//! Core balanced, log-domain Sinkhorn solver with reusable workspaces.
 
 use core::fmt;
 use core::mem;
@@ -27,15 +21,9 @@ fn use_parallel_sinkhorn(rows: usize, cols: usize) -> bool {
 }
 
 /// Solver configuration for balanced entropic OT.
-///
-/// **Stable** (provisional): all fields are semantically stable; a new field would be additive.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SinkhornConfig {
-    /// Entropy regularization strength.
-    ///
-    /// Smaller values better approximate exact OT but require more iterations.
-    /// Recommend scaling the cost matrix first and choosing epsilon relative
-    /// to a characteristic cost scale.
+    /// Entropy regularization strength; scale costs before choosing it.
     pub epsilon: f32,
     /// Hard iteration cap.
     pub max_iterations: usize,
@@ -64,8 +52,6 @@ impl Default for SinkhornConfig {
 }
 
 /// Work buffers reused across solves to avoid heap allocation in the hot loop.
-///
-/// **Stable** (provisional): allocate once, solve many; the allocation pattern is part of the documented usage contract.
 #[derive(Debug, Clone)]
 pub struct SinkhornWorkspace {
     pub(crate) log_u: Vec<f32>,
@@ -78,7 +64,6 @@ pub struct SinkhornWorkspace {
 impl SinkhornWorkspace {
     /// Create workspace for a problem of the given dimensions.
     ///
-    /// **Stable** (provisional): constructor matches struct stability.
     pub fn new(rows: usize, cols: usize) -> Self {
         Self {
             log_u: vec![0.0; rows],
@@ -91,7 +76,6 @@ impl SinkhornWorkspace {
 
     /// Resize buffers, resetting initialization state.
     ///
-    /// **Stable** (provisional): needed when problem size changes between batch solves.
     pub fn resize(&mut self, rows: usize, cols: usize) {
         self.log_u.resize(rows, 0.0);
         self.log_v.resize(cols, 0.0);
@@ -102,7 +86,6 @@ impl SinkhornWorkspace {
 
     /// Zero all buffers and mark as initialized (for warm-start).
     ///
-    /// **Stable** (provisional): warm-start support is a documented feature.
     pub fn reset(&mut self) {
         self.log_u.fill(0.0);
         self.log_v.fill(0.0);
@@ -122,7 +105,6 @@ impl SinkhornWorkspace {
 
     /// Number of source entries.
     ///
-    /// **Stable** (provisional): dimension accessor.
     #[inline]
     pub fn rows(&self) -> usize {
         self.log_u.len()
@@ -130,7 +112,6 @@ impl SinkhornWorkspace {
 
     /// Number of target entries.
     ///
-    /// **Stable** (provisional): dimension accessor.
     #[inline]
     pub fn cols(&self) -> usize {
         self.log_v.len()
@@ -138,8 +119,6 @@ impl SinkhornWorkspace {
 }
 
 /// Errors produced by the solver.
-///
-/// **Stable** (provisional): error variants reflect the documented failure modes; new variants would be additive.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SinkhornError {
     /// The problem has zero rows or columns.
@@ -250,8 +229,6 @@ impl fmt::Display for SinkhornError {
 }
 
 /// Lightweight progress snapshot emitted every `check_convergence_every` iterations.
-///
-/// **Stable** (provisional): all fields are pure read-only diagnostics; new fields would be additive.
 #[derive(Debug, Clone, Copy)]
 pub struct ProgressState {
     /// Index within a batch solve (0 for single solves).
@@ -269,12 +246,9 @@ pub struct ProgressState {
 }
 
 /// Observer interface used by long-running solves.
-///
-/// **Stable** (provisional): single-method trait; the `FnMut` blanket impl means closures work without a named type.
 pub trait ProgressObserver {
     /// Called periodically during iteration. Return `false` to cancel the solve.
     ///
-    /// **Stable** (provisional): signature matches struct stability.
     fn on_progress(&mut self, state: ProgressState) -> bool;
 }
 
@@ -288,8 +262,6 @@ where
 }
 
 /// Input pair for batch solving.
-///
-/// **Stable** (provisional): two-field view into source/target marginals; used by `solve_batch`.
 #[derive(Debug, Clone, Copy)]
 pub struct MarginalPair<'a> {
     /// Source marginal weights (sum to 1).
@@ -299,8 +271,6 @@ pub struct MarginalPair<'a> {
 }
 
 /// Returned by `solve_batch`.
-///
-/// **Stable** (provisional): simple wrapper over `Vec<SinkhornResult>`; shape stable.
 #[derive(Debug, Clone)]
 pub struct BatchSolveResult {
     /// One result per problem in the batch.
@@ -308,8 +278,6 @@ pub struct BatchSolveResult {
 }
 
 /// Solver output containing dual variables and primal statistics.
-///
-/// **Stable** (provisional): primary result type; all fields are documented outputs of the solve.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SinkhornResult {
     /// Epsilon used for this solve.
@@ -341,7 +309,6 @@ pub struct SinkhornResult {
 impl SinkhornResult {
     /// Returns the log-mass of a single coupling entry `gamma[row, col]`.
     ///
-    /// **Stable** (provisional): used by `extract_sparse_plan` and audit tooling.
     #[inline]
     pub fn log_gamma<C>(&self, cost: &C, row: usize, col: usize) -> Result<f32, SinkhornError>
     where
@@ -364,8 +331,6 @@ impl SinkhornResult {
 }
 
 /// Balanced Sinkhorn solver.
-///
-/// **Stable** (provisional): the main solver type; `Default` produces production-ready configuration.
 #[derive(Debug, Clone, Default)]
 pub struct SinkhornSolver {
     /// Solver configuration.
@@ -375,14 +340,12 @@ pub struct SinkhornSolver {
 impl SinkhornSolver {
     /// Create a solver with the given configuration.
     ///
-    /// **Stable** (provisional): constructor matches struct stability.
     pub fn new(config: SinkhornConfig) -> Self {
         Self { config }
     }
 
     /// Solve a single balanced OT problem.
     ///
-    /// **Stable** (provisional): primary entry point; signature stable.
     pub fn solve<C>(
         &self,
         cost: &C,
@@ -398,7 +361,6 @@ impl SinkhornSolver {
 
     /// Solve with a progress observer for cancellation and monitoring.
     ///
-    /// **Stable** (provisional): progress/cancellation support is a documented feature.
     pub fn solve_with_progress<C>(
         &self,
         cost: &C,
@@ -413,12 +375,8 @@ impl SinkhornSolver {
         self.solve_internal(cost, source, target, workspace, progress, false, 0, 1)
     }
 
-    /// Solve with warm-starting from previous dual variables.
+    /// Solve with warm-started dual variables for related problems.
     ///
-    /// Mainly intended for epsilon-scaling and repeated solves with slowly
-    /// changing marginals.
-    ///
-    /// **Stable** (provisional): warm-start is a documented performance feature.
     pub fn solve_warm_start<C>(
         &self,
         cost: &C,
@@ -435,7 +393,6 @@ impl SinkhornSolver {
 
     /// Solve multiple problems sharing the same cost matrix structure.
     ///
-    /// **Stable** (provisional): batch API reuses a single workspace across problems for efficiency.
     pub fn solve_batch<C>(
         &self,
         cost: &C,
@@ -476,11 +433,8 @@ impl SinkhornSolver {
         Ok(BatchSolveResult { results })
     }
 
-    /// Dense-matrix solve with gated Rayon-parallel row/column updates for n ≥ 500.
+    /// Dense-matrix solve that enables internal parallel updates.
     ///
-    /// Same semantics as `solve`; concrete `DenseCostMatrix` type enables internal parallelism.
-    ///
-    /// **Stable** (provisional): matches `solve` stability.
     pub fn solve_dense(
         &self,
         cost: &DenseCostMatrix,
@@ -522,7 +476,6 @@ impl SinkhornSolver {
         let use_par = use_parallel_sinkhorn(rows, cols);
 
         for iteration in 0..self.config.max_iterations {
-            // Update log_u (row scaling)
             if use_par {
                 let log_v = workspace.log_v.as_slice();
                 source
@@ -571,7 +524,6 @@ impl SinkhornSolver {
             }
             mem::swap(&mut workspace.log_u, &mut workspace.next_log_u);
 
-            // Update log_v (column scaling)
             if use_par {
                 let log_u = workspace.log_u.as_slice();
                 workspace
@@ -722,7 +674,6 @@ impl SinkhornSolver {
         let mut iterations = 0usize;
 
         for iteration in 0..self.config.max_iterations {
-            // Update log_u (row scaling)
             let mut max_du = 0.0f32;
             for (row, (&src, next_u)) in source
                 .iter()
@@ -750,7 +701,6 @@ impl SinkhornSolver {
             }
             mem::swap(&mut workspace.log_u, &mut workspace.next_log_u);
 
-            // Update log_v (column scaling)
             let mut max_dv = 0.0f32;
             for (col, (&tgt, next_v)) in target
                 .iter()
@@ -780,10 +730,7 @@ impl SinkhornSolver {
 
             iterations = iteration + 1;
             if iterations.is_multiple_of(check_every) || iterations == self.config.max_iterations {
-                // FP-026: convergence criterion is marginal constraint satisfaction
-                // (L1 residuals), not dual-variable update size. Dual updates are a
-                // proxy that can declare convergence while marginal constraints are
-                // still substantially violated.
+                // Use L1 marginal residuals; small dual updates need not satisfy constraints.
                 let (row_res, col_res) = marginal_residuals(
                     cost,
                     epsilon,
@@ -852,8 +799,6 @@ impl SinkhornSolver {
 }
 
 /// Creates a uniform probability vector.
-///
-/// **Stable** (provisional): convenience helper; commonly used in tests and examples.
 pub fn uniform_weights(len: usize) -> Vec<f32> {
     if len == 0 {
         return Vec::new();
@@ -863,8 +808,6 @@ pub fn uniform_weights(len: usize) -> Vec<f32> {
 }
 
 /// Normalizes a non-negative weight vector to sum to one.
-///
-/// **Stable** (provisional): utility needed by `detect_drift_records` and barycenter code.
 pub fn normalize_weights(weights: &[f32], floor: f32) -> Result<Vec<f32>, SinkhornError> {
     if weights.is_empty() {
         return Err(SinkhornError::EmptyProblem);
@@ -919,9 +862,7 @@ where
             got_cols: target.len(),
         });
     }
-    // FP-024: reject zero-mass and non-positive entries explicitly. Previously
-    // safe_ln would silently clamp zeros to min_marginal, injecting phantom mass
-    // and producing incorrect transport plans.
+    // Reject non-positive marginals: `safe_ln` would inject phantom mass.
     for (index, &value) in source.iter().enumerate() {
         if !value.is_finite() || value <= 0.0 {
             return Err(SinkhornError::InvalidMarginal {
@@ -942,8 +883,7 @@ where
     }
     let source_sum = sum(source);
     let target_sum = sum(target);
-    // FP-025: explicitly reject zero-total distributions. If both sums are zero
-    // they satisfy the mass-balance check below but the problem is degenerate.
+    // Equal zero totals are degenerate, not balanced.
     if source_sum <= 0.0 || !source_sum.is_finite() {
         return Err(SinkhornError::InvalidMarginal {
             axis: "source",

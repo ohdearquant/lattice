@@ -1,17 +1,10 @@
-//! Cost matrix abstractions.
-//!
-//! The central engineering choice is to separate **how** transport cost is
-//! computed from **how** Sinkhorn uses it. This keeps the solver generic over
-//! dense matrices, on-the-fly pairwise distances, and custom callback-based
-//! costs without changing the numerical kernel.
+//! Cost matrices and point-distance abstractions for Sinkhorn solvers.
 
 use core::fmt;
 
 use super::math::sqrt;
 
 /// Errors that arise while constructing or validating cost structures.
-///
-/// **Stable** (provisional): error type paired with the `Stable` cost API; changes only if the cost trait surface changes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CostError {
     /// Point set has no elements.
@@ -68,8 +61,6 @@ impl fmt::Display for CostError {
 }
 
 /// Common interface for accessing points without committing to a storage layout.
-///
-/// **Stable** (provisional): core cost abstraction; signature frozen pending second consumer.
 pub trait PointSet {
     /// Number of points in the set.
     fn len(&self) -> usize;
@@ -111,12 +102,7 @@ impl<'a> PointSet for [&'a [f32]] {
     }
 }
 
-/// Contiguous row-major storage for point clouds.
-///
-/// Convenient when embeddings already live in a flat buffer from a BLAS,
-/// database page, or GPU staging area.
-///
-/// **Stable** (provisional): lightweight view type; layout unlikely to change.
+/// Contiguous row-major point-cloud storage.
 #[derive(Debug, Clone, Copy)]
 pub struct ContiguousPoints<'a> {
     data: &'a [f32],
@@ -126,7 +112,6 @@ pub struct ContiguousPoints<'a> {
 impl<'a> ContiguousPoints<'a> {
     /// Create from a flat buffer with the given dimension per point.
     ///
-    /// **Stable** (provisional): constructor matches struct stability.
     pub fn new(data: &'a [f32], dim: usize) -> Result<Self, CostError> {
         if dim == 0 || data.is_empty() {
             return Err(CostError::EmptyPointSet);
@@ -158,8 +143,6 @@ impl PointSet for ContiguousPoints<'_> {
 }
 
 /// Distance function between two points.
-///
-/// **Stable** (provisional): `Copy` bound and two-method signature are stable; custom metrics implement this.
 pub trait PointMetric: Copy {
     /// Compute the distance (cost) between two points.
     fn distance(&self, lhs: &[f32], rhs: &[f32]) -> f32;
@@ -170,8 +153,6 @@ pub trait PointMetric: Copy {
 }
 
 /// Squared Euclidean cost `||x - y||^2`, appropriate for Wasserstein-2.
-///
-/// **Stable** (provisional): standard metric; no breaking change anticipated.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SquaredEuclidean;
 
@@ -194,12 +175,7 @@ impl PointMetric for SquaredEuclidean {
     }
 }
 
-/// Cosine distance `1 - cos(theta)`.
-///
-/// If embeddings are already unit-normalized, set `assume_unit_norm = true` to
-/// avoid recomputing norms for every pair.
-///
-/// **Stable** (provisional): standard metric; `norm_floor` field may gain a default-constructor helper but struct shape is stable.
+/// Cosine distance `1 - cos(theta)`; skip norms for unit-normalized embeddings.
 #[derive(Debug, Clone, Copy)]
 pub struct CosineDistance {
     /// Skip norm computation for pre-normalized vectors.
@@ -250,8 +226,6 @@ impl PointMetric for CosineDistance {
 }
 
 /// Generic cost matrix interface.
-///
-/// **Stable** (provisional): three-method trait; the core abstraction boundary between geometry and solver.
 pub trait CostMatrix {
     /// Number of source entries (rows).
     fn rows(&self) -> usize;
@@ -262,8 +236,6 @@ pub trait CostMatrix {
 }
 
 /// Dense row-major cost matrix.
-///
-/// **Stable** (provisional): primary cost matrix type used throughout the crate.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DenseCostMatrix {
     rows: usize,
@@ -272,16 +244,11 @@ pub struct DenseCostMatrix {
 }
 
 impl DenseCostMatrix {
-    /// Create from pre-computed data.
+    /// Create from pre-computed data, panicking on an invalid matrix shape.
     ///
-    /// Panics if `rows × cols` overflows `usize` or does not equal `data.len()`.
-    ///
-    /// **Stable** (provisional): constructor matches struct stability.
     pub fn new(rows: usize, cols: usize, data: Vec<f32>) -> Self {
-        // FP-030: validate shape in release builds too — a caller-provided
-        // dimension mismatch corrupts every subsequent cost() lookup.
-        // checked_mul guards rows × cols against silently wrapping in release,
-        // which could otherwise let a corrupt (rows, cols) pass the length check.
+        // Validate in release: invalid dimensions corrupt every `cost` lookup.
+        // `checked_mul` rejects overflowing dimensions.
         let Some(expected) = rows.checked_mul(cols) else {
             panic!("DenseCostMatrix: dimensions {rows}×{cols} overflow usize");
         };
@@ -296,7 +263,6 @@ impl DenseCostMatrix {
 
     /// Build a cost matrix by evaluating a closure for each (row, col) pair.
     ///
-    /// **Stable** (provisional): convenience constructor; signature stable.
     pub fn from_fn<F>(rows: usize, cols: usize, mut f: F) -> Self
     where
         F: FnMut(usize, usize) -> f32,
@@ -312,7 +278,6 @@ impl DenseCostMatrix {
 
     /// Build from two point sets and a distance metric.
     ///
-    /// **Stable** (provisional): primary way to turn point cloud pairs into a cost matrix.
     pub fn from_point_sets<X, Y, M>(source: &X, target: &Y, metric: M) -> Result<Self, CostError>
     where
         X: PointSet + ?Sized,
@@ -328,7 +293,6 @@ impl DenseCostMatrix {
 
     /// Access the underlying flat data.
     ///
-    /// **Stable** (provisional): zero-copy accessor; no breaking change anticipated.
     #[inline]
     pub fn as_slice(&self) -> &[f32] {
         &self.data
@@ -336,7 +300,6 @@ impl DenseCostMatrix {
 
     /// Compute the flat index for (row, col).
     ///
-    /// **Unstable**: layout-specific helper; may be removed if storage changes.
     #[inline]
     pub fn index(&self, row: usize, col: usize) -> usize {
         row * self.cols + col
@@ -358,8 +321,6 @@ impl CostMatrix for DenseCostMatrix {
 }
 
 /// Pairwise cost computed lazily from two point clouds and a metric.
-///
-/// **Stable** (provisional): lazy cost view; avoids materializing a dense matrix for large problems.
 #[derive(Debug, Clone, Copy)]
 pub struct PairwiseCostMatrix<'a, X: ?Sized, Y: ?Sized, M> {
     /// Source point set.
@@ -373,7 +334,6 @@ pub struct PairwiseCostMatrix<'a, X: ?Sized, Y: ?Sized, M> {
 impl<'a, X: ?Sized, Y: ?Sized, M> PairwiseCostMatrix<'a, X, Y, M> {
     /// Create a lazy pairwise cost matrix.
     ///
-    /// **Stable** (provisional): constructor matches struct stability.
     pub fn new(source: &'a X, target: &'a Y, metric: M) -> Self {
         Self {
             source,
@@ -404,11 +364,6 @@ where
 }
 
 /// Arbitrary callback-backed cost matrix.
-///
-/// Useful for non-Euclidean domain-specific penalties, for example
-/// hybrid symbolic/neural costs or graph-aware memory migration penalties.
-///
-/// **Stable** (provisional): escape hatch for custom cost functions; closure type is generic so the public shape won't change.
 #[derive(Clone, Copy)]
 pub struct ClosureCostMatrix<F> {
     rows: usize,
@@ -428,7 +383,6 @@ impl<F> fmt::Debug for ClosureCostMatrix<F> {
 impl<F> ClosureCostMatrix<F> {
     /// Create a closure-backed cost matrix.
     ///
-    /// **Stable** (provisional): constructor matches struct stability.
     pub fn new(rows: usize, cols: usize, f: F) -> Self {
         Self { rows, cols, f }
     }
@@ -453,8 +407,6 @@ where
 
 /// Validates that a point set is non-empty, has constant dimension, and does
 /// not contain NaNs or infinities.
-///
-/// **Unstable**: internal validation helper; may be inlined or split as the API evolves.
 pub fn validate_point_set<P>(points: &P) -> Result<(), CostError>
 where
     P: PointSet + ?Sized,

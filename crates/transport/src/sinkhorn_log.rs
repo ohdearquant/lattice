@@ -1,11 +1,6 @@
-//! Log-domain stabilized variants beyond the plain fixed-epsilon solver.
+//! Epsilon-scaling acceleration for the log-domain Sinkhorn solver.
 //!
-//! The base solver in `sinkhorn.rs` is already fully log-domain. This module
-//! adds epsilon-scaling acceleration (Schmitzer-style): solve a sequence of
-//! easier problems with larger `epsilon`, warm-starting the dual variables
-//! at each stage.
-//!
-//! See: Schmitzer, "Stabilized Sparse Scaling Algorithms for Entropy Regularized Transport Problems", SIAM J. Sci. Comput. 2019.
+//! Each stage warm-starts the next lower-epsilon solve.
 
 use super::cost::CostMatrix;
 use super::math::abs;
@@ -17,8 +12,6 @@ use super::sinkhorn::{
 const MAX_EPSILON_STAGES: usize = 10_000;
 
 /// Geometric epsilon schedule from `start` down to `target`.
-///
-/// **Unstable**: epsilon-scaling acceleration; schedule representation may change to support non-geometric sequences.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EpsilonScalingSchedule {
     /// Initial (large) epsilon.
@@ -34,7 +27,6 @@ pub struct EpsilonScalingSchedule {
 impl EpsilonScalingSchedule {
     /// Generate the geometric sequence of epsilon values.
     ///
-    /// **Unstable**: schedule generation detail; return type may become an iterator.
     pub fn geometric_values(&self) -> Vec<f32> {
         self.try_geometric_values().unwrap_or_default()
     }
@@ -106,8 +98,6 @@ impl EpsilonScalingSchedule {
 }
 
 /// Full configuration for the staged solver.
-///
-/// **Unstable**: wraps `SinkhornConfig` with an optional scaling schedule; field set may grow.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct LogDomainSinkhornConfig {
     /// Base solver configuration (epsilon here is used only when no scaling schedule is set).
@@ -117,8 +107,6 @@ pub struct LogDomainSinkhornConfig {
 }
 
 /// Summary of a single epsilon-scaling stage.
-///
-/// **Unstable**: per-stage diagnostic; field set mirrors `SinkhornResult` subset and may change.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EpsilonStageSummary {
     /// Stage index (0-based).
@@ -136,8 +124,6 @@ pub struct EpsilonStageSummary {
 }
 
 /// Result of a multi-stage log-domain solve.
-///
-/// **Unstable**: aggregates per-stage summaries with the final `SinkhornResult`; structure may be simplified.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogDomainSinkhornResult {
     /// Result from the final stage.
@@ -149,8 +135,6 @@ pub struct LogDomainSinkhornResult {
 }
 
 /// Warm-started log-domain Sinkhorn with optional epsilon scaling.
-///
-/// **Unstable**: acceleration layer on top of `SinkhornSolver`; may be absorbed into the main solver via a schedule option.
 #[derive(Debug, Clone, Default)]
 pub struct LogDomainSinkhornSolver {
     /// Solver configuration.
@@ -160,14 +144,12 @@ pub struct LogDomainSinkhornSolver {
 impl LogDomainSinkhornSolver {
     /// Create a solver with the given configuration.
     ///
-    /// **Unstable**: constructor matches struct stability.
     pub fn new(config: LogDomainSinkhornConfig) -> Self {
         Self { config }
     }
 
     /// Solve with optional epsilon scaling.
     ///
-    /// **Unstable**: primary entry point; rejects invalid epsilon schedules.
     pub fn solve<C>(
         &self,
         cost: &C,

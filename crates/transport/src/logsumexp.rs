@@ -1,34 +1,16 @@
 //! Numerically stable helpers for log-domain Sinkhorn updates.
 //!
-//! The core design rule in this crate is simple: never materialize the Gibbs
-//! kernel `K = exp(-C / epsilon)` directly. Instead we keep all scaling vectors
-//! in log space and only exponentiate when we intentionally recover transport
-//! mass. These helpers centralize the handful of stable transforms that the
-//! rest of the module relies on.
+//! Scaling vectors stay in log space; exponentiation only recovers transport mass.
 
 use super::math::{abs, exp, ln, log1p, sqrt as math_sqrt};
 
 /// Sentinel representing `log(0)`.
-///
-/// **Unstable**: numerical internal; value is mathematically fixed but export path may change.
 pub const LOG_ZERO: f32 = f32::NEG_INFINITY;
 
-/// Conservative cutoff before `expf` underflows in `f32`.
-///
-/// `exp(-87.0)` is ~1.6e-38, still a representable positive `f32`. Actual
-/// underflow is near the smallest subnormal value.
-///
-/// **Unstable**: tuning constant; value could change if benchmarking reveals a better cutoff.
+/// Conservative `f32` exponential underflow cutoff.
 pub const EXP_UNDERFLOW_CUTOFF: f32 = -103.97208;
 
-/// Safe natural logarithm that clamps the input away from zero.
-///
-/// In balanced OT the marginals should be strictly positive. In production,
-/// however, users often pass weights with zeros after filtering or importance
-/// truncation. Clamping to a tiny floor makes the algorithm robust while keeping
-/// the perturbation controlled and explicit.
-///
-/// **Unstable**: numerical internal; signature or clamping semantics may be adjusted.
+/// Natural logarithm with a caller-provided positive floor.
 #[inline]
 pub fn safe_ln(value: f32, floor: f32) -> f32 {
     let clamped = if value.is_finite() {
@@ -41,8 +23,6 @@ pub fn safe_ln(value: f32, floor: f32) -> f32 {
 
 /// Safe exponential used only when recovering transport mass or converting a
 /// normalized log probability back to probability space.
-///
-/// **Unstable**: numerical internal; underflow cutoff value may be tuned.
 #[inline]
 pub fn safe_exp(log_value: f32) -> f32 {
     if log_value < EXP_UNDERFLOW_CUTOFF {
@@ -53,8 +33,6 @@ pub fn safe_exp(log_value: f32) -> f32 {
 }
 
 /// Stable `log(exp(a) + exp(b))`.
-///
-/// **Unstable**: core Sinkhorn arithmetic primitive; always correct but module placement may change.
 #[inline]
 pub fn logaddexp(a: f32, b: f32) -> f32 {
     if a == LOG_ZERO {
@@ -67,14 +45,7 @@ pub fn logaddexp(a: f32, b: f32) -> f32 {
     hi + log1p(exp(lo - hi))
 }
 
-/// One-pass online log-sum-exp accumulator.
-///
-/// Tracks `(max, sum_of_exp_offsets)` and finalizes as `max + ln(sum)`.
-/// Compared with chaining `logaddexp`, this avoids one `log1p` call per term
-/// (only one `ln` at the end), reducing transcendental pressure in inner Sinkhorn
-/// loops by roughly 1×exp per element.
-///
-/// **Unstable**: internal optimization primitive used by solver inner loops.
+/// One-pass log-sum-exp accumulator.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OnlineLogSumExp {
     max: f32,
@@ -114,8 +85,6 @@ impl OnlineLogSumExp {
 }
 
 /// Stable log-sum-exp over a slice.
-///
-/// **Unstable**: numerical internal; may be replaced by the iterator-based variant.
 pub fn logsumexp(values: &[f32]) -> f32 {
     let mut acc = LOG_ZERO;
     for &value in values {
@@ -124,12 +93,7 @@ pub fn logsumexp(values: &[f32]) -> f32 {
     acc
 }
 
-/// Stable log-sum-exp over an implicit iterator `0..len`.
-///
-/// This is particularly useful when the values are generated on the fly from a
-/// cost matrix and we do not want to allocate a temporary buffer.
-///
-/// **Unstable**: convenience variant; may be unified with `logsumexp` via an `impl Iterator` parameter.
+/// Stable log-sum-exp over values generated for `0..len`.
 pub fn logsumexp_by<F>(len: usize, mut f: F) -> f32
 where
     F: FnMut(usize) -> f32,
@@ -143,8 +107,6 @@ where
 
 /// Subtracts `logsumexp(log_weights)` in place so that the exponentiated values
 /// sum to one. Returns the removed normalizer.
-///
-/// **Unstable**: barycenter internal; in-place mutation signature may be revised.
 pub fn normalize_log_weights(log_weights: &mut [f32]) -> f32 {
     let normalizer = logsumexp(log_weights);
     if normalizer.is_finite() {
@@ -155,15 +117,7 @@ pub fn normalize_log_weights(log_weights: &mut [f32]) -> f32 {
     normalizer
 }
 
-/// Maximum absolute difference between two same-length slices.
-///
-/// **Unstable**: barycenter convergence helper; may be inlined.
-///
-/// Fails closed on a non-finite difference: a NaN or Inf `delta` compares
-/// `false` against every running max under plain `>`, so a naive
-/// accumulate-the-max loop silently reports the non-finite input as `0.0`.
-/// This returns the first non-finite `delta` immediately instead, so a
-/// catastrophically wrong input can never read back as a clean small value.
+/// Maximum absolute difference, returning the first non-finite delta.
 pub fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
     let mut max_delta = 0.0;
     for (&left, &right) in lhs.iter().zip(rhs.iter()) {
@@ -179,16 +133,12 @@ pub fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
 }
 
 /// Converts log-probabilities to a freshly allocated probability vector.
-///
-/// **Unstable**: convenience converter; allocates — may be replaced with an iterator adapter.
 pub fn exp_normalized(log_weights: &[f32]) -> Vec<f32> {
     log_weights.iter().map(|&value| safe_exp(value)).collect()
 }
 
 /// Mean and standard deviation in one pass using Welford's online algorithm.
 /// Drift diagnostics use this for outlier detection.
-///
-/// **Unstable**: drift summary internal; may be moved to a dedicated stats module.
 pub fn mean_std(values: &[f32]) -> (f32, f32) {
     if values.is_empty() {
         return (0.0, 0.0);
@@ -212,8 +162,6 @@ pub fn mean_std(values: &[f32]) -> (f32, f32) {
 
 /// Median computed by sorting a scratch copy. Used only in high-level
 /// drift summaries, so the extra allocation is acceptable.
-///
-/// **Unstable**: drift summary internal; sorting allocation may be avoided with a selection algorithm.
 pub fn median(values: &[f32]) -> f32 {
     if values.is_empty() {
         return 0.0;
@@ -233,32 +181,24 @@ pub fn median(values: &[f32]) -> f32 {
 }
 
 /// Square root wrapper.
-///
-/// **Unstable**: thin shim over `f32::sqrt`; may be removed if callers use `f32::sqrt` directly.
 #[inline]
 pub fn sqrt(value: f32) -> f32 {
     math_sqrt(value)
 }
 
 /// Sum of a slice.
-///
-/// **Unstable**: convenience wrapper; may be removed in favor of iterator `.sum()` at call sites.
 #[inline]
 pub fn sum(values: &[f32]) -> f32 {
     values.iter().copied().sum()
 }
 
 /// Checks whether all values are finite.
-///
-/// **Unstable**: validation helper used in problem setup; may be inlined.
 #[inline]
 pub fn all_finite(values: &[f32]) -> bool {
     values.iter().all(|value| value.is_finite())
 }
 
 /// Stable `x * ln(x / y) - x + y`, with the usual `0 ln 0 = 0` convention.
-///
-/// **Unstable**: KL-divergence term used only by `UnbalancedSinkhornSolver`; may move to `unbalanced.rs`.
 pub fn kl_term(x: f32, y: f32, floor: f32) -> f32 {
     if x <= 0.0 {
         return y.max(0.0);
@@ -272,12 +212,7 @@ pub fn kl_term(x: f32, y: f32, floor: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// Mutation-sensitivity proof: a plain accumulate-the-max loop with no
-    /// finiteness check silently reports `0.0` for a NaN or Inf difference, so
-    /// a catastrophically wrong input would read as a clean small value and
-    /// pass a tolerance gate. This asserts the fixed helper surfaces the
-    /// non-finite value instead; if this ever fails, the gate is decoration
-    /// again.
+    /// Non-finite deltas must not appear converged.
     #[test]
     fn max_abs_diff_is_nan_and_inf_honest() {
         let clean = [1.0f32, 2.0, 3.0];

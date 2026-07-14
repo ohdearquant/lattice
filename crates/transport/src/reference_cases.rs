@@ -1,7 +1,4 @@
-//! Reference datasets and comparison helpers (test-only).
-//!
-//! Provides deterministic toy cases for correctness checks and a structured
-//! place for cross-library comparisons.
+//! Test-only reference datasets and comparison helpers.
 
 use super::cost::{CostMatrix, DenseCostMatrix};
 use super::math::abs;

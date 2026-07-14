@@ -1,8 +1,4 @@
-//! High-level embedding drift API.
-//!
-//! Translates raw OT outputs into the quantities a memory subsystem actually
-//! needs: a scalar drift magnitude, sparse correspondences, expected per-entry
-//! displacement, and summary statistics suitable for thresholding.
+//! High-level embedding drift analysis from optimal-transport outputs.
 
 use std::borrow::ToOwned;
 
@@ -17,8 +13,6 @@ use super::transport_plan::{SparseTransportPlan, extract_sparse_plan};
 use super::unbalanced::{UnbalancedConfig, UnbalancedSinkhornSolver};
 
 /// Lightweight embedding record accepted by the drift API.
-///
-/// **Stable** (provisional): input record for `detect_drift_records`; field set is minimal by design.
 #[derive(Debug, Clone)]
 pub struct EmbeddingRecord<'a, Id> {
     /// Identifier for this record.
@@ -34,7 +28,6 @@ pub struct EmbeddingRecord<'a, Id> {
 impl<'a, Id> EmbeddingRecord<'a, Id> {
     /// Create a record with uniform weight.
     ///
-    /// **Stable** (provisional): convenience constructor; equivalent to setting `weight = 1.0` and `model = None`.
     pub fn uniform(id: Id, embedding: &'a [f32]) -> Self {
         Self {
             id,
@@ -46,37 +39,29 @@ impl<'a, Id> EmbeddingRecord<'a, Id> {
 }
 
 /// Adapter trait for application-level memory structs.
-///
-/// **Stable** (provisional): bridge between application memory types and the OT drift pipeline; four-method contract is stable.
 pub trait MemoryLike {
     /// Identifier type for memories.
     type Id: Clone;
 
     /// Get the memory's identifier.
     ///
-    /// **Stable** (provisional): required method; part of the trait contract.
     fn memory_id(&self) -> Self::Id;
     /// Get the embedding, if present.
     ///
-    /// **Stable** (provisional): required method; `None` records are filtered before the OT solve.
     fn embedding(&self) -> Option<&[f32]>;
     /// Get the importance weight (defaults to 1.0).
     ///
-    /// **Stable** (provisional): optional method with provided default.
     fn importance(&self) -> f32 {
         1.0
     }
     /// Get the embedding model identifier.
     ///
-    /// **Stable** (provisional): optional method with provided default; used for model-change audit logging.
     fn embed_model(&self) -> Option<&str> {
         None
     }
 }
 
 /// How to weight entries in drift computation.
-///
-/// **Stable** (provisional): two-variant enum; a `Custom` variant may be added but existing variants are stable.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriftWeighting {
@@ -87,8 +72,6 @@ pub enum DriftWeighting {
 }
 
 /// Distance metric for drift computation.
-///
-/// **Stable** (provisional): two standard metrics; new entries (e.g., L1) would be additive.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriftMetricKind {
@@ -99,8 +82,6 @@ pub enum DriftMetricKind {
 }
 
 /// Solver variant for drift computation.
-///
-/// **Stable** (provisional): `Balanced` and `Unbalanced` cover the primary use cases; existing variants are stable.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriftSolverMode {
@@ -116,8 +97,6 @@ pub enum DriftSolverMode {
 }
 
 /// Configuration for drift detection.
-///
-/// **Stable** (provisional): aggregate config for the high-level drift API; new fields would be additive with `Default`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DriftConfig {
     /// Weighting strategy.
@@ -151,8 +130,6 @@ impl Default for DriftConfig {
 }
 
 /// Per-entry displacement in the transport plan.
-///
-/// **Stable** (provisional): per-source-entry diagnostic included in `DriftReport`; field set is stable.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PerEntryDisplacement<Id> {
     /// Record identifier.
@@ -172,8 +149,6 @@ pub struct PerEntryDisplacement<Id> {
 }
 
 /// Summary statistics for drift displacements.
-///
-/// **Stable** (provisional): five scalar statistics; new statistics would be additive.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DriftSummary {
     /// Mean displacement across all source entries.
@@ -189,8 +164,6 @@ pub struct DriftSummary {
 }
 
 /// Complete drift analysis report.
-///
-/// **Stable** (provisional): primary output type of the drift API; all fields are documented outputs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DriftReport<Id> {
     /// Wasserstein distance (scalar drift magnitude).
@@ -214,8 +187,6 @@ pub struct DriftReport<Id> {
 }
 
 /// Detect drift from application-level memory objects.
-///
-/// **Stable** (provisional): primary entry point for `MemoryLike`-typed corpora; filters None embeddings internally.
 pub fn detect_drift_memories<M>(
     source: &[M],
     target: &[M],
@@ -258,8 +229,6 @@ where
 }
 
 /// Detect drift from embedding records.
-///
-/// **Stable** (provisional): lower-level entry point; caller constructs `EmbeddingRecord` slices directly.
 pub fn detect_drift_records<Id>(
     source: &[EmbeddingRecord<'_, Id>],
     target: &[EmbeddingRecord<'_, Id>],

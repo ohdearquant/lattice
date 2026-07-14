@@ -1,7 +1,4 @@
-//! Small math shim for transport module.
-//!
-//! Delegates to platform `std` implementations. Kept as a thin wrapper to
-//! centralize all floating-point operations used by the Sinkhorn solvers.
+//! Small math shim for transport floating-point operations.
 
 #[inline]
 pub fn abs(x: f32) -> f32 {

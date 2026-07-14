@@ -2,9 +2,6 @@
 
 use super::*;
 
-/// Test 1: Uniform marginals on a symmetric cost matrix.
-/// The optimal transport for identical uniform distributions on a diagonal cost
-/// is to not move any mass. Transport cost should be near zero.
 #[test]
 fn uniform_marginals_identity_cost() {
     let cost = DenseCostMatrix::new(3, 3, vec![0.0, 1.0, 2.0, 1.0, 0.0, 1.0, 2.0, 1.0, 0.0]);
@@ -21,9 +18,6 @@ fn uniform_marginals_identity_cost() {
         .unwrap();
 
     assert!(result.converged, "Sinkhorn should converge");
-    // With identical source/target, exact OT cost is 0. Regularized version
-    // will be slightly positive due to entropy, but transport_cost should be
-    // very small relative to epsilon.
     assert!(
         result.transport_cost < 0.1,
         "transport cost should be small for identical distributions, got {}",
@@ -36,11 +30,8 @@ fn uniform_marginals_identity_cost() {
     );
 }
 
-/// Test 2: Epsilon convergence -- smaller epsilon should give tighter approximation
-/// to exact OT.
 #[test]
 fn epsilon_convergence() {
-    // 1x1 problem where exact OT cost = 5.0.
     let cost = DenseCostMatrix::new(1, 1, vec![5.0]);
     let source = vec![1.0];
     let target = vec![1.0];
@@ -60,7 +51,6 @@ fn epsilon_convergence() {
         costs_at_eps.push((eps, result.transport_cost));
     }
 
-    // All should be close to 5.0 (for 1x1 problem, exact solution is trivial)
     for &(eps, cost_val) in &costs_at_eps {
         assert!(
             (cost_val - 5.0).abs() < eps + 0.01,
@@ -71,8 +61,6 @@ fn epsilon_convergence() {
     }
 }
 
-/// Test 3: Sinkhorn divergence symmetry.
-/// S(a, b) and S(b, a) should be approximately equal (divergence is symmetric).
 #[test]
 fn sinkhorn_divergence_symmetry() {
     let points_a: Vec<Vec<f32>> = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
@@ -86,7 +74,6 @@ fn sinkhorn_divergence_symmetry() {
         ..SinkhornConfig::default()
     });
 
-    // S(a, b)
     let mut ws_ab = SinkhornWorkspace::new(2, 2);
     let mut ws_aa = SinkhornWorkspace::new(2, 2);
     let mut ws_bb = SinkhornWorkspace::new(2, 2);
@@ -103,7 +90,6 @@ fn sinkhorn_divergence_symmetry() {
     )
     .unwrap();
 
-    // S(b, a)
     let mut ws_ba = SinkhornWorkspace::new(2, 2);
     let mut ws_bb2 = SinkhornWorkspace::new(2, 2);
     let mut ws_aa2 = SinkhornWorkspace::new(2, 2);
@@ -130,9 +116,6 @@ fn sinkhorn_divergence_symmetry() {
     );
 }
 
-/// Test 4: Transport plan validity.
-/// The sparse transport plan entries should have non-negative mass and their total
-/// should be close to 1.0 for uniform distributions.
 #[test]
 fn transport_plan_validity() {
     let cost = DenseCostMatrix::new(3, 3, vec![0.0, 1.0, 4.0, 1.0, 0.0, 1.0, 4.0, 1.0, 0.0]);
@@ -145,7 +128,6 @@ fn transport_plan_validity() {
 
     let plan = extract_sparse_plan(&result, &cost, 1e-8).unwrap();
 
-    // All entries should have non-negative mass
     for entry in &plan.entries {
         assert!(
             entry.mass >= 0.0,
@@ -158,7 +140,6 @@ fn transport_plan_validity() {
         );
     }
 
-    // Total retained + dropped mass should be close to 1.0
     let total = plan.retained_mass + plan.dropped_mass;
     assert!(
         (total - 1.0).abs() < 0.05,
@@ -167,13 +148,8 @@ fn transport_plan_validity() {
     );
 }
 
-/// Test 5: Drift metric with known displacement.
-/// Two point clouds that are a known distance apart should produce a corresponding
-/// Wasserstein distance.
 #[test]
 fn drift_metric_known_displacement() {
-    // Source: two points at (0, 0) and (1, 0)
-    // Target: two points at (2, 0) and (3, 0) -- shifted right by 2 units
     let source_emb: Vec<Vec<f32>> = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
     let target_emb: Vec<Vec<f32>> = vec![vec![2.0, 0.0], vec![3.0, 0.0]];
 
@@ -201,15 +177,12 @@ fn drift_metric_known_displacement() {
 
     let report = detect_drift_records(&source_records, &target_records, &config).unwrap();
 
-    // Each point moves by 2 units, so squared distance = 4 per point.
-    // Wasserstein-2 distance = sqrt(average squared cost) = sqrt(4) = 2.
     assert!(
         (report.wasserstein_distance - 2.0).abs() < 0.2,
         "Wasserstein distance should be near 2.0, got {}",
         report.wasserstein_distance
     );
 
-    // Per-entry displacements should each be near 2.0
     for entry in &report.per_entry {
         assert!(
             (entry.expected_distance - 2.0).abs() < 0.5,
@@ -219,11 +192,9 @@ fn drift_metric_known_displacement() {
     }
 }
 
-/// Test 6: Unbalanced solver allows mass mismatch.
 #[test]
 fn unbalanced_solver_mass_mismatch() {
     let cost = DenseCostMatrix::new(2, 3, vec![0.0, 1.0, 4.0, 1.0, 0.0, 1.0]);
-    // Different sizes, different total mass
     let source = vec![0.5, 0.5];
     let target = vec![0.3, 0.3, 0.4];
 
@@ -248,7 +219,6 @@ fn unbalanced_solver_mass_mismatch() {
     assert!(result.transported_mass > 0.0, "Should transport some mass");
 }
 
-/// Test 7: Reference case correctness.
 #[test]
 fn reference_cases_pass() {
     let solver = SinkhornSolver::new(SinkhornConfig {
@@ -284,7 +254,6 @@ fn reference_cases_pass() {
     }
 }
 
-/// Test 8: Epsilon scaling solver converges.
 #[test]
 fn epsilon_scaling_converges() {
     let cost = DenseCostMatrix::new(3, 3, vec![0.0, 1.0, 4.0, 1.0, 0.0, 1.0, 4.0, 1.0, 0.0]);
@@ -319,7 +288,6 @@ fn epsilon_scaling_converges() {
     );
 }
 
-/// Test 9: Cost matrix from point sets.
 #[test]
 fn cost_matrix_from_points() {
     let points_a = [vec![0.0, 0.0], vec![1.0, 0.0]];
@@ -331,22 +299,16 @@ fn cost_matrix_from_points() {
     assert_eq!(cost.rows(), 2);
     assert_eq!(cost.cols(), 2);
 
-    // (0,0) -> (0,1): squared distance = 1.0
     assert!((cost.cost(0, 0) - 1.0).abs() < 1e-6);
-    // (0,0) -> (1,1): squared distance = 2.0
     assert!((cost.cost(0, 1) - 2.0).abs() < 1e-6);
-    // (1,0) -> (0,1): squared distance = 2.0
     assert!((cost.cost(1, 0) - 2.0).abs() < 1e-6);
-    // (1,0) -> (1,1): squared distance = 1.0
     assert!((cost.cost(1, 1) - 1.0).abs() < 1e-6);
 }
 
-/// Test 10: Cosine distance metric.
 #[test]
 fn cosine_distance_metric() {
     let metric = CosineDistance::default();
 
-    // Same direction: cosine distance = 0
     let a = vec![1.0, 0.0, 0.0];
     let b = vec![2.0, 0.0, 0.0];
     let d = metric.distance(&a, &b);
@@ -356,7 +318,6 @@ fn cosine_distance_metric() {
         d
     );
 
-    // Orthogonal: cosine distance = 1
     let c = vec![0.0, 1.0, 0.0];
     let d_val = metric.distance(&a, &c);
     assert!(
@@ -366,7 +327,6 @@ fn cosine_distance_metric() {
     );
 }
 
-/// Test 11: Contiguous points layout.
 #[test]
 fn contiguous_points_access() {
     let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -378,7 +338,6 @@ fn contiguous_points_access() {
     assert_eq!(points.point(1), &[4.0, 5.0, 6.0]);
 }
 
-/// Test 12: Error on empty problem.
 #[test]
 fn error_on_empty_problem() {
     let cost = DenseCostMatrix::new(0, 0, vec![]);
@@ -405,7 +364,6 @@ fn balanced_solver_rejects_zero_marginal_entries() {
     ));
 }
 
-/// Test 13: Error on non-positive epsilon.
 #[test]
 fn error_on_non_positive_epsilon() {
     let cost = DenseCostMatrix::new(2, 2, vec![0.0, 1.0, 1.0, 0.0]);
@@ -546,15 +504,12 @@ fn safe_exp_preserves_representable_positive_values() {
     assert_eq!(logsumexp::safe_exp(-104.0), 0.0);
 }
 
-/// Test 14: logsumexp numerical stability.
 #[test]
 fn logsumexp_stability() {
     use super::logsumexp::logsumexp;
 
-    // Large values that would overflow naive exp
     let values = vec![100.0, 101.0, 102.0];
     let result = logsumexp(&values);
-    // Should be close to 102 + ln(1 + exp(-1) + exp(-2))
     assert!(result.is_finite(), "logsumexp should not overflow");
     assert!(
         (result - 102.408).abs() < 0.01,
@@ -562,7 +517,6 @@ fn logsumexp_stability() {
         result
     );
 
-    // Very negative values
     let neg_values = vec![-100.0, -101.0, -102.0];
     let neg_result = logsumexp(&neg_values);
     assert!(

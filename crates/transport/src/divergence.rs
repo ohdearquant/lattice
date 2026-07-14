@@ -1,21 +1,14 @@
 //! Debiased Sinkhorn divergence.
 //!
-//! See: Genevay et al., "Learning Generative Models with Sinkhorn Divergences", AISTATS 2018.
-//!
-//! The regularized OT cost is not zero on identical distributions because the
-//! entropy term introduces a positive self-cost. The Sinkhorn divergence removes
-//! that bias by subtracting half of each self-interaction term:
-//!
-//! ```text
-//! S(a, b) = W_eps(a, b) - 0.5 * W_eps(a, a) - 0.5 * W_eps(b, b)
-//! ```
+//! Removes the entropy-induced self-cost of regularized transport. Extended
+//! background: <https://github.com/ohdearquant/lattice/blob/main/crates/transport/docs/algorithms.md>.
 
 use super::cost::{
     CostError, CostMatrix, DenseCostMatrix, PairwiseCostMatrix, PointMetric, PointSet,
 };
 use super::sinkhorn::{SinkhornError, SinkhornResult, SinkhornSolver, SinkhornWorkspace};
 
-/// Materialize cost matrices up to this combined byte limit.
+/// Combined limit for materialized cost matrices.
 const DENSE_COST_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 fn cost_error_to_sinkhorn(e: CostError) -> SinkhornError {
@@ -30,8 +23,6 @@ fn cost_error_to_sinkhorn(e: CostError) -> SinkhornError {
 }
 
 /// Result of a Sinkhorn divergence computation.
-///
-/// **Stable** (provisional): debiased divergence output; three nested `SinkhornResult` fields for cross and self terms.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SinkhornDivergence {
     /// Debiased divergence value.
@@ -45,8 +36,6 @@ pub struct SinkhornDivergence {
 }
 
 /// Compute Sinkhorn divergence from three pre-built cost matrices.
-///
-/// **Stable** (provisional): lower-level API when cost matrices are already materialized.
 #[allow(clippy::too_many_arguments)]
 pub fn sinkhorn_divergence<Cxy, Cxx, Cyy>(
     solver: &SinkhornSolver,
@@ -67,9 +56,7 @@ where
     let cross = solver.solve(cost_xy, source, target, workspace_xy)?;
     let self_source = solver.solve(cost_xx, source, source, workspace_xx)?;
     let self_target = solver.solve(cost_yy, target, target, workspace_yy)?;
-    // FP-023: Sinkhorn divergence must use the regularized OT cost
-    // (transport_cost − ε·entropy), not the raw primal transport cost.
-    // Using raw transport cost breaks symmetry and positive semi-definiteness.
+    // Use regularized cost: raw primal cost breaks divergence symmetry.
     let value = cross.regularized_cost
         - 0.5 * self_source.regularized_cost
         - 0.5 * self_target.regularized_cost;
@@ -81,14 +68,7 @@ where
     })
 }
 
-/// Compute Sinkhorn divergence directly from point sets.
-///
-/// When the combined cost matrices fit within 16 MiB, point-pair distances are
-/// precomputed once into dense matrices so the solver inner loops access O(1)
-/// lookups instead of recomputing 384-d distances on every iteration. For very
-/// large inputs the function falls back to lazy pairwise computation.
-///
-/// **Stable** (provisional): convenience API that builds cost matrices internally; preferred entry point for most callers.
+/// Compute Sinkhorn divergence from point sets, materializing costs below 16 MiB.
 #[allow(clippy::too_many_arguments)]
 pub fn point_set_sinkhorn_divergence<X, Y, M>(
     solver: &SinkhornSolver,
@@ -108,7 +88,6 @@ where
 {
     let n_src = source_points.len();
     let n_tgt = target_points.len();
-    // Three matrices: cross (n_src×n_tgt), self-source (n_src²), self-target (n_tgt²).
     let total_bytes = (n_src.saturating_mul(n_tgt))
         .saturating_add(n_src.saturating_mul(n_src))
         .saturating_add(n_tgt.saturating_mul(n_tgt))

@@ -6,3 +6,5 @@ the summary and public API surface; the files here hold the longer-form narrativ
 
 - [design.md](design.md) — architecture layers, the log-domain invariant and why it
   matters, workspace preallocation, and the no-external-linear-algebra constraint.
+- [algorithms.md](algorithms.md) — operational background for divergence, sparse
+  plans, barycenters, unbalanced transport, and online drift.

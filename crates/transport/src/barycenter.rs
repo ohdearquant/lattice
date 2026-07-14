@@ -1,12 +1,6 @@
-//! Wasserstein barycenters.
+//! Wasserstein barycenters with fixed or Euclidean free support.
 //!
-//! The fixed-support solver is the workhorse for model-drift analysis across
-//! multiple embedding versions. The support points are fixed, only the
-//! barycenter weights are optimized. The optional free-support routine
-//! alternates between fixed-support weight updates and Euclidean support
-//! relocation.
-//!
-//! See: Cuturi & Doucet, "Fast Computation of Wasserstein Barycenters", ICML 2014.
+//! Extended background: <https://github.com/ohdearquant/lattice/blob/main/crates/transport/docs/algorithms.md>.
 
 use super::cost::{CostMatrix, DenseCostMatrix, SquaredEuclidean};
 use super::logsumexp::{OnlineLogSumExp, max_abs_diff, normalize_log_weights, safe_exp};
@@ -17,8 +11,6 @@ use super::sinkhorn::{
 };
 
 /// Configuration for barycenter computation.
-///
-/// **Unstable**: barycenter API is less mature; inner/outer iteration structure may change.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BarycenterConfig {
     /// Inner Sinkhorn solver configuration.
@@ -40,8 +32,6 @@ impl Default for BarycenterConfig {
 }
 
 /// A single source measure and the cost to the common barycenter support.
-///
-/// **Unstable**: input type for `fixed_support_barycenter`; may grow fields as multi-source API matures.
 pub struct BarycenterProblem<'a> {
     /// Cost matrix from this source to the barycenter support.
     pub cost: &'a dyn CostMatrix,
@@ -50,8 +40,6 @@ pub struct BarycenterProblem<'a> {
 }
 
 /// Workspace for fixed-support barycenter computation.
-///
-/// **Unstable**: internal buffer management type; field layout may change if warm-starting is added.
 #[derive(Debug, Clone)]
 pub struct FixedSupportBarycenterWorkspace {
     source_workspaces: Vec<SinkhornWorkspace>,
@@ -64,7 +52,6 @@ pub struct FixedSupportBarycenterWorkspace {
 impl FixedSupportBarycenterWorkspace {
     /// Create workspace for the given problems and support size.
     ///
-    /// **Unstable**: constructor matches struct stability.
     pub fn new(problems: &[BarycenterProblem<'_>], support_size: usize) -> Self {
         let mut source_workspaces = Vec::with_capacity(problems.len());
         let mut ku_logs = Vec::with_capacity(problems.len());
@@ -83,8 +70,6 @@ impl FixedSupportBarycenterWorkspace {
 }
 
 /// Result of a fixed-support barycenter computation.
-///
-/// **Unstable**: output type for `fixed_support_barycenter`; `source_results` field may be made optional for memory efficiency.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FixedSupportBarycenter {
     /// Barycenter weights on the support.
@@ -104,8 +89,6 @@ pub struct FixedSupportBarycenter {
 }
 
 /// Compute a fixed-support Wasserstein barycenter.
-///
-/// **Unstable**: core barycenter algorithm; `initial_weights` parameter may become a typed enum.
 pub fn fixed_support_barycenter(
     problems: &[BarycenterProblem<'_>],
     combination_weights: &[f32],
@@ -243,8 +226,6 @@ pub fn fixed_support_barycenter(
 }
 
 /// Owned measure used by the free-support routine.
-///
-/// **Unstable**: input type for `free_support_barycenter`; may be replaced by a borrowed view when lifetimes are cleaner.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OwnedPointMeasure {
     /// Points in the measure.
@@ -254,8 +235,6 @@ pub struct OwnedPointMeasure {
 }
 
 /// Configuration for free-support barycenter.
-///
-/// **Unstable**: heuristic free-support iteration config; support-update strategy is exploratory.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FreeSupportConfig {
     /// Inner fixed-support barycenter configuration.
@@ -277,8 +256,6 @@ impl Default for FreeSupportConfig {
 }
 
 /// Result of a free-support barycenter computation.
-///
-/// **Unstable**: output of the heuristic free-support routine; shape tied to current relocation algorithm.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FreeSupportBarycenter {
     /// Barycenter support points.
@@ -294,12 +271,6 @@ pub struct FreeSupportBarycenter {
 }
 
 /// Heuristic free-support barycenter for squared Euclidean geometry.
-///
-/// Alternates between fixed-support weight updates and Euclidean support
-/// relocation. Useful for exploratory analysis; production drift scoring
-/// usually only needs fixed-support barycenters or pairwise OT.
-///
-/// **Unstable**: heuristic algorithm; convergence guarantees and parameter defaults are subject to tuning.
 pub fn free_support_barycenter(
     measures: &[OwnedPointMeasure],
     combination_weights: &[f32],

@@ -1,11 +1,6 @@
-//! Streaming online drift detection via Sinkhorn divergence.
+//! Streaming, sliding-window drift detection via Sinkhorn divergence.
 //!
-//! Implements `OnlineDriftDetector` as a sample-count sliding-window drift sensor
-//! that calls `point_set_sinkhorn_divergence` every `check_interval` observations.
-//! The first `window_size` samples populate a frozen reference distribution; all
-//! subsequent samples slide through `current_window`.
-//!
-//! See ADR-055 for design rationale and crate-boundary rules.
+//! Extended background: <https://github.com/ohdearquant/lattice/blob/main/crates/transport/docs/algorithms.md>.
 
 use std::collections::VecDeque;
 
@@ -17,17 +12,10 @@ use crate::{
 /// Minimum `window_size` enforced by `OnlineDriftConfig::normalized`.
 pub const MIN_ONLINE_DRIFT_WINDOW_SIZE: usize = 128;
 
-/// Maximum `window_size` enforced by `OnlineDriftConfig::normalized`.
-///
-/// Each drift check builds three `W×W` Sinkhorn workspaces, so memory scales as
-/// O(W²). This cap bounds one detector's workspace footprint to roughly
-/// 3 × 4096² × 4 bytes ≈ 192 MB, preventing a deserialized config with an
-/// oversized window from exhausting memory.
+/// Maximum window size, bounding three O(W²) workspaces to about 192 MiB.
 pub const MAX_ONLINE_DRIFT_WINDOW_SIZE: usize = 4096;
 
 /// Configuration for streaming Sinkhorn drift detection.
-///
-/// **Stable** (provisional): aggregate config for the online drift API; new fields would be additive with `Default`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OnlineDriftConfig {
     /// Sliding window size W. Clamped to `[128, 4096]` by `normalized` (O(W²) cost per check).
@@ -63,8 +51,6 @@ impl OnlineDriftConfig {
 }
 
 /// Per-sample online drift status returned by [`OnlineDriftDetector::observe`].
-///
-/// **Stable** (provisional): four-variant status enum; new variants would be additive.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnlineDriftSignal {
@@ -98,13 +84,7 @@ pub enum OnlineDriftSignal {
     },
 }
 
-/// Streaming Sinkhorn drift detector.
-///
-/// The first `window_size` samples auto-fit a frozen reference distribution.
-/// Subsequent samples slide through `current_window`; every `check_interval`
-/// observations `observe` computes S(reference, current) and emits a signal.
-///
-/// **Stable** (provisional): `new` + `observe` + `reset_reference` are the stable surface.
+/// Streaming Sinkhorn drift detector with frozen-reference and sliding windows.
 #[derive(Debug, Clone)]
 pub struct OnlineDriftDetector {
     config: OnlineDriftConfig,
@@ -142,10 +122,7 @@ impl OnlineDriftDetector {
         }
     }
 
-    /// Observe one embedding sample and return the current drift status.
-    ///
-    /// Returns `Err(SinkhornError)` only on solver failure; status signals are
-    /// encoded in the `Ok` variants.
+    /// Observe one sample; solver failures are `Err` and statuses are `Ok`.
     pub fn observe(&mut self, embedding: Vec<f32>) -> Result<OnlineDriftSignal, SinkhornError> {
         self.samples_seen += 1;
 
@@ -190,7 +167,7 @@ impl OnlineDriftDetector {
             &mut self.workspace_yy,
         )?;
 
-        // Clamp tiny negative floating-point noise; debiased divergence is non-negative by definition.
+        // Clamp roundoff: the debiased divergence is non-negative.
         let value = divergence.value.max(0.0);
         self.last_divergence = Some(value);
 
@@ -207,10 +184,7 @@ impl OnlineDriftDetector {
         }
     }
 
-    /// Promote the current window to the frozen reference distribution.
-    ///
-    /// Call after an adapter or router refresh to reset the baseline. `samples_seen`
-    /// is preserved so `window_pos` in future signals remains monotonically increasing.
+    /// Promote the current window to the reference while preserving `samples_seen`.
     pub fn reset_reference(&mut self) {
         self.reference_window = self.current_window.clone();
         self.workspace_xy.reset();
@@ -287,11 +261,10 @@ mod tests {
                 .state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            // Map high 32 bits to [0, 1).
             (self.state >> 32) as f32 / u32::MAX as f32
         }
 
-        // Sample from approximate N(mean, 1) using Box-Muller (two uniforms -> one normal).
+        // Box-Muller sample from approximately N(mean, 1).
         fn next_normal(&mut self, mean: f32) -> f32 {
             let u1 = self.next_f32().max(1e-10);
             let u2 = self.next_f32();
@@ -333,8 +306,6 @@ mod tests {
 
     #[test]
     fn online_drift_computes_when_window_fills() {
-        // With check_interval=1 and a high threshold, sample 128 fills both windows
-        // with identical data, which should yield near-zero divergence.
         let config = OnlineDriftConfig {
             window_size: 128,
             check_interval: 1,
@@ -376,15 +347,11 @@ mod tests {
         let mut detector = OnlineDriftDetector::new(config);
         let mut rng = Lcg::new(7);
 
-        // Feed 128 samples — fills both windows; sample 128 is divisible by 8 so it
-        // triggers a compute. Sample 129 is not divisible by 8 so it must be Skipped.
         for _ in 0..128 {
             detector.observe(make_vector(&mut rng, 4, 0.0)).unwrap();
         }
         let at_128 = detector.observe(make_vector(&mut rng, 4, 0.0)).unwrap();
-        // sample 129 (not on interval 8)
         let at_129 = at_128; // we already consumed it; redo:
-        // Reset and replay carefully.
         let mut detector2 = OnlineDriftDetector::new(OnlineDriftConfig {
             window_size: 128,
             check_interval: 8,
@@ -395,7 +362,6 @@ mod tests {
         for _ in 0..128 {
             detector2.observe(make_vector(&mut rng2, 4, 0.0)).unwrap();
         }
-        // sample 129 — check_interval=8, 129 % 8 = 1 ≠ 0 → Skipped
         let sig_129 = detector2.observe(make_vector(&mut rng2, 4, 0.0)).unwrap();
         assert!(
             matches!(
@@ -407,7 +373,6 @@ mod tests {
             ),
             "expected Skipped at 129 with next_check_in=7, got {sig_129:?}"
         );
-        // Verify sample 128 was Stable or Drift (not Warming or Skipped).
         let mut detector3 = OnlineDriftDetector::new(OnlineDriftConfig {
             window_size: 128,
             check_interval: 8,
@@ -418,7 +383,6 @@ mod tests {
         for _ in 0..127 {
             detector3.observe(make_vector(&mut rng3, 4, 0.0)).unwrap();
         }
-        // sample 128 — 128 % 8 == 0 → compute
         let sig_128 = detector3.observe(make_vector(&mut rng3, 4, 0.0)).unwrap();
         assert!(
             matches!(
@@ -432,8 +396,6 @@ mod tests {
 
     #[test]
     fn online_drift_detects_gaussian_shift() {
-        // Feed 128 reference samples near 0.0, then 128 shifted samples near 4.0.
-        // With a low threshold, a Drift signal must appear after the shift.
         let config = OnlineDriftConfig {
             window_size: 128,
             check_interval: 1,
@@ -443,14 +405,11 @@ mod tests {
         let mut detector = OnlineDriftDetector::new(config);
         let mut rng = Lcg::new(2025);
 
-        // Warm up with reference near 0.
         for _ in 0..128 {
             let sig = detector.observe(make_vector(&mut rng, 8, 0.0)).unwrap();
-            // These may be Warming or Stable; no assertion needed during warm-up.
             let _ = sig;
         }
 
-        // Feed shifted samples; at least one Drift should appear.
         let mut found_drift = false;
         for _ in 0..128 {
             let sig = detector.observe(make_vector(&mut rng, 8, 4.0)).unwrap();
@@ -460,8 +419,6 @@ mod tests {
             } = sig
             {
                 assert!(divergence > 0.1, "drift divergence should exceed threshold");
-                // window_pos is samples_seen at detection time; must be > 128 since windows
-                // need to be full first, and we're in the shifted batch.
                 assert!(
                     window_pos > 128,
                     "window_pos must be after warm-up: got {window_pos}"
@@ -478,7 +435,6 @@ mod tests {
 
     #[test]
     fn online_drift_zero_divergence_identical_distributions() {
-        // After reset_reference, feeding the same sequence should give near-zero divergence.
         let config = OnlineDriftConfig {
             window_size: 128,
             check_interval: 1,
@@ -488,15 +444,12 @@ mod tests {
         let mut detector = OnlineDriftDetector::new(config);
         let mut rng = Lcg::new(55);
 
-        // Collect 128 fixed vectors.
         let vecs: Vec<Vec<f32>> = (0..128).map(|_| make_vector(&mut rng, 4, 0.0)).collect();
 
-        // Fill detector with the fixed sequence.
         for v in &vecs {
             detector.observe(v.clone()).unwrap();
         }
 
-        // Promote current window to reference, then replay identical sequence.
         detector.reset_reference();
 
         let mut last_signal = None;
@@ -517,7 +470,6 @@ mod tests {
 
     #[test]
     fn online_drift_reproducible_with_fixed_sequence() {
-        // Two detectors with identical config and same input sequence must produce identical signals.
         let config = OnlineDriftConfig {
             window_size: 128,
             check_interval: 8,

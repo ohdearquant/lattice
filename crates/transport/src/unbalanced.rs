@@ -1,11 +1,6 @@
 //! Unbalanced Sinkhorn with KL-relaxed marginals.
 //!
-//! See: Chizat et al., "Scaling Algorithms for Unbalanced Optimal Transport Problems", Math. Comp. 2018.
-//!
-//! This variant is preferable when the two embedding corpora do not represent
-//! exactly the same total mass: entries may have been added, deleted, or had
-//! their importance reweighted. Instead of forcing equality with dummy nodes,
-//! the KL penalty softly charges mass creation and destruction.
+//! Extended background: <https://github.com/ohdearquant/lattice/blob/main/crates/transport/docs/algorithms.md>.
 
 use core::mem;
 
@@ -31,8 +26,6 @@ fn use_parallel_sinkhorn(rows: usize, cols: usize) -> bool {
 }
 
 /// Configuration for KL-relaxed Sinkhorn.
-///
-/// **Unstable**: unbalanced OT API is secondary to the balanced solver; tau parameters may be restructured.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UnbalancedConfig {
     /// Entropy regularization strength.
@@ -66,8 +59,6 @@ impl Default for UnbalancedConfig {
 }
 
 /// Result of an unbalanced Sinkhorn solve.
-///
-/// **Unstable**: field set mirrors `SinkhornResult` but adds KL penalty fields; may be unified in a future refactor.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UnbalancedResult {
     /// Epsilon used.
@@ -101,8 +92,6 @@ pub struct UnbalancedResult {
 }
 
 /// Unbalanced Sinkhorn solver with KL-relaxed marginal constraints.
-///
-/// **Unstable**: solver for mass-imbalanced distributions; API may be unified with `SinkhornSolver` via a mode enum.
 #[derive(Debug, Clone, Default)]
 pub struct UnbalancedSinkhornSolver {
     /// Solver configuration.
@@ -112,16 +101,11 @@ pub struct UnbalancedSinkhornSolver {
 impl UnbalancedSinkhornSolver {
     /// Create a solver with the given configuration.
     ///
-    /// **Unstable**: constructor matches struct stability.
     pub fn new(config: UnbalancedConfig) -> Self {
         Self { config }
     }
 
-    /// Dense-matrix solve with gated Rayon-parallel row/column updates for n ≥ 500.
-    ///
-    /// Same semantics as `solve`; concrete `DenseCostMatrix` type enables internal parallelism.
-    ///
-    /// **Unstable**: matches `solve` stability.
+    /// Dense-matrix solve that enables internal parallel updates.
     pub fn solve_dense(
         &self,
         cost: &DenseCostMatrix,
@@ -220,7 +204,6 @@ impl UnbalancedSinkhornSolver {
         let use_par = use_parallel_sinkhorn(rows, cols);
 
         for iteration in 0..self.config.max_iterations {
-            // Row update (log_u)
             let max_du = if use_par {
                 let log_v = workspace.log_v.as_slice();
                 let old_log_u = workspace.log_u.as_slice();
@@ -280,7 +263,6 @@ impl UnbalancedSinkhornSolver {
             };
             mem::swap(&mut workspace.log_u, &mut workspace.next_log_u);
 
-            // Column update (log_v)
             let max_dv = if use_par {
                 let log_u = workspace.log_u.as_slice();
                 let old_log_v = workspace.log_v.as_slice();
@@ -424,7 +406,6 @@ impl UnbalancedSinkhornSolver {
 
     /// Solve an unbalanced OT problem.
     ///
-    /// **Unstable**: primary entry point; signature may change when unified with balanced solver.
     pub fn solve<C>(
         &self,
         cost: &C,

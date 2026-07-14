@@ -1,17 +1,12 @@
-//! Sparse transport plan extraction.
+//! Sparse transport-plan extraction from Sinkhorn dual variables.
 //!
-//! The solver itself keeps only dual variables because storing the dense coupling
-//! is infeasible for large problems. This module reconstructs only the entries
-//! above a user-specified threshold, which is typically what downstream drift
-//! analysis and audit tooling needs.
+//! Extended background: <https://github.com/ohdearquant/lattice/blob/main/crates/transport/docs/algorithms.md>.
 
 use super::cost::CostMatrix;
 use super::logsumexp::{safe_exp, safe_ln};
 use super::sinkhorn::{SinkhornError, SinkhornResult};
 
 /// A single entry in the sparse transport plan.
-///
-/// **Stable** (provisional): output record type; all fields represent documented plan attributes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SparseTransportEntry {
     /// Source index.
@@ -27,8 +22,6 @@ pub struct SparseTransportEntry {
 }
 
 /// Sparse representation of the optimal coupling.
-///
-/// **Stable** (provisional): output from `extract_sparse_plan`; embedded in `DriftReport`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SparseTransportPlan {
     /// Number of source entries.
@@ -46,8 +39,6 @@ pub struct SparseTransportPlan {
 }
 
 /// Compute log-gamma for a single (row, col) entry.
-///
-/// **Stable** (provisional): thin delegation to `SinkhornResult::log_gamma`; re-exported for convenience.
 #[inline]
 pub fn log_gamma<C>(
     result: &SinkhornResult,
@@ -62,8 +53,6 @@ where
 }
 
 /// Extract entries of the transport plan above a mass threshold.
-///
-/// **Stable** (provisional): primary plan extraction function used by `DriftReport` construction.
 pub fn extract_sparse_plan<C>(
     result: &SinkhornResult,
     cost: &C,
