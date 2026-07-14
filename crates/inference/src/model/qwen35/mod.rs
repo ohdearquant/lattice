@@ -35,10 +35,11 @@ pub(crate) use eval::{log_softmax_nll, run_strided_perplexity};
 mod tests;
 
 /// Test-only tiny zero-weight model construction (ADR-080 C2), gated behind
-/// the `test-utils` Cargo feature so it never
-/// ships in a normal build -- see the module doc comment for why this can't
-/// just be `#[cfg(test)]` like the library's own internal test fixtures.
-#[cfg(feature = "test-utils")]
+/// the `test-utils` Cargo feature (for `crates/inference/src/bin/lattice.rs`'s
+/// separate compilation unit) OR `cfg(test)` (for this crate's own library
+/// tests, e.g. `generation.rs`'s `StopReason` tests) so it never ships in a
+/// normal build.
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
 
 pub use model::Qwen35Model;
