@@ -8,7 +8,7 @@
 
 The embedding service must:
 
-1. Load a transformer model once per process (model weights are 100-400 MB; reloading is too slow).
+1. Load a transformer model once per service instance (model weights are 100-400 MB; reloading is too slow).
 2. Be cancellation-safe: if an async client disconnects during model loading (e.g., MCP timeout), the loading must not be abandoned and then restarted on the next request.
 3. Support both BERT encoder and Qwen3 decoder architectures with a single code path.
 4. Allow the output dimension to be configured via environment variable for MRL models.
@@ -19,8 +19,9 @@ blocking thread pool.
 
 ## Decision
 
-`NativeEmbeddingService` uses `std::sync::OnceLock<Result<LoadedModel, String>>` wrapped in
-`Arc` to guarantee once-and-only-once model loading that is safe under async cancellation.
+`NativeEmbeddingService` uses an instance-owned `std::sync::OnceLock<Result<LoadedModel, String>>`
+wrapped in `Arc` to guarantee once-and-only-once model loading per service instance that is safe
+under async cancellation. Separately constructed services own independent locks and models.
 
 ### Key Design Choices
 
@@ -33,8 +34,8 @@ continuous load attempts under flaky connectivity.
 
 `std::sync::OnceLock` runs its initializer to completion inside `spawn_blocking`. Even if
 the outer async future is cancelled and dropped, the `spawn_blocking` task continues
-running. The model is set in the `OnceLock` exactly once regardless of how many callers
-cancelled while waiting. The `OnceLock` is in an `Arc` so the `spawn_blocking` closure
+running. The model is set in the `OnceLock` exactly once regardless of how many callers on that
+service instance cancelled while waiting. The `OnceLock` is in an `Arc` so the `spawn_blocking` closure
 can own a reference to it and store the result after the original `NativeEmbeddingService`
 reference may have been dropped.
 
@@ -82,8 +83,9 @@ different MRL configurations never share a cache file. This is separate from the
 
 **Model mismatch is a hard error**
 
-`NativeEmbeddingService` is single-model: it loads exactly one model at construction time.
-`embed()` rejects requests for a different model with `EmbedError::InvalidInput`. Callers
+`NativeEmbeddingService` is single-model: it is configured for exactly one model at construction
+time and lazily loads that model. `embed()` rejects requests for a different model with
+`EmbedError::InvalidInput`. Callers
 that need multiple models should instantiate one `NativeEmbeddingService` per model and
 multiplex through a higher-level router.
 
@@ -108,7 +110,7 @@ multiplex through a higher-level router.
 ### Negative
 
 - First-call latency is high (~1-10 seconds for Qwen3-4B). Callers that need guaranteed sub-second response time must warm the service before accepting traffic.
-- Error from model loading is permanent within a process lifetime: once `OnceLock` stores `Err(...)`, subsequent calls always return that error without retry. Process restart is required to attempt a fresh load.
+- Error from model loading is permanent within that service instance's lifetime: once its `OnceLock` stores `Err(...)`, subsequent calls on the instance always return that error without retry. A fresh service instance is required to attempt a fresh load.
 - `NativeEmbeddingService` does not implement `Clone` — only `Arc<NativeEmbeddingService>` can be shared.
 
 ### Risks
