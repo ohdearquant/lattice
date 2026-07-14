@@ -1,26 +1,28 @@
 # lattice-inference — CONFIG.md
 
-Complete configuration reference for the lattice-inference pure-Rust transformer inference engine.
+Configuration reference for the lattice-inference pure-Rust transformer inference engine.
 
 ---
 
 ## ModelInferenceConfig
 
-**Source**: `src/model/qwen.rs:244`
+**Source**: `src/model/qwen.rs` (`ModelInferenceConfig`)
 
 Per-model runtime configuration, loaded from `inference_config.json` in the model directory. Defaults preserve exact Qwen3-Embedding-0.6B behavior — a model with no `inference_config.json` works out of the box.
 
-**Loading** (`qwen.rs:276`): `ModelInferenceConfig::load(model_dir)` reads `{model_dir}/inference_config.json`. Missing file → defaults. Malformed JSON → warning logged, defaults used. Non-Qwen models that lack `config.json` will error earlier at `parse_qwen_config`, so this struct only matters for Qwen variants.
+**Loading**: `ModelInferenceConfig::load(model_dir)` reads `{model_dir}/inference_config.json`. Missing file → defaults. Malformed JSON → warning logged, defaults used. Non-Qwen models that lack `config.json` will error earlier at `parse_qwen_config`, so this struct only matters for Qwen variants.
 
 ### Fields
 
-| Field                    | Type    | Default  | Source of Default                                   |
-| ------------------------ | ------- | -------- | --------------------------------------------------- |
-| `eos_token_id`           | `u32`   | `151643` | `default_eos_token_id()` at `qwen.rs:255`           |
-| `rope_table_max_seq_len` | `usize` | `8192`   | `default_rope_table_max_seq_len()` at `qwen.rs:258` |
-| `gpu_max_seq_len`        | `usize` | `2048`   | `default_gpu_max_seq_len()` at `qwen.rs:261`        |
+| Field                    | Type     | Default                | Source of Default                                   |
+| ------------------------ | -------- | ---------------------- | --------------------------------------------------- |
+| `eos_token_id`           | `u32`    | `151643`               | `default_eos_token_id()` at `qwen.rs:283`           |
+| `rope_table_max_seq_len` | `usize`  | `8192`                 | `default_rope_table_max_seq_len()` at `qwen.rs:286` |
+| `gpu_max_seq_len`        | `usize`  | `2048`                 | `default_gpu_max_seq_len()` at `qwen.rs:289`        |
+| `base_model_rev`         | `String` | `"none"`, then derived | `default_cache_compat_rev()` at `qwen.rs:292`       |
+| `tokenizer_rev`          | `String` | `"none"`, then derived | `default_cache_compat_rev()` at `qwen.rs:292`       |
 
-**Default impl** at `qwen.rs:265` calls each `default_*` function.
+**Default impl** calls each `default_*` function.
 
 ### Field Details
 
@@ -46,7 +48,19 @@ Per-model runtime configuration, loaded from `inference_config.json` in the mode
 
 **Why `2048`**: Embedding inputs are typically <512 tokens; 2048 provides 4× headroom without excessive GPU memory usage. For the 4B model with wider hidden dimensions (2560 vs 1024), the per-token buffer cost is 2.5× higher — reduce to 1024 if GPU memory is tight. For generation workloads, increase up to `rope_table_max_seq_len`.
 
-**Where used**: Metal forward pass buffer allocation (`forward/metal.rs` `MetalForwardPass`), KV cache sizing (`kv_cache.rs` `FlatKVCacheConfig`).
+**Where used**: Metal forward pass buffer allocation (`forward/metal.rs` `MetalForwardPass`), KV cache sizing (`kv_cache/flat.rs` `FlatKVCacheConfig`).
+
+#### `base_model_rev` — default `"none"`, derived on load
+
+**What it does**: Identifies the model revision recorded in embedding-cache manifests. `cache_load()` rejects a cache whose revision differs, before loading any entries.
+
+**Precedence**: An explicit non-`"none"` value in `inference_config.json` wins. Otherwise `ModelInferenceConfig::load()` derives `sha256:<16 hex chars>` from `config.json` plus the weight-file names, lengths, and boundary samples. If `config.json` is missing or unreadable, the value remains `"none"`.
+
+#### `tokenizer_rev` — default `"none"`, derived on load
+
+**What it does**: Identifies the tokenizer revision recorded in embedding-cache manifests. `cache_load()` rejects a cache whose tokenizer revision differs.
+
+**Precedence**: An explicit non-`"none"` value wins. Otherwise `ModelInferenceConfig::load()` derives `sha256:<16 hex chars>` from the complete `tokenizer.json` contents. If that file is missing or unreadable, the value remains `"none"`.
 
 ### Example: `inference_config.json`
 
@@ -54,7 +68,9 @@ Per-model runtime configuration, loaded from `inference_config.json` in the mode
 {
   "eos_token_id": 151643,
   "rope_table_max_seq_len": 8192,
-  "gpu_max_seq_len": 2048
+  "gpu_max_seq_len": 2048,
+  "base_model_rev": "qwen3-embedding-0.6b-rev1",
+  "tokenizer_rev": "qwen3-tokenizer-rev1"
 }
 ```
 
@@ -64,16 +80,20 @@ Omit any field to use the default. An empty `{}` is valid and equivalent to all 
 
 ## GenerateConfig
 
-**Source**: `src/generate.rs:25`
+**Source**: `src/generate.rs` (`GenerateConfig`)
 
-Text generation configuration for decoder-only models.
+Legacy text generation configuration for decoder-only models. This `crate::generate::GenerateConfig` type is deprecated since 0.5.1 but remains functional during its compatibility window; the canonical Qwen3.5 configuration is `crate::model::GenerateConfig` in `src/model/qwen35_config.rs`.
 
-| Field            | Type             | Default   | Source                             | Why                                                                                           |
-| ---------------- | ---------------- | --------- | ---------------------------------- | --------------------------------------------------------------------------------------------- |
-| `max_new_tokens` | `usize`          | `256`     | `Default` impl at `generate.rs:37` | Practical limit for chat-style responses. Increase for long-form generation                   |
-| `sampling`       | `SamplingConfig` | see below | `SamplingConfig::default()`        | Balanced temperature+nucleus sampling                                                         |
-| `eos_token_id`   | `Option<u32>`    | `None`    | `Default` impl                     | When `None`, generation runs to `max_new_tokens`. Set to model's EOS to enable early stopping |
-| `include_prompt` | `bool`           | `false`   | `Default` impl                     | Whether output includes the original prompt text                                              |
+| Field               | Type                         | Default   | Source                              | Why                                                                                           |
+| ------------------- | ---------------------------- | --------- | ----------------------------------- | --------------------------------------------------------------------------------------------- |
+| `max_new_tokens`    | `usize`                      | `256`     | `Default` impl at `generate.rs:126` | Practical limit for chat-style responses. Increase for long-form generation                   |
+| `sampling`          | `SamplingConfig`             | see below | `SamplingConfig::default()`         | Balanced temperature+nucleus sampling                                                         |
+| `eos_token_id`      | `Option<u32>`                | `None`    | `Default` impl                      | When `None`, generation runs to `max_new_tokens`. Set to model's EOS to enable early stopping |
+| `include_prompt`    | `bool`                       | `false`   | `Default` impl                      | Whether output includes the original prompt text                                              |
+| `grammar`           | `Option<Arc<GrammarEngine>>` | `None`    | `Default` impl                      | Masks logits and advances grammar state at every generated token                              |
+| `kv_cache_capacity` | `Option<usize>`              | `None`    | `Default` impl                      | Optional per-request cap on KV allocation and effective generation length                     |
+
+When `grammar` masks every token, generation fails closed with `InferenceError::InvalidInput`; a token rejected while advancing the grammar stops with `StopReason::Grammar`. `kv_cache_capacity` is clamped to `[1, prompt_len + max_new_tokens]`; a cap smaller than the prompt is rejected, and generation stops with `StopReason::KvFull` when the cache reaches the effective cap.
 
 ---
 
@@ -96,44 +116,43 @@ Token sampling parameters for text generation.
 
 ## Metal GPU Shape Constraints
 
-**Source**: `src/forward/metal.rs:1014-1043`
+**Source**: `src/forward/metal.rs` (`validate_fused_kernel_shape`, `msl_source_for`)
 
-The Metal fused attention shader has **compile-time MSL constants** that cannot be changed at runtime. A Rust-side guard (`validate_fused_kernel_shape` at `metal.rs:1017`) validates the model config before any GPU buffer allocation.
+The Metal fused attention shader uses **model-specific compile-time MSL constants**. `MetalForwardPass::new` validates structural requirements, then `msl_source_for` injects the model's head dimension and GQA group count before compiling the shader library.
 
 ### Constants
 
-| MSL Constant       | Rust Constant            | Value | Purpose                                                                                   |
-| ------------------ | ------------------------ | ----- | ----------------------------------------------------------------------------------------- |
-| `FA_HEAD_DIM`      | `METAL_FUSED_HEAD_DIM`   | `128` | Fused attention tile dimension. Model requires `hidden_size / num_attention_heads == 128` |
-| `FA_GQA_GROUPS`    | `METAL_FUSED_GQA_GROUPS` | `2`   | GQA group count. Model requires `num_attention_heads / num_key_value_heads == 2`          |
-| `FUSED_C_HEAD_DIM` | (same as above)          | `128` | Used in fused QK-norm + RoPE kernel at `metal.rs:886`                                     |
-| `FUSED_C_HALF_DIM` | (derived)                | `64`  | `HEAD_DIM / 2` for RoPE frequency pairs                                                   |
+| MSL Constant       | Injected value                              | Purpose                               |
+| ------------------ | ------------------------------------------- | ------------------------------------- |
+| `FA_HEAD_DIM`      | `config.head_dim`                           | Fused attention dimension             |
+| `FA_GQA_GROUPS`    | `num_attention_heads / num_key_value_heads` | Query heads served by each KV head    |
+| `FUSED_C_HEAD_DIM` | `config.head_dim`                           | Fused QK-norm + RoPE dimension        |
+| `FUSED_C_HALF_DIM` | `config.head_dim / 2`                       | RoPE frequency-pair count             |
+| `FUSED_C_THREADS`  | `config.head_dim / 2`                       | Fused QK-norm + RoPE threadgroup size |
 
 ### Validation Logic
 
 ```
 validate_fused_kernel_shape(config: &QwenConfig):
-  1. config.head_dim != 128            → Err("head_dim mismatch")
-  2. config.num_key_value_heads == 0    → Err("zero kv_heads")
-  3. num_heads % num_kv_heads != 0      → Err("not divisible")
-  4. num_heads / num_kv_heads != 2      → Err("GQA groups mismatch")
-  All pass                              → Ok(())
+  1. config.head_dim == 0                → Err("nonzero head_dim required")
+  2. config.head_dim % 4 != 0            → Err("head_dim must be divisible by 4")
+  3. config.num_key_value_heads == 0     → Err("nonzero kv_heads required")
+  4. num_heads % num_kv_heads != 0       → Err("not divisible")
+  All pass                               → Ok(num_heads / num_kv_heads)
 ```
 
-**On mismatch**: `QwenModel` sets `self.metal = None`. All forward passes silently fall back to the **CPU NEON path** (`forward/neon_forward.rs`). No error is raised — the model still works, just slower.
+**On mismatch**: `QwenModel` leaves `self.metal` unset. Forward passes use the CPU path instead; no initialization error is raised to the caller.
 
 ### Model Compatibility Matrix
 
-| Model                 | hidden | heads | kv_heads | head_dim | GQA   | Metal GPU? | Why               |
-| --------------------- | ------ | ----- | -------- | -------- | ----- | ---------- | ----------------- |
-| Qwen3-Embedding-0.6B  | 1024   | 16    | 8        | **64**   | 2     | **NO**     | head_dim=64 ≠ 128 |
-| Qwen3-Embedding-4B    | 2560   | 32    | 16       | **80**   | 2     | **NO**     | head_dim=80 ≠ 128 |
-| Qwen3-8B (generation) | 4096   | 32    | 8        | 128      | **4** | **NO**     | gqa=4 ≠ 2         |
-| Qwen3.5-14B           | 5120   | 40    | 8        | 128      | **5** | **NO**     | gqa=5 ≠ 2         |
+| Model                | hidden | heads | kv_heads | head_dim | GQA | Structural gate |
+| -------------------- | ------ | ----- | -------- | -------- | --- | --------------- |
+| Qwen3-Embedding-0.6B | 1024   | 16    | 8        | 64       | 2   | Pass            |
+| Qwen3-Embedding-4B   | 2560   | 32    | 16       | 80       | 2   | Pass            |
 
-**Currently no Qwen3-Embedding model passes the Metal gate.** The GPU kernels were optimized for a Qwen3.5 generation configuration (head_dim=128, GQA=2) that no shipping model matches. All embedding models run on CPU/NEON.
+Both Qwen3 embedding shapes pass the structural gate. Actual GPU activation also requires a Metal device, successful shader compilation, and `LATTICE_NO_GPU` to be unset. Initialization failure leaves `QwenModel::metal` unset and falls back to CPU; a per-call Metal failure also logs a warning and retries that forward pass on CPU.
 
-**To add Metal support for other head_dim values**: Rewrite the MSL shader with parameterized tile dimensions. This is a shader rewrite, not a config change.
+Qwen3.5 generation uses the separate `forward/metal_qwen35.rs` engine and is not governed by this embedding-path validator.
 
 ---
 
@@ -181,7 +200,8 @@ validate_fused_kernel_shape(config: &QwenConfig):
    - `rope_table_max_seq_len`: from `config.json` → `max_position_embeddings`
    - `gpu_max_seq_len`: based on expected workload and GPU memory budget
 
-3. **Check Metal compatibility**: compute `head_dim = hidden_size / num_attention_heads`.
-   If `head_dim != 128` or `gqa_groups != 2` → model runs CPU-only (automatic, no error).
+3. **Check Metal compatibility**: require nonzero `head_dim` divisible by 4, nonzero
+   `num_key_value_heads`, and `num_attention_heads` divisible by `num_key_value_heads`.
+   The resulting head dimension and GQA group count are injected into the MSL source.
 
 4. **Test**: `cargo test -p lattice-inference`, manual embedding generation.

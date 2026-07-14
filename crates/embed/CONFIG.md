@@ -25,9 +25,9 @@ Runtime configuration pairing a model with an optional MRL truncation dimension.
 
 **What it does**: Selects which embedding model to load and run.
 
-**Why `BgeSmallEnV15` as the code default**: It's the lightest local model (384 dims, 33M params), suitable for fast testing and development. In production, the actual model is typically set via application configuration to `multilingual-e5-small` (same dimensions but multilingual). The enum default is rarely used directly — `EmbeddedConfig::memory()` and `EmbeddedConfig::file()` constructors set the model from config.
+**Why `BgeSmallEnV15` as the code default**: It's the lightest local model (384 dims, 33M params), suitable for fast testing and development. `ModelConfig::default()` and `NativeEmbeddingService::new()` use this enum default; applications select another model with `NativeEmbeddingService::with_model()`, `with_model_config()`, or `with_model_from_env()`.
 
-**Important**: The **production default is `multilingual-e5-small`, NOT `bge-small-en-v1.5`**. Configure the active model via your application's config. The `EmbeddingModel` enum `#[default]` is for code that doesn't go through an application config path.
+**Important**: The crate has no separate production default. The active model is the model configured on each `NativeEmbeddingService` instance.
 
 #### `output_dim` — default `None`
 
@@ -58,31 +58,31 @@ Runtime configuration pairing a model with an optional MRL truncation dimension.
 
 ### Supported Models
 
-| Variant                        | Display Name             | HuggingFace ID                   | Native Dims | Max Tokens | Local?       | MRL? | Architecture  |
-| ------------------------------ | ------------------------ | -------------------------------- | ----------- | ---------- | ------------ | ---- | ------------- |
-| `BgeSmallEnV15` (code default) | `bge-small-en-v1.5`      | `BAAI/bge-small-en-v1.5`         | 384         | 512        | yes          | no   | BERT encoder  |
-| `BgeBaseEnV15`                 | `bge-base-en-v1.5`       | `BAAI/bge-base-en-v1.5`          | 768         | 512        | yes          | no   | BERT encoder  |
-| `BgeLargeEnV15`                | `bge-large-en-v1.5`      | `BAAI/bge-large-en-v1.5`         | 1024        | 512        | yes          | no   | BERT encoder  |
-| `MultilingualE5Small`          | `multilingual-e5-small`  | `intfloat/multilingual-e5-small` | 384         | 512        | yes          | no   | BERT encoder  |
-| `MultilingualE5Base`           | `multilingual-e5-base`   | `intfloat/multilingual-e5-base`  | 768         | 512        | yes          | no   | BERT encoder  |
-| `Qwen3Embedding0_6B`           | `qwen3-embedding-0.6b`   | `Qwen/Qwen3-Embedding-0.6B`      | 1024        | 8192       | yes          | yes  | Qwen3 decoder |
-| `Qwen3Embedding4B`             | `qwen3-embedding-4b`     | `Qwen/Qwen3-Embedding-4B`        | 2560        | 8192       | yes          | yes  | Qwen3 decoder |
-| `TextEmbedding3Small`          | `text-embedding-3-small` | `text-embedding-3-small`         | 1536        | 8191       | **no** (API) | —    | OpenAI remote |
+| Variant                        | Display Name             | HuggingFace ID                   | Native Dims | Max Tokens | Local? | MRL? | Architecture                           |
+| ------------------------------ | ------------------------ | -------------------------------- | ----------- | ---------- | ------ | ---- | -------------------------------------- |
+| `BgeSmallEnV15` (code default) | `bge-small-en-v1.5`      | `BAAI/bge-small-en-v1.5`         | 384         | 512        | yes    | no   | BERT encoder                           |
+| `BgeBaseEnV15`                 | `bge-base-en-v1.5`       | `BAAI/bge-base-en-v1.5`          | 768         | 512        | yes    | no   | BERT encoder                           |
+| `BgeLargeEnV15`                | `bge-large-en-v1.5`      | `BAAI/bge-large-en-v1.5`         | 1024        | 512        | yes    | no   | BERT encoder                           |
+| `MultilingualE5Small`          | `multilingual-e5-small`  | `intfloat/multilingual-e5-small` | 384         | 512        | yes    | no   | BERT encoder                           |
+| `MultilingualE5Base`           | `multilingual-e5-base`   | `intfloat/multilingual-e5-base`  | 768         | 512        | yes    | no   | BERT encoder                           |
+| `Qwen3Embedding0_6B`           | `qwen3-embedding-0.6b`   | `Qwen/Qwen3-Embedding-0.6B`      | 1024        | 8192       | yes    | yes  | Qwen3 decoder                          |
+| `Qwen3Embedding4B`             | `qwen3-embedding-4b`     | `Qwen/Qwen3-Embedding-4B`        | 2560        | 8192       | yes    | yes  | Qwen3 decoder                          |
+| `TextEmbedding3Small`          | `text-embedding-3-small` | `text-embedding-3-small`         | 1536        | 8191       | **no** | —    | Remote identifier; no provider service |
 
 ### Key Methods
 
-| Method                   | Returns        | Notes                                                                    |
-| ------------------------ | -------------- | ------------------------------------------------------------------------ |
-| `native_dimensions()`    | `usize`        | Full output dimension (ignoring MRL) — `model.rs:143`                    |
-| `dimensions()`           | `usize`        | Same as `native_dimensions()` (MRL is on `ModelConfig`) — `model.rs:165` |
-| `is_local()`             | `bool`         | All except `TextEmbedding3Small` — `model.rs:171`                        |
-| `is_remote()`            | `bool`         | Only `TextEmbedding3Small` — `model.rs:186`                              |
-| `max_input_tokens()`     | `usize`        | Token limit for chunking/truncation — `model.rs:200`                     |
-| `supports_output_dim()`  | `bool`         | Only Qwen3 variants — `model.rs:263`                                     |
-| `query_instruction()`    | `Option<&str>` | Query prefix for asymmetric retrieval; BGE/E5/Qwen3 `Some`, MiniLM `None` — `model.rs:227`                       |
-| `document_instruction()` | `Option<&str>` | E5 `"passage: "`; `None` for others — `model.rs:242`                                |
-| `model_id()`             | `&str`         | HuggingFace ID — `model.rs:248`                                          |
-| `key_version()`          | `&str`         | `"v3"` for Qwen3/OpenAI, `"v1.5"` for BGE/E5 — `model.rs:272`            |
+| Method                   | Returns        | Notes                                                                                      |
+| ------------------------ | -------------- | ------------------------------------------------------------------------------------------ |
+| `native_dimensions()`    | `usize`        | Full output dimension (ignoring MRL) — `model.rs:143`                                      |
+| `dimensions()`           | `usize`        | Same as `native_dimensions()` (MRL is on `ModelConfig`) — `model.rs:165`                   |
+| `is_local()`             | `bool`         | All except `TextEmbedding3Small` — `model.rs:171`                                          |
+| `is_remote()`            | `bool`         | Only `TextEmbedding3Small`; classification only, no provider service — `model.rs:186`      |
+| `max_input_tokens()`     | `usize`        | Token limit for chunking/truncation — `model.rs:200`                                       |
+| `supports_output_dim()`  | `bool`         | Only Qwen3 variants — `model.rs:263`                                                       |
+| `query_instruction()`    | `Option<&str>` | Query prefix for asymmetric retrieval; BGE/E5/Qwen3 `Some`, MiniLM `None` — `model.rs:227` |
+| `document_instruction()` | `Option<&str>` | E5 `"passage: "`; `None` for others — `model.rs:242`                                       |
+| `model_id()`             | `&str`         | HuggingFace ID — `model.rs:248`                                                            |
+| `key_version()`          | `&str`         | `"v3"` for Qwen3/OpenAI, `"v1.5"` for BGE/E5 — `model.rs:272`                              |
 
 ### String Parsing
 
@@ -206,16 +206,16 @@ Runtime SIMD feature detection determines which vector kernel is used for dot pr
 
 ---
 
-## Production Model Selection
+## Service Model Selection
 
-The **production default is `multilingual-e5-small`**, configured at the application level.
+The crate default is `BgeSmallEnV15`. Select a different model when constructing a service.
 
 ### How to Change the Active Model
 
-1. Set via `EmbeddedConfig` in code:
+1. Set via `ModelConfig` and `NativeEmbeddingService` in code:
    ```rust
-   let config = EmbeddedConfig::file("/path/to/db")
-       .with_embedding_model("qwen3-embedding-0.6b", 1024);
+   let config = ModelConfig::try_new(EmbeddingModel::Qwen3Embedding0_6B, Some(1024))?;
+   let service = NativeEmbeddingService::with_model_config(config)?;
    ```
 
 2. After changing models, existing embeddings are **incompatible** — check a model hash on startup and block if it mismatches. Re-embed existing data or start with a fresh database.
@@ -267,13 +267,16 @@ Or via env var:
 LATTICE_EMBED_DIM=1024 your-app --embed-query "query"
 ```
 
-### Remote (OpenAI)
+### Reserved Remote Model Identifier
 
 ```rust
 let config = ModelConfig::new(EmbeddingModel::TextEmbedding3Small);
-// Requires OPENAI_API_KEY env var
-// 1536 dimensions, no MRL support
 ```
+
+`TextEmbedding3Small` is a type-level remote model identifier. `lattice-embed` does not implement
+an OpenAI provider service and does not read `OPENAI_API_KEY`; `NativeEmbeddingService` rejects
+this model when loading. Constructing this `ModelConfig` alone does not provide a runnable remote
+embedding path.
 
 ---
 

@@ -25,11 +25,11 @@ All thresholds are constants in `gpu::thresholds`:
 | Matrix-vector | >10,000 elements | GPU launch overhead dominates below this |
 | Batch matmul  | batch_size > 100 | Amortize kernel launch cost              |
 | Activation    | >1,000 elements  | Element-wise is memory-bound             |
-| Max dispatch  | 100,000 elements | Stay under Metal 2ms watchdog            |
+| Max dispatch  | 100,000 elements | Static heuristic for CPU fallback        |
 
 `GpuNetwork::new` evaluates `should_use_gpu(total_params, 1)` at construction time. If the network is too small, `use_gpu = false` and all `forward()` calls delegate to the CPU network immediately, incurring no GPU overhead.
 
-The watchdog check (`elements > MAX_ELEMENTS_PER_DISPATCH`) inside `forward_gpu` provides a second safety net: if a single layer would exceed the Metal 2ms dispatch limit, the entire forward pass falls back to CPU rather than risking a GPU timeout.
+The element-count check (`elements > MAX_ELEMENTS_PER_DISPATCH`) inside `forward_gpu` provides a second fallback heuristic: if a single layer exceeds the cap, the entire forward pass falls back to CPU. It does not measure GPU execution time or enforce a 2ms boundary; `MAX_DISPATCH_TIME_MS` is not read by the dispatch logic.
 
 #### Shader Types and Compilation
 
@@ -106,8 +106,8 @@ After CPU-side training updates weights, `GpuNetwork::sync_weights()` calls `que
 
 ### Risks
 
-- The fallback to CPU inside `forward_gpu` (watchdog check) returns from the entire forward pass using the CPU network, losing any GPU work done on previous layers. This is correct but potentially surprising — partial GPU acceleration is not attempted.
-- The Metal 2ms watchdog is empirically set; different GPU generations may have different thresholds. `MAX_DISPATCH_TIME_MS = 1.5` is a conservative headroom.
+- The fallback to CPU inside `forward_gpu` (element-count check) returns from the entire forward pass using the CPU network, losing any GPU work done on previous layers. This is correct but potentially surprising — partial GPU acceleration is not attempted.
+- The 100,000-element cap is a fixed heuristic and may not correlate with dispatch duration across GPU generations. `MAX_DISPATCH_TIME_MS = 1.5` records a documentation target only; the code does not measure elapsed dispatch time.
 
 ## References
 

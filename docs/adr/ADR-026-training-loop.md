@@ -63,11 +63,11 @@ Each epoch computes the average error across all batches. If `avg_error < config
 
 `TrainingConfig::seed: Option<u64>` controls the shuffle RNG. If `Some(seed)`, `SmallRng::seed_from_u64(seed)` is used; if `None`, `SmallRng::from_entropy()`. The RNG is created once before the epoch loop (not per-epoch) to ensure the full shuffle sequence is deterministic across epochs when a seed is provided.
 
-#### No Allocation in Hot Path
+#### Hot-Path Allocation Profile
 
 Gradient buffers (`weight_grads`, `bias_grads`) and the index vector (`indices`) are allocated once before the epoch loop. Inside each epoch, gradient buffers are zeroed with `fill(0.0)`. The velocity buffers are allocated once in `init_velocities` and reused across all epochs.
 
-The `compute_gradients` method calls `network.forward(input)` for the forward pass (which uses pre-allocated activation buffers), then reads layer weights and activations via `&[f32]` references — no per-sample cloning.
+The `compute_gradients` method calls `network.forward(input)` for the forward pass, which uses pre-allocated activation buffers. It then copies the final output into a new `Vec<f32>` and allocates the outer deltas vector plus one delta vector per layer for each sample. Layer weights and stored activation buffers are subsequently read through slice references rather than cloned.
 
 #### `Trainer` Trait
 
@@ -78,7 +78,7 @@ pub trait Trainer {
 }
 ```
 
-`lattice-tune`'s `GpuTrainer` can implement this trait to provide GPU-accelerated training as a drop-in replacement. The separation ensures `lattice-fann`'s core stays sync and allocation-free.
+`lattice-tune`'s `GpuTrainer` can implement this trait to provide GPU-accelerated training as a drop-in replacement. The separation keeps `lattice-fann`'s core training API synchronous and independent of the GPU runtime.
 
 ### Alternatives Considered
 
@@ -100,7 +100,7 @@ pub trait Trainer {
 
 ### Negative
 
-- `BackpropTrainer::compute_gradients` allocates `deltas: Vec<Vec<f32>>` per training sample. This is the most expensive allocation in the training hot path. A pre-allocated deltas buffer (similar to how gradient buffers are pre-allocated) would eliminate it.
+- `BackpropTrainer::compute_gradients` copies the final output and allocates `deltas: Vec<Vec<f32>>` per training sample. These are the per-sample allocations in the training hot path. Pre-allocated output and deltas buffers (similar to the gradient buffers) would eliminate them.
 - `Trainer` trait is synchronous only — async training requires a different interface, which is why `lattice-tune` implements its own `GpuTrainer`.
 
 ### Risks

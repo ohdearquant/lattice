@@ -4,6 +4,7 @@
 > **Target:** macOS 26, SwiftUI, `swift build`. Toolchain verified: Apple Swift 6.3.2 / `arm64-apple-macosx26.0`.
 > **Backend:** the `lattice` pure-Rust engine, driven via CLI subprocesses (line-delimited JSON event stream).
 > **Brand law (governs both directions):** *measure first, the number is the truth.* Bold is spent on the **numbers**, not on chrome. Adaptive light + dark from day one.
+> **Current implementation status:** The shipped app forces `.preferredColorScheme(.dark)`; light mode remains deferred relative to this decision.
 
 ---
 
@@ -45,7 +46,9 @@ The README is explicit that MLX is faster; lattice's edge is **capabilities + ho
 
 ### Palette
 
-Adaptive via semantic `Color` assets in the asset catalog (`Color(.panel)`, `Color(.ink)`, `Color(.signal)`…). Dark is the home key; light is a true first-class peer reading like a lab instrument under daylight — same hairline-and-well skeleton, value-inverted.
+This design specifies dark and light semantic color tokens. The shipped app currently locks
+`preferredColorScheme(.dark)`, so dark is the only active appearance and light implementation is
+deferred. The table below retains the intended paired values.
 
 | Token | Dark hex | Light hex | Usage |
 |---|---|---|---|

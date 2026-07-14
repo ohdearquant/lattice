@@ -9,6 +9,16 @@ Knowledge distillation and training infrastructure for lattice neural models.
 - **Model Registry**: Semver versioning with lineage tracking
 - **Endpoint Security**: TLS enforcement, domain whitelisting, checksum verification
 
+## Current Implementation Status
+
+`DistillationPipeline` and the CPU `TrainingLoop` currently provide orchestration
+placeholders, not end-to-end training. `DistillationPipeline::label_single` does
+not contact a teacher API; it returns a simulated label distribution and
+confidence. `TrainingLoop::train` drives batching, callbacks, metrics, early
+stopping, and in-memory checkpoints, but its loss and accuracy are simulated and
+it does not update model weights. Do not treat either result as evidence of live
+teacher labeling or trained parameters.
+
 ## Pipeline Overview
 
 ```text
@@ -152,10 +162,12 @@ let mut dataset = Dataset::from_examples(examples);
 // Configure batching
 let config = DatasetConfig::with_batch_size(32)
     .shuffle(true)
-    .seed(42)
-    .validation_split(0.2);
+    .seed(42);
 
 dataset.set_config(config)?;
+
+// Split explicitly: 80% training, 20% validation
+let (train, validation) = dataset.split(0.8)?;
 
 let stats = dataset.stats();
 println!("Examples: {}", stats.num_examples);
@@ -165,15 +177,17 @@ println!("Embedding dim: {}", stats.embedding_dim);
 ### Validation Split
 
 ```rust
-use lattice_tune::data::{Dataset, DatasetConfig};
+use lattice_tune::data::Dataset;
 
-let config = DatasetConfig::with_batch_size(32)
-    .validation_split(0.2);  // 20% for validation
-
-// Dataset automatically handles train/validation split
+let dataset = Dataset::from_examples(examples);
+let (train, validation) = dataset.split(0.8)?; // 20% for validation
 ```
 
 ## Distillation Pipeline
+
+This example exercises the current simulated response path. It validates the
+teacher configuration and formats the prompt, but it makes no HTTP request and
+does not read an API key.
 
 ```rust
 use lattice_tune::distill::{TeacherConfig, DistillationPipeline, RawExample};
@@ -190,9 +204,9 @@ let raw = RawExample::new(
     "What's the weather like?",
 );
 
-// Label with teacher
+// Produce the placeholder's simulated labels
 let result = pipeline.label_single(&raw)?;
-println!("Labeled with confidence: {}", result.confidence);
+println!("Simulated confidence: {}", result.confidence);
 
 // Check statistics
 let stats = pipeline.stats();
@@ -230,6 +244,9 @@ config.validate()?;
 
 ### Training Loop
 
+The CPU loop below reports simulated metrics and does not forward through or
+update a neural network.
+
 ```rust
 use lattice_tune::train::{TrainingConfig, TrainingLoop};
 use lattice_tune::data::Dataset;
@@ -238,22 +255,21 @@ let config = TrainingConfig::quick();  // Fast training preset
 let mut trainer = TrainingLoop::new(config)?;
 
 let metrics = trainer.train(&mut dataset)?;
-println!("Final loss: {:.4}", metrics.final_train_loss);
+println!("Simulated final loss: {:.4}", metrics.final_train_loss);
 println!("Epochs completed: {}", metrics.epochs_completed);
 ```
 
 ### Checkpointing
 
+`Checkpoint` is an in-memory record. The training loop sends periodic records to
+`TrainingCallback::on_checkpoint`; it does not write `checkpoint_dir`, and
+`Checkpoint` has no file `save`, `load`, or `into_network` methods. Callers own
+any serialization and persistence. Resuming restores only loop epoch, global
+step, and metrics—not model weights or optimizer state.
+
 ```rust
-use lattice_tune::train::Checkpoint;
-
-// Save checkpoint
-let checkpoint = Checkpoint::new(&network, &training_state);
-checkpoint.save("checkpoints/epoch_50.ckpt")?;
-
-// Load checkpoint
-let loaded = Checkpoint::load("checkpoints/epoch_50.ckpt")?;
-let network = loaded.into_network();
+let checkpoint = trainer.checkpoint();
+trainer.resume_from(&checkpoint);
 ```
 
 ## Model Registry
@@ -264,7 +280,7 @@ let network = loaded.into_network();
 use lattice_tune::registry::{ModelRegistry, RegisteredModel, ModelMetadata};
 
 // Create in-memory registry
-let mut registry = ModelRegistry::in_memory();
+let registry = ModelRegistry::in_memory();
 
 // Create model with metadata
 let metadata = ModelMetadata::classifier(768, 6, 10000)
@@ -279,11 +295,16 @@ let weights = vec![0u8; 1000];
 let id = registry.register(model, &weights)?;
 
 // Retrieve the model
-let loaded = registry.get("intent_classifier", "1.0.0")?;
-println!("Loaded: {}", loaded.full_name());
+if let Some(loaded) = registry.get("intent_classifier", "1.0.0") {
+    println!("Loaded: {}", loaded.full_name());
+}
 ```
 
 ### Model Status Lifecycle
+
+This is the conventional lifecycle, not an enforced transition graph.
+`update_status` can assign any status, and `promote_to_production` does not
+require a validated or staged target. Callers must enforce deployment gates.
 
 ```text
 Pending -> Validated -> Staged -> Production
@@ -317,36 +338,40 @@ let metadata = ModelMetadata::classifier(768, 6, 15000);
 
 let finetuned = RegisteredModel::new("intent_classifier", "1.1.0")
     .with_metadata(metadata)
-    .with_parent(base_id);  // Track lineage
+    .with_parent(base_id);  // Store the caller-supplied parent reference
 ```
+
+Registration does not validate `parent_id` or append the fine-tuned model's ID
+to the parent's `children` field. Applications that need reverse lineage must
+maintain both sides themselves.
 
 ## Feature Flags
 
-| Feature          | Default | Description                                                  |
-| ---------------- | ------- | ------------------------------------------------------------ |
-| `std`            | Yes     | Standard library support                                     |
-| `serde`          | No      | Serialization (propagates to lattice-fann)                   |
+| Feature          | Default | Description                                                             |
+| ---------------- | ------- | ----------------------------------------------------------------------- |
+| `std`            | Yes     | Standard library support                                                |
+| `serde`          | No      | Serialization (propagates to lattice-fann)                              |
 | `gpu`            | No      | GPU-accelerated forward/backward passes and validation[^gpu-limitation] |
-| `gpu-tests`      | No      | GPU tests requiring hardware                                 |
-| `safetensors`    | No      | Safe checkpoint serialization                                |
-| `inference-hook` | No      | `impl LoraHook for LoraAdapter` (pulls in `lattice-inference`) |
-| `train-backward` | No      | Backward/gradient training surface (pulls in `lattice-inference`) |
+| `gpu-tests`      | No      | GPU tests requiring hardware                                            |
+| `safetensors`    | No      | PEFT-compatible LoRA adapter serialization                              |
+| `inference-hook` | No      | `impl LoraHook for LoraAdapter` (pulls in `lattice-inference`)          |
+| `train-backward` | No      | Backward/gradient training surface (pulls in `lattice-inference`)       |
 
 [^gpu-limitation]: **Current limitation**: `GpuTrainer::train_batch` returns
-`Err` for every optimizer choice (Adam, AdamW, SGD-momentum, plain SGD,
-RMSprop) — the GPU-shader optimizer dispatch has no buffer bindings wired to
-the network's weight/gradient buffers, and the CPU-side plain-SGD arm has
-neither real gradient plumbing nor a mutable weight write-back path. Forward
-pass and loss computation work correctly; only the weight-update step is
-unimplemented. See [issue #797](https://github.com/ohdearquant/lattice/issues/797).
-This note will be removed once that wiring lands.
+    `Err` for every optimizer choice (Adam, AdamW, SGD-momentum, plain SGD,
+    RMSprop) — the GPU-shader optimizer dispatch has no buffer bindings wired to
+    the network's weight/gradient buffers, and the CPU-side plain-SGD arm has
+    neither real gradient plumbing nor a mutable weight write-back path. Forward
+    pass and loss computation work correctly; only the weight-update step is
+    unimplemented. See [issue #797](https://github.com/ohdearquant/lattice/issues/797).
+    This note will be removed once that wiring lands.
 
 ```toml
 [dependencies]
 lattice-tune = { version = "0.4.2" }                           # Default
 lattice-tune = { version = "0.4.2", features = ["serde"] }     # With serialization
 lattice-tune = { version = "0.4.2", features = ["gpu"] }       # GPU training
-lattice-tune = { version = "0.4.2", features = ["safetensors"] } # Safe checkpoints
+lattice-tune = { version = "0.4.2", features = ["safetensors"] } # LoRA adapter I/O
 ```
 
 ### Injecting an adapter into `lattice-inference`
@@ -357,15 +382,16 @@ as a `Box<dyn LoraHook>`:
 
 ```toml
 [dependencies]
-lattice-tune = { version = "0.4.2", features = ["inference-hook"] }
+lattice-tune = { version = "0.4.2", features = ["inference-hook", "safetensors"] }
 lattice-inference = "0.4.2" # provides the LoraHook trait
 ```
 
 ```rust,ignore
+use std::path::Path;
 use lattice_tune::lora::LoraAdapter;
 use lattice_inference::lora_hook::LoraHook; // not re-exported at the crate root
 
-let adapter: LoraAdapter = /* LoraAdapter::load_peft_safetensors(...) */;
+let adapter = LoraAdapter::from_safetensors(Path::new("adapter.safetensors"))?;
 let hook: Box<dyn LoraHook> = Box::new(adapter);
 // the engine calls hook.apply(layer_idx, module, x, output) on each projection
 ```
@@ -388,8 +414,8 @@ lattice-tune = { version = "0.4.2" }
 impl DistillationPipeline {
     pub fn with_teacher(config: TeacherConfig) -> Result<Self>;
     pub fn label_single(&mut self, example: &RawExample) -> Result<LabelingResult>;
-    pub fn label_batch(&mut self, examples: &[RawExample]) -> Result<Vec<LabelingResult>>;
-    pub fn stats(&self) -> DistillationStats;
+    pub fn label_batch(&mut self, examples: &[RawExample]) -> Vec<LabelingResult>;
+    pub fn stats(&self) -> &DistillationStats;
 }
 ```
 
@@ -399,7 +425,8 @@ impl DistillationPipeline {
 impl TrainingLoop {
     pub fn new(config: TrainingConfig) -> Result<Self>;
     pub fn train(&mut self, dataset: &mut Dataset) -> Result<TrainingMetrics>;
-    pub fn train_epoch(&mut self, dataset: &mut Dataset) -> Result<EpochMetrics>;
+    pub fn checkpoint(&self) -> Checkpoint;
+    pub fn resume_from(&mut self, checkpoint: &Checkpoint);
 }
 ```
 
@@ -408,9 +435,9 @@ impl TrainingLoop {
 ```rust
 impl ModelRegistry {
     pub fn in_memory() -> Self;
-    pub fn register(&mut self, model: RegisteredModel, weights: &[u8]) -> Result<Uuid>;
-    pub fn get(&self, name: &str, version: &str) -> Result<RegisteredModel>;
-    pub fn promote(&mut self, id: Uuid, status: ModelStatus) -> Result<()>;
-    pub fn find_latest(&self, name: &str) -> Option<&RegisteredModel>;
+    pub fn register(&self, model: RegisteredModel, weights: &[u8]) -> Result<Uuid>;
+    pub fn get(&self, name: &str, version: &str) -> Option<RegisteredModel>;
+    pub fn promote_to_production(&self, id: &Uuid) -> Result<()>;
+    pub fn get_latest(&self, name: &str) -> Option<RegisteredModel>;
 }
 ```

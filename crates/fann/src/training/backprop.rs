@@ -36,9 +36,9 @@ impl BackpropTrainer {
 
     /// Compute gradients for a single training sample using backpropagation.
     ///
-    /// After the forward pass, references weights and activations directly from
-    /// the network (no per-sample cloning). The forward pass is the only mutation;
-    /// all subsequent reads use immutable borrows.
+    /// After the forward pass, copies the final output so weights and activations can be
+    /// borrowed directly from the network. Delta vectors are allocated per sample; layer
+    /// weights and activation buffers are not cloned.
     fn compute_gradients(
         &self,
         network: &mut Network,

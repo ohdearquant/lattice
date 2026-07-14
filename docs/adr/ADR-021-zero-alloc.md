@@ -71,15 +71,17 @@ pub fn forward(&mut self, input: &[f32]) -> FannResult<&[f32]> {
 
 - **Memory committed upfront**: Network reserves memory for maximum activation sizes at
   construction, even if never used
-- **No concurrent inference on same Network**: `&mut self` requirement prevents parallel
-  forward passes on a single instance; callers must clone for parallelism
+- **Single-input forward requires exclusive access**: `forward(&mut self, ...)` prevents
+  concurrent calls to that method on one instance. With the `parallel` feature,
+  `forward_batch(&self, ...)` instead shares the immutable layer parameters across workers
 - **Fixed topology**: Buffer sizes are locked at construction; dynamic layer addition
   would require reallocation
 
 ### Neutral
 
-- **Batch inference requires cloning**: `forward_batch()` clones the network per thread
-  when using Rayon parallelism; acceptable for typical batch sizes
+- **Batch inference allocates activation buffers**: `forward_batch()` shares weight matrices
+  rather than cloning the network, but allocates independent layer-activation buffers for each
+  input in the Rayon iterator
 
 ## Alternatives Considered
 

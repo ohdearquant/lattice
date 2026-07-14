@@ -68,26 +68,41 @@ Pending --> Validated --> Staged --> Production
 **Lineage Tracking**: Fine-tuned models reference `parent_id` pointing to base model.
 Parent models accumulate `children` UUIDs for forward traceability.
 
+### Current implementation status (amended 2026-07-14)
+
+The lifecycle and bidirectional lineage above remain the accepted workflow, but
+the shipped registry stores descriptive records rather than enforcing that
+workflow:
+
+- `update_status` accepts any target status, and `promote_to_production` promotes
+  any existing record without requiring `Validated` or `Staged`. It demotes
+  production records with the same model name to `Staged`.
+- `register` and `register_metadata` validate only that name and version are
+  non-empty. They do not validate `parent_id`, append a child UUID to the parent,
+  or otherwise synchronize the two lineage fields. Callers must maintain both
+  sides, and a caller-supplied parent reference may be dangling.
+
 ## Consequences
 
 ### Positive
 
-- **Full Traceability**: Any production model can be traced to training config, dataset,
-  and parent lineage.
+- **Traceability Fields**: Production records can carry training config, dataset,
+  and caller-maintained parent lineage.
 - **Rollback Capability**: If v1.2.0 degrades, promote v1.1.0 from Archived to
   Production.
-- **Safe Promotion**: Status gates prevent deploying Pending models to production.
+- **Atomic Status Selection**: Promotion publishes one updated registry snapshot and
+  demotes existing Production records with the same name; callers enforce validation gates.
 - **Integrity Checking**: SHA-256 weights hash detects corruption before inference.
-- **Query by Version**: `find_latest(name)` returns highest semver for automated
-  deployments.
+- **Query by Version**: `get_latest(name)` orders versions by their parsed three-part
+  tuple, treating other version strings as `0.0.0`.
 
 ### Negative
 
 - **Storage Overhead**: Each version stores full weights (no delta compression).
 - **In-Memory Limitation**: Default `ModelRegistry::in_memory()` does not persist across
   restarts.
-- **Manual Lineage**: Parent-child relationships require explicit `with_parent()` calls;
-  not auto-detected.
+- **Manual Lineage**: Parent-child relationships are caller-maintained; registration
+  neither validates `parent_id` nor updates `children`.
 - **Orphan Risk**: Deleting a parent does not cascade to children, potentially leaving
   orphaned lineage references.
 
@@ -97,7 +112,8 @@ Parent models accumulate `children` UUIDs for forward traceability.
   (future work).
 - Document lineage workflow in examples to ensure developers set `parent_id` on
   fine-tuned models.
-- Validate `parent_id` exists before registration to prevent orphan references.
+- Callers should validate `parent_id` and maintain the corresponding `children` entry
+  before registration when reverse lineage is required.
 
 ## Alternatives Considered
 

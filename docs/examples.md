@@ -1,7 +1,7 @@
 # Lattice Examples
 
 This document provides runnable examples for the main crates in the lattice workspace:
-`lattice-inference`, `lattice-embed`, `lattice-fann`, `lattice-transport`, and the LoRA
+`lattice-embed`, `lattice-fann`, `lattice-transport`, `lattice-inference`, and the LoRA
 fine-tuning workflow in `lattice-tune`.
 
 Checked-in examples live in their respective crate's `examples/` directory. Existing example
@@ -725,3 +725,262 @@ Internally, `generate_lora` loads the adapter with `LoraAdapter::from_safetensor
 against the loaded model's `model.config()`, attaches it with `model.set_lora(Box::new(adapter))`,
 and prints `LoRA: ACTIVE` once an adapter is attached, before generating. Omitting `--lora` runs
 the base model unmodified.
+
+---
+
+## lattice-inference
+
+The examples below cover the shipped inference-time LoRA, speculative-decoding, and sampling
+surfaces. Metal examples require macOS and the `f16,metal-gpu` features.
+
+### Serving a trained LoRA adapter with `chat_metal`
+
+The adapter produced by the training example above is PEFT-compatible, so `chat_metal` can load it
+directly. Run the same deterministic prompt once against the base model and once with the adapter:
+
+```sh
+cargo build --release -p lattice-inference --features f16,metal-gpu --bin chat_metal
+
+./target/release/chat_metal \
+  --model ~/.lattice/models/qwen3.5-0.8b \
+  --prompt "Write a Rust function that checks if a number is prime" \
+  --max-tokens 64 --temperature 0 --top-k 1 --top-p 1 \
+  --repetition-penalty 1
+
+./target/release/chat_metal \
+  --model ~/.lattice/models/qwen3.5-0.8b \
+  --lora adapter.safetensors \
+  --prompt "Write a Rust function that checks if a number is prime" \
+  --max-tokens 64 --temperature 0 --top-k 1 --top-p 1 \
+  --repetition-penalty 1
+```
+
+The second process prints `Loading LoRA adapter` and runs with the adapter installed. Greedy
+settings make a before/after text comparison reproducible; whether the text changes depends on
+what the adapter learned.
+
+`chat_metal --lora` loads one adapter when the process starts. It does not expose an interactive
+command or JSON field that replaces the adapter inside an already-running `chat_metal` process.
+Library users can replace the one Metal adapter slot with `load_lora_adapter` and
+`unload_lora_adapter`; both operations invalidate the retained cross-turn prefix cache before the
+next request.
+
+### Weighted LoRA mixtures
+
+For CPU inference, `blend_lora_adapters` accepts a slice of `(adapter, mixture_weight)` pairs. It
+folds each adapter's own `alpha / rank` scale and the supplied mixture weight into one rank-sum
+adapter, which can be installed through the ordinary `LoraHook` slot:
+
+```rust,no_run
+use std::path::Path;
+
+use lattice_inference::model::qwen35::Qwen35Model;
+use lattice_inference::model::qwen35_config::GenerateConfig;
+use lattice_tune::lora::{LoraAdapter, blend_lora_adapters};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = Path::new("/path/to/qwen3.5-0.8b");
+    let mut model = Qwen35Model::from_safetensors(model_dir)?;
+
+    let domain = LoraAdapter::from_safetensors(Path::new("domain.safetensors"))?;
+    let style = LoraAdapter::from_safetensors(Path::new("style.safetensors"))?;
+    domain.validate_against(model.config())?;
+    style.validate_against(model.config())?;
+
+    // The request shape is &[(&LoraAdapter, f32)]: 70% domain + 30% style.
+    let mixed = blend_lora_adapters(&[(&domain, 0.7), (&style, 0.3)])?;
+    model.set_lora(Box::new(mixed));
+
+    let config = GenerateConfig {
+        max_new_tokens: 64,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        ..GenerateConfig::default()
+    };
+    println!("{}", model.generate("Explain ownership in Rust", &config)?.text);
+    Ok(())
+}
+```
+
+This requires `lattice-tune` features `safetensors,inference-hook`. The Metal equivalent is
+`MetalQwen35State::generate_with_lora_mixture`, whose request shape is
+`&[(&[LoraLayerData], effective_weight)]`. For that lower-level API,
+`effective_weight = mixture_weight * alpha / rank`; unlike `blend_lora_adapters`, it cannot infer
+`alpha` because `LoraLayerData` does not carry it. The blend is loaded into Metal's single adapter
+slot for the request and is always unloaded afterward. There is no LoRA-mixture field on either
+HTTP server or on `chat_metal`.
+
+The shipped synthetic benchmark is a runnable example of this Metal request shape:
+
+```sh
+cargo run --release -p lattice-inference --features f16,metal-gpu \
+  --bin bench_lora_mixture
+```
+
+Set `LATTICE_MODEL_DIR` to a Q4 model directory to request its optional GPU-decode half. The
+current GPU half has a known Qwen3.5 hybrid-layer bug documented in
+[`cli-tools.md`](cli-tools.md#common-failure-modes-including-one-confirmed-bug-not-fixed-here);
+the CPU blend measurements still exercise the weighted rank-sum operation.
+
+#### Router refits are caller-managed
+
+`AdapterRouter` is behind lattice-inference's `mixture` feature. It ranks the available adapters
+once per request and returns the selected top-k with fixed, uniform `1/k` weights. Online refitting
+is a separate lattice-tune `mixture` API: `update_router` consumes `FeedbackEvent` values plus a
+`ReplayBuffer`, `DiagonalFisher`, and `RouterUpdateConfig`, and returns a full replacement gate in
+`RouterDelta::network_bytes`.
+
+Nothing in Lattice automatically collects feedback, triggers a refit, persists the returned bytes,
+or reloads them into a live `AdapterRouter`. The host application must perform that loop by loading
+the returned bytes with `Network::from_bytes()` and constructing the next router. The available
+knobs are the fields of `RouterUpdateConfig`; there are no CLI or HTTP router-refit knobs. In v1,
+Fisher null-space projection is active, while the `ewc_lambda` anchor-penalty path is intentionally
+inactive.
+
+### Native MTP and self-speculative decoding
+
+The live native-MTP path is Metal/Q4-only. `MetalQwen35State::from_q4_dir` must find a model config
+with MTP layers and the complete MTP tensor set; the BF16 constructor does not load MTP weights.
+If `LATTICE_MTP` is set but a required MTP file is missing, loading warns and ordinary decoding is
+used.
+
+For a command-line A/B on the same prompt, keep every MTP gate condition identical between the two
+runs:
+
+```sh
+./target/release/chat_metal \
+  --model /path/to/qwen3.5-0.8b-q4 \
+  --prompt "Explain the Rust ownership model" \
+  --max-tokens 128 --temperature 0 --top-k 1 --top-p 1 \
+  --repetition-penalty 1
+
+LATTICE_MTP=1 LATTICE_MTP_VERBOSE=1 \
+  ./target/release/chat_metal \
+  --model /path/to/qwen3.5-0.8b-q4 \
+  --prompt "Explain the Rust ownership model" \
+  --max-tokens 128 --temperature 0 --top-k 1 --top-p 1 \
+  --repetition-penalty 1
+```
+
+Each run prints overall token throughput; the MTP run also prints rounds, accepted extra tokens,
+fallbacks, and time spent drafting, verifying, and rolling back. There is no guaranteed speedup:
+acceptance depends on the checkpoint and workload, and verification overhead can make MTP slower.
+For a Criterion comparison that explicitly sets `enable_mtp: Some(false)` and `Some(true)`, use the
+existing benchmark:
+
+```sh
+LATTICE_MODEL_DIR=/path/to/qwen3.5-0.8b-q4 \
+LATTICE_TOKENIZER_DIR=/path/to/qwen3.5-0.8b \
+  cargo bench -p lattice-inference --features metal-gpu,f16 -- mtp_decode
+```
+
+The live MTP branch is used only when all of these conditions hold:
+
+- MTP weights loaded successfully and `enable_mtp` is `Some(true)`, or it is `None` and
+  `LATTICE_MTP` is set.
+- Greedy decoding is selected (`temperature <= 0` and `top_k <= 1`).
+- Repetition penalty is exactly `1.0`, and compact GPU top-k is not enabled.
+- Grammar, string stops, reasoning budget, and log-probability capture are all disabled.
+
+Otherwise generation deliberately uses the ordinary path. The live Metal implementation drafts
+one MTP token per round and verifies it against the target. In greedy mode, accepted and rejected
+rounds are token-for-token equivalent to ordinary greedy decoding, including first-wins tied-logit
+behavior. Stop tokens are verified before they can terminate generation and are excluded from the
+returned text/token IDs, matching ordinary decoding; a wrong draft-EOS is rejected instead of
+truncating output.
+
+`LATTICE_SELF_SPEC=1` is a separate greedy-only mechanism that needs a Qwen3.5 hybrid model with
+active GDN layers but does not need an MTP head. Set the variable before constructing the Metal
+state (for a CLI, before starting the process) so its checkpoint pool is allocated. It drafts up to
+four tokens with GDN-only forwards and verifies the longest matching prefix with the full model.
+Its accepted, rejected, and fallback EOS cases use the same rule: the target-confirmed stop token
+ends generation but is not included in output. This path also has no promised throughput gain; use
+`LATTICE_SELF_SPEC_VERBOSE=1` to inspect its counters.
+
+### Sampling-parameter cookbook for `lattice_serve`
+
+`lattice_serve` exposes each sampler control twice: a process flag sets the server default, and the
+corresponding JSON field overrides that default for one request.
+
+```sh
+cargo run --release -p lattice-inference --features f16,metal-gpu,serve \
+  --bin lattice_serve -- \
+  --model /path/to/qwen3.5-0.8b-q4 \
+  --temperature 0.7 --top-k 50 --top-p 0.9 --repetition-penalty 1.1
+```
+
+| Control            | Server default | Shipped behavior                                                                                                                                                                                                         | CLI flag / HTTP field                         |
+| ------------------ | -------------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
+| Temperature        |          `0.7` | `<= 0` is greedy; `1.0` leaves logits unscaled; values between 0 and 1 sharpen the distribution; values above 1 flatten it. No upper bound is enforced by `lattice_serve`.                                               | `--temperature` / `temperature`               |
+| Top-k              |           `50` | Keeps the k highest-logit tokens. `1` is greedy and `0` disables this filter. Values at least as large as the vocabulary also leave it unfiltered.                                                                       | `--top-k` / `top_k`                           |
+| Top-p              |          `0.9` | Samples from the smallest high-probability prefix whose cumulative mass reaches p. The sampler clamps finite input to `[0, 1]`; `1` disables this filter and `0` keeps only the highest-probability token.               | `--top-p` / `top_p`                           |
+| Repetition penalty |          `1.1` | Applies once to every token already present in the prompt or generated history. `1` disables it; values above 1 discourage repeats; values between 0 and 1 boost repeats. Non-positive values are treated as no penalty. | `--repetition-penalty` / `repetition_penalty` |
+
+The JSON numbers accepted by the server are passed into `GenerateConfig` without a separate range
+validation step, so the table describes the sampler's actual normalization rather than an HTTP
+validation promise. `top_k` is an unsigned integer. For normal use, keep temperature non-negative,
+top-p in `[0, 1]`, and repetition penalty at least `1`.
+
+#### Deterministic evaluation
+
+Temperature zero or top-k one takes the deterministic argmax path. Disable repetition adjustment
+when exact base-model greedy output is the goal:
+
+```sh
+curl http://127.0.0.1:11435/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Summarize Rust ownership in one sentence."}],
+    "max_tokens": 64,
+    "temperature": 0,
+    "top_k": 1,
+    "top_p": 1,
+    "repetition_penalty": 1,
+    "seed": 42
+  }'
+```
+
+#### Balanced sampling
+
+The shipped defaults combine moderate temperature with top-k and nucleus filtering. A fixed seed
+makes a particular sampled run reproducible:
+
+```sh
+curl http://127.0.0.1:11435/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Invent three names for a Rust database."}],
+    "max_tokens": 96,
+    "temperature": 0.7,
+    "top_k": 50,
+    "top_p": 0.9,
+    "repetition_penalty": 1.1,
+    "seed": 42
+  }'
+```
+
+#### Repetition-loop mitigation
+
+For a long response that starts repeating phrases, increase the penalty modestly and narrow the
+nucleus. Excessive penalties can damage coherence, so tune from the default rather than jumping to
+a very large value:
+
+```sh
+curl http://127.0.0.1:11435/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Write a detailed deployment checklist."}],
+    "max_tokens": 512,
+    "temperature": 0.6,
+    "top_k": 40,
+    "top_p": 0.85,
+    "repetition_penalty": 1.2,
+    "seed": 42
+  }'
+```
+
+`top_k` and `repetition_penalty` are Lattice extensions to the OpenAI-shaped request. A request
+field wins over its corresponding process flag; omitted fields inherit the process defaults shown
+above.

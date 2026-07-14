@@ -257,14 +257,27 @@ fn reference_cases_pass() {
         convergence_threshold: 1e-7,
         ..SinkhornConfig::default()
     });
-    let comparisons = super::bench::compare_against_reference(&solver).unwrap();
+    let comparisons = super::reference_cases::compare_against_reference(&solver).unwrap();
 
     for comp in &comparisons {
+        assert!(
+            comp.result.converged,
+            "Reference case '{}' should converge",
+            comp.name,
+        );
         assert!(
             comp.absolute_error < 0.1,
             "Reference case '{}': absolute error {} is too large (expected ~{}, got {})",
             comp.name,
             comp.absolute_error,
+            comp.expected_exact_cost,
+            comp.sinkhorn_cost,
+        );
+        assert!(
+            comp.relative_error < 0.1,
+            "Reference case '{}': relative error {} is too large (expected ~{}, got {})",
+            comp.name,
+            comp.relative_error,
             comp.expected_exact_cost,
             comp.sinkhorn_cost,
         );

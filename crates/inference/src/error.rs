@@ -1,8 +1,9 @@
 //! Inference error type, display/error implementations, and I/O error conversion.
 use std::fmt::{Display, Formatter};
 
-/// **Stable**: primary error type consumed by `lattice-embed`; adding new variants
-/// is backward-compatible, but removing or renaming them requires a SemVer bump.
+/// **Stable**: primary error type consumed by `lattice-embed`; because downstream
+/// code can match it exhaustively, adding, removing, or renaming variants is
+/// SemVer-breaking.
 #[derive(Debug)]
 pub enum InferenceError {
     ModelNotFound(String),

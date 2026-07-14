@@ -116,7 +116,9 @@ outer iteration (points move), so only owned data structures are appropriate.
 
 ### Positive
 
-- Fixed-support barycenter re-uses the full `SinkhornSolver` machinery including Rayon parallelism (for large support sizes) and convergence checking.
+- Fixed-support barycenter reuses `SinkhornSolver` convergence checking and warm-started dual
+  variables. Its erased `dyn CostMatrix` inputs call the sequential `solve_warm_start` path,
+  not the Rayon-enabled `solve_dense` path.
 - The workspace pattern eliminates allocations in the outer loop after the first iteration.
 - `FixedSupportBarycenter.source_results` returns the per-source Sinkhorn results from the final outer iteration, enabling diagnosis of which source was furthest from the barycenter.
 
