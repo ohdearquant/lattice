@@ -152,7 +152,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 /// Sigmoid activation with numerical stability
 ///
-/// Uses clamping to prevent exp() overflow
+/// Uses sign-dependent formulas to keep the exponent non-positive
 pub const SIGMOID_SHADER: &str = r#"
 struct Uniforms {
     size: u32,
@@ -171,10 +171,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    // Clamp to [-10, 10] to prevent exp() overflow
-    // exp(88) overflows f32, exp(10) = 22026 is safe
-    let x = clamp(data[idx], -10.0, 10.0);
-    data[idx] = 1.0 / (1.0 + exp(-x));
+    let x = data[idx];
+    if (x >= 0.0) {
+        data[idx] = 1.0 / (1.0 + exp(-x));
+    } else {
+        let ex = exp(x);
+        data[idx] = ex / (1.0 + ex);
+    }
 }
 "#;
 
@@ -197,8 +200,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    // Clamp to [-5, 5] - tanh saturates faster than sigmoid
-    let x = clamp(data[idx], -5.0, 5.0);
-    data[idx] = tanh(x);
+    data[idx] = tanh(data[idx]);
 }
 "#;
