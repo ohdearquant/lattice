@@ -1071,11 +1071,11 @@ mod imp {
     }
 
     /// Phase machine for the SSE token stream.
-    /// `Done` and `End` carry the completion token count so the terminal
-    /// phase can include it in the telemetry event.
+    /// `Body`, `Done`, and `End` carry the completion token count so failure
+    /// paths preserve the deltas emitted before the worker failed.
     enum Phase {
         Start,
-        Body,
+        Body(usize),
         Done(usize), // holds completion_tokens from worker
         End(usize),  // holds completion_tokens; emits telemetry then stream ends
     }
@@ -1125,6 +1125,26 @@ mod imp {
                 false,
             );
             return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
+        }
+        if let Some(requested_model) = req.model.as_deref()
+            && requested_model != s.model_id.as_ref()
+        {
+            emit_serve_event(
+                "POST",
+                "/v1/chat/completions",
+                400,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+            );
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "model '{requested_model}' is not loaded; this server serves '{}'",
+                    s.model_id
+                ),
+                "model_not_found",
+            );
         }
         if req.messages.is_empty() {
             emit_serve_event(
@@ -1179,7 +1199,7 @@ mod imp {
                 return err.into_response();
             }
         };
-        let model_id = req.model.clone().unwrap_or_else(|| s.model_id.to_string());
+        let model_id = s.model_id.to_string();
         let streaming = req.stream.unwrap_or(false);
         let id = format!("chatcmpl-{}", unix_nanos());
         let created = unix_secs();
@@ -1294,10 +1314,10 @@ mod imp {
                                     Ok::<Event, std::convert::Infallible>(
                                         Event::default().data(chunk.to_string()),
                                     ),
-                                    (rx, Phase::Body, cancel_guard, pending),
+                                    (rx, Phase::Body(0), cancel_guard, pending),
                                 ))
                             }
-                            Phase::Body => match match pending.take() {
+                            Phase::Body(completion_tokens) => match match pending.take() {
                                 Some(ev) => Some(ev),
                                 None => rx.recv().await,
                             }
@@ -1311,7 +1331,12 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Body, cancel_guard, None),
+                                        (
+                                            rx,
+                                            Phase::Body(completion_tokens.saturating_add(1)),
+                                            cancel_guard,
+                                            None,
+                                        ),
                                     ))
                                 }
                                 Some(WorkerEvent::Complete(output)) => {
@@ -1345,18 +1370,20 @@ mod imp {
                                     // the status code. Mirror `lattice.rs`'s
                                     // `StreamMsg::Failed` contract: log the real
                                     // cause server-side (#611: e.g. a grammar mask
-                                    // that blocks every candidate token) and give
-                                    // the client a well-formed termination rather
-                                    // than hanging the stream open.
+                                    // that blocks every candidate token) and expose
+                                    // only the generic error envelope to the client.
                                     eprintln!("generation error (streaming): {message}");
-                                    let chunk = json!({
-                                        "id": id, "object": "chat.completion.chunk",
-                                        "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    let error = json!({
+                                        "error": {
+                                            "message": "inference failed",
+                                            "type": "server_error",
+                                            "code": "internal_error",
+                                            "param": null,
+                                        }
                                     });
                                     Some((
-                                        Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard, None),
+                                        Ok(Event::default().data(error.to_string())),
+                                        (rx, Phase::Done(completion_tokens), cancel_guard, None),
                                     ))
                                 }
                                 Some(WorkerEvent::Rejected(api_err)) => {
@@ -1368,36 +1395,41 @@ mod imp {
                                     // -- and the preflight above (ADR-080 C2)
                                     // already intercepts that one before
                                     // committing to 200 SSE. Kept as a
-                                    // defensive fallback (same
-                                    // graceful-termination shape as before)
+                                    // defensive fallback
                                     // in case that invariant ever changes
                                     // rather than deleting the arm outright.
                                     eprintln!(
                                         "request rejected (streaming): {}",
                                         api_err.message()
                                     );
-                                    let chunk = json!({
-                                        "id": id, "object": "chat.completion.chunk",
-                                        "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+                                    let error = json!({
+                                        "error": {
+                                            "message": "request rejected",
+                                            "type": "invalid_request_error",
+                                            "code": "invalid_request",
+                                            "param": null,
+                                        }
                                     });
                                     Some((
-                                        Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard, None),
+                                        Ok(Event::default().data(error.to_string())),
+                                        (rx, Phase::Done(completion_tokens), cancel_guard, None),
                                     ))
                                 }
                                 Some(WorkerEvent::Cancelled) => unreachable!(
                                     "normalize_cancelled already rewrote Cancelled into Complete"
                                 ),
                                 None => {
-                                    let chunk = json!({
-                                        "id": id, "object": "chat.completion.chunk",
-                                        "created": created, "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    let error = json!({
+                                        "error": {
+                                            "message": "inference worker unavailable",
+                                            "type": "server_error",
+                                            "code": "internal_error",
+                                            "param": null,
+                                        }
                                     });
                                     Some((
-                                        Ok(Event::default().data(chunk.to_string())),
-                                        (rx, Phase::Done(0), cancel_guard, None),
+                                        Ok(Event::default().data(error.to_string())),
+                                        (rx, Phase::Done(completion_tokens), cancel_guard, None),
                                     ))
                                 }
                             },
@@ -1858,8 +1890,6 @@ mod imp {
         use lattice_inference::serve::metal_worker::{WorkerJob, spawn_fake, test_client_and_jobs};
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::sync::Arc;
-        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
-        use std::time::Duration;
 
         // NOTE (issue #832): the FIFO/cancellation/window-check worker-loop
         // test suite that used to live here (`fake_generate`,
@@ -2527,6 +2557,44 @@ mod imp {
             );
         }
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_streaming_failure_emits_error_event() {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.reply(WorkerEvent::Delta("partial".to_string()));
+                    let _ = job.reply(WorkerEvent::Failed("blocked by grammar".to_string()));
+                }
+            });
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
+            );
+            let response = chat_completions(State(state), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("SSE response body must be readable");
+            let text = String::from_utf8(bytes.to_vec()).expect("SSE body must be valid UTF-8");
+            assert!(
+                text.contains("\"content\":\"partial\""),
+                "partial output must precede the error event; got: {text}"
+            );
+            let error_payload = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .find(|payload| payload.contains("\"error\""))
+                .expect("a failed generation must emit an SSE error payload");
+            let error: serde_json::Value =
+                serde_json::from_str(error_payload).expect("SSE error payload must be valid JSON");
+            assert_eq!(error["error"]["type"], "server_error");
+            assert_eq!(error["error"]["code"], "internal_error");
+            assert!(
+                !text.contains("\"finish_reason\":\"stop\""),
+                "generation failure must not masquerade as a clean stop; got: {text}"
+            );
+        }
+
         /// ADR-080 C2: a `stream:
         /// true` request whose prompt overflows the model's context window
         /// must return HTTP 400 `context_length_exceeded` BEFORE any SSE
@@ -2920,50 +2988,22 @@ mod imp {
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
-        async fn cm_lattice_serve_model_mismatch_accepted_expected_deviation() {
-            // Expected-deviation fixture, not a bug fix: `lattice serve` (the
-            // CLI's HTTP subcommand) rejects a request whose `model` field
-            // doesn't match the served model id with HTTP 400
-            // (`lattice.rs`'s `model_not_found` check, exercised by
-            // `cm_serve_model_mismatch_rejected` in that binary's own test
-            // module). This surface has no equivalent check at all: `req.model`
-            // is accepted as-is, and the request is queued for generation like
-            // any other. This fixture pins that CURRENT, documented divergence
-            // -- tracked in #663 -- by proving a mismatched `model` reaches the
-            // job queue rather than being rejected up front. If #663 ships a
-            // `model_not_found` check here, this fixture starts failing
-            // (`jobs_rx` never receives a `WorkerJob`), which is the intended signal
-            // to update it rather than a silent pass either way.
-            let (jobs, mut jobs_rx) = test_client_and_jobs();
-            let state = AppState {
-                jobs,
-                model_id: Arc::from("served-model"),
-                defaults: Defaults {
-                    max_tokens: 100,
-                    temperature: 0.7,
-                    top_k: 50,
-                    top_p: 0.9,
-                    repetition_penalty: 1.1,
-                    reasoning_budget: None,
-                },
-                model_max_context: 4096,
-            };
+        async fn cm_lattice_serve_model_mismatch_rejected() {
             let body = Body::from(
-                r#"{"model":"some-other-model","messages":[{"role":"user","content":"hi"}]}"#
+                r#"{"model":"wrong-model","messages":[{"role":"user","content":"hi"}]}"#
                     .to_string(),
             );
-            // The handler awaits a reply from a worker that doesn't exist in
-            // this test, so it never resolves; run it in the background and
-            // only wait on the job queue it should have fed synchronously
-            // before that await point.
-            tokio::spawn(async move {
-                let _ = chat_completions(State(state), body).await;
-            });
-            let queued = tokio::time::timeout(Duration::from_millis(500), jobs_rx.recv()).await;
-            assert!(
-                matches!(queued, Ok(Some(_))),
-                "a mismatched `model` must reach the job queue on this surface today \
-                 (expected deviation, tracked in #663)"
+            let response = chat_completions(State(test_app_state()), body).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("error response must be valid JSON");
+            assert_eq!(value["error"]["code"], "model_not_found");
+            assert_eq!(
+                value["error"]["message"],
+                "model 'wrong-model' is not loaded; this server serves 'test-model'"
             );
         }
 

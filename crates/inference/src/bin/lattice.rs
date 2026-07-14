@@ -4089,24 +4089,18 @@ mod serve {
                         futures::stream::iter(events)
                     }
                     StreamMsg::Failed => {
-                        // Emit a finish chunk with reason "stop" so the client
-                        // receives a well-formed termination, then the [DONE]
-                        // sentinel.  The error was already logged in the producer.
-                        let chunk = ChatCompletionChunk {
-                            id,
-                            object: "chat.completion.chunk",
-                            created,
-                            model: mdl,
-                            choices: vec![ChunkChoice {
-                                index: 0,
-                                delta: ChunkDelta {
-                                    role: None,
-                                    content: None,
-                                },
-                                finish_reason: Some("stop"),
-                            }],
-                        };
-                        let data = serde_json::to_string(&chunk).unwrap_or_default();
+                        // The producer already logged the specific cause; keep
+                        // client-visible detail generic while making failure
+                        // distinguishable from a genuine stop condition.
+                        let data = serde_json::json!({
+                            "error": {
+                                "message": "inference failed",
+                                "type": "server_error",
+                                "code": "internal_error",
+                                "param": null,
+                            }
+                        })
+                        .to_string();
                         let events: Vec<Result<Event, std::convert::Infallible>> = vec![
                             Ok(Event::default().data(data)),
                             Ok(Event::default().data("[DONE]")),
@@ -6181,6 +6175,55 @@ mod serve {
                     model_id: "test-model".to_string(),
                     request_counter: Arc::new(AtomicU64::new(0)),
                 }
+            }
+
+            #[tokio::test]
+            async fn chat_completions_streaming_failure_emits_error_event() {
+                let state = tiny_state_with_fake_cpu_generate(
+                    64,
+                    |_prompt, _cfg, on_token, _should_cancel| {
+                        let _ = on_token("partial");
+                        Err(lattice_inference::error::InferenceError::InvalidInput(
+                            "blocked by grammar".to_string(),
+                        ))
+                    },
+                );
+                let req = ChatCompletionRequest {
+                    model: "test-model".to_string(),
+                    messages: vec![user_msg("hi")],
+                    max_tokens: Some(64),
+                    stream: Some(true),
+                    ..bare_req()
+                };
+
+                let response = chat_completions(State(state), Ok(Json(req)))
+                    .await
+                    .expect("streaming request must be accepted");
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("SSE response body must be readable")
+                    .to_bytes();
+                let text = String::from_utf8(bytes.to_vec()).expect("SSE body must be valid UTF-8");
+                assert!(
+                    text.contains("\"content\":\"partial\""),
+                    "partial output must precede the error event; got: {text}"
+                );
+                let error_payload = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .find(|payload| payload.contains("\"error\""))
+                    .expect("a failed generation must emit an SSE error payload");
+                let error: serde_json::Value = serde_json::from_str(error_payload)
+                    .expect("SSE error payload must be valid JSON");
+                assert_eq!(error["error"]["type"], "server_error");
+                assert_eq!(error["error"]["code"], "internal_error");
+                assert!(
+                    !text.contains("\"finish_reason\":\"stop\""),
+                    "generation failure must not masquerade as a clean stop; got: {text}"
+                );
             }
 
             /// Mutation-sensitive to BOTH known regressions

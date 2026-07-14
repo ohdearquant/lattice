@@ -334,13 +334,11 @@ Two caveats worth knowing before you build on this:
   "per-token backpressure / disconnect-cancellation is a future refinement." The separate
   `lattice_serve` daemon binary _does_ have this (a `CancelOnDrop`/`watch::channel` mechanism added
   in PR #552/#606) — `lattice serve` does not, as of this writing.
-- **An internal generation failure mid-stream is invisible in the stream shape.** If the
-  generation task errors out partway through (an engine panic path, an invariant violation), the
-  server emits a normal-looking finish chunk (`finish_reason: "stop"`) followed by `[DONE]` —
-  exactly what a successful completion looks like. The only trace of the failure is a server-side
-  `eprintln!` (`"generation error (streaming): ..."` or `"generation invariant violation: ..."`).
-  A client cannot distinguish "finished normally" from "failed partway through" from the SSE
-  stream alone.
+- **Mid-stream generation failures are explicit.** If generation errors after emitting content,
+  the server preserves those partial content chunks, then emits an OpenAI error envelope as an SSE
+  `data:` payload (`type: "server_error"`, `code: "internal_error"`) followed by `[DONE]`. It does
+  not emit a finish chunk, so `finish_reason: "stop"` remains reserved for genuine stop conditions.
+  The specific engine error is logged server-side and is not exposed to the client.
 
 ## Context window and token-budget limits
 
@@ -404,5 +402,4 @@ message content. There is no requirement to strip reasoning blocks between turns
 - `logprobs` is rejected today; PR #620 (in review) adds it non-streaming-only.
 - `max_tokens` is hard-capped at 4096 server-wide; the Metal/Q4 backend additionally caps total
   context at 4096 regardless of the model's own configured maximum.
-- No cross-turn caching, no disconnect-cancellation on the streaming path, and a mid-stream
-  internal failure is indistinguishable from a normal finish in the SSE shape itself.
+- No cross-turn caching or disconnect-cancellation on the streaming path.
