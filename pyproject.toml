@@ -17,4 +17,12 @@ dependencies = [
 [tool.uv]
 dev-dependencies = [
     "pytest>=8.0",
+    # HF differential golden fixtures (scripts/vision_goldens_qwen35.py, ADR-069) need a real
+    # torch + torchvision runtime to execute the reference Qwen3.5 vision forward pass.
+    # transformers pinned exactly (not just >=4.46 above) so `uv run` reproduces the fixtures'
+    # recorded methodology byte-for-byte; see tests/fixtures/vision/README.md.
+    "torch>=2.9",
+    "torchvision>=0.24",
+    "pillow>=10",
+    "transformers==5.12.1",
 ]

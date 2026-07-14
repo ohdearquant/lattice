@@ -27,6 +27,8 @@ Thumbs.db
 *.bin
 *.onnx
 *.gguf
+# ...except small committed HF differential golden tensors (ADR-069, ~1 MB total).
+!tests/fixtures/vision/*.bin
 
 # Review scratch artifacts (repo-root only)
 /review*.md
