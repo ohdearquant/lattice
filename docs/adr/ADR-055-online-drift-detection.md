@@ -38,7 +38,7 @@ applies symmetrically to both mechanisms. This ADR formalizes the dual-use desig
 ## Decision
 
 Add an `OnlineDriftDetector` to `lattice-transport` that computes Sinkhorn divergence over
-a sliding window of hidden-state samples. Expose an `OnlineDriftSignal` event type that
+a sliding window of hidden-state samples. Expose an `OnlineDriftSignal` per-sample status enum that
 `lattice-inference` subscribes to for triggering adapter and router staleness checks.
 
 **Existing drift API**: `crates/transport/src/drift.rs` already provides `DriftConfig`,
@@ -86,13 +86,15 @@ No new crates. No Metal kernel changes. No changes to serving hot path.
 pub struct OnlineDriftConfig {
     pub window_size: usize,     // W; minimum 128. O(W²) per divergence call.
     pub check_interval: usize,  // compute divergence every N new samples (amortizes cost)
-    pub threshold: f32,         // S(ref, current) > threshold → emit OnlineDriftSignal
+    pub threshold: f32,         // S(ref, current) > threshold → return Drift
     pub epsilon: f32,           // Sinkhorn regularization (inherited from SinkhornConfig)
 }
 
-pub struct OnlineDriftSignal {
-    pub divergence: f32,        // S(reference, current) value at detection
-    pub window_pos: usize,      // total samples seen when signal fired
+pub enum OnlineDriftSignal {
+    Warming { samples_seen: usize, window_size: usize },
+    Skipped { samples_seen: usize, next_check_in: usize },
+    Stable { divergence: f32, window_pos: usize },
+    Drift { divergence: f32, window_pos: usize },
 }
 
 pub struct OnlineDriftDetector {
@@ -100,21 +102,24 @@ pub struct OnlineDriftDetector {
     reference_window: VecDeque<Vec<f32>>,   // first W samples; frozen as reference
     current_window: VecDeque<Vec<f32>>,     // sliding window of last W samples
     samples_seen: usize,
-    // Three workspaces for warm-start across repeated divergence calls (ADR-039 pattern)
+    // Three independently sized, reusable workspaces; divergence solves reset dual variables
     workspace_xy: SinkhornWorkspace,
     workspace_xx: SinkhornWorkspace,
     workspace_yy: SinkhornWorkspace,
 }
 
 impl OnlineDriftDetector {
-    pub fn push(&mut self, sample: Vec<f32>) -> Option<OnlineDriftSignal>;
+    pub fn observe(&mut self, sample: Vec<f32>)
+        -> Result<OnlineDriftSignal, SinkhornError>;
     pub fn reset_reference(&mut self);  // call after adapter/router refresh
 }
 ```
 
-`push()` appends to `current_window`, evicts oldest entry if full. Every `check_interval`
-samples, calls `point_set_sinkhorn_divergence` (ADR-039) between `reference_window` and
-`current_window`. If `divergence > threshold`, returns `Some(OnlineDriftSignal)`.
+`observe()` appends to `current_window` and evicts the oldest entry if full. It returns
+`Warming` while the windows fill and `Skipped` between checks. Every `check_interval`
+samples, it calls `point_set_sinkhorn_divergence` (ADR-039) between `reference_window` and
+`current_window`, returning `Stable` or `Drift` according to the threshold. Solver failures
+are returned as `Err(SinkhornError)`.
 
 The reference window is frozen at construction from the first W samples. After an adapter
 refresh, `reset_reference()` promotes `current_window` to `reference_window`, restarting
@@ -175,8 +180,9 @@ use, and `rate_of_divergence` is empirically estimated from the drift signal tim
 
 In practice, `threshold` in `OnlineDriftConfig` is a Sinkhorn divergence value calibrated from a
 validation set: compute `S(training_dist, held_out_dist)` at known excess NLL levels and pick
-the divergence that corresponds to acceptable degradation. The `OnlineDriftSignal.divergence` value
-lets the reactor apply graduated responses (warn vs. force-refresh vs. fallback to base model).
+the divergence that corresponds to acceptable degradation. The `divergence` value carried by the
+`Stable` and `Drift` variants lets the reactor apply graduated responses (warn vs. force-refresh
+vs. fallback to base model).
 
 ---
 
@@ -224,7 +230,7 @@ receives `Vec<f32>` values. Enforcement: `crates/transport/Cargo.toml` must neve
 
 - ADR-035: Sinkhorn-Knopp Solver — sliding window builds on this primitive
 - ADR-036: Log-Domain Stability — numerical robustness inherited
-- ADR-039: Sinkhorn Divergence — `point_set_sinkhorn_divergence`, three-workspace warm-start
+- ADR-039: Sinkhorn Divergence — `point_set_sinkhorn_divergence`, three reusable workspaces
 - ADR-040: Gated Attention (MoE router) — router staleness context
 - ADR-043: LoRA Serving Verification — adapter serving context
 - Genevay, Peyré, Cuturi, "Learning Generative Models with Sinkhorn Divergences", AISTATS 2018

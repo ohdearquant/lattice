@@ -69,11 +69,12 @@ pub fn safe_exp(log_value: f32) -> f32 {
 }
 ```
 
-`exp(-104)` ≈ `1.2e-45` which is below f32's smallest subnormal (`~1.4e-45`), producing
-0.0 in round-to-nearest mode. Subnormal numbers incur a performance penalty on some CPUs
-(x87 "denormal assist"). The cutoff is set conservatively at `-103.97208` (≈ `ln(f32::MIN_POSITIVE)`)
-to ensure clean zero rather than a subnormal. `safe_exp` is only called when recovering
-transport mass for statistics — it is not in the inner Sinkhorn loop.
+`exp(-104)` ≈ `1.2e-45` which is below f32's smallest subnormal (`2^-149` ≈ `1.4e-45`),
+producing 0.0 in round-to-nearest mode. Subnormal numbers incur a performance penalty on
+some CPUs (x87 "denormal assist"). The cutoff `-103.97208` is approximately `ln(2^-150)`,
+the rounding boundary below the minimum f32 subnormal, so smaller values become clean zero
+rather than a subnormal. `safe_exp` is only called when recovering transport mass for
+statistics — it is not in the inner Sinkhorn loop.
 
 **`logaddexp(a, b)` — stable log(exp(a) + exp(b))**
 
