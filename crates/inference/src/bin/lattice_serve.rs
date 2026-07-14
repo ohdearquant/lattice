@@ -986,18 +986,9 @@ mod imp {
 
         match format {
             ModelFormat::Q4 => {
-                let has_config_json = model_dir.join("config.json").exists();
-                let cfg = if has_config_json {
-                    Qwen35Config::from_config_json(&model_dir.join("config.json"))
-                        .map_err(|e| format!("config.json parse failed: {e}"))?
-                } else {
-                    Qwen35Config::qwen36_27b()
-                };
-                let requested_context = if has_config_json {
-                    model_context_from_config(Some(&cfg))
-                } else {
-                    model_context_from_config(None)
-                };
+                let cfg = Qwen35Config::from_model_dir(model_dir)
+                    .map_err(|e| format!("config.json load failed: {e}"))?;
+                let requested_context = model_context_from_config(Some(&cfg));
                 let metal = MetalQwen35State::from_q4_dir(
                     model_dir,
                     tokenizer_path,

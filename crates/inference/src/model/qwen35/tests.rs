@@ -871,3 +871,51 @@ mod lora_serving {
         );
     }
 }
+
+// -- #923: from_safetensors' config resolution is fail-closed --------
+//
+// Before the fix, a config-less directory silently loaded under the
+// hardcoded `qwen35_2b()` preset here -- the one *silent* fallback among
+// the issue's four divergent loaders, since this is the library path
+// every binary ultimately calls through. It now delegates to the same
+// `Qwen35Config::from_model_dir` fail-closed helper as every other
+// loader in the crate. Reverting this call site back to the old
+// exists-then-preset pattern makes this test fail (it would return `Ok`
+// instead of an error naming `config.json`).
+
+fn write_metadata_only_safetensors(path: &std::path::Path) {
+    // No tensors, just a metadata-only header -- from_safetensors
+    // resolves `config.json` before validating required tensor names,
+    // so a minimally-openable safetensors file is enough to reach (and
+    // isolate) the config-resolution step under test.
+    let header = r#"{"__metadata__":{"format":"pt"}}"#;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    std::fs::write(path, bytes).expect("test setup: write metadata-only safetensors file");
+}
+
+#[test]
+fn from_safetensors_missing_config_json_is_hard_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "lattice_from_safetensors_no_config_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("test setup: create model dir");
+    write_metadata_only_safetensors(&dir.join("model.safetensors"));
+    // Deliberately no config.json.
+
+    let Err(err) = Qwen35Model::from_safetensors(&dir) else {
+        panic!("a directory with no config.json must be a hard error")
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("config.json"),
+        "error must name the missing config.json, not a guessed preset: {msg}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
