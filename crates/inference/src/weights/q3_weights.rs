@@ -530,39 +530,50 @@ fn checked_alloc_bytes(
 /// # Errors
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
-pub fn read_q3_header(file: &std::fs::File) -> Result<Q3FileHeader, Box<dyn std::error::Error>> {
-    use std::io::Read;
+pub fn read_q3_header(
+    file: &mut std::fs::File,
+) -> Result<Q3FileHeader, Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
     let file_len = file.metadata()?.len();
-    let mut f = std::io::BufReader::new(file);
 
-    let mut magic = [0u8; 4];
-    f.read_exact(&mut magic)?;
-    if &magic != b"KHQ3" {
-        return Err("invalid magic: not a .q3 file".into());
-    }
+    let (shape, original_len, payload_offset) = {
+        let mut f = std::io::BufReader::new(&mut *file);
 
-    let mut b4 = [0u8; 4];
-    f.read_exact(&mut b4)?;
-    let ver = u32::from_le_bytes(b4);
-    if ver != 1 {
-        return Err(format!("unsupported .q3 file version: {ver}").into());
-    }
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic)?;
+        if &magic != b"KHQ3" {
+            return Err("invalid magic: not a .q3 file".into());
+        }
 
-    f.read_exact(&mut b4)?;
-    let ndim = u32::from_le_bytes(b4) as usize;
-    checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
-    let mut shape = Vec::with_capacity(ndim);
-    let mut b8 = [0u8; 8];
-    for _ in 0..ndim {
+        let mut b4 = [0u8; 4];
+        f.read_exact(&mut b4)?;
+        let ver = u32::from_le_bytes(b4);
+        if ver != 1 {
+            return Err(format!("unsupported .q3 file version: {ver}").into());
+        }
+
+        f.read_exact(&mut b4)?;
+        let ndim = u32::from_le_bytes(b4) as usize;
+        checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
+        let mut shape = Vec::with_capacity(ndim);
+        let mut b8 = [0u8; 8];
+        for _ in 0..ndim {
+            f.read_exact(&mut b8)?;
+            shape.push(u64::from_le_bytes(b8) as usize);
+        }
+
         f.read_exact(&mut b8)?;
-        shape.push(u64::from_le_bytes(b8) as usize);
-    }
+        let original_len = u64::from_le_bytes(b8) as usize;
 
-    f.read_exact(&mut b8)?;
-    let original_len = u64::from_le_bytes(b8) as usize;
+        // payload_offset = 4 (magic) + 4 (version) + 4 (ndim) + ndim*8 + 8 (original_len)
+        let payload_offset = (20 + ndim * 8) as u64;
 
-    // payload_offset = 4 (magic) + 4 (version) + 4 (ndim) + ndim*8 + 8 (original_len)
-    let payload_offset = (20 + ndim * 8) as u64;
+        (shape, original_len, payload_offset)
+        // `f` (the BufReader) is dropped here, before the seek below, so the
+        // seek acts on the raw `File` and is not undone by buffered lookahead.
+    };
+
+    file.seek(SeekFrom::Start(payload_offset))?;
 
     Ok(Q3FileHeader {
         shape,
@@ -810,8 +821,8 @@ mod tests {
         save_q3_file(&path, &t).unwrap();
 
         // Header parses independently of the block payload.
-        let file = std::fs::File::open(&path).unwrap();
-        let header = read_q3_header(&file).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let header = read_q3_header(&mut file).unwrap();
         assert_eq!(header.shape, vec![3, 32]);
         assert_eq!(header.original_len, 96);
         assert_eq!(header.payload_offset, 20 + 2 * 8);
@@ -820,6 +831,39 @@ mod tests {
         assert_eq!(loaded.shape, t.shape);
         assert_eq!(loaded.original_len, t.original_len);
         assert_eq!(loaded.blocks, t.blocks);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_q3_header_leaves_cursor_at_payload_offset() {
+        // Regression for the doc promise on `read_q3_header`: the cursor of
+        // the SAME file handle must sit at `payload_offset` on return, not
+        // wherever the internal BufReader's last fill left the shared fd.
+        // Reading the first block directly off `file` (no re-open, no seek)
+        // must reproduce the first block written by `save_q3_file`.
+        let src: Vec<f32> = (0..96).map(|i| (i as f32 - 40.0) * 0.05).collect();
+        let t = quantize_f32_to_q3(&src, &[3, 32]).unwrap();
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("lattice_q3_cursor_{}.q3", std::process::id()));
+        save_q3_file(&path, &t).unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let header = read_q3_header(&mut file).unwrap();
+
+        assert_eq!(
+            std::io::Seek::stream_position(&mut file).unwrap(),
+            header.payload_offset,
+            "cursor must sit at payload_offset after read_q3_header returns"
+        );
+
+        let mut first_block_bytes = [0u8; Q3_BLOCK_BYTES];
+        std::io::Read::read_exact(&mut file, &mut first_block_bytes).unwrap();
+        let expected: &[u8; Q3_BLOCK_BYTES] = unsafe { &*std::ptr::from_ref(&t.blocks[0]).cast() };
+        assert_eq!(
+            &first_block_bytes, expected,
+            "reading off the same handle post-header must yield the first block, not header tail"
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 
