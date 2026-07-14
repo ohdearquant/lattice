@@ -40,6 +40,8 @@ final class ServeController {
     private(set) var lastError: String?
     /// The model name the running daemon was launched with (for the tray label).
     private(set) var servingModelName: String?
+    /// The model path the running daemon was launched with (`--model`), for the CLI footer.
+    private(set) var servingModelPath: URL?
     /// True after the daemon emits its `ready` event; false on stop or process exit.
     private(set) var isReady: Bool = false
     /// Live request log — newest entry last, capped at 200 rows.
@@ -76,6 +78,7 @@ final class ServeController {
             if self.handle === h {
                 self.handle = nil
                 self.servingModelName = nil
+                self.servingModelPath = nil
                 self.isReady = false
                 self.onChange?()
             }
@@ -112,6 +115,7 @@ final class ServeController {
             try h.start(spec)
             handle = h
             servingModelName = model.name
+            servingModelPath = model.path
             lastError = nil
             onChange?()
             return true
@@ -126,6 +130,7 @@ final class ServeController {
         handle?.stop()
         handle = nil
         servingModelName = nil
+        servingModelPath = nil
         isReady = false
         onChange?()
     }

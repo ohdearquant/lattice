@@ -1,4 +1,9 @@
-//! Registered model types
+//! Versioned registry records, metadata, status, and lineage fields.
+//!
+//! Status is descriptive rather than an enforced state machine, and lineage
+//! links are maintained by callers.
+//!
+//! See `docs/registry.md` for identity, versioning, metadata, and lifecycle details.
 
 use crate::train::TrainingMetrics;
 use chrono::{DateTime, Utc};

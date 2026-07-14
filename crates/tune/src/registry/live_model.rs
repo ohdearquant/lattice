@@ -1,28 +1,9 @@
-//! Live model handle for atomic hot-swap during inference.
+//! Lock-free snapshots and atomic replacement for a live model record.
 //!
-//! [`LiveModel`] wraps a [`RegisteredModel`] in an [`ArcSwap`], enabling
-//! lock-free reads and atomic swaps for model hot-reload scenarios.
+//! A loaded [`RegisteredModel`] remains valid after a swap; a new load sees
+//! the replacement. This handle does not load weights or persist a deployment.
 //!
-//! # Example
-//!
-//! ```
-//! use lattice_tune::registry::{RegisteredModel, LiveModel};
-//!
-//! let model_v1 = RegisteredModel::new("classifier", "1.0.0");
-//! let live = LiveModel::new(model_v1);
-//!
-//! // Read current model (lock-free)
-//! let current = live.load();
-//! assert_eq!(current.version, "1.0.0");
-//!
-//! // Hot-swap to new version
-//! let model_v2 = RegisteredModel::new("classifier", "2.0.0");
-//! let old = live.swap(model_v2);
-//! assert_eq!(old.version, "1.0.0");
-//!
-//! // Readers now see v2
-//! assert_eq!(live.version(), "2.0.0");
-//! ```
+//! See `docs/registry.md` for live-model replacement semantics.
 
 use arc_swap::ArcSwap;
 use std::sync::Arc;
@@ -30,14 +11,10 @@ use uuid::Uuid;
 
 use super::model::RegisteredModel;
 
-/// A handle to a live model that can be atomically swapped.
+/// A handle to a live model record that can be atomically swapped.
 ///
-/// Readers get a consistent snapshot via [`load()`](LiveModel::load) (lock-free);
-/// writers replace the model atomically via [`swap()`](LiveModel::swap).
-///
-/// This is designed for inference hot-reload: an inference server holds a
-/// `LiveModel` and reads the current model on each request. A background
-/// updater swaps in a new model version without blocking readers.
+/// `load` returns a stable, lock-free [`Arc`] snapshot; `swap` replaces the
+/// current record without invalidating prior snapshots.
 pub struct LiveModel {
     current: ArcSwap<RegisteredModel>,
 }

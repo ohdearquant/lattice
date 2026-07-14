@@ -1,4 +1,7 @@
-//! Caching wrapper for embedding services.
+//! Native-only LRU wrapper for an [`EmbeddingService`].
+//!
+//! It preserves caller order across partial cache hits and uses role-aware keys for asymmetric
+//! retrieval. See `docs/service.md` for the lookup and fill algorithm.
 
 use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_CHARS};
 use crate::error::Result;
@@ -9,36 +12,10 @@ use tracing::debug;
 
 /// **Unstable**: caching strategy and constructor API may change; foundation-internal use only.
 ///
-/// Caching wrapper around an embedding service.
+/// LRU-caching wrapper around an embedding service.
 ///
-/// Wraps any `EmbeddingService` implementation with LRU caching. Identical
-/// texts (with the same model) will return cached embeddings instead of
-/// recomputing.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use lattice_embed::{
-///     CachedEmbeddingService, NativeEmbeddingService, EmbeddingService,
-///     EmbeddingModel, EmbeddingCache,
-/// };
-/// use std::sync::Arc;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let inner = Arc::new(NativeEmbeddingService::new());
-///     let cached = CachedEmbeddingService::new(inner, 1000);
-///
-///     // First call - computes and caches
-///     let emb1 = cached.embed_one("Hello", EmbeddingModel::default()).await?;
-///
-///     // Second call - returns from cache
-///     let emb2 = cached.embed_one("Hello", EmbeddingModel::default()).await?;
-///
-///     assert_eq!(emb1, emb2);
-///     Ok(())
-/// }
-/// ```
+/// It preserves input order while reusing embeddings with matching model configuration and role.
+/// See [`docs/service.md`](../../docs/service.md#cachedembeddingservice-cache-hit-behavior) for the lookup and fill algorithm.
 pub struct CachedEmbeddingService<S> {
     inner: Arc<S>,
     cache: crate::cache::EmbeddingCache,
@@ -80,9 +57,7 @@ impl<S: EmbeddingService> CachedEmbeddingService<S> {
 #[async_trait]
 impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<S> {
     async fn embed(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
-        // Generic role: cache key does NOT include a role tag, maintaining
-        // backwards compatibility with any on-disk cache entries written before
-        // role-aware keys were introduced.
+        // Generic has its own role tag — see docs/service.md.
         self.embed_with_role(texts, model, EmbeddingRole::Generic)
             .await
     }
@@ -129,8 +104,7 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
     ) -> Result<Vec<Vec<f32>>> {
         use crate::error::EmbedError;
 
-        // Validate inputs before any cache interaction so callers always get
-        // consistent errors regardless of whether the result is fully cached.
+        // Validate wrapper-owned request bounds before cache interaction.
         if texts.is_empty() {
             return Err(EmbedError::InvalidInput("no texts provided".into()));
         }

@@ -1,4 +1,8 @@
-//! Training example types
+//! Training examples, soft intent labels, and traceability metadata.
+//!
+//! Examples combine chronological embedding context with a fixed six-class
+//! label vector. See `docs/data.md` for the data contract and normalization
+//! rules.
 
 use uuid::Uuid;
 

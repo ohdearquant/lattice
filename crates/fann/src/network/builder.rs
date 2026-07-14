@@ -1,42 +1,25 @@
-//! Network builder for fluent API construction
+//! Fluent construction of dense feedforward networks.
 //!
-//! Provides `NetworkBuilder` for constructing neural networks with a fluent API.
+//! The builder records layer sizes and activations, then validates and creates
+//! `Layer` objects at build time. It can use either entropy or a caller seed
+//! for Xavier/Glorot initialization.
+//!
+//! See `docs/network.md` for build-time validation and buffer allocation.
 
 use crate::activation::Activation;
 use crate::error::{FannError, FannResult};
 use crate::layer::Layer;
 use crate::network::Network;
 
-/// Builder for constructing neural networks with a fluent API
-///
-/// # Example
-///
-/// ```
-/// use lattice_fann::{NetworkBuilder, Activation};
-///
-/// let network = NetworkBuilder::new()
-///     .input(784)                          // MNIST input
-///     .hidden(128, Activation::ReLU)       // Hidden layer 1
-///     .hidden(64, Activation::ReLU)        // Hidden layer 2
-///     .output(10, Activation::Softmax)     // 10 classes
-///     .build()
-///     .unwrap();
-///
-/// assert_eq!(network.num_inputs(), 784);
-/// assert_eq!(network.num_outputs(), 10);
-/// ```
+/// Fluent builder for a dense feedforward network.
+/// See [`docs/network.md`](../../docs/network.md#networkbuilder) for construction examples.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkBuilder {
     input_size: Option<usize>,
     layers: Vec<(usize, Activation)>,
 }
 
-/// Reject Softmax on any hidden (non-final) layer.
-///
-/// Softmax normalises over the simplex — meaningful only at the output.
-/// On hidden layers the gradient degrades to the diagonal approximation
-/// `s_i*(1-s_i)`, producing silently wrong gradients (accepted limitation,
-/// see ADR-023).
+/// Reject Softmax before the final layer: its derivative here is only diagonal (see ADR-023).
 fn validate_no_hidden_softmax(layers: &[(usize, Activation)]) -> FannResult<()> {
     if layers.len() < 2 {
         return Ok(());
@@ -87,13 +70,10 @@ impl NetworkBuilder {
         self.hidden(size, Activation::ReLU)
     }
 
-    /// Build the network
+    /// Builds the configured network with entropy-seeded initialization.
     ///
-    /// Returns an error if:
-    /// - Input size was not specified
-    /// - No layers were added
-    /// - Any layer has size 0
-    /// - Softmax is used on a hidden (non-output) layer
+    /// Returns an error for a missing or zero input, no layers, a zero-width
+    /// layer, or Softmax before the output layer.
     pub fn build(self) -> FannResult<Network> {
         let input_size = self
             .input_size
@@ -124,33 +104,10 @@ impl NetworkBuilder {
         Network::new(layers)
     }
 
-    /// Build with specific seed for reproducible initialization
+    /// Builds the configured network with deterministic initialization from `seed`.
     ///
-    /// Uses a seeded RNG for deterministic weight initialization,
-    /// ensuring the same seed always produces the same network.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use lattice_fann::{NetworkBuilder, Activation};
-    ///
-    /// let network1 = NetworkBuilder::new()
-    ///     .input(4)
-    ///     .hidden(8, Activation::ReLU)
-    ///     .output(2, Activation::Softmax)
-    ///     .build_with_seed(42)
-    ///     .unwrap();
-    ///
-    /// let network2 = NetworkBuilder::new()
-    ///     .input(4)
-    ///     .hidden(8, Activation::ReLU)
-    ///     .output(2, Activation::Softmax)
-    ///     .build_with_seed(42)
-    ///     .unwrap();
-    ///
-    /// // Same seed produces identical weights
-    /// assert_eq!(network1.layer(0).unwrap().weights(), network2.layer(0).unwrap().weights());
-    /// ```
+    /// The same architecture and seed produce identical parameters.
+    /// See [`docs/network.md`](../../docs/network.md#networkbuilder) for reproducibility details.
     pub fn build_with_seed(self, seed: u64) -> FannResult<Network> {
         use rand::SeedableRng;
 

@@ -1,8 +1,9 @@
-//! Model registry for storing and retrieving versioned models.
+//! In-process versioned model index with pluggable artifact storage.
 //!
-//! Uses `ArcSwap` for lock-free concurrent reads and a clone-modify-store
-//! pattern for writes. Readers always see a consistent snapshot; writers
-//! are serialized via `write_lock` to prevent lost updates.
+//! Reads use `ArcSwap` snapshots; serialized writers clone, modify, and publish
+//! indexes after the required storage operation succeeds.
+//!
+//! See `docs/registry.md` for registry ordering, concurrency, and integrity rules.
 
 use super::backends::InMemoryStorage;
 use super::{FileSystemStorage, StorageBackend, sha256_hash};
@@ -14,12 +15,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Model registry for storing and retrieving versioned models.
+/// In-process index for versioned models and their stored weight artifacts.
 ///
-/// All read operations (`get_by_id`, `get`, `list_*`, `len`, `is_empty`)
-/// are lock-free via `ArcSwap` snapshots. Write operations (`register`,
-/// `update_status`, `promote_to_production`, `delete`) use a
-/// clone-modify-store pattern serialized by an internal write lock.
+/// Reads use lock-free snapshots; writers are serialized and publish cloned
+/// indexes atomically after their required storage operation succeeds.
 pub struct ModelRegistry {
     /// Storage backend (behind Mutex for `&mut self` methods)
     storage: parking_lot::Mutex<Box<dyn StorageBackend>>,
@@ -302,30 +301,11 @@ impl ModelRegistry {
         names
     }
 
-    /// Load model weights, verifying the recorded checksum when one is on
-    /// record.
+    /// Load bytes using the canonical registry record for this model ID.
     ///
-    /// #504 remaining slice 3: this used to be a pure raw load with **no**
-    /// checksum check at all — a caller reaching for the "obvious" method
-    /// name silently bypassed the verification `load_weights_verified`
-    /// performed, even though every model registered via [`Self::register`]
-    /// always carries a `weights_hash`. Fail-closed discipline now applies
-    /// here too: a hash mismatch is a hard
-    /// `TuneError::WeightIntegrityError`, not a silent pass-through.
-    ///
-    /// Verification is anchored to the **canonical registry record**
-    /// (resolved by `model.id` from the registry's own snapshot), never to
-    /// the caller-provided value: [`RegisteredModel`] is a plain DTO with
-    /// public `weights_path`/`weights_hash` fields, so a mutated clone
-    /// could otherwise redirect the load to a different path or "verify"
-    /// tampered bytes against a recomputed hash. A caller argument that
-    /// disagrees with the canonical record on either field is rejected
-    /// outright. A model whose *canonical* record has no hash at all
-    /// (e.g. [`Self::register_metadata`] with weights added out-of-band,
-    /// or a legacy pre-hash record) has nothing to check against and loads
-    /// unverified — that is the only remaining "raw" case, and it is
-    /// explicit (a `None` hash on the canonical record), never a silent
-    /// skip of a hash that *is* present.
+    /// A caller clone that disagrees on weight path or hash is rejected. A
+    /// recorded checksum must match; only a canonical record with no hash loads
+    /// unverified. See `docs/registry.md` for the integrity boundary.
     pub fn load_weights(&self, model: &RegisteredModel) -> Result<Vec<u8>> {
         let snap = self.models.load();
         let canonical = snap
@@ -365,25 +345,10 @@ impl ModelRegistry {
         Ok(weights)
     }
 
-    /// Load model weights, **requiring** a recorded checksum to verify
-    /// against.
+    /// Load bytes only when the canonical record has a checksum to verify.
     ///
-    /// This is [`Self::load_weights`] (which already verifies whenever a
-    /// hash is on record) plus one additional guarantee for callers that
-    /// explicitly want verification: a model with **no** recorded
-    /// `weights_hash` is rejected rather than silently loaded unverified.
-    /// Use this entry point wherever the caller's contract requires "this
-    /// load is verified", and [`Self::load_weights`] only when an
-    /// unverified load of a hash-less (metadata-only-registered) model is
-    /// an accepted, understood case.
-    ///
-    /// Returns `TuneError::WeightIntegrityError` if the checksum doesn't
-    /// match, or `TuneError::Storage` if no checksum is on record at all.
-    ///
-    /// Like [`Self::load_weights`], the "is a hash on record" decision is
-    /// made against the canonical registry record, not the caller's clone
-    /// (whose public `weights_hash` field could have been set to `None` or
-    /// to a recomputed hash of tampered bytes).
+    /// A missing hash and a hash mismatch are both errors. Verification uses
+    /// the canonical record, never caller-controlled fields; see `docs/registry.md`.
     pub fn load_weights_verified(&self, model: &RegisteredModel) -> Result<Vec<u8>> {
         let snap = self.models.load();
         let canonical = snap

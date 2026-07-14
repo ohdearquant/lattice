@@ -1,61 +1,9 @@
-//! GPU Buffer Pool - 3-tier memory management with lifecycle tracking
+//! Three-tier GPU buffer reuse pool with lifecycle-based eviction and pressure control.
 //!
-//! # Memory Management Strategy
-//!
-//! This module implements a production-grade GPU buffer pooling system designed
-//! to address key challenges in GPU memory management:
-//!
-//! ## Problem
-//!
-//! 1. **Allocation Overhead**: GPU buffer allocation is expensive (~100-500μs per call)
-//! 2. **Fragmentation**: Frequent alloc/dealloc leads to memory fragmentation
-//! 3. **Async Deallocation**: Rust's `Drop` is synchronous but GPU dealloc is async,
-//!    causing OOM during training loops despite "freeing" memory
-//!
-//! ## Solution: 3-Tier Buffer Pool
-//!
-//! Buffers are categorized by size and managed in separate pools:
-//!
-//! | Tier   | Size Range | Max Pooled | Max Age | Use Case |
-//! |--------|------------|------------|---------|----------|
-//! | Small  | < 1MB      | 256        | 5 min   | Biases, small activations |
-//! | Medium | 1-10MB     | 64         | 3 min   | Layer weights |
-//! | Large  | > 10MB     | 16         | 1 min   | Batch data, large layers |
-//!
-//! ## Lifecycle Management
-//!
-//! Each buffer tracks:
-//! - **Creation time**: For age-based eviction
-//! - **Last used time**: For idle-based cleanup
-//! - **Use count**: For reuse efficiency metrics
-//!
-//! ## Memory Pressure Handling
-//!
-//! The pool integrates with [`CircuitBreaker`] to handle memory pressure:
-//!
-//! - **Normal**: Regular pooling and reuse
-//! - **Low/Medium**: Aggressive cleanup of idle buffers
-//! - **High/Critical**: Block new allocations, force CPU fallback
-//!
-//! ## Explicit Flush
-//!
-//! For training loops, call [`BufferPool::flush`] periodically to:
-//! 1. Release all cached buffers immediately
-//! 2. Prevent OOM from async deallocation lag
-//!
-//! ## Example
-//!
-//! ```ignore
-//! // During training loop
-//! for epoch in 0..epochs {
-//!     for batch in dataset.batches() {
-//!         train_step(&mut network, batch);
-//!     }
-//!     // Flush every epoch to prevent memory buildup
-//!     ctx.buffer_pool().flush();
-//!     ctx.poll(); // Process pending deallocations
-//! }
-//! ```
+//! Allocation sizes are rounded to the required 256-byte Apple-Silicon alignment.
+//! GPU `Drop` is asynchronous: periodically flush the pool *and* poll or wait for
+//! completion during long-running work, or apparently freed buffers can still OOM.
+//! See ADR-025 and `docs/gpu.md` for the full backend design.
 
 use super::apple_silicon::BUFFER_ALIGNMENT;
 use super::circuit_breaker::{CircuitBreaker, MemoryPressure};
@@ -347,9 +295,9 @@ impl BufferPool {
         if let Ok(mut pools) = self.pools.write() {
             let pool = pools.entry(buffer.category).or_insert_with(Vec::new);
 
-            // Check if pool is full
+            // Keep the most-reused buffers when the tier is full.
             if pool.len() >= config.max_buffers {
-                // Evict oldest buffer
+                // Evict the least-reused buffer.
                 if let Some(oldest_idx) = pool
                     .iter()
                     .enumerate()
@@ -376,10 +324,10 @@ impl BufferPool {
             for (category, pool) in pools.iter_mut() {
                 let config = self.tier_configs.get(category).cloned().unwrap_or_default();
 
-                // Calculate target size based on pressure
+                // Scale tier capacity down according to memory pressure.
                 let target = ((1.0 - aggressiveness) * config.max_buffers as f32) as usize;
 
-                // Remove buffers that shouldn't be retained, prioritizing oldest
+                // Remove the least-reused buffers first.
                 pool.sort_by_key(|b| std::cmp::Reverse(b.use_count()));
 
                 while pool.len() > target {
@@ -414,12 +362,9 @@ impl BufferPool {
         self.stats.current_memory_bytes.load(Ordering::Relaxed)
     }
 
-    /// Flush all pooled buffers, releasing GPU memory
+    /// Drops all cached buffers and returns their accounted byte total.
     ///
-    /// This method drops all cached buffers immediately, freeing their GPU memory.
-    /// Use this during long training loops or when memory pressure is detected.
-    ///
-    /// Returns the number of bytes freed.
+    /// See [`docs/gpu.md`](../../docs/gpu.md#bufferpoolflush) for asynchronous-release guidance.
     pub fn flush(&self) -> u64 {
         let mut total_freed = 0u64;
 

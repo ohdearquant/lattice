@@ -1,7 +1,8 @@
-//! JIT (Just-In-Time) model adaptation
+//! Just-in-time adaptation configuration, control flow, and layer-selection helpers.
 //!
-//! Fast fine-tuning infrastructure for rapid model adaptation.
-//! Enables 5-10 second adaptation cycles with GPU acceleration.
+//! CPU adaptation currently reports simulated loss; GPU adaptation delegates to
+//! the GPU trainer and therefore cannot complete a weight update yet. See
+//! `docs/train.md` for strategies, stopping rules, and current limitations.
 
 use crate::data::{Dataset, TrainingExample};
 use crate::error::{Result, TuneError};

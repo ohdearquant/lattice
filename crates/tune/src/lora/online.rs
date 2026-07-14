@@ -1,8 +1,10 @@
-//! Online single-event SGD for LoRA weights (ADR-057 D3).
+//! One-event SGD refitting for a LoRA layer.
 //!
-//! Provides [`adapt_step`] for one gradient descent step given a single
-//! (input, target_delta) pair. The forward pass matches `apply_lora` exactly,
-//! then back-propagates through B and A using the MSE residual.
+//! [`adapt_step`] matches inference arithmetic, then updates A and B from the
+//! squared-error residual for one `(input, target_delta)` observation.
+//!
+//! See ADR-057 for the decision record.
+//! See `docs/lora-core.md` for the objective, gradients, and diagnostics.
 
 use super::LoraAdapter;
 use crate::error::TuneError;

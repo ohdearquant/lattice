@@ -1,4 +1,6 @@
-//! SIMD-accelerated cosine similarity operations.
+//! SIMD cosine-similarity kernels and batch variants.
+//!
+//! See docs/simd.md for fused reductions and query-reuse behaviour.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -89,18 +91,9 @@ fn cosine_simd128_kernel(a: &[f32], b: &[f32]) -> f32 {
     unsafe { cosine_similarity_simd128_unrolled(a, b) }
 }
 
-/// Cosine similarity over equal-length, non-empty `f32` slices.
+/// Computes cosine similarity, returning `0.0` for a mismatch, empty input, or zero norm.
 ///
-/// For pre-normalized vectors (embeddings typically are), use `dot_product`
-/// directly for better performance.
-///
-/// # Stability — khive ANN consumer contract
-///
-/// Part of the `simd::*` distance surface consumed directly by khive's ANN indexes
-/// (`khive-hnsw`, `khive-vamana`; ADR-012). The `(&[f32], &[f32]) -> f32` signature
-/// and the length-mismatch / empty-input behaviour (returns 0.0) are a **stable
-/// consumer contract** across the 0.4.x line. For the general-purpose ergonomic
-/// wrapper use `lattice_embed::utils::cosine_similarity`.
+/// See [`docs/simd.md`](../../docs/simd.md#cosine-similarity) for fused reduction and normalized-input use.
 #[inline]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
@@ -124,20 +117,11 @@ pub(crate) fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// AVX-512F-accelerated cosine similarity with 4x unrolling.
-///
-/// Computes dot(a,b) / (|a| * |b|) in a single pass with 4 accumulators each.
+/// Computes fused cosine similarity with AVX-512F.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX-512F instructions (verified via `simd_config()`)
-/// - `a` and `b` have equal, non-zero length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm512_loadu_ps` for unaligned loads (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loops use safe indexing after bounds checks
+/// Caller must provide AVX-512F and equal, non-empty slices; chunked loads stay in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn cosine_similarity_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -242,20 +226,11 @@ unsafe fn cosine_similarity_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// AVX2-accelerated cosine similarity with 4x unrolling.
-///
-/// Computes dot(a,b) / (|a| * |b|) in a single pass with 4 accumulators each.
+/// Computes fused cosine similarity with AVX2 and FMA.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX2 and FMA instructions (verified via `simd_config()`)
-/// - `a` and `b` have equal, non-zero length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm256_loadu_ps` for unaligned loads (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe indexing
+/// Caller must provide AVX2/FMA and equal, non-empty slices; chunked loads stay in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn cosine_similarity_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -344,20 +319,11 @@ unsafe fn cosine_similarity_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// NEON-accelerated cosine similarity with 4x unrolling.
-///
-/// Computes dot(a,b) / (|a| * |b|) in a single pass with 4 accumulators each.
+/// Computes fused cosine similarity with NEON.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Running on aarch64 (NEON is mandatory, always available)
-/// - `a` and `b` have equal, non-zero length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `vld1q_f32` for loads (handles any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe indexing
+/// Caller must run on aarch64 with equal, non-empty slices; chunked loads stay in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn cosine_similarity_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -442,25 +408,11 @@ unsafe fn cosine_similarity_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// wasm32 SIMD128-accelerated cosine similarity with 4x unrolling.
-///
-/// Computes dot(a,b) / (|a| * |b|) in a single pass with 4 accumulators each,
-/// mirroring the NEON kernel above. See `dot_product::dot_product_simd128_unrolled`
-/// for the reassociation caveat (not bit-identical to the scalar path) and the
-/// wasm safety notes (no runtime feature detection, alignment-free loads).
+/// Computes fused cosine similarity with wasm32 SIMD128.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Compiled with the wasm32 `simd128` target feature (compile-time
-///   precondition; this function only exists under `#[cfg(target_feature =
-///   "simd128")]`)
-/// - `a` and `b` have equal, non-zero length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `v128_load` for loads (wasm loads are alignment-free by spec)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe indexing
+/// This function requires compile-time SIMD128 and equal, non-empty slices; bounds are chunked.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for wasm and reassociation semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn cosine_similarity_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -545,13 +497,7 @@ unsafe fn cosine_similarity_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// **Unstable**: SIMD batch dispatch; use `lattice_embed::utils::batch_cosine_similarity` for stable wrapper.
-///
-/// Resolves the SIMD cosine kernel once to hoist OnceLock dispatch out of the per-pair loop.
-/// For unit-normalized inputs, callers should use `batch_dot_product` directly (or the
-/// PreparedQuery/HNSW APIs which accept explicit normalization hints). Auto-detecting
-/// unit-normalization here would require an O(N×dim) pre-scan costing as much as the
-/// computation itself, so detection is left to the caller.
+/// **Unstable**: batched cosine dispatch; callers supply normalization knowledge.
 pub fn batch_cosine_similarity(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
     let kernel = cosine_kernel();
     pairs
@@ -566,17 +512,9 @@ pub fn batch_cosine_similarity(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
         .collect()
 }
 
-/// **Unstable**: Fused single-pass cosine similarity; same SIMD path as `cosine_similarity`.
+/// **Unstable**: fused single-pass cosine similarity.
 ///
-/// Computes dot(a,b), norm(a), and norm(b) in a single pass over memory using three
-/// simultaneous SIMD accumulators. This is 3x more memory-efficient than computing
-/// each quantity in a separate pass (3x fewer cache-line loads).
-///
-/// The SIMD kernels (AVX-512, AVX2, NEON) already fuse all three reductions internally.
-/// The scalar fallback is also fused here, unlike `cosine_similarity_scalar` which
-/// makes three separate passes.
-///
-/// For pre-normalized vectors, callers should use `dot_product` directly.
+/// For pre-normalized vectors, use `dot_product` directly.
 #[inline]
 pub fn cosine_similarity_fused(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
@@ -587,18 +525,9 @@ pub fn cosine_similarity_fused(a: &[f32], b: &[f32]) -> f32 {
     cosine_kernel()(a, b)
 }
 
-/// **Unstable**: One-vs-many cosine similarity, pre-computing the query norm once.
+/// **Unstable**: one-query/many-candidate cosine similarity.
 ///
-/// When comparing a single query vector against many stored vectors, the query's
-/// L2 norm is constant across all comparisons. This function computes `|query|`
-/// once and reuses it, saving `candidates.len()` square-root operations.
-///
-/// Each dot(query, candidate) and |candidate| are still computed per-pair via
-/// the SIMD kernel (fused with the candidate norm). The per-pair computation
-/// is 2-accumulator fused (dot_qc and norm_c) after the query norm is factored out.
-///
-/// Returns a `Vec<f32>` of cosine similarities in `[-1, 1]`, in the same order
-/// as `candidates`. Returns 0.0 for any candidate whose length differs from the query.
+/// Results retain candidate order and use `0.0` for dimensional mismatches.
 pub fn batch_cosine_one_vs_many(query: &[f32], candidates: &[&[f32]]) -> Vec<f32> {
     if query.is_empty() || candidates.is_empty() {
         return vec![0.0_f32; candidates.len()];

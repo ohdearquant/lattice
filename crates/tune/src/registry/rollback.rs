@@ -1,31 +1,9 @@
-//! Rollback controller for model version management.
+//! Bounded in-memory audit records for model rollbacks.
 //!
-//! Enables safe rollback to previous model versions with history tracking.
-//! When a production model causes issues, operators can roll back to a
-//! known-good version while maintaining an audit trail.
+//! Recording a rollback does not update registry status, swap a live model, or
+//! persist the audit trail. Applications coordinate those operations explicitly.
 //!
-//! # Example
-//!
-//! ```
-//! use lattice_tune::registry::{RollbackController, RollbackRecord};
-//! use uuid::Uuid;
-//!
-//! let mut controller = RollbackController::new(100);
-//!
-//! // Record a rollback operation
-//! let from_id = Uuid::new_v4();
-//! let to_id = Uuid::new_v4();
-//! let record = controller.record_rollback(
-//!     from_id,
-//!     to_id,
-//!     "Performance regression detected",
-//!     Some("ops-team".to_string()),
-//! );
-//!
-//! // Query history
-//! assert_eq!(controller.history().len(), 1);
-//! assert_eq!(controller.last_rollback().unwrap().reason, "Performance regression detected");
-//! ```
+//! See `docs/registry.md` for rollback lifecycle and retention semantics.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -73,16 +51,10 @@ impl RollbackRecord {
     }
 }
 
-/// Controller for model rollback operations.
+/// Bounded in-memory history of rollback operations.
 ///
-/// Maintains a bounded history of rollback operations for audit and
-/// debugging purposes. The history is stored in memory; for persistence,
-/// serialize the records externally.
-///
-/// # Thread Safety
-///
-/// This type is NOT thread-safe. For concurrent access, wrap in a
-/// `Mutex` or `RwLock`.
+/// The controller does not enact a rollback or persist records. Synchronize
+/// mutable shared access externally with a `Mutex` or `RwLock`.
 pub struct RollbackController {
     /// History of rollback operations (oldest first)
     history: Vec<RollbackRecord>,
@@ -97,12 +69,8 @@ impl Default for RollbackController {
 }
 
 impl RollbackController {
-    /// Create a new rollback controller with specified history limit.
-    ///
-    /// # Arguments
-    ///
-    /// * `max_history` - Maximum number of rollback records to retain.
-    ///   When exceeded, oldest records are removed first.
+    /// Creates a controller retaining at most `max_history` rollback records.
+    /// See [`docs/registry.md`](../../docs/registry.md#rollbackcontroller-retention) for eviction behavior.
     pub fn new(max_history: usize) -> Self {
         Self {
             history: Vec::new(),
@@ -110,22 +78,9 @@ impl RollbackController {
         }
     }
 
-    /// Record a rollback operation.
-    ///
-    /// Creates a new [`RollbackRecord`] with the current timestamp and
-    /// adds it to the history. If history exceeds `max_history`, the
-    /// oldest record is removed.
-    ///
-    /// # Arguments
-    ///
-    /// * `from_id` - The model ID being rolled back from (current production)
-    /// * `to_id` - The model ID being rolled back to (new production)
-    /// * `reason` - Human-readable reason for the rollback
-    /// * `initiated_by` - Optional identifier for who/what initiated the rollback
-    ///
-    /// # Returns
-    ///
-    /// The created [`RollbackRecord`].
+    /// Appends and returns a timestamped rollback audit record.
+    /// Evicts the oldest record after exceeding the configured capacity.
+    /// See [`docs/registry.md`](../../docs/registry.md#rollbackcontroller-retention) for lifecycle limits.
     pub fn record_rollback(
         &mut self,
         from_id: Uuid,

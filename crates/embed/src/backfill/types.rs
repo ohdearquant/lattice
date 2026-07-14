@@ -1,4 +1,9 @@
-//! Backfill types: routing decisions, phases, and configuration.
+//! Defines migration-time routing decisions and backfill configuration.
+//!
+//! The routing configuration separates query and write model selection so a completed
+//! cutover can retain source writes during its rollback window.
+//!
+//! See [docs/backfill.md](../../docs/backfill.md) for the routing contract and defaults.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,26 +48,8 @@ pub enum RoutingPhase {
 
 /// Configuration for embedding request routing.
 ///
-/// Separates query routing from write routing to enable true rollback.
-/// During the rollback window after cutover, queries use the new model
-/// but writes continue to both models, ensuring atoms created after
-/// cutover are present in both indexes.
-///
-/// # Example
-///
-/// ```rust
-/// use lattice_embed::backfill::{EmbeddingRoutingConfig, RoutingPhase};
-/// use lattice_embed::EmbeddingModel;
-///
-/// let config = EmbeddingRoutingConfig {
-///     query_model: EmbeddingModel::BgeBaseEnV15,
-///     write_models: vec![EmbeddingModel::BgeSmallEnV15, EmbeddingModel::BgeBaseEnV15],
-///     phase: RoutingPhase::RollbackWindow,
-///     migration_id: Some("mig-001".to_string()),
-/// };
-///
-/// assert!(config.write_models.len() > 1); // dual-write active
-/// ```
+/// Query and write selections are separate so a rollback window can preserve source writes.
+/// See [docs/backfill.md](../../docs/backfill.md) for how each phase is represented.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingRoutingConfig {
     /// Which model to query against.
@@ -77,24 +64,8 @@ pub struct EmbeddingRoutingConfig {
 
 /// Configuration for the backfill coordinator.
 ///
-/// Controls batch sizing, concurrency, dual-write behavior, and the
-/// threshold at which queries switch to the target model.
-///
-/// # Example
-///
-/// ```rust
-/// use lattice_embed::backfill::BackfillConfig;
-///
-/// let config = BackfillConfig {
-///     batch_size: 200,
-///     max_concurrent: 8,
-///     dual_write: true,
-///     target_query_threshold: 0.9,
-///     rollback_window_secs: 3600, // 1 hour
-/// };
-///
-/// assert_eq!(config.batch_size, 200);
-/// ```
+/// Controls batch sizing, caller-managed concurrency, routing, and rollback timing.
+/// See [docs/backfill.md](../../docs/backfill.md) for default values and policy semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackfillConfig {
     /// Batch size for backfill operations.
@@ -103,19 +74,9 @@ pub struct BackfillConfig {
     pub max_concurrent: usize,
     /// Whether new documents should be dual-written during migration.
     pub dual_write: bool,
-    /// Minimum progress fraction before allowing target-only queries `[0.0, 1.0]`.
-    ///
-    /// When the migration progress reaches this threshold, query routing
-    /// switches from legacy to target embeddings.
+    /// Raw progress threshold at which query routing may choose the target model.
     pub target_query_threshold: f64,
-    /// Duration in seconds to continue dual-writing after cutover.
-    ///
-    /// During the rollback window, queries use the new target model but
-    /// writes continue to both models. This ensures atoms created after
-    /// cutover exist in both indexes, enabling instant rollback without
-    /// data loss.
-    ///
-    /// Default: 86400 seconds (24 hours).
+    /// Seconds to retain both write models after a completed cutover.
     pub rollback_window_secs: u64,
 }
 

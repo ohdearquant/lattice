@@ -1,4 +1,8 @@
-//! Endpoint security configuration for teacher models.
+//! Endpoint policy for teacher-model connections.
+//!
+//! The policy can require TLS, restrict hosts, and carry certificate or local
+//! weight-integrity expectations. See `docs/distill.md` for the exact checks
+//! performed today and the verification that remains the HTTP client's job.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -110,8 +114,7 @@ impl EndpointSecurity {
     /// would need TLS library integration)
     pub fn validate_cert_fingerprint(&self, _actual_fingerprint: &str) -> Result<(), String> {
         if let Some(ref expected) = self.expected_cert_fingerprint {
-            // In production, this would compare against the actual server cert
-            // For now, we just validate the format
+            // A live client must compare the format-validated value to its peer certificate.
             if expected.len() != 64 {
                 return Err(
                     "Certificate fingerprint should be 64 hex characters (SHA-256)".to_string(),

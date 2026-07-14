@@ -1,30 +1,9 @@
-//! Knowledge distillation module
+//! Knowledge-distillation interfaces for producing soft intent labels.
 //!
-//! This module provides infrastructure for distilling knowledge from
-//! large teacher models (Claude, GPT, Gemini) into smaller student models.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Raw Data → Teacher (LLM) → Soft Labels → Dataset → Student Training
-//! ```
-//!
-//! # Example
-//!
-//! ```ignore
-//! use lattice_tune::distill::{TeacherConfig, DistillationPipeline, DistillationConfig};
-//!
-//! // Configure the teacher model
-//! let teacher = TeacherConfig::claude_sonnet()
-//!     .temperature(0.3)
-//!     .build();
-//!
-//! // Create distillation pipeline
-//! let pipeline = DistillationPipeline::new(teacher, DistillationConfig::default());
-//!
-//! // Label raw examples
-//! let labeled = pipeline.label_batch(&raw_examples).await?;
-//! ```
+//! It configures a teacher, sanitizes raw conversational input, records label
+//! outcomes, and converts successful results after embeddings are supplied.
+//! See `docs/distill.md` for the full data flow, security policy, and current
+//! placeholder boundary.
 
 mod pipeline;
 mod teacher;

@@ -1,4 +1,6 @@
-//! SIMD-accelerated distance operations.
+//! SIMD Euclidean and squared-Euclidean distance kernels.
+//!
+//! See docs/simd.md for distance semantics and ranking guidance.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -51,16 +53,9 @@ fn dispatch_squared(a: &[f32], b: &[f32]) -> f32 {
     squared_euclidean_distance_scalar(a, b)
 }
 
-/// Euclidean (L2) distance over equal-length `f32` slices.
+/// Computes Euclidean (L2) distance, returning [`f32::MAX`] for a dimensional mismatch.
 ///
-/// # Stability — khive ANN consumer contract
-///
-/// Part of the `simd::*` distance surface consumed directly by khive's ANN indexes
-/// (`khive-hnsw`, `khive-vamana`; ADR-012). The `(&[f32], &[f32]) -> f32` signature
-/// and length-mismatch behaviour (returns [`f32::MAX`]) are a **stable consumer
-/// contract** across the 0.4.x line. For the general-purpose ergonomic wrapper use
-/// `lattice_embed::utils::euclidean_distance`; prefer [`squared_euclidean_distance`]
-/// on hot paths where only ordering matters (it skips the final sqrt).
+/// See [`docs/simd.md`](../../docs/simd.md#public-api-contracts) for ranking guidance.
 #[inline]
 pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
@@ -70,24 +65,10 @@ pub fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     dispatch_squared(a, b).sqrt()
 }
 
-/// Squared Euclidean distance — skips the final sqrt.
+/// Computes squared Euclidean distance without a square root.
 ///
-/// Ordering is preserved: `sq_dist(a,b) <= sq_dist(a,c) ↔ dist(a,b) <= dist(a,c)`.
-/// Use this for ANN graph comparisons where only ordering matters; apply `.sqrt()`
-/// at the output boundary when the true L2 distance is required.
-///
-/// # Stability — khive ANN consumer contract
-///
-/// This is the primary hot-path distance for khive's ANN indexes (`khive-hnsw`
-/// today, `khive-vamana` next; ADR-012). The `(&[f32], &[f32]) -> f32` signature,
-/// the length-mismatch behaviour (returns [`f32::MAX`]), and the squared-L2 ordering
-/// invariant above — vs this crate's [`euclidean_distance`], which derives from the
-/// same accumulated squared distance — are a **stable consumer contract** across the
-/// 0.4.x line. SIMD accumulates terms in a different order than the scalar reference,
-/// so results are not bit-identical and no exact scalar ordering of near-ties is
-/// promised; the documented squared-vs-Euclidean equivalence is the property an ANN
-/// graph relies on. For the general-purpose ergonomic wrapper use
-/// `lattice_embed::utils::euclidean_distance`.
+/// Returns [`f32::MAX`] for a mismatch; it preserves L2 ordering for valid inputs.
+/// See [`docs/simd.md`](../../docs/simd.md#euclidean-distance) for ANN ranking and precision semantics.
 #[inline]
 pub fn squared_euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
@@ -114,18 +95,11 @@ pub(crate) fn euclidean_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
     squared_euclidean_distance_scalar(a, b).sqrt()
 }
 
-/// AVX-512F-accelerated squared Euclidean distance with 4x unrolling.
+/// Computes squared L2 with AVX-512F.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX-512F instructions (verified via `simd_config()`)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm512_loadu_ps` for unaligned loads (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk/remainder calculation
-/// - Remainder loops use safe indexing
+/// Caller must provide AVX-512F and equal slices; chunked unaligned loads stay in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn squared_euclidean_distance_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -195,18 +169,11 @@ unsafe fn squared_euclidean_distance_avx512_unrolled(a: &[f32], b: &[f32]) -> f3
     sum
 }
 
-/// AVX2-accelerated squared Euclidean distance with 4x unrolling.
+/// Computes squared L2 with AVX2 and FMA.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX2 and FMA instructions (verified via `simd_config()`)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm256_loadu_ps` for unaligned loads (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe indexing
+/// Caller must provide AVX2/FMA and equal slices; chunked unaligned loads stay in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn squared_euclidean_distance_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -258,18 +225,11 @@ unsafe fn squared_euclidean_distance_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 
     sum
 }
 
-/// NEON-accelerated squared Euclidean distance with 4x unrolling.
+/// Computes squared L2 with NEON.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Running on aarch64 (NEON is mandatory, always available)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `vld1q_f32` for loads (handles any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe indexing
+/// Caller must run on aarch64 with equal slices; chunked loads stay in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn squared_euclidean_distance_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
@@ -321,25 +281,11 @@ unsafe fn squared_euclidean_distance_neon_unrolled(a: &[f32], b: &[f32]) -> f32 
     sum
 }
 
-/// wasm32 SIMD128-accelerated squared Euclidean distance with 4x unrolling.
-///
-/// Mirrors `squared_euclidean_distance_neon_unrolled` above; see
-/// `dot_product::dot_product_simd128_unrolled` for the reassociation caveat
-/// (results are not bit-identical to the scalar reference) and the wasm
-/// safety notes (no runtime feature detection, alignment-free loads).
+/// Computes squared L2 with wasm32 SIMD128.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Compiled with the wasm32 `simd128` target feature (compile-time
-///   precondition; this function only exists under `#[cfg(target_feature =
-///   "simd128")]`)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `v128_load` for loads (wasm loads are alignment-free by spec)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe indexing
+/// This function requires compile-time SIMD128 and equal slices; bounds are chunked.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for wasm and reassociation semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn squared_euclidean_distance_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {

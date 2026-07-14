@@ -50,21 +50,22 @@ pub fn cross_entropy_backward(
 /// computes dL/dx = W^T g.
 ///
 /// `w` is row-major [d_out, d_in].  `g` is [d_out].  Returns [d_in].
+///
+/// Reuses the same GEMM dispatch the forward path uses (`matmul_into`, m=1):
+/// `dx = g @ W` treating `g` as a `[1, d_out]` row and `w` as `[d_out, d_in]`
+/// row-major — Accelerate `cblas_sgemm` on macOS; on non-macOS `matmul_into`
+/// currently routes straight to the generic scalar matmul (only `matmul_bt`
+/// has the tiled/SIMD dispatch), so this rewrite's speedup is a macOS-only
+/// claim until a non-macOS GEMM path lands. This is the single largest
+/// scalar loop in the tape (`d_out` reaches vocab_size at the LM head), so
+/// dispatching it through the same kernel as the forward pass is the
+/// primary lever in #737 stage 1 — on macOS.
 pub fn linear_vjp(w: &[f32], g: &[f32], d_in: usize, d_out: usize) -> Vec<f32> {
     assert_eq!(w.len(), d_out * d_in);
     assert_eq!(g.len(), d_out);
 
     let mut dx = vec![0.0f32; d_in];
-    for i in 0..d_out {
-        let gi = g[i];
-        if gi == 0.0 {
-            continue;
-        }
-        let row = &w[i * d_in..(i + 1) * d_in];
-        for (j, &wij) in row.iter().enumerate() {
-            dx[j] += wij * gi;
-        }
-    }
+    crate::forward::cpu::matmul_into(g, w, &mut dx, 1, d_out, d_in);
     dx
 }
 
@@ -93,7 +94,8 @@ pub fn lora_vjp(
     assert_eq!(x.len(), d_in);
     assert_eq!(h.len(), rank);
 
-    // grad_B[i, r] = scale * g[i] * h[r]
+    // grad_B[i, r] = scale * g[i] * h[r]  (outer product; O(d_out*rank), already
+    // a contiguous auto-vectorizable broadcast-multiply — left as a plain loop).
     let mut grad_b = vec![0.0f32; d_out * rank];
     for i in 0..d_out {
         for r in 0..rank {
@@ -101,17 +103,13 @@ pub fn lora_vjp(
         }
     }
 
-    // bt_g[r] = B^T g = Σ_i B[i,r] * g[i]
+    // bt_g[r] = B^T g = Σ_i B[i,r] * g[i]. Same matmul-transpose-accumulation
+    // shape as `linear_vjp`: B is [d_out, rank] row-major, g is [1, d_out] ⇒
+    // bt_g = g @ B via the shared GEMM dispatch (m=1, k=d_out, n=rank).
     let mut bt_g = vec![0.0f32; rank];
-    for r in 0..rank {
-        let mut acc = 0.0f32;
-        for i in 0..d_out {
-            acc += b[i * rank + r] * g[i];
-        }
-        bt_g[r] = acc;
-    }
+    crate::forward::cpu::matmul_into(g, b, &mut bt_g, 1, d_out, rank);
 
-    // grad_A[r, j] = scale * bt_g[r] * x[j]
+    // grad_A[r, j] = scale * bt_g[r] * x[j]  (outer product; same shape as grad_B).
     let mut grad_a = vec![0.0f32; rank * d_in];
     for r in 0..rank {
         for j in 0..d_in {
@@ -119,15 +117,16 @@ pub fn lora_vjp(
         }
     }
 
-    // dx = A^T (bt_g): dx[j] = scale * Σ_r A[r,j] * bt_g[r]
-    let mut dx = vec![0.0f32; d_in];
-    for r in 0..rank {
-        let scaled_bt_g = scale * bt_g[r];
-        let row = &a[r * d_in..(r + 1) * d_in];
-        for (j, &aij) in row.iter().enumerate() {
-            dx[j] += aij * scaled_bt_g;
-        }
+    // dx = A^T (bt_g): dx[j] = scale * Σ_r A[r,j] * bt_g[r]. A is [rank, d_in]
+    // row-major ⇒ dx = (scale*bt_g) @ A via the shared GEMM dispatch. Scale
+    // bt_g in place (same `v * scale` rounding order as the old allocated
+    // form) instead of collecting a fresh Vec — bt_g isn't read again after
+    // this point in the tape hot path.
+    for v in bt_g.iter_mut() {
+        *v *= scale;
     }
+    let mut dx = vec![0.0f32; d_in];
+    crate::forward::cpu::matmul_into(&bt_g, a, &mut dx, 1, rank, d_in);
 
     (grad_b, grad_a, dx)
 }
@@ -218,7 +217,105 @@ pub fn swiglu_backward(
     assert_eq!(w_gate.len(), inter * hidden);
     assert_eq!(w_up.len(), inter * hidden);
 
-    // dL/dm = W_down^T dy   [inter]
+    // dL/dm = W_down^T dy   [inter]. W_down is [hidden, inter] row-major, dy is
+    // [1, hidden] ⇒ dm = dy @ W_down via the shared GEMM dispatch (matches the
+    // forward `swiglu_forward`'s own down-proj matmul shape).
+    let mut dm = vec![0.0f32; inter];
+    crate::forward::cpu::matmul_into(dy, w_down, &mut dm, 1, hidden, inter);
+
+    // Elementwise SwiGLU-gate backward: silu'(gate) and the up/gate splits.
+    // O(inter), dominated by `exp()` (not a reduction) — left as a scan.
+    let mut d_up = vec![0.0f32; inter];
+    let mut d_gate_pre = vec![0.0f32; inter];
+    for j in 0..inter {
+        let a = gate_pre[j];
+        let sigma_a = 1.0 / (1.0 + (-a).exp());
+        let silu_a = a * sigma_a;
+        let up_j = up_pre[j];
+        let dm_j = dm[j];
+
+        d_up[j] = dm_j * silu_a;
+        let d_s = dm_j * up_j;
+        let silu_prime = sigma_a + a * sigma_a * (1.0 - sigma_a);
+        d_gate_pre[j] = d_s * silu_prime;
+    }
+
+    // dx = W_up^T d_up + W_gate^T d_gate_pre. Both W_up/W_gate are [inter, hidden]
+    // row-major, so each term is a `[1, inter] @ [inter, hidden]` GEMM — same
+    // matmul-transpose-accumulation shape as `dm` above.
+    let mut dx = vec![0.0f32; hidden];
+    crate::forward::cpu::matmul_into(&d_up, w_up, &mut dx, 1, inter, hidden);
+    let mut dx_gate = vec![0.0f32; hidden];
+    crate::forward::cpu::matmul_into(&d_gate_pre, w_gate, &mut dx_gate, 1, inter, hidden);
+    for (dxi, dgi) in dx.iter_mut().zip(dx_gate.iter()) {
+        *dxi += *dgi;
+    }
+
+    (dx, dm)
+}
+
+// ---------------------------------------------------------------------------
+// Scalar reference oracles (#737 stage 1) — the pre-vectorization loops,
+// preserved verbatim behind `#[cfg(test)]` so the GEMM-dispatched versions
+// above can be parity-checked against a known-naive accumulation order.
+// f32 sums are NOT reorder-invariant around nonlinearities, but these are
+// pure linear reductions, so parity is expected to hold to a tight tolerance
+// (not bit-exact — see `PARITY_TOL` below).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+fn linear_vjp_scalar(w: &[f32], g: &[f32], d_in: usize, d_out: usize) -> Vec<f32> {
+    let mut dx = vec![0.0f32; d_in];
+    for i in 0..d_out {
+        let gi = g[i];
+        let row = &w[i * d_in..(i + 1) * d_in];
+        for (j, &wij) in row.iter().enumerate() {
+            dx[j] += wij * gi;
+        }
+    }
+    dx
+}
+
+#[cfg(test)]
+fn lora_bt_g_dx_scalar(
+    g: &[f32],
+    a: &[f32],
+    b: &[f32],
+    rank: usize,
+    d_in: usize,
+    d_out: usize,
+    scale: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut bt_g = vec![0.0f32; rank];
+    for r in 0..rank {
+        let mut acc = 0.0f32;
+        for i in 0..d_out {
+            acc += b[i * rank + r] * g[i];
+        }
+        bt_g[r] = acc;
+    }
+    let mut dx = vec![0.0f32; d_in];
+    for r in 0..rank {
+        let scaled_bt_g = scale * bt_g[r];
+        let row = &a[r * d_in..(r + 1) * d_in];
+        for (j, &aij) in row.iter().enumerate() {
+            dx[j] += aij * scaled_bt_g;
+        }
+    }
+    (bt_g, dx)
+}
+
+#[cfg(test)]
+fn swiglu_backward_scalar(
+    dy: &[f32],
+    gate_pre: &[f32],
+    up_pre: &[f32],
+    w_down: &[f32],
+    w_gate: &[f32],
+    w_up: &[f32],
+    hidden: usize,
+    inter: usize,
+) -> (Vec<f32>, Vec<f32>) {
     let mut dm = vec![0.0f32; inter];
     for j in 0..inter {
         let mut acc = 0.0f32;
@@ -611,5 +708,121 @@ mod tests {
         let err = rel_err(&analytic_dx, &fd);
         eprintln!("swiglu_backward rel_err={err:.2e}");
         assert!(err < TOL, "swiglu rel_err {err:.2e} >= {TOL:.2e}");
+    }
+
+    // -------------------------------------------------------------------
+    // GEMM-dispatch vs scalar-reference parity (#737 stage 1).
+    //
+    // The gradcheck tests above already prove correctness against finite
+    // differences at small sizes. These tests additionally prove the
+    // vectorized (matmul_into-dispatched) path agrees with the exact
+    // pre-vectorization scalar accumulation order at sizes representative
+    // of real backward-tape shapes (non-multiple-of-lane-width dims
+    // included on purpose, to exercise scalar remainder paths in the SIMD
+    // kernels). Tolerance is not bit-exact: BLAS/SIMD reassociate the sum,
+    // which is not f32-exact around a pure linear reduction, but should
+    // still agree to a tight relative tolerance.
+    // -------------------------------------------------------------------
+
+    const PARITY_TOL: f64 = 1e-4;
+
+    /// Deterministic xorshift64 float generator so parity tests are
+    /// reproducible without pulling in a `rand` dev-dependency here.
+    fn xorshift_fill(seed: u64, n: usize, amp: f32) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 32) as u32 as f32 / u32::MAX as f32 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    #[test]
+    fn linear_vjp_parity_vs_scalar() {
+        // Non-power-of-2 dims on purpose: exercises the scalar remainder tail
+        // in the SIMD/BLAS dispatch, not just the fast-path multiple-of-lane case.
+        let d_in = 517;
+        let d_out = 251;
+        let w = xorshift_fill(1, d_out * d_in, 0.5);
+        let g = xorshift_fill(2, d_out, 1.0);
+
+        let vectorized = linear_vjp(&w, &g, d_in, d_out);
+        let scalar = linear_vjp_scalar(&w, &g, d_in, d_out);
+
+        let err = rel_err(&vectorized, &scalar);
+        eprintln!("linear_vjp parity rel_err={err:.2e}");
+        assert!(
+            err < PARITY_TOL,
+            "linear_vjp vectorized vs scalar rel_err {err:.2e} >= {PARITY_TOL:.2e}"
+        );
+    }
+
+    #[test]
+    fn lora_vjp_parity_vs_scalar() {
+        let rank = 11;
+        let d_in = 199;
+        let d_out = 257;
+        let scale = 0.37f32;
+
+        let g = xorshift_fill(3, d_out, 1.0);
+        let x = xorshift_fill(4, d_in, 0.5);
+        let a = xorshift_fill(5, rank * d_in, 0.3);
+        let b = xorshift_fill(6, d_out * rank, 0.3);
+        let h = xorshift_fill(7, rank, 0.4);
+
+        let (_grad_b, _grad_a, dx_vec) = lora_vjp(&g, &x, &h, &a, &b, rank, d_in, d_out, scale);
+        let (bt_g_scalar, dx_scalar) = lora_bt_g_dx_scalar(&g, &a, &b, rank, d_in, d_out, scale);
+
+        // Cross-check bt_g indirectly through the caller-visible dx, and
+        // directly recompute it via matmul_into to pin down the isolated hop.
+        let mut bt_g_vec = vec![0.0f32; rank];
+        crate::forward::cpu::matmul_into(&g, &b, &mut bt_g_vec, 1, d_out, rank);
+
+        let err_btg = rel_err(&bt_g_vec, &bt_g_scalar);
+        let err_dx = rel_err(&dx_vec, &dx_scalar);
+        eprintln!("lora_vjp parity bt_g rel_err={err_btg:.2e} dx rel_err={err_dx:.2e}");
+        assert!(
+            err_btg < PARITY_TOL,
+            "lora bt_g vectorized vs scalar rel_err {err_btg:.2e} >= {PARITY_TOL:.2e}"
+        );
+        assert!(
+            err_dx < PARITY_TOL,
+            "lora dx vectorized vs scalar rel_err {err_dx:.2e} >= {PARITY_TOL:.2e}"
+        );
+    }
+
+    #[test]
+    fn swiglu_backward_parity_vs_scalar() {
+        let hidden = 131;
+        let inter = 347;
+
+        let dy = xorshift_fill(8, hidden, 0.8);
+        let gate_pre = xorshift_fill(9, inter, 1.2);
+        let up_pre = xorshift_fill(10, inter, 1.2);
+        let w_down = xorshift_fill(11, hidden * inter, 0.2);
+        let w_gate = xorshift_fill(12, inter * hidden, 0.2);
+        let w_up = xorshift_fill(13, inter * hidden, 0.2);
+
+        let (dx_vec, dm_vec) = swiglu_backward(
+            &dy, &gate_pre, &up_pre, &w_down, &w_gate, &w_up, hidden, inter,
+        );
+        let (dx_scalar, dm_scalar) = swiglu_backward_scalar(
+            &dy, &gate_pre, &up_pre, &w_down, &w_gate, &w_up, hidden, inter,
+        );
+
+        let err_dm = rel_err(&dm_vec, &dm_scalar);
+        let err_dx = rel_err(&dx_vec, &dx_scalar);
+        eprintln!("swiglu_backward parity dm rel_err={err_dm:.2e} dx rel_err={err_dx:.2e}");
+        assert!(
+            err_dm < PARITY_TOL,
+            "swiglu dm vectorized vs scalar rel_err {err_dm:.2e} >= {PARITY_TOL:.2e}"
+        );
+        assert!(
+            err_dx < PARITY_TOL,
+            "swiglu dx vectorized vs scalar rel_err {err_dx:.2e} >= {PARITY_TOL:.2e}"
+        );
     }
 }

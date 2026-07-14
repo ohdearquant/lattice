@@ -1,6 +1,8 @@
-//! INT8 quantization for efficient embedding storage and similarity computation.
+//! INT8 vector quantization and approximate similarity kernels.
 //!
-//! Quantized vectors provide ~3x speedup and 4x memory reduction with 99%+ accuracy.
+//! Constructor-owned values preserve the SIMD range invariant.
+//!
+//! See docs/simd.md for the encoding, error model, and dispatch strategy.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -135,16 +137,9 @@ impl QuantizedVector {
         Self { data, params, norm }
     }
 
-    /// **Unstable**: dequantization; output precision may change with scheme update.
+    /// **Unstable**: dequantizes this vector using its stored scale.
     ///
-    /// # Precision
-    ///
-    /// INT8 symmetric quantization maps `[-max_abs, max_abs]` to `[-127, 127]`,
-    /// so the quantization step size is `max_abs / 127`. The maximum per-element
-    /// round-trip error is bounded by half a quantization step: `max_abs / 254`.
-    ///
-    /// For a 384-dim unit-norm embedding (`max_abs` ≈ 1.0), expect element-wise
-    /// absolute error ≤ 0.004 and cosine-similarity error ≤ 0.5%.
+    /// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for the encoding and error bounds.
     pub fn to_f32(&self) -> Vec<f32> {
         let scale = if self.params.scale.is_finite() && self.params.scale != 0.0 {
             self.params.scale
@@ -168,19 +163,10 @@ impl QuantizedVector {
     }
 }
 
-/// **Unstable**: SIMD INT8 dot product; VNNI/AVX2/NEON dispatch may change.
+/// **Unstable**: computes an approximate float dot product, returning `0.0` for a mismatch.
 ///
-/// Returns the approximate float dot product.
-/// Returns 0.0 if vectors have different lengths.
-///
-/// # Invariant
-///
-/// Both vectors must satisfy the `[-127, 127]` range invariant. The value `-128`
-/// causes silent corruption on the AVX2 and AVX-512-VNNI paths, which apply an
-/// operand's sign by negating a byte (`_mm256_sign_epi8` / a `0 - b` emulation):
-/// negating `-128` wraps back to `-128` in two's complement instead of `+128`,
-/// so the kernel accumulates the wrong sign. The `data` field is private, so
-/// only `from_f32` (which clamps) can populate it — `debug_assert!` is sufficient.
+/// Inputs satisfy the constructor-owned `[-127, 127]` invariant.
+/// See [`docs/simd.md`](../../docs/simd.md#raw-int8-input-invariant) for its SIMD requirement.
 #[inline]
 pub fn dot_product_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
     debug_assert!(a.data.iter().all(|&v| v != -128i8));
@@ -228,11 +214,9 @@ pub fn cosine_similarity_i8(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
     dot_product_i8(a, b) / denom
 }
 
-/// Trusted INT8 cosine similarity for constructor-owned vectors in prepared-query paths.
+/// Computes INT8 cosine similarity for constructor-owned vectors without a release scan.
 ///
-/// Uses `dot_product_i8_trusted` instead of `dot_product_i8` to skip release-mode
-/// O(N) invariant scans. Callers must guarantee vectors were produced by
-/// `QuantizedVector::from_f32` or equivalent (clamped to [-127, 127]).
+/// See [`docs/simd.md`](../../docs/simd.md#raw-int8-input-invariant) for the trusted-path precondition.
 #[inline]
 pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVector) -> f32 {
     let denom = a.norm * b.norm;
@@ -242,23 +226,11 @@ pub(crate) fn cosine_similarity_i8_trusted(a: &QuantizedVector, b: &QuantizedVec
     dot_product_i8_trusted(a, b) / denom
 }
 
-/// NEON int8 dot product using vmull/vpadal with 4x unrolling and software prefetch.
-///
-/// Processes 64 int8s per iteration with 4 accumulators. Prefetches the next
-/// cache line (64 bytes) one iteration ahead to hide DRAM latency for large dims.
+/// Computes an INT8 dot product with FEAT_DotProd and guarded prefetch.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Running on aarch64 with FEAT_DotProd (uses SDOT instruction)
-/// - `a` and `b` have equal length (checked by caller)
-/// - No element is i8::MIN (-128) — see SIMD invariant docs
-///
-/// Memory safety:
-/// - Uses `vld1q_s8` for loads (handles any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder handled via safe slice iteration
-/// - Prefetch pointers are bounds-checked before issuing (only prefetch if within slice)
+/// Caller must provide FEAT_DotProd, equal `[-127, 127]` slices, and bounded prefetches.
+/// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for dispatch and implementation details.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
@@ -275,9 +247,7 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
     let mut sum2 = vdupq_n_s32(0);
     let mut sum3 = vdupq_n_s32(0);
 
-    // Use SDOT (ARMv8.2 dotprod) via inline asm — 1 instruction per 16 i8 elements
-    // vs 6 instructions (split + vmull×2 + vpadalq×2) with the widening approach.
-    // Apple Silicon (M1+) supports dotprod; runtime check at dispatch level.
+    // SDOT is selected only after runtime FEAT_DotProd detection — see docs/simd.md.
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
@@ -380,21 +350,11 @@ unsafe fn mm512_sign_epi8(b: __m512i, a: __m512i) -> __m512i {
     _mm512_mask_blend_epi8(mask_zero, result, zero)
 }
 
-/// AVX-512 VNNI int8 dot product using _mm512_dpbusd_epi32.
-///
-/// Processes 256 int8s per iteration (4x64 with 4 accumulators).
-/// Note: VNNI expects unsigned x signed, so we handle signs carefully.
+/// Computes an INT8 dot product with AVX-512 VNNI.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX-512F, AVX-512VNNI, and AVX-512BW (verified via `simd_config()`)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm512_loadu_si512` for unaligned loads (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder handled via safe slice iteration
+/// Caller must provide AVX-512F/VNNI/BW and equal `[-127, 127]` slices; bounds are chunked.
+/// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for signed-product transformation details.
 #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
 #[target_feature(enable = "avx512f", enable = "avx512vnni", enable = "avx512bw")]
 unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
@@ -462,19 +422,11 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
     (sum + remainder) as f32
 }
 
-/// AVX2 int8 dot product with 4x unrolling and software prefetch.
+/// Computes an INT8 dot product with AVX2 and guarded prefetch.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX2 (verified via `simd_config()`)
-/// - `a` and `b` have equal length (checked by caller)
-///
-/// Memory safety:
-/// - Uses `_mm256_loadu_si256` for unaligned loads (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder handled via safe slice iteration
-/// - Prefetch hint issues `_MM_HINT_T0` only when next chunk is within slice bounds
+/// Caller must provide AVX2 and equal `[-127, 127]` slices; bounds and prefetch are guarded.
+/// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for signed-product transformation details.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
@@ -569,10 +521,7 @@ pub type I8DotKernel = fn(&[i8], &[i8]) -> f32;
 
 static I8_DOT_KERNEL: OnceLock<I8DotKernel> = OnceLock::new();
 
-/// Return the cached INT8 dot-product kernel.
-///
-/// Callers that invoke INT8 dot product in a tight loop can hoist this call
-/// outside the loop so the OnceLock check runs once, not per-iteration.
+/// Return the cached INT8 dot-product kernel for tight loops.
 #[inline]
 pub fn resolved_i8_dot_kernel() -> I8DotKernel {
     *I8_DOT_KERNEL.get_or_init(resolve_i8_dot_kernel)
@@ -635,59 +584,16 @@ fn dot_product_i8_scalar_kernel(a: &[i8], b: &[i8]) -> f32 {
         .sum::<i32>() as f32
 }
 
-/// **Unstable**: raw SIMD INT8 hot path; signature and scaling semantics may change.
-///
-/// This is the hot-path function for HNSW quantized search. Unlike `dot_product_i8`,
-/// it takes raw `&[i8]` slices and does NOT divide by scale factors -- the caller
-/// handles scaling. This avoids allocating `QuantizedVector` wrappers.
-///
-/// Returns 0.0 if slices have different lengths.
-///
-/// # Invariant
-///
-/// Both slices must satisfy the `[-127, 127]` range invariant. The value `-128`
-/// causes silent corruption on the AVX2 and AVX-512-VNNI paths, which apply an
-/// operand's sign by negating a byte (`_mm256_sign_epi8` / a `0 - b` emulation):
-/// negating `-128` wraps back to `-128` in two's complement instead of `+128`,
-/// so the kernel accumulates the wrong sign. The invariant is enforced with a
-/// **`debug_assert!`** (debug builds only); callers MUST guarantee it. The
-/// `QuantizedVector::from_f32` constructor satisfies it by clamping to `[-127, 127]`.
-/// Promoting this to a release `assert!` would add an O(n) scan to a documented hot
-/// path and is intentionally avoided.
-///
-/// # Performance
-///
+/// Dispatch a validated raw INT8 dot product.
 #[inline]
 fn dot_product_i8_dispatch(a: &[i8], b: &[i8]) -> f32 {
     resolved_i8_dot_kernel()(a, b)
 }
 
-/// **Unstable**: raw INT8 dot product on slices; SIMD strategy may change.
+/// **Unstable**: computes an unscaled raw INT8 dot product, returning `0.0` for a mismatch.
 ///
-/// Uses the same SIMD paths as `dot_product_i8`:
-/// - aarch64: NEON with 4x unrolling + tail SIMD chunks
-/// - x86_64: AVX-512 VNNI > AVX2 > scalar
-///
-/// The key difference is zero allocation overhead: no `Vec<i8>`, no
-/// `QuantizedVector`, no `QuantizationParams`. Just raw slices in, f32 out.
-///
-/// # Invariant (caller-guaranteed)
-///
-/// Every element of `a` and `b` must lie in `[-127, 127]`, i.e. the value
-/// `-128` (`i8::MIN`) must not appear. The AVX2 and AVX-512-VNNI kernels apply
-/// an operand's sign by negating a byte (`_mm256_sign_epi8` / a `0 - b`
-/// emulation); negating `-128` wraps back to `-128` in two's complement instead
-/// of `+128`, so the kernel silently accumulates the wrong sign and the dispatch
-/// returns a wrong distance with no panic. The precondition is checked only by
-/// `debug_assert!`, which is compiled out in release builds, so a release caller
-/// gets no diagnostic. `-128` is memory-safe (no UB), only numerically
-/// out-of-contract.
-///
-/// Vectors produced by [`QuantizedVector::from_f32`] satisfy this automatically
-/// (it clamps to `[-127, 127]`). Callers feeding slices from an external or
-/// differently-configured quantizer must clamp `i8::MIN` up to `-127` first.
-/// The invariant is a `debug_assert!` rather than a release `assert!` on
-/// purpose: a release-time scan would add O(n) work to this documented hot path.
+/// Every value must lie in `[-127, 127]`; `i8::MIN` is numerically invalid.
+/// See [`docs/simd.md`](../../docs/simd.md#raw-int8-input-invariant) for the release-mode precondition.
 #[inline]
 pub fn dot_product_i8_raw(a: &[i8], b: &[i8]) -> f32 {
     if a.len() != b.len() {

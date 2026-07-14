@@ -52,11 +52,7 @@ fn run() {
     let dir = std::path::Path::new(&model_dir_str);
     let tokenizer_path = std::path::Path::new(&tokenizer_dir_str).join("tokenizer.json");
 
-    let cfg = if dir.join("config.json").exists() {
-        Qwen35Config::from_config_json(&dir.join("config.json")).expect("parse config.json")
-    } else {
-        Qwen35Config::qwen36_27b()
-    };
+    let cfg = Qwen35Config::from_model_dir(dir).expect("load model config.json");
 
     let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path).expect("load tokenizer");
 

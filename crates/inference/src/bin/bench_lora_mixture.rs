@@ -177,12 +177,7 @@ fn run_gpu_decode_bench(
 
     eprintln!("[bench_lora_mixture] loading model from {model_dir_str}");
 
-    let cfg = if dir.join("config.json").exists() {
-        Qwen35Config::from_config_json(&dir.join("config.json"))
-            .map_err(|e| format!("config.json parse: {e}"))?
-    } else {
-        Qwen35Config::qwen35_0_8b()
-    };
+    let cfg = Qwen35Config::from_model_dir(dir).map_err(|e| format!("config.json load: {e}"))?;
 
     let mut metal = MetalQwen35State::from_q4_dir(dir, &tokenizer_path, &cfg, 512)
         .map_err(|e| format!("Metal Q4 init: {e}"))?;

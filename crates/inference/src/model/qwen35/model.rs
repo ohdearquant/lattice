@@ -34,12 +34,7 @@ impl Qwen35Model {
             )));
         };
 
-        let config_path = path.join("config.json");
-        let config = if config_path.exists() {
-            Qwen35Config::from_config_json(&config_path)?
-        } else {
-            Qwen35Config::qwen35_2b()
-        };
+        let config = Qwen35Config::from_model_dir(path)?;
 
         validate_required_tensor_names(source.as_mut(), &config)?;
 

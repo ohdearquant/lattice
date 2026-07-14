@@ -1,4 +1,6 @@
-//! SIMD-accelerated vector normalization.
+//! SIMD in-place L2 normalization kernels.
+//!
+//! See docs/simd.md for the two-pass algorithm and backend differences.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -74,21 +76,11 @@ pub(crate) fn normalize_scalar(vector: &mut [f32]) {
     }
 }
 
-/// AVX-512F-accelerated normalization with 4x unrolling.
-///
-/// Performs two passes:
-/// 1. Compute L2 norm
-/// 2. Scale each element by 1 / norm
+/// Normalizes in two passes with AVX-512F.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX-512F instructions (verified via `simd_config()`)
-///
-/// Memory safety:
-/// - Uses `_mm512_loadu_ps`/`_mm512_storeu_ps` for unaligned access
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loops use safe indexing
+/// Caller must provide AVX-512F; chunked unaligned access stays in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
@@ -198,17 +190,11 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
     }
 }
 
-/// AVX2-accelerated normalization with 4x unrolling.
+/// Normalizes in two passes with AVX2 and FMA.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - CPU supports AVX2 and FMA instructions (verified via `simd_config()`)
-///
-/// Memory safety:
-/// - Uses `_mm256_loadu_ps`/`_mm256_storeu_ps` for unaligned access (safe for any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe indexing
+/// Caller must provide AVX2 and FMA; chunked unaligned access stays in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for the shared kernel invariant.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
@@ -294,23 +280,11 @@ unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
     }
 }
 
-/// NEON-accelerated normalization with 4x unrolling.
-///
-/// Uses `vrsqrteq_f32` + two Newton–Raphson steps (`vrsqrtsq_f32`) to compute
-/// the reciprocal square root of the squared L2 norm.  This replaces a scalar
-/// `sqrt` + scalar reciprocal with ~4–6 NEON cycles and converges to full f32
-/// precision (relative error floored at ~2^-23); the measured per-element diff
-/// vs the scalar path is ~3e-8, well within the 1e-6 tolerance verified below.
+/// Normalizes in two passes with NEON reciprocal-square-root refinement.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Running on aarch64 (NEON is mandatory, always available)
-///
-/// Memory safety:
-/// - Uses `vld1q_f32`/`vst1q_f32` for loads/stores (handles any alignment)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe iteration
+/// Caller must run on aarch64; chunked unaligned access stays in bounds.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for convergence and fallback semantics.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
@@ -408,25 +382,11 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
     }
 }
 
-/// wasm32 SIMD128-accelerated normalization with 4x unrolling.
-///
-/// Mirrors `normalize_avx2_unrolled` above (plain `sqrt` + scalar reciprocal,
-/// not the NEON kernel's `vrsqrteq_f32`+Newton-Raphson estimate -- wasm's
-/// `f32x4_sqrt` is already a single instruction, so there is no equivalent
-/// estimate-and-refine trick to apply here).
+/// Normalizes in two passes with wasm32 SIMD128.
 ///
 /// # Safety
-///
-/// Caller must ensure:
-/// - Compiled with the wasm32 `simd128` target feature (compile-time
-///   precondition; this function only exists under `#[cfg(target_feature =
-///   "simd128")]`)
-///
-/// Memory safety:
-/// - Uses `v128_load`/`v128_store` for loads/stores (wasm loads/stores are
-///   alignment-free by spec)
-/// - Pointer arithmetic stays within slice bounds via chunk calculation
-/// - Remainder loop uses safe indexing
+/// This function requires the compile-time `simd128` target feature; bounds are chunked.
+/// See [`docs/simd.md`](../../docs/simd.md#kernel-safety-boundary) for wasm alignment semantics.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 unsafe fn normalize_simd128_unrolled(vector: &mut [f32]) {

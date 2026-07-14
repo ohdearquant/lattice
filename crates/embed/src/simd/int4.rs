@@ -1,17 +1,8 @@
-//! INT4 quantization for ultra-compact embedding storage.
+//! INT4 packed-vector quantization and approximate dot products.
 //!
-//! Two 4-bit values packed per byte (8x compression vs f32).
-//! Uses symmetric unsigned quantization: maps [-max_abs, max_abs] to [0, 15].
+//! Nibble layout and offset correction are shared by scalar and NEON paths.
 //!
-//! ## Packing format
-//!
-//! High nibble = even index, low nibble = odd index.
-//! For D dimensions, storage is `ceil(D / 2)` bytes.
-//!
-//! ## Dot product
-//!
-//! Dot products dequantize before accumulation so the unsigned INT4 offset is
-//! handled identically on every target.
+//! See docs/simd.md for the packed format and corrected dot-product derivation.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -117,23 +108,9 @@ impl Int4Vector {
         }
     }
 
-    /// **Unstable**: dequantization output semantics may change.
+    /// **Unstable**: dequantizes packed INT4 data, or returns empty for a malformed buffer.
     ///
-    /// Reverses the quantization: `v[i] = q[i] / scale - max_abs`
-    ///
-    /// Returns an empty `Vec` if the packed buffer is shorter than `dims.div_ceil(2)`
-    /// bytes — i.e. the vector was constructed with mismatched fields.
-    ///
-    /// # Precision
-    ///
-    /// INT4 unsigned symmetric quantization maps `[-max_abs, max_abs]` to `[0, 15]`
-    /// (16 levels), so the quantization step size is `2 * max_abs / 15`. The maximum
-    /// per-element round-trip error is bounded by half a step: `max_abs / 15`.
-    ///
-    /// For a 384-dim unit-norm embedding (`max_abs` ≈ 1.0), expect element-wise
-    /// absolute error ≤ 0.067 and relative dot-product error ≤ 15% (see
-    /// `test_int4_dot_product_vs_f32` and `test_int4_roundtrip_accuracy`).
-    /// Use `Int8` tier when higher fidelity is required.
+    /// See [`docs/simd.md`](../../docs/simd.md#int4-vectors) for format and precision bounds.
     pub fn to_f32(&self) -> Vec<f32> {
         let required_bytes = self.dims.div_ceil(2);
         if self.data.len() < required_bytes {
@@ -184,12 +161,7 @@ impl Int4Vector {
     }
 }
 
-/// **Unstable**: SIMD INT4 dot product; NEON/scalar dispatch may change.
-///
-/// Unpacks nibbles, computes dot product of quantized values, then applies
-/// dequantization scaling: `result = (raw_dot / (scale_a * scale_b)) - correction`
-///
-/// The correction accounts for the unsigned offset in the quantization formula.
+/// **Unstable**: dequantized INT4 dot product; dispatch may change.
 #[inline]
 pub fn dot_product_int4(a: &Int4Vector, b: &Int4Vector) -> f32 {
     if a.dims != b.dims {

@@ -1,13 +1,8 @@
-//! Binary-private support shared by `train_grad`, `train_grad_full`, and
-//! `train_grad_layer23` (issue #845): the loader, the CLI arg-lookup
-//! semantics, and the fail-closed TBV (trust-but-verify) check.
+//! Binary-private support shared by the gradient-training executables.
 //!
-//! Deliberately narrow. Each bin keeps its own typed config and usage text —
-//! defaults and supported flags genuinely differ between bins (see the flag
-//! table in issue #845) — so this module holds only the pieces that were
-//! byte-identical across all three: `Sample`/`load_jsonl`, the
-//! `parse_arg`/`parse_flag` lookup semantics (as `ArgView`), the shared
-//! path defaults, and `verify_tbv`.
+//! It owns JSONL sample loading, raw argument lookup, path defaults, and the
+//! fail-closed trust-but-verify comparison. Each binary owns its typed options
+//! and usage contract. See `docs/design.md` for the CLI data and TBV flow.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -20,11 +15,10 @@ pub struct Sample {
     pub completion_start: usize,
 }
 
-/// Load `prompt`/`completion` JSONL rows, tokenizing full = prompt+completion
-/// and recording where the completion starts. Rows that are empty, missing a
-/// field, or whose tokenized length falls outside `(1, seq_len]` (or whose
-/// completion is empty after tokenization) are skipped. Stops once
-/// `max_samples` rows have been collected.
+/// Load up to `max_samples` valid `prompt`/`completion` JSONL rows.
+///
+/// Each sample stores full token IDs and the completion boundary; invalid or
+/// over-length rows are skipped. See [`docs/design.md`](../../../docs/design.md#shared-jsonl-samples) for acceptance rules.
 pub fn load_jsonl(
     path: &Path,
     tokenizer: &dyn Tokenizer,
@@ -87,13 +81,8 @@ pub fn default_data_dir() -> PathBuf {
     PathBuf::from("data/lora-train")
 }
 
-/// A read-only view over `std::env::args()`-style argv, preserving the exact
-/// lookup semantics every bin's inline `parse_arg`/`parse_flag` had: first
-/// matching flag wins, a missing/invalid value is the caller's problem (this
-/// type only ever returns the raw string or `None`), presence flags are
-/// presence-only, and unknown flags are silently ignored. Parser strictness
-/// is explicitly out of scope for this migration (issue #845 non-goals) —
-/// this type must not add validation beyond what the two free functions did.
+/// Provides the shared permissive lookup semantics for gradient-training arguments.
+/// See [`docs/design.md`](../../../docs/design.md#argview) for compatibility and validation boundaries.
 pub struct ArgView<'a> {
     args: &'a [String],
 }
@@ -133,12 +122,10 @@ pub struct TbvObservation {
     pub diff: f32,
 }
 
-/// Compare a candidate (cached/assembled-chain) masked NLL against the
-/// reference (real model `compute_token_nlls`) masked NLL. Fails closed:
-/// non-finite reference, non-finite candidate, non-finite difference, or a
-/// difference exceeding [`TBV_MAX_ABS_DIFF`] all return `Err` rather than
-/// merely being printed. `context` is folded into the error message to
-/// identify which check failed (e.g. "train_grad cache check (sample 0)").
+/// Compare candidate and reference masked NLL values and return their observation.
+///
+/// Fails closed for non-finite values or a difference above [`TBV_MAX_ABS_DIFF`].
+/// See [`docs/design.md`](../../../docs/design.md#verify_tbv) for gate behavior and diagnostics.
 pub fn verify_tbv(
     context: &str,
     reference_nll: f32,

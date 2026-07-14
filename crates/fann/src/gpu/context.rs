@@ -1,4 +1,8 @@
-//! GPU compute context - device, queue, and resource management
+//! GPU device context: adapter selection, queue ownership, pooled memory, and pipelines.
+//!
+//! `flush_memory` drops pooled buffers and waits for pending work. GPU destruction is
+//! asynchronous, so dropping buffers without polling or waiting can still cause OOM.
+//! See `docs/gpu.md` for the full backend design.
 
 use super::buffer::BufferPool;
 use super::circuit_breaker::MemoryPressure;
@@ -172,14 +176,9 @@ impl GpuContext {
         self.device.poll(wgpu::Maintain::Wait);
     }
 
-    /// Flush GPU memory and wait for pending operations
+    /// Drops pooled buffers, waits for pending work, and returns freed pool bytes.
     ///
-    /// This method:
-    /// 1. Flushes all pooled buffers, releasing cached GPU memory
-    /// 2. Waits for all pending GPU operations to complete
-    ///
-    /// Use this during long training loops to prevent OOM from async deallocation lag.
-    /// Returns the number of bytes freed from the buffer pool.
+    /// See [`docs/gpu.md`](../../docs/gpu.md#gpucontextflush_memory) for release ordering.
     pub fn flush_memory(&self) -> u64 {
         let freed = self.buffer_pool.flush();
         self.wait();
@@ -200,24 +199,9 @@ impl GpuContext {
         }
     }
 
-    /// Set memory pressure handler callback
+    /// Sets the callback invoked by explicit memory-pressure notifications.
     ///
-    /// The callback is invoked when memory pressure is detected or changes.
-    /// Use this for graceful degradation under memory pressure.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// ctx.set_memory_pressure_handler(|level, usage| {
-    ///     match level {
-    ///         MemoryPressureLevel::High | MemoryPressureLevel::Critical => {
-    ///             eprintln!("GPU memory pressure: {:?}, usage: {} MB", level, usage / 1_000_000);
-    ///             // Reduce batch size, flush caches, etc.
-    ///         }
-    ///         _ => {}
-    ///     }
-    /// });
-    /// ```
+    /// See [`docs/gpu.md`](../../docs/gpu.md#gpucontextset_memory_pressure_handler) for usage guidance.
     pub fn set_memory_pressure_handler<F>(&self, handler: F)
     where
         F: Fn(MemoryPressureLevel, u64) + Send + Sync + 'static,

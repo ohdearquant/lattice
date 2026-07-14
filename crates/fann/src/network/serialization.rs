@@ -1,6 +1,10 @@
-//! Network serialization and deserialization
+//! Compact binary network serialization.
 //!
-//! Provides binary serialization for efficient network storage and loading.
+//! The format is little-endian, versioned, and contains each layer's shape,
+//! activation, weights, and biases. Parsing validates bounds before allocation
+//! and requires an exact-length blob.
+//!
+//! See `docs/network.md` for the complete on-disk format and invariants.
 
 use crate::activation::Activation;
 use crate::error::{FannError, FannResult, validate_allocation_size, validate_layer_dimensions};
@@ -8,39 +12,8 @@ use crate::layer::Layer;
 use crate::network::Network;
 
 impl Network {
-    /// Serialize the network to a compact binary format
-    ///
-    /// Format:
-    /// - Magic: 4 bytes "FANN"
-    /// - Version: u32 little-endian (1)
-    /// - Num layers: u32 little-endian
-    /// - For each layer:
-    ///   - num_inputs: u32 little-endian
-    ///   - num_outputs: u32 little-endian
-    ///   - activation_type: u8 (0=Linear, 1=Sigmoid, 2=Tanh, 3=ReLU, 4=LeakyReLU, 5=Softmax)
-    ///   - If LeakyReLU: alpha f32 little-endian
-    ///   - weights: num_inputs * num_outputs f32s little-endian
-    ///   - biases: num_outputs f32s little-endian
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use lattice_fann::{Network, NetworkBuilder, Activation};
-    ///
-    /// let network = NetworkBuilder::new()
-    ///     .input(4)
-    ///     .hidden(8, Activation::ReLU)
-    ///     .output(2, Activation::Softmax)
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// let bytes = network.to_bytes();
-    /// let restored = Network::from_bytes(&bytes).unwrap();
-    ///
-    /// assert_eq!(network.num_inputs(), restored.num_inputs());
-    /// assert_eq!(network.num_outputs(), restored.num_outputs());
-    /// assert_eq!(network.num_layers(), restored.num_layers());
-    /// ```
+    /// Serializes this network in the version-1 little-endian binary format.
+    /// See [`docs/network.md`](../../docs/network.md#network-serialization) for the wire format.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
@@ -86,43 +59,16 @@ impl Network {
         bytes
     }
 
-    /// Deserialize a network from binary format
+    /// Deserializes an exact-length version-1 network blob.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Magic number is invalid
-    /// - Version is unsupported
-    /// - Data is truncated or malformed
-    /// - Layer dimensions are invalid
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use lattice_fann::{Network, NetworkBuilder, Activation};
-    ///
-    /// let original = NetworkBuilder::new()
-    ///     .input(10)
-    ///     .hidden(20, Activation::ReLU)
-    ///     .output(5, Activation::Softmax)
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// let bytes = original.to_bytes();
-    /// let restored = Network::from_bytes(&bytes).unwrap();
-    ///
-    /// assert_eq!(original.total_params(), restored.total_params());
-    /// ```
+    /// Returns an error for malformed headers, records, dimensions, or trailing data.
+    /// See [`docs/network.md`](../../docs/network.md#network-serialization) for validation rules.
     pub fn from_bytes(bytes: &[u8]) -> FannResult<Self> {
         let mut pos = 0;
 
-        // Helper to read bytes
+        // Read only after an overflow-safe remaining-byte check.
         let read_bytes = |pos: &mut usize, n: usize| -> FannResult<&[u8]> {
-            // Compute the remaining budget by subtraction, never `*pos + n`, so a
-            // hostile byte count near usize::MAX cannot overflow the bounds check
-            // itself. `*pos` is always <= bytes.len() (every read advances pos only
-            // after validating), so the subtraction is exact and `*pos + n` below
-            // is safe once `n <= available` is established.
+            // Subtraction avoids overflow with hostile byte counts — see docs/network.md.
             let available = bytes.len().saturating_sub(*pos);
             if n > available {
                 return Err(FannError::InvalidBuilder(format!(
@@ -164,10 +110,7 @@ impl Network {
             return Err(FannError::EmptyNetwork);
         }
 
-        // Bounds-before-allocation: every layer header needs at minimum 9 bytes
-        // (num_inputs u32=4 + num_outputs u32=4 + activation u8=1). A hostile
-        // num_layers field cannot legitimately exceed what the remaining bytes
-        // can encode, so we bound it before reserving any capacity.
+        // Every layer needs 9 header bytes; bound counts before allocation — see docs/network.md.
         let remaining_for_layers = bytes.len().saturating_sub(pos);
         let max_plausible_layers = remaining_for_layers / 9;
         if num_layers > max_plausible_layers {
@@ -176,7 +119,7 @@ impl Network {
                  bytes can encode (max plausible with 9 bytes/layer: {max_plausible_layers})"
             )));
         }
-        // Secondary allocation-size guard for defence in depth.
+        // Apply the general allocation guard as defence in depth.
         validate_allocation_size(num_layers)?;
 
         let mut layers = Vec::with_capacity(num_layers);
@@ -193,12 +136,7 @@ impl Network {
                 .map_err(|_| FannError::InvalidBuilder("Failed to read num_outputs".into()))?;
             let num_outputs = u32::from_le_bytes(num_outputs_bytes) as usize;
 
-            // Bounds-before-allocation: enforce the per-layer element cap on the
-            // hostile dimension fields BEFORE reading and collecting the weight and
-            // bias payloads. `Layer::with_weights` re-validates as defence in depth,
-            // but checking here keeps a large declared shape from driving a
-            // multi-hundred-MB `Vec<f32>` allocation before the cap is applied.
-            // num_inputs > 0 (enforced here) also bounds num_outputs for biases.
+            // Validate hostile dimensions before collecting payloads — see docs/network.md.
             validate_layer_dimensions(num_inputs, num_outputs)?;
 
             // Read activation type
@@ -223,8 +161,7 @@ impl Network {
                 }
             };
 
-            // Read weights; use checked arithmetic so hostile dimension fields
-            // produce a clean Err rather than an allocation-abort.
+            // Checked payload sizing rejects hostile dimensions without allocation — see docs/network.md.
             let weight_count = num_inputs.checked_mul(num_outputs).ok_or_else(|| {
                 FannError::InvalidBuilder(format!(
                     "layer {layer_idx}: num_inputs ({num_inputs}) * num_outputs \
@@ -248,8 +185,7 @@ impl Network {
                 })
                 .collect();
 
-            // Read biases; checked arithmetic for the same parser-boundary
-            // reason as the weight byte count above.
+            // Bias payload sizing uses the same checked-arithmetic boundary.
             let bias_byte_count = num_outputs.checked_mul(4).ok_or_else(|| {
                 FannError::InvalidBuilder(format!(
                     "layer {layer_idx}: bias byte count overflows ({num_outputs} * 4)"
@@ -271,8 +207,7 @@ impl Network {
             layers.push(layer);
         }
 
-        // Reject trailing bytes — the binary format is exact; to_bytes produces
-        // no padding or footer. Extra bytes indicate a malformed or incorrect blob.
+        // The format is exact-length; trailing bytes are malformed — see docs/network.md.
         if pos != bytes.len() {
             return Err(FannError::InvalidBuilder(format!(
                 "trailing bytes after parsing: consumed {pos} of {} bytes; \

@@ -1,4 +1,8 @@
-//! Distillation pipeline orchestration.
+//! Orchestration from raw prompts to labeled examples.
+//!
+//! This implementation validates configuration, formats prompts, and records
+//! results; its teacher response is currently simulated rather than fetched.
+//! See `docs/distill.md` for the execution path and integration boundaries.
 
 use super::DistillationConfig;
 use super::types::{DistillationStats, LabelingResult, RawExample};
@@ -66,11 +70,7 @@ impl DistillationPipeline {
     pub fn label_single(&mut self, raw: &RawExample) -> Result<LabelingResult> {
         let start = std::time::Instant::now();
 
-        // Placeholder: simulate labeling
-        // In real implementation, this would:
-        // 1. Format the prompt from raw example
-        // 2. Call the teacher API
-        // 3. Parse the response into IntentLabels
+        // The simulated result preserves the future client boundary — see docs/distill.md.
 
         let _prompt = raw.to_prompt();
 

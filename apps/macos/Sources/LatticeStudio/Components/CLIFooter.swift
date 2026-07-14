@@ -94,7 +94,7 @@ struct CLIFooter: View {
     VStack(spacing: 0) {
         Spacer()
         CLIFooter(
-            command: "lattice serve qwen3.5-0.8b --host 127.0.0.1 --port 11435",
+            command: "lattice_serve --model /Users/you/.lattice/models/qwen3.5-0.8b --port 11435",
             caption: "http://127.0.0.1:11435/v1"
         )
     }

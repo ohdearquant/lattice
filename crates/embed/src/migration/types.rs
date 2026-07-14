@@ -1,4 +1,9 @@
-//! Migration types: states, plans, progress snapshots, and errors.
+//! Defines migration plans, states, progress snapshots, skip reasons, and errors.
+//!
+//! These serializable values describe a model-version transition; the controller supplies
+//! the lifecycle and accounting rules that give their fields meaning.
+//!
+//! See [docs/migration.md](../../docs/migration.md) for state, format, and coverage details.
 
 use serde::{Deserialize, Serialize};
 
@@ -135,7 +140,7 @@ impl MigrationState {
         matches!(self, MigrationState::InProgress { .. })
     }
 
-    /// Returns the progress as a fraction in [0.0, 1.0], or `None` if not applicable.
+    /// Returns raw processed-to-total progress; a zero total returns 1.0.
     pub fn progress(&self) -> Option<f64> {
         match self {
             MigrationState::Planned => Some(0.0),
@@ -201,7 +206,7 @@ impl MigrationState {
         self.total().saturating_sub(self.skipped())
     }
 
-    /// Returns the fraction of effective_total that has been processed (0.0 to 1.0).
+    /// Returns processed-to-effective-total coverage; a zero effective total returns 1.0.
     pub fn effective_coverage(&self) -> f64 {
         let eff = self.effective_total();
         if eff == 0 {
@@ -214,23 +219,7 @@ impl MigrationState {
 
 /// Describes an embedding migration operation.
 ///
-/// # Example
-///
-/// ```rust
-/// use lattice_embed::migration::MigrationPlan;
-/// use lattice_embed::EmbeddingModel;
-///
-/// let plan = MigrationPlan {
-///     id: "mig-001".to_string(),
-///     source_model: EmbeddingModel::BgeSmallEnV15,
-///     target_model: EmbeddingModel::BgeBaseEnV15,
-///     total_embeddings: 10_000,
-///     batch_size: 256,
-///     created_at: "2026-01-27T00:00:00Z".to_string(),
-/// };
-///
-/// assert_eq!(plan.total_embeddings, 10_000);
-/// ```
+/// See [docs/migration.md](../../docs/migration.md) for plan fields and transition scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationPlan {
     /// Unique migration identifier.
@@ -260,7 +249,7 @@ pub struct MigrationProgress {
     /// Total minus skipped -- the number of embeddings that actually need processing.
     #[serde(default)]
     pub effective_total: usize,
-    /// Fraction of effective_total that has been processed (0.0 to 1.0).
+    /// Processed-to-effective-total coverage.
     #[serde(default)]
     pub effective_coverage: f64,
     /// Embeddings processed per second.
