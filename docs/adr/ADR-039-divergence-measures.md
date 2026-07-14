@@ -48,9 +48,10 @@ and `regularized_cost = transport_cost - ε * entropy`. Using `regularized_cost`
 
 `sinkhorn_divergence` accepts three `SinkhornWorkspace` parameters (`workspace_xy`,
 `workspace_xx`, `workspace_yy`). Reusing a single workspace would require resizing it
-between the cross-term solve (n×m) and self-term solves (n×n and m×m), destroying
-warm-start state. Three workspaces allow each solve to warm-start independently across
-repeated divergence computations with slowly-changing distributions.
+between the cross-term solve (n×m) and self-term solves (n×n and m×m). Three workspaces
+preserve independently sized buffers across repeated divergence computations. Each term
+uses `SinkhornSolver::solve`, which resets its workspace's dual variables before solving;
+the current divergence API reuses buffer capacity but does not warm-start between calls.
 
 **Three separate cost matrices**
 
@@ -122,7 +123,8 @@ important for debugging cases where one of the three solves failed to converge.
 ### Positive
 
 - `S(a, a) ≈ 0` for any distribution `a` when the correct `regularized_cost` formula is used (FP-023 fix). This enables a single threshold parameter for drift detection regardless of distribution shape.
-- The three-workspace design enables warm-starting across repeated drift checks with slowly-changing distributions (e.g., streaming window drift detection where the reference window advances by one sample at a time).
+- The three-workspace design reuses independently sized buffers across repeated drift checks,
+  avoiding allocation when the cross and self problem dimensions remain unchanged.
 - The lower-level API `sinkhorn_divergence` is testable with synthetic `ClosureCostMatrix` inputs without needing real embedding data.
 
 ### Negative
