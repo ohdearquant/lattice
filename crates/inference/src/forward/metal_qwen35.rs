@@ -951,9 +951,98 @@ mod route_predicate_tests {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Chat Completion API -- CPU-available (#668)
+// -----------------------------------------------------------------------------
+//
+// `ChatRole`, `ChatMessage`, and `format_chat_template` used to live inside
+// `mod inner`, gated on `metal-gpu`, so a CPU-only build had no shared
+// ChatML renderer to call and `lattice.rs`'s CPU serve path carried its own
+// hand-rolled `render_prompt` instead (#661 follow-up). They are pure and
+// `Device`-free -- same reasoning as `mtp_tensor_path` above -- so they move
+// to module scope, unconditionally compiled, and `mod inner` re-imports them
+// via `use super::{...}`.
+
+/// **Unstable**: chat conversation role; variants may extend for tool/function roles.
+///
+/// Role in a chat conversation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl ChatRole {
+    fn as_str(&self) -> &str {
+        match self {
+            ChatRole::System => "system",
+            ChatRole::User => "user",
+            ChatRole::Assistant => "assistant",
+        }
+    }
+}
+
+/// **Unstable**: single chat message; fields may expand with tool call support.
+///
+/// A single message in a chat conversation.
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+impl ChatMessage {
+    /// **Unstable**: construct a system message.
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::System,
+            content: content.into(),
+        }
+    }
+    /// **Unstable**: construct a user message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: content.into(),
+        }
+    }
+    /// **Unstable**: construct an assistant message.
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content: content.into(),
+        }
+    }
+}
+
+/// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
+///
+/// Format messages into Qwen3.5 chat template.
+/// Template: <|im_start|>{role}\n{content}<|im_end|>\n
+/// Final assistant turn left open for generation.
+pub fn format_chat_template(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for msg in messages {
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(msg.role.as_str());
+        prompt.push('\n');
+        prompt.push_str(&msg.content);
+        prompt.push_str("<|im_end|>\n");
+    }
+    // Open assistant turn for generation
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     use super::GdnStateTrafficScope;
+    // Chat message types + the shared ChatML renderer (#668) live at the file
+    // top level (module-scope, above `mod inner`) so CPU-only builds can
+    // render through the same `format_chat_template` this Metal path uses,
+    // same reasoning as the MTP resolution helpers below.
+    use super::{ChatMessage, format_chat_template};
     // MTP Q4/F16 flavor + shape resolution (#630, #636) now lives at the file
     // top level (module-scope, above `mod inner`) so it compiles and is
     // unit-testable without the `metal-gpu` feature at all.
@@ -13104,59 +13193,6 @@ mod inner {
     // Chat Completion API
     // -----------------------------------------------------------------------
 
-    /// **Unstable**: chat conversation role; variants may extend for tool/function roles.
-    ///
-    /// Role in a chat conversation.
-    #[derive(Debug, Clone, PartialEq)]
-    pub enum ChatRole {
-        System,
-        User,
-        Assistant,
-    }
-
-    impl ChatRole {
-        fn as_str(&self) -> &str {
-            match self {
-                ChatRole::System => "system",
-                ChatRole::User => "user",
-                ChatRole::Assistant => "assistant",
-            }
-        }
-    }
-
-    /// **Unstable**: single chat message; fields may expand with tool call support.
-    ///
-    /// A single message in a chat conversation.
-    #[derive(Debug, Clone)]
-    pub struct ChatMessage {
-        pub role: ChatRole,
-        pub content: String,
-    }
-
-    impl ChatMessage {
-        /// **Unstable**: construct a system message.
-        pub fn system(content: impl Into<String>) -> Self {
-            Self {
-                role: ChatRole::System,
-                content: content.into(),
-            }
-        }
-        /// **Unstable**: construct a user message.
-        pub fn user(content: impl Into<String>) -> Self {
-            Self {
-                role: ChatRole::User,
-                content: content.into(),
-            }
-        }
-        /// **Unstable**: construct an assistant message.
-        pub fn assistant(content: impl Into<String>) -> Self {
-            Self {
-                role: ChatRole::Assistant,
-                content: content.into(),
-            }
-        }
-    }
-
     /// **Unstable**: output from chat completion; fields may expand with streaming and usage stats.
     ///
     /// Output from chat completion.
@@ -13174,25 +13210,6 @@ mod inner {
         /// an OpenAI `finish_reason` had no choice but to hardcode `"stop"`
         /// unconditionally -- exactly what `lattice_serve.rs`'s worker did.
         pub stopped: bool,
-    }
-
-    /// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
-    ///
-    /// Format messages into Qwen3.5 chat template.
-    /// Template: <|im_start|>{role}\n{content}<|im_end|>\n
-    /// Final assistant turn left open for generation.
-    pub fn format_chat_template(messages: &[ChatMessage]) -> String {
-        let mut prompt = String::new();
-        for msg in messages {
-            prompt.push_str("<|im_start|>");
-            prompt.push_str(msg.role.as_str());
-            prompt.push('\n');
-            prompt.push_str(&msg.content);
-            prompt.push_str("<|im_end|>\n");
-        }
-        // Open assistant turn for generation
-        prompt.push_str("<|im_start|>assistant\n");
-        prompt
     }
 
     impl MetalQwen35State {
@@ -34206,10 +34223,9 @@ mod gdn_state_traffic_tests {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
-    ChatCompletionOutput, ChatMessage, ChatRole, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord, PathProofSnapshot,
-    arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
-    format_chat_template, take_moe_routing_trace,
+    ChatCompletionOutput, LayerImportanceScore, LayerPruningPlan, LoraLayerData, MetalQwen35State,
+    MoeRoutingTraceRecord, PathProofSnapshot, arm_moe_routing_trace, blend_lora_layer_data,
+    dump_moe_routing_trace_jsonl, take_moe_routing_trace,
 };
 
 #[cfg(all(
