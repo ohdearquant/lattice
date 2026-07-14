@@ -109,13 +109,8 @@ pub struct RouterUpdateConfig {
     /// Training epochs over the combined feedback + replay batch per call.
     pub epochs: usize,
     /// EWC++ Fisher regularisation strength.
-    ///
-    /// Reserved for the `penalty_gradient` variant of EWC regularisation.
-    /// The current implementation uses `DiagonalFisher::project_delta`
-    /// (null-space projection), which does not use this coefficient.
-    /// Set to `0.0` to communicate intent of no regularisation; values
-    /// above `0.0` will be used if the implementation switches to the
-    /// penalty-gradient path.
+    /// Reserved for the inactive anchor-penalty path; v1 uses Fisher projection instead.
+    /// See [`docs/lora-router.md`](../../docs/lora-router.md#routerupdateconfigewc_lambda) for the phase boundary.
     pub ewc_lambda: f32,
     /// Fraction of the replay buffer to include in each refit epoch.
     ///
@@ -158,18 +153,9 @@ pub struct RouterDelta {
     pub replay_accuracy: Option<f32>,
 }
 
-/// Bounded FIFO experience-replay buffer of preference events.
-///
-/// Holds a history of `(context_vector, preferred_adapter_idx)` pairs —
-/// always positive-polarity, representing adapters that produced useful
-/// responses.  Capped at `max_size` entries; oldest events are evicted first.
-///
-/// # Replay polarity
-///
-/// Only events with a positive [`PreferenceSignal`] enter the buffer
-/// (see [`update_router`]).  During refit, buffered entries are replayed
-/// with reward `+1.0`.  Negative events carry no information about which
-/// adapter *should* be selected, so they are not stored.
+/// Bounded FIFO of positive `(context_vector, adapter index)` feedback.
+/// Refit replays its entries with reward `+1.0` and evicts the oldest at capacity.
+/// See [`docs/lora-router.md`](../../docs/lora-router.md#replaybuffer) for replay-polarity rationale.
 #[derive(Clone, Debug, Default)]
 pub struct ReplayBuffer {
     inner: VecDeque<ReplayEntry>,
@@ -248,48 +234,10 @@ struct ReplayEntry {
 // Core function
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Update the adapter selector gate from a batch of preference feedback events.
-///
-/// Loads `gate_bytes`, validates all events against the gate's dimensions,
-/// runs `config.epochs` passes of single-sample policy-gradient updates
-/// (RLOO / M=1) over the combined `events` + replay sample, applies Fisher
-/// null-space damping after each step to protect parameters important to prior
-/// tasks, serialises the updated gate, and returns a [`RouterDelta`].
-///
-/// The v1 anti-forgetting mechanism is [`DiagonalFisher::project_delta`]:
-/// parameters with a high squared-gradient EMA are damped toward zero.  The
-/// anchor-pullback penalty (Phase-2) is wired to `config.ewc_lambda` but is
-/// **not** active in this version; the parameter is validated and stored for
-/// forward compatibility.
-///
-/// The replay buffer and Fisher state are updated **in place**: after refit,
-/// new positive-signal events are appended to `replay` (oldest evicted if at
-/// capacity) and the Fisher anchor is set to the post-refit gate parameters.
-///
-/// # Polarity invariant
-///
-/// `events` may carry any [`PreferenceSignal`].  Positive signals raise the
-/// target adapter's probability; negative signals lower it.  Both polarities
-/// flow through the same `RlooTrainer::step` code path — the reward sign in
-/// `PreferenceSignal::reward()` determines the direction automatically.
-///
-/// # Arguments
-///
-/// * `gate_bytes` — Current gate serialised with `Network::to_bytes()`
-///   (from a previous `RouterDelta` or the initial construction).
-/// * `events` — Non-empty batch of preference signals.
-/// * `replay` — Mutable replay buffer; updated in place after refit.
-/// * `fisher` — Mutable diagonal Fisher state; auto-initialised to gate's
-///   parameter count on first use (empty `values`/`anchor`).  Returns
-///   [`TuneError::Validation`] if non-empty and size mismatches the gate.
-/// * `config` — Refit hyperparameters.
-///
-/// # Errors
-///
-/// * [`TuneError::Validation`] — empty event batch, context dimension
-///   mismatch, adapter index out of range, or Fisher size mismatch.
-/// * [`TuneError::Training`] — gate deserialisation failure, NaN/Inf in
-///   gate output, or Fisher accumulation failure.
+/// Refit a serialized adapter-selector gate from a non-empty feedback batch.
+/// Updates `replay` and `fisher` in place, then returns complete replacement gate bytes.
+/// Returns validation errors for invalid input/state and training errors for gate or Fisher failures.
+/// See [`docs/lora-router.md`](../../docs/lora-router.md#update_router) for the refit algorithm and invariants.
 pub fn update_router(
     gate_bytes: &[u8],
     events: &[FeedbackEvent],
@@ -508,11 +456,7 @@ pub fn update_router(
 // Private helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Collect all gate parameters into a flat Vec (weights then biases per layer).
-///
-/// The layout mirrors `Network::total_params()`: for each layer in forward
-/// order, weights (row-major) then biases.  Used to snapshot parameters before
-/// a training step and to restore them after EWC projection.
+/// Collect gate parameters as row-major weights then biases for each layer.
 fn collect_params(gate: &Network) -> Vec<f32> {
     let mut params = Vec::with_capacity(gate.total_params());
     for layer in gate.layers() {
@@ -522,13 +466,7 @@ fn collect_params(gate: &Network) -> Vec<f32> {
     params
 }
 
-/// Restore all gate parameters from a flat slice (same layout as
-/// [`collect_params`]).
-///
-/// # Safety invariant
-///
-/// `params.len()` must equal `gate.total_params()`.  Callers ensure this by
-/// using `collect_params` on the same gate to produce `params`.
+/// Restore parameters collected from this gate with [`collect_params`].
 fn set_params(gate: &mut Network, params: &[f32]) {
     let mut offset = 0_usize;
     for layer in gate.layers_mut() {
@@ -551,24 +489,7 @@ fn set_params(gate: &mut Network, params: &[f32]) {
     );
 }
 
-/// Apply one policy-gradient step with EWC null-space projection.
-///
-/// Steps:
-/// 1. Snapshot `gate` parameters.
-/// 2. Run `trainer.step(gate, context, action_idx, reward)` to compute and
-///    apply the RLOO gradient (reward sign determines direction; one code
-///    path for ±reward).
-/// 3. Compute the raw parameter delta and approximate gradient.
-/// 4. Observe the gradient in the `DiagonalFisher` EMA.
-/// 5. Apply `fisher.project_delta` to damp updates on high-importance
-///    parameters (diagonal null-space projection).
-/// 6. Restore `gate` parameters to `before + projected_delta`.
-///
-/// # Polarity note
-///
-/// `reward > 0` → RLOO step raises `gate.forward(context)[action_idx]`.
-/// `reward < 0` → RLOO step lowers `gate.forward(context)[action_idx]`.
-/// The sign is carried through the gradient formula unchanged.
+/// Apply one RLOO step and project its parameter delta through the Fisher state.
 fn one_gradient_step(
     gate: &mut Network,
     trainer: &mut RlooTrainer,
@@ -603,9 +524,7 @@ fn one_gradient_step(
         .observe_gradient(&approx_grad)
         .map_err(|e| TuneError::Training(format!("Fisher gradient observation failed: {e}")))?;
 
-    // EWC null-space projection: damp updates proportional to Fisher importance.
-    // Parameters with high Fisher (important to prior tasks) are scaled toward
-    // zero; parameters with near-zero Fisher pass through unchanged.
+    // Preserve high-importance parameters through Fisher projection — see docs/lora-router.md.
     let mut projected_delta = raw_delta;
     fisher.project_delta(&mut projected_delta);
 

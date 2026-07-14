@@ -57,14 +57,14 @@ invoke a teacher or an embedding service.
 
 ## Module ownership and hand-offs
 
-| Module | Owns | Receives | Produces | Guide |
-| --- | --- | --- | --- | --- |
-| `data` | `TrainingExample`, labels, metadata, in-memory datasets, batches | Embeddings and labels from a caller | Filtered datasets and cloned batches | [data.md](data.md) |
-| `distill` | Teacher configuration, endpoint policy, raw prompt handling, labeling result accounting | Raw conversational text | Results; training examples only after caller supplies embeddings | [distill.md](distill.md) |
-| `train` | Generic training config, loop state, callbacks, checkpointing, and optional GPU surface | `Dataset` batches | Metrics, checkpoints, and trained model state | [train.md](train.md) |
-| `lora` | Low-rank adapter representation, application, persistence, online/router work, and optional backward utilities | Base-projection context and adapter inputs | Adapter weights or inference-time deltas | [lora-core.md](lora-core.md), [lora-router.md](lora-router.md), [lora-io.md](lora-io.md) |
-| `registry` | Registered model records, storage/query interfaces, live swaps, shadow evaluation, and rollback | Model metadata and weight artifacts | Versioned, deployable model records | [registry.md](registry.md) |
-| `error` | `TuneError` and `Result` | Failures from every subsystem | A common, domain-specific error vocabulary | This page |
+| Module     | Owns                                                                                                           | Receives                                   | Produces                                                         | Guide                                                                                    |
+| ---------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------ | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `data`     | `TrainingExample`, labels, metadata, in-memory datasets, batches                                               | Embeddings and labels from a caller        | Filtered datasets and cloned batches                             | [data.md](data.md)                                                                       |
+| `distill`  | Teacher configuration, endpoint policy, raw prompt handling, labeling result accounting                        | Raw conversational text                    | Results; training examples only after caller supplies embeddings | [distill.md](distill.md)                                                                 |
+| `train`    | Generic training config, loop state, callbacks, checkpointing, and optional GPU surface                        | `Dataset` batches                          | Metrics, checkpoints, and trained model state                    | [train.md](train.md)                                                                     |
+| `lora`     | Low-rank adapter representation, application, persistence, online/router work, and optional backward utilities | Base-projection context and adapter inputs | Adapter weights or inference-time deltas                         | [lora-core.md](lora-core.md), [lora-router.md](lora-router.md), [lora-io.md](lora-io.md) |
+| `registry` | Registered model records, storage/query interfaces, live swaps, shadow evaluation, and rollback                | Model metadata and weight artifacts        | Versioned, deployable model records                              | [registry.md](registry.md)                                                               |
+| `error`    | `TuneError` and `Result`                                                                                       | Failures from every subsystem              | A common, domain-specific error vocabulary                       | This page                                                                                |
 
 Each subsystem has a deliberately small data boundary:
 
@@ -181,17 +181,17 @@ crate is optional and only enters through feature-gated adapter injection or
 backward training. That direction matters: training may consume inference
 capabilities, while inference remains usable without `lattice-tune`.
 
-| Feature | Adds or enables | Boundary it affects |
-| --- | --- | --- |
-| `std` | Standard-library support; enabled by default | Base crate |
-| `serde` | Serialization derives and JSON support | Data, config, checkpoints, metadata |
-| `safetensors` | Safe adapter/artifact serialization support | LoRA I/O |
-| `sqlite` | SQLite-backed registry storage; enabled by default | Registry |
-| `gpu` | WGPU-backed GPU training surface | Train |
-| `gpu-tests` | Hardware-dependent GPU tests | Train testing |
-| `inference-hook` | `LoraHook` implementation for `LoraAdapter` | LoRA → inference bridge |
-| `train-backward` | Inference backward/f16 support plus safetensors and serde | Exact-gradient LoRA binaries |
-| `mixture` | Experimental online adapter-selector refit | LoRA routing |
+| Feature          | Adds or enables                                           | Boundary it affects                 |
+| ---------------- | --------------------------------------------------------- | ----------------------------------- |
+| `std`            | Standard-library support; enabled by default              | Base crate                          |
+| `serde`          | Serialization derives and JSON support                    | Data, config, checkpoints, metadata |
+| `safetensors`    | Safe adapter/artifact serialization support               | LoRA I/O                            |
+| `sqlite`         | SQLite-backed registry storage; enabled by default        | Registry                            |
+| `gpu`            | WGPU-backed GPU training surface                          | Train                               |
+| `gpu-tests`      | Hardware-dependent GPU tests                              | Train testing                       |
+| `inference-hook` | `LoraHook` implementation for `LoraAdapter`               | LoRA → inference bridge             |
+| `train-backward` | Inference backward/f16 support plus safetensors and serde | Exact-gradient LoRA binaries        |
+| `mixture`        | Experimental online adapter-selector refit                | LoRA routing                        |
 
 Feature gates select integrations; they do not erase the ownership
 boundaries above. For example, enabling `safetensors` enables an artifact
@@ -204,14 +204,14 @@ Every public subsystem can return the crate alias
 `Result<T> = std::result::Result<T, TuneError>`. `TuneError` keeps failures
 classified by the boundary that detected them:
 
-| Family | Examples |
-| --- | --- |
-| Data | Dataset errors, missing examples, invalid batches, dimensions |
-| Teacher | Provider failures and request timeouts |
-| Training | Training errors and non-convergence |
-| Configuration and validation | Invalid configuration or user/input validation |
-| Registry and storage | Missing/duplicate models and backing storage failures |
-| Artifact integrity | Serialization, I/O, weight checksum, and memory-budget failures |
+| Family                       | Examples                                                        |
+| ---------------------------- | --------------------------------------------------------------- |
+| Data                         | Dataset errors, missing examples, invalid batches, dimensions   |
+| Teacher                      | Provider failures and request timeouts                          |
+| Training                     | Training errors and non-convergence                             |
+| Configuration and validation | Invalid configuration or user/input validation                  |
+| Registry and storage         | Missing/duplicate models and backing storage failures           |
+| Artifact integrity           | Serialization, I/O, weight checksum, and memory-budget failures |
 
 Callers should add context while preserving the variant whenever possible.
 This lets a UI or orchestration layer distinguish an invalid local data record
@@ -334,3 +334,112 @@ For a new implementation or integration:
    model.
 6. Consult the linked ADRs when changing a boundary or revisiting an accepted
    design decision.
+
+## ArgView
+
+`ArgView` is intentionally a lookup helper rather than a command-line parser.
+It preserves the gradient binaries' legacy behavior: the first matching value
+flag wins; an absent flag or a final flag with no following value returns
+`None`; a presence flag is true whenever its token occurs; and unknown flags
+are ignored. It does not validate a value's syntax or decide whether a missing
+value is an error. Each binary owns those typed parsing decisions and its own
+usage contract.
+
+This permissiveness is a compatibility boundary. Do not add global validation
+to `ArgView`, because it would silently change a binary's historical accepted
+argument set. New flags should be parsed and checked by their owning binary.
+
+## verify_tbv
+
+`verify_tbv` is the shared trust-but-verify gate for cached or assembled
+forwards. It compares a candidate masked NLL to the real model's masked
+`compute_token_nlls` result and returns the two values plus their absolute
+difference. The gate fails when either input or the computed difference is
+non-finite, or when the difference is greater than
+`TBV_MAX_ABS_DIFF = 1e-2`; it includes the supplied context in the error.
+
+The boundary is intentionally inclusive: a difference exactly equal to the
+tolerance passes. This is a correctness gate rather than a diagnostic, so a
+caller must stop before optimization whenever it fails.
+
+## train_grad
+
+`train_grad` is the smallest exact reverse-mode LoRA trainer. It adapts only
+the Qwen3.5 `lm_head`, whose frozen-transformer input is the final normalized
+hidden vector `H_t` for each completion source position. The command runs the
+real 24-layer forward once per sample, caching `(H_t, base_logits, target)`;
+subsequent steps do not re-run the transformer.
+
+For a rank-`r` adapter with A and B factors, each cached position computes:
+
+```text
+a_h      = A · H_t
+logits_t = base_logits_t + scale · B · a_h
+loss_t   = cross_entropy(logits_t, next_token)
+```
+
+It averages masked completion-token loss and gradients, then applies Adam to
+the two adapter factors. Both gradient computation and reported NLL use the
+LoRA-adjusted logits, so the curve measures the trained adapter rather than
+the frozen base. Before optimization, a zero-B TBV check compares cached loss
+to the real model's loss; no mismatch is treated as a harmless warning.
+
+## train_grad_layer23
+
+`train_grad_layer23` adapts `q_proj` and `v_proj` in Qwen3.5's top GQA layer,
+layer 23. It captures the frozen prefix residual entering that layer and the
+RoPE tables once per sample. Every lower layer and every base weight remains
+frozen; only the four low-rank factors `(A_q, B_q, A_v, B_v)` are updated.
+
+For each completion source position, the materialized chain is:
+
+```text
+normed   = rms_norm(h_in, pre_attn_norm)
+attn_out = gated_GQA(normed; LoRA_q, LoRA_v)
+h_mid    = h_in + attn_out
+h_out    = h_mid + swiglu(rms_norm(h_mid, post_attn_norm))
+logits   = lm_head · rms_norm(h_out, final_norm)
+loss     = cross_entropy(logits, next_token)
+```
+
+The reverse pass crosses the head, final norm, FFN, residual, and GQA
+attention, then deliberately discards the gradient below layer 23 because the
+prefix is frozen. Layer and final RMSNorm weights are shifted as
+`1 + gamma` before calling helpers that expect ordinary weights. GQA q/k norm
+weights stay raw because its forward implementation applies that shift.
+
+Training starts with random A and zero B, so the initial adapter reproduces
+the base while B receives a nonzero first update. The zero-adapter TBV check
+therefore validates the entire layer-23-plus-head reconstruction. When saved,
+the adapter uses B as row-major `[d_out, rank]` and A as `[rank, d_in]`; gated
+`q_proj` has `d_out = 2 * q_dim`, covering both Q and gate rows.
+
+## train_grad_full details
+
+`train_grad_full` extends the same exact-gradient approach across an inclusive
+`first_layer..=23` materialized range. Each GQA layer gets a `q_proj`/`v_proj`
+adapter slot; each GatedDeltaNet layer gets slots for its five supported
+projections. The trainer borrows all frozen base weights, caches the frozen
+prefix and RoPE tables, reconstructs the range, and fails closed if its
+zero-adapter NLL does not match the real model.
+
+GDN factor construction must go through `GdnLoraParams::shaped`, the sole
+shape authority. In particular, the B factors for `in_proj_b` and `in_proj_a`
+are sized by `value_heads`, not key heads. This matters for asymmetric GDN
+geometries: deriving their sizes from `num_kh` can construct a superficially
+plausible adapter whose beta and alpha projections have the wrong shape.
+
+Gradcheck fills both A and B with nonzero noise so neither A gradients nor
+gate paths pass vacuously. It probes both large analytical gradients and
+deterministic strided positions, evaluating central differences at four
+scales around `--fd-eps`. Taking the best relative error across those scales
+is deliberate: a single finite-difference step can be dominated by roundoff
+or truncation in this deep `f32` chain. The default center, `4e-3`, avoids the
+too-small-step roundoff regime observed for the full model.
+
+In normal training B begins at zero while A uses a
+`1 / sqrt(input_dimension)` amplitude compatible with `mlx_lm`'s LoRA
+initialization. The base forward is therefore reproduced at step zero and B
+moves first. `valid.jsonl`, when available and enabled, is never trained on;
+its NLL is the held-out counterpart to the training NLL when judging whether
+optimization is learning rather than memorizing.

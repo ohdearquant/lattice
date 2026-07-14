@@ -35,15 +35,10 @@ impl Default for RlooConfig {
     }
 }
 
-/// Single-sample policy-gradient trainer for a selector gate.
+/// A policy-gradient trainer for selector gates with linear logits.
 ///
-/// The gate is a `Network` whose output layer activation is `Linear` (it
-/// returns raw logits; softmax is applied here in the loss, not in the
-/// network).
-///
-/// EWC forgetting-guard integration is intentionally outside this struct —
-/// compose `DiagonalFisher` at the call site to apply penalty gradients on
-/// top of the policy-gradient delta independently.
+/// It applies softmax in the loss and leaves EWC composition to the caller.
+/// See [`docs/training.md`](../../docs/training.md#reinforce-with-leave-one-out-rloo) for the gate contract and loss terms.
 pub struct RlooTrainer {
     config: RlooConfig,
     /// RNG used for Gumbel-max sampling in the Phase-2 multi-sample path.
@@ -69,18 +64,11 @@ impl RlooTrainer {
         }
     }
 
-    /// Phase-1 single-sample REINFORCE step (M=1), the active path.
+    /// Applies one REINFORCE update for `action_idx` from a signed reward.
     ///
-    /// `action_idx` is the adapter index the reward is about:
-    ///   - positive reward  → `action_idx` = the preferred adapter
-    ///   - negative reward  → `action_idx` = the selected adapter (push it down)
-    ///
-    /// `reward` carries polarity AND strength: `+1.0` / `−1.0` explicit,
-    /// `+0.5` / `−0.5` implicit. There is exactly one code path for ±reward —
-    /// the sign is embedded in the gradient formula; no special-casing for
-    /// negative reward.
-    ///
-    /// Returns the scalar policy loss `−reward · log p[action_idx]` for logging.
+    /// The reward sign controls policy direction and its magnitude controls update strength.
+    /// Returns the scalar policy loss for logging.
+    /// See [`docs/training.md`](../../docs/training.md#phase-1-single-sample-reinforce-step-the-active-path) for reward semantics and the loss formula.
     pub fn step(
         &mut self,
         gate: &mut Network,
@@ -127,18 +115,7 @@ impl RlooTrainer {
         // Scalar used in the load-balance gradient (computed once).
         let c = sum_p_sq - 1.0 / k as f32;
 
-        // Output-layer error vector g (length K).
-        //
-        // Because the output activation is Linear (derivative = 1), g is the
-        // pre-activation error directly — no additional derivative multiply.
-        //
-        // g[j] = reward * (p[j] − onehot(action)[j])          (1) policy term
-        //      + aux_coeff * (2/K) * p[j] * (p[j] − 1/K − c) (2) load-balance
-        //      + z_coeff   * 2 * LSE * p[j]                   (3) z-loss
-        //
-        // For reward > 0 the policy term is the CE gradient pulling q(action) UP.
-        // For reward < 0 the sign flips and pushes q(action) DOWN.
-        // One code path handles both — DO NOT special-case negative reward.
+        // Linear output makes this the pre-activation error; preserve reward polarity — see docs/training.md.
         let output_deltas: Vec<f32> = probs
             .iter()
             .enumerate()
@@ -159,23 +136,11 @@ impl RlooTrainer {
         Ok(loss)
     }
 
-    /// Phase-2 full RLOO multi-sample step (M > 1).
+    /// Runs a Gumbel-top-`k` RLOO update with a leave-one-out baseline.
     ///
-    /// Draws `m_samples` k-subsets via Gumbel-max sampling and uses a
-    /// leave-one-out baseline to reduce gradient variance. Returns the mean
-    /// reward across samples.
-    ///
-    /// This is not the default path — activate via the bench harness when
-    /// comparing against Phase-1.
-    ///
-    /// Invariant for any future activation: this path consumes only
-    /// preferred-known (positive) events, so it MUST be paired with the M=1
-    /// [`Self::step`] negative path; never run it positive-only. The
-    /// convergence bench's positive-only arm collapsed to chance (policy
-    /// entropy toward zero, mass on a single output) because dropping
-    /// negative feedback removes the signal that pushes a wrongly-selected
-    /// output down. Carrying both polarities is a correctness requirement,
-    /// not a tuning choice.
+    /// Pair its positive events with [`Self::step`] negative feedback; a positive-only stream is invalid.
+    /// Returns the mean sampled reward or a validation error.
+    /// See [`docs/training.md`](../../docs/training.md#phase-2-multi-sample-rloo-rloo_step-not-the-default-path) for sampling and update details.
     pub fn rloo_step(
         &mut self,
         gate: &mut Network,
@@ -214,11 +179,7 @@ impl RlooTrainer {
             ));
         }
 
-        // Reject caller-supplied sizes that would cause Vec::with_capacity to OOM.
-        // m_samples sizes the rewards/subsets outer vecs directly; the retained
-        // subsets additionally hold m_samples * k indices in aggregate. k alone is
-        // range-checked, but the product can still overflow usize or exceed the
-        // allocation cap, so bound the product before any allocation runs.
+        // Bound both caller-controlled capacities before allocation; checked multiplication prevents overflow.
         validate_allocation_size(m_samples)?;
         let subset_storage = m_samples.checked_mul(k).ok_or_else(|| {
             FannError::TrainingError(format!(
@@ -240,13 +201,12 @@ impl RlooTrainer {
         let probs = softmax(&logits);
         let lse = log_sum_exp(&logits);
 
-        // Gumbel-max sampling: draw m_samples k-subsets.
+        // Draw `m_samples` Gumbel-top-`k` subsets — see docs/training.md.
         let mut rewards: Vec<f32> = Vec::with_capacity(m_samples);
         let mut subsets: Vec<Vec<usize>> = Vec::with_capacity(m_samples);
 
         for _ in 0..m_samples {
-            // Perturb each logit with independent Gumbel(0,1) noise:
-            //   g_i = s_i + (−ln(−ln(u_i))),  u_i ~ Uniform(0,1) open interval.
+            // Perturb each logit with independent Gumbel(0,1) noise.
             let mut perturbed: Vec<(f32, usize)> = logits
                 .iter()
                 .enumerate()

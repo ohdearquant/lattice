@@ -96,12 +96,9 @@ fn migrate_models_metadata_json_to_metadata(
     Ok(())
 }
 
-/// Upgrade legacy text timestamps to INTEGER epoch microseconds.
-///
-/// The migration is a no-op for an INTEGER schema. Otherwise it performs the
-/// backup/copy/rename sequence under `BEGIN IMMEDIATE`, distinguishes native
-/// integers, date strings, and numeric strings, and fails initialization on an
-/// SQLite error. See `docs/registry.md` for conversion and transaction details.
+/// Upgrades legacy timestamp columns to INTEGER epoch microseconds.
+/// It is a no-op for an INTEGER schema and fails initialization on SQLite errors.
+/// See [`docs/registry.md`](../../../docs/registry.md#sqlite-migration-helpers) for conversion and transaction details.
 // Called from SqliteStorage::new() which is cfg(feature = "sqlite");
 // the compiler cannot trace the call site when checking without that feature.
 #[cfg(feature = "sqlite")]
@@ -109,11 +106,8 @@ fn migrate_models_metadata_json_to_metadata(
 fn migrate_models_timestamps_text_to_integer(
     conn: &rusqlite::Connection,
 ) -> std::result::Result<(), rusqlite::Error> {
-    // Check declared type of `registered_at` via PRAGMA table_info.
-    // Column indices: 0=cid, 1=name, 2=type, 3=notnull, 4=dflt_value, 5=pk.
-    // `|r| r.ok()` cannot be replaced with `Result::ok` here: the iterator
-    // yields `rusqlite::Result<_>` but the crate re-exports its own `Result`,
-    // so clippy's suggestion produces a type-mismatch compile error.
+    // `PRAGMA table_info` exposes column name/type at indices 1/2.
+    // The iterator yields `rusqlite::Result`, not this crate's `Result` alias.
     #[allow(clippy::redundant_closure_for_method_calls)]
     let registered_at_type: Option<String> = conn
         .prepare("PRAGMA table_info(models)")?
@@ -133,12 +127,8 @@ fn migrate_models_timestamps_text_to_integer(
         _ => {} // TEXT or any other type — proceed with migration
     }
 
-    // Recreate the table with INTEGER columns.  We use a backup + rename
-    // pattern which is the only portable way to change column types in SQLite.
-    // Wrapped in BEGIN IMMEDIATE so the 4-step recreation (CREATE backup →
-    // INSERT SELECT → DROP original → RENAME backup) is atomic.  Any failure
-    // in an intermediate step causes an automatic rollback, leaving the
-    // original table intact.
+    // SQLite needs backup-and-rename; `BEGIN IMMEDIATE` keeps the replacement atomic.
+    // See [`docs/registry.md`](../../../docs/registry.md#sqlite-migration-helpers).
     conn.execute_batch(
         "
         BEGIN IMMEDIATE;
@@ -501,9 +491,7 @@ impl StorageBackend for SqliteStorage {
         // Validate path to prevent path traversal
         validate_path(path)?;
 
-        // Remove the weights file first. If this fails, we do not delete the DB
-        // row so the registry remains consistent (no orphaned DB record pointing
-        // to a missing file, and no missing DB record for an existing file).
+        // Keep the database row when artifact removal fails; see docs/registry.md.
         let full_path = self.weights_dir.join(path);
         if full_path.exists() {
             std::fs::remove_file(&full_path)?;

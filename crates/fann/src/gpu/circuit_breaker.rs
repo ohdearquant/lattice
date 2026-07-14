@@ -68,20 +68,9 @@ pub enum CircuitBreakerState {
     HalfOpen,
 }
 
-/// Circuit breaker for GPU memory operations
+/// Circuit breaker for GPU memory operations.
 ///
-/// State machine:
-/// ```text
-/// Closed ──(failures >= threshold)──> Open
-///    ^                                  │
-///    │                                  │ (after timeout)
-///    │                                  v
-///    └────────(success)───────────── HalfOpen
-///                                      │
-///                                      │ (failure)
-///                                      v
-///                                    Open
-/// ```
+/// See [`docs/gpu.md`](../../docs/gpu.md#circuitbreaker) for its recovery state machine.
 pub struct CircuitBreaker {
     state: Mutex<CircuitBreakerState>,
     failure_threshold: usize,

@@ -9,13 +9,13 @@ configuration valid but do not yet make it an executable optimization run.
 
 The public interfaces distinguish five relevant execution paths:
 
-| Path | What works now | What it does not do |
-| --- | --- | --- |
-| `TrainingLoop` | Validates configuration, splits and batches data, invokes callbacks, records metrics, applies early stopping, and produces checkpoint metadata. | It simulates loss and accuracy and never forwards through or updates a network. |
-| `GpuTrainer::validate` | Runs the WGPU network forward, checks outputs for NaN/Infinity, computes loss, and reports top-class accuracy. | It is evaluation only and does not update weights. |
-| `GpuTrainer::train_batch` | Runs forward, finite-value checks, loss calculation, and placeholder backward preparation. | It always returns `TuneError::Training` at the optimizer update. No optimizer choice changes weights. |
-| `JitAdapter::adapt_cpu` | Batches examples, observes its timeout and patience rules, and returns a loss history. | Its per-step loss is simulated; it does not adapt a model. |
-| `JitAdapter::adapt_gpu` | Uses the same batching and stop rules, when the `gpu` feature is enabled. | It delegates to `GpuTrainer::train_batch`, so it currently fails at the optimizer update. |
+| Path                      | What works now                                                                                                                                  | What it does not do                                                                                   |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `TrainingLoop`            | Validates configuration, splits and batches data, invokes callbacks, records metrics, applies early stopping, and produces checkpoint metadata. | It simulates loss and accuracy and never forwards through or updates a network.                       |
+| `GpuTrainer::validate`    | Runs the WGPU network forward, checks outputs for NaN/Infinity, computes loss, and reports top-class accuracy.                                  | It is evaluation only and does not update weights.                                                    |
+| `GpuTrainer::train_batch` | Runs forward, finite-value checks, loss calculation, and placeholder backward preparation.                                                      | It always returns `TuneError::Training` at the optimizer update. No optimizer choice changes weights. |
+| `JitAdapter::adapt_cpu`   | Batches examples, observes its timeout and patience rules, and returns a loss history.                                                          | Its per-step loss is simulated; it does not adapt a model.                                            |
+| `JitAdapter::adapt_gpu`   | Uses the same batching and stop rules, when the `gpu` feature is enabled.                                                                       | It delegates to `GpuTrainer::train_batch`, so it currently fails at the optimizer update.             |
 
 Treat these boundaries as part of the API contract. In particular, callers must
 not interpret a successful forward-only validation result, a CPU-loop metric, or
@@ -30,19 +30,19 @@ trainer.
 
 ### Defaults and presets
 
-| Setting | `TrainingConfig::default()` | `quick()` | `thorough()` |
-| --- | --- | --- | --- |
-| Epochs | 100 | 10 | 200 |
-| Batch size | 32 | 64 | 32 |
-| Optimizer | default AdamW | default AdamW | AdamW, LR `0.0001`, decay `0.01` |
-| Schedule | cosine warmup: 100 steps, floor `1e-6`, period 100 epochs | same as default | cosine warmup: 500 steps, floor `1e-7`, period 200 epochs |
-| Regularization | default | default | `strong()` |
-| Validation split | 0.1 | 0.0 | 0.15 |
-| Early stopping | default validation-loss monitor | disabled | validation-loss monitor, patience 20 |
-| Checkpoint interval | 10 epochs | 5 epochs | 5 epochs |
-| Logging interval | 100 steps | 100 steps | 50 steps |
-| Mixed precision | disabled | disabled | enabled |
-| Seed | 42 | 42 | 42 |
+| Setting             | `TrainingConfig::default()`                               | `quick()`       | `thorough()`                                              |
+| ------------------- | --------------------------------------------------------- | --------------- | --------------------------------------------------------- |
+| Epochs              | 100                                                       | 10              | 200                                                       |
+| Batch size          | 32                                                        | 64              | 32                                                        |
+| Optimizer           | default AdamW                                             | default AdamW   | AdamW, LR `0.0001`, decay `0.01`                          |
+| Schedule            | cosine warmup: 100 steps, floor `1e-6`, period 100 epochs | same as default | cosine warmup: 500 steps, floor `1e-7`, period 200 epochs |
+| Regularization      | default                                                   | default         | `strong()`                                                |
+| Validation split    | 0.1                                                       | 0.0             | 0.15                                                      |
+| Early stopping      | default validation-loss monitor                           | disabled        | validation-loss monitor, patience 20                      |
+| Checkpoint interval | 10 epochs                                                 | 5 epochs        | 5 epochs                                                  |
+| Logging interval    | 100 steps                                                 | 100 steps       | 50 steps                                                  |
+| Mixed precision     | disabled                                                  | disabled        | enabled                                                   |
+| Seed                | 42                                                        | 42              | 42                                                        |
 
 The default optimizer is AdamW with learning rate `0.001`, momentum `0.9`,
 Adam coefficients `beta1 = 0.9` and `beta2 = 0.999`, epsilon `1e-8`, and
@@ -53,13 +53,13 @@ rate and epsilon; finite momentum in `[0, 1]`; finite Adam coefficients in
 
 Configuration validity also requires:
 
-| Field | Requirement |
-| --- | --- |
-| `epochs` | Greater than zero. |
-| `batch_size` | In `1..=8192`; the upper bound prevents excessive allocation. |
-| `val_split` | In the closed interval `[0, 1]`. |
-| `accumulation_steps` | Greater than zero. |
-| Optimizer, regularization, schedule | Each nested configuration must validate. |
+| Field                               | Requirement                                                   |
+| ----------------------------------- | ------------------------------------------------------------- |
+| `epochs`                            | Greater than zero.                                            |
+| `batch_size`                        | In `1..=8192`; the upper bound prevents excessive allocation. |
+| `val_split`                         | In the closed interval `[0, 1]`.                              |
+| `accumulation_steps`                | Greater than zero.                                            |
+| Optimizer, regularization, schedule | Each nested configuration must validate.                      |
 
 The effective batch size reported by `effective_batch_size()` is
 `batch_size.saturating_mul(accumulation_steps)`. It is a configuration-derived
@@ -100,12 +100,12 @@ must call both before construction or execution.
 `RegularizationConfig` contains independent settings. The validation range does
 not imply that every setting is applied by every path.
 
-| Setting | Default | Validation | Current use |
-| --- | ---: | --- | --- |
-| `dropout` | 0.1 | Must be within `[0, 1]`. | Stored only in the training configuration. |
-| `label_smoothing` | 0.1 | Must be within `[0, 1]`. | Used by `GpuTrainer` loss calculation. |
-| `gradient_clip` | `Some(1.0)` | If set, must be greater than zero. | Available through `apply_gradient_clip`; no current trainer calls it. |
-| `mixup_alpha` | `None` | If set, must be greater than zero. | Stored only in the training configuration. |
+| Setting           |     Default | Validation                         | Current use                                                           |
+| ----------------- | ----------: | ---------------------------------- | --------------------------------------------------------------------- |
+| `dropout`         |         0.1 | Must be within `[0, 1]`.           | Stored only in the training configuration.                            |
+| `label_smoothing` |         0.1 | Must be within `[0, 1]`.           | Used by `GpuTrainer` loss calculation.                                |
+| `gradient_clip`   | `Some(1.0)` | If set, must be greater than zero. | Available through `apply_gradient_clip`; no current trainer calls it. |
+| `mixup_alpha`     |      `None` | If set, must be greater than zero. | Stored only in the training configuration.                            |
 
 The presets are `none()` (no dropout, no smoothing, no clipping, no mixup),
 `light()` (dropout 0.05, smoothing 0.05, clipping 1.0), and `strong()`
@@ -133,14 +133,14 @@ clipping case. An empty or all-zero vector remains unchanged and returns zero.
 optimizer rate. Schedules do not mutate optimizer configuration. Let `b` be
 `base_lr`, `s` be `step`, and `e` be `epoch`.
 
-| Schedule | Result |
-| --- | --- |
-| `Constant` | `b` |
-| `LinearWarmup { warmup_steps: W }` | `b × s / W` while `s < W`; otherwise `b` |
-| `StepDecay { step_size: K, gamma: γ }` | `b × γ^(floor(e / K))` |
-| `ExponentialDecay { gamma: γ }` | `b × γ^e` |
-| `CosineAnnealing { min_lr: m, t_max: T }` | `m + (b - m) × (1 + cos(π × ((e mod T) / T))) / 2` |
-| `CosineAnnealingWarmup { W, m, T }` | Linear warmup while `s < W`; otherwise the cosine formula above, using `e mod T` |
+| Schedule                                               | Result                                                                                                              |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `Constant`                                             | `b`                                                                                                                 |
+| `LinearWarmup { warmup_steps: W }`                     | `b × s / W` while `s < W`; otherwise `b`                                                                            |
+| `StepDecay { step_size: K, gamma: γ }`                 | `b × γ^(floor(e / K))`                                                                                              |
+| `ExponentialDecay { gamma: γ }`                        | `b × γ^e`                                                                                                           |
+| `CosineAnnealing { min_lr: m, t_max: T }`              | `m + (b - m) × (1 + cos(π × ((e mod T) / T))) / 2`                                                                  |
+| `CosineAnnealingWarmup { W, m, T }`                    | Linear warmup while `s < W`; otherwise the cosine formula above, using `e mod T`                                    |
 | `OneCycle { max_lr: M, pct_start: p, total_steps: N }` | Rise linearly from `b` to `M` for `s/N < p`; then linearly descend from `M` to `0.01b` over the remaining fraction. |
 
 The default is `CosineAnnealingWarmup { warmup_steps: 100, min_lr: 1e-6,
@@ -259,10 +259,10 @@ performs file creation, serialization, deserialization, or buffer restoration.
 With the `serde` feature, the struct serializes as JSON. Applications that
 populate and consume its byte vectors must preserve this byte-level contract:
 
-| Field | Required byte layout |
-| --- | --- |
-| `weights` | Little-endian `f32` values, layer by layer; for each layer, its row-major weight matrix then its biases; layers proceed input to output. |
-| `optimizer_state` | Optimizer-specific vectors per parameter: one velocity vector for momentum SGD; first (`m`) and second (`v`) moment vectors for Adam. |
+| Field             | Required byte layout                                                                                                                     |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `weights`         | Little-endian `f32` values, layer by layer; for each layer, its row-major weight matrix then its biases; layers proceed input to output. |
+| `optimizer_state` | Optimizer-specific vectors per parameter: one velocity vector for momentum SGD; first (`m`) and second (`v`) moment vectors for Adam.    |
 
 `TrainingLoop::checkpoint()` captures only the current epoch, global step, and
 cloned metrics in that record. `resume_from` restores exactly those three
@@ -318,20 +318,20 @@ largest target. Empty validation data returns `(0.0, 0.0)`.
 ### Backward and optimizer status
 
 The current backward preparation first forms `output - target` using the
-*unsmoothed* target. It then ignores those values: the CPU fallback uploads the
+_unsmoothed_ target. It then ignores those values: the CPU fallback uploads the
 constant gradient `0.01 / batch_size` for every weight and bias of every layer.
 Consequently, even before optimizer dispatch, this is placeholder work rather
 than an implementation of backpropagation for the loss above.
 
 All optimizer selections deliberately fail:
 
-| Optimizer | Current result |
-| --- | --- |
-| Adam | Returns `TuneError::Training`; shader buffer bindings are absent. |
-| AdamW | Returns the same error. |
-| SGD with momentum | Returns the same error. |
-| SGD | Returns `TuneError::Training`; there is neither real gradient plumbing nor mutable network weight write-back. |
-| RMSprop | Returns `TuneError::Training`; it does not substitute a different algorithm. |
+| Optimizer         | Current result                                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------------- |
+| Adam              | Returns `TuneError::Training`; shader buffer bindings are absent.                                             |
+| AdamW             | Returns the same error.                                                                                       |
+| SGD with momentum | Returns the same error.                                                                                       |
+| SGD               | Returns `TuneError::Training`; there is neither real gradient plumbing nor mutable network weight write-back. |
+| RMSprop           | Returns `TuneError::Training`; it does not substitute a different algorithm.                                  |
 
 The failure is intentional. A previous no-op or substitute update would have
 made a training call look successful while leaving weights unchanged. Since the
@@ -350,11 +350,11 @@ evaluation and handle `train_batch` errors as an expected capability boundary.
 multiplier `0.1`, batch size 16, GPU requested, a 10-second timeout, patience
 10, minimum improvement `1e-4`, and seed 42.
 
-| Preset | Strategy | Steps | LR | Batch | Timeout | Patience |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `fast()` | head only | 50 | 0.01 | 32 | 5 s | 5 |
-| `thorough()` | last 3 layers | 200 | 0.001 | 16 | 10 s | 20 |
-| `few_shot()` | head only | 30 | 0.005 | 4 | 3 s | 5 |
+| Preset       | Strategy      | Steps |    LR | Batch | Timeout | Patience |
+| ------------ | ------------- | ----: | ----: | ----: | ------: | -------: |
+| `fast()`     | head only     |    50 |  0.01 |    32 |     5 s |        5 |
+| `thorough()` | last 3 layers |   200 | 0.001 |    16 |    10 s |       20 |
+| `few_shot()` | head only     |    30 | 0.005 |     4 |     3 s |        5 |
 
 Validation requires positive `steps`, learning rate, batch size, and timeout.
 It does not validate strategy parameters, `frozen_lr_multiplier`, `patience`,
@@ -367,13 +367,13 @@ explicitly between `adapt_cpu` and the feature-gated `adapt_gpu`.
 The `freeze` helpers use `true` to mean a frozen layer and order layers from
 input to output.
 
-| Strategy | `get_frozen_layers` | `get_lr_multipliers` |
-| --- | --- | --- |
-| `LastNLayers(n)` | Freeze all except the final `min(n, total_layers)` layers. | Frozen layers get `frozen_lr_multiplier`; final layers get 1.0. |
-| `HeadOnly` | Freeze all except the final layer; an empty model remains empty. | Frozen layers get the multiplier; the head gets 1.0. |
-| `GradualUnfreeze` | All layers are marked trainable. | Linear interpolation from the frozen multiplier on layer 0 to 1.0 on the last layer. |
-| `LowRank { rank }` | Every original layer is frozen. | Every layer gets the frozen multiplier. |
-| `Full` | No layers are frozen. | Every layer gets 1.0. |
+| Strategy           | `get_frozen_layers`                                              | `get_lr_multipliers`                                                                 |
+| ------------------ | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `LastNLayers(n)`   | Freeze all except the final `min(n, total_layers)` layers.       | Frozen layers get `frozen_lr_multiplier`; final layers get 1.0.                      |
+| `HeadOnly`         | Freeze all except the final layer; an empty model remains empty. | Frozen layers get the multiplier; the head gets 1.0.                                 |
+| `GradualUnfreeze`  | All layers are marked trainable.                                 | Linear interpolation from the frozen multiplier on layer 0 to 1.0 on the last layer. |
+| `LowRank { rank }` | Every original layer is frozen.                                  | Every layer gets the frozen multiplier.                                              |
+| `Full`             | No layers are frozen.                                            | Every layer gets 1.0.                                                                |
 
 The helpers describe selection only. In particular, the JIT adapter does not
 construct low-rank matrices, apply per-layer multipliers, or otherwise connect
@@ -407,3 +407,42 @@ optional final accuracy, completed-step count, elapsed seconds, early-stop and
 timeout flags, and the complete loss history. `is_success()` means only that
 the run did not time out and its final loss is finite; an early-stopped result
 can be successful. `avg_loss()` returns zero for an empty history.
+
+## Checkpoint byte layout
+
+`Checkpoint` is an in-memory record; it does not serialize itself or verify
+the contents of either byte vector. With the `serde` feature, the enclosing
+record serializes as JSON. Producers and consumers of the two byte fields must
+therefore agree on their binary contents independently of that JSON envelope.
+
+`weights` contains little-endian `f32` values in network order: for each layer
+from input to output, write its row-major weight matrix followed by its bias
+vector. `optimizer_state` is optimizer-specific and is ordered per parameter:
+momentum SGD uses one velocity vector, while Adam uses its first (`m`) and
+second (`v`) moment vectors. The constructor leaves both fields empty, so a
+checkpoint made by `TrainingLoop` contains metadata and metrics only unless a
+caller populates those vectors.
+
+Restoring through `TrainingLoop::resume_from` copies only epoch, global step,
+and aggregate metrics. It cannot restore these byte vectors, learning rate,
+early-stopping counters, callbacks, or dataset position. External persistence
+code must restore model and optimizer state itself, and must not treat this API
+as a complete continuation mechanism.
+
+## GPU placeholder-gradient path
+
+`GpuTrainer::train_batch` runs forward evaluation, rejects non-finite outputs,
+computes loss, checks the loss, prepares placeholder gradients, and then calls
+the optimizer dispatcher. The backward preparation first forms `output -
+target` with the unsmoothed target, but the current CPU fallback does not use
+those values to derive parameter gradients. For every layer, it uploads the
+same `0.01 / batch_size` value for every weight and bias. The recorded
+activation set contains only the input and output vectors.
+
+This is explicitly scaffolding, not a gradient implementation. The optimizer
+dispatcher then returns `TuneError::Training` for every optimizer choice until
+network buffer binding and weight write-back exist. Because the error is
+propagated before bookkeeping, a failed call leaves `global_step` and
+`current_lr` unchanged. Only a completed forward, backward, and optimizer
+update may advance the step; it then recomputes the learning rate from the base
+rate using that new step and an approximate epoch of `global_step / 100`.

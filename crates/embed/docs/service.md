@@ -75,15 +75,15 @@ from `EmbeddingModel`, prepends it to every supplied text when present, then del
 `embed`. They are not interchangeable with generic `embed`: a model trained for asymmetric
 retrieval expects its query and document vectors to be placed correctly in the shared space.
 
-| Model family | `embed_query` prefix | `embed_passage` prefix | Pooling on native BERT path |
-| --- | --- | --- | --- |
-| BGE v1.5 | `Represent this sentence for searching relevant passages: ` | none | CLS |
-| Multilingual E5 | `query: ` | `passage: ` | masked mean |
-| Qwen3-Embedding | retrieval instruction followed by `Query: ` | none | not a BERT path |
-| MiniLM variants | none | none | masked mean |
+| Model family    | `embed_query` prefix                                       | `embed_passage` prefix | Pooling on native BERT path |
+| --------------- | ---------------------------------------------------------- | ---------------------- | --------------------------- |
+| BGE v1.5        | `Represent this sentence for searching relevant passages:` | none                   | CLS                         |
+| Multilingual E5 | `query:`                                                   | `passage:`             | masked mean                 |
+| Qwen3-Embedding | retrieval instruction followed by `Query:`                 | none                   | not a BERT path             |
+| MiniLM variants | none                                                       | none                   | masked mean                 |
 
 The Qwen query instruction currently reads: `Instruct: Given a web search query, retrieve
-relevant passages that answer the query\nQuery: `. The library's model API owns these values; use
+relevant passages that answer the query\nQuery:`. The library's model API owns these values; use
 the role methods rather than duplicating prompt strings in an application.
 
 The caching wrapper overrides the two role methods instead of relying only on the trait defaults.
@@ -93,24 +93,28 @@ solely because their raw input happens to match.
 
 ## Request validation
 
-The native service and cache wrapper enforce the same request limits before inference or cache
-lookup:
+The cache wrapper validates empty batches, batch size, and text length before any lookup. The
+native service enforces those same limits when it is called and additionally verifies that the
+requested model matches its configured model:
 
-| Rule | Failure |
-| --- | --- |
-| Batch must contain at least one text | `EmbedError::InvalidInput` |
-| Batch may contain at most `DEFAULT_MAX_BATCH_SIZE` (1,000) texts | `EmbedError::InvalidInput` |
-| Each text must be at most `MAX_TEXT_CHARS` (32,768) according to the implementation's `String::len()` check | `EmbedError::TextTooLong` |
-| Native request model must equal that service's configured model | `EmbedError::InvalidInput` |
+| Rule                                                                                                        | Failure                    |
+| ----------------------------------------------------------------------------------------------------------- | -------------------------- |
+| Batch must contain at least one text                                                                        | `EmbedError::InvalidInput` |
+| Batch may contain at most `DEFAULT_MAX_BATCH_SIZE` (1,000) texts                                            | `EmbedError::InvalidInput` |
+| Each text must be at most `MAX_TEXT_CHARS` (32,768) according to the implementation's `String::len()` check | `EmbedError::TextTooLong`  |
+| Native request model must equal that service's configured model                                             | `EmbedError::InvalidInput` |
 
 `String::len()` measures UTF-8 bytes, so the present implementation can reject fewer than
 32,768 non-ASCII characters. Prefixes are applied before validation in role-specific calls, so
 the prefix bytes count too. A caller that needs a character-based product limit should enforce
 that separately before calling the service.
 
-The cache performs validation even for an all-hit request. This makes failure behavior stable:
-a request that is invalid cannot start succeeding merely because an older result happens to be
-cached.
+The wrapper performs its own three request-bound checks even for an all-hit request. It does
+not call `inner.embed` merely to validate a cache hit, so an inner service's model-specific
+checks are not part of the all-hit path. In particular, `NativeEmbeddingService` compares the
+requested model with its configured model only when the cache is disabled or the wrapper has at
+least one miss to delegate. A fully cached request therefore bypasses that native model check;
+a mixed request reaches it only for its missing subset.
 
 ## NativeEmbeddingService
 
@@ -120,11 +124,11 @@ there is no ONNX runtime, C++ FFI, or external embedding process.
 
 ### Construction and configuration
 
-| Constructor | Configuration |
-| --- | --- |
-| `new` / `default` | The crate's default embedding model at its native dimension |
-| `with_model` | One selected `EmbeddingModel` at its native dimension |
-| `with_model_config` | A model plus validated optional MRL output dimension |
+| Constructor           | Configuration                                                                     |
+| --------------------- | --------------------------------------------------------------------------------- |
+| `new` / `default`     | The crate's default embedding model at its native dimension                       |
+| `with_model`          | One selected `EmbeddingModel` at its native dimension                             |
+| `with_model_config`   | A model plus validated optional MRL output dimension                              |
 | `with_model_from_env` | A selected model with `LATTICE_EMBED_DIM` parsed as its optional output dimension |
 
 An absent or blank `LATTICE_EMBED_DIM` means native dimension. A nonnumeric environment value or
@@ -209,7 +213,7 @@ are management APIs rather than a promise of distributed or persistent caching.
 For every generic, query, or passage request, the wrapper does the following:
 
 1. Apply the role prefix, if any. Generic calls remain raw text with the `Generic` role.
-2. Validate the full, prompted batch before looking at the cache.
+2. Validate only the wrapper-owned empty-batch, batch-size, and text-length bounds before lookup.
 3. If capacity is zero, bypass hash computation and locks and delegate the prompted batch to the
    inner service.
 4. Ask the inner service for the effective `ModelConfig`, then hash each prompted text with the
@@ -225,8 +229,7 @@ For every generic, query, or passage request, the wrapper does the following:
 
 The wrapper avoids mixing role-specific data in two ways: text has already been prompted when a
 role needs a prefix, and the cache key additionally contains the `EmbeddingRole` tag. The latter
-protects behavior as prompt policies evolve and preserves the backward-compatible generic key
-form for `embed`.
+keeps generic, query, and passage requests in distinct cache namespaces as prompt policies evolve.
 
 The cache is a reuse optimization, not a single-flight coordinator. Concurrent cache misses for
 the same text may each call the inner service before either request inserts its result. Callers
@@ -238,21 +241,72 @@ All service methods use `crate::Result<T>`, an alias for `Result<T, EmbedError>`
 also serves model configuration and prepared SIMD APIs, so not every variant originates in a
 native embedding call.
 
-| Error | Meaning at this boundary | Typical caller action |
-| --- | --- | --- |
-| `ModelNotLoaded` | A service requires initialization before use | Initialize/preload the service or surface the configuration issue |
-| `WrongModelLoaded` | The loaded model differs from the expected model during a concurrent switch | Retry with backoff after coordinating the model selection |
-| `ModelInitialization` | Model discovery, download/load, or blocking initialization failed | Inspect model configuration/files; construct a fresh service after correcting it |
-| `InferenceFailed` | The inference backend failed, including a cache-wrapper result-count violation | Surface the backend failure; do not accept a partial batch |
-| `TaskFailed` | A background task was cancelled or panicked | Treat the current call as failed and check service state before retrying |
-| `InvalidInput` | Empty/oversized batch, wrong model, invalid configuration, or other invalid request | Correct the request without retrying unchanged input |
-| `TextTooLong` | A text exceeded the service's length check | Chunk or shorten the prompted input |
-| `DimensionMismatch` | An operation received vectors of different expected and actual dimensions | Keep model/config/index namespaces consistent |
-| `UnsupportedModel` | The selected service cannot provide that model | Select a capable service or model |
-| `Internal` | An invariant failed, such as a missing single-item result | Treat as a bug report; do not synthesize a vector |
-| `TierMismatch` | Prepared SIMD quantization data used a different tier than the operation expects | Reprepare/query with matching quantization metadata |
+| Error                 | Meaning at this boundary                                                            | Typical caller action                                                            |
+| --------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `ModelNotLoaded`      | A service requires initialization before use                                        | Initialize/preload the service or surface the configuration issue                |
+| `WrongModelLoaded`    | The loaded model differs from the expected model during a concurrent switch         | Retry with backoff after coordinating the model selection                        |
+| `ModelInitialization` | Model discovery, download/load, or blocking initialization failed                   | Inspect model configuration/files; construct a fresh service after correcting it |
+| `InferenceFailed`     | The inference backend failed, including a cache-wrapper result-count violation      | Surface the backend failure; do not accept a partial batch                       |
+| `TaskFailed`          | A background task was cancelled or panicked                                         | Treat the current call as failed and check service state before retrying         |
+| `InvalidInput`        | Empty/oversized batch, wrong model, invalid configuration, or other invalid request | Correct the request without retrying unchanged input                             |
+| `TextTooLong`         | A text exceeded the service's length check                                          | Chunk or shorten the prompted input                                              |
+| `DimensionMismatch`   | An operation received vectors of different expected and actual dimensions           | Keep model/config/index namespaces consistent                                    |
+| `UnsupportedModel`    | The selected service cannot provide that model                                      | Select a capable service or model                                                |
+| `Internal`            | An invariant failed, such as a missing single-item result                           | Treat as a bug report; do not synthesize a vector                                |
+| `TierMismatch`        | Prepared SIMD quantization data used a different tier than the operation expects    | Reprepare/query with matching quantization metadata                              |
 
 Errors are descriptive but not a transaction protocol: if a batch fails after an inner service
 has done work, a caller should assume no usable batch result was returned and decide whether its
 own retry policy is safe. In particular, cache insertion happens only after the wrapper has
 received the expected number of new vectors.
+
+## Trait API details
+
+`EmbeddingService` is the stable async contract. `embed` produces one vector per input in input
+order and represents the `Generic` role. `embed_one` is a one-item convenience call and reports
+an internal error if an implementation violates that cardinality contract rather than fabricating
+an empty vector.
+
+`embed_query` and `embed_passage` obtain a model instruction, prefix every text when one exists,
+then delegate to `embed`. The defaults cannot create role-separated cache entries by themselves:
+that behavior comes from `CachedEmbeddingService` overriding those methods and supplying its
+`Query` or `Passage` role tag. `EmbeddingRole::Generic` also has its own tag, so all three wrapper
+entry points receive distinct cache keys even when their resulting text is identical.
+
+`model_config` defaults to the model's native dimension. A service that has selected an MRL
+dimension overrides it so a caching wrapper hashes the actual output space, not merely the model
+variant. `supports_model` is a capability query and `name` is a static implementation label;
+neither replaces a caller's own model/index compatibility checks.
+
+## NativeEmbeddingService implementation notes
+
+The native service contains an `Arc<OnceLock<Result<LoadedModel, String>>>` together with one
+`ModelConfig`. It delegates BERT-family and Qwen inference to `lattice-inference`, using local
+SIMD-capable kernels and safetensors rather than an external runtime. The wrapped model types
+already satisfy the service's `Send + Sync` requirements, so the wrapper adds no manual unsafe
+thread-safety implementation.
+
+The first preload or embedding request checks the lock and otherwise schedules
+`OnceLock::get_or_init` on Tokio's blocking pool. The cloned lock remains owned by the blocking
+worker if the awaiting future is dropped, so cancellation cannot reset an in-progress load.
+Concurrent callers share the same initializer; both a successful load and a loading failure are
+memoized for the service lifetime. `ensure_loaded` exercises that sequence without encoding text,
+which makes it suitable for an explicit download/load warm-up.
+
+The BERT path calls `encode_batch` once after selecting CLS pooling for BGE or masked mean pooling
+for E5 and MiniLM. The Qwen path calls `encode` once per text, in input order, so Qwen's
+model-local cache participates. The persistent Qwen cache described above is separate from this
+wrapper's LRU.
+
+## CachedEmbeddingService cache-hit behavior
+
+The wrapper applies an optional role prefix, performs its local request-bound checks, and then
+either bypasses a disabled cache or computes keys from the prompted text, effective model
+configuration, and role. It gathers every LRU hit before deciding whether to call the inner
+service. A full hit returns immediately and never invokes the inner service.
+
+Consequently, the wrapper cannot enforce an inner service's model selection, authorization, or
+other service-specific validation on a full hit. With at least one miss it delegates only the
+misses, and `NativeEmbeddingService::embed` performs its configured-model check before loading or
+encoding them. The wrapper rejects a mismatched number of returned vectors before insertion, which
+prevents a partial `zip` from losing original result positions.

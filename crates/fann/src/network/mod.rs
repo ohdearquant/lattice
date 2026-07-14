@@ -53,29 +53,11 @@ fn forward_into_buffers(
     Ok(())
 }
 
-/// A feedforward neural network optimized for fast inference
+/// Feedforward network with reusable, per-layer activation buffers.
 ///
-/// The network pre-allocates all intermediate buffers at construction time
-/// to avoid allocations during inference.
-///
-/// # Example
-///
-/// ```
-/// use lattice_fann::{Network, NetworkBuilder, Activation};
-///
-/// // Build a simple network: 4 inputs -> 8 hidden (ReLU) -> 2 outputs (Softmax)
-/// let mut network = NetworkBuilder::new()
-///     .input(4)
-///     .hidden(8, Activation::ReLU)
-///     .output(2, Activation::Softmax)
-///     .build()
-///     .unwrap();
-///
-/// // Run inference
-/// let input = [1.0, 2.0, 3.0, 4.0];
-/// let output = network.forward(&input).unwrap();
-/// assert_eq!(output.len(), 2);
-/// ```
+/// `forward` allocates no activation buffers; its output borrow remains valid
+/// until the next mutable use of the network.
+/// See [`docs/network.md`](../../docs/network.md#network) for execution and usage details.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "NetworkData"))]
@@ -134,12 +116,10 @@ impl Network {
         Ok(Self { layers, buffers })
     }
 
-    /// Run forward pass through the network
+    /// Runs `input` through all layers and borrows the final activation buffer.
     ///
-    /// Returns a reference to the output buffer (valid until next forward call).
-    ///
-    /// # Arguments
-    /// * `input` - Input vector (must match network's input size)
+    /// Returns an error when the input width is invalid or a layer output is non-finite.
+    /// See [`docs/network.md`](../../docs/network.md#network) for buffer lifetime details.
     #[inline]
     pub fn forward(&mut self, input: &[f32]) -> FannResult<&[f32]> {
         let expected_inputs = self.num_inputs();
@@ -154,30 +134,10 @@ impl Network {
         Ok(&self.buffers[self.buffers.len() - 1])
     }
 
-    /// Async forward pass for API consistency with GpuNetwork
+    /// Runs the CPU forward pass behind the async GPU-compatible interface.
     ///
-    /// This provides a unified async interface for CPU/GPU switching.
-    /// Returns an owned Vec instead of a reference.
-    ///
-    /// # Arguments
-    /// * `input` - Input vector (must match network's input size)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // In an async context:
-    /// use lattice_fann::{Network, NetworkBuilder, Activation};
-    ///
-    /// let mut network = NetworkBuilder::new()
-    ///     .input(4)
-    ///     .output(2, Activation::Softmax)
-    ///     .build()
-    ///     .unwrap();
-    ///
-    /// let input = vec![1.0, 2.0, 3.0, 4.0];
-    /// let output = network.forward_async(&input).await.unwrap();
-    /// assert_eq!(output.len(), 2);
-    /// ```
+    /// Returns an owned copy of the output and propagates `forward` validation errors.
+    /// See [`docs/network.md`](../../docs/network.md#networkforward_async) for interface rationale.
     pub async fn forward_async(&mut self, input: &[f32]) -> FannResult<Vec<f32>> {
         // CPU forward is synchronous, just wrap in async for API consistency
         self.forward(input).map(<[f32]>::to_vec)
@@ -252,11 +212,10 @@ impl Network {
 
 #[cfg(feature = "parallel")]
 impl Network {
-    /// Run forward pass on multiple inputs in parallel
+    /// Runs a forward pass for each input in parallel.
     ///
-    /// Shares the (read-only) network weights across threads. Only the
-    /// intermediate activation buffers are allocated per input, avoiding
-    /// the cost of cloning all weight matrices.
+    /// Shares layer parameters and allocates independent activation buffers per input.
+    /// See [`docs/network.md`](../../docs/network.md#networkforward_batch) for concurrency details.
     pub fn forward_batch(&self, inputs: &[Vec<f32>]) -> FannResult<Vec<Vec<f32>>> {
         use rayon::prelude::*;
 

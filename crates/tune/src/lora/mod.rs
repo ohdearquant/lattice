@@ -93,11 +93,7 @@ impl LoraConfig {
     }
 }
 
-/// A single LoRA low-rank decomposition for one linear projection.
-///
-/// Stores the A and B matrices in row-major f32 layout:
-/// - `a`: shape `(rank, d_in)` -- projects input down to rank
-/// - `b`: shape `(d_out, rank)` -- projects rank up to output
+/// A row-major low-rank update for one linear projection.
 #[derive(Debug, Clone)]
 pub struct LoraLayer {
     /// Matrix A, row-major `(rank, d_in)`.
@@ -112,40 +108,8 @@ pub struct LoraLayer {
     pub rank: usize,
 }
 
-/// A complete LoRA adapter: one [`LoraLayer`] per (layer_idx, module_name) pair.
-///
-/// Loaded from a PEFT-format safetensors file and applied at inference time
-/// to modify the output of specific linear projections in the transformer.
-///
-/// ```compile_fail
-/// use lattice_tune::lora::{LoraAdapter, LoraConfig};
-/// use std::collections::HashMap;
-///
-/// let adapter = LoraAdapter {
-///     config: LoraConfig {
-///         rank: 8,
-///         alpha: f32::NAN,
-///         target_modules: Vec::new(),
-///     },
-///     layers: HashMap::new(),
-/// };
-/// ```
-///
-/// ```compile_fail
-/// use lattice_tune::lora::{LoraAdapter, LoraConfig};
-/// use std::collections::HashMap;
-///
-/// let mut adapter = LoraAdapter::new(
-///     LoraConfig {
-///         rank: 8,
-///         alpha: 16.0,
-///         target_modules: Vec::new(),
-///     },
-///     HashMap::new(),
-/// )
-/// .unwrap();
-/// adapter.config.alpha = f32::NAN;
-/// ```
+/// A validated collection of LoRA layers keyed by transformer layer and module.
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for serving-time validation.
 #[derive(Debug, Clone)]
 pub struct LoraAdapter {
     /// Adapter configuration.
@@ -157,14 +121,8 @@ pub struct LoraAdapter {
 
 impl LoraAdapter {
     /// Load a LoRA adapter from a PEFT-format safetensors file.
-    ///
-    /// Parses tensor keys like:
-    /// `base_model.model.model.layers.{i}.self_attn.q_proj.lora_A.weight`
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file is invalid, has mismatched A/B pairs,
-    /// or contains tensors with inconsistent ranks.
+    /// Returns an error for invalid tensors, pairs, or ranks.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for the loading boundary.
     #[cfg(feature = "safetensors")]
     pub fn from_safetensors(path: &Path) -> crate::error::Result<Self> {
         safetensors::load_peft_safetensors(path)
@@ -172,14 +130,9 @@ impl LoraAdapter {
 
     /// Save this LoRA adapter to a PEFT-format safetensors file.
     ///
-    /// Pass `governance: Some(..)` to embed provenance fields (name, owner,
-    /// base/tokenizer rev, dtype, approval status) into the safetensors
-    /// metadata header; `None` preserves the pre-#610 behavior of writing
-    /// only `rank`/`alpha`/`target_modules`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if tensor serialization fails or the file cannot be written.
+    /// `governance` optionally adds provenance metadata to the file header.
+    /// Returns an error when serialization or writing fails.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for the metadata boundary.
     #[cfg(feature = "safetensors")]
     pub fn save_safetensors(
         &self,
@@ -217,17 +170,9 @@ impl LoraAdapter {
         &mut self.layers
     }
 
-    /// Apply the LoRA adapter to a single projection output.
-    ///
-    /// Looks up the adapter for `(layer_idx, module)`. If no adapter exists
-    /// for that combination, this is a no-op (base output unchanged).
-    ///
-    /// # Arguments
-    ///
-    /// * `layer_idx` - Transformer layer index (0-based)
-    /// * `module` - Module name, e.g. `"q_proj"`, `"gate_proj"`
-    /// * `x` - Input activation vector (length = d_in of the projection)
-    /// * `base_output` - Base projection output to modify in-place (length = d_out)
+    /// Add this adapter's correction to one projection output in place.
+    /// A missing `(layer_idx, module)` layer is a no-op; slices must match its shape.
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-representation-and-inference) for the matrix layout.
     pub fn apply(&self, layer_idx: usize, module: &str, x: &[f32], base_output: &mut [f32]) {
         let key = (layer_idx, module.to_string());
         if let Some(lora_layer) = self.layers().get(&key) {
@@ -267,14 +212,10 @@ impl LoraAdapter {
 impl LoraAdapter {
     /// Validate adapter dimensions against a Qwen3.5 model configuration.
     ///
-    /// Checks every `(layer_idx, module)` pair in the adapter:
-    /// - `layer_idx` is within `config.num_hidden_layers`
-    /// - `d_in` / `d_out` match the projection dimensions the model expects
-    ///
-    /// Returns `Err(TuneError::Validation(...))` on the first mismatch found.
-    /// Call this after loading and before
-    /// [`set_lora`](lattice_inference::model::qwen35::Qwen35Model::set_lora)
-    /// to surface dim errors before generation starts.
+    /// Returns the first invalid layer, module, or projection-shape mismatch.
+    /// Call it after loading and before
+    /// [`set_lora`](lattice_inference::model::qwen35::Qwen35Model::set_lora).
+    /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-validation) for projection shape rules.
     pub fn validate_against(
         &self,
         config: &lattice_inference::model::qwen35_config::Qwen35Config,
@@ -296,10 +237,7 @@ impl LoraAdapter {
                 ("o_proj", true) => (config.full_q_dim(), config.hidden_size),
                 ("in_proj_qkv", false) => (config.hidden_size, config.linear_qkv_dim()),
                 ("in_proj_z", false) => (config.hidden_size, config.linear_output_dim()),
-                // beta/alpha are projected per VALUE head (matches the shipping
-                // gdn_fused forward and the f16 weight loader), not per key head
-                // (#792: this was linear_num_key_heads, wrong for asymmetric
-                // 4B/27B shapes where value_heads != key_heads).
+                // GDN beta/alpha widths are per value head, never key head.
                 ("in_proj_b", false) => (config.hidden_size, config.linear_num_value_heads()),
                 ("in_proj_a", false) => (config.hidden_size, config.linear_num_value_heads()),
                 ("out_proj", false) => (config.linear_output_dim(), config.hidden_size),
@@ -325,8 +263,7 @@ impl LoraAdapter {
     }
 }
 
-// Implement LoraHook from lattice-inference so LoraAdapter can be injected
-// into the inference forward pass.
+// Delegate inference hooks to the adapter's application path.
 #[cfg(feature = "inference-hook")]
 impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
     fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]) {

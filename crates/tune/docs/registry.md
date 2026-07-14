@@ -92,14 +92,14 @@ fields explicitly.
 
 The status vocabulary is:
 
-| Status | Meaning |
-| --- | --- |
-| `Pending` | Registered but not yet validated. |
-| `Validated` | Validation has passed. |
-| `Staged` | Prepared for deployment. |
-| `Production` | The selected production version. |
-| `Archived` | Superseded or retained for history. |
-| `Deprecated` | Not for further use. |
+| Status       | Meaning                             |
+| ------------ | ----------------------------------- |
+| `Pending`    | Registered but not yet validated.   |
+| `Validated`  | Validation has passed.              |
+| `Staged`     | Prepared for deployment.            |
+| `Production` | The selected production version.    |
+| `Archived`   | Superseded or retained for history. |
+| `Deprecated` | Not for further use.                |
 
 The conventional lifecycle is `Pending -> Validated -> Staged -> Production`,
 with old versions later archived or deprecated. This is convention, not a
@@ -215,12 +215,12 @@ either UUID currently denotes a registry record.
 
 `ShadowConfig` contains four acceptance inputs:
 
-| Field | Interpretation | Default | `quick()` | `strict()` |
-| --- | --- | ---: | ---: | ---: |
-| `sample_rate` | Fraction of traffic the caller intends to sample. | 0.10 | 0.20 | 0.10 |
-| `min_samples` | Observations required before a terminal evaluation. | 1,000 | 100 | 10,000 |
-| `min_agreement` | Minimum agreeing-output fraction. | 0.95 | 0.90 | 0.99 |
-| `max_latency_increase_ms` | Largest allowed mean candidate-minus-production latency. | 50.0 | 100.0 | 20.0 |
+| Field                     | Interpretation                                           | Default | `quick()` | `strict()` |
+| ------------------------- | -------------------------------------------------------- | ------: | --------: | ---------: |
+| `sample_rate`             | Fraction of traffic the caller intends to sample.        |    0.10 |      0.20 |       0.10 |
+| `min_samples`             | Observations required before a terminal evaluation.      |   1,000 |       100 |     10,000 |
+| `min_agreement`           | Minimum agreeing-output fraction.                        |    0.95 |      0.90 |       0.99 |
+| `max_latency_increase_ms` | Largest allowed mean candidate-minus-production latency. |    50.0 |     100.0 |       20.0 |
 
 `validate` requires `sample_rate` and `min_agreement` to lie in `[0, 1]`,
 requires a nonzero sample count, and rejects a negative latency allowance.
@@ -426,11 +426,11 @@ runs two fail-closed, idempotent migrations before exposing the storage:
 The timestamp copy handles three legacy representations for both timestamp
 columns:
 
-| Stored value | Detection | Result |
-| --- | --- | --- |
-| Native integer | `typeof(value) = 'integer'` | Preserve it unchanged. |
+| Stored value                       | Detection                     | Result                                                                       |
+| ---------------------------------- | ----------------------------- | ---------------------------------------------------------------------------- |
+| Native integer                     | `typeof(value) = 'integer'`   | Preserve it unchanged.                                                       |
 | Parseable RFC 3339 / ISO 8601 text | `datetime(value) IS NOT NULL` | Convert `strftime('%s', value)` to microseconds by multiplying by 1,000,000. |
-| Numeric text | Neither condition | Cast directly to `INTEGER`. |
+| Numeric text                       | Neither condition             | Cast directly to `INTEGER`.                                                  |
 
 The third case matters because SQLite's old `TEXT` affinity could convert
 integer microseconds into digit strings. RFC 3339 conversion is based on epoch
@@ -477,3 +477,61 @@ shapes in their returned `Vec<f32>` values.
 > Validate the container before accepting external bytes and use
 > `load_weights_verified` when a recorded artifact checksum is required.
 
+## `ShadowSession` public methods
+
+`ShadowSession::new` creates a `Running` session from the supplied production
+ID, candidate ID, and configuration. It does not validate the configuration or
+apply `sample_rate`; the calling service must validate it and decide which
+requests invoke both models. `record_sample` accepts observations only while
+the session is running. Its latency value is candidate minus production
+latency, so a positive value means the candidate is slower.
+
+`evaluate` is the only normal transition to `Passed` or `Failed`. It leaves a
+running session unchanged until `min_samples` observations exist, then requires
+both `agreement_rate >= min_agreement` and
+`latency_diff_ms <= max_latency_increase_ms` to pass. Once terminal,
+evaluation and further samples leave the result unchanged; `cancel` is the
+explicit exception and replaces any state with `Cancelled`.
+
+## `RollbackController` retention
+
+`RollbackController::new(max_history)` owns an in-memory, oldest-first audit
+buffer. `record_rollback` creates a new timestamped `RollbackRecord`, appends
+it, returns a clone, and removes exactly one oldest entry when the capacity is
+exceeded. A zero-capacity controller therefore returns each record but retains
+none. The controller only records intent: it neither performs the registry
+promotion nor swaps a live serving model, and concurrent callers must
+synchronize mutable access themselves.
+
+## `safetensors_io` helpers
+
+The single-tensor helpers serialize a supplied `&[f32]` as a named,
+one-dimensional `F32` tensor and load the named `F32` tensor back as a flat
+vector. They reject an invalid container, a missing name, another dtype, or an
+F32 byte length that is not divisible by four. The multi-tensor helpers apply
+the same one-dimensional representation to each map entry. Loading skips
+non-F32 tensors and additionally checks that the byte-derived element count
+matches the declared shape product before returning a vector.
+
+The safetensors parser can reject malformed tensor ranges before the explicit
+alignment and shape guards run. Those guards remain defence in depth: a loader
+must return an error rather than truncate data or panic. `validate` establishes
+only that the container parses; it does not establish tensor identity, tensor
+contract, or registry artifact integrity.
+
+## SQLite migration helpers
+
+The timestamp migration inspects the actual `registered_at` schema rather than
+assuming a database version. It does nothing for an absent table or an INTEGER
+column; otherwise it recreates the table under `BEGIN IMMEDIATE` as a backup,
+copy, drop, rename, and index-recreation transaction. An intermediate failure
+rolls the transaction back, so initialization fails instead of exposing a
+partially converted schema.
+
+The copy preserves native integer timestamps. For text values it uses SQLite's
+`datetime` probe: parseable date text becomes epoch microseconds from
+`strftime('%s', value) * 1_000_000`, while other text is cast as a numeric
+microsecond value. This handles the old TEXT-affinity database forms but loses
+sub-second precision from parseable timestamp text. The `metadata_json` rename
+is likewise schema-driven and idempotent; unexpected SQLite errors stop
+initialization.

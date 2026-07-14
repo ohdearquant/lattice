@@ -1,28 +1,4 @@
-// Reverse-mode (exact) gradient LoRA trainer for Qwen3.5-0.8B — layer 23.
-//
-// Milestone-2: rank-r LoRA on layer 23's q_proj and v_proj (the top GQA layer,
-// so no GatedDeltaNet backward is involved). Unlike the lm_head trainer, the
-// gradient flows through a full transformer block + the head:
-//
-//   h_in (frozen, layers 0..22)  ── cached once per sample
-//   normed   = rms_norm(h_in,  pre_attn_norm)
-//   attn_out = gated_GQA(normed; LoRA_q, LoRA_v)        ← trained
-//   h_mid    = h_in + attn_out
-//   ffn_out  = swiglu(rms_norm(h_mid, post_attn_norm))
-//   h_out    = h_mid + ffn_out
-//   logits   = lm_head · rms_norm(h_out, final_norm)
-//   loss     = CE(logits, next_token)  over completion positions
-//
-// The frozen prefix (layers 0..22) is captured once via capture_attn_io, which
-// returns h_in = the residual entering layer 23. Everything below layer 23 and
-// every base weight is frozen; only the four LoRA factors move.
-//
-// Qwen3.5 RMSNorm is SHIFTED (x·inv·(1+gamma)); rms_norm_forward/rmsnorm_backward
-// use plain gamma, so the layer/final norms get (1+gamma) precomputed weights.
-// q_norm/k_norm are shifted inside gqa_forward_with_cache, so they stay raw.
-//
-// Usage: train_grad_layer23 --model-dir <path> --data-dir <path> [--steps 25]
-//        [--lr 1e-3] [--rank 8] [--alpha 16] [--max-train 3] [--seq-len 64]
+// Exact layer-23 GQA LoRA trainer — see docs/design.md (§train_grad_layer23).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -524,9 +500,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcache.elapsed().as_secs_f64()
     );
 
-    // LoRA init: A small random, B zero. At B=0 the delta is zero so the forward
-    // reproduces the base model (TBV below); grad_B = scale·outer(g, A·x) ≠ 0 at
-    // init, so B moves first, then A.
+    // Zero B preserves the base at initialization; nonzero A gives B the first update.
     let mut rng = 0xFEED_FACEu64;
     let mut rand_small = |n: usize| -> Vec<f32> {
         (0..n)
@@ -543,9 +517,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut lora_a_v = rand_small(rank * dims.hidden);
     let mut lora_b_v = vec![0.0f32; kv_dim * rank];
 
-    // TBV: with zero LoRA, the chain NLL must match the real model's own
-    // compute_token_nlls — validates the whole layer-23 + head chain (shifted
-    // norms, gate, FFN, lm_head) against the model, not just self-consistency.
+    // Fail closed unless the zero-LoRA layer-23 chain matches the real model NLL.
     {
         let zero_lora = Lora {
             a_q: &lora_a_q,

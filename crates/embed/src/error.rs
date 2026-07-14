@@ -70,11 +70,8 @@ pub enum EmbedError {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// A quantization tier did not match the tier required by the operation.
-    ///
-    /// Raised by the `simd::tier` prepared-dispatch functions (e.g.
-    /// `approximate_cosine_distance_prepared`) when a `PreparedQuery`'s tier does not
-    /// match the stored data's tier, or a batch dispatch function's presumed tier.
+    /// A prepared SIMD operation received data at a different quantization tier.
+    /// See [`docs/design.md`](../docs/design.md#prepared-dispatch-errors) for recovery and failure semantics.
     #[error("tier mismatch in {op}: expected {expected:?}, got {actual:?}")]
     TierMismatch {
         /// Name of the operation where the mismatch was detected.

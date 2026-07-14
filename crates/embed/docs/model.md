@@ -45,18 +45,18 @@ index, or constructing an embedding cache key.
 
 ### Supported variants
 
-| Variant | Model identifier | Native dimensions | Conservative maximum input tokens | Execution | Native BERT pooling |
-| --- | --- | ---: | ---: | --- | --- |
-| `BgeSmallEnV15` | `BAAI/bge-small-en-v1.5` | 384 | 512 | Local | CLS |
-| `BgeBaseEnV15` | `BAAI/bge-base-en-v1.5` | 768 | 512 | Local | CLS |
-| `BgeLargeEnV15` | `BAAI/bge-large-en-v1.5` | 1,024 | 512 | Local | CLS |
-| `MultilingualE5Small` | `intfloat/multilingual-e5-small` | 384 | 512 | Local | Mean |
-| `MultilingualE5Base` | `intfloat/multilingual-e5-base` | 768 | 512 | Local | Mean |
-| `AllMiniLmL6V2` | `sentence-transformers/all-MiniLM-L6-v2` | 384 | 256 | Local | Mean |
-| `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 384 | 128 | Local | Mean |
-| `Qwen3Embedding0_6B` | `Qwen/Qwen3-Embedding-0.6B` | 1,024 | 8,192 | Local | Not a BERT path |
-| `Qwen3Embedding4B` | `Qwen/Qwen3-Embedding-4B` | 2,560 | 8,192 | Local | Not a BERT path |
-| `TextEmbedding3Small` | `text-embedding-3-small` | 1,536 | 8,191 | Remote | Not a BERT path |
+| Variant                             | Model identifier                                              | Native dimensions | Conservative maximum input tokens | Execution | Native BERT pooling |
+| ----------------------------------- | ------------------------------------------------------------- | ----------------: | --------------------------------: | --------- | ------------------- |
+| `BgeSmallEnV15`                     | `BAAI/bge-small-en-v1.5`                                      |               384 |                               512 | Local     | CLS                 |
+| `BgeBaseEnV15`                      | `BAAI/bge-base-en-v1.5`                                       |               768 |                               512 | Local     | CLS                 |
+| `BgeLargeEnV15`                     | `BAAI/bge-large-en-v1.5`                                      |             1,024 |                               512 | Local     | CLS                 |
+| `MultilingualE5Small`               | `intfloat/multilingual-e5-small`                              |               384 |                               512 | Local     | Mean                |
+| `MultilingualE5Base`                | `intfloat/multilingual-e5-base`                               |               768 |                               512 | Local     | Mean                |
+| `AllMiniLmL6V2`                     | `sentence-transformers/all-MiniLM-L6-v2`                      |               384 |                               256 | Local     | Mean                |
+| `ParaphraseMultilingualMiniLmL12V2` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` |               384 |                               128 | Local     | Mean                |
+| `Qwen3Embedding0_6B`                | `Qwen/Qwen3-Embedding-0.6B`                                   |             1,024 |                             8,192 | Local     | Not a BERT path     |
+| `Qwen3Embedding4B`                  | `Qwen/Qwen3-Embedding-4B`                                     |             2,560 |                             8,192 | Local     | Not a BERT path     |
+| `TextEmbedding3Small`               | `text-embedding-3-small`                                      |             1,536 |                             8,191 | Remote    | Not a BERT path     |
 
 The limits are intended for chunking and truncation. They leave room for
 special tokens. In particular, Qwen3-Embedding is capped at 8,192 tokens for
@@ -77,13 +77,13 @@ queries and documents. Apply the prefix returned by `query_instruction()` or
 prefix is not display-only metadata: omitting it changes retrieval quality and
 creates vectors that are not comparable to correctly prepared vectors.
 
-| Family | Query input | Document input | Why it matters |
-| --- | --- | --- | --- |
-| E5 | `query: {query}` | `passage: {document}` | E5 was trained with these asymmetric prefixes. |
-| BGE v1.5 | `Represent this sentence for searching relevant passages: {query}` | Raw document text | The query instruction is required; BGE passages remain unprefixed. |
-| Qwen3-Embedding | `Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: {query}` | Raw document text | The task instruction aligns query embeddings with passages. |
-| MiniLM variants | Raw query text | Raw document text | These models use symmetric raw-text inputs. |
-| Remote text-embedding model | Raw query text | Raw document text | The registry supplies no instruction prefix. |
+| Family                      | Query input                                                                                            | Document input        | Why it matters                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------ | --------------------- | ------------------------------------------------------------------ |
+| E5                          | `query: {query}`                                                                                       | `passage: {document}` | E5 was trained with these asymmetric prefixes.                     |
+| BGE v1.5                    | `Represent this sentence for searching relevant passages: {query}`                                     | Raw document text     | The query instruction is required; BGE passages remain unprefixed. |
+| Qwen3-Embedding             | `Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: {query}` | Raw document text     | The task instruction aligns query embeddings with passages.        |
+| MiniLM variants             | Raw query text                                                                                         | Raw document text     | These models use symmetric raw-text inputs.                        |
+| Remote text-embedding model | Raw query text                                                                                         | Raw document text     | The registry supplies no instruction prefix.                       |
 
 For example, a retrieval caller can make the role explicit before asking an
 embedding service to embed the text:
@@ -167,16 +167,16 @@ embedding-space description.
 
 The enum discriminants are part of `EmbeddingKey::canonical_bytes()`:
 
-| Descriptor | Variant | Byte | Additional meaning |
-| --- | --- | ---: | --- |
-| `DistanceMetric` | `Cosine` | 1 | Cosine similarity / distance convention |
-|  | `Dot` | 2 | Inner product |
-|  | `L2` | 3 | Euclidean distance |
-| `VectorDType` | `F32` | 1 | Four bytes per element |
-|  | `F16` | 2 | Two bytes per element |
-|  | `I8` | 3 | One byte per element |
-| `VectorNorm` | `None` | 0 | No normalisation applied |
-|  | `Unit` | 1 | L2 norm equals one |
+| Descriptor       | Variant  | Byte | Additional meaning                      |
+| ---------------- | -------- | ---: | --------------------------------------- |
+| `DistanceMetric` | `Cosine` |    1 | Cosine similarity / distance convention |
+|                  | `Dot`    |    2 | Inner product                           |
+|                  | `L2`     |    3 | Euclidean distance                      |
+| `VectorDType`    | `F32`    |    1 | Four bytes per element                  |
+|                  | `F16`    |    2 | Two bytes per element                   |
+|                  | `I8`     |    3 | One byte per element                    |
+| `VectorNorm`     | `None`   |    0 | No normalisation applied                |
+|                  | `Unit`   |    1 | L2 norm equals one                      |
 
 `DistanceMetric::from_byte()` returns `None` for an unknown discriminant.
 `VectorDType::size_bytes()` reports the storage width. All three types use
@@ -234,11 +234,11 @@ query embedding cannot satisfy a passage or generic embedding lookup.
 
 The model version values currently divide the registry into these families:
 
-| Key version | Models |
-| --- | --- |
-| `v1.5` | BGE and multilingual E5 variants |
-| `v2` | Both MiniLM variants |
-| `v3` | Both Qwen3-Embedding variants and `TextEmbedding3Small` |
+| Key version | Models                                                  |
+| ----------- | ------------------------------------------------------- |
+| `v1.5`      | BGE and multilingual E5 variants                        |
+| `v2`        | Both MiniLM variants                                    |
+| `v3`        | Both Qwen3-Embedding variants and `TextEmbedding3Small` |
 
 Including the model, version, active dimensions, and role prevents the cache
 from crossing known embedding-space boundaries. `compute_key()` is public and
@@ -333,3 +333,53 @@ The cache stores only embedding values and never owns the model or its weights.
 Clearing it releases the entries, not the model that produced them. A process
 restart creates an empty cache; cache keys and contents are not an on-disk
 format.
+
+## EmbeddingModel source behavior
+
+`EmbeddingModel` is the source of the model facts consumed by services: native dimensions,
+conservative input-token limits, local-versus-remote execution, prompt policy, BERT pooling, and
+the cache-key revision. `native_dimensions()` and `dimensions()` both report the registry's full
+width; a service-specific active dimension belongs to `ModelConfig` instead. This distinction
+keeps callers from allocating or indexing for a Qwen MRL space as though it were the full model
+width.
+
+`max_input_tokens()` is a conservative chunking limit rather than a tokenizer operation. It
+leaves room for special tokens and currently reports 512 for BGE and E5, 256 for all-MiniLM,
+128 for paraphrase multilingual MiniLM, 8,192 for Qwen3-Embedding, and 8,191 for the remote
+OpenAI variant.
+
+The query and document instruction accessors return the literal prefix that must be prepended to
+the original text, or `None` for raw text. E5 uses paired `query:` and `passage:` prefixes, each
+including a trailing space; BGE and Qwen use only a query instruction; MiniLM and the remote model
+use neither. Prompted and unprompted text occupy different retrieval semantics, which is why
+callers should select a role instead of copying these strings ad hoc.
+
+With the `native` feature, BGE selects CLS pooling and E5 and MiniLM select masked mean pooling.
+Qwen and the remote model return no BERT pooling choice because their inference paths own that
+operation. `key_version()` groups BGE/E5 as `v1.5`, MiniLM as `v2`, and Qwen/remote as `v3` for
+cache identity; it is not a substitute for the provider model identifier.
+
+`Display` emits the canonical lowercase model name. `FromStr` lowercases, trims, converts
+underscores to hyphens, removes a BAAI prefix, and accepts selected short aliases and provider
+identifiers. That convenience is suitable for configuration input, whereas persisted identity
+should use the selected registry variant and cache-key revision.
+
+## ModelConfig source behavior
+
+`ModelConfig` pairs an `EmbeddingModel` with an optional output dimension. `try_new` and
+`validate` allow an explicit dimension only for Qwen3-Embedding, require at least 32 dimensions,
+and reject a value above the model's native width. `new` leaves truncation unset and
+`dimensions()` then returns the native width.
+
+Its fields are public for serialization and configuration, so directly constructed values should
+be validated before use. A changed active dimension is a changed embedding space: it must use a
+separate vector-index namespace and cache key, even when the underlying Qwen model is unchanged.
+
+## ModelProvenance source behavior
+
+`ModelProvenance::new` records the selected model, caller-provided source identifier, current
+load time, and an RFC 3339 rendering of that time. Its 64-character BLAKE3 hexadecimal `hash`
+is calculated from `{model_id}:{loaded_at_iso}:{model_debug_representation}`. It identifies a
+metadata load event, not the contents or integrity of model weights; weight verification belongs
+to the inference layer's checksum facilities. `dimensions()` reports the model's native width and
+`matches_model()` compares the recorded variant with an expected one.

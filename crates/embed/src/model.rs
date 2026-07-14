@@ -10,36 +10,16 @@ use std::time::SystemTime;
 
 /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
 ///
-/// Model provenance information for security audits.
+/// Records the model source and metadata for a load event.
 ///
-/// Tracks metadata about when and how a model was loaded, including a hash
-/// for verification that the model hasn't been tampered with.
-///
-/// # Example
-///
-/// ```rust
-/// use lattice_embed::{EmbeddingModel, ModelProvenance};
-///
-/// // Created when a model is loaded
-/// let provenance = ModelProvenance::new(
-///     EmbeddingModel::BgeSmallEnV15,
-///     "BAAI/bge-small-en-v1.5".to_string(),
-/// );
-///
-/// assert!(provenance.model_id.contains("BAAI"));
-/// assert!(!provenance.hash.is_empty());
-/// ```
+/// See [`docs/model.md`](../docs/model.md#modelprovenance-source-behavior) for hash semantics and verification boundaries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProvenance {
     /// **Stable**: model variant that was loaded.
     pub model: EmbeddingModel,
     /// **Stable**: source identifier (HuggingFace ID, URL, or file path).
     pub model_id: String,
-    /// **Stable**: Blake3 hash of the model identifier + timestamp for uniqueness.
-    ///
-    /// Note: This is a lightweight hash based on metadata, not a full hash
-    /// of model weights (which would be expensive). For full model verification,
-    /// use the lattice-inference library's built-in checksum verification.
+    /// **Stable**: metadata-derived BLAKE3 identifier for this load event, not a weight checksum.
     pub hash: String,
     /// **Stable**: when the model was loaded.
     pub loaded_at: SystemTime,
@@ -82,21 +62,9 @@ impl ModelProvenance {
 
 /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
 ///
-/// Supported embedding models.
+/// Registry of supported local and remote embedding models.
 ///
-/// This enum represents the embedding models available for text vectorization.
-/// Models are categorized as either local (run on-device via lattice-inference) or
-/// remote (require API calls).
-///
-/// # Example
-///
-/// ```rust
-/// use lattice_embed::EmbeddingModel;
-///
-/// let model = EmbeddingModel::default();
-/// assert_eq!(model.dimensions(), 384);
-/// assert!(model.is_local());
-/// ```
+/// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for model capabilities and identity rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -162,17 +130,9 @@ impl EmbeddingModel {
         }
     }
 
-    /// **Stable**: get the output dimension of this model's embeddings.
+    /// **Stable**: get this model's native output dimension.
     ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use lattice_embed::EmbeddingModel;
-    ///
-    /// assert_eq!(EmbeddingModel::BgeSmallEnV15.dimensions(), 384);
-    /// assert_eq!(EmbeddingModel::BgeBaseEnV15.dimensions(), 768);
-    /// assert_eq!(EmbeddingModel::BgeLargeEnV15.dimensions(), 1024);
-    /// ```
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for active-dimension selection.
     #[inline]
     pub const fn dimensions(&self) -> usize {
         self.native_dimensions()
@@ -201,65 +161,33 @@ impl EmbeddingModel {
         matches!(self, EmbeddingModel::TextEmbedding3Small)
     }
 
-    /// **Stable**: maximum input tokens supported by this model.
+    /// **Stable**: conservative maximum input tokens for chunking and truncation.
     ///
-    /// Use this for chunking/truncation decisions. Values are conservative
-    /// to leave room for special tokens.
-    ///
-    /// Reference limits:
-    /// - BGE models: 512 tokens
-    /// - OpenAI text-embedding-3: 8191 tokens
-    /// - Gemini embedding-001: 20000 tokens
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for per-model limits.
     #[inline]
     pub const fn max_input_tokens(&self) -> usize {
         match self {
-            // BGE models have 512 token limit
             EmbeddingModel::BgeSmallEnV15 => 512,
             EmbeddingModel::BgeBaseEnV15 => 512,
             EmbeddingModel::BgeLargeEnV15 => 512,
-            // E5 models have 512 token limit
             EmbeddingModel::MultilingualE5Small => 512,
             EmbeddingModel::MultilingualE5Base => 512,
-            // MiniLM has a shorter context window
             EmbeddingModel::AllMiniLmL6V2 => 256,
-            // paraphrase-multilingual-MiniLM max sequence length 128
             EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => 128,
-            // Qwen3-Embedding supports 32K but we cap at 8192 for practical use
+            // Conservative cap; see docs/model.md.
             EmbeddingModel::Qwen3Embedding0_6B => 8192,
             EmbeddingModel::Qwen3Embedding4B => 8192,
-            // OpenAI text-embedding-3-small has 8191 token limit
             EmbeddingModel::TextEmbedding3Small => 8191,
         }
     }
 
-    /// **Stable**: query instruction prefix for asymmetric retrieval.
+    /// **Stable**: query instruction prefix for asymmetric retrieval, when required.
     ///
-    /// Some models require different text for queries vs documents (asymmetric retrieval).
-    ///
-    /// - **E5 models** (`MultilingualE5Small`, `MultilingualE5Base`): trained with
-    ///   "query: " / "passage: " asymmetric prefixes. Omitting the prefix degrades
-    ///   retrieval quality significantly — the model expects them during fine-tuning.
-    ///
-    /// - **Qwen3-Embedding** models: require an instruction prompt to align the
-    ///   decoder embedding space for retrieval tasks.
-    ///
-    /// - **BGE** models (`BgeSmallEnV15`, `BgeBaseEnV15`, `BgeLargeEnV15`): also
-    ///   asymmetric-retrieval — queries need the BGE-v1.5 retrieval instruction
-    ///   prefix, passages do not (see `document_instruction()`, which stays
-    ///   `None` for BGE). Omitting the prefix degrades retrieval quality.
-    ///
-    /// - **MiniLM** models: trained with contrastive objectives on raw text;
-    ///   genuinely symmetric, no prefix needed on either side.
-    ///
-    /// Returns `Some(prefix)` if the query text should be wrapped as
-    /// `"{prefix}{query}"` before embedding. Returns `None` for models that
-    /// don't need instruction prompting.
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for prompt policy and vector-space implications.
     #[inline]
     pub const fn query_instruction(&self) -> Option<&'static str> {
         match self {
             EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
-                // E5 asymmetric retrieval: "query: " prefix for queries,
-                // "passage: " prefix for documents (see document_instruction()).
                 Some("query: ")
             }
             EmbeddingModel::Qwen3Embedding0_6B | EmbeddingModel::Qwen3Embedding4B => Some(
@@ -268,32 +196,19 @@ impl EmbeddingModel {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
             | EmbeddingModel::BgeLargeEnV15 => {
-                // BGE-v1.5 asymmetric retrieval: queries get the documented
-                // retrieval instruction, passages stay raw text (see
-                // document_instruction()).
                 Some("Represent this sentence for searching relevant passages: ")
             }
             _ => None,
         }
     }
 
-    /// **Stable**: document instruction prefix for asymmetric retrieval.
+    /// **Stable**: document instruction prefix for asymmetric retrieval, when required.
     ///
-    /// Some models use different prompts for documents vs queries.
-    /// Returns `Some(prefix)` if the document text should be wrapped as
-    /// `"{prefix}{text}"` before embedding at storage time.
-    ///
-    /// - **E5 models**: trained with `"passage: "` prefix on document/passage inputs.
-    ///   Omitting the prefix on the document side degrades retrieval quality because
-    ///   the model's embedding space was conditioned on this asymmetry during fine-tuning.
-    /// - **BGE / MiniLM**: no document prefix required (contrastive training on raw text).
-    /// - **Qwen3-Embedding**: raw passage text is used without an instruction prefix;
-    ///   only the query side carries the task instruction.
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for prompt policy and vector-space implications.
     #[inline]
     pub const fn document_instruction(&self) -> Option<&'static str> {
         match self {
             EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
-                // E5 asymmetric retrieval: "passage: " prefix for documents/passages.
                 Some("passage: ")
             }
             _ => None,
@@ -328,33 +243,22 @@ impl EmbeddingModel {
         )
     }
 
-    /// **Stable**: the pooling strategy this model expects from BERT-family inference.
+    /// **Stable**: BERT pooling strategy for this model, or `None` for non-BERT paths.
     ///
-    /// BGE v1.5 models use CLS-token pooling (first token) as documented on their
-    /// HuggingFace model cards (`model_output[0][:, 0]`).  All other BERT-family
-    /// models (E5, MiniLM) use masked mean pooling.
-    ///
-    /// Returns `None` for non-BERT models (Qwen3, OpenAI remote) which have their
-    /// own pooling paths.
-    ///
-    /// Only available when the `native` feature is enabled (requires `lattice-inference`).
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for pooling routing.
     #[cfg(feature = "native")]
     #[inline]
     pub const fn bert_pooling(&self) -> Option<lattice_inference::BertPooling> {
         match self {
-            // BGE v1.5 — CLS pooling per model card
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
             | EmbeddingModel::BgeLargeEnV15 => Some(lattice_inference::BertPooling::CLS),
-            // E5 multilingual — masked mean pooling per model card
             EmbeddingModel::MultilingualE5Small | EmbeddingModel::MultilingualE5Base => {
                 Some(lattice_inference::BertPooling::Mean)
             }
-            // MiniLM family — masked mean pooling per sentence-transformers convention
             EmbeddingModel::AllMiniLmL6V2 | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => {
                 Some(lattice_inference::BertPooling::Mean)
             }
-            // Qwen and remote models — not BERT-family, pooling handled separately
             EmbeddingModel::Qwen3Embedding0_6B
             | EmbeddingModel::Qwen3Embedding4B
             | EmbeddingModel::TextEmbedding3Small => None,
@@ -398,12 +302,9 @@ impl std::fmt::Display for EmbeddingModel {
 impl std::str::FromStr for EmbeddingModel {
     type Err = String;
 
-    /// **Stable**: parse model from string (case-insensitive, flexible matching).
+    /// **Stable**: parse a normalized canonical name, alias, or supported provider identifier.
     ///
-    /// Accepts:
-    /// - Display names: "bge-small-en-v1.5"
-    /// - Short names: "bge-small", "small"
-    /// - HuggingFace IDs: "BAAI/bge-small-en-v1.5"
+    /// See [`docs/model.md`](../docs/model.md#embeddingmodel-source-behavior) for accepted forms and persistence guidance.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let lower = s.to_lowercase();
         let normalized = lower.trim().replace("_", "-").replace("baai/", "");
@@ -457,10 +358,9 @@ impl std::str::FromStr for EmbeddingModel {
 /// Minimum allowed MRL output dimension.
 pub const MIN_MRL_OUTPUT_DIM: usize = 32;
 
-/// Runtime configuration pairing a model with an optional MRL truncation dimension.
+/// Runtime model configuration with an optional MRL truncation dimension.
 ///
-/// Two `ModelConfig` values with different `output_dim` produce different embedding spaces
-/// and must be stored in separate vector index namespaces.
+/// See [`docs/model.md`](../docs/model.md#modelconfig-source-behavior) for validation and namespace requirements.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// The underlying embedding model.

@@ -213,11 +213,10 @@ impl Activation {
         }
     }
 
-    /// Apply activation function to a batch of values (in-place)
+    /// Applies this activation in place to `values`.
     ///
-    /// This is more efficient than calling `forward` repeatedly and handles
-    /// Softmax correctly. Uses SIMD acceleration for ReLU and LeakyReLU on
-    /// supported platforms when the `simd` feature is enabled.
+    /// Softmax operates on the complete slice; ReLU variants use supported SIMD paths.
+    /// See [`docs/network.md`](../docs/network.md#activationforward_batch) for semantics.
     #[inline]
     pub fn forward_batch(&self, values: &mut [f32]) {
         match self {
@@ -314,11 +313,10 @@ impl Activation {
         }
     }
 
-    /// Compute an activation derivative from its output value.
+    /// Computes a derivative from an activation output value.
     ///
-    /// Softmax returns only the Jacobian diagonal. Output-layer backpropagation
-    /// computes the full Jacobian; the builder rejects hidden-layer Softmax
-    /// (see ADR-023).
+    /// Softmax returns its Jacobian diagonal only.
+    /// See [`docs/network.md`](../docs/network.md#activation-derivatives) for derivative scope.
     #[inline]
     pub fn derivative(&self, output: f32) -> f32 {
         match self {

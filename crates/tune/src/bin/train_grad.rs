@@ -1,20 +1,4 @@
-// Reverse-mode (exact) gradient LoRA trainer for Qwen3.5-0.8B.
-//
-// Milestone-1: rank-r LoRA on lm_head. lm_head is the top of the network, so
-// its gradient needs no transformer backward — the input to lm_head is the
-// final hidden state H_t (post final-norm), and the base weights are frozen, so
-// H_t is a fixed per-position input. We cache (H_t, base_logits, target) once,
-// then run real Adam on the LoRA factors:
-//
-//   logits_t = base_logits_t + scale · B · (A · H_t)
-//   dL/dlogits = softmax(logits) - onehot(target)   (masked to completion, /n)
-//   grad_B, grad_A = lora_vjp(dL/dlogits, H_t, A·H_t, A, B, ...)
-//
-// The LoRA delta is applied in BOTH the gradient and the NLL eval, so the
-// reported curve reflects the trained adapter.
-//
-// Usage: train_grad --model-dir <path> --data-dir <path> [--steps 150]
-//        [--lr 1e-3] [--max-train 6] [--seq-len 96]
+// Exact lm_head LoRA trainer — see docs/design.md (§train_grad).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -347,9 +331,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tcache.elapsed().as_secs_f64()
     );
 
-    // TBV: cached base NLL must match the model's own compute_token_nlls.
-    // Fail closed (issue #845) — a NaN or arbitrarily large mismatch must
-    // stop the run, not just print a diagnostic.
+    // Fail closed unless the cached base NLL matches the model's reference NLL.
     {
         let s0 = &train_samples[0];
         let model_nlls = model.compute_token_nlls(&s0.tokens)?;
