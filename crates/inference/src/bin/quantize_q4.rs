@@ -246,6 +246,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if !dry_run {
         fs::create_dir_all(&output_dir)?;
+        let source_config = model_dir.join("config.json");
+        let output_config = output_dir.join("config.json");
+        fs::copy(&source_config, &output_config).map_err(|e| {
+            format!(
+                "failed to copy {} to {}: {e}",
+                source_config.display(),
+                output_config.display()
+            )
+        })?;
     }
 
     let reader = QuarotTensorReader::open(&model_dir)?;
