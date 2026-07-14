@@ -471,7 +471,6 @@ impl Layer {
         // weights is row-major: weights[out_idx * num_inputs + in_idx]
         self.matmul_add(input, output);
 
-        // Apply activation
         self.activation.forward_batch(output);
 
         Ok(())

@@ -225,7 +225,6 @@ impl BufferPool {
         let aligned_size = align_size(size as usize, BUFFER_ALIGNMENT) as u64;
         let category = BufferCategory::from_size(aligned_size as usize);
 
-        // Try to reuse from pool
         if let Some(mut buffer) = self.try_reuse(aligned_size, usage, category) {
             buffer.mark_used();
             self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -234,7 +233,6 @@ impl BufferPool {
 
         self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 
-        // Allocate new buffer
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label,
             size: aligned_size,

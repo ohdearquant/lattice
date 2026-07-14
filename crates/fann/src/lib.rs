@@ -20,7 +20,6 @@ pub mod training;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
-// Re-exports
 pub use activation::Activation;
 pub use error::{FannError, FannResult};
 pub use layer::Layer;
@@ -49,7 +48,6 @@ mod tests {
 
     #[test]
     fn test_full_workflow() {
-        // Build network
         let mut network = NetworkBuilder::new()
             .input(4)
             .hidden(8, Activation::ReLU)
@@ -58,12 +56,10 @@ mod tests {
             .build()
             .unwrap();
 
-        // Verify architecture
         assert_eq!(network.num_inputs(), 4);
         assert_eq!(network.num_outputs(), 2);
         assert_eq!(network.num_layers(), 3);
 
-        // Run inference
         let input = [1.0, 2.0, 3.0, 4.0];
         let output = network.forward(&input).unwrap();
 
@@ -88,12 +84,10 @@ mod tests {
 
         let input: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
 
-        // Warm up
         for _ in 0..10 {
             network.forward(&input).unwrap();
         }
 
-        // Benchmark
         let iterations = 1000;
         let start = Instant::now();
         for _ in 0..iterations {
@@ -118,7 +112,6 @@ mod tests {
 
         let input = [1.0, 2.0, 3.0, 4.0];
 
-        // Run multiple times
         let output1 = network.forward(&input).unwrap().to_vec();
         let output2 = network.forward(&input).unwrap().to_vec();
 
