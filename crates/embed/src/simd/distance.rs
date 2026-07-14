@@ -143,7 +143,6 @@ unsafe fn squared_euclidean_distance_avx512_unrolled(a: &[f32], b: &[f32]) -> f3
     let sum_vec = _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3));
     let main_sum = horizontal_sum_avx512(sum_vec);
 
-    // Handle remainder with single-register AVX-512F loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -159,7 +158,6 @@ unsafe fn squared_euclidean_distance_avx512_unrolled(a: &[f32], b: &[f32]) -> f3
 
     let mut sum = main_sum + horizontal_sum_avx512(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         let diff = a[i] - b[i];
@@ -216,7 +214,6 @@ unsafe fn squared_euclidean_distance_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 
     let sum_vec = _mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3));
     let mut sum = horizontal_sum_avx2(sum_vec);
 
-    // Handle remainder
     for i in (chunks * CHUNK_SIZE)..n {
         let diff = a[i] - b[i];
         sum += diff * diff;
@@ -272,7 +269,6 @@ unsafe fn squared_euclidean_distance_neon_unrolled(a: &[f32], b: &[f32]) -> f32 
     let sum_vec = vaddq_f32(vaddq_f32(sum0, sum1), vaddq_f32(sum2, sum3));
     let mut sum = horizontal_sum_neon(sum_vec);
 
-    // Handle remainder
     for i in (chunks * CHUNK_SIZE)..n {
         let diff = a[i] - b[i];
         sum += diff * diff;
@@ -328,7 +324,6 @@ unsafe fn squared_euclidean_distance_simd128_unrolled(a: &[f32], b: &[f32]) -> f
     let sum_vec = f32x4_add(f32x4_add(sum0, sum1), f32x4_add(sum2, sum3));
     let mut sum = horizontal_sum_simd128(sum_vec);
 
-    // Handle remainder
     for i in (chunks * CHUNK_SIZE)..n {
         let diff = a[i] - b[i];
         sum += diff * diff;

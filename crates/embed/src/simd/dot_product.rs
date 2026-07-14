@@ -251,7 +251,6 @@ unsafe fn dot_product_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     let main_sum = horizontal_sum_avx512(sum_vec);
 
-    // Handle remainder with single-register loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -266,7 +265,6 @@ unsafe fn dot_product_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     let mut total = main_sum + horizontal_sum_avx512(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         total += a[i] * b[i];
@@ -359,7 +357,6 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
 
     let sum = horizontal_sum_avx2(sum_vec);
 
-    // Handle remainder with single-vector loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -374,7 +371,6 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
 
     let mut total = sum + horizontal_sum_avx2(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         total += a[i] * b[i];
@@ -668,7 +664,6 @@ unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     let mut sum = horizontal_sum_neon(sum_vec);
 
-    // Handle remainder with single-vector loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -683,7 +678,6 @@ unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     sum += horizontal_sum_neon(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         sum += a[i] * b[i];
@@ -752,7 +746,6 @@ unsafe fn dot_product_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     let mut total = horizontal_sum_simd128(sum_vec);
 
-    // Handle remainder with single-vector loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -767,7 +760,6 @@ unsafe fn dot_product_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     total += horizontal_sum_simd128(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         total += a[i] * b[i];

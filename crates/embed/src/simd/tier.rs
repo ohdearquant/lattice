@@ -501,17 +501,14 @@ pub fn approximate_cosine_distance(query_f32: &[f32], stored: &QuantizedData) ->
             1.0 - cosine_similarity(query_f32, v)
         }
         QuantizedData::Int8(q) => {
-            // Quantize query to INT8, compute via INT8 path
             let query_q = QuantizedVector::from_f32(query_f32);
             1.0 - q.cosine_similarity(&query_q)
         }
         QuantizedData::Int4(q) => {
-            // Quantize query to INT4, compute via INT4 path
             let query_q = Int4Vector::from_f32(query_f32);
             q.cosine_distance(&query_q)
         }
         QuantizedData::Binary(q) => {
-            // Quantize query to binary, compute Hamming-based approx
             let query_q = BinaryVector::from_f32(query_f32);
             q.cosine_distance_approx(&query_q)
         }

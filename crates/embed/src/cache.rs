@@ -370,14 +370,11 @@ mod tests {
             EmbeddingRole::Generic,
         );
 
-        // Miss
         assert!(cache.get(&key).is_none());
 
-        // Put
         let embedding = vec![0.1, 0.2, 0.3];
         cache.put(key, embedding.clone());
 
-        // Hit — returns Arc<[f32]>
         let cached = cache.get(&key).unwrap();
         assert_eq!(&*cached, &embedding[..]);
     }
