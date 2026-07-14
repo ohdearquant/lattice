@@ -8769,40 +8769,6 @@ mod inner {
             Ok(GenerateAdmission::Ready(prompt_ids))
         }
 
-        /// **Unstable**: Metal-backed n-gram speculative generation.
-        ///
-        /// Runs the total-context admission check before the first Metal forward
-        /// step. The backend-neutral [`crate::speculative::generate_with_speculation`]
-        /// function remains unchanged for non-Metal callers.
-        ///
-        /// # Errors
-        ///
-        /// Returns the shared context-budget error when the prompt plus requested
-        /// decode cap exceeds [`Self::max_context`].
-        pub fn generate_with_speculation(
-            &mut self,
-            prompt_tokens: &[u32],
-            max_new_tokens: usize,
-            eos_token: u32,
-            max_ngram: usize,
-            max_draft: usize,
-        ) -> Result<Vec<u32>, crate::error::InferenceError> {
-            crate::model::qwen35::check_context_budget(
-                prompt_tokens.len(),
-                None,
-                max_new_tokens,
-                self.max_context(),
-            )?;
-            Ok(crate::speculative::generate_with_speculation(
-                prompt_tokens,
-                max_new_tokens,
-                eos_token,
-                |token, position| self.forward_step(token, position),
-                max_ngram,
-                max_draft,
-            ))
-        }
-
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
         ///
         /// Generate text from a prompt.
@@ -26539,43 +26505,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
-        fn metal_speculative_generation_enforces_context_admission() {
-            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
-            let Some(_) = metal::Device::system_default() else {
-                assert!(
-                    !enforce,
-                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
-                );
-                return;
-            };
-            let _gpu_guard = gpu_test_lock();
-
-            let (mut cfg, weights) = tiny_hybrid_fixture();
-            cfg.eos_token_id = u32::MAX;
-            let exact_prompt: Vec<u32> = (0..31).collect();
-            let mut exact_state =
-                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-            let generated = exact_state
-                .generate_with_speculation(&exact_prompt, 1, u32::MAX, 5, 4)
-                .expect("31 prompt tokens plus one speculative token must fit");
-            assert_eq!(generated.len(), 1, "exact-fit request must decode once");
-            assert_eq!(
-                exact_state.session.kv_cache.seq_len, 1,
-                "exact-fit request must exercise the Metal forward callback"
-            );
-
-            let over_prompt: Vec<u32> = (0..32).collect();
-            let mut over_state =
-                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-            let result = over_state.generate_with_speculation(&over_prompt, 1, u32::MAX, 5, 4);
-            assert_context_budget_error(&result, 32, 1, 32);
-            assert_eq!(
-                over_state.session.kv_cache.seq_len, 0,
-                "speculative admission rejection must precede the first forward_step"
-            );
-        }
-
-        #[test]
         fn lora_mixture_context_rejection_preserves_adapter_and_cache() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
@@ -34346,21 +34275,7 @@ impl MetalQwen35State {
         Vec::new()
     }
 
-    /// **Unstable**: Metal speculative generation stub; always errors without metal-gpu.
-    pub fn generate_with_speculation(
-        &mut self,
-        _prompt_tokens: &[u32],
-        _max_new_tokens: usize,
-        _eos_token: u32,
-        _max_ngram: usize,
-        _max_draft: usize,
-    ) -> Result<Vec<u32>, crate::error::InferenceError> {
-        Err(crate::error::InferenceError::Inference(
-            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
-        ))
-    }
-
-    /// **Unstable**: Metal generate stub; always panics without metal-gpu feature.
+    /// **Unstable**: Metal generate stub; always errors without metal-gpu feature.
     ///
     /// #856 follow-up (PR #915 review, first pass): this used to
     /// return an unconditional `Ok(GenerateOutput { .. })` with empty
@@ -34373,40 +34288,39 @@ impl MetalQwen35State {
     /// directly and get a *successful* empty completion back from an
     /// empty (or any) prompt.
     ///
-    /// PR #915 review, second pass: the first fix changed this
-    /// method's return type to `Result<GenerateOutput, InferenceError>`,
-    /// which is itself a semver-breaking signature change -- this stub is
-    /// what every **default** build gets (`metal-gpu` is not a default
-    /// feature), so any existing downstream default-build caller
-    /// consuming a bare `GenerateOutput` would stop compiling, and
-    /// `cargo-semver-checks`' inherent-method lint would not catch a
-    /// non-unit-to-non-unit return type change. `lattice-inference` v0.6.1
-    /// just shipped, so the signature is restored to the published
-    /// `-> GenerateOutput`.
+    /// Changing this method's return type
+    /// from `-> GenerateOutput` to `-> Result<GenerateOutput,
+    /// InferenceError>` directly is itself a semver-breaking signature
+    /// change -- this stub is what every **default** build gets
+    /// (`metal-gpu` is not a default feature), so any existing downstream
+    /// default-build caller consuming a bare `GenerateOutput` would stop
+    /// compiling, and `cargo-semver-checks`' inherent-method lint would
+    /// not catch a non-unit-to-non-unit return type change. As an interim
+    /// step (v0.6.1), the signature was kept as `-> GenerateOutput` and
+    /// the stub panicked instead: fail-loud rather than fail-open, but
+    /// still a rougher contract than a typed `Err`.
     ///
-    /// Instead this fails **loud**: it panics with a message identifying
-    /// the missing capability, rather than silently returning a
-    /// successful-looking empty completion. That is strictly better than
-    /// the pre-#856/#915 fail-open state (a panic is impossible to miss;
-    /// an empty `Ok` looked like a real, if vacuous, generation) and
-    /// matches the v0.6.0 release notes' fail-loudly convention for
-    /// unimplemented GPU arms elsewhere in this crate. It is not the
-    /// intended long-term shape -- a panic in a library function is still
-    /// a rougher contract than a typed `Err` -- so the eventual fallible
-    /// signature is tracked for a semver-major-eligible release at
-    /// <https://github.com/ohdearquant/lattice/issues/917> (targets
-    /// 0.7.0, sibling to #916's `generate_with_speculation` tracking).
+    /// #917 (this signature, targeting the 0.7.0 semver-major release
+    /// alongside the other already-known 0.7.0 breaking changes): the
+    /// return type is now `Result<GenerateOutput, InferenceError>`,
+    /// matching the real metal-gpu-enabled implementation's signature
+    /// exactly. This is a deliberate breaking change gated to 0.7.0; it
+    /// replaces the v0.6.1 panic with a typed capability error, following
+    /// the same "fail with `Err(InferenceError::Inference(..))`" pattern
+    /// used by every other stub method on this type
+    /// (`blend_lora_layer_data`, `load_lora_adapter`,
+    /// `compute_token_nlls`, `compute_perplexity`). See
+    /// <https://github.com/ohdearquant/lattice/issues/917> (sibling to
+    /// #916's `generate_with_speculation` tracking).
     pub fn generate(
         &mut self,
         _prompt: &str,
         _tokenizer: &crate::tokenizer::bpe::BpeTokenizer,
         _cfg: &crate::model::qwen35_config::GenerateConfig,
-    ) -> crate::model::qwen35_config::GenerateOutput {
-        panic!(
-            "MetalQwen35State::generate called on a build compiled without \
-             the metal-gpu feature; construct via new() which returns an \
-             error on such builds"
-        );
+    ) -> Result<crate::model::qwen35_config::GenerateOutput, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
     }
 
     /// **Unstable**: load LoRA adapter stub; always errors without metal-gpu feature.
@@ -34452,25 +34366,26 @@ impl MetalQwen35State {
 }
 
 /// Regression coverage for the non-metal-gpu `MetalQwen35State` stub (#856
-/// follow-up, PR #915 review feedback). This runs in the DEFAULT build (no
-/// `metal-gpu` feature, hence no `#[cfg(metal-gpu)]` on the test itself) --
-/// exactly the build a downstream crate gets by default, and exactly the
-/// build where `MetalQwen35State` is directly constructible as a public
-/// unit struct without going through the fallible `new`/`from_q4_dir`.
+/// follow-up; #917 follow-up). This runs in the
+/// DEFAULT build (no `metal-gpu` feature, hence no `#[cfg(metal-gpu)]` on
+/// the test itself) -- exactly the build a downstream crate gets by
+/// default, and exactly the build where `MetalQwen35State` is directly
+/// constructible as a public unit struct without going through the
+/// fallible `new`/`from_q4_dir`.
 ///
-/// PR #915 review, second pass: the stub's `generate` keeps its
-/// published `-> GenerateOutput` signature (changing it to `Result` would
-/// itself be a semver break for every default build, since `metal-gpu` is
-/// not a default feature) and instead panics with a message identifying
-/// the missing capability. These tests assert the panic, not a `Result`.
+/// #917: the stub's `generate` now returns
+/// `Result<GenerateOutput, InferenceError>`, matching the metal-gpu-enabled
+/// implementation's signature. These tests assert the typed `Err`, not a
+/// panic (the v0.6.1 interim behavior).
 ///
-/// Mutation sensitivity: reverting the stub's `generate` to its old
-/// unconditional `GenerateOutput { .. }` return (no panic) makes both
-/// tests below fail (`#[should_panic]` requires the call to panic; a
-/// normal return is a test failure).
+/// Mutation sensitivity: reverting the stub's `generate` to the v0.6.1
+/// panic (or to the original unconditional `Ok(GenerateOutput { .. })`)
+/// makes both tests below fail -- neither a panic nor a bare `Ok` matches
+/// the `Err(InferenceError::Inference(..))` assertion.
 #[cfg(all(test, not(all(target_os = "macos", feature = "metal-gpu"))))]
 mod non_metal_stub_tests {
     use super::MetalQwen35State;
+    use crate::error::InferenceError;
     use crate::model::qwen35_config::GenerateConfig;
     use crate::tokenizer::bpe::BpeTokenizer;
     use std::collections::HashMap;
@@ -34488,28 +34403,44 @@ mod non_metal_stub_tests {
     }
 
     #[test]
-    #[should_panic(expected = "metal-gpu")]
     fn non_metal_stub_generate_rejects_empty_prompt() {
         let tokenizer = tiny_tokenizer();
         let gen_cfg = GenerateConfig::default();
         let mut state = MetalQwen35State;
 
-        // Must panic (fail loud) rather than return a successful-looking
-        // empty GenerateOutput for an empty prompt.
-        let _ = state.generate("", &tokenizer, &gen_cfg);
+        // Must return a typed Err (fail loud, not fail open) rather than a
+        // successful-looking empty GenerateOutput for an empty prompt.
+        let result = state.generate("", &tokenizer, &gen_cfg);
+        match result {
+            Err(InferenceError::Inference(msg)) => {
+                assert!(
+                    msg.contains("metal-gpu"),
+                    "expected capability error mentioning metal-gpu, got: {msg}"
+                );
+            }
+            other => panic!("expected Err(InferenceError::Inference(..)), got: {other:?}"),
+        }
     }
 
-    /// The stub fails loud for every prompt, not only the empty one --
+    /// The stub errors for every prompt, not only the empty one --
     /// directly-constructing it (bypassing the fallible `new`/`from_q4_dir`)
     /// must never yield a successful (if vacuous) completion.
     #[test]
-    #[should_panic(expected = "metal-gpu")]
     fn non_metal_stub_generate_rejects_nonempty_prompt() {
         let tokenizer = tiny_tokenizer();
         let gen_cfg = GenerateConfig::default();
         let mut state = MetalQwen35State;
 
-        let _ = state.generate("hello", &tokenizer, &gen_cfg);
+        let result = state.generate("hello", &tokenizer, &gen_cfg);
+        match result {
+            Err(InferenceError::Inference(msg)) => {
+                assert!(
+                    msg.contains("metal-gpu"),
+                    "expected capability error mentioning metal-gpu, got: {msg}"
+                );
+            }
+            other => panic!("expected Err(InferenceError::Inference(..)), got: {other:?}"),
+        }
     }
 }
 

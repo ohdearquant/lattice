@@ -81,7 +81,7 @@ impl DiagonalFisher {
     /// Adds the EWC penalty gradient for `params` into `out`.
     ///
     /// Returns [`FannError::InputSizeMismatch`] unless both slices match the Fisher length.
-    /// See [`docs/training.md`](../../docs/training.md#anchor-penalty-gradient) for the formula and descent integration.
+    /// See [`docs/training.md`](../../docs/training.md#anchor--penalty-gradient) for the formula and descent integration.
     pub fn penalty_gradient(&self, params: &[f32], lambda: f32, out: &mut [f32]) -> FannResult<()> {
         let n = self.values.len();
         if params.len() != n {
