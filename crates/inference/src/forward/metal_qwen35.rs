@@ -34155,7 +34155,7 @@ impl MetalQwen35State {
     /// directly and get a *successful* empty completion back from an
     /// empty (or any) prompt.
     ///
-    /// PR #915 review, second pass: changing this method's return type
+    /// Changing this method's return type
     /// from `-> GenerateOutput` to `-> Result<GenerateOutput,
     /// InferenceError>` directly is itself a semver-breaking signature
     /// change -- this stub is what every **default** build gets
@@ -34233,7 +34233,7 @@ impl MetalQwen35State {
 }
 
 /// Regression coverage for the non-metal-gpu `MetalQwen35State` stub (#856
-/// follow-up, PR #915 review feedback; #917 follow-up). This runs in the
+/// follow-up; #917 follow-up). This runs in the
 /// DEFAULT build (no `metal-gpu` feature, hence no `#[cfg(metal-gpu)]` on
 /// the test itself) -- exactly the build a downstream crate gets by
 /// default, and exactly the build where `MetalQwen35State` is directly
