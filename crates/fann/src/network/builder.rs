@@ -45,7 +45,8 @@ impl NetworkBuilder {
 
     /// Set the input size for the network
     ///
-    /// This must be called before adding any layers.
+    /// This must be called before `build` or `build_with_seed`; call order is otherwise
+    /// unconstrained.
     pub fn input(mut self, size: usize) -> Self {
         self.input_size = Some(size);
         self

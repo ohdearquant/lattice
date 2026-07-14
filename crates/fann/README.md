@@ -273,14 +273,26 @@ Enable the `gpu` feature for wgpu-based GPU acceleration.
 
 ```rust
 #[cfg(feature = "gpu")]
-use lattice_fann::gpu::{GpuContext, GpuNetwork};
+use lattice_fann::{
+    Activation, NetworkBuilder,
+    gpu::{GpuContext, GpuNetwork},
+};
+#[cfg(feature = "gpu")]
+use std::sync::Arc;
 
 #[cfg(feature = "gpu")]
 async fn gpu_inference() -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = GpuContext::new().await?;
-    let network = GpuNetwork::from_cpu(&ctx, cpu_network)?;
+    let cpu_network = NetworkBuilder::new()
+        .input(4)
+        .hidden(8, Activation::ReLU)
+        .output(2, Activation::Softmax)
+        .build()?;
+    let ctx = Arc::new(GpuContext::new().await?);
+    let mut network = GpuNetwork::new(ctx, cpu_network)?;
+    let input = [0.1, 0.2, 0.3, 0.4];
 
     let output = network.forward(&input).await?;
+    println!("{output:?}");
     Ok(())
 }
 ```
