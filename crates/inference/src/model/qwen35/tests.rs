@@ -617,9 +617,11 @@ mod lora_serving {
         let mut model = build_model(cfg.clone(), 0xA11C_E5ED);
 
         let calls = Arc::new(Mutex::new(Vec::new()));
-        model.set_lora(Box::new(SpyHook {
-            calls: Arc::clone(&calls),
-        }));
+        model
+            .set_lora(Box::new(SpyHook {
+                calls: Arc::clone(&calls),
+            }))
+            .expect("SpyHook has no shape declaration; default validate_against always passes");
 
         let (mut gdn, mut kv, mut scratch) = fresh_state(&cfg);
         model.forward_step(1, 0, &mut gdn, &mut kv, &mut scratch);
@@ -698,7 +700,9 @@ mod lora_serving {
 
         // Two NoopLoraHook runs must be bit-identical — this establishes that any
         // difference below is provably caused by the adapter, not nondeterminism.
-        model.set_lora(Box::new(NoopLoraHook));
+        model
+            .set_lora(Box::new(NoopLoraHook))
+            .expect("NoopLoraHook always validates");
         let baseline_a = run(&model);
         let baseline_b = run(&model);
         assert_eq!(
@@ -707,11 +711,13 @@ mod lora_serving {
         );
 
         // An adapter targeting a real projection must move the logits.
-        model.set_lora(Box::new(DeltaHook {
-            layer: 3,
-            module: "q_proj",
-            delta: 0.5,
-        }));
+        model
+            .set_lora(Box::new(DeltaHook {
+                layer: 3,
+                module: "q_proj",
+                delta: 0.5,
+            }))
+            .expect("DeltaHook has no shape declaration; default validate_against always passes");
         let adapted = run(&model);
         assert_ne!(
             adapted, baseline_a,
@@ -720,16 +726,59 @@ mod lora_serving {
 
         // An adapter keyed to a non-existent (layer, module) must be a no-op —
         // confirms forward_step only dispatches the hook to real projections.
-        model.set_lora(Box::new(DeltaHook {
-            layer: 999,
-            module: "q_proj",
-            delta: 0.5,
-        }));
+        model
+            .set_lora(Box::new(DeltaHook {
+                layer: 999,
+                module: "q_proj",
+                delta: 0.5,
+            }))
+            .expect("DeltaHook has no shape declaration; default validate_against always passes");
         let unmatched = run(&model);
         assert_eq!(
             unmatched, baseline_a,
             "an adapter keyed to a non-existent layer must not affect output"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // set_lora shape/rank validation (issue #753)
+    // ---------------------------------------------------------------------------
+
+    /// A hook whose `validate_against` always fails, and whose `apply` panics
+    /// if it is ever invoked — standing in for a real adapter whose declared
+    /// rank/shape doesn't match the model.
+    struct RejectingHook;
+    impl LoraHook for RejectingHook {
+        fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {
+            panic!(
+                "RejectingHook::apply must never run — set_lora should have \
+                 rejected this hook via validate_against before installing it"
+            );
+        }
+        fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
+            Err("synthetic shape mismatch".to_string())
+        }
+    }
+
+    /// `set_lora` must call the hook's `validate_against` before installing
+    /// it: a hook that fails validation must be rejected (`Err`) and must
+    /// never become the active hook, so it can never have `apply` called on
+    /// it during a later `forward_step`.
+    #[test]
+    fn set_lora_rejects_hook_that_fails_validation() {
+        let cfg = test_config();
+        let mut model = build_model(cfg.clone(), 0x5EED_0753);
+
+        let result = model.set_lora(Box::new(RejectingHook));
+        assert!(
+            result.is_err(),
+            "set_lora must reject a hook whose validate_against fails"
+        );
+
+        // If RejectingHook had been installed anyway, this would panic inside
+        // its `apply` — proving the rejected hook never becomes active.
+        let (mut gdn, mut kv, mut scratch) = fresh_state(&cfg);
+        model.forward_step(1, 0, &mut gdn, &mut kv, &mut scratch);
     }
 
     // ---------------------------------------------------------------------------

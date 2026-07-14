@@ -463,15 +463,18 @@ mod tests {
                 rank,
             },
         );
-        let adapter = LoraAdapter::new(
-            LoraConfig {
+        // Bypasses `LoraAdapter::new` (which now itself rejects this exact
+        // shape) via a direct struct literal — privacy allows it since this
+        // module is a descendant of `lora` — to exercise blend's own
+        // defense-in-depth check on a malformed adapter.
+        let adapter = LoraAdapter {
+            config: LoraConfig {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        )
-        .expect("valid adapter config");
+        };
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(
             result.is_err(),
@@ -501,15 +504,16 @@ mod tests {
                 rank,
             },
         );
-        let adapter = LoraAdapter::new(
-            LoraConfig {
+        // Bypasses `LoraAdapter::new` (see the mirrored A-length test above)
+        // to exercise blend's own defense-in-depth check.
+        let adapter = LoraAdapter {
+            config: LoraConfig {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        )
-        .expect("valid adapter config");
+        };
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(
             result.is_err(),
@@ -649,15 +653,16 @@ mod tests {
                 rank,
             },
         );
-        let adapter = LoraAdapter::new(
-            LoraConfig {
+        // Bypasses `LoraAdapter::new` (see the mismatched-length tests above)
+        // to exercise blend's own overflow guard on a malformed adapter.
+        let adapter = LoraAdapter {
+            config: LoraConfig {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        )
-        .expect("valid adapter config");
+        };
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
         // per-entry checked_mul is defense-in-depth for the same class.
@@ -729,15 +734,17 @@ mod tests {
                 },
             );
         }
-        let adapter = LoraAdapter::new(
-            LoraConfig {
+        // Bypasses `LoraAdapter::new` (see the mismatched-length tests above)
+        // to exercise blend's own aggregate-budget guard on an adapter whose
+        // declared shapes alone (no real buffers) would blow the budget.
+        let adapter = LoraAdapter {
+            config: LoraConfig {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
             },
             layers,
-        )
-        .expect("valid adapter config");
+        };
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
         assert!(result.is_err(), "aggregate budget exceeded must return Err");
         let msg = result.unwrap_err().to_string();

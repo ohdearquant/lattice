@@ -123,7 +123,10 @@ fn main() {
                     adapter.config().scale(),
                     adapter.num_parameters()
                 );
-                model.set_lora(Box::new(adapter));
+                if let Err(e) = model.set_lora(Box::new(adapter)) {
+                    eprintln!("LoRA adapter incompatible with loaded model: {e}");
+                    std::process::exit(1);
+                }
                 println!(
                     "  LoRA active (loaded in {}ms)",
                     t_lora.elapsed().as_millis()

@@ -61,8 +61,27 @@ impl Qwen35Model {
     }
 
     /// **Unstable**: attach a LoRA adapter hook; hook trait API may change.
-    pub fn set_lora(&mut self, hook: Box<dyn crate::lora_hook::LoraHook>) {
+    ///
+    /// Calls [`LoraHook::validate_against`](crate::lora_hook::LoraHook::validate_against)
+    /// against this model's own config before installing the hook, so a
+    /// rank/dimension-mismatched adapter is rejected up front instead of
+    /// silently corrupting projection outputs (or panicking past a
+    /// `debug_assert` in a release build). The previously-installed hook
+    /// stays active if validation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` (via [`InferenceError::InvalidInput`]) when the hook's
+    /// own `validate_against` reports a rank, dimension, or layer-index
+    /// mismatch against this model's geometry.
+    pub fn set_lora(
+        &mut self,
+        hook: Box<dyn crate::lora_hook::LoraHook>,
+    ) -> Result<(), InferenceError> {
+        hook.validate_against(&self.config)
+            .map_err(InferenceError::InvalidInput)?;
         self.lora = hook;
+        Ok(())
     }
 
     /// **Unstable**: access raw model weights.
