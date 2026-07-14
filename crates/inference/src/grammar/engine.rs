@@ -310,6 +310,26 @@ impl GrammarEngine {
         true
     }
 
+    /// Return whether `state` is accepting and no non-empty vocabulary token
+    /// can legally advance it.
+    pub(crate) fn is_complete_without_continuation(&self, state: &GrammarState) -> bool {
+        if !state.is_complete() {
+            return false;
+        }
+
+        let has_continuation = match self.find_state_id(state) {
+            Some(state_id) => self.partition.any_allowed_token(state_id, |token_id| {
+                simulate_token(state, &self.grammar, &self.vocab_bytes[token_id]).0
+                    == SimResult::Accept
+            }),
+            None => self.vocab_bytes.iter().any(|token_bytes| {
+                !token_bytes.is_empty()
+                    && simulate_token(state, &self.grammar, token_bytes).0 == SimResult::Accept
+            }),
+        };
+        !has_continuation
+    }
+
     /// Find the partition state id for `state` by matching stack configuration.
     ///
     /// Returns `None` when no matching precomputed state exists. This happens
@@ -559,6 +579,30 @@ mod tests {
         let engine = GrammarEngine::new(&spec, vocab).unwrap();
         let state = engine.initial_state();
         assert!(!state.is_complete(), "initial state should not be complete");
+    }
+
+    #[test]
+    fn complete_state_without_continuation_is_terminal() {
+        let vocab = vec![b"a".to_vec()];
+        let spec = GrammarSpec::Gbnf("root ::= \"a\"\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab).unwrap();
+        let mut state = engine.initial_state();
+
+        assert!(engine.advance(&mut state, 0));
+        assert!(engine.is_complete_without_continuation(&state));
+    }
+
+    #[test]
+    fn complete_state_with_continuation_is_not_terminal() {
+        let vocab = vec![b"a".to_vec()];
+        let spec = GrammarSpec::Gbnf("root ::= \"a\"+\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab).unwrap();
+        let mut state = engine.initial_state();
+
+        assert!(engine.advance(&mut state, 0));
+        assert!(state.is_complete());
+        assert!(!engine.is_complete_without_continuation(&state));
+        assert!(engine.advance(&mut state, 0));
     }
 
     #[test]

@@ -187,6 +187,32 @@ impl VocabPartition {
     pub fn grammar_state(&self, state_id: usize) -> Option<&GrammarState> {
         self.states.get(state_id)
     }
+
+    /// Return whether any token allowed by the precomputed mask satisfies
+    /// `predicate`.
+    pub(crate) fn any_allowed_token(
+        &self,
+        state_id: usize,
+        mut predicate: impl FnMut(usize) -> bool,
+    ) -> bool {
+        if state_id >= self.states.len().min(MAX_GRAMMAR_STATES) {
+            return false;
+        }
+
+        let mask_base = state_id * self.mask_stride;
+        for word_idx in 0..self.mask_stride {
+            let mut mask_word = self.masks[mask_base + word_idx];
+            while mask_word != 0 {
+                let bit = mask_word.trailing_zeros() as usize;
+                let token_id = word_idx * 64 + bit;
+                if token_id < self.vocab_size && predicate(token_id) {
+                    return true;
+                }
+                mask_word &= mask_word - 1;
+            }
+        }
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
