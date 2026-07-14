@@ -262,6 +262,17 @@ impl MetalWorkerClient {
         let _ = self.jobs.send(job);
         Ok(rx)
     }
+
+    /// Live snapshot of the admission semaphore's free slots (issue #932's
+    /// cap). `/metrics` (issue #583) computes queue depth / in-flight jobs
+    /// as `max_pending - available_permits()`: a permit is held from
+    /// `submit` until `run_worker_loop` is fully done with the job (see this
+    /// type's own doc comment above), so this reflects real outstanding
+    /// work rather than a separately-tracked counter that could drift from
+    /// the actual admission state.
+    pub fn available_permits(&self) -> usize {
+        self.admission.available_permits()
+    }
 }
 
 /// Adapter-selected KV-window invariant for Metal jobs (#656).

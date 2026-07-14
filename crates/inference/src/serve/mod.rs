@@ -32,6 +32,12 @@ use crate::model::qwen35_config::GenerateConfig;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub mod metal_worker;
 
+/// In-process Prometheus text-format metrics registry (issue #583), shared
+/// by any binary that calls [`metrics::ServeMetrics`]'s recording methods
+/// from its own request-completion hook (currently `lattice_serve.rs`'s
+/// `emit_serve_event`).
+pub mod metrics;
+
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries
 /// already enforced this exact limit independently (`lattice.rs` via
 /// `DefaultBodyLimit::max`, `lattice_serve.rs` via `to_bytes(body, LIMIT)`);
@@ -92,6 +98,20 @@ impl ApiError {
             ApiError::PayloadTooLarge { message } => message,
             ApiError::Internal { message } => message,
             ApiError::ServiceUnavailable { message } => message,
+        }
+    }
+
+    /// The OpenAI-style error code, regardless of variant -- mirrors exactly
+    /// the string each variant's `IntoResponse` impl below serializes as
+    /// `error.code`, so a caller recording metrics from this accessor (issue
+    /// #583's `/metrics` error-count-by-code series) always matches what the
+    /// client actually observed in the response body.
+    pub fn code(&self) -> &'static str {
+        match self {
+            ApiError::BadRequest { code, .. } => code,
+            ApiError::PayloadTooLarge { .. } => "request_body_too_large",
+            ApiError::Internal { .. } => "internal_error",
+            ApiError::ServiceUnavailable { .. } => "server_busy",
         }
     }
 }
