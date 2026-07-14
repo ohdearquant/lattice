@@ -3734,8 +3734,15 @@ mod tests {
             .unwrap()
         };
 
+        // `SpecRng` is a raw xorshift64 seeded directly with `seed` and no avalanche,
+        // so small sequential seeds (0, 1, 2, …) all produce a near-zero *first* draw —
+        // and with a single draft token that first `next_f32()` is the decision-critical
+        // `u`. Scanning raw 0..200 therefore only ever samples `u ≈ 0`, which accepts at
+        // both temperatures and never lands in the accept-probability gap, so spread the
+        // seed across the u64 range (golden-ratio multiply) to sample `u` uniformly.
         let mut saw_divergence = false;
-        for seed in 0u64..200 {
+        for k in 0u64..200 {
+            let seed = k.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let low_t = run_at(1.0, seed);
             let high_t = run_at(4.0, seed);
             if low_t.accepted_count != high_t.accepted_count {
