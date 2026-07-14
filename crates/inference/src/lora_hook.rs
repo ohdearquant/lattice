@@ -6,6 +6,8 @@
 //!
 //! The default `NoopLoraHook` does nothing — zero overhead when no adapter is loaded.
 
+use crate::model::qwen35_config::Qwen35Config;
+
 /// **Unstable**: trait for LoRA adapter injection into linear projections.
 ///
 /// The inference forward pass calls `apply()` after each `matmul_bt`.
@@ -24,6 +26,19 @@ pub trait LoraHook: Send + Sync {
     /// * `x` - Input activation (the same input that was passed to the base projection)
     /// * `output` - Base projection output to modify in-place
     fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]);
+
+    /// **Unstable**: self-check this hook's declared rank/shape against a
+    /// Qwen3.5 model's geometry before it is installed.
+    ///
+    /// [`crate::model::qwen35::Qwen35Model::set_lora`] calls this before
+    /// swapping the hook in, so a mismatched adapter is rejected instead of
+    /// silently corrupting a projection's output prefix (or panicking past a
+    /// `debug_assert` in a release build). Default: no-op (trusts the
+    /// caller) — real adapters with known geometry (e.g.
+    /// `lattice_tune::lora::LoraAdapter`) override it.
+    fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// No-op implementation. Used when no adapter is loaded.

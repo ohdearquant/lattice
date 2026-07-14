@@ -270,6 +270,13 @@ impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
         // Delegate to the existing apply method
         LoraAdapter::apply(self, layer_idx, module, x, output);
     }
+
+    fn validate_against(
+        &self,
+        config: &lattice_inference::model::qwen35_config::Qwen35Config,
+    ) -> Result<(), String> {
+        LoraAdapter::validate_against(self, config).map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +638,38 @@ mod tests {
             assert!(
                 bad_a.validate_against(&cfg).is_err(),
                 "in_proj_a with key-head dim (16) must fail on a 16-key/48-value config"
+            );
+        }
+
+        /// Regression for #753: `Qwen35Model::set_lora` rejects a mismatched
+        /// adapter by calling through `dyn LoraHook::validate_against`, not
+        /// the inherent `LoraAdapter::validate_against`. This confirms the
+        /// trait-object glue (`impl LoraHook for LoraAdapter`) actually
+        /// delegates to the inherent method instead of defaulting to the
+        /// trait's no-op `Ok(())`, for both a mismatched and a matching
+        /// adapter.
+        #[test]
+        fn test_lora_hook_trait_validate_against_delegates_to_inherent_method() {
+            use lattice_inference::lora_hook::LoraHook;
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+
+            // Same mismatch as `test_validate_against_dim_mismatch`: 2b dims
+            // supplied against the 0.8b config's expected q_proj shape.
+            // Fully-qualified syntax forces dispatch through the trait method
+            // (not `LoraAdapter`'s own inherent `validate_against`, which dot
+            // syntax would otherwise prefer).
+            let mismatched = make_adapter_for_layer(3, "q_proj", 2048, 8192);
+            assert!(
+                LoraHook::validate_against(&mismatched, &cfg).is_err(),
+                "the LoraHook trait method must surface the same dim mismatch as \
+                 the inherent LoraAdapter::validate_against"
+            );
+
+            let matching = make_adapter_for_layer(3, "q_proj", 1024, 4096);
+            assert!(
+                LoraHook::validate_against(&matching, &cfg).is_ok(),
+                "the LoraHook trait method must accept an adapter with correct dims"
             );
         }
     }
