@@ -1,45 +1,9 @@
-//! Backfill coordinator: orchestrates embedding migration with routing logic.
+//! Coordinates an embedding backfill above the migration state machine.
 //!
-//! # Overview
+//! It selects model routes, accounts for batches, and maintains the post-cutover
+//! rollback window; it does not perform embedding work or persistence itself.
 //!
-//! When migrating from one embedding model to another, the system needs to:
-//!
-//! 1. Continue serving queries against existing (legacy) embeddings
-//! 2. Route new document embeddings appropriately (dual-write or target-only)
-//! 3. Backfill old documents with the new model's embeddings in batches
-//! 4. Switch queries to the new model once sufficient coverage exists
-//!
-//! The [`BackfillCoordinator`] wraps a [`MigrationController`] and adds routing
-//! logic and batch management on top of the state machine.
-//!
-//! # Example
-//!
-//! ```rust
-//! use lattice_embed::backfill::{BackfillCoordinator, BackfillConfig, EmbeddingRoute};
-//! use lattice_embed::migration::MigrationPlan;
-//! use lattice_embed::EmbeddingModel;
-//!
-//! let plan = MigrationPlan {
-//!     id: "mig-001".to_string(),
-//!     source_model: EmbeddingModel::BgeSmallEnV15,
-//!     target_model: EmbeddingModel::BgeBaseEnV15,
-//!     total_embeddings: 1000,
-//!     batch_size: 100,
-//!     created_at: "2026-01-27T00:00:00Z".to_string(),
-//! };
-//!
-//! let mut coord = BackfillCoordinator::with_defaults(plan);
-//!
-//! // Before starting, all requests go to legacy
-//! assert_eq!(coord.route_request(true), EmbeddingRoute::Legacy);
-//!
-//! coord.start().unwrap();
-//!
-//! // During migration, new documents get dual-written
-//! assert_eq!(coord.route_request(true), EmbeddingRoute::DualWrite);
-//! // Existing documents still use legacy
-//! assert_eq!(coord.route_request(false), EmbeddingRoute::Legacy);
-//! ```
+//! See [docs/backfill.md](../../docs/backfill.md) for the routing and batching design.
 
 use std::time::{Duration, Instant};
 
@@ -52,32 +16,15 @@ use super::types::{BackfillConfig, EmbeddingRoute, EmbeddingRoutingConfig, Routi
 
 /// Coordinates the backfill process during embedding migration.
 ///
-/// Wraps a [`MigrationController`] and adds:
-/// - **Request routing**: decides which model handles new embedding requests
-/// - **Query routing**: decides which model's embeddings to search
-/// - **Batch management**: tracks backfill progress and computes next batch sizes
+/// It layers request/query routing, batch sizing, and rollback timing over the migration
+/// controller; callers perform the actual embedding and index updates.
 ///
-/// # State Machine
-///
-/// The coordinator delegates all state transitions to [`MigrationController`]
-/// and layers routing logic on top:
-///
-/// | State       | New Doc Route | Existing Doc Route | Query Route         |
-/// |-------------|---------------|--------------------|---------------------|
-/// | Planned     | Legacy        | Legacy             | Legacy              |
-/// | InProgress  | DualWrite*    | Legacy             | Legacy or Target**  |
-/// | Paused      | Legacy        | Legacy             | Legacy              |
-/// | Completed   | Target        | Target             | Target              |
-/// | Failed      | Legacy        | Legacy             | Legacy              |
-/// | Cancelled   | Legacy        | Legacy             | Legacy              |
-///
-/// \* Only if `dual_write` is enabled in config.
-/// \*\* Switches to Target when progress >= `target_query_threshold`.
+/// See [docs/backfill.md](../../docs/backfill.md) for the lifecycle and routing tables.
 #[derive(Debug)]
 pub struct BackfillCoordinator {
     pub(super) config: BackfillConfig,
     pub(super) controller: MigrationController,
-    /// Count of items successfully backfilled.
+    /// Count accumulated by `record_batch` calls.
     backfilled_count: usize,
     /// Timestamp when cutover occurred (for rollback window tracking).
     pub(super) cutover_at: Option<Instant>,
@@ -249,9 +196,8 @@ impl BackfillCoordinator {
 
     /// Check if we are currently in the post-cutover rollback window.
     ///
-    /// Returns `true` if the migration has completed and we are still within
-    /// the rollback window duration. During this period, queries use the
-    /// target model but writes continue to both models.
+    /// Returns `true` only after this coordinator observed completion and before its
+    /// configured rollback duration has elapsed.
     #[inline]
     pub fn in_rollback_window(&self) -> bool {
         self.cutover_at
@@ -261,19 +207,8 @@ impl BackfillCoordinator {
 
     /// Get the routing configuration for the current state.
     ///
-    /// Returns an [`EmbeddingRoutingConfig`] that separates query routing
-    /// from write routing. This enables true rollback during the post-cutover
-    /// window by continuing to dual-write while queries use the new model.
-    ///
-    /// # Routing Logic
-    ///
-    /// | State               | Query Model | Write Models        | Phase         |
-    /// |---------------------|-------------|---------------------|---------------|
-    /// | Planned             | source      | `[source]`          | Stable        |
-    /// | InProgress          | source      | `[source, target]`  | Migrating     |
-    /// | Completed (window)  | target      | `[source, target]`  | RollbackWindow|
-    /// | Completed (stable)  | target      | `[target]`          | Stable        |
-    /// | Paused/Failed/etc   | source      | `[source]`          | Stable        |
+    /// The post-cutover rollback window selects target queries and both write models.
+    /// See [docs/backfill.md](../../docs/backfill.md) for the complete routing contract.
     pub fn routing_config(&self) -> EmbeddingRoutingConfig {
         match self.controller.state() {
             MigrationState::Planned => EmbeddingRoutingConfig {
@@ -329,7 +264,7 @@ impl BackfillCoordinator {
         &self.config
     }
 
-    /// Get the total count of items successfully backfilled.
+    /// Get the total count accumulated by `record_batch` calls.
     #[inline]
     pub fn backfilled_count(&self) -> usize {
         self.backfilled_count

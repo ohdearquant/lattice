@@ -9,20 +9,15 @@ name: cargo audit
 # see .cargo/audit.toml for the documented, individually-justified ignore
 # list, and never add a vulnerability-severity advisory to that list.
 #
-# NOTE: no `paths` filter on the `pull_request` trigger below, matching the
-# reasoning in `ci.yml`'s header comment. `cargo-audit-gate` at the bottom of
-# this file is meant to become a *required* status check, and a required
-# check whose workflow never even runs leaves a PR stuck on "Expected,
-# waiting for status to be reported" forever. So this workflow always
-# triggers on every PR to main; dependency-irrelevant PRs are instead
-# handled by gating `audit` and `audit-native` on the `changes` job below,
-# exactly like `ci.yml` gates `ci`/`feature-matrix`/`bench-compile`/`msrv` on
-# its own `changes` job. `cargo-audit-gate` always runs and always reports,
-# so it is the safe context to require — mirroring `ci-gate` in ci.yml,
-# `parity-gate` in e2e-parity.yml, and `app-binaries-gate` in
-# app-binaries.yml. Flipping `cargo-audit-gate` into the branch ruleset's
-# required-checks list is a separate maintainer step (not done by this PR —
-# see the PR description).
+# NOTE: no `paths` filter on the `pull_request` or `merge_group` triggers below,
+# matching the reasoning in `ci.yml`'s header comment. `cargo-audit-gate` is a
+# required status check, and a required check whose workflow never even runs
+# leaves a PR stuck on "Expected, waiting for status to be reported" forever.
+# So this workflow always triggers on every PR and queue entry targeting main;
+# dependency-irrelevant changes are instead handled by gating `audit` and
+# `audit-native` on the `changes` job below, exactly like `ci.yml` gates its
+# expensive jobs. `cargo-audit-gate` always runs, always reports, and fails
+# closed when change detection fails.
 #
 # Two audit jobs cover the two independent Cargo dependency graphs this repo
 # ships: `audit` for the root workspace's tracked `Cargo.lock`, and
@@ -44,6 +39,9 @@ name: cargo audit
 on:
   pull_request:
     branches: [main]
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
   schedule:
     - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
   workflow_dispatch:
@@ -68,12 +66,13 @@ jobs:
         with:
           fetch-depth: 0
       - id: filter
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin "${{ github.base_ref }}" --depth=1 2>/dev/null || true
-            CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
-              || git diff --name-only "HEAD~1...HEAD")
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] || [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
+            CHANGED=$(./scripts/ci-changed-files.sh)
             echo "Changed files:"
             echo "$CHANGED"
             # Two single greps against a here-string, not a `grep | grep -q`
@@ -82,7 +81,7 @@ jobs:
             # as the pipeline's exit code instead of the match result
             # (fail-open on a large diff) — see the matching comment in
             # ci.yml's `changes` job.
-            MATCH=$(grep -E '(^Cargo\.lock$|^Cargo\.toml$|^crates/.*/Cargo\.toml$|^npm/lattice-embed-native/Cargo\.toml$|^\.cargo/audit\.toml$|^\.github/workflows/cargo-audit\.yml$)' <<<"$CHANGED" || true)
+            MATCH=$(grep -E '(^Cargo\.lock$|^Cargo\.toml$|^crates/.*/Cargo\.toml$|^npm/lattice-embed-native/Cargo\.toml$|^\.cargo/audit\.toml$|^scripts/ci-changed-files\.sh$|^\.github/workflows/cargo-audit\.yml$)' <<<"$CHANGED" || true)
             if grep -q . <<<"$MATCH"; then
               echo "deps=true" >> "$GITHUB_OUTPUT"
               echo "→ dependency-relevant change: audit REQUIRED"
@@ -91,9 +90,9 @@ jobs:
               echo "→ no dependency-relevant change: audit work skipped"
             fi
           else
-            # schedule / workflow_dispatch: no PR diff to gate on, always audit.
+            # schedule / workflow_dispatch: no event diff to gate on, always audit.
             echo "deps=true" >> "$GITHUB_OUTPUT"
-            echo "→ non-PR trigger (${{ github.event_name }}): audit REQUIRED"
+            echo "→ non-diff trigger (${{ github.event_name }}): audit REQUIRED"
           fi
 
   audit:

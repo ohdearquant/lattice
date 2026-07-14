@@ -1,4 +1,8 @@
-//! Distillation pipeline orchestration.
+//! Orchestration from raw prompts to labeled examples.
+//!
+//! This implementation validates configuration, formats prompts, and records
+//! results; its teacher response is currently simulated rather than fetched.
+//! See `docs/distill.md` for the execution path and integration boundaries.
 
 use super::DistillationConfig;
 use super::types::{DistillationStats, LabelingResult, RawExample};

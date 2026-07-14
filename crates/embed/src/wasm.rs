@@ -1,19 +1,8 @@
-//! wasm-bindgen JS bindings for browser-hosted embedding generation.
+//! Browser `wasm-bindgen` bindings for in-memory BERT embeddings and vector utilities.
 //!
-//! Exposes a minimal surface: construct a [`LatticeEmbedder`] from in-memory
-//! model bytes (no filesystem, no network access: the caller fetches or
-//! otherwise holds the bytes on the JS side), then call [`LatticeEmbedder::embed`]
-//! to get an L2-normalized embedding vector for a string.
-//!
-//! This wraps `lattice_inference::BertModel::from_bytes`, which itself avoids
-//! `std::fs`/`mmap` entirely. That is required, not incidental:
-//! `wasm32-unknown-unknown` has no real filesystem, and `memmap2`'s wasm
-//! fallback compiles but every `Mmap::map` call returns
-//! `io::ErrorKind::Unsupported` at runtime (see `SafetensorsFile::from_bytes`'s
-//! doc comment in `lattice-inference`). Everything in this module runs
-//! synchronously in memory: there is no `spawn_blocking`, disk cache, or
-//! download path here; those belong to `NativeEmbeddingService` and stay
-//! native-only.
+//! On `wasm32-unknown-unknown`, filesystem-backed loading and `mmap` are unsupported at
+//! runtime: callers must provide model bytes in memory, and native download/cache paths do not
+//! apply. This module runs synchronously. See `docs/design.md` for the WebAssembly boundary.
 
 use lattice_inference::{BertModel, BertPooling};
 use wasm_bindgen::prelude::*;

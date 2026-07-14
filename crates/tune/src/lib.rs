@@ -2,146 +2,18 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 #![allow(clippy::field_reassign_with_default)]
 
-//! lattice-tune - Training infrastructure for Lattice neural models
+//! Training infrastructure for Lattice neural models.
 //!
-//! Provides a complete pipeline for training neural networks through knowledge distillation:
+//! The crate connects data preparation, teacher-label distillation, training,
+//! LoRA adaptation, and versioned model registration. The public modules
+//! retain those boundaries: [`data`], [`distill`], [`train`], [`lora`], and
+//! [`registry`].
 //!
-//! - **Data**: Training examples, datasets, and batching
-//! - **Distill**: Knowledge distillation from teacher models (Claude, GPT, Gemini)
-//! - **Train**: Training loop, optimization, and checkpointing
-//! - **Registry**: Model versioning, storage, and deployment tracking
+//! Optional features add serialization, GPU paths, registry storage, LoRA
+//! inference integration, and backward-training support.
 //!
-//! # Architecture
-//!
-//! ```text
-//! Raw Data → Teacher (LLM) → Soft Labels → Dataset → Training → Model → Registry
-//!                                                        ↓
-//!                                                   Deployment
-//! ```
-//!
-//! # Quick Start
-//!
-//! ```rust
-//! use lattice_tune::data::{TrainingExample, IntentLabels, Dataset, DatasetConfig};
-//!
-//! // Create training examples
-//! let examples = vec![
-//!     TrainingExample::new(
-//!         vec![vec![0.1, 0.2, 0.3]],  // context embeddings
-//!         vec![0.4, 0.5, 0.6],        // message embedding
-//!         IntentLabels::continuation(0.8),
-//!     ),
-//! ];
-//!
-//! // Create a dataset
-//! let dataset = Dataset::from_examples(examples);
-//! let stats = dataset.stats();
-//! println!("Dataset has {} examples", stats.num_examples);
-//! ```
-//!
-//! # Distillation Example
-//!
-//! ```ignore
-//! use lattice_tune::distill::{TeacherConfig, DistillationPipeline, RawExample};
-//!
-//! // Configure teacher model
-//! let teacher = TeacherConfig::claude_sonnet();
-//!
-//! // Create distillation pipeline
-//! let mut pipeline = DistillationPipeline::with_teacher(teacher)?;
-//!
-//! // Create raw examples (text, not embeddings)
-//! let raw = RawExample::new(
-//!     vec!["Hello".to_string(), "How are you?".to_string()],
-//!     "What's the weather like?",
-//! );
-//!
-//! // Label with teacher
-//! let result = pipeline.label_single(&raw)?;
-//! println!("Labeled with confidence: {}", result.confidence);
-//! ```
-//!
-//! # Training Example
-//!
-//! ```ignore
-//! use lattice_tune::train::{TrainingConfig, TrainingLoop};
-//! use lattice_tune::data::Dataset;
-//!
-//! // Configure training
-//! let config = TrainingConfig::default()
-//!     .epochs(100)
-//!     .batch_size(32)
-//!     .learning_rate(0.001);
-//!
-//! // Train
-//! let mut trainer = TrainingLoop::new(config)?;
-//! let metrics = trainer.train(&mut dataset)?;
-//!
-//! println!("Final loss: {:.4}", metrics.final_train_loss);
-//! ```
-//!
-//! # Registry Example
-//!
-//! ```rust
-//! use lattice_tune::registry::{ModelRegistry, RegisteredModel, ModelMetadata};
-//!
-//! // Create a registry
-//! let registry = ModelRegistry::in_memory();
-//!
-//! // Register a model
-//! let metadata = ModelMetadata::classifier(768, 6, 10000);
-//! let model = RegisteredModel::new("intent_classifier", "1.0.0")
-//!     .with_metadata(metadata)
-//!     .with_description("Intent classification model");
-//!
-//! let weights = vec![0u8; 1000]; // Model weights
-//! let id = registry.register(model, &weights).unwrap();
-//!
-//! // Retrieve the model
-//! let loaded = registry.get("intent_classifier", "1.0.0").unwrap();
-//! println!("Loaded: {}", loaded.full_name());
-//! ```
-//!
-//! # Consuming the `inference-hook` bridge
-//!
-//! To inject a trained [`LoraAdapter`] into a running
-//! `lattice-inference` forward pass, enable the `inference-hook` feature. It
-//! pulls in `lattice-inference` and provides `impl
-//! lattice_inference::lora_hook::LoraHook for LoraAdapter`, so an adapter can be
-//! handed to the engine as a `Box<dyn LoraHook>`:
-//!
-//! ```toml
-//! [dependencies]
-//! lattice-tune = { version = "0.4.2", features = ["inference-hook"] }
-//! lattice-inference = "0.4.2" # provides the LoraHook trait
-//! ```
-//!
-//! ```ignore
-//! use lattice_tune::lora::LoraAdapter;
-//! use lattice_inference::lora_hook::LoraHook;
-//!
-//! let adapter: LoraAdapter = /* load via LoraAdapter::load_peft_safetensors(...) */;
-//! let hook: Box<dyn LoraHook> = Box::new(adapter);
-//! // hand `hook` to the inference engine; on each projection it calls
-//! // hook.apply(layer_idx, module, x, output)
-//! ```
-//!
-//! The trait path is `lattice_inference::lora_hook::LoraHook` (it is not
-//! re-exported at the inference crate root). Without the `inference-hook`
-//! feature, `LoraAdapter` is a pure training type and carries no dependency on
-//! `lattice-inference`.
-//!
-//! # Design Principles
-//!
-//! 1. **Data-first**: Well-defined training example format with full traceability
-//! 2. **Modular**: Distillation, training, and registry are separate concerns
-//! 3. **Extensible**: Support different teacher models (Claude, GPT, Gemini)
-//! 4. **Traceable**: All models have version, training config, and metrics
-//!
-//! # Feature Flags
-//!
-//! - `std` (default): Standard library support
-//! - `serde`: Serialization support for all types
+//! See [`docs/design.md`](https://github.com/ohdearquant/lattice/blob/main/crates/tune/docs/design.md)
+//! for architecture, lifecycle boundaries, and links to the subsystem guides.
 
 #![warn(missing_docs)]
 

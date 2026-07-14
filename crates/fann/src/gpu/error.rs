@@ -1,4 +1,7 @@
-//! GPU error types with proper categorization
+//! Error taxonomy and recovery classification for GPU operations.
+//!
+//! Callers can distinguish retryable pressure or execution failures from errors that
+//! should immediately use the CPU path. See `docs/gpu.md` for recovery guidance.
 
 use thiserror::Error;
 

@@ -1,8 +1,10 @@
-//! Adam and AdamW optimizers for LoRA weight updates.
+//! Adam/AdamW state and exact single-layer LoRA gradient computation.
 //!
-//! Provides [`AdamState`] for stateful Adam/AdamW updates and
-//! [`compute_lora_gradients`] which mirrors the forward/backward pass of
-//! [`adapt_step`](super::online::adapt_step) without applying the update.
+//! Adam state and bias correction are tracked per parameter key, never with a
+//! global timestep. [`compute_lora_gradients`] uses the same MSE arithmetic as
+//! [`adapt_step`](super::online::adapt_step) without changing adapter weights.
+//!
+//! See `docs/lora-core.md` for the optimizer and local-refit equations.
 
 use std::collections::HashMap;
 
@@ -11,16 +13,10 @@ use crate::error::TuneError;
 
 /// Stateful Adam / AdamW optimizer.
 ///
-/// Tracks per-parameter first and second moment estimates keyed by an
-/// arbitrary string (typically `"{layer_idx}_{module}_{param}"` where
-/// `param` is `"a"` or `"b"`).  Each key advances its OWN Adam timestep, so
-/// bias correction reflects how many updates that tensor has received — not
-/// how many `step` calls occurred across all keys.  (A single shared counter
-/// over-advances `t` whenever one optimiser step updates several tensors, as
-/// LoRA training does — every tensor then bias-corrects with a `t` far larger
-/// than its true update count, inflating m̂/√v̂ and over-stepping early updates,
-/// which defeats Adam's warmup.  Per-key `t` matches MLX/PyTorch, which key the
-/// timestep per parameter.)
+/// Tracks moments and a bias-correction timestep per parameter key.
+///
+/// A key's timestep advances only when that tensor is updated; sharing one
+/// counter across LoRA tensors would bias-correct later tensors incorrectly.
 pub struct AdamState {
     /// First moment estimates (exponential moving average of gradients).
     m: HashMap<String, Vec<f32>>,
@@ -45,7 +41,8 @@ impl AdamState {
     ///
     /// # Arguments
     ///
-    /// * `key` - Unique string key identifying this parameter tensor.
+    /// * `key` - Stable, unique string key identifying this parameter tensor.
+    ///   Reusing a key requires the parameter slice to keep the same length.
     /// * `params` - Parameter slice to update in place.
     /// * `grads` - Gradient slice (same length as `params`).
     /// * `lr` - Learning rate for this step (may be scheduled externally).
@@ -147,31 +144,11 @@ pub struct LoraGradients {
     pub loss: f32,
 }
 
-/// Compute LoRA gradients without applying an update.
+/// Compute local MSE gradients without applying an update.
 ///
-/// Mirrors the forward / backward arithmetic in [`adapt_step`](super::online::adapt_step)
-/// exactly, returning raw gradients instead of performing an SGD step.
-///
-/// # Forward pass
-///
-/// ```text
-/// intermediate = A @ input          (rank,)
-/// delta        = scale * B @ intermediate  (d_out,)
-/// error        = delta - target_delta
-/// loss         = ||error||²
-/// ```
-///
-/// # Backward pass
-///
-/// ```text
-/// dL/dB[i,r] = 2 · scale · error[i] · intermediate[r]
-/// dL/dA[r,j] = 2 · scale · (Bᵀ·error)[r] · input[j]
-/// ```
-///
-/// # Errors
-///
-/// * [`TuneError::Training`]          – layer `(layer_idx, module)` not found.
-/// * [`TuneError::DimensionMismatch`] – `input` or `target_delta` wrong length.
+/// Uses the same forward and backward arithmetic as
+/// [`adapt_step`](super::online::adapt_step). Returns [`TuneError::Training`]
+/// for a missing layer and [`TuneError::DimensionMismatch`] for bad input sizes.
 pub fn compute_lora_gradients(
     adapter: &LoraAdapter,
     layer_idx: usize,

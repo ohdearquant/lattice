@@ -1,4 +1,8 @@
-//! Endpoint security configuration for teacher models.
+//! Endpoint policy for teacher-model connections.
+//!
+//! The policy can require TLS, restrict hosts, and carry certificate or local
+//! weight-integrity expectations. See `docs/distill.md` for the exact checks
+//! performed today and the verification that remains the HTTP client's job.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};

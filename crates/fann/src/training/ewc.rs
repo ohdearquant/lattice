@@ -1,13 +1,10 @@
 //! Elastic Weight Consolidation (EWC++) diagonal-Fisher forgetting guard.
 //!
-//! Prevents catastrophic forgetting during online or continual learning by
-//! penalising updates to parameters that were important for prior tasks.
-//! "Importance" is measured via an exponential moving average of squared
-//! gradients — a diagonal approximation to the Fisher information matrix.
+//! Tracks per-parameter importance from squared gradients and uses it to
+//! penalise or damp changes to parameters important to earlier tasks.
+//! The guard is independent of `Network` and operates on flat parameter slices.
 //!
-//! Reference: Kirkpatrick et al., "Overcoming catastrophic forgetting in
-//! neural networks", PNAS 2017; Chaudhry et al., "Efficient Lifelong Learning
-//! with A-GEM", ICLR 2019 (EWC++ online variant).
+//! See `docs/training.md` for the EWC model, lifecycle, and update formulas.
 
 use crate::error::{FannError, FannResult, validate_allocation_size};
 

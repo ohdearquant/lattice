@@ -1,6 +1,9 @@
-//! Embedding model definitions.
+//! Embedding model selection, runtime dimensions, and load provenance.
 //!
-//! Provides `EmbeddingModel` enum for local model selection.
+//! `EmbeddingModel` defines model-specific limits, prompting, and inference wiring.
+//! `ModelConfig` validates optional Matryoshka output truncation for supported models.
+//!
+//! See docs/model.md for the model and cache design.
 
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;

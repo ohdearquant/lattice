@@ -1,4 +1,8 @@
-//! Error types for lattice-tune
+//! Error vocabulary shared by lattice-tune subsystems.
+//!
+//! `TuneError` preserves the domain that failed—data, teacher, training,
+//! registry, storage, validation, or integrity—while `Result` is the crate
+//! alias. See `docs/design.md` for subsystem ownership and hand-off points.
 
 use thiserror::Error;
 use uuid::Uuid;

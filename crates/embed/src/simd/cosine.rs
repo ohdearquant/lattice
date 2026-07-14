@@ -1,4 +1,6 @@
-//! SIMD-accelerated cosine similarity operations.
+//! SIMD cosine-similarity kernels and batch variants.
+//!
+//! See docs/simd.md for fused reductions and query-reuse behaviour.
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -545,13 +547,7 @@ unsafe fn cosine_similarity_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// **Unstable**: SIMD batch dispatch; use `lattice_embed::utils::batch_cosine_similarity` for stable wrapper.
-///
-/// Resolves the SIMD cosine kernel once to hoist OnceLock dispatch out of the per-pair loop.
-/// For unit-normalized inputs, callers should use `batch_dot_product` directly (or the
-/// PreparedQuery/HNSW APIs which accept explicit normalization hints). Auto-detecting
-/// unit-normalization here would require an O(N×dim) pre-scan costing as much as the
-/// computation itself, so detection is left to the caller.
+/// **Unstable**: batched cosine dispatch; callers supply normalization knowledge.
 pub fn batch_cosine_similarity(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
     let kernel = cosine_kernel();
     pairs
@@ -566,17 +562,9 @@ pub fn batch_cosine_similarity(pairs: &[(&[f32], &[f32])]) -> Vec<f32> {
         .collect()
 }
 
-/// **Unstable**: Fused single-pass cosine similarity; same SIMD path as `cosine_similarity`.
+/// **Unstable**: fused single-pass cosine similarity.
 ///
-/// Computes dot(a,b), norm(a), and norm(b) in a single pass over memory using three
-/// simultaneous SIMD accumulators. This is 3x more memory-efficient than computing
-/// each quantity in a separate pass (3x fewer cache-line loads).
-///
-/// The SIMD kernels (AVX-512, AVX2, NEON) already fuse all three reductions internally.
-/// The scalar fallback is also fused here, unlike `cosine_similarity_scalar` which
-/// makes three separate passes.
-///
-/// For pre-normalized vectors, callers should use `dot_product` directly.
+/// For pre-normalized vectors, use `dot_product` directly.
 #[inline]
 pub fn cosine_similarity_fused(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
@@ -587,18 +575,9 @@ pub fn cosine_similarity_fused(a: &[f32], b: &[f32]) -> f32 {
     cosine_kernel()(a, b)
 }
 
-/// **Unstable**: One-vs-many cosine similarity, pre-computing the query norm once.
+/// **Unstable**: one-query/many-candidate cosine similarity.
 ///
-/// When comparing a single query vector against many stored vectors, the query's
-/// L2 norm is constant across all comparisons. This function computes `|query|`
-/// once and reuses it, saving `candidates.len()` square-root operations.
-///
-/// Each dot(query, candidate) and |candidate| are still computed per-pair via
-/// the SIMD kernel (fused with the candidate norm). The per-pair computation
-/// is 2-accumulator fused (dot_qc and norm_c) after the query norm is factored out.
-///
-/// Returns a `Vec<f32>` of cosine similarities in `[-1, 1]`, in the same order
-/// as `candidates`. Returns 0.0 for any candidate whose length differs from the query.
+/// Results retain candidate order and use `0.0` for dimensional mismatches.
 pub fn batch_cosine_one_vs_many(query: &[f32], candidates: &[&[f32]]) -> Vec<f32> {
     if query.is_empty() || candidates.is_empty() {
         return vec![0.0_f32; candidates.len()];

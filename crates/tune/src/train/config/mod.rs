@@ -1,7 +1,8 @@
-//! Training configuration
+//! Training configuration, validation, and memory estimation.
 //!
-//! This module provides configuration for training loops, optimizers,
-//! learning rate schedules, and regularization.
+//! [`TrainingConfig`] combines optimizer, schedule, regularization, validation,
+//! checkpoint, and reproducibility settings for a training run.
+//! See `docs/train.md` for configuration semantics and memory-estimate details.
 
 mod early_stopping;
 mod lr_schedule;

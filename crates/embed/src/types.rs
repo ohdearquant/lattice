@@ -1,8 +1,9 @@
-//! ML-domain vector types local to lattice-embed.
+//! Vector-space identity and storage-format descriptors for `lattice-embed`.
 //!
-//! These types are defined here because the new lattice-types foundation crate
-//! only contains identity/policy/capability primitives and does not include
-//! vector configuration types. These are ML-domain concerns.
+//! These ML-domain types identify compatible vector spaces and define their canonical
+//! byte representation for deterministic hashing.
+//!
+//! See docs/model.md for the embedding-space format and cache-key relationship.
 
 use serde::{Deserialize, Serialize};
 

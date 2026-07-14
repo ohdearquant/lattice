@@ -1,7 +1,10 @@
-//! Neural network implementation
+//! Feedforward-network execution and construction.
 //!
-//! Provides the `Network` struct for fast inference and `NetworkBuilder`
-//! for fluent network construction.
+//! `Network` validates layer connectivity, pre-allocates one activation buffer
+//! per layer, and rejects non-finite layer outputs. `NetworkBuilder` constructs
+//! compatible dense stacks.
+//!
+//! See `docs/network.md` for the execution model and binary format.
 
 mod builder;
 mod serialization;
@@ -11,14 +14,7 @@ pub use builder::NetworkBuilder;
 use crate::error::{FannError, FannResult};
 use crate::layer::Layer;
 
-/// Check for NaN or Inf values in a layer's output buffer.
-///
-/// Takes a layer index instead of a string to avoid format!() allocation
-/// on every call in the forward pass hot path. The string is only
-/// formatted in the error branch.
-///
-/// This check is always active, including release builds, so inference fails
-/// closed instead of returning non-finite activations.
+/// Reject non-finite layer output in every build; format an error only on failure.
 #[inline]
 fn check_numeric_stability(values: &[f32], layer_index: usize) -> FannResult<()> {
     for (i, &v) in values.iter().enumerate() {
@@ -36,11 +32,7 @@ fn check_numeric_stability(values: &[f32], layer_index: usize) -> FannResult<()>
     Ok(())
 }
 
-/// Run a forward pass through layers using provided buffers.
-///
-/// This is the core forward-pass logic, extracted so that `forward_batch` can
-/// share the (read-only) layer weights across threads without cloning the
-/// entire network — only the mutable activation buffers are per-thread.
+/// Shared forward pass using caller-provided, per-layer activation buffers.
 #[inline]
 fn forward_into_buffers(
     layers: &[Layer],
@@ -91,17 +83,12 @@ pub struct Network {
     /// Network layers
     layers: Vec<Layer>,
     /// Pre-allocated buffers for intermediate activations
-    /// buffers[i] holds output of layer i (or input for i=0)
+    /// `buffers[i]` holds the output of layer `i`.
     #[cfg_attr(feature = "serde", serde(skip))]
     buffers: Vec<Vec<f32>>,
 }
 
-/// Deserialization shadow for [`Network`] that routes through [`Network::new`].
-///
-/// `buffers` is `#[serde(skip)]`, so a directly-deserialized `Network` would
-/// have empty buffers and panic on the first `forward`. Routing through `new`
-/// rebuilds the buffers from the layer dimensions and rejects empty or
-/// dimension-incompatible layer stacks with a `FannError`.
+/// Serde input that rebuilds skipped activation buffers through [`Network::new`].
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 struct NetworkData {

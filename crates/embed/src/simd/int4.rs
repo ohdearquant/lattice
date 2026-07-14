@@ -1,17 +1,8 @@
-//! INT4 quantization for ultra-compact embedding storage.
+//! INT4 packed-vector quantization and approximate dot products.
 //!
-//! Two 4-bit values packed per byte (8x compression vs f32).
-//! Uses symmetric unsigned quantization: maps [-max_abs, max_abs] to [0, 15].
+//! Nibble layout and offset correction are shared by scalar and NEON paths.
 //!
-//! ## Packing format
-//!
-//! High nibble = even index, low nibble = odd index.
-//! For D dimensions, storage is `ceil(D / 2)` bytes.
-//!
-//! ## Dot product
-//!
-//! Dot products dequantize before accumulation so the unsigned INT4 offset is
-//! handled identically on every target.
+//! See docs/simd.md for the packed format and corrected dot-product derivation.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -184,12 +175,7 @@ impl Int4Vector {
     }
 }
 
-/// **Unstable**: SIMD INT4 dot product; NEON/scalar dispatch may change.
-///
-/// Unpacks nibbles, computes dot product of quantized values, then applies
-/// dequantization scaling: `result = (raw_dot / (scale_a * scale_b)) - correction`
-///
-/// The correction accounts for the unsigned offset in the quantization formula.
+/// **Unstable**: dequantized INT4 dot product; dispatch may change.
 #[inline]
 pub fn dot_product_int4(a: &Int4Vector, b: &Int4Vector) -> f32 {
     if a.dims != b.dims {

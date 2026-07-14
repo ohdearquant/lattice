@@ -1,4 +1,8 @@
-//! Teacher model configuration and builder.
+//! Teacher selection, request policy, and endpoint-security configuration.
+//!
+//! Presets and the builder produce a `TeacherConfig`; validation checks its
+//! local invariants and custom endpoint policy before pipeline construction.
+//! See `docs/distill.md` for provider defaults, validation, and security limits.
 
 use super::TeacherProvider;
 use super::security::EndpointSecurity;
@@ -24,7 +28,7 @@ pub struct TeacherConfig {
     /// API key environment variable name
     pub api_key_env: String,
 
-    /// Temperature for generation (0.0 - 1.0)
+    /// Temperature for generation (0.0 - 2.0)
     pub temperature: f32,
 
     /// Maximum tokens in response

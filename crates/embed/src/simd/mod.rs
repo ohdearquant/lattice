@@ -1,20 +1,9 @@
-//! SIMD-accelerated vector operations for embedding similarity.
+//! SIMD vector operations for embedding similarity and compressed-vector search.
 //!
-//! Provides optimized implementations with automatic fallback:
-//! - **x86_64 (float32)**: AVX-512F > AVX2 + FMA > scalar
-//! - **x86_64 (int8)**: AVX-512 VNNI > AVX2 > scalar
-//! - **aarch64**: ARM NEON with multiple accumulators and loop unrolling
-//! - **wasm32**: SIMD128 with multiple accumulators and loop unrolling, gated at
-//!   compile time via `target-feature=+simd128` (wasm has no runtime feature
-//!   detection, unlike x86_64/aarch64 — see [`SimdConfig::simd128_enabled`])
-//! - **Other**: Scalar fallback
+//! Dispatch uses the best supported target kernel with scalar fallbacks; WASM
+//! SIMD128 is selected at compile time. The public SIMD surface is unstable.
 //!
-//! ## Optimizations
-//!
-//! - **Multiple accumulators**: 4 parallel accumulators to break dependency chains
-//! - **Loop unrolling**: Process 16/32/64 elements per iteration depending on ISA
-//! - **AVX-512F**: Wide float32 kernels for dot, cosine, normalize, and distance
-//! - **AVX-512 VNNI**: Integer VNNI instructions when available (quantized int8 path)
+//! See docs/simd.md for the kernel family, dispatch, and quantization design.
 
 mod binary;
 mod cosine;
@@ -151,28 +140,10 @@ impl SimdConfig {
         }
     }
 
-    /// **Unstable**: wasm32 SIMD128 support available.
+    /// **Unstable**: reports compile-time wasm32 SIMD128 availability.
     ///
-    /// Unlike the x86_64/aarch64 fields, this is a **compile-time**, not
-    /// runtime, signal: wasm has no runtime CPU feature detection (a given
-    /// `.wasm` binary either was or wasn't compiled with `-C
-    /// target-feature=+simd128`; there is no dispatching between two
-    /// codepaths inside one binary). Mirrors `cfg!(target_feature =
-    /// "simd128")` and is always false on non-wasm32 targets. A method rather
-    /// than a field so existing `SimdConfig` struct literals keep compiling.
-    ///
-    /// Because this ignores `self` entirely, no `SimdConfig` value -- not
-    /// `SimdConfig::scalar_only` (the existing test-only force-scalar
-    /// helper), not a hypothetical future runtime override -- can flip it
-    /// back to `false` on a simd128-compiled wasm artifact: it always
-    /// re-derives the same compile-time `cfg!` regardless of which instance
-    /// calls it. The four dispatch resolvers that gate on
-    /// this method (`resolve_dot_product_kernel` in `dot_product.rs`,
-    /// `resolve_cosine_kernel` in `cosine.rs`, `dispatch_squared` in
-    /// `distance.rs`, and `normalize`'s inline dispatch in `normalize.rs`)
-    /// inherit the same property. The only way to get scalar dispatch on
-    /// wasm32 is to build without the `simd128` target feature in the first
-    /// place; there is no runtime escape hatch.
+    /// This mirrors the build's `target-feature=+simd128` setting; no
+    /// `SimdConfig` instance can override it at runtime. See docs/simd.md.
     #[inline]
     pub fn simd128_enabled(&self) -> bool {
         cfg!(all(target_arch = "wasm32", target_feature = "simd128"))

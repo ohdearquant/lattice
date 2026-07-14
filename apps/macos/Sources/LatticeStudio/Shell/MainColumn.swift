@@ -46,11 +46,15 @@ struct MainColumn: View {
             return raw.replacingOccurrences(of: "  ", with: " ")
 
         case .serve:
-            let model = store.serve?.servingModelName
-                ?? store.targetModel?.name
-                ?? "model"
+            // Mirrors ServeController.start(): it launches the standalone `lattice_serve`
+            // binary with `--model <path> --port <port>` (no `--host` — the daemon always
+            // binds 127.0.0.1), so the footer must match that shape, not the `lattice`
+            // CLI's unrelated `serve` subcommand.
+            let modelPath = store.serve?.servingModelPath?.path
+                ?? store.targetModel?.path.path
+                ?? "<model-path>"
             let port = store.serve?.port ?? 11435
-            return "lattice serve \(model) --host 127.0.0.1 --port \(port)"
+            return "lattice_serve --model \(modelPath) --port \(port)"
 
         case .quantize, .train, .inspect:
             return nil

@@ -1,7 +1,9 @@
-//! Training module for neural networks
+//! Training algorithms and their shared configuration.
 //!
-//! Provides basic backpropagation training with configurable learning rates
-//! and optimization strategies.
+//! Provides momentum backpropagation, gradient-instability policies, and the
+//! feature-gated EWC and RLOO tools for online routing.
+//!
+//! See `docs/training.md` for training flow, configuration, and algorithms.
 
 mod backprop;
 #[cfg(feature = "online-router")]

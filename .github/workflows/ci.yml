@@ -1,11 +1,11 @@
 name: CI
 
-# NOTE: no `paths-ignore` on the triggers below. Every job here is (or can be)
-# a *required* status check, and a required check whose workflow never even
-# runs leaves a PR stuck on "Expected, waiting for status to be reported"
-# forever. So this workflow always triggers on every PR to main. Docs-only
-# PRs are instead handled by gating `ci`, `feature-matrix`, `bench-compile`,
-# and `msrv` on the `changes` job below.
+# NOTE: no `paths-ignore` on the PR or merge-group triggers below. Every job
+# here is (or can be) a *required* status check, and a required check whose
+# workflow never even runs leaves a PR or queue entry stuck on "Expected,
+# waiting for status to be reported" forever. So this workflow always
+# triggers on both. Docs-only changes are instead handled by gating `ci`,
+# `feature-matrix`, `bench-compile`, and `msrv` on the `changes` job below.
 #
 # `ci` and `feature-matrix` are matrix jobs, so their required-check contexts
 # come from matrix expansion ("CI (macos-latest)", "feature-matrix
@@ -17,20 +17,22 @@ name: CI
 # names are NOT the required contexts here: `ci-gate` at the bottom of this
 # file is, mirroring `parity-gate` in e2e-parity.yml and `app-binaries-gate`
 # in app-binaries.yml. It always runs, always reports, and fails closed if
-# change-detection itself failed. `cargo-deny`, `rustdoc-lint`, and
-# `unwrap-in-lib-lint` stay ungated and directly required: they are already
-# cheap ubuntu-only jobs, so gating them would save nothing.
+# change-detection itself failed. `cargo-deny`, `typos`, and `actionlint` stay
+# directly required because they are cheap ubuntu-only jobs. `rustdoc-lint` and
+# `unwrap-in-lib-lint` remain informational and are deliberately not required.
 #
 # Rollout note: branch protection's required contexts were swapped on
 # 2026-07-04 from the seven heavy job/matrix names to `ci-gate` (plus the
-# unchanged cargo-deny, parity-gate, app-binaries-gate, and q4 composed
-# golden). PRs branched from a pre-ci-gate main must update their branch
-# (strict up-to-date protection forces this anyway) to produce the context.
+# unchanged direct required contexts). The `merge_group` trigger below makes
+# the same contexts report on the synthetic queue commit before it can land.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
 
 # Cancel a PR's own superseded runs so they stop occupying the shared
 # macOS runner pool (~5 concurrent, account-wide) while a newer push on the
@@ -49,9 +51,10 @@ env:
   LATTICE_REQUIRE_FIXTURES: "1"
 
 jobs:
-  # Decide whether anything outside the docs set changed. A PR that only
-  # touches markdown, ADRs, LICENSE, or .gitignore cannot affect compilation,
-  # so it does not need the macOS/ARM compile matrix below.
+  # Decide whether any Rust code changed. A PR that only touches markdown,
+  # ADRs, LICENSE, .gitignore, or the Swift macOS app (apps/macos/**) cannot
+  # affect this workspace's compilation, so it does not need the macOS/ARM
+  # compile matrix below.
   changes:
     name: detect-code-changes
     runs-on: ubuntu-latest
@@ -62,26 +65,34 @@ jobs:
         with:
           fetch-depth: 0
       - id: filter
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin "${{ github.base_ref }}" --depth=1 2>/dev/null || true
-            CHANGED=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
-              || git diff --name-only "HEAD~1...HEAD")
-          else
-            CHANGED=$(git diff --name-only "HEAD~1...HEAD" 2>/dev/null || true)
-          fi
+          CHANGED=$(./scripts/ci-changed-files.sh)
           echo "Changed files:"
           echo "$CHANGED"
-          # Docs set: **/*.md, docs/**, LICENSE*, .gitignore. Everything else
-          # counts as code, including workflow files, Cargo.*, Makefile*, and
-          # scripts/**. Conservative on purpose: when in doubt, run the matrix.
+          # Non-Rust set: **/*.md, docs/**, LICENSE*, .gitignore, and the
+          # macOS Studio app (apps/macos/**). Everything else counts as code,
+          # including workflow files, Cargo.*, Makefile*, and scripts/**.
+          # Conservative on purpose: when in doubt, run the matrix.
+          #
+          # apps/macos/** is the Swift app. It has no Rust surface, so it
+          # cannot affect this workspace's compilation, and there is no Swift
+          # job in this workflow that would validate it. The Rust binaries the
+          # app bundles are covered separately by app-binaries.yml, which
+          # triggers independently on every PR. So a Swift-only change should
+          # not drag the whole macOS/ARM Rust matrix. A PR that touches BOTH
+          # apps/macos and a Rust path still leaves the Rust file in NON_DOCS
+          # below, so code=true and the full matrix runs.
+          #
           # Two single greps against here-strings, not a `grep | grep -q` pipe:
           # a downstream `-q` can close its end of a pipe early and SIGPIPE the
           # upstream producer, and under `pipefail` that reports as the
           # pipeline's exit code instead of the match result (fail-open on a
           # large diff).
-          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$)' <<<"$CHANGED" || true)
+          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/)' <<<"$CHANGED" || true)
           if grep -q . <<<"$NON_DOCS"; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "→ non-docs files changed: full matrix REQUIRED"
@@ -528,10 +539,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: crate-ci/typos@v1.48.0
 
-  # Cheap ubuntu workflow lint. Catches malformed expressions, unknown
-  # contexts/inputs, and shellcheck-level issues inside `run:` steps before
-  # they only surface as a confusing failure on a live runner. Ungated for the
-  # same reason as `typos`: it is a fast, dependency-light static check.
+  # Cheap ubuntu workflow/config lint. Catches malformed expressions, unknown
+  # contexts/inputs, shellcheck-level issues, and changed-file range regressions
+  # before they only surface as a confusing failure on a live runner. Ungated
+  # for the same reason as `typos`: it is a fast, dependency-light check.
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest
@@ -540,11 +551,21 @@ jobs:
       - uses: raven-actions/actionlint@v2.2.0
         with:
           version: '1.7.12'
+      - name: merge-queue config tests
+        run: python3 tests/test_ci_changed_files.py -v
 
   # Deterministic fake-adapter unit tests + raw-observation schema validation
-  # for the decode-benchmark harness core (issue #813 step 1). Stdlib-only,
-  # no engine binary or model weights required — cheap ubuntu-only, so it is
-  # ungated like typos/actionlint above rather than routed through ci-gate.
+  # for the decode-benchmark harness core (issue #813 step 1) and every
+  # migrated profile's adapter module (issue #813 step 2: apples_to_apples,
+  # apples_precise, q4_apples, context_scaling). Stdlib-only (mlx_lm/ollama
+  # are never imported by these test files -- adapters are exercised only
+  # through pure parsing helpers and the harness's own deterministic fake
+  # adapters), no engine binary or model weights required — cheap
+  # ubuntu-only, so it is ungated like typos/actionlint above rather than
+  # routed through ci-gate. (The four adapter test files were not wired into
+  # any CI job before this issue's step-2 migrations landed; this closes
+  # that gap for all of them at once rather than repeating the same
+  # omission per migrated script.)
   bench-decode-harness-tests:
     name: bench-decode-harness-tests
     runs-on: ubuntu-latest
@@ -555,6 +576,14 @@ jobs:
           python-version: '3.11'
       - name: python3 tests/test_bench_decode_harness.py
         run: python3 tests/test_bench_decode_harness.py -v
+      - name: python3 tests/test_bench_decode_adapters_apples_to_apples.py
+        run: python3 tests/test_bench_decode_adapters_apples_to_apples.py -v
+      - name: python3 tests/test_bench_decode_adapters_apples_precise.py
+        run: python3 tests/test_bench_decode_adapters_apples_precise.py -v
+      - name: python3 tests/test_bench_decode_adapters_q4_apples.py
+        run: python3 tests/test_bench_decode_adapters_q4_apples.py -v
+      - name: python3 tests/test_bench_decode_adapters_context_scaling.py
+        run: python3 tests/test_bench_decode_adapters_context_scaling.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is

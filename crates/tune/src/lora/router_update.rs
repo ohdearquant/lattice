@@ -1,36 +1,11 @@
-//! Online adapter-selector refit from preference feedback signals.
+//! Online refit of an adapter-selection gate from preference feedback.
 //!
-//! Consumes a batch of [`FeedbackEvent`]s, retunes the adapter-selection gate
-//! network with a single-sample policy-gradient update (RLOO / M=1), applies
-//! Fisher null-space damping for anti-forgetting (v1), and returns the updated
-//! gate as a self-contained FANN binary blob.
-//!
-//! # Anti-forgetting mechanism (v1)
-//!
-//! The shipped v1 mechanism is **Fisher null-space damping** via
-//! [`DiagonalFisher::project_delta`]: parameters with a high squared-gradient
-//! EMA (important to prior tasks) have their update scaled toward zero;
-//! parameters with near-zero importance pass through unchanged.  The anchor
-//! parameter vector is updated at the end of each refit call, but it is used
-//! only by the off-by-default penalty path — not by `project_delta`.
-//!
-//! The anchor-pullback penalty ([`DiagonalFisher::penalty_gradient`]) is a
-//! tested Phase-2 path wired to [`RouterUpdateConfig::ewc_lambda`].  It is
-//! **not** active in v1; `ewc_lambda` is validated and stored but not consumed
-//! by the current update loop.
-//!
-//! # Polarity invariant
-//!
-//! The reward carried in each [`FeedbackEvent`] flows through a **single code
-//! path** to [`RlooTrainer::step`].  Positive reward raises the target
-//! adapter's routing probability; negative reward lowers it.  There is no
-//! separate branch for negative feedback — the sign is embedded in the
-//! gradient formula (`reward * (p - onehot(action))`).  See
-//! [`RlooTrainer::step`] for the derivation.
-//!
-//! # Feature gate
-//!
-//! This entire module is compiled only when the `mixture` feature is active.
+//! Each signed reward takes the same RLOO update path: positive feedback raises
+//! the selected adapter's score and negative feedback lowers it. v1 protects
+//! prior routing behavior with Fisher delta projection; `ewc_lambda` is
+//! validated but intentionally inactive until the penalty-gradient path ships.
+//! This module requires the `mixture` feature.
+//! See docs/lora-router.md.
 
 use std::collections::VecDeque;
 

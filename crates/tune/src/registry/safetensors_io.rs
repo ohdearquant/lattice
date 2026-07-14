@@ -1,35 +1,9 @@
-//! Safe checkpoint serialization using safetensors format.
+//! Safetensors serialization for flat `f32` weight vectors.
 //!
-//! This module provides secure model weight serialization that prevents
-//! arbitrary code execution vulnerabilities found in formats like Python pickle.
+//! Parsing accepts data only and validates the safetensors container, but it
+//! does not replace registry identity or checksum verification.
 //!
-//! # Security Guarantees
-//!
-//! The safetensors format provides:
-//! - **No code execution**: Pure data format, cannot contain executable code
-//! - **Memory safety**: Zero-copy deserialization with bounds checking
-//! - **Integrity**: Header contains tensor shapes and data types
-//!
-//! # Format
-//!
-//! ```text
-//! [8 bytes: header size (little-endian u64)]
-//! [header: JSON metadata + tensor info]
-//! [tensor data: raw bytes, aligned]
-//! ```
-//!
-//! # Example
-//!
-//! ```ignore
-//! use lattice_tune::registry::safetensors_io::{save_weights, load_weights};
-//!
-//! // Save weights securely
-//! let weights: Vec<f32> = vec![0.1, 0.2, 0.3];
-//! let bytes = save_weights(&weights, "layer0.weights")?;
-//!
-//! // Load weights safely (validates format, no code execution)
-//! let loaded: Vec<f32> = load_weights(&bytes, "layer0.weights")?;
-//! ```
+//! See `docs/registry.md` for the format, tensor contract, and security boundary.
 
 use crate::error::{Result, TuneError};
 use safetensors::Dtype;
