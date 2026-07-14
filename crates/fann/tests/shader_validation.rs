@@ -121,8 +121,11 @@ fn test_sigmoid_shader_valid() {
     let shader = &rest[shader_start..shader_start + shader_end];
 
     validate_wgsl(shader).expect("SIGMOID_SHADER should be valid WGSL");
-    // Check for numerical stability clamping
-    check_shader_patterns(shader, &["@compute", "clamp", "exp"]);
+    check_shader_patterns(shader, &["@compute", "if (x >= 0.0)", "exp(-x)", "exp(x)"]);
+    assert!(
+        !shader.contains("clamp("),
+        "Sigmoid must preserve extreme inputs"
+    );
 }
 
 #[test]
@@ -135,7 +138,11 @@ fn test_tanh_shader_valid() {
     let shader = &rest[shader_start..shader_start + shader_end];
 
     validate_wgsl(shader).expect("TANH_SHADER should be valid WGSL");
-    check_shader_patterns(shader, &["@compute", "clamp", "tanh"]);
+    check_shader_patterns(shader, &["@compute", "tanh(data[idx])"]);
+    assert!(
+        !shader.contains("clamp("),
+        "Tanh must preserve extreme inputs"
+    );
 }
 
 // ============================================================================
@@ -143,19 +150,16 @@ fn test_tanh_shader_valid() {
 // ============================================================================
 
 #[test]
-fn test_shader_numerical_stability_patterns() {
+fn test_activation_shaders_preserve_extreme_inputs() {
     let source = include_str!("../src/gpu/shaders.rs");
 
-    // Sigmoid should clamp inputs to prevent exp() overflow
     assert!(
-        source.contains("clamp(data[idx], -10.0, 10.0)"),
-        "Sigmoid should clamp inputs for numerical stability"
+        source.contains("if (x >= 0.0)"),
+        "Sigmoid should use a sign-stable branch"
     );
-
-    // Tanh should clamp inputs
     assert!(
-        source.contains("clamp(data[idx], -5.0, 5.0)"),
-        "Tanh should clamp inputs for numerical stability"
+        source.contains("data[idx] = tanh(data[idx]);"),
+        "Tanh should evaluate the original input"
     );
 }
 

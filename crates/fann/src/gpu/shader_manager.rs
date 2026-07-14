@@ -240,7 +240,7 @@ mod tests {
                 .source()
                 .contains("@compute")
         );
-        assert!(ShaderType::Sigmoid.source().contains("clamp"));
+        assert!(ShaderType::Sigmoid.source().contains("if (x >= 0.0)"));
     }
 
     #[test]

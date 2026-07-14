@@ -11,12 +11,14 @@
 
 #![cfg(feature = "gpu")]
 
-use lattice_fann::gpu::{GpuContext, GpuNetwork, is_gpu_available};
+use lattice_fann::gpu::{GpuContext, GpuNetwork, is_gpu_available, should_use_gpu};
 use lattice_fann::{Activation, NetworkBuilder};
 use std::sync::Arc;
 
 /// Maximum acceptable difference between CPU and GPU outputs
 const TOLERANCE: f32 = 1e-4;
+const EXTREME_ACTIVATION_TOLERANCE: f32 = 1e-6;
+const GPU_ACTIVATION_WIDTH: usize = 100;
 
 /// Helper to skip tests if no GPU is available
 fn require_gpu() -> bool {
@@ -37,6 +39,10 @@ fn try_create_context() -> Option<Arc<GpuContext>> {
 
 /// Compare two slices within tolerance
 fn assert_outputs_close(cpu: &[f32], gpu: &[f32], test_name: &str) {
+    assert_outputs_close_with_tolerance(cpu, gpu, test_name, TOLERANCE);
+}
+
+fn assert_outputs_close_with_tolerance(cpu: &[f32], gpu: &[f32], test_name: &str, tolerance: f32) {
     assert_eq!(
         cpu.len(),
         gpu.len(),
@@ -48,10 +54,31 @@ fn assert_outputs_close(cpu: &[f32], gpu: &[f32], test_name: &str) {
     for (i, (c, g)) in cpu.iter().zip(gpu.iter()).enumerate() {
         let diff = (c - g).abs();
         assert!(
-            diff < TOLERANCE,
+            diff < tolerance,
             "{test_name}: index {i} mismatch - CPU: {c}, GPU: {g}, diff: {diff}"
         );
     }
+}
+
+fn identity_activation_network(activation: Activation) -> lattice_fann::Network {
+    let mut network = NetworkBuilder::new()
+        .input(GPU_ACTIVATION_WIDTH)
+        .output(GPU_ACTIVATION_WIDTH, activation)
+        .build_with_seed(0)
+        .unwrap();
+
+    let layer = network.layer_mut(0).unwrap();
+    layer.weights_mut().fill(0.0);
+    layer.biases_mut().fill(0.0);
+    for index in 0..GPU_ACTIVATION_WIDTH {
+        assert!(layer.set_weight(index, index, 1.0));
+    }
+
+    assert!(
+        should_use_gpu(network.total_params(), 1),
+        "extreme activation parity must exercise the GPU path"
+    );
+    network
 }
 
 // ============================================================================
@@ -257,69 +284,47 @@ fn test_parity_wide_network() {
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
 fn test_parity_sigmoid_activation() {
-    if !require_gpu() {
-        return;
-    }
-
-    let ctx = try_create_context().expect("GPU context");
-    let seed = 111;
-
-    let mut cpu_network = NetworkBuilder::new()
-        .input(4)
-        .hidden(8, Activation::Sigmoid)
-        .output(2, Activation::Linear)
-        .build_with_seed(seed)
-        .unwrap();
-
-    let gpu_cpu_network = NetworkBuilder::new()
-        .input(4)
-        .hidden(8, Activation::Sigmoid)
-        .output(2, Activation::Linear)
-        .build_with_seed(seed)
-        .unwrap();
+    let ctx = Arc::new(GpuContext::new_blocking().expect("gpu-tests requires a real GPU"));
+    let mut cpu_network = identity_activation_network(Activation::Sigmoid);
+    let gpu_cpu_network = cpu_network.clone();
 
     let mut gpu_network = GpuNetwork::new(ctx, gpu_cpu_network).unwrap();
-
-    let input = vec![0.5f32, -0.5, 1.0, -1.0];
+    let input: Vec<f32> = (0..GPU_ACTIVATION_WIDTH)
+        .map(|index| if index % 2 == 0 { -100.0 } else { 100.0 })
+        .collect();
 
     let cpu_output = cpu_network.forward(&input).unwrap().to_vec();
     let gpu_output = gpu_network.forward_sync(&input).unwrap();
 
-    assert_outputs_close(&cpu_output, &gpu_output, "sigmoid_activation");
+    assert_outputs_close_with_tolerance(
+        &cpu_output,
+        &gpu_output,
+        "sigmoid_activation_extremes",
+        EXTREME_ACTIVATION_TOLERANCE,
+    );
 }
 
 #[test]
 #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
 fn test_parity_tanh_activation() {
-    if !require_gpu() {
-        return;
-    }
-
-    let ctx = try_create_context().expect("GPU context");
-    let seed = 222;
-
-    let mut cpu_network = NetworkBuilder::new()
-        .input(4)
-        .hidden(8, Activation::Tanh)
-        .output(2, Activation::Linear)
-        .build_with_seed(seed)
-        .unwrap();
-
-    let gpu_cpu_network = NetworkBuilder::new()
-        .input(4)
-        .hidden(8, Activation::Tanh)
-        .output(2, Activation::Linear)
-        .build_with_seed(seed)
-        .unwrap();
+    let ctx = Arc::new(GpuContext::new_blocking().expect("gpu-tests requires a real GPU"));
+    let mut cpu_network = identity_activation_network(Activation::Tanh);
+    let gpu_cpu_network = cpu_network.clone();
 
     let mut gpu_network = GpuNetwork::new(ctx, gpu_cpu_network).unwrap();
-
-    let input = vec![0.3f32, -0.7, 0.9, -0.2];
+    let input: Vec<f32> = (0..GPU_ACTIVATION_WIDTH)
+        .map(|index| if index % 2 == 0 { -10.0 } else { 10.0 })
+        .collect();
 
     let cpu_output = cpu_network.forward(&input).unwrap().to_vec();
     let gpu_output = gpu_network.forward_sync(&input).unwrap();
 
-    assert_outputs_close(&cpu_output, &gpu_output, "tanh_activation");
+    assert_outputs_close_with_tolerance(
+        &cpu_output,
+        &gpu_output,
+        "tanh_activation_extremes",
+        EXTREME_ACTIVATION_TOLERANCE,
+    );
 }
 
 #[test]
