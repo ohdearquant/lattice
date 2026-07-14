@@ -11,17 +11,19 @@ cd lattice/
 
 This will:
 1. Run `swift build -c release` to produce the Swift instrument panel.
-2. Build all 6 Rust engine binaries with `cargo build --release`.
-3. Assemble `apps/macos/dist/LatticeStudio.app` with the engine binaries inside
+2. Build all 10 Rust engine binaries with `cargo build --release`: `quantize_q4`,
+   `quantize_quarot`, `lattice`, `qwen35_generate`, `train_grad_full`, `generate_lora`,
+   `eval_perplexity`, `embed`, `chat_metal`, and `lattice_serve`.
+3. Assemble `apps/macos/dist/Lattice.app` with the engine binaries inside
    `Contents/Resources/bin/` so the app is fully self-contained.
 4. Write `Contents/Info.plist` with bundle ID `ai.khive.lattice.studio`.
 5. Ad-hoc codesign the bundle.
-6. Produce `apps/macos/dist/LatticeStudio.dmg` and `LatticeStudio.zip`.
+6. Produce `apps/macos/dist/Lattice.dmg` and `Lattice.zip`.
 
 Options:
 
 ```bash
-# Skip Swift rebuild (use existing .build/release/LatticeStudio)
+# Skip Swift rebuild (use existing .build/release/Lattice)
 ./apps/macos/scripts/package-app.sh --skip-build
 
 # Skip Cargo rebuild (use existing target/release/ binaries)
@@ -33,7 +35,7 @@ Options:
 
 ## Installing
 
-Drag `LatticeStudio.app` from the DMG to `/Applications`.
+Drag `Lattice.app` from the DMG to `/Applications`.
 
 Requires macOS 14.0 (Sonoma) or later. The app is self-contained — no source
 checkout, no Cargo, no Rust toolchain needed on the recipient machine.
@@ -44,13 +46,13 @@ The app is ad-hoc signed, which means macOS Gatekeeper will quarantine it on
 first launch because it lacks a Developer ID certificate. Recipients must:
 
 **Option 1 — right-click → Open:**
-1. Right-click (or Ctrl-click) `LatticeStudio.app` in Finder.
+1. Right-click (or Ctrl-click) `Lattice.app` in Finder.
 2. Choose "Open" from the context menu.
 3. Click "Open" in the dialog. macOS remembers the exception.
 
 **Option 2 — remove the quarantine xattr:**
 ```bash
-xattr -dr com.apple.quarantine /Applications/LatticeStudio.app
+xattr -dr com.apple.quarantine /Applications/Lattice.app
 ```
 
 This is a one-time step. The app will open normally on subsequent launches.

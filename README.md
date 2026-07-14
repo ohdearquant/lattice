@@ -25,8 +25,8 @@ the `lattice` binary for interactive chat and an OpenAI-compatible HTTP server.
 
 **Lattice Studio: a native macOS app.** A SwiftUI instrument panel that drives the Rust engine
 via CLI subprocesses. Train LoRA adapters with a live loss oscilloscope, quantize models with
-a before/after comparison, hot-swap adapters in chat with zero reload, and manage your model
-library from a single window. To build and install it, follow the step-by-step guide in
+a before/after comparison, run multi-turn chat with persistent GPU model residency, and manage your
+model library from a single window. To build and install it, follow the step-by-step guide in
 [`apps/macos/INSTALL.md`](apps/macos/INSTALL.md).
 
 ---
@@ -40,8 +40,8 @@ library from a single window. To build and install it, follow the step-by-step g
 | Generation models      | Qwen3.5-0.8B / 2B via `lattice chat`/`serve`. Qwen3.6-27B via `lattice chat`/`serve` from a native Q4 checkpoint (requires the Metal GPU build, `--features "f16 metal-gpu"`); safetensors 27B is loader-level only. Qwen3.6-35B-A3B (MoE): config + weight loader support. Hybrid GatedDeltaNet + GQA architecture. |
 | Embedding models       | 9 models: BGE, E5, MiniLM, Qwen3-Embedding families. Auto-download for 7 BERT-family variants.                                                                                                                                                                                                                       |
 | Three tokenizers       | WordPiece, SentencePiece, BPE. No Hugging Face tokenizers C extension.                                                                                                                                                                                                                                               |
-| Quantization           | Q8, Q4, and QuaRot (rotation-based 4-bit). No other engine runs Q4 + LoRA hot-swap on Qwen3.5.                                                                                                                                                                                                                       |
-| LoRA                   | Inference hook, hot-swap with no reload, PEFT safetensors format, training via `lattice-tune`.                                                                                                                                                                                                                       |
+| Quantization           | Q8, Q4, and QuaRot (rotation-based 4-bit), including Q4 + LoRA inference on Qwen3.5.                                                                                                                                                                                                                                |
+| LoRA                   | Inference hooks, load-time adapter selection, PEFT safetensors format, training via `lattice-tune`.                                                                                                                                                                                                                  |
 | HTTP API               | OpenAI-compatible `/v1/chat/completions` via `lattice serve`.                                                                                                                                                                                                                                                        |
 | Safetensors native     | Memory-mapped weight loading. Single-file and sharded checkpoints.                                                                                                                                                                                                                                                   |
 | KV cache               | Incremental decoding with key-value caching.                                                                                                                                                                                                                                                                         |
@@ -98,7 +98,7 @@ provide for this model family:
 | Capability                          | Lattice | MLX | Ollama |
 | ----------------------------------- | ------- | --- | ------ |
 | QuaRot 4-bit (rotation-based quant) | yes     | no  | no     |
-| Q4 + LoRA hot-swap (no reload)      | yes     | no  | no     |
+| Q4 + LoRA inference                 | yes     | no  | no     |
 | Pure Rust, zero Python or framework | yes     | no  | no     |
 
 PPL benchmark (wikitext-2, from `docs/bench_results/perplexity.tsv`): Lattice q4 19.27, q4-QuaRot 19.95 (2048 tokens); MLX q8 15.82, q4 18.18 (2041 tokens). Reproduce:
@@ -327,7 +327,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 Lattice Studio is a native SwiftUI app for macOS 14+. It wraps the Rust engine in an
 instrument-panel interface: live loss curves, before/after quantization comparisons,
-LoRA hot-swap in chat, and a model library manager.
+multi-turn chat, and a model library manager.
 
 > New to the app? [`apps/macos/INSTALL.md`](apps/macos/INSTALL.md) is a step-by-step
 > install, get-a-model, and first-chat guide. The reference below covers building the
@@ -340,9 +340,9 @@ LoRA hot-swap in chat, and a model library manager.
 ./apps/macos/scripts/package-app.sh
 ```
 
-This builds the Swift frontend, compiles all Rust engine binaries in release mode, and
-assembles a self-contained `LatticeStudio.app` bundle at `apps/macos/dist/`. A `.dmg`
-and `.zip` are also produced. The packaged app needs no Rust toolchain on the recipient
+This builds the Swift frontend, compiles all ten Rust engine binaries in release mode, and
+assembles a self-contained `Lattice.app` bundle at `apps/macos/dist/`. `Lattice.dmg` and
+`Lattice.zip` are also produced. The packaged app needs no Rust toolchain on the recipient
 machine.
 
 ```bash
@@ -355,14 +355,14 @@ machine.
 
 ### Install
 
-Drag `LatticeStudio.app` from the `.dmg` to `/Applications`.
+Drag `Lattice.app` from the `.dmg` to `/Applications`.
 
 The app is ad-hoc signed. On first launch, right-click and choose "Open" to bypass
 Gatekeeper, then click "Open" in the dialog. macOS remembers the exception for subsequent
 launches. Alternatively:
 
 ```bash
-xattr -dr com.apple.quarantine /Applications/LatticeStudio.app
+xattr -dr com.apple.quarantine /Applications/Lattice.app
 ```
 
 ### What is in Lattice Studio
@@ -379,9 +379,10 @@ ticks digit-by-digit as the run progresses. Scrub the loss curve to freeze all m
 bits, and estimated PPL before and after. True-scale bars animate to show the compression
 ratio. A gate pill states the result: PASS, WARN, or FAIL.
 
-**Chat (cmd-4).** Side-by-side base vs. base+adapter columns streaming the same prompt in
-parallel. The adapter selector is a console fader: slide it and the engine swaps the adapter
-with no reload. A "0 ms reload" stamp confirms it. Each column shows live tok/s and time-to-first-token.
+**Chat (cmd-4).** A single streaming transcript replays completed turns into each prompt. The GPU
+path reuses a persistent `chat_metal --serve` process so the selected model stays resident between
+turns; the CPU path launches `generate_lora` once per turn. The shipped Chat screen does not yet
+expose adapter selection or parallel base-vs.-adapter comparison.
 
 **Data (cmd-5).** Paste raw text or load files. Preview the derived `{prompt, completion}` pairs
 as a JSONL table, validate token counts (using the same tokenizer the engine uses), and export

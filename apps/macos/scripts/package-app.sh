@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# package-app.sh — Build and package LatticeStudio.app + .dmg + .zip
+# package-app.sh — Build and package Lattice.app + .dmg + .zip
 #
 # Usage:
 #   ./scripts/package-app.sh [--out <dir>] [--skip-build] [--skip-cargo]
 #
 # Options:
 #   --out <dir>       Output directory (default: apps/macos/dist/)
-#   --skip-build      Skip `swift build -c release` (use existing .build/release/LatticeStudio)
+#   --skip-build      Skip `swift build -c release` (use existing .build/release/Lattice)
 #   --skip-cargo      Skip cargo builds (use existing target/release/ binaries)
 #
 # Idempotent: re-running overwrites dist/ cleanly.
 #
 # Signing: ad-hoc codesign only (no Developer ID required).
-# Recipients must right-click → Open, or: xattr -dr com.apple.quarantine LatticeStudio.app
+# Recipients must right-click → Open, or: xattr -dr com.apple.quarantine Lattice.app
 # See DISTRIBUTION.md for the Developer ID upgrade path.
 
 set -euo pipefail

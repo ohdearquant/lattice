@@ -38,13 +38,13 @@ installed, run:
 ./apps/macos/scripts/package-app.sh
 ```
 
-This compiles the Swift app and all engine binaries in release mode and assembles
-`apps/macos/dist/LatticeStudio.app`, along with a `.dmg` and a `.zip`. Any of these
+This compiles the Swift app and all ten engine binaries in release mode and assembles
+`apps/macos/dist/Lattice.app`, along with `Lattice.dmg` and `Lattice.zip`. Any of these
 can be copied to another Mac and will run there without a toolchain.
 
 ### Install a `.dmg` someone built
 
-If a developer hands you a `LatticeStudio.dmg` (or you built one with the command
+If a developer hands you a `Lattice.dmg` (or you built one with the command
 above), you do not need any developer tools to install it. Open the `.dmg` and go
 to step 2.
 
@@ -56,17 +56,17 @@ to step 2.
 
 ## 2. Install and open it
 
-1. Drag **LatticeStudio** from the `.dmg` into your **Applications** folder.
+1. Drag **Lattice** from the `.dmg` into your **Applications** folder.
 2. The app is signed with a free ad-hoc certificate, not a paid Apple Developer ID,
    so the first launch needs one extra step. **Right-click** (or Control-click)
-   **LatticeStudio** in Applications, choose **Open**, then click **Open** in the
+   **Lattice** in Applications, choose **Open**, then click **Open** in the
    dialog. macOS remembers this, so every launch after the first is a normal
    double-click.
 
    The terminal equivalent of that one-time step is:
 
    ```bash
-   xattr -dr com.apple.quarantine /Applications/LatticeStudio.app
+   xattr -dr com.apple.quarantine /Applications/Lattice.app
    ```
 
 ---
