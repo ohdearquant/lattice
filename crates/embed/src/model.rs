@@ -36,7 +36,6 @@ impl ModelProvenance {
             dt.to_rfc3339()
         };
 
-        // Create a lightweight hash from model metadata
         let hash_input = format!("{model_id}:{loaded_at_iso}:{model:?}");
         let hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
 

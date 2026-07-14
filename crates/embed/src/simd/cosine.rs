@@ -178,12 +178,10 @@ unsafe fn cosine_similarity_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
         nb3 = _mm512_fmadd_ps(b3, b3, nb3);
     }
 
-    // Combine accumulators
     let dot_vec = _mm512_add_ps(_mm512_add_ps(dot0, dot1), _mm512_add_ps(dot2, dot3));
     let na_vec = _mm512_add_ps(_mm512_add_ps(na0, na1), _mm512_add_ps(na2, na3));
     let nb_vec = _mm512_add_ps(_mm512_add_ps(nb0, nb1), _mm512_add_ps(nb2, nb3));
 
-    // Handle remainder with single-register AVX-512F loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -206,7 +204,6 @@ unsafe fn cosine_similarity_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
     let mut norm_a = horizontal_sum_avx512(na_vec) + horizontal_sum_avx512(na_remainder);
     let mut norm_b = horizontal_sum_avx512(nb_vec) + horizontal_sum_avx512(nb_remainder);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         let av = a[i];
@@ -290,7 +287,6 @@ unsafe fn cosine_similarity_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
         nb3 = _mm256_fmadd_ps(b3, b3, nb3);
     }
 
-    // Combine accumulators
     let dot_vec = _mm256_add_ps(_mm256_add_ps(dot0, dot1), _mm256_add_ps(dot2, dot3));
     let na_vec = _mm256_add_ps(_mm256_add_ps(na0, na1), _mm256_add_ps(na2, na3));
     let nb_vec = _mm256_add_ps(_mm256_add_ps(nb0, nb1), _mm256_add_ps(nb2, nb3));
@@ -299,7 +295,6 @@ unsafe fn cosine_similarity_avx2_unrolled(a: &[f32], b: &[f32]) -> f32 {
     let mut norm_a = horizontal_sum_avx2(na_vec);
     let mut norm_b = horizontal_sum_avx2(nb_vec);
 
-    // Handle remainder
     let remainder_start = chunks * CHUNK_SIZE;
     for i in remainder_start..n {
         let av = a[i];
@@ -379,7 +374,6 @@ unsafe fn cosine_similarity_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
         nb3 = vfmaq_f32(nb3, b3, b3);
     }
 
-    // Combine accumulators
     let dot_vec = vaddq_f32(vaddq_f32(dot0, dot1), vaddq_f32(dot2, dot3));
     let na_vec = vaddq_f32(vaddq_f32(na0, na1), vaddq_f32(na2, na3));
     let nb_vec = vaddq_f32(vaddq_f32(nb0, nb1), vaddq_f32(nb2, nb3));
@@ -388,7 +382,6 @@ unsafe fn cosine_similarity_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
     let mut norm_a = horizontal_sum_neon(na_vec);
     let mut norm_b = horizontal_sum_neon(nb_vec);
 
-    // Handle remainder
     let remainder_start = chunks * CHUNK_SIZE;
     for i in remainder_start..n {
         let av = a[i];
@@ -468,7 +461,6 @@ unsafe fn cosine_similarity_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
         nb3 = f32x4_add(nb3, f32x4_mul(b3, b3));
     }
 
-    // Combine accumulators
     let dot_vec = f32x4_add(f32x4_add(dot0, dot1), f32x4_add(dot2, dot3));
     let na_vec = f32x4_add(f32x4_add(na0, na1), f32x4_add(na2, na3));
     let nb_vec = f32x4_add(f32x4_add(nb0, nb1), f32x4_add(nb2, nb3));
@@ -477,7 +469,6 @@ unsafe fn cosine_similarity_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
     let mut norm_a = horizontal_sum_simd128(na_vec);
     let mut norm_b = horizontal_sum_simd128(nb_vec);
 
-    // Handle remainder
     let remainder_start = chunks * CHUNK_SIZE;
     for i in remainder_start..n {
         let av = a[i];

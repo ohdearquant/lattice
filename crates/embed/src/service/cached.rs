@@ -139,7 +139,6 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
         // Check cache for all texts — returns Arc<[f32]> refs (O(1) per hit)
         let cached = self.cache.get_many(&keys);
 
-        // Identify which texts need embedding
         let mut to_embed: Vec<(usize, &String)> = Vec::new();
         let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
 
@@ -179,7 +178,6 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
             )));
         }
 
-        // Store in cache and populate results
         let mut cache_entries = Vec::with_capacity(to_embed.len());
         for ((i, _), embedding) in to_embed.into_iter().zip(new_embeddings.into_iter()) {
             cache_entries.push((keys[i], embedding.clone()));
@@ -187,7 +185,6 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
         }
         self.cache.put_many(cache_entries);
 
-        // Return all results
         // SAFETY: All slots are guaranteed to be Some at this point:
         // - Cached items were assigned via results[i] = Some(arc.to_vec())
         // - Non-cached items were assigned via results[i] = Some(embedding) in the loop above
