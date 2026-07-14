@@ -16,7 +16,6 @@ use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
 
-// Re-exports
 #[cfg(feature = "native")]
 pub use cached::CachedEmbeddingService;
 #[cfg(feature = "native")]

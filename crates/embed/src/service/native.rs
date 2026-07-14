@@ -17,7 +17,7 @@ enum LoadedModel {
     Qwen(Arc<QwenModel>),
 }
 
-// Wrapped model types provide the required thread-safety — see docs/service.md.
+// Wrapped model types provide the required thread safety.
 
 impl LoadedModel {
     fn encode_batch(&self, texts: &[&str]) -> std::result::Result<Vec<Vec<f32>>, String> {
@@ -152,7 +152,6 @@ impl NativeEmbeddingService {
     ///
     /// See [`docs/service.md`](../../docs/service.md#nativeembeddingservice-implementation-notes) for the cancellation invariant.
     async fn ensure_model(&self) -> Result<&LoadedModel> {
-        // Fast path: already loaded.
         if let Some(result) = self.model.get() {
             return result
                 .as_ref()
@@ -202,8 +201,7 @@ fn load_model_sync(model_config: ModelConfig) -> std::result::Result<LoadedModel
             };
             info!(model = model_name, "loading native BERT embedding model");
             let mut bert = BertModel::from_pretrained(model_name).map_err(|e| e.to_string())?;
-            // Route each model family through its correct pooling strategy.
-            // BGE uses CLS pooling; E5 and MiniLM use mean pooling.
+            // Pooling depends on the model family.
             if let Some(pooling) = model_config.model.bert_pooling() {
                 bert.set_pooling(pooling);
             }
@@ -256,7 +254,6 @@ fn embedding_cache_path(model: &str, dim: usize) -> std::path::PathBuf {
 
 /// Locate Qwen3-Embedding model directory for the given model variant.
 fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
-    // Check env override first — applies to whichever Qwen model is loaded.
     if let Ok(dir) = std::env::var("LATTICE_QWEN_MODEL_DIR") {
         return Ok(std::path::PathBuf::from(dir));
     }

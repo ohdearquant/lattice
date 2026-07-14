@@ -30,15 +30,11 @@ pub fn normalize(vector: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
     {
         if config.avx512f_enabled {
-            // SAFETY: Runtime feature detection verified AVX-512F. The mutable
-            // slice is valid for the call lifetime; the callee uses unaligned
-            // loads/stores and chunk/remainder bounds that stay inside the slice.
+            // SAFETY: AVX-512F was detected; bounded unaligned accesses stay in the slice.
             return unsafe { normalize_avx512_unrolled(vector) };
         }
         if config.avx2_enabled && config.fma_enabled {
-            // SAFETY: Runtime feature detection verified AVX2+FMA. The mutable
-            // slice is valid for the call lifetime; the callee uses unaligned
-            // loads/stores and chunk/remainder bounds that stay inside the slice.
+            // SAFETY: AVX2+FMA were detected; bounded unaligned accesses stay in the slice.
             return unsafe { normalize_avx2_unrolled(vector) };
         }
     }
@@ -46,9 +42,7 @@ pub fn normalize(vector: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     {
         if config.neon_enabled {
-            // SAFETY: NEON is available on aarch64. The mutable slice is valid
-            // for the call lifetime; the callee uses unaligned loads/stores and
-            // bounded chunk/remainder loops that stay inside the slice.
+            // SAFETY: AArch64 guarantees NEON; bounded unaligned accesses stay in the slice.
             return unsafe { normalize_neon_unrolled(vector) };
         }
     }
@@ -56,10 +50,7 @@ pub fn normalize(vector: &mut [f32]) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
         if config.simd128_enabled() {
-            // SAFETY: compiled with wasm32 simd128 (compile-time gate, see
-            // `SimdConfig::simd128_enabled`). The mutable slice is valid for
-            // the call lifetime; the callee uses alignment-free loads/stores
-            // and bounded chunk/remainder loops that stay inside the slice.
+            // SAFETY: This target was compiled with SIMD128; bounded accesses stay in the slice.
             return unsafe { normalize_simd128_unrolled(vector) };
         }
     }
@@ -94,7 +85,6 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
 
-    // First pass: compute L2 norm with 4 accumulators
     let mut norm0 = _mm512_setzero_ps();
     let mut norm1 = _mm512_setzero_ps();
     let mut norm2 = _mm512_setzero_ps();
@@ -118,7 +108,6 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
 
     let norm_vec = _mm512_add_ps(_mm512_add_ps(norm0, norm1), _mm512_add_ps(norm2, norm3));
 
-    // Remainder for norm calculation with single-register AVX-512F loop
     let mut norm_remainder = _mm512_setzero_ps();
     for i in 0..remaining_chunks {
         let offset = main_processed + i * SIMD_WIDTH;
@@ -128,16 +117,12 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
 
     let mut norm_sq = horizontal_sum_avx512(norm_vec) + horizontal_sum_avx512(norm_remainder);
 
-    // Scalar tail for norm (recomputed inline to avoid cross-pass variable dependency)
     for i in (main_processed + remaining_chunks * SIMD_WIDTH)..n {
         norm_sq += vector[i] * vector[i];
     }
 
     let norm = norm_sq.sqrt();
-    // Match `normalize_scalar`, which only scales when `norm > 0.0`. Rejecting
-    // NaN here too (a NaN element makes `norm` NaN) leaves the vector
-    // byte-identical to the scalar path instead of scaling by a NaN inv_norm.
-    // `is_nan() || <= 0.0` is the lint-clean equivalent of `!(norm > 0.0)`.
+    // Preserve scalar behavior: leave zero- and NaN-norm vectors unchanged.
     if norm.is_nan() || norm <= 0.0 {
         return;
     }
@@ -145,7 +130,6 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
     let inv_norm = 1.0 / norm;
     let inv_norm_vec = _mm512_set1_ps(inv_norm);
 
-    // Second pass: scale by inverse norm with 4x unrolling
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
@@ -174,7 +158,6 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
         );
     }
 
-    // Remainder for scaling with single-register AVX-512F loop
     for i in 0..remaining_chunks {
         let offset = main_processed + i * SIMD_WIDTH;
         let v = _mm512_loadu_ps(vector.as_ptr().add(offset));
@@ -184,7 +167,6 @@ unsafe fn normalize_avx512_unrolled(vector: &mut [f32]) {
         );
     }
 
-    // Final scalar remainder (recomputed inline to avoid cross-pass variable dependency)
     for i in (main_processed + remaining_chunks * SIMD_WIDTH)..n {
         vector[i] *= inv_norm;
     }
@@ -204,7 +186,6 @@ unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
     let n = vector.len();
     let chunks = n / CHUNK_SIZE;
 
-    // First pass: compute L2 norm with 4 accumulators
     let mut norm0 = _mm256_setzero_ps();
     let mut norm1 = _mm256_setzero_ps();
     let mut norm2 = _mm256_setzero_ps();
@@ -229,15 +210,12 @@ unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
     let norm_vec = _mm256_add_ps(_mm256_add_ps(norm0, norm1), _mm256_add_ps(norm2, norm3));
     let mut norm_sq = horizontal_sum_avx2(norm_vec);
 
-    // Remainder for norm calculation
     for i in (chunks * CHUNK_SIZE)..n {
         norm_sq += vector[i] * vector[i];
     }
 
     let norm = norm_sq.sqrt();
-    // Match `normalize_scalar`: reject 0.0 and NaN alike so a NaN-containing
-    // vector is left unchanged rather than scaled by NaN. `is_nan() || <= 0.0`
-    // is the lint-clean equivalent of `!(norm > 0.0)`.
+    // Preserve scalar behavior: leave zero- and NaN-norm vectors unchanged.
     if norm.is_nan() || norm <= 0.0 {
         return;
     }
@@ -245,7 +223,6 @@ unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
     let inv_norm = 1.0 / norm;
     let inv_norm_vec = _mm256_set1_ps(inv_norm);
 
-    // Second pass: divide by norm with 4x unrolling
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
@@ -274,7 +251,6 @@ unsafe fn normalize_avx2_unrolled(vector: &mut [f32]) {
         );
     }
 
-    // Remainder for scaling
     for i in (chunks * CHUNK_SIZE)..n {
         vector[i] *= inv_norm;
     }
@@ -294,7 +270,6 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
     let n = vector.len();
     let chunks = n / CHUNK_SIZE;
 
-    // First pass: compute L2 norm with 4 accumulators
     let mut norm0 = vdupq_n_f32(0.0);
     let mut norm1 = vdupq_n_f32(0.0);
     let mut norm2 = vdupq_n_f32(0.0);
@@ -323,34 +298,24 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
         norm_sq += val * val;
     }
 
-    // Match `normalize_scalar`: reject 0.0 and NaN alike. A subnormal-but-positive
-    // norm_sq still passes here and is handled by the finite-fallback below; only
-    // zero/NaN short-circuit to leave the vector unchanged, keeping NEON
-    // byte-consistent with the scalar path. `is_nan() || <= 0.0` is the lint-clean
-    // equivalent of `!(norm_sq > 0.0)`.
+    // Preserve scalar behavior; positive subnormals use the finite fallback below.
     if norm_sq.is_nan() || norm_sq <= 0.0 {
         return;
     }
 
-    // vrsqrteq_f32 gives ~8-bit estimate; two Newton–Raphson steps reach full f32
-    // precision (~23 bits), eliminating any residual above the 1e-5 accuracy gate.
-    // vrsqrtsq_f32(a, b) = (3 - a*b) / 2  →  y' = y * vrsqrtsq_f32(x, y*y)
+    // Two Newton-Raphson refinements bring the reciprocal-square-root to f32 precision.
     let norm_sq_v = vdupq_n_f32(norm_sq);
     let y0 = vrsqrteq_f32(norm_sq_v);
     let y1 = vmulq_f32(y0, vrsqrtsq_f32(norm_sq_v, vmulq_f32(y0, y0)));
     let y2 = vmulq_f32(y1, vrsqrtsq_f32(norm_sq_v, vmulq_f32(y1, y1)));
-    // SAFETY: y2 has 4 identical lanes (norm_sq_v is a broadcast), so lane 0 is the
-    // scalar inv_norm used for both the NEON broadcast and the 1-3 element tail.
+    // SAFETY: A broadcast input yields identical lanes; lane 0 also scales the tail.
     let mut inv_norm = vgetq_lane_f32(y2, 0);
-    // vrsqrte/Newton overflow to inf for a subnormal-but-nonzero norm_sq (‖v‖ ≲ 7e-20),
-    // where the AVX2/scalar lanes stay finite via 1.0/sqrt; fall back to keep NEON
-    // byte-consistent with them rather than scaling the vector to inf/NaN.
+    // Subnormal norms can overflow the estimate; use the scalar reciprocal square root.
     if !inv_norm.is_finite() {
         inv_norm = 1.0 / norm_sq.sqrt();
     }
     let inv_norm_vec = vdupq_n_f32(inv_norm);
 
-    // Second pass: scale by inverse norm with 4x unrolling
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
@@ -376,7 +341,6 @@ unsafe fn normalize_neon_unrolled(vector: &mut [f32]) {
         );
     }
 
-    // Remainder for scaling
     for val in vector.iter_mut().skip(chunks * CHUNK_SIZE) {
         *val *= inv_norm;
     }
@@ -396,7 +360,6 @@ unsafe fn normalize_simd128_unrolled(vector: &mut [f32]) {
     let n = vector.len();
     let chunks = n / CHUNK_SIZE;
 
-    // First pass: compute L2 norm with 4 accumulators
     let mut norm0 = f32x4_splat(0.0);
     let mut norm1 = f32x4_splat(0.0);
     let mut norm2 = f32x4_splat(0.0);
@@ -421,15 +384,12 @@ unsafe fn normalize_simd128_unrolled(vector: &mut [f32]) {
     let norm_vec = f32x4_add(f32x4_add(norm0, norm1), f32x4_add(norm2, norm3));
     let mut norm_sq = horizontal_sum_simd128(norm_vec);
 
-    // Remainder for norm calculation
     for i in (chunks * CHUNK_SIZE)..n {
         norm_sq += vector[i] * vector[i];
     }
 
     let norm = norm_sq.sqrt();
-    // Match `normalize_scalar`: reject 0.0 and NaN alike so a NaN-containing
-    // vector is left unchanged rather than scaled by NaN. `is_nan() || <= 0.0`
-    // is the lint-clean equivalent of `!(norm > 0.0)`.
+    // Preserve scalar behavior: leave zero- and NaN-norm vectors unchanged.
     if norm.is_nan() || norm <= 0.0 {
         return;
     }
@@ -437,7 +397,6 @@ unsafe fn normalize_simd128_unrolled(vector: &mut [f32]) {
     let inv_norm = 1.0 / norm;
     let inv_norm_vec = f32x4_splat(inv_norm);
 
-    // Second pass: divide by norm with 4x unrolling
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
@@ -466,7 +425,6 @@ unsafe fn normalize_simd128_unrolled(vector: &mut [f32]) {
         );
     }
 
-    // Remainder for scaling
     for i in (chunks * CHUNK_SIZE)..n {
         vector[i] *= inv_norm;
     }

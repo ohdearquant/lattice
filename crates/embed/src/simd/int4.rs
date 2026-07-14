@@ -34,7 +34,6 @@ impl Int4Params {
             }
         }
 
-        // Epsilon guard: avoid division by near-zero
         let scale = if max_abs > 1e-10 {
             15.0 / (2.0 * max_abs)
         } else {
@@ -70,7 +69,6 @@ impl Int4Vector {
         let params = Int4Params::from_vector(vector);
         let dims = vector.len();
 
-        // Compute L2 norm
         let mut norm_sq = 0.0f32;
         for &v in vector {
             if v.is_finite() {
@@ -79,23 +77,19 @@ impl Int4Vector {
         }
         let norm = norm_sq.sqrt();
 
-        // Quantize each value to [0, 15] and pack pairs into bytes
         let packed_len = dims.div_ceil(2);
         let mut data = vec![0u8; packed_len];
 
         for (i, &elem) in vector[..dims].iter().enumerate() {
             let v = if elem.is_finite() { elem } else { 0.0 };
-            // Map [-max_abs, max_abs] -> [0, 15]
             let q = ((v + params.max_abs) * params.scale)
                 .round()
                 .clamp(0.0, 15.0) as u8;
 
             let byte_idx = i / 2;
             if i % 2 == 0 {
-                // Even index -> high nibble
                 data[byte_idx] |= q << 4;
             } else {
-                // Odd index -> low nibble
                 data[byte_idx] |= q;
             }
         }
@@ -183,9 +177,7 @@ pub fn dot_product_int4(a: &Int4Vector, b: &Int4Vector) -> f32 {
     {
         let config = simd_config();
         if config.neon_enabled {
-            // SAFETY: aarch64 NEON is available by config, the packed data length guard
-            // above prevents out-of-bounds loads, and the callee handles odd dimensions
-            // without reading the padding nibble as a real dimension.
+            // SAFETY: AArch64 NEON and checked packed lengths keep loads in bounds.
             let (raw_dot, sum_a, sum_b) =
                 unsafe { dot_product_int4_neon_unrolled(&a.data, &b.data, a.dims) };
             return finish_int4_dot(raw_dot, sum_a, sum_b, a, b);
@@ -253,9 +245,7 @@ unsafe fn dot_product_int4_neon_unrolled(a: &[u8], b: &[u8], dims: usize) -> (i3
     const UNROLL: usize = 4;
     const CHUNK_BYTES: usize = BLOCK_BYTES * UNROLL;
 
-    // Only bytes containing two valid dimensions are processed in SIMD.
-    // If dims is odd, the final high nibble is handled separately and the low
-    // padding nibble is ignored to preserve current to_f32 semantics.
+    // Process odd final nibbles separately so padding never contributes.
     let full_bytes = dims / 2;
     let chunks = full_bytes / CHUNK_BYTES;
 
@@ -365,8 +355,6 @@ mod tests {
 
         assert_eq!(dequantized.len(), original.len());
 
-        // INT4 has only 16 levels, so error is larger than INT8.
-        // Max error should be within 1/15 of the range.
         let max_abs = original
             .iter()
             .filter(|v| v.is_finite())
@@ -385,23 +373,19 @@ mod tests {
 
     #[test]
     fn test_int4_packing_correctness() {
-        // Verify nibble packing: even index -> high nibble, odd -> low
         let v = vec![0.5, -0.5, 0.0, 1.0]; // 4 values -> 2 packed bytes
         let q = Int4Vector::from_f32(&v);
         assert_eq!(q.data.len(), 2);
         assert_eq!(q.dims, 4);
 
-        // Verify roundtrip preserves approximate values
         let deq = q.to_f32();
         assert_eq!(deq.len(), 4);
-        // 0.5 should map to roughly the right region
         assert!((deq[0] - 0.5).abs() < 0.15, "deq[0]={}", deq[0]);
         assert!((deq[1] - (-0.5)).abs() < 0.15, "deq[1]={}", deq[1]);
     }
 
     #[test]
     fn test_int4_odd_dimensions() {
-        // Odd number of dimensions: last nibble has a padding zero
         let v = generate_vector(383, 77);
         let q = Int4Vector::from_f32(&v);
         assert_eq!(q.data.len(), 192); // ceil(383/2) = 192
@@ -426,9 +410,7 @@ mod tests {
 
     #[test]
     fn test_int4_dot_product_vs_f32() {
-        // Use correlated vectors so the true dot product is large relative to noise.
-        // For uncorrelated random vectors, the expected dot product is ~0 while
-        // quantization noise is O(dims * step^2), so relative error is unbounded.
+        // Correlated vectors avoid unbounded relative error near a zero dot product.
         let a = generate_vector(384, 101);
         let b: Vec<f32> = a
             .iter()
@@ -436,15 +418,12 @@ mod tests {
             .map(|(i, &x)| x + 0.2 * (i as f32 * 0.3).sin())
             .collect();
 
-        // f32 reference
         let f32_dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
 
         let qa = Int4Vector::from_f32(&a);
         let qb = Int4Vector::from_f32(&b);
         let int4_dot = qa.dot_product(&qb);
 
-        // INT4 has 16 levels; for correlated vectors the relative error should be
-        // within ~15% (quantization step = 2*max_abs/15 per component).
         let rel_error = (f32_dot - int4_dot).abs() / f32_dot.abs().max(1.0);
         assert!(
             rel_error < 0.15,
@@ -455,10 +434,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_packed_scalar_matches_neon_exact() {
-        // Directly compare dot_product_int4_packed_scalar against
-        // dot_product_int4_neon_unrolled on integer tuples. Both return
-        // (raw_dot, sum_a, sum_b) as i32 — integer domain, exact equality expected.
-        // This is the executing parity proof for the non-aarch64 fallback kernel.
+        // Integer-domain parity is exact for packed scalar and NEON paths.
         for dim in [1usize, 3, 31, 127, 383, 384] {
             let a_f32 = generate_vector(dim, 500 + dim as u64);
             let b_f32 = generate_vector(dim, 600 + dim as u64);
@@ -466,8 +442,7 @@ mod tests {
             let qb = Int4Vector::from_f32(&b_f32);
 
             let scalar_result = dot_product_int4_packed_scalar(&qa.data, &qb.data, dim);
-            // SAFETY: aarch64 always has NEON; data slices are correctly sized by
-            // Int4Vector::from_f32 (len = dims.div_ceil(2)).
+            // SAFETY: AArch64 guarantees NEON and `from_f32` sizes packed slices.
             let neon_result = unsafe { dot_product_int4_neon_unrolled(&qa.data, &qb.data, dim) };
 
             assert_eq!(
@@ -507,7 +482,6 @@ mod tests {
         let qb = Int4Vector::from_f32(&b);
         let int4_cos = qa.cosine_similarity(&qb);
 
-        // Compute f32 reference cosine
         let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
         let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -524,8 +498,6 @@ mod tests {
         let v = generate_vector(384, 999);
         let q = Int4Vector::from_f32(&v);
 
-        // f32: 384 * 4 = 1536 bytes
-        // INT4: ceil(384/2) = 192 bytes = 8x compression
         assert_eq!(q.data.len(), 192);
         assert_eq!(v.len() * 4, 1536);
     }
@@ -545,19 +517,13 @@ mod tests {
         let q = Int4Vector::from_f32(&v);
         let deq = q.to_f32();
         assert_eq!(deq.len(), 8);
-        // NaN and Inf should be treated as 0
-        // The dequantized value for the "0" slot should be near -max_abs + something,
-        // but the key invariant is no panics and finite output.
         for &val in &deq {
             assert!(val.is_finite(), "Dequantized value should be finite");
         }
     }
 
-    // --- Issue #211 regression tests -------------------------------------------------
-
     #[test]
     fn test_int4_to_f32_short_data_returns_empty() {
-        // dims=128 requires 64 bytes; supply only 4.
         let q = Int4Vector {
             dims: 128,
             data: vec![0xFFu8; 4],
@@ -576,7 +542,6 @@ mod tests {
 
     #[test]
     fn test_int4_to_f32_exact_length_works() {
-        // Exactly the right number of bytes — must succeed and not index OOB.
         let v: Vec<f32> = (0..128).map(|i| (i as f32) / 64.0 - 1.0).collect();
         let q = Int4Vector::from_f32(&v);
         let deq = q.to_f32();

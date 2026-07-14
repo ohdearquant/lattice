@@ -60,10 +60,6 @@ fn resolve_dot_product_kernel() -> DotKernel {
     dot_product_scalar
 }
 
-// ---------------------------------------------------------------------------
-// Batch-4 dot product kernel (query vs. 4 candidates simultaneously)
-// ---------------------------------------------------------------------------
-
 /// SIMD kernel type for batch-4 f32 dot product.
 ///
 /// Signature: (query, c0, c1, c2, c3) → [dot(q,c0), dot(q,c1), dot(q,c2), dot(q,c3)].
@@ -177,9 +173,7 @@ fn dot_product_neon_kernel(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[inline]
 fn dot_product_simd128_kernel(a: &[f32], b: &[f32]) -> f32 {
-    // SAFETY: only stored in DOT_PRODUCT_KERNEL when compiled with the wasm32
-    // `simd128` target feature (the `#[cfg(target_feature = "simd128")]` gate
-    // above is compile-time, not runtime -- see `SimdConfig::simd128_enabled`).
+    // SAFETY: Stored only when the wasm32 `simd128` target feature is compiled in.
     unsafe { dot_product_simd128_unrolled(a, b) }
 }
 
@@ -188,7 +182,7 @@ fn dot_product_simd128_kernel(a: &[f32], b: &[f32]) -> f32 {
 /// See [`docs/simd.md`](../../docs/simd.md#public-api-contracts) for ANN and normalization semantics.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
-    // Runtime length check to prevent UB in release builds
+    // Reject mismatched slices before raw-pointer loads.
     if a.len() != b.len() {
         return 0.0;
     }
@@ -218,7 +212,6 @@ unsafe fn dot_product_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(n, b.len());
     let chunks = n / CHUNK_SIZE;
 
-    // 4 independent accumulators to break dependency chains
     let mut sum0 = _mm512_setzero_ps();
     let mut sum1 = _mm512_setzero_ps();
     let mut sum2 = _mm512_setzero_ps();
@@ -244,14 +237,12 @@ unsafe fn dot_product_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
         sum3 = _mm512_fmadd_ps(a3, b3, sum3);
     }
 
-    // Combine accumulators (dependencies are introduced only once at the end)
     let sum01 = _mm512_add_ps(sum0, sum1);
     let sum23 = _mm512_add_ps(sum2, sum3);
     let sum_vec = _mm512_add_ps(sum01, sum23);
 
     let main_sum = horizontal_sum_avx512(sum_vec);
 
-    // Handle remainder with single-register loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -266,7 +257,6 @@ unsafe fn dot_product_avx512_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     let mut total = main_sum + horizontal_sum_avx512(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         total += a[i] * b[i];
@@ -302,7 +292,6 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(n, b.len());
     let chunks = n / CHUNK_SIZE;
 
-    // 8 independent accumulators to break dependency chains
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
     let mut sum2 = _mm256_setzero_ps();
@@ -348,7 +337,6 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
         sum7 = _mm256_fmadd_ps(a7, b7, sum7);
     }
 
-    // Combine accumulators pairwise to reduce dependency chain depth
     let sum01 = _mm256_add_ps(sum0, sum1);
     let sum23 = _mm256_add_ps(sum2, sum3);
     let sum45 = _mm256_add_ps(sum4, sum5);
@@ -359,7 +347,6 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
 
     let sum = horizontal_sum_avx2(sum_vec);
 
-    // Handle remainder with single-vector loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -374,7 +361,6 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
 
     let mut total = sum + horizontal_sum_avx2(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         total += a[i] * b[i];
@@ -392,7 +378,6 @@ unsafe fn dot_product_avx2_8acc(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_384_avx2(a: &[f32], b: &[f32]) -> f32 {
     const SIMD_WIDTH: usize = 8;
-    // 384 / 8 = 48 iterations, processed as 6 groups of 8 for accumulator reuse
     const UNROLL: usize = 8;
     const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL; // 64 floats per iteration
     const CHUNKS: usize = 384 / CHUNK_SIZE; // 6 full chunks
@@ -402,7 +387,6 @@ unsafe fn dot_product_384_avx2(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(b.len(), 384);
     debug_assert_eq!(CHUNKS * CHUNK_SIZE + TAIL_ITERS * SIMD_WIDTH, 384);
 
-    // 8 independent accumulators
     let mut sum0 = _mm256_setzero_ps();
     let mut sum1 = _mm256_setzero_ps();
     let mut sum2 = _mm256_setzero_ps();
@@ -412,7 +396,6 @@ unsafe fn dot_product_384_avx2(a: &[f32], b: &[f32]) -> f32 {
     let mut sum6 = _mm256_setzero_ps();
     let mut sum7 = _mm256_setzero_ps();
 
-    // 6 full chunks of 64 elements = 384 elements total
     for i in 0..CHUNKS {
         let base = i * CHUNK_SIZE;
 
@@ -449,7 +432,6 @@ unsafe fn dot_product_384_avx2(a: &[f32], b: &[f32]) -> f32 {
         sum7 = _mm256_fmadd_ps(a7, b7, sum7);
     }
 
-    // Combine accumulators pairwise
     let sum01 = _mm256_add_ps(sum0, sum1);
     let sum23 = _mm256_add_ps(sum2, sum3);
     let sum45 = _mm256_add_ps(sum4, sum5);
@@ -470,12 +452,10 @@ unsafe fn dot_product_384_avx2(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "avx2")]
 #[inline]
 pub(crate) unsafe fn horizontal_sum_avx2(v: __m256) -> f32 {
-    // Sum high and low 128-bit lanes
     let high = _mm256_extractf128_ps(v, 1);
     let low = _mm256_castps256_ps128(v);
     let sum128 = _mm_add_ps(high, low);
 
-    // Horizontal add within 128-bit
     let shuf = _mm_movehdup_ps(sum128); // [1,1,3,3]
     let sums = _mm_add_ps(sum128, shuf); // [0+1,1+1,2+3,3+3]
     let shuf2 = _mm_movehl_ps(sums, sums); // [2+3,3+3,2+3,3+3]
@@ -635,7 +615,6 @@ unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(n, b.len());
     let chunks = n / CHUNK_SIZE;
 
-    // 4 independent accumulators
     let mut sum0 = vdupq_n_f32(0.0);
     let mut sum1 = vdupq_n_f32(0.0);
     let mut sum2 = vdupq_n_f32(0.0);
@@ -661,14 +640,12 @@ unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
         sum3 = vfmaq_f32(sum3, a3, b3);
     }
 
-    // Combine accumulators
     let sum01 = vaddq_f32(sum0, sum1);
     let sum23 = vaddq_f32(sum2, sum3);
     let sum_vec = vaddq_f32(sum01, sum23);
 
     let mut sum = horizontal_sum_neon(sum_vec);
 
-    // Handle remainder with single-vector loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -683,7 +660,6 @@ unsafe fn dot_product_neon_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     sum += horizontal_sum_neon(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         sum += a[i] * b[i];
@@ -719,7 +695,6 @@ unsafe fn dot_product_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(n, b.len());
     let chunks = n / CHUNK_SIZE;
 
-    // 4 independent accumulators to break dependency chains
     let mut sum0 = f32x4_splat(0.0);
     let mut sum1 = f32x4_splat(0.0);
     let mut sum2 = f32x4_splat(0.0);
@@ -745,14 +720,12 @@ unsafe fn dot_product_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
         sum3 = f32x4_add(sum3, f32x4_mul(a3, b3));
     }
 
-    // Combine accumulators (dependencies are introduced only once at the end)
     let sum01 = f32x4_add(sum0, sum1);
     let sum23 = f32x4_add(sum2, sum3);
     let sum_vec = f32x4_add(sum01, sum23);
 
     let mut total = horizontal_sum_simd128(sum_vec);
 
-    // Handle remainder with single-vector loop
     let main_processed = chunks * CHUNK_SIZE;
     let remaining = n - main_processed;
     let remaining_chunks = remaining / SIMD_WIDTH;
@@ -767,7 +740,6 @@ unsafe fn dot_product_simd128_unrolled(a: &[f32], b: &[f32]) -> f32 {
 
     total += horizontal_sum_simd128(remainder_sum);
 
-    // Final scalar remainder
     let scalar_start = main_processed + remaining_chunks * SIMD_WIDTH;
     for i in scalar_start..n {
         total += a[i] * b[i];

@@ -497,21 +497,17 @@ pub fn approximate_cosine_distance(query_f32: &[f32], stored: &QuantizedData) ->
     );
     match stored {
         QuantizedData::Full(v) => {
-            // Exact cosine distance
             1.0 - cosine_similarity(query_f32, v)
         }
         QuantizedData::Int8(q) => {
-            // Quantize query to INT8, compute via INT8 path
             let query_q = QuantizedVector::from_f32(query_f32);
             1.0 - q.cosine_similarity(&query_q)
         }
         QuantizedData::Int4(q) => {
-            // Quantize query to INT4, compute via INT4 path
             let query_q = Int4Vector::from_f32(query_f32);
             q.cosine_distance(&query_q)
         }
         QuantizedData::Binary(q) => {
-            // Quantize query to binary, compute Hamming-based approx
             let query_q = BinaryVector::from_f32(query_f32);
             q.cosine_distance_approx(&query_q)
         }
@@ -531,7 +527,6 @@ pub fn approximate_dot_product(query_f32: &[f32], stored: &QuantizedData) -> f32
             q.dot_product(&query_q)
         }
         QuantizedData::Binary(_q) => {
-            // Binary doesn't have a meaningful dot product; fall back to dequantize
             let stored_f32 = _q.to_f32();
             dot_product(query_f32, &stored_f32)
         }
@@ -618,7 +613,6 @@ mod tests {
             assert_eq!(data.tier(), tier, "tier mismatch for {tier:?}");
             assert_eq!(data.dims(), 384, "dims mismatch for {tier:?}");
 
-            // Verify storage bytes match expected
             let expected_bytes = tier.storage_bytes(384);
             assert_eq!(
                 data.storage_bytes(),
@@ -630,15 +624,12 @@ mod tests {
 
     #[test]
     fn test_approximate_cosine_distance_ordering() {
-        // Vectors a and b should be "closer" than a and c.
         let a = generate_vector(384, 1);
-        // b = a + small noise
         let b: Vec<f32> = a
             .iter()
             .enumerate()
             .map(|(i, &x)| x + 0.05 * (i as f32 * 0.3).sin())
             .collect();
-        // c = random, uncorrelated
         let c = generate_vector(384, 999);
 
         for tier in [
@@ -653,7 +644,6 @@ mod tests {
             let dist_ab = approximate_cosine_distance(&a, &stored_b);
             let dist_ac = approximate_cosine_distance(&a, &stored_c);
 
-            // a should be closer to b than to c at all tiers
             assert!(
                 dist_ab < dist_ac,
                 "{tier:?}: dist(a,b)={dist_ab} should be < dist(a,c)={dist_ac}"
@@ -666,7 +656,6 @@ mod tests {
         let v = generate_vector(384, 42);
         let binary = QuantizedData::from_f32(&v, QuantizationTier::Binary);
 
-        // Promote Binary -> Int4 -> Int8 -> Full
         let int4 = binary.promote(QuantizationTier::Int4);
         assert_eq!(int4.tier(), QuantizationTier::Int4);
 
@@ -730,10 +719,6 @@ mod tests {
 
     #[test]
     fn test_int4_batch_prepared_api_dispatch_parity() {
-        // Verify that approximate_int4_batch_prepared produces the same cosine distance
-        // as approximate_cosine_distance_prepared for each candidate. On aarch64 both
-        // sides dispatch to NEON; on other targets both use the packed scalar fallback.
-        // For direct scalar-vs-NEON integer parity, see int4::tests::test_packed_scalar_matches_neon_exact.
         for dim in [1usize, 3, 31, 127, 383, 384] {
             let query = generate_vector(dim, 700 + dim as u64);
             let candidate = generate_vector(dim, 800 + dim as u64);
@@ -758,18 +743,12 @@ mod tests {
     fn test_quantized_data_to_f32_roundtrip() {
         let v = generate_vector(384, 55);
 
-        // Full tier should be lossless
         let full_data = QuantizedData::from_f32(&v, QuantizationTier::Full);
         let full_rt = full_data.to_f32();
         for (a, b) in v.iter().zip(full_rt.iter()) {
             assert!((a - b).abs() < 1e-10, "Full tier should be lossless");
         }
     }
-
-    // ------------------------------------------------------------------
-    // Regression tests for issue #210: tier-mismatch in prepared SIMD
-    // dispatch must return a typed error, not panic.
-    // ------------------------------------------------------------------
 
     #[test]
     fn test_cosine_distance_prepared_tier_mismatch_returns_typed_error() {
@@ -791,7 +770,6 @@ mod tests {
             other => panic!("expected TierMismatch, got {other:?}"),
         }
 
-        // try_ alias must agree.
         assert!(try_approximate_cosine_distance_prepared(&query, &stored).is_err());
     }
 

@@ -57,7 +57,6 @@ impl<S: EmbeddingService> CachedEmbeddingService<S> {
 #[async_trait]
 impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<S> {
     async fn embed(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
-        // Generic has its own role tag — see docs/service.md.
         self.embed_with_role(texts, model, EmbeddingRole::Generic)
             .await
     }
@@ -104,7 +103,6 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
     ) -> Result<Vec<Vec<f32>>> {
         use crate::error::EmbedError;
 
-        // Validate wrapper-owned request bounds before cache interaction.
         if texts.is_empty() {
             return Err(EmbedError::InvalidInput("no texts provided".into()));
         }
@@ -124,22 +122,18 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
             }
         }
 
-        // Fast path: bypass cache entirely when disabled (no key computation, no locking)
         if !self.cache.is_enabled() {
             return self.inner.embed(texts, model).await;
         }
 
-        // Compute cache keys — include the active dimension (for MRL models) and role.
         let model_config = self.inner.model_config(model);
         let keys: Vec<_> = texts
             .iter()
             .map(|t| self.cache.compute_key(t, model_config, role))
             .collect();
 
-        // Check cache for all texts — returns Arc<[f32]> refs (O(1) per hit)
         let cached = self.cache.get_many(&keys);
 
-        // Identify which texts need embedding
         let mut to_embed: Vec<(usize, &String)> = Vec::new();
         let mut results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
 
@@ -151,11 +145,9 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
             }
         }
 
-        // If all cached, return immediately
         if to_embed.is_empty() {
             debug!("all {} texts found in cache", texts.len());
-            // SAFETY: All slots are Some because we only reach here when to_embed is empty,
-            // meaning every text was found in cache and had results[i] = Some(...) assigned.
+            // SAFETY: An empty miss list means every result slot was populated.
             return Ok(results.into_iter().flatten().collect());
         }
 
@@ -165,12 +157,10 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
             to_embed.len()
         );
 
-        // Embed missing texts (after prompt is already applied in texts)
         let texts_to_embed: Vec<String> = to_embed.iter().map(|(_, t)| (*t).clone()).collect();
         let new_embeddings = self.inner.embed(&texts_to_embed, model).await?;
 
-        // FP-035: validate count before zipping — a count mismatch would silently
-        // drop slots via zip() and return fewer embeddings than requested.
+        // Reject count mismatches before `zip` can silently omit results.
         if new_embeddings.len() != to_embed.len() {
             return Err(EmbedError::InferenceFailed(format!(
                 "embedding service returned {} vectors for {} inputs",
@@ -179,7 +169,6 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
             )));
         }
 
-        // Store in cache and populate results
         let mut cache_entries = Vec::with_capacity(to_embed.len());
         for ((i, _), embedding) in to_embed.into_iter().zip(new_embeddings.into_iter()) {
             cache_entries.push((keys[i], embedding.clone()));
@@ -187,15 +176,11 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
         }
         self.cache.put_many(cache_entries);
 
-        // Return all results
-        // SAFETY: All slots are guaranteed to be Some at this point:
-        // - Cached items were assigned via results[i] = Some(arc.to_vec())
-        // - Non-cached items were assigned via results[i] = Some(embedding) in the loop above
+        // SAFETY: Cache hits and validated fresh results populate every slot.
         Ok(results.into_iter().flatten().collect())
     }
 }
 
-// Suppress dead code warnings for constants that are used by other modules
 const _: () = {
     let _ = DEFAULT_MAX_BATCH_SIZE;
     let _ = MAX_TEXT_CHARS;

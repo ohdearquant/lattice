@@ -67,7 +67,7 @@ impl LatticeEmbedder {
     }
 }
 
-// Expose the stable SIMD consumer contract to JavaScript — see docs/design.md.
+// Expose the stable SIMD contract to JavaScript.
 
 /// Dot product of two equal-length vectors via `simd::dot_product`.
 ///

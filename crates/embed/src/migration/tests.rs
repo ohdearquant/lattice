@@ -128,19 +128,14 @@ fn test_cancel_from_failed() {
 fn test_invalid_transitions() {
     let mut ctrl = MigrationController::new(test_plan());
 
-    // Cannot pause before starting
     assert!(ctrl.pause("oops").is_err());
-    // Cannot record progress before starting
     assert!(ctrl.record_progress(10).is_err());
-    // Cannot resume from Planned
     assert!(ctrl.resume().is_err());
 
     ctrl.start().unwrap();
     ctrl.record_progress(1000).unwrap(); // auto-completes
 
-    // Cannot cancel a completed migration
     assert!(ctrl.cancel().is_err());
-    // Cannot start a completed migration
     assert!(ctrl.start().is_err());
 }
 
@@ -216,9 +211,7 @@ fn test_zero_total_progress() {
     };
     let mut ctrl = MigrationController::new(plan);
     ctrl.start().unwrap();
-    // total=0, so any progress completes
     assert!(ctrl.state().is_active());
-    // Verify progress shows 1.0 for zero-total when in-progress
     let state = &MigrationState::InProgress {
         processed: 0,
         total: 0,
@@ -314,8 +307,6 @@ fn test_full_lifecycle() {
     assert_eq!(report.error_count, 1);
     assert_eq!(report.migration_id, "test-migration-001");
 }
-
-// ==================== Skip Handling Tests ====================
 
 #[test]
 fn test_skip_reason_display() {
@@ -520,7 +511,6 @@ fn test_lifecycle_with_skips() {
     ctrl.resume().unwrap();
 
     ctrl.record_progress(496).unwrap();
-    // 996 < 998 (effective_total = 1000 - 2 = 998), not complete yet
     assert!(!ctrl.state().is_terminal());
 
     ctrl.record_progress(2).unwrap();
@@ -541,12 +531,10 @@ fn test_record_skip_rejects_exceeding_total() {
     let mut ctrl = MigrationController::new(plan);
     ctrl.start().unwrap();
 
-    // First two skips exhaust the budget (processed=0, so 0+0<2, 0+1<2).
     assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_ok());
     assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_ok());
     assert_eq!(ctrl.state().skipped(), 2);
 
-    // Third skip must be rejected (0+2 >= 2); skipped count must not change.
     assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_err());
     assert_eq!(ctrl.state().skipped(), 2);
 }
@@ -564,11 +552,9 @@ fn test_all_skipped_still_completes() {
     let mut ctrl = MigrationController::new(plan);
     ctrl.start().unwrap();
 
-    // Skipping all items is legitimate: effective_total becomes 0.
     assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_ok());
     assert!(ctrl.record_skip(SkipReason::ContentDeleted).is_ok());
 
-    // record_progress(0) should complete because effective_total == 0.
     ctrl.record_progress(0).unwrap();
 
     assert!(

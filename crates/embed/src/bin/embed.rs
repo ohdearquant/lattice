@@ -113,8 +113,6 @@ options:
 
         let service = NativeEmbeddingService::with_model(model);
 
-        // --download-only: ensure the model is present (downloading + checksum-verifying if
-        // needed) and loadable, then exit without running any encode pass.
         if download_only {
             match service.ensure_loaded().await {
                 Ok(()) => {
@@ -163,7 +161,6 @@ options:
         let dims = embeddings[0].len();
         let count = embeddings.len();
 
-        // Build NxN pairwise cosine matrix.
         let mut cosine: Vec<Vec<f32>> = Vec::with_capacity(count);
         for i in 0..count {
             let mut row = Vec::with_capacity(count);
@@ -174,7 +171,6 @@ options:
             cosine.push(row);
         }
 
-        // Build preview: first 8 dims of each vector.
         let preview_len = dims.min(8);
         let preview: Vec<Vec<f32>> = embeddings
             .iter()
@@ -214,8 +210,6 @@ fn main() -> std::process::ExitCode {
     cli::main()
 }
 
-// wasm32 has no terminal environment for this CLI to run in (see module doc
-// comment above); the crate's wasm-facing surface is the `wasm` feature's
-// wasm-bindgen bindings instead. This no-op keeps the bin target linkable.
+// `wasm32` still builds this target, but cannot run the native CLI.
 #[cfg(target_arch = "wasm32")]
 fn main() {}

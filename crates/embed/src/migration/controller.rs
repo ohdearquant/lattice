@@ -105,7 +105,6 @@ impl MigrationController {
                 total,
                 skipped,
             } => {
-                // Accept skips only while their combined work count is strictly below total.
                 if *processed + *skipped >= *total {
                     return Err(MigrationError::InvalidTransition {
                         from: format!("{:?}", self.state),

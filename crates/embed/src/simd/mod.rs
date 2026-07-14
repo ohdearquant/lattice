@@ -17,7 +17,6 @@ mod tier;
 #[cfg(test)]
 mod tests;
 
-// Re-export public API
 pub use binary::BinaryVector;
 pub use cosine::{
     batch_cosine_one_vs_many, batch_cosine_similarity, cosine_similarity, cosine_similarity_fused,
@@ -94,9 +93,7 @@ impl SimdConfig {
         }
         #[cfg(target_arch = "aarch64")]
         {
-            // NEON is mandatory on aarch64, always available.
-            // FEAT_DotProd (dotprod) is optional: required on Armv8.4+,
-            // optional on Armv8.2/v8.3. Detect at runtime.
+            // NEON is mandatory; optional FEAT_DotProd needs runtime detection.
             Self {
                 avx512f_enabled: false,
                 avx2_enabled: false,
@@ -108,11 +105,7 @@ impl SimdConfig {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            // No runtime detection on wasm32: `simd128` is either compiled in
-            // for the whole module (via `-C target-feature=+simd128`) or not.
-            // `cfg!` reads the same compile-time flag the `#[cfg(...)]` gates
-            // on the SIMD kernel functions themselves key off, so this stays
-            // consistent with which kernels actually exist in the binary.
+            // WASM SIMD availability is a compile-time target-feature choice.
             Self {
                 avx512f_enabled: false,
                 avx2_enabled: false,
@@ -171,7 +164,7 @@ impl SimdConfig {
     }
 }
 
-// Process-wide SIMD configuration (detected once).
+// Process-wide configuration is detected once.
 static SIMD_CONFIG: OnceLock<SimdConfig> = OnceLock::new();
 
 /// **Unstable**: SIMD dispatch internal; shape may change as new backends are added.

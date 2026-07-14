@@ -122,7 +122,6 @@ impl BackfillCoordinator {
         self.backfilled_count += count;
         self.controller.record_progress(count)?;
 
-        // Track cutover time when transitioning to Completed
         if was_in_progress && matches!(self.controller.state(), MigrationState::Completed { .. }) {
             self.cutover_at = Some(Instant::now());
         }
@@ -226,7 +225,6 @@ impl BackfillCoordinator {
                 }
             }
             MigrationState::Completed { .. } => {
-                // During rollback window, still dual-write
                 if self.in_rollback_window() {
                     EmbeddingRoutingConfig {
                         query_model: self.target_model(), // query new
@@ -243,7 +241,6 @@ impl BackfillCoordinator {
                     }
                 }
             }
-            // Paused, Failed, Cancelled: fall back to source-only
             _ => EmbeddingRoutingConfig {
                 query_model: self.source_model(),
                 write_models: vec![self.source_model()],

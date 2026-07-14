@@ -34,7 +34,6 @@ impl QuantizationParams {
     ///
     /// Handles edge cases: empty vectors, NaN, Inf, near-zero vectors.
     pub fn from_vector(vector: &[f32]) -> Self {
-        // Single pass over finite values to handle NaN/Inf gracefully.
         let mut min_val = f32::INFINITY;
         let mut max_val = f32::NEG_INFINITY;
 
@@ -45,16 +44,13 @@ impl QuantizationParams {
             }
         }
 
-        // Handle edge case: empty or all non-finite.
         if !min_val.is_finite() || !max_val.is_finite() {
             min_val = 0.0;
             max_val = 0.0;
         }
 
-        // Symmetric quantization: map [-max_abs, max_abs] to [-127, 127]
         let max_abs = min_val.abs().max(max_val.abs());
 
-        // Epsilon guard to avoid division by near-zero
         let scale = if max_abs > 1e-10 {
             127.0 / max_abs
         } else {
@@ -109,12 +105,10 @@ impl QuantizedVector {
     pub fn from_f32(vector: &[f32]) -> Self {
         let mut params = QuantizationParams::from_vector(vector);
 
-        // Defensive guard: avoid NaN/Inf/zero scale.
         if !params.scale.is_finite() || params.scale == 0.0 {
             params.scale = 1.0;
         }
 
-        // Compute L2 norm of finite values (NaN/Inf are treated as 0.0).
         let mut norm_sq = 0.0f32;
         for &v in vector {
             if v.is_finite() {
@@ -247,7 +241,7 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
     let mut sum2 = vdupq_n_s32(0);
     let mut sum3 = vdupq_n_s32(0);
 
-    // SDOT is selected only after runtime FEAT_DotProd detection — see docs/simd.md.
+    // SDOT requires runtime FEAT_DotProd detection.
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
@@ -299,7 +293,6 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
     let sum23 = vaddq_s32(sum2, sum3);
     let mut sum_vec = vaddq_s32(sum01, sum23);
 
-    // Tail: remaining full 16-byte vectors using sdot
     let tail_start = chunks * CHUNK_SIZE;
     let tail_chunks = (n - tail_start) / SIMD_WIDTH;
     for j in 0..tail_chunks {
@@ -317,7 +310,6 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
 
     let sum = vaddvq_s32(sum_vec);
 
-    // Scalar tail: only the final < SIMD_WIDTH elements
     let remainder_start = tail_start + tail_chunks * SIMD_WIDTH;
     let remainder: i32 = a[remainder_start..]
         .iter()
@@ -340,13 +332,9 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
 unsafe fn mm512_sign_epi8(b: __m512i, a: __m512i) -> __m512i {
     let zero = _mm512_setzero_si512();
     let neg_b = _mm512_sub_epi8(zero, b);
-    // mask where a < 0
     let mask_neg = _mm512_cmplt_epi8_mask(a, zero);
-    // mask where a == 0
     let mask_zero = _mm512_cmpeq_epi8_mask(a, zero);
-    // Start with b, replace with -b where a < 0
     let result = _mm512_mask_blend_epi8(mask_neg, b, neg_b);
-    // Replace with 0 where a == 0
     _mm512_mask_blend_epi8(mask_zero, result, zero)
 }
 
@@ -367,7 +355,6 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
     debug_assert!(b.iter().all(|&v| v != i8::MIN));
     let chunks = n / CHUNK_SIZE;
 
-    // 4 independent int32 accumulators (16 int32s each)
     let mut sum0 = _mm512_setzero_si512();
     let mut sum1 = _mm512_setzero_si512();
     let mut sum2 = _mm512_setzero_si512();
@@ -376,8 +363,7 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
-        // VNNI: dpbusd computes sum += a[unsigned] * b[signed]
-        // For signed * signed, we use: abs(a) * sign(b, a)
+        // Map signed products through VNNI's unsigned-by-signed operation.
         let a0 = _mm512_loadu_si512(a.as_ptr().add(base) as *const __m512i);
         let b0 = _mm512_loadu_si512(b.as_ptr().add(base) as *const __m512i);
         let a0_abs = _mm512_abs_epi8(a0);
@@ -403,15 +389,12 @@ unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
         sum3 = _mm512_dpbusd_epi32(sum3, a3_abs, b3_signed);
     }
 
-    // Combine accumulators
     let sum01 = _mm512_add_epi32(sum0, sum1);
     let sum23 = _mm512_add_epi32(sum2, sum3);
     let sum_vec = _mm512_add_epi32(sum01, sum23);
 
-    // Horizontal sum of 16 int32s
     let sum = _mm512_reduce_add_epi32(sum_vec);
 
-    // Handle remainder with scalar
     let remainder_start = chunks * CHUNK_SIZE;
     let remainder: i32 = a[remainder_start..]
         .iter()
@@ -433,7 +416,6 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
     const SIMD_WIDTH: usize = 32;
     const UNROLL: usize = 4;
     const CHUNK_SIZE: usize = SIMD_WIDTH * UNROLL;
-    // Prefetch one full chunk ahead for both input arrays.
     const PREFETCH_DISTANCE: usize = CHUNK_SIZE;
     let n = a.len();
     debug_assert_eq!(n, b.len());
@@ -441,7 +423,6 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
     debug_assert!(b.iter().all(|&v| v != i8::MIN));
     let chunks = n / CHUNK_SIZE;
 
-    // 4 independent int32 accumulators
     let mut sum0 = _mm256_setzero_si256();
     let mut sum1 = _mm256_setzero_si256();
     let mut sum2 = _mm256_setzero_si256();
@@ -452,35 +433,30 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
     for i in 0..chunks {
         let base = i * CHUNK_SIZE;
 
-        // Software prefetch for the next chunk.
         let next_base = base + PREFETCH_DISTANCE;
         if next_base + CHUNK_SIZE <= n {
             _mm_prefetch(a.as_ptr().add(next_base), _MM_HINT_T0);
             _mm_prefetch(b.as_ptr().add(next_base), _MM_HINT_T0);
         }
 
-        // Unroll 0
         let a0 = _mm256_loadu_si256(a.as_ptr().add(base) as *const __m256i);
         let b0 = _mm256_loadu_si256(b.as_ptr().add(base) as *const __m256i);
         let prod0 = _mm256_maddubs_epi16(_mm256_abs_epi8(a0), _mm256_sign_epi8(b0, a0));
         let prod0_32 = _mm256_madd_epi16(prod0, ones);
         sum0 = _mm256_add_epi32(sum0, prod0_32);
 
-        // Unroll 1
         let a1 = _mm256_loadu_si256(a.as_ptr().add(base + SIMD_WIDTH) as *const __m256i);
         let b1 = _mm256_loadu_si256(b.as_ptr().add(base + SIMD_WIDTH) as *const __m256i);
         let prod1 = _mm256_maddubs_epi16(_mm256_abs_epi8(a1), _mm256_sign_epi8(b1, a1));
         let prod1_32 = _mm256_madd_epi16(prod1, ones);
         sum1 = _mm256_add_epi32(sum1, prod1_32);
 
-        // Unroll 2
         let a2 = _mm256_loadu_si256(a.as_ptr().add(base + SIMD_WIDTH * 2) as *const __m256i);
         let b2 = _mm256_loadu_si256(b.as_ptr().add(base + SIMD_WIDTH * 2) as *const __m256i);
         let prod2 = _mm256_maddubs_epi16(_mm256_abs_epi8(a2), _mm256_sign_epi8(b2, a2));
         let prod2_32 = _mm256_madd_epi16(prod2, ones);
         sum2 = _mm256_add_epi32(sum2, prod2_32);
 
-        // Unroll 3
         let a3 = _mm256_loadu_si256(a.as_ptr().add(base + SIMD_WIDTH * 3) as *const __m256i);
         let b3 = _mm256_loadu_si256(b.as_ptr().add(base + SIMD_WIDTH * 3) as *const __m256i);
         let prod3 = _mm256_maddubs_epi16(_mm256_abs_epi8(a3), _mm256_sign_epi8(b3, a3));
@@ -488,12 +464,10 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
         sum3 = _mm256_add_epi32(sum3, prod3_32);
     }
 
-    // Combine accumulators
     let sum01 = _mm256_add_epi32(sum0, sum1);
     let sum23 = _mm256_add_epi32(sum2, sum3);
     let sum_vec = _mm256_add_epi32(sum01, sum23);
 
-    // Horizontal sum
     let sum128_lo = _mm256_castsi256_si128(sum_vec);
     let sum128_hi = _mm256_extracti128_si256(sum_vec, 1);
     let sum128 = _mm_add_epi32(sum128_lo, sum128_hi);
@@ -501,7 +475,6 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
     let sum32 = _mm_add_epi32(sum64, _mm_srli_si128(sum64, 4));
     let sum = _mm_cvtsi128_si32(sum32);
 
-    // Handle remainder
     let remainder_start = chunks * CHUNK_SIZE;
     let remainder: i32 = a[remainder_start..]
         .iter()
@@ -511,10 +484,6 @@ unsafe fn dot_product_i8_avx2_unrolled(a: &[i8], b: &[i8]) -> f32 {
 
     (sum + remainder) as f32
 }
-
-// ============================================================================
-// INT8 kernel dispatch cache (mirrors f32 DotKernel pattern in dot_product.rs)
-// ============================================================================
 
 /// INT8 dot-product kernel function pointer type.
 pub type I8DotKernel = fn(&[i8], &[i8]) -> f32;
@@ -532,8 +501,7 @@ fn resolve_i8_dot_kernel() -> I8DotKernel {
 
     #[cfg(target_arch = "aarch64")]
     {
-        // The NEON kernel uses SDOT (ARMv8.2 FEAT_DotProd), which is optional on
-        // Armv8.2/v8.3. Only dispatch when dotprod_enabled is confirmed at runtime.
+        // SDOT is optional on older Arm versions, so require runtime detection.
         if config.neon_enabled && config.dotprod_enabled {
             return dot_product_i8_neon_kernel;
         }
@@ -628,8 +596,7 @@ mod simd_parity_tests {
             .collect()
     }
 
-    // FP-034: NEON SDOT vs scalar parity for INT8 dot product.
-    // Gated on dotprod: SDOT is FEAT_DotProd, not baseline NEON.
+    // SDOT is FEAT_DotProd, not baseline NEON.
     #[test]
     fn test_i8_neon_scalar_parity() {
         #[cfg(target_arch = "aarch64")]
@@ -661,7 +628,6 @@ mod simd_parity_tests {
         }
     }
 
-    // FP-034: AVX2 vs scalar parity for INT8 dot product.
     #[test]
     fn test_i8_avx2_scalar_parity() {
         #[cfg(target_arch = "x86_64")]

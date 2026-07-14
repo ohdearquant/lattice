@@ -31,7 +31,7 @@ const NUM_SHARDS: usize = 16;
 /// Mask for shard index computation: `key[0] as usize & SHARD_MASK`.
 const SHARD_MASK: usize = NUM_SHARDS - 1;
 
-// Compile-time assertion that NUM_SHARDS is a power of 2.
+// Masking shard selection requires a power-of-two count.
 const _: () = assert!(
     NUM_SHARDS.is_power_of_two(),
     "NUM_SHARDS must be a power of 2"
@@ -153,7 +153,6 @@ impl EmbeddingCache {
     ) -> CacheKey {
         let mut hasher = blake3::Hasher::new();
         hasher.update(text.as_bytes());
-        // Deterministic model/role namespace for this cache key.
         let model_key = format!(
             "{}:{}:{}:{}",
             model_config.model,
@@ -370,28 +369,19 @@ mod tests {
             EmbeddingRole::Generic,
         );
 
-        // Miss
         assert!(cache.get(&key).is_none());
 
-        // Put
         let embedding = vec![0.1, 0.2, 0.3];
         cache.put(key, embedding.clone());
 
-        // Hit — returns Arc<[f32]>
         let cached = cache.get(&key).unwrap();
         assert_eq!(&*cached, &embedding[..]);
     }
 
     #[test]
     fn test_cache_eviction() {
-        // With 16 shards, a capacity of 16 gives 1 entry per shard.
-        // To test eviction, we need keys that hash to the same shard.
-        // Use a larger capacity and fill it up.
         let cache = EmbeddingCache::new(16);
 
-        // Insert 32 entries — each shard has capacity 1, so each shard
-        // can only hold 1 entry. Inserting 2 entries to the same shard
-        // will evict the first.
         let mut keys = Vec::new();
         for i in 0..32u32 {
             let text = format!("text_{i}");
@@ -404,21 +394,17 @@ mod tests {
             cache.put(key, vec![i as f32]);
         }
 
-        // Total size should not exceed capacity (16)
         let stats = cache.stats();
         assert!(stats.size <= 16, "size {} exceeds capacity 16", stats.size);
     }
 
     #[test]
     fn test_cache_lru_eviction_within_shard() {
-        // Create cache with capacity 32 (2 per shard).
         let cache = EmbeddingCache::new(32);
 
-        // Find 3 keys that land in the same shard.
         let mut same_shard_keys = Vec::new();
         let mut i = 0u32;
 
-        // Find the first key's shard and collect 3 keys for it.
         let first_key = cache.compute_key(
             "probe_0",
             ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
@@ -445,14 +431,11 @@ mod tests {
         let (k2, v2) = same_shard_keys[1];
         let (k3, v3) = same_shard_keys[2];
 
-        // Insert k1 and k2 (shard capacity is 2).
         cache.put(k1, vec![v1 as f32]);
         cache.put(k2, vec![v2 as f32]);
 
-        // Access k1 to make it recently used.
         assert!(cache.get(&k1).is_some());
 
-        // Insert k3 — should evict k2 (least recently used in this shard).
         cache.put(k3, vec![v3 as f32]);
 
         assert!(
@@ -478,7 +461,6 @@ mod tests {
             EmbeddingRole::Generic,
         );
 
-        // Same text, different models = different keys
         assert_ne!(key_small, key_base);
     }
 
@@ -504,7 +486,6 @@ mod tests {
 
     #[test]
     fn test_cache_get_many() {
-        // Use capacity large enough that no shard evicts.
         let cache = EmbeddingCache::new(100);
 
         let key1 = cache.compute_key(
@@ -535,7 +516,6 @@ mod tests {
 
     #[test]
     fn test_cache_put_many() {
-        // Use capacity large enough that no shard evicts (ceil(100/16) = 7 per shard).
         let cache = EmbeddingCache::new(100);
 
         let key1 = cache.compute_key(
@@ -602,17 +582,13 @@ mod tests {
     fn test_concurrent_access() {
         use std::thread;
 
-        // Use large capacity so no eviction occurs (800 entries across 16 shards).
-        // Per-shard capacity = ceil(4000/16) = 250, so 800 entries fit easily.
         let cache = Arc::new(EmbeddingCache::new(4000));
         let mut handles = Vec::new();
 
-        // Spawn 8 threads, each doing 100 put+get operations.
         for t in 0..8 {
             let cache = Arc::clone(&cache);
             handles.push(thread::spawn(move || {
                 for i in 0..100 {
-                    // Each thread uses unique keys to avoid contention on same entry.
                     let text = format!("thread_{t}_item_{i}");
                     let key = cache.compute_key(
                         &text,
@@ -633,7 +609,6 @@ mod tests {
             h.join().expect("thread panicked");
         }
 
-        // All 800 entries should be in cache (capacity 4000 >> 800).
         let stats = cache.stats();
         assert_eq!(stats.size, 800);
         assert!(stats.hits >= 800, "at least 800 hits expected");
@@ -641,8 +616,6 @@ mod tests {
 
     #[test]
     fn test_shard_distribution() {
-        // Use generous capacity to avoid eviction from uneven distribution.
-        // 4000 total → 250/shard. We insert 800 entries → ~50/shard on average.
         let cache = EmbeddingCache::new(4000);
 
         let n = 800;
@@ -658,7 +631,6 @@ mod tests {
         let shard_stats = cache.per_shard_stats();
         assert_eq!(shard_stats.len(), NUM_SHARDS);
 
-        // Each shard should have entries. With uniform hash, each shard gets ~50.
         for ss in &shard_stats {
             assert!(
                 ss.size > 0,
@@ -667,11 +639,9 @@ mod tests {
             );
         }
 
-        // No eviction since 800 << 4000. Total should be exactly 800.
         let total: usize = shard_stats.iter().map(|s| s.size).sum();
         assert_eq!(total, n);
 
-        // Check distribution is reasonably uniform: no shard has >3x the average.
         let avg = n / NUM_SHARDS; // 50
         for ss in &shard_stats {
             assert!(
@@ -688,7 +658,6 @@ mod tests {
     fn test_per_shard_stats_hit_tracking() {
         let cache = EmbeddingCache::new(100);
 
-        // Insert a few entries and access them.
         let key1 = cache.compute_key(
             "hello",
             ModelConfig::new(EmbeddingModel::BgeSmallEnV15),
@@ -703,7 +672,6 @@ mod tests {
         cache.put(key1, vec![1.0]);
         cache.put(key2, vec![2.0]);
 
-        // Access key1 three times, key2 once.
         cache.get(&key1);
         cache.get(&key1);
         cache.get(&key1);
@@ -720,7 +688,6 @@ mod tests {
 
     #[test]
     fn test_small_capacity_rounds_up() {
-        // Capacity smaller than NUM_SHARDS: each shard gets at least 1.
         let cache = EmbeddingCache::new(3);
         assert!(cache.is_enabled());
 
@@ -732,10 +699,6 @@ mod tests {
         cache.put(key, vec![42.0]);
         assert!(cache.get(&key).is_some());
     }
-
-    // -------------------------------------------------------------------------
-    // Role-aware cache key tests (P0-E2)
-    // -------------------------------------------------------------------------
 
     /// Query and passage roles must produce different cache keys for the same raw text
     /// so that embed_query("hello") and embed_passage("hello") are stored separately.
@@ -774,16 +737,13 @@ mod tests {
         let key_query = cache.compute_key("embed me", model, EmbeddingRole::Query);
         let key_passage = cache.compute_key("embed me", model, EmbeddingRole::Passage);
 
-        // Store under Query role.
         cache.put(key_query, vec![1.0, 2.0]);
 
-        // Passage role key must still be a miss.
         assert!(
             cache.get(&key_passage).is_none(),
             "passage key must miss after storing under query key"
         );
 
-        // Query role key must hit.
         assert!(
             cache.get(&key_query).is_some(),
             "query key must hit after storing under query key"

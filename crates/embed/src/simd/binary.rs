@@ -35,7 +35,6 @@ impl BinaryVector {
     pub fn from_f32_with_threshold(vector: &[f32], threshold: f32) -> Self {
         let dims = vector.len();
 
-        // Compute norm
         let mut norm_sq = 0.0f32;
         for &v in vector {
             if v.is_finite() {
@@ -128,10 +127,7 @@ pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
     #[cfg(target_arch = "aarch64")]
     {
         if config.neon_enabled {
-            // SAFETY: NEON is available on aarch64. Both slices have been verified above
-            // to contain at least `required_bytes` elements, which is the exact packed
-            // length for `dims` bits. The callee uses unaligned loads and chunk/remainder
-            // bounds strictly within those slices; no out-of-bounds read is possible.
+            // SAFETY: AArch64 guarantees NEON and the checked packed slices cover `dims`.
             return unsafe {
                 hamming_distance_neon(&a.data[..required_bytes], &b.data[..required_bytes], a.dims)
             };
@@ -152,11 +148,9 @@ pub fn hamming_distance_binary(a: &BinaryVector, b: &BinaryVector) -> u32 {
 fn hamming_distance_scalar(a: &[u8], b: &[u8], dims: usize) -> u32 {
     let mut total: u32 = 0;
 
-    // Number of fully-populated 8-byte chunks (all bits valid).
     let full_bytes = dims / 8; // bytes where every bit is a real dimension
     let chunks = full_bytes / 8;
 
-    // Process 8 bytes at a time as u64
     for c in 0..chunks {
         let offset = c * 8;
         let a_u64 = u64::from_ne_bytes([
@@ -182,14 +176,12 @@ fn hamming_distance_scalar(a: &[u8], b: &[u8], dims: usize) -> u32 {
         total += (a_u64 ^ b_u64).count_ones();
     }
 
-    // Handle the remaining full bytes (between the last u64 chunk and the partial byte)
     let remainder_start = chunks * 8;
     for i in remainder_start..full_bytes {
         total += (a[i] ^ b[i]).count_ones();
     }
 
-    // Handle the single partial byte (if dims is not a multiple of 8).
-    // The `r` valid bits occupy the top `r` bits of the byte (MSB = dim 0 within byte).
+    // Partial bytes store valid dimensions in their high bits.
     let r = dims % 8;
     if r != 0 {
         let mask = 0xFFu8 << (8 - r); // top `r` bits set, bottom `(8-r)` clear
@@ -207,7 +199,7 @@ fn hamming_distance_scalar(a: &[u8], b: &[u8], dims: usize) -> u32 {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn hamming_distance_neon(a: &[u8], b: &[u8], dims: usize) -> u32 {
-    // SA-163/164: verify equal-length backing slices before the SIMD loop.
+    // Validate packed lengths before SIMD loads.
     debug_assert_eq!(
         a.len(),
         b.len(),
@@ -216,14 +208,12 @@ unsafe fn hamming_distance_neon(a: &[u8], b: &[u8], dims: usize) -> u32 {
         b.len()
     );
 
-    // Only full bytes (where every bit is a real dimension) go through the SIMD loop.
+    // Keep the partial byte out of SIMD so padding cannot contribute.
     let full_bytes = dims / 8;
     const SIMD_WIDTH: usize = 16;
     let chunks = full_bytes / SIMD_WIDTH;
 
-    // Accumulate popcount bytes into u16 to avoid overflow
-    // (max 8 bits per byte, 16 bytes per register = 128 per chunk, fits u8 for ~1 chunk)
-    // Use vpaddlq to widen: u8 -> u16 -> u32 -> u64
+    // Widen popcounts before accumulation to avoid byte overflow.
     let mut sum_u64 = vdupq_n_u64(0);
 
     for c in 0..chunks {
@@ -231,30 +221,24 @@ unsafe fn hamming_distance_neon(a: &[u8], b: &[u8], dims: usize) -> u32 {
         let va = vld1q_u8(a.as_ptr().add(base));
         let vb = vld1q_u8(b.as_ptr().add(base));
 
-        // XOR to find differing bits
         let xor = veorq_u8(va, vb);
 
-        // Population count per byte
         let popcnt = vcntq_u8(xor);
 
-        // Widen and accumulate: u8 -> u16 -> u32 -> u64
         let sum_u16 = vpaddlq_u8(popcnt);
         let sum_u32 = vpaddlq_u16(sum_u16);
         sum_u64 = vaddq_u64(sum_u64, vpaddlq_u32(sum_u32));
     }
 
-    // Extract final sum
     let total = vgetq_lane_u64(sum_u64, 0) + vgetq_lane_u64(sum_u64, 1);
     let mut result = total as u32;
 
-    // Handle remaining full bytes (between last SIMD chunk and the partial byte)
     let remainder_start = chunks * SIMD_WIDTH;
     for i in remainder_start..full_bytes {
         result += (a[i] ^ b[i]).count_ones();
     }
 
-    // Handle the single partial byte (if dims is not a multiple of 8).
-    // Top `r` bits are real dimensions; bottom `(8 - r)` bits are padding.
+    // Mask low padding bits from the final partial byte.
     let r = dims % 8;
     if r != 0 {
         let mask = 0xFFu8 << (8 - r); // top `r` bits set, bottom `(8-r)` clear
@@ -289,7 +273,6 @@ mod tests {
         assert_eq!(bv.data.len(), 1); // 8 dims -> 1 byte
         assert_eq!(bv.dims, 8);
 
-        // Expected bits (MSB first): 1, 0, 1, 0, 1, 1, 0, 1 = 0b10101101 = 0xAD
         assert_eq!(bv.data[0], 0xAD, "packed bits: {:08b}", bv.data[0]);
     }
 
@@ -299,24 +282,18 @@ mod tests {
         let bv = BinaryVector::from_f32(&v);
         let deq = bv.to_f32();
 
-        // Binary: positive -> +1.0, negative -> -1.0
         assert_eq!(deq, vec![1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0]);
     }
 
     #[test]
     fn test_binary_hamming_distance() {
-        // Same vector should have 0 Hamming distance
         let v = generate_vector(384, 42);
         let bv = BinaryVector::from_f32(&v);
         assert_eq!(bv.hamming_distance(&bv), 0);
 
-        // Opposite sign vector should have max Hamming distance
         let neg_v: Vec<f32> = v.iter().map(|x| -x).collect();
         let neg_bv = BinaryVector::from_f32(&neg_v);
-        // Some values might be exactly 0.0, which maps to +1 in both cases
-        // So Hamming may not be exactly 384
         let hamming = bv.hamming_distance(&neg_bv);
-        // But it should be close to 384 for random vectors
         assert!(hamming > 350, "hamming={hamming}, expected close to 384");
     }
 
@@ -336,7 +313,6 @@ mod tests {
         let a = generate_vector(384, 101);
         let b = generate_vector(384, 202);
 
-        // f32 reference cosine
         let dot: f32 = a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum();
         let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
         let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -346,7 +322,6 @@ mod tests {
         let bb = BinaryVector::from_f32(&b);
         let bin_cos = ba.cosine_similarity_approx(&bb);
 
-        // Binary is a rough approximation -- within 0.3 is acceptable for pre-filtering
         assert!(
             (f32_cos - bin_cos).abs() < 0.35,
             "Binary cosine too far from f32: f32={f32_cos}, binary={bin_cos}"
@@ -358,20 +333,16 @@ mod tests {
         let v = generate_vector(384, 999);
         let bv = BinaryVector::from_f32(&v);
 
-        // f32: 384 * 4 = 1536 bytes
-        // Binary: ceil(384/8) = 48 bytes = 32x compression
         assert_eq!(bv.data.len(), 48);
     }
 
     #[test]
     fn test_binary_non_multiple_of_8_dims() {
-        // 385 dims -> ceil(385/8) = 49 bytes
         let v = generate_vector(385, 77);
         let bv = BinaryVector::from_f32(&v);
         assert_eq!(bv.data.len(), 49);
         assert_eq!(bv.dims, 385);
 
-        // Roundtrip should preserve all 385 values
         let deq = bv.to_f32();
         assert_eq!(deq.len(), 385);
     }
@@ -379,10 +350,8 @@ mod tests {
     #[test]
     fn test_binary_with_threshold() {
         let v = vec![0.5, 0.3, 0.1, -0.1, -0.3, -0.5, 0.7, 0.2];
-        // With threshold 0.25, only values >= 0.25 map to 1
         let bv = BinaryVector::from_f32_with_threshold(&v, 0.25);
         let deq = bv.to_f32();
-        // Expected: 1, 1, -1, -1, -1, -1, 1, -1
         assert_eq!(deq, vec![1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, -1.0]);
     }
 
@@ -408,7 +377,6 @@ mod tests {
 
     #[test]
     fn test_hamming_scalar_vs_neon_parity() {
-        // Generate two distinct binary vectors and verify both paths give same result
         let a = generate_vector(384, 111);
         let b = generate_vector(384, 222);
         let ba = BinaryVector::from_f32(&a);
@@ -423,11 +391,8 @@ mod tests {
         );
     }
 
-    // --- Issue #211 regression tests -------------------------------------------------
-
     #[test]
     fn test_hamming_short_data_returns_max() {
-        // dims=128 requires 16 bytes; supply only 4 — must return u32::MAX, not OOB.
         let a = BinaryVector {
             dims: 128,
             data: vec![0xFFu8; 4],
@@ -447,7 +412,6 @@ mod tests {
 
     #[test]
     fn test_hamming_one_side_short_returns_max() {
-        // a is correct length, b is too short.
         let a = BinaryVector {
             dims: 128,
             data: vec![0xFFu8; 16],
@@ -463,7 +427,6 @@ mod tests {
 
     #[test]
     fn test_hamming_correct_data_still_works() {
-        // Verify the guard does not break the normal path.
         let v = generate_vector(128, 42);
         let bv = BinaryVector::from_f32(&v);
         assert_eq!(bv.hamming_distance(&bv), 0);
@@ -471,7 +434,6 @@ mod tests {
 
     #[test]
     fn test_binary_to_f32_short_data_returns_empty() {
-        // dims=128 requires 16 bytes; supply only 4.
         let bv = BinaryVector {
             dims: 128,
             data: vec![0xFFu8; 4],
@@ -486,14 +448,11 @@ mod tests {
 
     #[test]
     fn test_binary_to_f32_exact_length_works() {
-        // Exactly the right number of bytes — must succeed.
         let v = generate_vector(128, 7);
         let bv = BinaryVector::from_f32(&v);
         let deq = bv.to_f32();
         assert_eq!(deq.len(), 128);
     }
-
-    // --- Issue #249 regression: padding-bit masking in Hamming distance -------------
 
     /// Vectors with 12 dimensions use 2 bytes, with 4 padding bits in byte 1 (the low
     /// nibble). Two vectors that agree on all 12 real dimensions but differ in their
@@ -504,22 +463,17 @@ mod tests {
     /// the low nibble before counting, giving the correct answer.
     #[test]
     fn test_hamming_ignores_padding_bits() {
-        // 12 dims → 2 bytes; the last 4 bits of byte 1 are padding.
-        // Build via pub fields so we can inject arbitrary padding.
         let clean = BinaryVector {
             dims: 12,
-            // byte 1: top nibble = 4 valid dims, low nibble = 0 (zero padding)
             data: vec![0b10101010u8, 0b11110000u8],
             norm: 1.0,
         };
         let dirty = BinaryVector {
             dims: 12,
-            // same valid bits in top nibble of byte 1, non-zero garbage in low-nibble padding
             data: vec![0b10101010u8, 0b11111111u8],
             norm: 1.0,
         };
 
-        // Both vectors agree on all 12 real dimensions; Hamming distance must be 0.
         assert_eq!(
             hamming_distance_scalar(&clean.data, &dirty.data, 12),
             0,
@@ -531,7 +485,6 @@ mod tests {
             "dispatch: padding bits must not be counted"
         );
 
-        // Cosine distance approximation must also be 0.0 for identical valid bits.
         assert_eq!(
             clean.cosine_distance_approx(&dirty),
             0.0,

@@ -23,7 +23,6 @@ mod native_tests {
     fn test_native_service_supports_only_loaded_model() {
         let service = NativeEmbeddingService::default();
         assert!(service.supports_model(EmbeddingModel::BgeSmallEnV15));
-        // All other models must be rejected even if they are local.
         assert!(!service.supports_model(EmbeddingModel::BgeBaseEnV15));
         assert!(!service.supports_model(EmbeddingModel::BgeLargeEnV15));
         assert!(!service.supports_model(EmbeddingModel::MultilingualE5Small));
@@ -59,7 +58,6 @@ mod native_tests {
     #[test]
     fn test_native_service_with_model_config_invalid_dim_rejected() {
         use crate::model::ModelConfig;
-        // BgeSmallEnV15 does not support MRL — output_dim must be rejected at construction.
         let cfg = ModelConfig {
             model: EmbeddingModel::BgeSmallEnV15,
             output_dim: Some(128),
@@ -84,7 +82,7 @@ mod native_tests {
         assert_eq!(returned.dimensions(), 768);
     }
 
-    // Mutex to serialize all tests that read or write LATTICE_EMBED_DIM.
+    // Serializes environment-variable mutation in this test binary.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// LATTICE_EMBED_DIM absent → with_model_from_env returns native dim (2560 for 4B).
@@ -190,7 +188,6 @@ mod native_tests {
     async fn test_native_service_embed_wrong_model_returns_error() {
         let service = NativeEmbeddingService::default(); // loads BgeSmallEnV15
         let texts = vec!["hello".to_string()];
-        // Requesting a different local model should fail before any IO.
         let result = service.embed(&texts, EmbeddingModel::BgeBaseEnV15).await;
         assert!(result.is_err(), "expected error for wrong model");
         let err = result.unwrap_err().to_string();
@@ -200,10 +197,6 @@ mod native_tests {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Role-aware prompt tests (P0-E2)
-// ---------------------------------------------------------------------------
 
 /// E5 query_instruction returns "query: ", document_instruction returns "passage: ".
 #[test]

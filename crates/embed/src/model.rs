@@ -36,7 +36,6 @@ impl ModelProvenance {
             dt.to_rfc3339()
         };
 
-        // Create a lightweight hash from model metadata
         let hash_input = format!("{model_id}:{loaded_at_iso}:{model:?}");
         let hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
 
@@ -174,7 +173,6 @@ impl EmbeddingModel {
             EmbeddingModel::MultilingualE5Base => 512,
             EmbeddingModel::AllMiniLmL6V2 => 256,
             EmbeddingModel::ParaphraseMultilingualMiniLmL12V2 => 128,
-            // Conservative cap; see docs/model.md.
             EmbeddingModel::Qwen3Embedding0_6B => 8192,
             EmbeddingModel::Qwen3Embedding4B => 8192,
             EmbeddingModel::TextEmbedding3Small => 8191,
@@ -351,10 +349,6 @@ impl std::str::FromStr for EmbeddingModel {
     }
 }
 
-// ============================================================================
-// ModelConfig — runtime MRL dimension configuration
-// ============================================================================
-
 /// Minimum allowed MRL output dimension.
 pub const MIN_MRL_OUTPUT_DIM: usize = 32;
 
@@ -458,7 +452,6 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10)); // Ensure different timestamp
         let p2 = ModelProvenance::new(EmbeddingModel::BgeSmallEnV15, "model1".into());
 
-        // Different timestamps should produce different hashes
         assert_ne!(p1.hash, p2.hash);
     }
 
@@ -488,8 +481,7 @@ mod tests {
         let provenance = ModelProvenance::new(EmbeddingModel::BgeSmallEnV15, "test-model".into());
 
         let json = serde_json::to_string(&provenance).unwrap();
-        // FP-037: EmbeddingModel has #[serde(rename_all = "snake_case")] so
-        // BgeSmallEnV15 serializes as "bge_small_en_v15", not "BgeSmallEnV15".
+        // The enum's snake-case serde form is part of the persisted format.
         assert!(json.contains("bge_small_en_v15"), "json={json}");
         assert!(json.contains("test-model"));
         assert!(json.contains(&provenance.hash));
@@ -638,10 +630,6 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("unknown embedding model"));
     }
-
-    // -------------------------------------------------------------------------
-    // bert_pooling() routing tests (P1-E3) — require `native` feature
-    // -------------------------------------------------------------------------
 
     /// BGE small/base/large must use CLS pooling per their HF model cards.
     #[cfg(feature = "native")]

@@ -357,10 +357,8 @@ fn test_avx512_euclidean_distance_dimensions() {
 /// 4. **Degenerate-input behaviour** — the documented length-mismatch returns.
 #[test]
 fn test_simd_distance_consumer_contract() {
-    // The `(&[f32], &[f32]) -> f32` shape khive ANN indexes bind to.
     type DistFn = fn(&[f32], &[f32]) -> f32;
 
-    // (1) Signature gate: fails to compile if any signature drifts.
     let _contract: [DistFn; 4] = [
         squared_euclidean_distance,
         euclidean_distance,
@@ -368,7 +366,6 @@ fn test_simd_distance_consumer_contract() {
         cosine_similarity,
     ];
 
-    // (2) squared_euclidean_distance == scalar reference, within FP tolerance.
     for dim in AVX512_TEST_DIMS {
         let a = generate_random_vector_seeded(dim, 911);
         let b = generate_random_vector_seeded(dim, 1013);
@@ -385,7 +382,6 @@ fn test_simd_distance_consumer_contract() {
         );
     }
 
-    // (3) Ordering invariant: sorting by squared-L2 matches sorting by true L2.
     let query = generate_random_vector_seeded(384, 1);
     let candidates: Vec<Vec<f32>> = (0..16)
         .map(|i| generate_random_vector_seeded(384, 100 + i as u64))
@@ -405,7 +401,6 @@ fn test_simd_distance_consumer_contract() {
         "squared_euclidean_distance must preserve true-L2 ordering (ANN invariant)"
     );
 
-    // (4) Documented degenerate-input behaviour is part of the contract.
     let a4 = [1.0_f32, 2.0, 3.0, 4.0];
     let b3 = [1.0_f32, 2.0, 3.0];
     assert_eq!(squared_euclidean_distance(&a4, &b3), f32::MAX);
@@ -413,7 +408,6 @@ fn test_simd_distance_consumer_contract() {
     assert_eq!(dot_product(&a4, &b3), 0.0);
     assert_eq!(cosine_similarity(&a4, &b3), 0.0);
 
-    // cosine_similarity additionally documents empty-input → 0.0 (explicit guard).
     assert_eq!(cosine_similarity(&[], &[]), 0.0);
 }
 
@@ -448,7 +442,6 @@ fn test_avx512f_config_detection() {
 #[test]
 fn test_simd_config_detection() {
     let config = SimdConfig::detect();
-    // Just verify it doesn't panic and show capabilities
     println!(
         "AVX512F: {}, AVX2: {}, FMA: {}, AVX512-VNNI: {}, NEON: {}",
         config.avx512f_enabled,
@@ -463,7 +456,6 @@ fn test_simd_config_detection() {
         assert!(config.avx512f_enabled, "AVX512-VNNI requires AVX512F");
     }
 
-    // On aarch64 (Apple Silicon, Graviton, etc.), NEON should be enabled
     #[cfg(target_arch = "aarch64")]
     assert!(config.neon_enabled, "NEON should be available on aarch64");
 }
@@ -487,7 +479,6 @@ fn test_batch_operations() {
     let results = batch_cosine_similarity(&pair_refs);
     assert_eq!(results.len(), 10);
 
-    // Verify each result is in valid range
     for sim in results {
         assert!((-1.0..=1.0).contains(&sim));
     }
@@ -495,7 +486,6 @@ fn test_batch_operations() {
 
 #[test]
 fn test_non_multiple_of_8() {
-    // Test with dimensions that aren't multiples of 8 or 16.
     for dim in [7, 15, 100, 383, 385] {
         let a = generate_random_vector_seeded(dim, 23);
         let b = generate_random_vector_seeded(dim, 47);
@@ -513,17 +503,12 @@ fn test_non_multiple_of_8() {
     }
 }
 
-// ========================================================================
-// INT8 QUANTIZATION TESTS
-// ========================================================================
-
 #[test]
 fn test_quantization_roundtrip() {
     let original = generate_random_vector(384);
     let quantized = QuantizedVector::from_f32(&original);
     let dequantized = quantized.to_f32();
 
-    // Check approximate equality (quantization introduces some error)
     for (orig, deq) in original.iter().zip(dequantized.iter()) {
         assert!(
             (orig - deq).abs() < 0.02,
@@ -561,7 +546,6 @@ fn test_i8_cosine_similarity_accuracy() {
     let b_q = QuantizedVector::from_f32(&b);
     let i8_result = cosine_similarity_i8(&a_q, &b_q);
 
-    // int8 cosine similarity should be very close to float32
     assert!(
         (float_result - i8_result).abs() < 0.02,
         "int8 cosine similarity error too large: float={float_result}, i8={i8_result}"
@@ -573,24 +557,12 @@ fn test_i8_memory_savings() {
     let v = generate_random_vector(384);
     let q = QuantizedVector::from_f32(&v);
 
-    // float32: 384 * 4 = 1536 bytes
-    // int8: 384 * 1 = 384 bytes
     assert_eq!(v.len() * 4, 1536, "float32 should be 1536 bytes");
     assert_eq!(q.len(), 384, "int8 should be 384 bytes");
-    // 4x memory reduction
 }
-
-// ============================================================================
-// PROPTEST - Property-based tests for embedding dimension invariants (#451)
-// ============================================================================
-
-// ========================================================================
-// BATCH-4 KERNEL PARITY TESTS
-// ========================================================================
 
 #[test]
 fn test_batch4_dot_matches_per_pair_basic() {
-    // Small known vectors so correctness is obvious.
     let q = vec![1.0_f32, 0.5, -0.5, 0.25, 0.0, -1.0, 0.75, 0.1];
     let c0 = vec![1.0_f32, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
     let c1 = vec![0.0_f32, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
@@ -645,7 +617,6 @@ fn test_batch4_dot_matches_per_pair_384dim() {
 
 #[test]
 fn test_batch4_dot_matches_per_pair_odd_dims() {
-    // 100 is not a multiple of 8; exercises the scalar tail.
     let q = generate_random_vector_seeded(100, 7777);
     let c0 = generate_random_vector_seeded(100, 7778);
     let c1 = generate_random_vector_seeded(100, 7779);
@@ -673,15 +644,11 @@ fn test_batch4_dot_matches_per_pair_odd_dims() {
 
 #[test]
 fn test_batch_dot_product_same_query_matches_per_pair() {
-    // Constructs a same-query batch (N=16 candidates, all with the same query).
-    // batch_dot_product should take the batch-4 SIMD path for chunks of 4
-    // and produce the same values as per-pair calls.
     let query = generate_random_vector_seeded(384, 9001);
     let candidates: Vec<Vec<f32>> = (0..16)
         .map(|i| generate_random_vector_seeded(384, 9100 + i as u64))
         .collect();
 
-    // Build pairs where every left-hand side is the same query borrow.
     let pairs: Vec<(&[f32], &[f32])> = candidates
         .iter()
         .map(|c| (query.as_slice(), c.as_slice()))
@@ -705,9 +672,6 @@ fn test_batch_dot_product_same_query_matches_per_pair() {
 
 #[test]
 fn test_batch_dot_product_unit_vectors_equals_cosine() {
-    // For unit-normalized vectors, dot product == cosine similarity.
-    // This validates the fast path that routes normalized cosine similarity
-    // through a plain dot product.
     let mut q = generate_random_vector_seeded(384, 42);
     let mut c = generate_random_vector_seeded(384, 43);
     normalize(&mut q);
@@ -730,13 +694,11 @@ mod proptests {
     /// Strategy for generating embedding dimensions (common model sizes + edge cases)
     fn embedding_dimension_strategy() -> impl Strategy<Value = usize> {
         prop_oneof![
-            // Common embedding model dimensions
             Just(128),
             Just(384),  // bge-small-en-v1.5
             Just(768),  // bge-base-en-v1.5
             Just(1024), // bge-large-en-v1.5
             Just(1536),
-            // Edge cases for SIMD alignment
             Just(1),    // Minimum
             Just(7),    // Non-aligned small
             Just(8),    // AVX alignment
@@ -749,7 +711,6 @@ mod proptests {
             Just(383),  // Off-by-one small
             Just(385),  // Off-by-one large
             Just(1023), // Off-by-one 1024
-            // Random dimensions
             (1usize..2048usize),
         ]
     }
@@ -769,7 +730,6 @@ mod proptests {
         #[test]
         fn prop_cosine_identical_is_one(dim in embedding_dimension_strategy()) {
             let v: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.1).cos()).collect();
-            // Skip zero vectors
             let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             prop_assume!(norm > 1e-6);
 
@@ -891,7 +851,6 @@ mod proptests {
         /// Property: int8 quantization preserves relative similarity ordering
         #[test]
         fn prop_i8_quantization_preserves_similarity_order(dim in 32usize..512usize) {
-            // Generate 3 vectors where a is more similar to b than to c
             let a: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.1).sin()).collect();
             let b: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.1).sin() + 0.1 * (i as f32 * 0.3).cos()).collect();
             let c: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.5).cos()).collect();
@@ -899,7 +858,6 @@ mod proptests {
             let sim_ab_float = cosine_similarity(&a, &b);
             let sim_ac_float = cosine_similarity(&a, &c);
 
-            // Only test if there's meaningful difference
             prop_assume!((sim_ab_float - sim_ac_float).abs() > 0.1);
 
             let a_q = QuantizedVector::from_f32(&a);
@@ -909,7 +867,6 @@ mod proptests {
             let sim_ab_i8 = cosine_similarity_i8(&a_q, &b_q);
             let sim_ac_i8 = cosine_similarity_i8(&a_q, &c_q);
 
-            // Relative ordering should be preserved
             if sim_ab_float > sim_ac_float {
                 prop_assert!(sim_ab_i8 > sim_ac_i8 - 0.1,
                     "i8 should preserve order: ab={} > ac={} but i8: ab={}, ac={}",
@@ -918,10 +875,6 @@ mod proptests {
         }
     }
 }
-
-// ============================================================================
-// OPTIMIZATION CORRECTNESS TESTS (added with perf(embed) optimizations)
-// ============================================================================
 
 /// Verify that `cosine_similarity_fused` produces the same result as `cosine_similarity`.
 ///
@@ -947,11 +900,9 @@ fn test_cosine_fused_matches_separate() {
 /// Edge cases for `cosine_similarity_fused`: zero vectors, mismatched lengths, identical vectors.
 #[test]
 fn test_cosine_fused_edge_cases() {
-    // Empty input
     let result = cosine_similarity_fused(&[], &[]);
     assert_eq!(result, 0.0, "fused: empty slices should return 0.0");
 
-    // Length mismatch
     let a = vec![1.0_f32, 2.0, 3.0];
     let b = vec![1.0_f32, 2.0];
     assert_eq!(
@@ -960,7 +911,6 @@ fn test_cosine_fused_edge_cases() {
         "fused: length mismatch should return 0.0"
     );
 
-    // Identical non-zero vector -> similarity 1.0
     let v = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
     let sim = cosine_similarity_fused(&v, &v);
     assert!(
@@ -1004,12 +954,10 @@ fn test_batch_cosine_one_vs_many_dim_mismatch() {
 
     let results = batch_cosine_one_vs_many(&query, &refs);
     assert_eq!(results.len(), 2);
-    // good candidate should produce a valid similarity
     assert!(
         results[0].is_finite(),
         "good candidate should produce finite similarity"
     );
-    // bad candidate (dim mismatch) should return 0.0
     assert_eq!(results[1], 0.0, "dim-mismatch candidate should return 0.0");
 }
 
@@ -1024,7 +972,6 @@ fn test_i8_dot_unrolled_matches_original() {
         let a_q = QuantizedVector::from_f32(&a_f32);
         let b_q = QuantizedVector::from_f32(&b_f32);
 
-        // Scalar reference: direct i32 accumulation over raw i8 slices.
         let scalar: f32 = a_q
             .data()
             .iter()
@@ -1032,7 +979,6 @@ fn test_i8_dot_unrolled_matches_original() {
             .map(|(&x, &y)| x as i32 * y as i32)
             .sum::<i32>() as f32;
 
-        // SIMD path (with prefetch via dot_product_i8_raw).
         let simd = dot_product_i8_raw(a_q.data(), b_q.data());
 
         let diff = (simd - scalar).abs();

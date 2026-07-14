@@ -7,10 +7,6 @@
 
 use serde::{Deserialize, Serialize};
 
-// ============================================================================
-// DistanceMetric
-// ============================================================================
-
 /// Distance metric used for vector similarity search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -45,10 +41,6 @@ impl DistanceMetric {
     }
 }
 
-// ============================================================================
-// VectorDType
-// ============================================================================
-
 /// Element data type for stored vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -82,10 +74,6 @@ impl VectorDType {
     }
 }
 
-// ============================================================================
-// VectorNorm
-// ============================================================================
-
 /// Normalization state of stored vectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -106,10 +94,6 @@ impl VectorNorm {
         self as u8
     }
 }
-
-// ============================================================================
-// EmbeddingKey
-// ============================================================================
 
 /// Identifies an embedding space (model + revision + dims + metric + dtype + norm).
 ///

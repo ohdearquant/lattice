@@ -51,7 +51,7 @@ impl std::fmt::Display for SkipReason {
 #[non_exhaustive]
 pub enum MigrationState {
     /// Migration is planned but has not started.
-    // FP-036: alias allows deserializing data stored before rename_all = "snake_case" was applied.
+    // Accept the pre-snake-case serialized form.
     #[serde(alias = "Planned")]
     Planned,
     /// Migration is actively processing embeddings.
