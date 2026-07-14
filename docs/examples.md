@@ -1,10 +1,11 @@
 # Lattice Examples
 
 This document provides runnable examples for the main crates in the lattice workspace:
-`lattice-embed`, `lattice-fann`, `lattice-transport`, and the LoRA fine-tuning workflow in
-`lattice-tune`.
+`lattice-inference`, `lattice-embed`, `lattice-fann`, `lattice-transport`, and the LoRA
+fine-tuning workflow in `lattice-tune`.
 
-All examples live in their respective crate's `examples/` directory and can be run with:
+Checked-in examples live in their respective crate's `examples/` directory. Existing example
+targets can be run with:
 
 ```
 cargo run -p lattice-embed --example basic_embed
@@ -12,6 +13,130 @@ cargo run -p lattice-embed --example similarity
 cargo run -p lattice-fann --example fann_xor
 cargo run -p lattice-transport --example sinkhorn_ot
 ```
+
+---
+
+## lattice-inference
+
+### Grammar-constrained generation (BETA)
+
+Grammar-constrained generation is an unstable, opt-in library API. Build a `GrammarEngine` from
+the loaded model's exact token-byte table, then attach it through `GenerateConfig::grammar`. The
+default is `None`, so ordinary generation is unchanged.
+
+The following program loads a local Qwen3.5 safetensors directory, generates one JSON value from a
+JSON Schema, validates the returned text, then generates a non-JSON configuration format from raw
+GBNF. Save it as `crates/inference/examples/grammar_constrained.rs` and run it with:
+
+```sh
+cargo run --release -p lattice-inference --example grammar_constrained -- \
+  ~/.lattice/models/qwen3.5-0.8b
+```
+
+```rust
+use std::error::Error;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
+use lattice_inference::model::{GenerateConfig, Qwen35Model};
+
+fn compile(
+    model: &Qwen35Model,
+    spec: &GrammarSpec,
+) -> Result<Arc<GrammarEngine>, Box<dyn Error>> {
+    let vocab_bytes = model
+        .tokenizer()
+        .vocab_bytes(model.config().vocab_size)?;
+    Ok(Arc::new(GrammarEngine::new(spec, vocab_bytes)?))
+}
+
+fn generate(model: &Qwen35Model, grammar: Arc<GrammarEngine>, prompt: &str) -> Result<String, Box<dyn Error>> {
+    let config = GenerateConfig {
+        max_new_tokens: 64,
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        repetition_penalty: 1.0,
+        seed: Some(7),
+        enable_thinking: false,
+        enable_mtp: Some(false),
+        grammar: Some(grammar),
+        ..GenerateConfig::default()
+    };
+    Ok(model.generate(prompt, &config)?.text)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let model_dir = std::env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .ok_or_else(|| std::io::Error::other("usage: grammar_constrained <model-dir>"))?;
+    let model = Qwen35Model::from_safetensors(&model_dir)?;
+
+    let schema = GrammarSpec::json_schema_str(
+        r#"{
+          "type": "object",
+          "properties": {
+            "status": {"type": "string", "enum": ["ok", "error"]},
+            "count": {"type": "integer"}
+          },
+          "required": ["status", "count"]
+        }"#,
+    )?;
+    let json_text = generate(
+        &model,
+        compile(&model, &schema)?,
+        "Return only a JSON object with a status and count.",
+    )?;
+    let value: serde_json::Value = serde_json::from_str(&json_text)?;
+    assert!(matches!(
+        value.get("status").and_then(serde_json::Value::as_str),
+        Some("ok" | "error")
+    ));
+    assert!(value.get("count").is_some_and(serde_json::Value::is_i64));
+    println!("JSON Schema: {json_text}");
+
+    let gbnf = GrammarSpec::Gbnf(
+        r#"root ::= "priority=" priority "\nretries=" digit "\n"
+priority ::= "low" | "medium" | "high"
+digit ::= [0-9]"#
+            .to_string(),
+    );
+    let config_text = generate(
+        &model,
+        compile(&model, &gbnf)?,
+        "Return only a two-line priority and retry configuration.",
+    )?;
+    assert!(config_text.starts_with("priority="));
+    assert!(config_text.contains("\nretries="));
+    println!("GBNF:\n{config_text}");
+
+    Ok(())
+}
+```
+
+Compile a grammar once per schema/model vocabulary and reuse its `Arc`; constructing the vocabulary
+partition is initialization work, not a per-token operation. The canonical CPU and Metal Qwen3.5
+generation loops both apply the grammar before sampling. Grammar constraints disable incompatible
+speculative/compact-top-k paths rather than silently bypassing the constraint.
+
+Current limits:
+
+- The JSON Schema front-end implements a draft 2020-12 subset: `type`, `properties`, `required`,
+  `items`, `prefixItems`, `minItems`, `maxItems`, `enum`, `const`, `anyOf`, `oneOf`, and local
+  `$ref`/`$defs`. It does not implement `pattern`, external `$ref`, or `if`/`then`/`else`.
+- The GBNF front-end requires a `root` rule and supports literals, character ranges,
+  concatenation, alternation, grouping, and `*`/`+`/`?` repetition. It constrains syntax, not
+  context-sensitive or semantic relationships.
+- Residual JSON-Schema compiler and PDA/runtime correctness work is tracked in
+  [#310](https://github.com/ohdearquant/lattice/issues/310) and
+  [#322](https://github.com/ohdearquant/lattice/issues/322). Treat the feature as BETA even when a
+  schema compiles successfully.
+- The OpenAI-compatible HTTP servers and interactive CLI do not yet accept grammar constraints;
+  they reject non-text `response_format` values and build generation configs with `grammar: None`.
+  HTTP wiring remains tracked in [#588](https://github.com/ohdearquant/lattice/issues/588) and
+  ADR-068. Until that lands, opt in through the Rust library API shown above.
 
 ---
 

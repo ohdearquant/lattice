@@ -7,22 +7,25 @@
 **Issues**: N/A
 **Depends on**: ADR-058 (CPU performance regression CI), ADR-063 (serving architecture release surface)
 
-## Implementation status (2026-06-27)
+## Implementation status (reconciled 2026-07-14)
 
 This ADR systematizes the existing CI gates, records verified gaps, and defines the promotion rule
 for new merge-blocking gates.
 
-Implemented additive changes in this run:
+Current shipped state:
 
 1. This ADR (`docs/adr/ADR-064-ci-gate-taxonomy.md`) — documentation only.
-2. `rustdoc-lint` observation job added to `.github/workflows/ci.yml` with `continue-on-error: true`
-   at the job level. Not added to any required-status set.
+2. `rustdoc-lint` observation job added to `.github/workflows/ci.yml` with
+   `continue-on-error: true` on the lint step. Not added to any required-status set.
 3. `unwrap-in-lib-lint` observation job added to `.github/workflows/ci.yml` with
-   `continue-on-error: true` at the job level. Not added to any required-status set.
+   `continue-on-error: true` on the lint step. Not added to any required-status set.
+4. The workspace declares Rust 1.93 as its MSRV. The `msrv` job selects Rust 1.93.1 and checks all
+   workspace targets with `f16,metal-gpu` on Apple Silicon; the always-reporting `ci-gate` requires
+   that job to succeed for code changes.
 
-All new merge-blocking gates listed below remain proposed until maintainer sign-off. No proposed gate
-in this ADR should be treated as accepted branch-protection policy. The two observation jobs above
-are explicitly non-blocking and will show existing debt on first run.
+The MSRV gate was implemented after this ADR's initial documentation pass. Other merge-blocking
+proposals listed below remain proposed until maintainer sign-off. The two observation jobs above are
+explicitly non-blocking and surface their findings in step logs while their jobs conclude green.
 
 ---
 
@@ -73,18 +76,18 @@ only when they are non-required or explicitly allowed to fail during their obser
 Any change that would make a new gate merge-blocking is not decided here. It requires maintainer
 sign-off because it changes branch-protection policy, migration expectations, and merge risk.
 
-### Verified absence ledger
+### Gap ledger
 
-Only gaps verified as absent by the researcher ledger are listed. Rank order follows protected
-property priority: correctness first, then build-hygiene, then packaging. No supply-chain or
-performance gap was verified absent by the evidence artifacts.
+The original research pass verified the following gaps. This table preserves that audit scope while
+recording their status on current `main`; an implemented informational observation is not described
+as a merge-blocking gate.
 
-| rank | verified absent gap | protected property | evidence | implication |
+| rank | original gap | protected property | current status and evidence | remaining implication |
 |---|---|---|---|---|
-| 1 | Unwrap and expect lint for library code | correctness | No workflow, script, Cargo, or crate match for `clippy::unwrap_used` or `clippy::expect_used`; existing Clippy denies warnings generally but does not deny these lints. | Panic-safety debt in library surfaces is not separately surfaced by CI. |
-| 2 | MSRV gate | build-hygiene | No `rust-version` in Cargo manifests; CI pins `dtolnay/rust-toolchain@1.94.1`; workspace lint policy allows `incompatible_msrv`. | The current fixed toolchain proves pinned-toolchain buildability, not minimum supported Rust compatibility. |
-| 3 | Rustdoc and intra-doc-link lint gate | build-hygiene | No matches for `RUSTDOCFLAGS`, `cargo doc`, `rustdoc`, `broken_intra_doc_links`, `private_intra_doc_links`, `intra_doc`, or `intra-doc` across workflows, scripts, Cargo files, and crates. | Rust API docs and links can rot without CI signal. |
-| 4 | Packaging or publish dry-run CI gate | packaging | No workflow invokes `cargo package`, `cargo publish`, `scripts/publish.sh`, or `--dry-run`; local `scripts/publish.sh --dry-run` exists but is not wired to CI. | Package metadata and publishability are only locally checkable today. |
+| 1 | Unwrap and expect lint for library code | correctness | Observed informationally by the `unwrap-in-lib-lint` job. Its Clippy step carries `continue-on-error: true`; the job is not part of `ci-gate`. | Panic-safety debt is visible but does not block merges. |
+| 2 | MSRV gate | build-hygiene | Closed. The workspace declares `rust-version = "1.93"`; the `msrv` job selects 1.93.1, checks all targets with `f16,metal-gpu`, and is required by `ci-gate` for code changes. | MSRV regressions in the checked workspace/feature surface block code changes. |
+| 3 | Rustdoc and intra-doc-link lint gate | build-hygiene | Observed informationally by the `rustdoc-lint` job. Its `cargo doc` step carries `continue-on-error: true`; the job is not part of `ci-gate`. | Rustdoc warnings and link rot are visible but do not block merges. |
+| 4 | Packaging or publish dry-run CI gate | packaging | Open. Local `scripts/publish.sh --dry-run` exists, but no workflow invokes it or an equivalent package/publish dry run. | Package metadata and publishability are only locally checkable today. |
 
 ---
 
@@ -118,6 +121,7 @@ whether it is gated or informational today.
 | `feature-matrix / lattice-inference metal-gpu Q4 tests` | correctness | Same `feature-matrix` trigger; no path filter; macOS-only step; `LATTICE_METAL_TEST_ENFORCE=1` | gated - this is behavioral coverage for Metal Q4 dispatch correctness, with enforced fail-closed behavior if the runner loses required capability. |
 | `bench-compile / lattice-inference bench-internals compile` | performance | `.github/workflows/ci.yml`; `push` to `main`, `pull_request` to `main`; no path filter; `macos-latest` | gated - the protected surface is the performance harness; it blocks merge on benchmark compile rot, not on benchmark score changes. |
 | `bench-compile / lattice-embed benches compile` | performance | Same `bench-compile` trigger; no path filter; `macos-latest` | gated - keeps embedding benchmark code buildable so performance baselines remain measurable. |
+| `msrv / workspace check at Rust 1.93.1` (`cargo check --workspace --features f16,metal-gpu --all-targets`) | build-hygiene | `.github/workflows/ci.yml`; `push`, `pull_request`, and `merge_group`; runs on `macos-latest` only when `changes.outputs.code == 'true'` | gated - checks the declared Rust 1.93 compatibility floor, including the Apple Silicon NEON/Metal and bench targets that exposed the original regression; `ci-gate` requires success for code changes. |
 | `cargo-deny / licenses + bans + sources` | supply-chain | `.github/workflows/ci.yml`; `push` to `main`, `pull_request` to `main`; no path filter; `ubuntu-latest` | gated - these checks are deterministic over manifest and lockfile state, so policy violations fail the required supply-chain context. |
 | `cargo-deny / advisories` | supply-chain | Same `cargo-deny` trigger; no path filter; `continue-on-error: true` | informational - fresh external advisories can appear without a repo change, so the workflow intentionally reports them without wedging merges. |
 | `e2e-parity / detect-engine-changes` | correctness | `.github/workflows/e2e-parity.yml`; `pull_request` to `main` with no workflow-level PR path filter; `push` to `main` filtered to inference and embed source paths; weekly schedule; manual; internal regex also checks relevant Cargo files, `Cargo.lock`, script, and workflow | gated - change detection controls whether expensive correctness jobs must run and `parity-gate` fails closed if detection errors. |
@@ -129,6 +133,11 @@ whether it is gated or informational today.
 | `bench-update / publish perf-baselines branch` | performance | Same `bench-update` trigger; needs bench artifacts; writes orphan `perf-baselines` branch | informational - publishing baseline artifacts is a reporting and history-maintenance action, not a merge gate. |
 | `app-binaries / build app-shipped binaries` | packaging | `.github/workflows/app-binaries.yml`; `pull_request` to `main` filtered to `crates/**`, `scripts/build-app-bins.sh`, and workflow file; `push` to `main` filtered to `crates/**`; manual | gated - it compiles the binaries the macOS app ships with their required features, so the protected property is packaging completeness. |
 | `embed-parity-release / production-model embedding parity` | correctness | `.github/workflows/embed-parity-release.yml`; `push` tags `v*`; `push` branches `release-prep/**`; manual | gated - it fails the release-prep or tag workflow on production-model embedding parity regressions, but it is intentionally not a per-PR merge gate. |
+
+`ci-gate` is an always-reporting enforcement aggregator rather than a separate protected-property
+test. It depends on change detection plus `ci`, `feature-matrix`, `bench-compile`, `msrv`, and
+`semver-checks`. For code changes it fails closed unless every gated dependency succeeds; for
+docs-only changes it reports success without requiring the skipped heavy jobs.
 
 ### D2: Preserve the current gated vs informational split
 
@@ -143,31 +152,34 @@ The current split is intentional enough to preserve:
 - Release-cadence embedding parity remains gated for release-prep and tag workflows, but is not a
   per-PR required gate.
 
-### D3: Implemented additive changes in this run
+### D3: Implemented changes and later reconciliation
 
 | implemented additive change | property | enforcement effect | rationale |
 |---|---|---|---|
 | Add this ADR as `docs/adr/ADR-064-ci-gate-taxonomy.md`. | documentation | No CI or branch-protection change. | Establishes a coherent taxonomy, verified gap ledger, and promotion rule before any gate expansion. |
-| `rustdoc-lint` observation job in `.github/workflows/ci.yml` with `continue-on-error: true`. | build-hygiene | Non-required; cannot block merges. | Covers a verified absent docs gate using only the existing Rust toolchain; no new dependencies. |
-| `unwrap-in-lib-lint` observation job in `.github/workflows/ci.yml` with `continue-on-error: true`. | correctness | Non-required; cannot block merges. | Covers a verified absent panic-safety lint using existing Clippy; expected to surface existing debt on first run. |
+| `rustdoc-lint` observation job in `.github/workflows/ci.yml` with step-level `continue-on-error: true`. | build-hygiene | Non-required; the lint step can fail while the job concludes success. | Covers a verified absent docs signal using only the existing Rust toolchain; no new dependencies. |
+| `unwrap-in-lib-lint` observation job in `.github/workflows/ci.yml` with step-level `continue-on-error: true`. | correctness | Non-required; the lint step can fail while the job concludes success. | Covers a verified absent panic-safety signal using existing Clippy. |
+| Rust 1.93 MSRV declaration and the Rust 1.93.1 `msrv` workflow job, aggregated by `ci-gate`. | build-hygiene | Required for code changes through the always-reporting aggregator. | Prevents APIs stabilized after the declared MSRV from passing under the repository's newer development toolchain and silently breaking supported users. |
 
-Neither observation job is added to any required-status set. Both jobs carry `continue-on-error: true`
-at the job level so a failure is visible in the workflow UI but cannot block a merge. No Rust code,
-dependency, script, or branch-protection rule is changed.
+Neither observation job is added to `ci-gate` or any required-status set. In each job only the lint
+step carries `continue-on-error: true`; the workflow comments explicitly reject job-level placement
+because a failed job-level check run would still make the commit status red.
 
-### D4: Skipped candidate: MSRV check
+### D4: MSRV check (implemented after the initial ADR pass)
 
-The MSRV check candidate was evaluated and skipped for this run. No workspace crate defines
-`rust-version` in its `Cargo.toml`, so any MSRV job must either:
+The original pass deferred MSRV because the workspace had no declared compatibility floor. Current
+`main` has made that policy decision:
 
-- Run `cargo check --workspace` under the same pinned toolchain (trivially passes, no new signal), or
-- Pick an arbitrary older toolchain version that has no policy backing and could produce persistent
-  noise if the codebase uses syntax unavailable on that version.
+- `Cargo.toml` declares `rust-version = "1.93"` for the workspace.
+- The `msrv` job pins `RUSTUP_TOOLCHAIN` and `dtolnay/rust-toolchain` to 1.93.1, asserts the selected
+  compiler version, and runs `cargo check --workspace --features f16,metal-gpu --all-targets` on
+  Apple Silicon.
+- `ci-gate` requires the `msrv` result to be `success` whenever code changes, while docs-only changes
+  may skip the heavy job and still receive the always-reporting required context.
 
-Without a maintainer-approved minimum Rust version, a non-trivial MSRV job cannot be made cleanly
-non-blocking in spirit — it would be guessing at a policy rather than measuring against one. The
-absence of `rust-version` remains a verified gap (rank 2 in the verified absence ledger). It is
-recorded below as an open proposal pending an explicit policy decision.
+This closes the original rank-2 gap without changing this ADR's promotion rule: the compatibility
+floor is explicit, the failure mode is documented in the workflow, and required enforcement is
+routed through an always-reporting aggregator.
 
 ### D5: Remaining non-blocking additive candidates (not yet implemented)
 
@@ -183,7 +195,6 @@ for maintainer sign-off and are not decided by this ADR.
 | proposal | protected property | maintainer decision needed |
 |---|---|---|
 | Make `unwrap-in-lib-lint` required, or encode unwrap and expect denial in workspace lint policy. | correctness | Blocks merges on existing or future panic-safety violations; requires agreement on tolerated exceptions and migration path. |
-| Define official MSRV, add `rust-version`, and make an MSRV compile check required. | build-hygiene | Establishes a compatibility contract that can constrain dependency and language-feature choices. |
 | Make `rustdoc-lint` required. | build-hygiene | Blocks merges on public/internal doc link rot; requires agreement that rustdoc completeness is branch-protection material. |
 | Make `publish-dry-run` required. | packaging | Blocks merges on package metadata or packaging issues; requires workspace publication policy decisions. |
 | Promote `cargo-deny advisories` from informational to blocking. | supply-chain | Changes the existing deliberate split where external advisory publication should not wedge unrelated merges. |
@@ -241,7 +252,7 @@ This keeps new gates additive while preventing surprise merge blockage.
 - The ADR does not itself increase CI coverage.
 - Non-required observation jobs, if added later, may produce noise before the repo has cleanup
   budgets and ownership assigned.
-- MSRV remains undefined until a separate policy decision sets a minimum supported Rust version.
+- Package publishability remains locally checkable but is not observed by remote CI.
 
 ### Risks
 
@@ -263,8 +274,7 @@ Land this ADR with no workflow changes.
 ### Phase 2: Optional observation jobs
 
 If accepted separately, add non-required jobs for rustdoc linting, unwrap/expect lint observation,
-publish dry-run visibility, or MSRV telemetry. These jobs must not be added to branch protection in
-the same change.
+or publish dry-run visibility. These jobs must not be added to branch protection in the same change.
 
 ### Phase 3: Maintainer sign-off
 
