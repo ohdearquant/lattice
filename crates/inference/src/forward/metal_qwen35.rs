@@ -2169,6 +2169,11 @@ mod inner {
         pub(crate) path_proof: PathProofCounters,
     }
 
+    enum GenerateAdmission {
+        Zero(GenerateOutput),
+        Ready(Vec<u32>),
+    }
+
     // ---------------------------------------------------------------------------
     // Cross-turn KV prefix cache (#462)
     // ---------------------------------------------------------------------------
@@ -4236,7 +4241,9 @@ mod inner {
         /// # Errors
         ///
         /// Returns an error if blending fails (e.g. dimension mismatch across
-        /// adapters for the same projection) or if adapter loading fails.
+        /// adapters for the same projection), if adapter loading fails, or if the
+        /// request fails the direct generator's preflight. Admission errors are
+        /// returned before the existing adapter or prefix cache is changed.
         pub fn generate_with_lora_mixture(
             &mut self,
             adapter_weights: &[(&[LoraLayerData], f32)],
@@ -4249,6 +4256,11 @@ mod inner {
                 return Err(crate::error::InferenceError::InvalidInput(
                     "generate_with_lora_mixture: adapter_weights must not be empty".into(),
                 ));
+            }
+
+            match self.preflight_generate(prompt, tokenizer, gen_cfg)? {
+                GenerateAdmission::Zero(output) => return Ok(output),
+                GenerateAdmission::Ready(_) => {}
             }
 
             // Unload any previously loaded adapter so the slot is free.
@@ -8723,6 +8735,40 @@ mod inner {
             }
         }
 
+        fn preflight_generate(
+            &self,
+            prompt: &str,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+        ) -> Result<GenerateAdmission, crate::error::InferenceError> {
+            let input = tokenizer.tokenize(prompt);
+            let prompt_ids = input.input_ids[..input.real_length].to_vec();
+            let prompt_len = prompt_ids.len();
+
+            crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+            if gen_cfg.max_new_tokens == 0 {
+                return Ok(GenerateAdmission::Zero(GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
+                }));
+            }
+            crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
+            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+            crate::model::qwen35::check_context_budget(
+                prompt_len,
+                gen_cfg.reasoning_budget,
+                gen_cfg.max_new_tokens,
+                self.max_context(),
+            )?;
+
+            Ok(GenerateAdmission::Ready(prompt_ids))
+        }
+
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
         ///
         /// Generate text from a prompt.
@@ -8732,6 +8778,8 @@ mod inner {
         /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
         /// blocks every token (prefill or any decode step) — mirrors the CPU
         /// `generate` contract (#611).
+        /// Returns `InferenceError::Inference` when the prompt plus requested decode
+        /// cap exceeds [`Self::max_context`].
         pub fn generate(
             &mut self,
             prompt: &str,
@@ -8739,6 +8787,12 @@ mod inner {
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
+
+            let prompt_ids = match self.preflight_generate(prompt, tokenizer, gen_cfg)? {
+                GenerateAdmission::Zero(output) => return Ok(output),
+                GenerateAdmission::Ready(prompt_ids) => prompt_ids,
+            };
+            let prompt_len = prompt_ids.len();
 
             let cfg = self.engine.config.clone();
 
@@ -8760,72 +8814,6 @@ mod inner {
                     if t == 0 { 1 } else { t }
                 }
             };
-
-            // Tokenize prompt
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-            let prompt_len = prompt_ids.len();
-
-            // Empty prompt is rejected with a typed Err on every generation
-            // entry point as of #856. This used to return an empty
-            // Ok(GenerateOutput { stopped: false, stop_reason: None, .. })
-            // here, diverging from all three CPU forward paths, which
-            // reject via this exact same shared guard. See
-            // docs/generation-entrypoint-matrix.md row 2. Runs before
-            // `reset_state()` below, so a rejected request never mutates
-            // session/cache state (mirrors the reasoning_budget/logprobs
-            // guards immediately after).
-            crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
-
-            // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
-            // so we never emit a token the caller did not ask for. Mirrors the CPU
-            // generate() guard (model::qwen35::generation) and generate_streaming below.
-            if gen_cfg.max_new_tokens == 0 {
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: false,
-                    stop_reason: Some(StopReason::Length),
-                    token_logprobs: vec![],
-                });
-            }
-
-            // Reject reasoning_budget before any prefill/state work (ADR-080 C3,
-            // #783): budget-forcing (`decode_cap` / `force_close_think`) is not
-            // wired into this decode loop, unlike `generate_streaming` /
-            // `generate_streaming_with_cancel` below, which do apply it. Without
-            // this guard the field would be silently ignored, producing
-            // unbudgeted output despite a reasoning budget being requested.
-            // `stop_strings` does not need an equivalent guard here: this loop
-            // already applies it via `stop_text_state` further down.
-            crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
-
-            // Reject logprobs before any prefill/state work (PR #787): this
-            // entry point unconditionally returns
-            // `token_logprobs: vec![]` on every return path below (including
-            // the MTP and self-spec fast-path delegations), so a caller
-            // requesting `gen_cfg.logprobs` would otherwise get `Ok` with the
-            // requested output silently absent -- the same apply-or-fail-closed
-            // defect as `check_reasoning_budget_not_set` above guards against.
-            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-
-            // Fail-closed: a prompt longer than the KV cache would trip the
-            // forward_prefill length assertion (n <= max_cache_len) and panic the
-            // caller thread. Return a clean empty completion instead. Mirrors the
-            // streaming path and the CPU generate() preflight (see generate_streaming).
-            if prompt_len > self.max_context() {
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: true,
-                    stop_reason: Some(StopReason::KvFull),
-                    token_logprobs: vec![],
-                });
-            }
 
             // Reset state for new generation
             self.reset_state();
@@ -9141,7 +9129,9 @@ mod inner {
         /// Returns `InferenceError::InvalidInput` if:
         /// - `input.d_model` does not match this model's `hidden_size`
         /// - `input.patch_embeddings` length is inconsistent with `visual_tokens * d_model`
-        /// - the total sequence length (visual + text) exceeds the KV cache capacity
+        ///
+        /// Returns the shared `InferenceError::Inference` context-budget error if the
+        /// visual and text prompt plus requested decode cap exceed the KV cache capacity.
         pub fn generate_multimodal(
             &mut self,
             input: crate::vision::MultimodalInput,
@@ -9159,8 +9149,7 @@ mod inner {
                 InferenceError::InvalidInput(format!("MultimodalInput validation failed: {e}"))
             })?;
 
-            let cfg = self.engine.config.clone();
-            let hidden = cfg.hidden_size;
+            let hidden = self.engine.config.hidden_size;
 
             if input.d_model != hidden {
                 return Err(InferenceError::InvalidInput(format!(
@@ -9200,13 +9189,14 @@ mod inner {
                 });
             }
 
-            if total_len > self.session.kv_cache.max_cache_len {
-                return Err(InferenceError::InvalidInput(format!(
-                    "generate_multimodal: total sequence length ({}) exceeds KV cache capacity ({}); \
-                     rebuild the session with a larger max_cache_len",
-                    total_len, self.session.kv_cache.max_cache_len
-                )));
-            }
+            crate::model::qwen35::check_context_budget(
+                total_len,
+                gen_cfg.reasoning_budget,
+                gen_cfg.max_new_tokens,
+                self.max_context(),
+            )?;
+
+            let cfg = self.engine.config.clone();
 
             // Reset recurrent state for a clean generation.
             self.reset_state();
@@ -13279,6 +13269,8 @@ mod inner {
         /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
         /// blocks every token (prefill or any decode step) — mirrors the CPU
         /// `generate_streaming` contract (#611).
+        /// Returns `InferenceError::Inference` when the prompt plus effective decode
+        /// cap exceeds [`Self::max_context`].
         pub fn generate_streaming_with_cancel<F, C>(
             &mut self,
             prompt: &str,
@@ -13292,26 +13284,6 @@ mod inner {
             C: FnMut() -> bool,
         {
             use crate::error::InferenceError;
-
-            let cfg = self.engine.config.clone();
-
-            let mut rng_state = match gen_cfg.seed {
-                Some(s) => {
-                    if s == 0 {
-                        1
-                    } else {
-                        s
-                    }
-                }
-                None => {
-                    use std::time::SystemTime;
-                    let t = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x12345678_9abcdef0);
-                    if t == 0 { 1 } else { t }
-                }
-            };
 
             let input = tokenizer.tokenize(prompt);
             let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
@@ -13346,27 +13318,31 @@ mod inner {
                 });
             }
 
-            // Fail-closed: a prompt longer than the KV cache would trip the
-            // forward_prefill length assertion (n <= max_cache_len), panicking and
-            // killing this GPU worker thread — a persistent DoS for every later
-            // request routed to it. Return a clean empty completion instead so the
-            // worker survives. Mirrors the CPU generate() preflight in spirit (both
-            // fail closed on an over-length prompt), but intentionally keeps
-            // returning an empty stopped output here rather than Err — this guard's
-            // contract is unrelated to and unchanged by the grammar fail-closed fix
-            // below (#611). The decode loop self-limits the prompt+completion case
-            // (it breaks on seq_len >= max_cache_len), so only prefill needs guarding.
-            if prompt_len > self.max_context() {
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: true,
-                    stop_reason: Some(StopReason::KvFull),
-                    token_logprobs: vec![],
-                });
-            }
+            crate::model::qwen35::check_context_budget(
+                prompt_len,
+                gen_cfg.reasoning_budget,
+                gen_cfg.max_new_tokens,
+                self.max_context(),
+            )?;
+
+            let cfg = self.engine.config.clone();
+            let mut rng_state = match gen_cfg.seed {
+                Some(s) => {
+                    if s == 0 {
+                        1
+                    } else {
+                        s
+                    }
+                }
+                None => {
+                    use std::time::SystemTime;
+                    let t = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0x12345678_9abcdef0);
+                    if t == 0 { 1 } else { t }
+                }
+            };
 
             self.reset_state();
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
@@ -15993,6 +15969,11 @@ mod inner {
         /// `generate_streaming` and `chat_completion_streaming` are left
         /// untouched and never use this cache, so their behavior stays
         /// deterministic and unaffected by any cache state.
+        ///
+        /// # Errors
+        ///
+        /// Returns the shared context-budget error before cache restore or eviction
+        /// when the prompt plus effective decode cap exceeds [`Self::max_context`].
         pub fn generate_streaming_with_prefix_cache<F>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
@@ -16065,6 +16046,15 @@ mod inner {
             // this call never touched.
             crate::model::qwen35::check_prompt_not_empty(prompt_ids.len())?;
 
+            if gen_cfg.max_new_tokens > 0 {
+                crate::model::qwen35::check_context_budget(
+                    prompt_ids.len(),
+                    gen_cfg.reasoning_budget,
+                    gen_cfg.max_new_tokens,
+                    self.max_context(),
+                )?;
+            }
+
             // #835: validate the suffix a reuse plan would select for this
             // slot BEFORE calling `_inner` at all -- same reasoning as the
             // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
@@ -16077,18 +16067,7 @@ mod inner {
             // reachable), or a valid pre-existing cross-turn entry this call
             // never touched would be destroyed alongside it.
             //
-            // The `!prompt_ids.is_empty()` clause below is now always true
-            // (empty prompt already returned above) and is kept only because
-            // this condition still gates on the other two trivial-request
-            // shapes `_inner` special-cases with an early `Ok` (zero
-            // `max_new_tokens`, prompt longer than the cache): neither of
-            // those reaches `_inner`'s mutating match either, so validating a
-            // plan for them here would reject requests `_inner` legitimately
-            // accepts.
-            if !prompt_ids.is_empty()
-                && gen_cfg.max_new_tokens > 0
-                && prompt_ids.len() <= self.max_context()
-            {
+            if gen_cfg.max_new_tokens > 0 {
                 let metadata = self.cross_turn_metadata(tokenizer);
                 let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
                 self.plan_prefix_request(&prompt_ids, &plan)?;
@@ -16179,13 +16158,8 @@ mod inner {
                  empty prompt before calling _inner"
             );
 
-            // These two guards are byte-for-byte the same as
-            // `generate_streaming` and run before any state mutation, so an
-            // existing cache entry (if any) is left exactly as-is. (A third,
-            // empty-prompt, guard used to live here too -- see the
-            // `check_prompt_not_empty` note above this function for why
-            // #856 moved it to the wrapper instead of leaving a duplicate
-            // here.)
+            // Zero-budget requests return before any state mutation, leaving an
+            // existing cache entry exactly as-is.
             if gen_cfg.max_new_tokens == 0 {
                 return Ok(CachedGenerateOutput {
                     output: GenerateOutput {
@@ -16206,27 +16180,6 @@ mod inner {
                     },
                 });
             }
-            if prompt_len > self.max_context() {
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: true,
-                        stop_reason: Some(StopReason::KvFull),
-                        token_logprobs: vec![],
-                    },
-                    cache: CrossTurnCacheStats {
-                        slot_id,
-                        prompt_tokens: prompt_len,
-                        reused_tokens: 0,
-                        prefetched_tokens: 0,
-                        mode: PrefixReuseMode::FullRefill,
-                    },
-                });
-            }
-
             let metadata = self.cross_turn_metadata(tokenizer);
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
 
@@ -25753,6 +25706,22 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("single-char vocab tokenizer build")
         }
 
+        fn assert_context_budget_error<T: std::fmt::Debug>(
+            result: &Result<T, crate::error::InferenceError>,
+            prompt_len: usize,
+            effective_new: usize,
+            max_context: usize,
+        ) {
+            let expected = format!(
+                "prompt ({prompt_len} tokens) plus effective decode cap ({effective_new} tokens; \
+                 max_new_tokens={effective_new}) exceeds model context window ({max_context})"
+            );
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::Inference(message)) if message == &expected),
+                "expected shared context-budget error {expected:?}, got {result:?}"
+            );
+        }
+
         /// A vocab with two multibyte (CJK) single-token entries plus the same
         /// single-char ASCII fallback as [`single_char_vocab_tokenizer`], so a
         /// stop string spanning a token boundary can be built purely out of
@@ -26392,57 +26361,221 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// `generate`'s prompt-too-long preflight (`prompt_len > max_context()`) must
-        /// report `StopReason::KvFull` rather than the default `Length`, so callers
-        /// can distinguish "rejected for exceeding the cache" from "ran out of
-        /// generation budget".
         #[test]
-        fn stop_reason_kv_full_on_tight_cache() {
+        fn metal_generation_entrypoints_enforce_context_admission() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
                 return;
             };
-
-            use crate::model::qwen35_config::GenerateConfig;
+            let _gpu_guard = gpu_test_lock();
 
             let tokenizer = single_char_vocab_tokenizer();
-            let gen_cfg = GenerateConfig {
-                max_new_tokens: 4,
-                temperature: 0.0,
-                top_k: 1,
-                top_p: 1.0,
-                repetition_penalty: 1.0,
-                seed: Some(1),
-                stop_token_ids: vec![],
-                enable_thinking: false,
-                enable_mtp: Some(false),
-                grammar: None,
-                stop_strings: vec![],
-                reasoning_budget: None,
-                logprobs: None,
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let gen_cfg = cross_turn_test_gen_cfg(1, 1);
+            let exact_prompt = "a".repeat(31);
+            let over_budget_prompt = "a".repeat(32);
+            let over_window_prompt = "a".repeat(33);
+
+            let mut direct =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            direct
+                .generate(&exact_prompt, &tokenizer, &gen_cfg)
+                .expect("31 prompt tokens plus one decode token must fit a 32-token window");
+            let direct_seq_len = direct.session.kv_cache.seq_len;
+            let direct_over = direct.generate(&over_budget_prompt, &tokenizer, &gen_cfg);
+            assert_context_budget_error(&direct_over, 32, 1, 32);
+            assert_eq!(
+                direct.session.kv_cache.seq_len, direct_seq_len,
+                "direct admission rejection must precede reset/prefill/decode"
+            );
+            let direct_prompt_over = direct.generate(&over_window_prompt, &tokenizer, &gen_cfg);
+            assert_context_budget_error(&direct_prompt_over, 33, 1, 32);
+
+            let mut streaming =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            streaming
+                .generate_streaming(&exact_prompt, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("streaming exact-fit request must succeed");
+            let streaming_seq_len = streaming.session.kv_cache.seq_len;
+            let mut streaming_callbacks = 0usize;
+            let streaming_over =
+                streaming.generate_streaming(&over_budget_prompt, &tokenizer, &gen_cfg, |_, _| {
+                    streaming_callbacks += 1;
+                    true
+                });
+            assert_context_budget_error(&streaming_over, 32, 1, 32);
+            assert_eq!(streaming_callbacks, 0, "rejection must precede callbacks");
+            assert_eq!(
+                streaming.session.kv_cache.seq_len, streaming_seq_len,
+                "streaming admission rejection must precede reset/prefill/decode"
+            );
+            let streaming_prompt_over =
+                streaming
+                    .generate_streaming(&over_window_prompt, &tokenizer, &gen_cfg, |_, _| true);
+            assert_context_budget_error(&streaming_prompt_over, 33, 1, 32);
+
+            let mut cached =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            cached
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    &exact_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                )
+                .expect("prefix-cache exact-fit request must succeed");
+            let cached_tokens = cached
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .expect("exact-fit request must retain a prefix-cache entry")
+                .generic
+                .token_ids
+                .clone();
+            let mut cached_callbacks = 0usize;
+            let cached_over = cached.generate_streaming_with_prefix_cache(
+                slot_id,
+                &over_budget_prompt,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| {
+                    cached_callbacks += 1;
+                    true
+                },
+            );
+            assert_context_budget_error(&cached_over, 32, 1, 32);
+            assert_eq!(cached_callbacks, 0, "rejection must precede callbacks");
+            assert_eq!(
+                cached
+                    .cross_turn_prefix_cache
+                    .entry
+                    .as_ref()
+                    .map(|entry| entry.generic.token_ids.clone()),
+                Some(cached_tokens.clone()),
+                "prefix-cache admission rejection must not evict the warm entry"
+            );
+            let cached_prompt_over = cached.generate_streaming_with_prefix_cache(
+                slot_id,
+                &over_window_prompt,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+            assert_context_budget_error(&cached_prompt_over, 33, 1, 32);
+            assert_eq!(
+                cached
+                    .cross_turn_prefix_cache
+                    .entry
+                    .as_ref()
+                    .map(|entry| entry.generic.token_ids.clone()),
+                Some(cached_tokens),
+                "prompt-over-window rejection must not evict the warm entry"
+            );
+
+            let make_multimodal = |total_len: usize| crate::vision::MultimodalInput {
+                patch_embeddings: vec![0.0; cfg.hidden_size],
+                raw_patches: 1,
+                visual_tokens: 1,
+                d_model: cfg.hidden_size,
+                text_tokens: vec![0; total_len - 1],
             };
-
-            let (cfg, weights) = tiny_hybrid_fixture();
-            // max_cache_len=4 is smaller than the 8-token prompt below, so the
-            // length preflight must trip before any prefill/decode work happens.
-            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny hybrid fixture");
-
-            let out = state
-                .generate("abcdefgh", &tokenizer, &gen_cfg)
-                .expect("no grammar configured; must not fail closed");
-
+            let mut multimodal =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            multimodal
+                .generate_multimodal(make_multimodal(31), &tokenizer, &gen_cfg)
+                .expect("multimodal exact-fit request must succeed");
+            let multimodal_seq_len = multimodal.session.kv_cache.seq_len;
+            let multimodal_over =
+                multimodal.generate_multimodal(make_multimodal(32), &tokenizer, &gen_cfg);
+            assert_context_budget_error(&multimodal_over, 32, 1, 32);
             assert_eq!(
-                out.generated_tokens, 0,
-                "the length preflight must bail before generating any tokens"
+                multimodal.session.kv_cache.seq_len, multimodal_seq_len,
+                "multimodal admission rejection must precede reset/prefill/decode"
             );
+            let multimodal_prompt_over =
+                multimodal.generate_multimodal(make_multimodal(33), &tokenizer, &gen_cfg);
+            assert_context_budget_error(&multimodal_prompt_over, 33, 1, 32);
+        }
+
+        #[test]
+        fn lora_mixture_context_rejection_preserves_adapter_and_cache() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let mut loaded_layer = make_valid_layer(cfg.hidden_size, 2);
+            loaded_layer.layer_idx = 3;
+            state
+                .load_lora_adapter(vec![loaded_layer], 1.0, None)
+                .expect("precondition adapter must load");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let warm_cfg = cross_turn_test_gen_cfg(7, 1);
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &warm_cfg,
+                    |_, _| true,
+                )
+                .expect("precondition cache warm-up must succeed");
+            let cached_tokens = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .expect("precondition cache entry must exist")
+                .generic
+                .token_ids
+                .clone();
+            let seq_len = state.session.kv_cache.seq_len;
+
+            let mut mixture_layer = make_valid_layer(cfg.hidden_size, 2);
+            mixture_layer.layer_idx = 3;
+            let mixture_layers = vec![mixture_layer];
+            let rejected_cfg = cross_turn_test_gen_cfg(9, 1);
+            let over_budget_prompt = "a".repeat(32);
+            let result = state.generate_with_lora_mixture(
+                &[(&mixture_layers, 1.0)],
+                &over_budget_prompt,
+                &tokenizer,
+                &rejected_cfg,
+            );
+
+            assert_context_budget_error(&result, 32, 1, 32);
             assert!(
-                out.stopped,
-                "prompt-too-long preflight must report stopped=true"
+                state.has_lora_adapter(),
+                "rejection must precede unloading the pre-existing adapter"
             );
             assert_eq!(
-                out.stop_reason,
-                Some(StopReason::KvFull),
-                "prompt longer than max_context must report KvFull, got {:?}",
-                out.stop_reason
+                state
+                    .cross_turn_prefix_cache
+                    .entry
+                    .as_ref()
+                    .map(|entry| entry.generic.token_ids.clone()),
+                Some(cached_tokens),
+                "rejection must precede adapter-driven prefix-cache invalidation"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len, seq_len,
+                "rejection must precede generation-state reset or GPU decode"
             );
         }
 

@@ -94,15 +94,15 @@ impl Qwen35Model {
         // extra edge request, never admit a panic). Same guard in
         // generate_streaming — using decode_cap is what makes a budgeted request
         // (which decodes past max_new_tokens) preflight against its true reach.
+        // #922: shared with the Metal entry points via `check_context_budget`.
         let max_context = self.max_context();
+        check_context_budget(
+            prompt_len,
+            gen_cfg.reasoning_budget,
+            gen_cfg.max_new_tokens,
+            max_context,
+        )?;
         let effective_new = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
-        if prompt_len.saturating_add(effective_new) > max_context {
-            return Err(InferenceError::Inference(format!(
-                "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
-                 model context window ({max_context})",
-                gen_cfg.max_new_tokens
-            )));
-        }
 
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
@@ -490,15 +490,15 @@ impl Qwen35Model {
         // unchecked, so a request past max_context() would panic in the decode
         // loop; this mirrors the HTTP server's total-token contract verbatim.
         // decode_cap accounts for a budgeted request decoding past max_new_tokens.
+        // #922: shared with the Metal entry points via `check_context_budget`.
         let max_context = self.max_context();
+        check_context_budget(
+            prompt_len,
+            gen_cfg.reasoning_budget,
+            gen_cfg.max_new_tokens,
+            max_context,
+        )?;
         let effective_new = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
-        if prompt_len.saturating_add(effective_new) > max_context {
-            return Err(InferenceError::Inference(format!(
-                "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
-                 model context window ({max_context})",
-                gen_cfg.max_new_tokens
-            )));
-        }
 
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
@@ -2241,6 +2241,54 @@ pub(crate) fn check_prompt_not_empty(prompt_len: usize) -> Result<(), InferenceE
     Ok(())
 }
 
+/// Shared total-context admission bound (#922): rejects a request whose
+/// prompt fits the window alone but whose prompt plus decode budget does
+/// not, closing exactly the gap between "will prefill" and "will actually
+/// be able to decode the requested completion."
+///
+/// This is the same "prompt plus requested completion fits the window"
+/// bound `generate` / `generate_streaming` (this module) apply inline —
+/// `effective_new` is `decode_cap(reasoning_budget, max_new_tokens)`, the
+/// budget-extended cap (equal to `max_new_tokens` when reasoning is
+/// unbudgeted), matching the true furthest position the decode loop can
+/// reach. Before #922, the three Metal entry points in
+/// `forward::metal_qwen35` (`generate`, `generate_streaming_with_cancel`,
+/// `generate_streaming_with_prefix_cache_and_cancel`) only checked
+/// `prompt_len > max_context`, so a request that fit the window by itself
+/// but would run the decode budget past it was admitted and either
+/// silently truncated mid-decode (the streaming paths self-limit on
+/// `seq_len >= max_cache_len`) or, worse, indexed the RoPE table
+/// out-of-bounds in the non-streaming `generate` (a release panic). Direct
+/// library callers and `chat_metal` hit this gap directly; HTTP callers
+/// behind `lattice_serve`/`lattice.rs` were already shielded by
+/// `serve::metal_worker::check_prompt_fits_window`'s independent
+/// (pre-existing) enforcement of the same total bound.
+///
+/// Every call site is expected to have already confirmed `prompt_len > 0`
+/// (via [`check_prompt_not_empty`]) and `max_new_tokens > 0` (typically via
+/// an early `max_new_tokens == 0` return) before calling this — those are
+/// separate, distinct guards with their own contracts and error shapes;
+/// this function only enforces the arithmetic bound.
+pub(crate) fn check_context_budget(
+    prompt_len: usize,
+    reasoning_budget: Option<usize>,
+    max_new_tokens: usize,
+    max_context: usize,
+) -> Result<(), InferenceError> {
+    let effective_new = decode_cap(reasoning_budget, max_new_tokens);
+    if prompt_len.saturating_add(effective_new) > max_context {
+        let reasoning_detail = reasoning_budget
+            .map(|budget| format!(", reasoning_budget={budget}"))
+            .unwrap_or_default();
+        return Err(InferenceError::Inference(format!(
+            "prompt ({prompt_len} tokens) plus effective decode cap ({effective_new} tokens; \
+             max_new_tokens={max_new_tokens}{reasoning_detail}) exceeds \
+             model context window ({max_context})"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2666,6 +2714,91 @@ mod tests {
         assert!(
             check_prompt_not_empty(1).is_ok(),
             "prompt_len == 1 (a real prompt) must be allowed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_context_budget (#922) — the shared total-context admission bound
+    // (prompt_len + decode budget <= max_context) every CPU `generate` /
+    // `generate_streaming` call site (this module) and every Metal generation
+    // entry point (`forward::metal_qwen35`: `generate`,
+    // `generate_streaming_with_cancel`, `generate_multimodal`,
+    // `generate_streaming_with_prefix_cache_and_cancel`) now calls, instead of
+    // the Metal-only bug of bounding `prompt_len` alone. Pure-function unit
+    // tests here (no GPU/Metal device needed); per-entry-point production-seam
+    // tests for the Metal call sites live in `forward/metal_qwen35.rs`.
+    // -----------------------------------------------------------------------
+
+    /// A prompt that fits the window by itself, but whose decode budget pushes
+    /// `prompt_len + max_new_tokens` past `max_context`, must be rejected.
+    ///
+    /// This is exactly the gap #922 reports: before the fix, the three Metal
+    /// entry points only checked `prompt_len > max_context` (8 <= 10 here), so
+    /// a request needing 8 + 5 = 13 tokens of window was wrongly admitted.
+    ///
+    /// Mutation sensitivity: change `check_context_budget` to check
+    /// `prompt_len > max_context` instead of the summed bound → this
+    /// assertion fails (8 > 10 is false), catching exactly the #922 gap this
+    /// function exists to close.
+    #[test]
+    fn check_context_budget_rejects_prompt_plus_budget_overflow() {
+        let result = check_context_budget(8, None, 5, 10);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(ref msg))
+                if msg.contains("8 tokens") && msg.contains("5") && msg.contains("10")),
+            "prompt (8) + max_new_tokens (5) = 13 > max_context (10) must be \
+             rejected, naming all three lengths in the message; got {result:?}"
+        );
+    }
+
+    /// Boundary: `prompt_len + max_new_tokens == max_context` exactly must be
+    /// admitted (the CPU bound is `<=`, not `<`).
+    ///
+    /// Mutation sensitivity: change the comparison from `>` to `>=` → this
+    /// assertion fails, catching a regression that would reject the exact
+    /// boundary request the CPU path (and the HTTP server) accepts.
+    #[test]
+    fn check_context_budget_admits_exact_boundary() {
+        assert!(
+            check_context_budget(8, None, 2, 10).is_ok(),
+            "prompt (8) + max_new_tokens (2) == max_context (10) must be admitted"
+        );
+    }
+
+    /// A prompt that fits alone AND fits with its budget must be admitted.
+    #[test]
+    fn check_context_budget_admits_well_within_bound() {
+        assert!(
+            check_context_budget(4, None, 2, 10).is_ok(),
+            "prompt (4) + max_new_tokens (2) = 6 <= max_context (10) must be admitted"
+        );
+    }
+
+    /// A reasoning budget extends the effective decode cap by
+    /// `reasoning_budget + 1` (the forced `</think>` delimiter, see
+    /// `decode_cap`), so a request that fits on `max_new_tokens` alone must
+    /// still be rejected once its reasoning budget is accounted for.
+    ///
+    /// Mutation sensitivity: change `check_context_budget` to ignore
+    /// `reasoning_budget` (pass `max_new_tokens` directly to the bound
+    /// instead of `decode_cap(reasoning_budget, max_new_tokens)`) → this
+    /// assertion fails (8 + 2 = 10 <= 10 would wrongly admit), catching a
+    /// regression that silently drops budgeted-reasoning requests from the
+    /// bound.
+    #[test]
+    fn check_context_budget_accounts_for_reasoning_budget() {
+        // decode_cap(Some(3), 2) = 3 + 2 + 1 = 6; prompt 8 + 6 = 14 > 10.
+        let result = check_context_budget(8, Some(3), 2, 10);
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::Inference(ref message))
+                    if message == "prompt (8 tokens) plus effective decode cap (6 tokens; \
+                                   max_new_tokens=2, reasoning_budget=3) exceeds model context \
+                                   window (10)"
+            ),
+            "reasoning-budget admission errors must report the effective cap and its inputs; \
+             got {result:?}"
         );
     }
 

@@ -60,6 +60,17 @@ pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_n
 // (forward::metal_qwen35) calls this instead of its own inline
 // `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
 pub(crate) use generation::check_prompt_not_empty;
+// Shared total-context admission bound (#922): every Metal generation entry
+// point (forward::metal_qwen35) calls this after check_prompt_not_empty to
+// mirror the CPU `generate`/`generate_streaming` total bound
+// (prompt_len + decode budget <= max_context), instead of only bounding the
+// prompt alone. Only the Metal (`mod inner`, gated identically) consumer
+// needs the re-export; the CPU forward paths (cpu_f16, cpu_q8, neon_forward)
+// already enforce this same bound with their own inline check and
+// `generation.rs` itself uses `check_context_budget` directly within its own
+// module.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use generation::check_context_budget;
 // Shared backend-neutral decode-policy struct (reasoning-budget accounting +
 // logprobs formatting), consumed by the Metal streaming loops in
 // `crate::forward::metal_qwen35` so the same bookkeeping isn't re-duplicated
