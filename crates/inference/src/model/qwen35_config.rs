@@ -42,6 +42,37 @@ pub enum LayerType {
     FullAttention,
 }
 
+/// **Unstable**: ViT geometry for vision-language checkpoint variants, parsed from the
+/// top-level `vision_config` object in `config.json` (a sibling of `text_config`, not nested
+/// inside it). `None` on [`Qwen35Config`] for text-only checkpoints.
+///
+/// Parsed but not yet consumed (ADR-069 stage S1) — weight loading (S2), the Metal ViT
+/// forward pass, patch merger, and image-token injection land in later stages.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct VisionModelConfig {
+    /// Number of ViT transformer blocks.
+    pub depth: usize,
+    /// ViT hidden dimension.
+    pub hidden_size: usize,
+    /// ViT attention head count.
+    pub num_heads: usize,
+    /// Patch size in pixels (square patches).
+    pub patch_size: usize,
+    /// Spatial merge factor applied by the patch merger before projecting into decoder space.
+    pub spatial_merge_size: usize,
+    /// Merger output dimension (equals the text decoder `hidden_size` for this checkpoint).
+    pub out_hidden_size: usize,
+    /// Temporal patch size (frames folded per patch) for video input.
+    pub temporal_patch_size: usize,
+    /// Learned position-embedding table size.
+    pub num_position_embeddings: usize,
+    /// Input image channel count.
+    pub in_channels: usize,
+    /// DeepStack visual layer indexes; empty for checkpoints that don't use DeepStack fusion.
+    #[serde(default)]
+    pub deepstack_visual_indexes: Vec<usize>,
+}
+
 /// **Unstable**: Qwen hybrid attention model configuration; fields evolving with model variants.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
@@ -122,6 +153,25 @@ pub struct Qwen35Config {
     /// preset's context length.
     #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
+
+    // --- Vision-language extension (ADR-069 S1) ---
+    /// ViT geometry from the top-level `vision_config` object; `None` for text-only
+    /// checkpoints. Parsed but not yet consumed by the forward pass (S2 loads the weights;
+    /// S3+ wires them into the decode path).
+    #[serde(default)]
+    pub vision_config: Option<VisionModelConfig>,
+    /// Placeholder token id marking an image-patch span in the input sequence.
+    #[serde(default)]
+    pub image_token_id: Option<u32>,
+    /// Placeholder token id marking a video-frame span in the input sequence.
+    #[serde(default)]
+    pub video_token_id: Option<u32>,
+    /// Token id opening a vision content span (wraps image/video token runs).
+    #[serde(default)]
+    pub vision_start_token_id: Option<u32>,
+    /// Token id closing a vision content span.
+    #[serde(default)]
+    pub vision_end_token_id: Option<u32>,
 }
 
 fn default_tie_word_embeddings() -> bool {
@@ -140,15 +190,38 @@ pub struct RopeParams {
     pub rope_theta: f64,
     #[serde(default)]
     pub partial_rotary_factor: Option<f32>,
+    /// Per-axis (temporal, height, width) M-RoPE section sizes, e.g. `[11, 11, 10]`.
+    /// `None` when the checkpoint has no vision M-RoPE config (text-only decoders use plain
+    /// 1-D partial RoPE). Parsed but not yet consumed by the forward pass (ADR-069 S1; wired
+    /// in S3+).
+    #[serde(default)]
+    pub mrope_section: Option<Vec<usize>>,
+    /// Whether M-RoPE frequencies are interleaved `[T, H, W, T, H, W, ...]` (true for
+    /// Qwen3.5) rather than block-concatenated. `None` when absent (text-only decoders).
+    #[serde(default)]
+    pub mrope_interleaved: Option<bool>,
 }
 
-// Private helper for HF config.json structure (outer wrapper with text_config).
+// Private helper for HF config.json structure (outer wrapper with text_config). The
+// vision-language fields are siblings of text_config at the top level of config.json, not
+// nested inside it, so they are threaded onto the parsed Qwen35Config in from_config_json_str
+// the same way tie_word_embeddings already is.
 #[derive(Debug, serde::Deserialize)]
 struct HfQwenConfigFile {
     #[serde(default)]
     text_config: Option<Qwen35Config>,
     #[serde(default)]
     tie_word_embeddings: Option<bool>,
+    #[serde(default)]
+    vision_config: Option<VisionModelConfig>,
+    #[serde(default)]
+    image_token_id: Option<u32>,
+    #[serde(default)]
+    video_token_id: Option<u32>,
+    #[serde(default)]
+    vision_start_token_id: Option<u32>,
+    #[serde(default)]
+    vision_end_token_id: Option<u32>,
 }
 
 impl Default for Qwen35Config {
@@ -203,6 +276,12 @@ impl Qwen35Config {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            // Vision-language extension (this preset is text-only, no vision tower)
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         }
     }
 
@@ -253,6 +332,12 @@ impl Qwen35Config {
             mtp_num_hidden_layers: 1,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            // Vision-language extension (this preset is text-only, no vision tower)
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         }
     }
 
@@ -295,6 +380,12 @@ impl Qwen35Config {
             mtp_num_hidden_layers: 1,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            // Vision-language extension (this preset is text-only, no vision tower)
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         }
     }
 
@@ -345,6 +436,12 @@ impl Qwen35Config {
             mtp_num_hidden_layers: 1,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            // Vision-language extension (this preset is text-only, no vision tower)
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         }
     }
 
@@ -393,6 +490,14 @@ impl Qwen35Config {
         if let Some(tie) = parsed.tie_word_embeddings {
             cfg.tie_word_embeddings = tie;
         }
+        // Vision-language fields (ADR-069 S1) are siblings of text_config at the top level of
+        // config.json, not nested inside it — thread them onto cfg the same way as
+        // tie_word_embeddings above. Parsed but not yet consumed by the forward pass.
+        cfg.vision_config = parsed.vision_config;
+        cfg.image_token_id = parsed.image_token_id;
+        cfg.video_token_id = parsed.video_token_id;
+        cfg.vision_start_token_id = parsed.vision_start_token_id;
+        cfg.vision_end_token_id = parsed.vision_end_token_id;
         // Many models nest rope_theta and partial_rotary_factor under rope_parameters
         // instead of at the text_config level — extract when the flat fields are unset.
         if let Some(rp) = &cfg.rope_parameters {
@@ -1558,8 +1663,9 @@ mod tests {
         assert_eq!(cfg.max_position_embeddings, 262_144);
         assert_eq!(cfg.mtp_num_hidden_layers, 1);
 
-        // Released checkpoint is a dense vision-language model — neither the MoE
-        // fields nor the vision wrapper may leak into the text config.
+        // Released checkpoint is a dense vision-language model: the MoE fields must still
+        // resolve to None (0.8B has no MoE), while the vision_config / token-id / mrope
+        // fields below are now parsed onto the config (ADR-069 S1) instead of being dropped.
         assert!(!cfg.is_moe(), "Qwen3.5-0.8B is dense, not MoE");
 
         // rope_theta and partial_rotary_factor are nested under rope_parameters
@@ -1583,6 +1689,78 @@ mod tests {
 
         // tie_word_embeddings is taken from the outer wrapper.
         assert!(cfg.tie_word_embeddings);
+
+        // ADR-069 S1: vision_config, the four vision token ids, and the M-RoPE section
+        // fields are top-level / text_config.rope_parameters siblings, respectively, and
+        // must now round-trip onto the config (parsed but not yet consumed by forward).
+        let vision = cfg
+            .vision_config
+            .as_ref()
+            .expect("released checkpoint has a vision_config");
+        assert_eq!(vision.depth, 12);
+        assert_eq!(vision.hidden_size, 768);
+        assert_eq!(vision.num_heads, 12);
+        assert_eq!(vision.patch_size, 16);
+        assert_eq!(vision.spatial_merge_size, 2);
+        assert_eq!(vision.out_hidden_size, 1024);
+        assert_eq!(vision.temporal_patch_size, 2);
+        assert_eq!(vision.num_position_embeddings, 2304);
+        assert_eq!(vision.in_channels, 3);
+        assert!(vision.deepstack_visual_indexes.is_empty());
+
+        assert_eq!(cfg.image_token_id, Some(248_056));
+        assert_eq!(cfg.video_token_id, Some(248_057));
+        assert_eq!(cfg.vision_start_token_id, Some(248_053));
+        assert_eq!(cfg.vision_end_token_id, Some(248_054));
+
+        let rope_params = cfg
+            .rope_parameters
+            .as_ref()
+            .expect("released checkpoint nests rope_parameters under text_config");
+        assert_eq!(rope_params.mrope_section, Some(vec![11, 11, 10]));
+        assert_eq!(rope_params.mrope_interleaved, Some(true));
+    }
+
+    #[test]
+    fn test_text_only_config_has_no_vision_fields() {
+        // A text-only config.json (no vision_config, no token ids, no mrope fields) must
+        // still parse cleanly, with every vision-language field resolving to None — proving
+        // the ADR-069 S1 additions don't regress the plain-text decoder path. Also asserts an
+        // existing non-vision field to prove nothing else regressed in the same parse.
+        let json = r#"{
+            "text_config": {
+                "hidden_size": 1024,
+                "num_hidden_layers": 4,
+                "vocab_size": 1000,
+                "intermediate_size": 2048,
+                "rms_norm_eps": 1e-6,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 0.25,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 16,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "full_attention_interval": 4,
+                "eos_token_id": 999,
+                "max_position_embeddings": 4096
+            }
+        }"#;
+        let cfg =
+            Qwen35Config::from_config_json_str(json).expect("text-only config.json still parses");
+
+        assert_eq!(cfg.hidden_size, 1024, "non-vision field must still parse");
+        assert!(cfg.vision_config.is_none());
+        assert!(cfg.image_token_id.is_none());
+        assert!(cfg.video_token_id.is_none());
+        assert!(cfg.vision_start_token_id.is_none());
+        assert!(cfg.vision_end_token_id.is_none());
+        let rope_params = cfg.rope_parameters.clone().unwrap_or_default();
+        assert!(rope_params.mrope_section.is_none());
+        assert!(rope_params.mrope_interleaved.is_none());
     }
 
     // ──────────────────────────────────────────────────────────────────────

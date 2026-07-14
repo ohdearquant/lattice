@@ -482,6 +482,11 @@ mod lora_serving {
             mtp_num_hidden_layers: 0,
             mtp_use_dedicated_embeddings: false,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         }
     }
 

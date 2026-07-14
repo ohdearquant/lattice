@@ -289,6 +289,11 @@ mod mtp_resolve_tests {
             eos_token_id: 63,
             max_position_embeddings: 128,
             quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
         }
     }
 
@@ -18890,6 +18895,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 eos_token_id: (vocab - 1) as u32,
                 max_position_embeddings: 128,
                 quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
             };
 
             let mut embed_tokens = vec![0.0f32; vocab * hidden];
@@ -19909,6 +19919,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 eos_token_id: (vocab - 1) as u32,
                 max_position_embeddings: 128,
                 quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
             }
         }
 
@@ -23742,6 +23757,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 eos_token_id: (vocab - 1) as u32,
                 max_position_embeddings: 128,
                 quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
             };
 
             let make_common = || CommonLayerWeights {
@@ -24088,6 +24108,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 eos_token_id: (vocab - 1) as u32,
                 max_position_embeddings: 128,
                 quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
             };
 
             let embed_tokens = vec![0.0f32; vocab * hidden];

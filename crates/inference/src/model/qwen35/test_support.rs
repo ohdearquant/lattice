@@ -90,6 +90,11 @@ pub fn tiny_zero_model_with_tokenizer(tok_json: &str) -> Qwen35Model {
         mtp_num_hidden_layers: 0,
         mtp_use_dedicated_embeddings: false,
         quarot_rotation_seed: None,
+        vision_config: None,
+        image_token_id: None,
+        video_token_id: None,
+        vision_start_token_id: None,
+        vision_end_token_id: None,
     };
 
     let z = |len: usize| vec![0.0_f32; len];
