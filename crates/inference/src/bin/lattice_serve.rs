@@ -1100,6 +1100,16 @@ mod imp {
     /// read directly off the shared worker's admission semaphore (issue
     /// #932's cap), not a separately-tracked counter that could drift from
     /// the real admission state.
+    ///
+    /// **Deployment boundary**: this endpoint has no authentication or
+    /// opt-in guard, matching every other route on this server (see
+    /// "Auth, rate limiting, and concurrency" in `docs/serve-http-api.md`).
+    /// Accepted as-is for the current local-first deployment model (this
+    /// server binds `127.0.0.1` by default), but `--host` can bind a
+    /// non-loopback address -- doing that exposes `/metrics` (request
+    /// volume/latency/error-rate shape) to anyone who can reach the
+    /// listening address. Do not bind `--host` to a non-loopback address
+    /// without an external auth layer (reverse proxy, firewall) in front.
     async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
         let in_flight = s.max_pending.saturating_sub(s.jobs.available_permits());
         let body = s.metrics.render(s.model_id.as_ref(), in_flight);
@@ -1116,12 +1126,20 @@ mod imp {
     /// `Body`, `Done`, and `End` carry the (completion_tokens, prompt_tokens)
     /// pair so failure paths preserve the deltas emitted before the worker
     /// failed, and `/metrics` (issue #583) gets prompt-token counts even for
-    /// streaming responses.
+    /// streaming responses. `Done`/`End` also carry an `error outcome`:
+    /// `None` for a clean `Complete`, `Some((status, code))` for a mid-stream
+    /// `Failed`/`Rejected`/worker-gone event -- the on-the-wire HTTP status
+    /// was already committed to 200 before streaming started and can't
+    /// change, but `Phase::End`'s `emit_serve_event` call uses this to
+    /// record the *true* logical status/error code, mirroring exactly what
+    /// the non-streaming branch below records for the same failure classes.
+    /// Without this, every failed stream was recorded as a successful 200
+    /// with no error code, so `lattice_errors_total` never counted them.
     enum Phase {
         Start,
         Body(usize),
-        Done(usize, usize), // completion_tokens, prompt_tokens
-        End(usize, usize),  // completion_tokens, prompt_tokens; emits telemetry then stream ends
+        Done(usize, usize, Option<(u16, &'static str)>), // completion_tokens, prompt_tokens, error outcome
+        End(usize, usize, Option<(u16, &'static str)>),  // same; emits telemetry then stream ends
     }
 
     async fn chat_completions(State(s): State<AppState>, body: Body) -> Response {
@@ -1439,6 +1457,7 @@ mod imp {
                                             Phase::Done(
                                                 output.generated_tokens,
                                                 output.prompt_tokens,
+                                                None,
                                             ),
                                             cancel_guard,
                                             None,
@@ -1468,7 +1487,13 @@ mod imp {
                                         Ok(Event::default().data(error.to_string())),
                                         (
                                             rx,
-                                            Phase::Done(completion_tokens, 0),
+                                            // Mirrors the non-streaming `Failed` arm's
+                                            // 500 + "internal_error" recording below.
+                                            Phase::Done(
+                                                completion_tokens,
+                                                0,
+                                                Some((500, "internal_error")),
+                                            ),
                                             cancel_guard,
                                             None,
                                             metrics,
@@ -1499,11 +1524,14 @@ mod imp {
                                             "param": null,
                                         }
                                     });
+                                    // Mirrors the non-streaming `Rejected` arm's
+                                    // 400 + `api_err.code()` recording below.
+                                    let error_outcome = Some((400, api_err.code()));
                                     Some((
                                         Ok(Event::default().data(error.to_string())),
                                         (
                                             rx,
-                                            Phase::Done(completion_tokens, 0),
+                                            Phase::Done(completion_tokens, 0, error_outcome),
                                             cancel_guard,
                                             None,
                                             metrics,
@@ -1522,11 +1550,18 @@ mod imp {
                                             "param": null,
                                         }
                                     });
+                                    // Mirrors this same file's non-streaming
+                                    // worker-unavailable preflight, which
+                                    // records 500 + "internal_error".
                                     Some((
                                         Ok(Event::default().data(error.to_string())),
                                         (
                                             rx,
-                                            Phase::Done(completion_tokens, 0),
+                                            Phase::Done(
+                                                completion_tokens,
+                                                0,
+                                                Some((500, "internal_error")),
+                                            ),
                                             cancel_guard,
                                             None,
                                             metrics,
@@ -1534,21 +1569,34 @@ mod imp {
                                     ))
                                 }
                             },
-                            Phase::Done(ct, pt) => Some((
+                            Phase::Done(ct, pt, outcome) => Some((
                                 Ok(Event::default().data("[DONE]")),
-                                (rx, Phase::End(ct, pt), cancel_guard, None, metrics),
+                                (rx, Phase::End(ct, pt, outcome), cancel_guard, None, metrics),
                             )),
-                            Phase::End(ct, pt) => {
+                            Phase::End(ct, pt, outcome) => {
+                                // `outcome` is the true logical result of the
+                                // stream: `None` for a clean `Complete`,
+                                // `Some((status, code))` when one of the
+                                // failure arms above ran. The wire status was
+                                // already committed to 200 SSE and cannot
+                                // change, but the RECORDED metric must
+                                // reflect what actually happened so
+                                // `lattice_errors_total` and the request
+                                // counter aren't lying about a failed stream.
+                                let (status, error_code) = match outcome {
+                                    Some((status, code)) => (status, Some(code)),
+                                    None => (200, None),
+                                };
                                 emit_serve_event(
                                     &metrics,
                                     "POST",
                                     "/v1/chat/completions",
-                                    200,
+                                    status,
                                     Some(pt),
                                     Some(ct),
                                     timer.elapsed().as_secs_f64() * 1000.0,
                                     true,
-                                    None,
+                                    error_code,
                                 );
                                 None
                             }
@@ -1871,6 +1919,18 @@ mod imp {
             .unwrap_or_else(|| model_dir.join("tokenizer.json"));
 
         let host = parse_arg(&args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
+        // `/metrics` (and every other route on this server) has no
+        // authentication -- fine for the local-first default (`127.0.0.1`),
+        // but a non-loopback `--host` exposes it to the network. Warn once
+        // at startup rather than silently doing so; see the deployment-
+        // boundary note on `metrics_handler` and `docs/serve-http-api.md`.
+        if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+            eprintln!(
+                "[lattice_serve] WARNING: --host {host} is not loopback; /metrics and every \
+                 other route are unauthenticated -- do not expose this to an untrusted network \
+                 without an external auth layer (reverse proxy, firewall)."
+            );
+        }
         let port: u16 = parse_arg(&args, "--port")
             .and_then(|s| s.parse().ok())
             .or_else(|| {
@@ -2803,6 +2863,64 @@ mod imp {
             assert!(
                 !text.contains("\"finish_reason\":\"stop\""),
                 "generation failure must not masquerade as a clean stop; got: {text}"
+            );
+        }
+
+        /// Reviewer finding (b): a mid-stream `WorkerEvent::Failed` (or
+        /// `Rejected`/worker-gone) emits a client-facing SSE error event
+        /// (asserted above) but, before this fix, the terminal `Phase::End`
+        /// still recorded the request in `/metrics` as a plain 200 with no
+        /// error code -- `lattice_errors_total` never incremented for a
+        /// failed stream. Mutation-sensitive: reverting the `Phase::Done`/
+        /// `Phase::End` error-outcome threading (while keeping this test)
+        /// makes this fail, because the recorded counter reverts to
+        /// `status="200"` and `lattice_errors_total{code="internal_error"}`
+        /// stays absent.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_streaming_failure_records_failed_metric() {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.reply(WorkerEvent::Delta("partial".to_string()));
+                    let _ = job.reply(WorkerEvent::Failed("blocked by grammar".to_string()));
+                }
+            });
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
+            );
+            let response = chat_completions(State(state.clone()), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            // Drain the full SSE body so the stream runs to `Phase::End`,
+            // which is where the metric gets recorded.
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("SSE response body must be readable");
+
+            let metrics_response = metrics_handler(State(state.clone())).await.into_response();
+            let bytes = axum::body::to_bytes(metrics_response.into_body(), usize::MAX)
+                .await
+                .expect("metrics body must be readable");
+            let text = String::from_utf8(bytes.to_vec()).expect("metrics body must be UTF-8");
+
+            assert!(
+                !text.contains(
+                    "lattice_http_requests_total{method=\"POST\",route=\"/v1/chat/completions\",status=\"200\""
+                ),
+                "a failed stream must NOT be recorded as a 200; got:\n{text}"
+            );
+            assert!(
+                text.contains(
+                    "lattice_http_requests_total{method=\"POST\",route=\"/v1/chat/completions\",status=\"500\",model=\"test-model\"} 1"
+                ),
+                "failed stream must be recorded with the same 500 status the non-streaming \
+                 `Failed` arm records; got:\n{text}"
+            );
+            assert!(
+                text.contains(
+                    "lattice_errors_total{code=\"internal_error\",model=\"test-model\"} 1"
+                ),
+                "lattice_errors_total must increment for a failed stream; got:\n{text}"
             );
         }
 

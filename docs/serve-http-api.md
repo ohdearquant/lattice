@@ -19,10 +19,15 @@ This codebase has **two** separately built HTTP servers with confusingly similar
 - **`lattice_serve`** — a separate, standalone binary
   (`crates/inference/src/bin/lattice_serve.rs`), purpose-built as the internal HTTP daemon the
   macOS Lattice Studio app spawns and talks to (introduced in PR #435). It has its own, narrower
-  route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`) and its own
-  disconnect-cancellation behavior (PR #552/#606) that `lattice serve` does not have (see
-  "Streaming" below). It is not what the README's HTTP API section documents, and it is out of
-  scope for this document.
+  route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `GET /metrics`)
+  and its own disconnect-cancellation behavior (PR #552/#606) that `lattice serve` does not have
+  (see "Streaming" below). It is not what the README's HTTP API section documents, and it is out
+  of scope for this document -- with one exception worth flagging here: `lattice_serve`'s
+  `GET /metrics` (issue #583) carries the same "no authentication" posture described below for
+  `lattice serve`'s routes, and it is bound by the same `--host`/loopback-default rule. Do not
+  point `--host` at a non-loopback address for either binary without an external auth layer
+  (reverse proxy, firewall) in front -- `/metrics` exposes request volume/latency/error-rate shape
+  to anyone who can reach the listening address.
 
 If you arrived here from an issue or note that points at `lattice_serve.rs` specifically: the
 README's actual HTTP API example — the thing that issue was asking to be expanded — targets
