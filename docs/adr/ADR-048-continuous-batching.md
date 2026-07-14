@@ -5,6 +5,7 @@
 **Crate**: `lattice-inference`
 **Depends on**: ADR-004 (KV Cache), ADR-008 (LoRA Injection), ADR-047 (Paged KV Cache)
 **Amendment (2026-05-27)**: ADR-063 supersedes the "Tokio task owning a dedicated Metal command buffer encoder" Phase 2 wording. GPU work runs on a dedicated OS thread (`std::thread`), not on the tokio runtime, to avoid starving HTTP handlers during 10-100ms GPU steps. The Phase 1 `FifoScheduler`, chunked prefill, and single-resource GPU scheduling remain unchanged and are consumed by ADR-063.
+**Implementation correction (2026-07-14)**: The shipped Phase 1 `InferenceRequest` does not carry a caller-assigned `SeqId` or response channel. `BatchWorker::submit` assigns and returns `Option<SeqId>`, rejecting empty or over-length requests, and `BatchWorker::step` returns the iteration's buffered `Vec<InferenceToken>` events. The original request-lifecycle decision remains otherwise unchanged.
 
 ---
 
@@ -131,17 +132,18 @@ pub struct SeqId(u64);
 
 /// Submitted by the caller; scheduler takes ownership.
 pub struct InferenceRequest {
-    pub id: SeqId,
     pub prompt_ids: Vec<u32>,
     pub sampling: SamplingConfig,
     /// None = base model. Some = adapter key for LoraHook dispatch.
     pub lora_adapter: Option<AdapterKey>,
     /// Maximum tokens to generate (hard cap enforced by scheduler).
     pub max_new_tokens: usize,
-    pub response_tx: tokio::sync::mpsc::Sender<InferenceToken>,
 }
 
-/// Streamed back to caller one token at a time.
+// The worker assigns identity at admission; None means the request was rejected.
+let seq_id: Option<SeqId> = worker.submit(request);
+
+/// Returned from BatchWorker::step for this iteration.
 pub struct InferenceToken {
     pub seq_id: SeqId,
     pub token_id: u32,

@@ -868,7 +868,7 @@ impl<'a> MtpVerifier<'a> {
             );
         }
 
-        // Partial RoPE (interleaved pairing, first rope_dim dims of each head)
+        // Partial RoPE (stride-half pairing; see mtp_apply_partial_rope)
         for h in 0..num_q_heads {
             let start = h * head_dim;
             mtp_apply_partial_rope(

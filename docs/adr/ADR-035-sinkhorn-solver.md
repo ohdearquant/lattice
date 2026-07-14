@@ -14,7 +14,7 @@ embedding drift diagnostics.
 
 Entropic regularization (Cuturi 2013) reduces this to O(n²) iterations via the
 Sinkhorn-Knopp algorithm, at the cost of biased distances that must be corrected via
-Sinkhorn divergence (see ADR-005).
+Sinkhorn divergence (see ADR-039).
 
 ## Decision
 

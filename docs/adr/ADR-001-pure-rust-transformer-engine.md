@@ -22,7 +22,7 @@ The engine implements the full transformer forward pass:
 
 ### Hardware acceleration
 
-- **Metal GPU** (Apple Silicon) — fused attention kernel, head_dim=128, GQA groups=2
+- **Metal GPU** (Apple Silicon) — fused attention kernels compiled with model-specific head dimension and GQA group count; requires a nonzero head dimension divisible by 4 and query-head count divisible by a nonzero KV-head count
 - **NEON** (aarch64 CPU) — fallback when Metal shape constraints don't match
 - **AVX2** (x86_64) — 8-wide f32 SIMD
 - **Scalar** — universal fallback

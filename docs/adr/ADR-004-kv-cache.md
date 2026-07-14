@@ -99,7 +99,7 @@ Provide **two complementary KV cache implementations**: `FlatKVCache` for single
    bounds check now produces an `Err` instead of panicking. The allocation-free
    property is preserved.] For embedding workloads where `forward()` is called
    thousands of times per second, this eliminates GC pressure entirely.
-2. **Contiguous layout per layer**: Each layer's K tensor is a single `Vec<f32>` of size `max_seq_len * kv_dim`. The layout `[max_seq_len, kv_dim]` means that reading a full key sequence for attention is a single contiguous memory region — cache-friendly for the GEMM in attention scoring.
+2. **Contiguous layout per layer**: Each layer's K tensor is a single `Vec<f16>` of size `max_seq_len * kv_dim`. The layout `[max_seq_len, kv_dim]` means that reading a full key sequence for attention is a single contiguous memory region; reads dequantize into caller-provided f32 scratch for attention scoring.
 3. **`reset_fast()` vs `reset()`**: The fast reset sets only `seq_len = 0` without zeroing. The caller is responsible for not reading stale data. This is correct because every position up to `seq_len` is written before being read. Saves ~7 ms for a 4096-token cache on M3.
 4. **256-token page granularity in PagedKVCache**: Balances internal fragmentation (larger pages = more waste for short sequences) against management overhead (smaller pages = more entries in the page table and LRU structure). 256 tokens at 128 head_dim × 8 heads × 2 sides × 4 bytes = 2 MB per page — fits one huge page on Linux.
 5. **LRU eviction in PagedKVCache**: Sequences that haven't been accessed recently are evicted. This is correct for multi-user embedding servers where active queries are always in progress and idle sequences can be re-encoded on next request.
