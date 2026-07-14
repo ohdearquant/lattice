@@ -23,7 +23,7 @@
 //! ```rust,ignore
 //! use std::sync::Arc;
 //! use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
-//! use lattice_inference::generate::GenerateConfig;
+//! use lattice_inference::model::GenerateConfig;
 //!
 //! let spec = GrammarSpec::json_schema_str(r#"{"type":"object","properties":{"name":{"type":"string"}}}"#)?;
 //! let vocab_bytes: Vec<Vec<u8>> = tokenizer.vocab_bytes(model.config().vocab_size)?;
