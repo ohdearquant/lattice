@@ -775,11 +775,11 @@ pub struct ProductionAdapterObservation {
 }
 
 /// The exact ChatML rendering both binaries' production code produces for a
-/// single `{role: "user", content: "hi there"}` message -- `lattice.rs`'s
-/// `render_prompt` and `lattice_serve.rs`'s (shared-engine)
-/// `format_chat_template` use the identical
-/// `"<|im_start|>{role}\n{content}<|im_end|>\n"` + trailing
-/// `"<|im_start|>assistant\n"` template. A ground-truth literal, not a call
+/// single `{role: "user", content: "hi there"}` message -- `lattice.rs` and
+/// `lattice_serve.rs` both render every request through the same engine
+/// `format_chat_template` (#668) as of this fixture, so there is only one
+/// renderer to pin against: `"<|im_start|>{role}\n{content}<|im_end|>\n"` +
+/// trailing `"<|im_start|>assistant\n"`. A ground-truth literal, not a call
 /// into either binary's render function, so a template regression in either
 /// binary is visible against this fixture instead of round-tripping through
 /// the same (possibly mutated) function that produced it (issue #828).
