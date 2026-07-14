@@ -103,12 +103,10 @@ destructive-eviction hazard those two existing guards were already routed around
 **Scope note:** "unified" above means the seven `MetalQwen35State`/CPU-forward paths
 this document tracks (eight physical call sites once the CPU dispatcher/streaming
 entry points that call into the three CPU forward functions are counted separately —
-see #915's PR body). It does **not** cover
+see #915's PR body). The separate, model-agnostic public helper
 `lattice_inference::speculative::generate_with_speculation`
-(`crates/inference/src/speculative.rs`) — a separate, model-agnostic, non-`Result`
-public helper outside this issue's original scope. That function has its own
-documented empty-input exception (see its doc comment) and is tracked for a fallible
-signature at <https://github.com/ohdearquant/lattice/issues/916> (targets 0.7.0).
+(`crates/inference/src/speculative.rs`) also rejects an empty prompt with the same
+typed error as of 0.7.0 (#916), but remains outside this document's path count.
 
 Re-verify these line numbers before relying on them; `metal_qwen35.rs` changes
 frequently (see the file-level warning at the top of this document).
