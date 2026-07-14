@@ -1,7 +1,7 @@
 # ADR-072: Weight Quantization Priority (Metal)
 
-**Status**: Proposed
-**Date**: 2026-07-09
+**Status**: Accepted
+**Date**: 2026-07-09 (accepted 2026-07-14)
 **Crate**: lattice-inference
 
 > **Evidence basis**: The Decision below is grounded in this engine's own shipped source and
@@ -109,6 +109,45 @@ and loader stay shipped infrastructure (correct and gated, and still serving the
 but offline QuaRot is **not a recommended serving tier** until #703 recovers it — the ADR-044
 conclusion is amended to this at the priority level (already reflected in the W5 gate's note).
 
+## Amendment 1 — `Q3Block` format (P1, accepted 2026-07-14)
+
+The P1 W3 build is split into a CPU format stage and a Metal kernel stage. This amendment fixes the
+on-disk / in-memory `Q3Block` format so the two stages share one authoritative definition. Stage 1
+(the format module + round-trip goldens, no engine change) implements exactly this; Stage 2 (the
+Metal `gemm_q3` / `gemv_q3` dequant kernels) consumes it. Attention and GDN weights stay Q4/Q8 — W3
+is MLP-only (gate/up/down).
+
+**Block.** Group-32, **16 bytes**, 4.0 bpw:
+
+| bytes | field | meaning |
+|-------|-------|---------|
+| `0..2` | `scale` | `f16` (stored as `u16` bits) |
+| `2..4` | `bias` | `f16` (stored as `u16` bits) |
+| `4..16` | `packed` | `[u8; 12]` — 32 3-bit codes, plane-split |
+
+**Plane-split 2+1 packing.** The 32 codes are split into a low-2-bit plane and a high-1-bit plane
+(chosen over a dense 3-bit bitstream because each plane byte-aligns, so pack/unpack is branch-free
+and no code straddles a byte boundary):
+
+- low-2-bit plane → `packed[0..8]`: `packed[b] = q2[4b] | q2[4b+1]<<2 | q2[4b+2]<<4 | q2[4b+3]<<6`
+- high-1-bit plane → `packed[8..12]`: `packed[8+b] = Σ_{k=0..7} hi[8b+k] << k`
+- dequant index `i`: `q[i] = ((packed[i/4] >> ((i%4)*2)) & 0x3) | (((packed[8 + i/8] >> (i%8)) & 0x1) << 2)`
+
+**Quantization.** Asymmetric is the default; symmetric is available for zero-mean weights:
+
+- asymmetric: `scale = (max - min) / 7`, `bias = min`, `q = clamp(round((w - min) / scale), 0, 7)`
+- symmetric: `scale = abs_max / 3.5`, `bias = -4·scale`, `q = clamp(round(w / scale) + 4, 0, 7)`
+- dequant (both): `w ≈ q · scale + bias`
+
+**File.** Magic `KHQ3`, version `1`. Load fails closed on bad magic, non-finite scale/bias, or a
+shape whose element count disagrees with the block count.
+
+**Validation gates (pre-registered, binding).** PPL delta ceiling **0.2** vs the 16.589111 golden
+via the `eval_perplexity --q4-dir` path (#616 gate), no post-hoc widening; a miss routes to
+role-aware selective W3 (#423), documented honestly. Plus `make bench-compare` for the decode-time
+claim. Stage 1 carries no runtime path, so its gate is the round-trip / mutation-sensitivity test
+suite; the PPL and bench gates bind at Stage 2.
+
 ## Consequences
 
 - **Positive.** The ADR leads with the single lever the measured decode profile says matters
@@ -125,7 +164,7 @@ conclusion is amended to this at the priority level (already reflected in the W5
 
 ## Follow-ups
 
-- #420 (W3 MLP-only) → **P1**; `Q3Block` at group-32 + the #616 `eval_perplexity` gate path + `make bench-compare`.
+- #420 (W3 MLP-only) → **P1**; `Q3Block` at group-32 (Amendment 1) + the #616 `eval_perplexity` gate path + `make bench-compare`. Stage 1 (CPU format module) = #978; Stage 2 = Metal `gemm_q3`/`gemv_q3`.
 - #703 (online R3/R4 Hadamard) → **P2**; CPU/f16 equivalence gate first (W6 precedent), then the recovery PPL matrix.
 - #684 / #683 (FP8 / FP4 loaders) → **P3**, demand-gated on a target checkpoint shipping in-format.
 - #421 (SpinQuant) → deferred, gated on #703.
