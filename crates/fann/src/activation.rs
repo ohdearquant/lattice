@@ -5,7 +5,7 @@
 //!
 //! See `docs/network.md` for formulas, numerical rules, and derivative limits.
 
-/// Activation function types
+/// Supported activation functions.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -30,12 +30,10 @@ pub enum Activation {
     Softmax,
 }
 
-// --- SIMD activation function helpers ---
-
 /// NEON-accelerated ReLU: max(0, x) for 4 elements at a time.
 ///
 /// # Safety
-/// NEON must be available (mandatory on aarch64). Slice pointer must be valid.
+/// Must run on AArch64, where NEON is mandatory.
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 #[inline]
 unsafe fn simd_relu_neon(values: &mut [f32]) {
@@ -54,7 +52,6 @@ unsafe fn simd_relu_neon(values: &mut [f32]) {
         vst1q_f32(p.add(offset), result);
         offset += 4;
     }
-    // Scalar tail
     for i in offset..n {
         let val = *p.add(i);
         if val < 0.0 {
@@ -66,7 +63,7 @@ unsafe fn simd_relu_neon(values: &mut [f32]) {
 /// AVX2-accelerated ReLU: max(0, x) for 8 elements at a time.
 ///
 /// # Safety
-/// Caller must ensure AVX2 is available. Slice pointer must be valid.
+/// Caller must ensure AVX2 is available.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn simd_relu_avx2(values: &mut [f32]) {
@@ -85,7 +82,6 @@ unsafe fn simd_relu_avx2(values: &mut [f32]) {
         _mm256_storeu_ps(p.add(offset), result);
         offset += 8;
     }
-    // Scalar tail
     for i in offset..n {
         let val = *p.add(i);
         if val < 0.0 {
@@ -96,11 +92,10 @@ unsafe fn simd_relu_avx2(values: &mut [f32]) {
 
 /// NEON-accelerated LeakyReLU: x if x > 0, else alpha * x.
 ///
-/// Uses vbslq_f32 (bitwise select) to blend between x and alpha*x based on
-/// whether x >= 0. This avoids branching entirely.
+/// Uses vector selection to avoid per-lane branches.
 ///
 /// # Safety
-/// NEON must be available (mandatory on aarch64). Slice pointer must be valid.
+/// Must run on AArch64, where NEON is mandatory.
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 #[inline]
 unsafe fn simd_leaky_relu_neon(values: &mut [f32], alpha: f32) {
@@ -117,14 +112,11 @@ unsafe fn simd_leaky_relu_neon(values: &mut [f32], alpha: f32) {
         // SAFETY: offset + 4 <= n; p is valid for n elements
         let v = vld1q_f32(p.add(offset));
         let scaled = vmulq_f32(v, alpha_v);
-        // mask: all-ones where v >= 0, all-zeros where v < 0
         let mask = vcgeq_f32(v, zero);
-        // Select: where mask is set, pick v; where clear, pick scaled
         let result = vbslq_f32(mask, v, scaled);
         vst1q_f32(p.add(offset), result);
         offset += 4;
     }
-    // Scalar tail
     for i in offset..n {
         let val = *p.add(i);
         if val < 0.0 {
@@ -135,11 +127,10 @@ unsafe fn simd_leaky_relu_neon(values: &mut [f32], alpha: f32) {
 
 /// AVX2-accelerated LeakyReLU: x if x > 0, else alpha * x.
 ///
-/// Uses _mm256_blendv_ps to select between x and alpha*x. The blend uses
-/// the sign bit of x: positive keeps x, negative gets alpha*x.
+/// Uses vector selection to avoid per-lane branches.
 ///
 /// # Safety
-/// Caller must ensure AVX2 is available. Slice pointer must be valid.
+/// Caller must ensure AVX2 is available.
 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn simd_leaky_relu_avx2(values: &mut [f32], alpha: f32) {
@@ -156,14 +147,11 @@ unsafe fn simd_leaky_relu_avx2(values: &mut [f32], alpha: f32) {
         // SAFETY: offset + 8 <= n; p is valid for n elements
         let v = _mm256_loadu_ps(p.add(offset));
         let scaled = _mm256_mul_ps(v, alpha_v);
-        // Compare: mask lanes where v > 0 (all bits set for true lanes)
         let mask = _mm256_cmp_ps(v, zero, _CMP_GT_OQ);
-        // Blend: pick v where mask is set, scaled where not
         let result = _mm256_blendv_ps(scaled, v, mask);
         _mm256_storeu_ps(p.add(offset), result);
         offset += 8;
     }
-    // Scalar tail
     for i in offset..n {
         let val = *p.add(i);
         if val < 0.0 {
@@ -172,11 +160,7 @@ unsafe fn simd_leaky_relu_avx2(values: &mut [f32], alpha: f32) {
     }
 }
 
-/// Numerically stable sigmoid: avoids overflow when x is large and negative.
-///
-/// For x >= 0 uses the standard formula 1/(1+e^-x).
-/// For x < 0 rewrites as e^x/(1+e^x) so the exponent is always non-negative,
-/// preventing the intermediate `-(-x).exp()` from overflowing to +Inf.
+/// Evaluates sigmoid without overflowing for large negative inputs.
 #[inline]
 fn stable_sigmoid(x: f32) -> f32 {
     if x >= 0.0 {
@@ -188,10 +172,10 @@ fn stable_sigmoid(x: f32) -> f32 {
 }
 
 impl Activation {
-    /// Default leaky ReLU alpha value
+    /// Default alpha for leaky ReLU.
     pub const DEFAULT_LEAKY_ALPHA: f32 = 0.01;
 
-    /// Apply activation function to a single value (element-wise)
+    /// Applies this activation to one value.
     ///
     /// Note: For Softmax, use `forward_batch` instead as it requires the full vector.
     #[inline]
@@ -208,7 +192,7 @@ impl Activation {
                     alpha * x
                 }
             }
-            // For single element, softmax is just 1.0
+            // A scalar Softmax is 1.0.
             Activation::Softmax => 1.0,
         }
     }
@@ -234,17 +218,13 @@ impl Activation {
             Activation::ReLU => {
                 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
                 {
-                    // SAFETY: NEON is mandatory on aarch64. We process values
-                    // in chunks of 4 using vld1q/vmaxq/vst1q, then handle
-                    // the scalar tail. All pointer arithmetic stays within the
-                    // slice bounds.
+                    // SAFETY: NEON is mandatory on AArch64; the helper bounds-checks vector loads.
                     unsafe { simd_relu_neon(values) };
                 }
                 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
                 {
                     if is_x86_feature_detected!("avx2") {
-                        // SAFETY: AVX2 verified above; function processes in
-                        // 8-element chunks with scalar tail.
+                        // SAFETY: AVX2 was detected above.
                         unsafe { simd_relu_avx2(values) };
                     } else {
                         for v in values.iter_mut() {
@@ -266,15 +246,13 @@ impl Activation {
                 let a = *alpha;
                 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
                 {
-                    // SAFETY: NEON is mandatory on aarch64. Processes in chunks
-                    // of 4, blending between x and alpha*x based on sign.
+                    // SAFETY: NEON is mandatory on AArch64; the helper bounds-checks vector loads.
                     unsafe { simd_leaky_relu_neon(values, a) };
                 }
                 #[cfg(all(feature = "simd", target_arch = "x86_64"))]
                 {
                     if is_x86_feature_detected!("avx2") {
-                        // SAFETY: AVX2 verified above; processes in 8-element
-                        // chunks with blendv for conditional alpha scaling.
+                        // SAFETY: AVX2 was detected above.
                         unsafe { simd_leaky_relu_avx2(values, a) };
                     } else {
                         for v in values.iter_mut() {
@@ -297,7 +275,7 @@ impl Activation {
                 }
             }
             Activation::Softmax => {
-                // Numerically stable softmax
+                // Subtract the maximum to avoid exponent overflow.
                 let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0;
                 for v in values.iter_mut() {
@@ -337,15 +315,12 @@ impl Activation {
                     *alpha
                 }
             }
-            // Diagonal approximation of the Softmax Jacobian; accepted
-            // limitation, see ADR-023.
+            // The full Jacobian is handled by output-layer backpropagation (ADR-023).
             Activation::Softmax => output * (1.0 - output),
         }
     }
 
-    /// Compute derivatives for a batch of output values (in-place)
-    ///
-    /// Modifies `outputs` to contain the derivatives.
+    /// Replaces each output with its derivative.
     #[inline]
     pub fn derivative_batch(&self, outputs: &mut [f32]) {
         match self {
@@ -376,8 +351,7 @@ impl Activation {
                 }
             }
             Activation::Softmax => {
-                // Simplified: diagonal of Jacobian
-                // Full Jacobian: J[i,j] = s[i](delta[i,j] - s[j])
+                // This exposes only the Softmax Jacobian diagonal.
                 for v in outputs.iter_mut() {
                     *v = *v * (1.0 - *v);
                 }
@@ -385,13 +359,13 @@ impl Activation {
         }
     }
 
-    /// Returns true if this activation is Softmax
+    /// Returns whether this is Softmax.
     #[inline]
     pub fn is_softmax(&self) -> bool {
         matches!(self, Activation::Softmax)
     }
 
-    /// Returns true if this activation has a bounded output range
+    /// Returns whether this activation has a bounded output range.
     #[inline]
     pub fn is_bounded(&self) -> bool {
         matches!(
@@ -425,7 +399,6 @@ mod tests {
         assert!(approx_eq(act.forward(0.0), 0.5));
         assert!(act.forward(10.0) > 0.99);
         assert!(act.forward(-10.0) < 0.01);
-        // Derivative at output 0.5
         assert!(approx_eq(act.derivative(0.5), 0.25));
     }
 
@@ -435,7 +408,6 @@ mod tests {
         assert!(approx_eq(act.forward(0.0), 0.0));
         assert!(act.forward(3.0) > 0.99);
         assert!(act.forward(-3.0) < -0.99);
-        // Derivative at output 0
         assert!(approx_eq(act.derivative(0.0), 1.0));
     }
 
@@ -465,11 +437,9 @@ mod tests {
         let mut values = vec![1.0, 2.0, 3.0];
         act.forward_batch(&mut values);
 
-        // Sum should be 1.0
         let sum: f32 = values.iter().sum();
         assert!(approx_eq(sum, 1.0));
 
-        // Values should be in increasing order (since input was increasing)
         assert!(values[0] < values[1]);
         assert!(values[1] < values[2]);
     }
@@ -477,7 +447,6 @@ mod tests {
     #[test]
     fn test_softmax_numerical_stability() {
         let act = Activation::Softmax;
-        // Large values that would overflow without stability fix
         let mut values = vec![1000.0, 1001.0, 1002.0];
         act.forward_batch(&mut values);
 

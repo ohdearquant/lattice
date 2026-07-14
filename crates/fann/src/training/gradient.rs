@@ -1,18 +1,13 @@
-//! Gradient utilities for training
+//! Gradient validation and guard strategies.
 //!
-//! Provides utilities for gradient checking, sanitization, and guard strategies.
 
-/// Check if a gradient vector contains NaN or Inf values.
-///
-/// Returns Some(index) of the first bad value, or None if all values are finite.
+/// Returns the index of the first non-finite gradient.
 #[inline]
 pub fn find_nan_or_inf(grads: &[f32]) -> Option<usize> {
     grads.iter().position(|&g| !g.is_finite())
 }
 
-/// Check multiple gradient vectors for NaN/Inf values.
-///
-/// Returns a description of where the bad value was found.
+/// Validates all weight and bias gradients.
 pub fn check_gradients_valid(
     weight_grads: &[Vec<f32>],
     bias_grads: &[Vec<f32>],
@@ -36,9 +31,7 @@ pub fn check_gradients_valid(
     Ok(())
 }
 
-/// Replace NaN/Inf values with zeros (gradient clipping fallback).
-///
-/// Returns the number of values replaced.
+/// Replaces non-finite gradients with zero and returns the count.
 pub fn sanitize_gradients(grads: &mut [f32]) -> usize {
     let mut count = 0;
     for g in grads.iter_mut() {
@@ -50,17 +43,17 @@ pub fn sanitize_gradients(grads: &mut [f32]) -> usize {
     count
 }
 
-/// Strategy for handling NaN/Inf gradients
+/// Response to non-finite gradients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum GradientGuardStrategy {
-    /// Return an error immediately when NaN/Inf detected
+    /// Returns an error immediately.
     #[default]
     Error,
-    /// Replace NaN/Inf with zero and continue (gradient clipping fallback)
+    /// Replaces non-finite values with zero.
     Sanitize,
-    /// Skip the batch when NaN/Inf detected
+    /// Skips the batch.
     SkipBatch,
 }
 
@@ -70,19 +63,15 @@ mod tests {
 
     #[test]
     fn test_find_nan_or_inf() {
-        // Normal gradients
         let normal = vec![0.1, 0.2, 0.3, -0.5];
         assert!(find_nan_or_inf(&normal).is_none());
 
-        // NaN value
         let with_nan = vec![0.1, f32::NAN, 0.3];
         assert_eq!(find_nan_or_inf(&with_nan), Some(1));
 
-        // Inf value
         let with_inf = vec![0.1, 0.2, f32::INFINITY];
         assert_eq!(find_nan_or_inf(&with_inf), Some(2));
 
-        // Negative Inf
         let with_neg_inf = vec![f32::NEG_INFINITY, 0.2];
         assert_eq!(find_nan_or_inf(&with_neg_inf), Some(0));
     }
@@ -93,13 +82,11 @@ mod tests {
         let bias_grads = vec![vec![0.1], vec![0.2]];
         assert!(check_gradients_valid(&weight_grads, &bias_grads).is_ok());
 
-        // With NaN in weight gradients
         let bad_weight_grads = vec![vec![0.1, f32::NAN], vec![0.3, 0.4]];
         let result = check_gradients_valid(&bad_weight_grads, &bias_grads);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("weight gradient"));
 
-        // With Inf in bias gradients
         let bad_bias_grads = vec![vec![0.1], vec![f32::INFINITY]];
         let result = check_gradients_valid(&weight_grads, &bad_bias_grads);
         assert!(result.is_err());
@@ -116,7 +103,6 @@ mod tests {
 
     #[test]
     fn test_gradient_guard_strategy_default() {
-        // Default should be Error
         let strategy = GradientGuardStrategy::default();
         assert_eq!(strategy, GradientGuardStrategy::Error);
     }

@@ -5,17 +5,13 @@
 
 use thiserror::Error;
 
-/// Result type for neural network operations
+/// Result type for neural-network operations.
 pub type FannResult<T> = std::result::Result<T, FannError>;
 
-/// Maximum allowed elements in a single tensor allocation.
-/// 100 million elements = ~400MB for f32, a reasonable limit to prevent OOM.
+/// Maximum elements in a single tensor allocation.
 pub const MAX_ALLOWED_ELEMENTS: usize = 100_000_000;
 
-/// Validate that an allocation size is within safe limits.
-///
-/// Returns an error if the requested size exceeds [`MAX_ALLOWED_ELEMENTS`].
-/// This prevents denial-of-service attacks via memory exhaustion.
+/// Validates an allocation size against [`MAX_ALLOWED_ELEMENTS`].
 #[inline]
 pub fn validate_allocation_size(num_elements: usize) -> FannResult<()> {
     if num_elements > MAX_ALLOWED_ELEMENTS {
@@ -27,10 +23,7 @@ pub fn validate_allocation_size(num_elements: usize) -> FannResult<()> {
     Ok(())
 }
 
-/// Validate layer dimensions for safe allocation.
-///
-/// Checks both that dimensions are non-zero and that the total allocation
-/// (num_inputs * num_outputs for weights) doesn't exceed safe limits.
+/// Validates nonzero layer dimensions and their weight allocation size.
 #[inline]
 pub fn validate_layer_dimensions(num_inputs: usize, num_outputs: usize) -> FannResult<()> {
     if num_inputs == 0 || num_outputs == 0 {
@@ -40,7 +33,6 @@ pub fn validate_layer_dimensions(num_inputs: usize, num_outputs: usize) -> FannR
         });
     }
 
-    // Check for overflow and size limit
     let total = num_inputs
         .checked_mul(num_outputs)
         .ok_or(FannError::ShapeTooLarge {
@@ -51,10 +43,10 @@ pub fn validate_layer_dimensions(num_inputs: usize, num_outputs: usize) -> FannR
     validate_allocation_size(total)
 }
 
-/// Errors that can occur in neural network operations
+/// Errors from neural-network operations.
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum FannError {
-    /// Input size does not match network's expected input size
+    /// Input length differs from the network input width.
     #[error("Input size mismatch: expected {expected}, got {actual}")]
     InputSizeMismatch {
         /// Expected input size
@@ -63,7 +55,7 @@ pub enum FannError {
         actual: usize,
     },
 
-    /// Output size does not match network's expected output size
+    /// Output length differs from the network output width.
     #[error("Output size mismatch: expected {expected}, got {actual}")]
     OutputSizeMismatch {
         /// Expected output size
@@ -72,7 +64,7 @@ pub enum FannError {
         actual: usize,
     },
 
-    /// Weight count does not match expected weight count for layer
+    /// Weight count differs from the layer shape.
     #[error("Weight count mismatch: expected {expected}, got {actual}")]
     WeightCountMismatch {
         /// Expected weight count
@@ -81,7 +73,7 @@ pub enum FannError {
         actual: usize,
     },
 
-    /// Bias count does not match expected bias count for layer
+    /// Bias count differs from the layer output width.
     #[error("Bias count mismatch: expected {expected}, got {actual}")]
     BiasCountMismatch {
         /// Expected bias count
@@ -90,7 +82,7 @@ pub enum FannError {
         actual: usize,
     },
 
-    /// Layer dimensions are invalid
+    /// Layer dimensions are invalid.
     #[error("Invalid layer dimensions: inputs={inputs}, outputs={outputs}")]
     InvalidLayerDimensions {
         /// Number of inputs
@@ -99,7 +91,7 @@ pub enum FannError {
         outputs: usize,
     },
 
-    /// Allocation size exceeds maximum allowed elements (DoS prevention)
+    /// Allocation size exceeds the configured limit.
     #[error("Shape too large: requested {requested} elements, max allowed is {max}")]
     ShapeTooLarge {
         /// Requested number of elements
@@ -108,31 +100,31 @@ pub enum FannError {
         max: usize,
     },
 
-    /// Network has no layers
+    /// Network has no layers.
     #[error("Network has no layers")]
     EmptyNetwork,
 
-    /// Builder configuration is invalid
+    /// Builder configuration is invalid.
     #[error("Invalid builder configuration: {0}")]
     InvalidBuilder(String),
 
-    /// Training error
+    /// Training failed.
     #[error("Training error: {0}")]
     TrainingError(String),
 
-    /// Gradient computation failed
+    /// Gradient computation failed.
     #[error("Gradient computation failed: {0}")]
     GradientError(String),
 
-    /// Numeric instability detected
+    /// Numeric instability was detected.
     #[error("Numeric instability: {0}")]
     NumericInstability(String),
 
-    /// Invalid distribution parameters (e.g., negative std_dev, NaN)
+    /// Distribution parameters are invalid.
     #[error("Invalid distribution parameters: {0}")]
     InvalidDistributionParams(String),
 
-    /// Serialization error
+    /// Serialization failed.
     #[cfg(feature = "serde")]
     #[error("Serialization error: {0}")]
     SerializationError(String),
@@ -238,14 +230,12 @@ mod tests {
 
     #[test]
     fn test_validate_layer_dimensions_too_large() {
-        // 100_001 * 100_001 > MAX_ALLOWED_ELEMENTS (100M)
         let result = validate_layer_dimensions(100_001, 100_001);
         assert!(matches!(result, Err(FannError::ShapeTooLarge { .. })));
     }
 
     #[test]
     fn test_validate_layer_dimensions_overflow() {
-        // usize::MAX * 2 would overflow
         let result = validate_layer_dimensions(usize::MAX, 2);
         assert!(matches!(result, Err(FannError::ShapeTooLarge { .. })));
     }

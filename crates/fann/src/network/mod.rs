@@ -39,11 +39,9 @@ fn forward_into_buffers(
     input: &[f32],
     buffers: &mut [Vec<f32>],
 ) -> FannResult<()> {
-    // First layer takes input directly
     layers[0].forward(input, &mut buffers[0])?;
     check_numeric_stability(&buffers[0], 0)?;
 
-    // Subsequent layers take previous layer's output
     for i in 1..layers.len() {
         let (prev, curr) = buffers.split_at_mut(i);
         layers[i].forward(&prev[i - 1], &mut curr[0])?;
@@ -62,10 +60,7 @@ fn forward_into_buffers(
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "NetworkData"))]
 pub struct Network {
-    /// Network layers
     layers: Vec<Layer>,
-    /// Pre-allocated buffers for intermediate activations
-    /// `buffers[i]` holds the output of layer `i`.
     #[cfg_attr(feature = "serde", serde(skip))]
     buffers: Vec<Vec<f32>>,
 }
@@ -87,16 +82,13 @@ impl TryFrom<NetworkData> for Network {
 }
 
 impl Network {
-    /// Create a network from a list of layers
-    ///
-    /// Validates that layer dimensions are compatible and Softmax appears only
-    /// on the output layer.
+    /// Creates a network from compatible layers with terminal Softmax only.
     pub fn new(layers: Vec<Layer>) -> FannResult<Self> {
         if layers.is_empty() {
             return Err(FannError::EmptyNetwork);
         }
 
-        // Reject Softmax before the final layer: its derivative here is only diagonal (see ADR-023).
+        // Hidden Softmax needs a full Jacobian; this API exposes only its diagonal (ADR-023).
         if layers[..layers.len() - 1]
             .iter()
             .any(|layer| layer.activation().is_softmax())
@@ -108,7 +100,6 @@ impl Network {
             ));
         }
 
-        // Validate layer compatibility
         for i in 1..layers.len() {
             let prev_outputs = layers[i - 1].num_outputs();
             let curr_inputs = layers[i].num_inputs();
@@ -120,7 +111,6 @@ impl Network {
             }
         }
 
-        // Allocate buffers for intermediate activations
         let buffers = layers
             .iter()
             .map(|layer| vec![0.0; layer.num_outputs()])
@@ -152,23 +142,22 @@ impl Network {
     /// Returns an owned copy of the output and propagates `forward` validation errors.
     /// See [`docs/network.md`](../../docs/network.md#networkforward_async) for interface rationale.
     pub async fn forward_async(&mut self, input: &[f32]) -> FannResult<Vec<f32>> {
-        // CPU forward is synchronous, just wrap in async for API consistency
         self.forward(input).map(<[f32]>::to_vec)
     }
 
-    /// Get the number of inputs the network expects
+    /// Returns the expected input width.
     #[inline]
     pub fn num_inputs(&self) -> usize {
         self.layers[0].num_inputs()
     }
 
-    /// Get the number of outputs the network produces
+    /// Returns the output width.
     #[inline]
     pub fn num_outputs(&self) -> usize {
         self.layers[self.layers.len() - 1].num_outputs()
     }
 
-    /// Get the total number of parameters in the network
+    /// Returns the total parameter count.
     #[inline]
     pub fn total_params(&self) -> usize {
         self.layers
@@ -177,43 +166,43 @@ impl Network {
             .sum()
     }
 
-    /// Get the number of layers in the network
+    /// Returns the layer count.
     #[inline]
     pub fn num_layers(&self) -> usize {
         self.layers.len()
     }
 
-    /// Get a reference to a specific layer
+    /// Returns a layer by index.
     #[inline]
     pub fn layer(&self, index: usize) -> Option<&Layer> {
         self.layers.get(index)
     }
 
-    /// Get a mutable reference to a specific layer (for training)
+    /// Returns a mutable layer by index.
     #[inline]
     pub fn layer_mut(&mut self, index: usize) -> Option<&mut Layer> {
         self.layers.get_mut(index)
     }
 
-    /// Get all layers
+    /// Returns all layers.
     #[inline]
     pub fn layers(&self) -> &[Layer] {
         &self.layers
     }
 
-    /// Get all layers mutably (for training)
+    /// Returns all layers mutably.
     #[inline]
     pub fn layers_mut(&mut self) -> &mut [Layer] {
         &mut self.layers
     }
 
-    /// Get intermediate activations buffer for a layer (for debugging/training)
+    /// Returns a layer's latest activation buffer.
     #[inline]
     pub fn activations(&self, layer_index: usize) -> Option<&[f32]> {
         self.buffers.get(layer_index).map(std::vec::Vec::as_slice)
     }
 
-    /// Get network architecture as a string
+    /// Formats the network architecture.
     pub fn architecture(&self) -> String {
         let mut parts = vec![self.num_inputs().to_string()];
         for layer in &self.layers {
@@ -235,7 +224,6 @@ impl Network {
         inputs
             .par_iter()
             .map(|input| {
-                // Allocate only activation buffers — weights are shared via &self
                 let mut buffers: Vec<Vec<f32>> = self
                     .layers
                     .iter()
@@ -279,7 +267,6 @@ mod tests {
         let input = [1.0, 2.0, 3.0, 4.0];
         let output = network.forward(&input).unwrap();
 
-        // Softmax output should sum to 1
         let sum: f32 = output.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
     }
@@ -380,7 +367,6 @@ mod tests {
         let input = [1.0, 2.0];
         network.forward(&input).unwrap();
 
-        // Can access intermediate activations
         let hidden_activations = network.activations(0).unwrap();
         assert_eq!(hidden_activations.len(), 4);
 
@@ -402,7 +388,6 @@ mod tests {
         let output1 = network1.forward(&input).unwrap().to_vec();
         let output2 = network2.forward(&input).unwrap().to_vec();
 
-        // Cloned networks should produce same output
         for (a, b) in output1.iter().zip(output2.iter()) {
             assert!((a - b).abs() < 1e-5);
         }
@@ -415,7 +400,6 @@ mod serde_validation_tests {
     use crate::activation::Activation;
 
     fn sample_network() -> Network {
-        // 3 -> 4 (ReLU) -> 2 (Linear): first layer has 3*4 = 12 weights.
         NetworkBuilder::new()
             .input(3)
             .hidden(4, Activation::ReLU)
@@ -428,8 +412,7 @@ mod serde_validation_tests {
     fn roundtrip_rebuilds_skipped_buffers_and_runs_forward() {
         let net = sample_network();
         let json = serde_json::to_string(&net).unwrap();
-        // `buffers` is #[serde(skip)] — a direct field-deserialize would leave it
-        // empty and panic in forward. The TryFrom path must rebuild it.
+        // Deserialization must rebuild skipped activation buffers.
         let mut restored: Network = serde_json::from_str(&json).unwrap();
         let out = restored.forward(&[1.0, 2.0, 3.0]).unwrap();
         assert_eq!(out.len(), 2);
@@ -446,9 +429,6 @@ mod serde_validation_tests {
 
     #[test]
     fn layer_with_short_weights_is_rejected() {
-        // Serialize a valid network, then drop one weight from the first layer
-        // so weights.len() no longer equals num_inputs * num_outputs. Routing
-        // through Value avoids hard-coding the Activation serialization format.
         let net = sample_network();
         let json = serde_json::to_string(&net).unwrap();
         let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();

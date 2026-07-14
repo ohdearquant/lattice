@@ -8,21 +8,21 @@ use crate::network::Network;
 use crate::training::gradient::{GradientGuardStrategy, check_gradients_valid, sanitize_gradients};
 use crate::training::{Trainer, TrainingConfig, TrainingResult};
 
-/// Basic backpropagation trainer with momentum
+/// Backpropagation trainer with momentum.
 #[derive(Debug, Default)]
 pub struct BackpropTrainer {
-    /// Velocity buffers for momentum (one per layer)
+    /// Per-layer momentum buffers.
     weight_velocities: Vec<Vec<f32>>,
     bias_velocities: Vec<Vec<f32>>,
 }
 
 impl BackpropTrainer {
-    /// Create a new backpropagation trainer
+    /// Creates a backpropagation trainer.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Initialize velocity buffers for a network
+    /// Initializes momentum buffers for a network.
     fn init_velocities(&mut self, network: &Network) {
         self.weight_velocities.clear();
         self.bias_velocities.clear();
@@ -36,9 +36,7 @@ impl BackpropTrainer {
 
     /// Compute gradients for a single training sample using backpropagation.
     ///
-    /// After the forward pass, copies the final output so weights and activations can be
-    /// borrowed directly from the network. Delta vectors are allocated per sample; layer
-    /// weights and activation buffers are not cloned.
+    /// Copies the output so it can borrow the network for backpropagation.
     fn compute_gradients(
         &self,
         network: &mut Network,
@@ -49,24 +47,18 @@ impl BackpropTrainer {
     ) -> FannResult<f32> {
         let num_layers = network.num_layers();
 
-        // Forward pass (populates activation buffers) — only mutation
         let output: Vec<f32> = network.forward(input)?.to_vec();
         let output_len = output.len();
 
-        // After forward returns, reborrow network immutably.
-        // Reference layers and activations directly — no cloning needed.
         let layers = network.layers();
 
-        // Compute output error (MSE derivative)
         let mut error = 0.0;
         let mut deltas: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
 
-        // Output layer deltas
         let output_activation = layers[num_layers - 1].activation();
         let mut output_deltas = vec![0.0_f32; output_len];
         if matches!(output_activation, crate::activation::Activation::Softmax) {
-            // Full Jacobian for softmax: J[i,j] = s[j]*(delta[i,j] - s[i])
-            // Chain rule with MSE loss: delta[i] = sum_j((output[j]-target[j]) * J[j,i])
+            // Softmax output requires its full Jacobian.
             for i in 0..output_len {
                 let mut delta = 0.0_f32;
                 for j in 0..output_len {
@@ -91,7 +83,6 @@ impl BackpropTrainer {
         }
         deltas.push(output_deltas);
 
-        // Backpropagate deltas through hidden layers
         for layer_idx in (0..num_layers - 1).rev() {
             let layer_activation = layers[layer_idx].activation();
             let layer_num_outputs = layers[layer_idx].num_outputs();
@@ -120,10 +111,8 @@ impl BackpropTrainer {
             deltas.push(layer_deltas);
         }
 
-        // Reverse deltas (now in layer order)
         deltas.reverse();
 
-        // Compute gradients — reference layer dimensions and activations directly
         for (layer_idx, delta) in deltas.iter().enumerate() {
             let num_inputs = layers[layer_idx].num_inputs();
             let num_outputs = layers[layer_idx].num_outputs();
@@ -138,14 +127,12 @@ impl BackpropTrainer {
                 })?
             };
 
-            // Weight gradients: dW[i,j] = delta[i] * input[j]
             for (i, &d) in delta.iter().enumerate().take(num_outputs) {
                 for (j, &inp) in layer_input.iter().enumerate().take(num_inputs) {
                     weight_grads[layer_idx][i * num_inputs + j] += d * inp;
                 }
             }
 
-            // Bias gradients: dB[i] = delta[i]
             for (i, &d) in delta.iter().enumerate().take(num_outputs) {
                 bias_grads[layer_idx][i] += d;
             }
@@ -154,7 +141,7 @@ impl BackpropTrainer {
         Ok(error / output_len as f32)
     }
 
-    /// Apply gradients with momentum and weight decay
+    /// Applies gradients with momentum and weight decay.
     fn apply_gradients(
         &mut self,
         network: &mut Network,
@@ -172,17 +159,14 @@ impl BackpropTrainer {
                 continue;
             };
 
-            // Update weights
             let weights = layer.weights_mut();
             for (i, w) in weights.iter_mut().enumerate() {
-                // Momentum update
                 self.weight_velocities[layer_idx][i] = momentum
                     * self.weight_velocities[layer_idx][i]
                     - lr * (weight_grads[layer_idx][i] + weight_decay * *w);
                 *w += self.weight_velocities[layer_idx][i];
             }
 
-            // Update biases
             let biases = layer.biases_mut();
             for (i, b) in biases.iter_mut().enumerate() {
                 self.bias_velocities[layer_idx][i] =
@@ -219,7 +203,6 @@ impl Trainer for BackpropTrainer {
             )));
         }
 
-        // Validate dimensions
         for (i, (input, target)) in inputs.iter().zip(targets.iter()).enumerate() {
             if input.len() != network.num_inputs() {
                 return Err(FannError::TrainingError(format!(
@@ -239,10 +222,8 @@ impl Trainer for BackpropTrainer {
             }
         }
 
-        // Initialize velocity buffers
         self.init_velocities(network);
 
-        // Allocate gradient buffers
         let mut weight_grads: Vec<Vec<f32>> = network
             .layers()
             .iter()
@@ -257,7 +238,6 @@ impl Trainer for BackpropTrainer {
         let mut error_history = Vec::with_capacity(config.max_epochs);
         let mut indices: Vec<usize> = (0..inputs.len()).collect();
 
-        // Create RNG once before the epoch loop to avoid per-epoch allocation
         use rand::SeedableRng;
         let mut rng = match config.seed {
             Some(seed) => rand::rngs::SmallRng::seed_from_u64(seed),
@@ -265,7 +245,6 @@ impl Trainer for BackpropTrainer {
         };
 
         for epoch in 0..config.max_epochs {
-            // Shuffle if configured
             if config.shuffle {
                 use rand::seq::SliceRandom;
                 indices.shuffle(&mut rng);
@@ -274,7 +253,6 @@ impl Trainer for BackpropTrainer {
             let mut epoch_error = 0.0;
             let mut batch_count = 0;
 
-            // Process batches
             let effective_batch_size = if config.batch_size == 0 {
                 1
             } else {
@@ -284,7 +262,6 @@ impl Trainer for BackpropTrainer {
                 let batch_end = (batch_start + effective_batch_size).min(inputs.len());
                 let actual_batch_size = batch_end - batch_start;
 
-                // Zero gradients
                 for grads in weight_grads.iter_mut() {
                     grads.fill(0.0);
                 }
@@ -292,8 +269,7 @@ impl Trainer for BackpropTrainer {
                     grads.fill(0.0);
                 }
 
-                // Accumulate gradients over batch; keep batch error separate so
-                // SkipBatch can discard it without inflating epoch_error.
+                // Keep skipped batches out of the epoch metric.
                 let mut batch_error = 0.0_f32;
                 for &idx in &indices[batch_start..batch_end] {
                     let error = self.compute_gradients(
@@ -306,7 +282,6 @@ impl Trainer for BackpropTrainer {
                     batch_error += error;
                 }
 
-                // Check for NaN/Inf gradients before applying
                 let gradient_check = check_gradients_valid(&weight_grads, &bias_grads);
                 if let Err(location) = gradient_check {
                     match config.gradient_guard {
@@ -316,8 +291,6 @@ impl Trainer for BackpropTrainer {
                             )));
                         }
                         GradientGuardStrategy::Sanitize => {
-                            // Replace NaN/Inf with zeros and continue; batch is
-                            // still applied (sanitized) so we commit its error.
                             for grads in weight_grads.iter_mut() {
                                 sanitize_gradients(grads);
                             }
@@ -331,8 +304,7 @@ impl Trainer for BackpropTrainer {
                             );
                         }
                         GradientGuardStrategy::SkipBatch => {
-                            // Discard both gradients AND error for this batch so
-                            // epoch_error stays proportional to batch_count.
+                            // Skipped batches contribute neither update nor error.
                             tracing::warn!(
                                 "Epoch {}: skipping batch due to NaN/Inf gradients ({})",
                                 epoch,
@@ -343,7 +315,6 @@ impl Trainer for BackpropTrainer {
                     }
                 }
 
-                // Apply gradients
                 self.apply_gradients(
                     network,
                     &weight_grads,
@@ -352,23 +323,20 @@ impl Trainer for BackpropTrainer {
                     actual_batch_size,
                 );
 
-                // Commit error and sample count only for non-skipped batches.
                 epoch_error += batch_error;
                 batch_count += actual_batch_size;
             }
 
-            // Every batch was skipped — error metric is undefined; fail loudly.
+            // An all-skipped epoch has no defined error metric.
             if batch_count == 0 {
                 return Err(FannError::NumericInstability(
                     "all batches skipped due to NaN/Inf gradients".into(),
                 ));
             }
 
-            // Average error
             let avg_error = epoch_error / batch_count as f32;
             error_history.push(avg_error);
 
-            // Check convergence
             if avg_error < config.target_error {
                 return Ok(TrainingResult {
                     final_error: avg_error,
@@ -378,9 +346,6 @@ impl Trainer for BackpropTrainer {
                 });
             }
 
-            // Catch both NaN and +Inf (the latter arises when every batch skips
-            // but batch_count is somehow non-zero due to partial skips and a
-            // very large accumulated error).
             if avg_error.is_nan() || avg_error.is_infinite() {
                 return Err(FannError::NumericInstability(
                     "non-finite error during training".into(),
@@ -405,7 +370,6 @@ mod tests {
 
     #[test]
     fn test_xor_training() {
-        // XOR problem - classic test for neural network training
         let mut network = NetworkBuilder::new()
             .input(2)
             .hidden(4, Activation::Tanh)
@@ -437,8 +401,6 @@ mod tests {
 
         let result = trainer.train(&mut network, &inputs, &targets, &config);
 
-        // Training should complete without error
-        // Note: XOR convergence is not guaranteed with random initialization
         assert!(result.is_ok());
     }
 
@@ -495,10 +457,6 @@ mod tests {
 
     #[test]
     fn test_skip_batch_all_skipped_returns_error() {
-        // Targets containing NaN propagate into gradients (diff = output - NaN = NaN),
-        // triggering the gradient guard on every batch.  With SkipBatch the whole
-        // epoch completes with batch_count == 0, which must be an Err not an Ok
-        // with a non-finite final_error.
         let mut network = NetworkBuilder::new()
             .input(2)
             .hidden(2, Activation::Tanh)
@@ -507,7 +465,6 @@ mod tests {
             .unwrap();
 
         let inputs = vec![vec![1.0_f32, 0.0], vec![0.0, 1.0]];
-        // NaN targets guarantee NaN in every gradient computation.
         let targets = vec![vec![f32::NAN], vec![f32::NAN]];
 
         let mut trainer = BackpropTrainer::new();
@@ -524,7 +481,6 @@ mod tests {
             matches!(result, Err(FannError::NumericInstability(_))),
             "expected NumericInstability, got {result:?}"
         );
-        // Confirm the error text is informative (not just any instability error).
         if let Err(FannError::NumericInstability(msg)) = result {
             assert!(
                 msg.contains("all batches skipped"),
@@ -535,7 +491,6 @@ mod tests {
 
     #[test]
     fn test_linear_regression() {
-        // Simple linear regression: y = 2x + 1
         let mut network = NetworkBuilder::new()
             .input(1)
             .output(1, Activation::Linear)
@@ -558,7 +513,6 @@ mod tests {
             .train(&mut network, &inputs, &targets, &config)
             .unwrap();
 
-        // Linear regression should converge easily
         assert!(
             result.final_error < 0.1,
             "Error {} too high",

@@ -20,7 +20,6 @@ pub mod training;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
-// Re-exports
 pub use activation::Activation;
 pub use error::{FannError, FannResult};
 pub use layer::Layer;
@@ -32,7 +31,7 @@ pub use training::{
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuContext, GpuNetwork};
 
-/// Prelude for common imports
+/// Common imports.
 pub mod prelude {
     pub use crate::{
         Activation, BackpropTrainer, FannError, FannResult, GradientGuardStrategy, Layer, Network,
@@ -49,7 +48,6 @@ mod tests {
 
     #[test]
     fn test_full_workflow() {
-        // Build network
         let mut network = NetworkBuilder::new()
             .input(4)
             .hidden(8, Activation::ReLU)
@@ -58,16 +56,13 @@ mod tests {
             .build()
             .unwrap();
 
-        // Verify architecture
         assert_eq!(network.num_inputs(), 4);
         assert_eq!(network.num_outputs(), 2);
         assert_eq!(network.num_layers(), 3);
 
-        // Run inference
         let input = [1.0, 2.0, 3.0, 4.0];
         let output = network.forward(&input).unwrap();
 
-        // Softmax output sums to 1
         let sum: f32 = output.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
     }
@@ -76,7 +71,6 @@ mod tests {
     fn test_inference_speed() {
         use std::time::Instant;
 
-        // Create a reasonably sized network
         let mut network = NetworkBuilder::new()
             .input(128)
             .hidden(256, Activation::ReLU)
@@ -88,12 +82,10 @@ mod tests {
 
         let input: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
 
-        // Warm up
         for _ in 0..10 {
             network.forward(&input).unwrap();
         }
 
-        // Benchmark
         let iterations = 1000;
         let start = Instant::now();
         for _ in 0..iterations {
@@ -104,7 +96,6 @@ mod tests {
         let avg_us = elapsed.as_micros() as f64 / iterations as f64;
         println!("Average inference time: {avg_us:.2} us");
 
-        // Should be well under 5ms (5000us)
         assert!(avg_us < 5000.0, "Inference too slow: {avg_us} us");
     }
 
@@ -118,11 +109,9 @@ mod tests {
 
         let input = [1.0, 2.0, 3.0, 4.0];
 
-        // Run multiple times
         let output1 = network.forward(&input).unwrap().to_vec();
         let output2 = network.forward(&input).unwrap().to_vec();
 
-        // Should be deterministic
         for (a, b) in output1.iter().zip(output2.iter()) {
             assert!((a - b).abs() < 1e-6);
         }

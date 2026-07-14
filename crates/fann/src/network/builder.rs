@@ -11,8 +11,7 @@ use crate::error::{FannError, FannResult};
 use crate::layer::Layer;
 use crate::network::Network;
 
-/// Fluent builder for a dense feedforward network.
-/// See [`docs/network.md`](../../docs/network.md#networkbuilder) for construction examples.
+/// Fluent builder for dense feedforward networks.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkBuilder {
     input_size: Option<usize>,
@@ -20,35 +19,30 @@ pub struct NetworkBuilder {
 }
 
 impl NetworkBuilder {
-    /// Create a new network builder
+    /// Creates a new network builder.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set the input size for the network
-    ///
-    /// This must be called before `build` or `build_with_seed`; call order is otherwise
-    /// unconstrained.
+    /// Sets the input width.
     pub fn input(mut self, size: usize) -> Self {
         self.input_size = Some(size);
         self
     }
 
-    /// Add a hidden layer with the specified size and activation
+    /// Adds a hidden layer.
     pub fn hidden(mut self, size: usize, activation: Activation) -> Self {
         self.layers.push((size, activation));
         self
     }
 
-    /// Add the output layer with the specified size and activation
-    ///
-    /// This is semantically the same as `hidden` but improves readability.
+    /// Adds the output layer.
     pub fn output(mut self, size: usize, activation: Activation) -> Self {
         self.layers.push((size, activation));
         self
     }
 
-    /// Add a layer with default ReLU activation
+    /// Adds a ReLU layer.
     pub fn dense(self, size: usize) -> Self {
         self.hidden(size, Activation::ReLU)
     }
@@ -88,7 +82,6 @@ impl NetworkBuilder {
     /// Builds the configured network with deterministic initialization from `seed`.
     ///
     /// The same architecture and seed produce identical parameters.
-    /// See [`docs/network.md`](../../docs/network.md#networkbuilder) for reproducibility details.
     pub fn build_with_seed(self, seed: u64) -> FannResult<Network> {
         use rand::SeedableRng;
 
@@ -173,7 +166,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // dense() uses ReLU
         assert_eq!(network.layer(0).unwrap().activation(), Activation::ReLU);
         assert_eq!(network.layer(1).unwrap().activation(), Activation::ReLU);
         assert_eq!(network.layer(2).unwrap().activation(), Activation::Softmax);
@@ -195,7 +187,6 @@ mod tests {
             .build_with_seed(42)
             .unwrap();
 
-        // Same seed should produce identical weights
         for i in 0..network1.num_layers() {
             let layer1 = network1.layer(i).unwrap();
             let layer2 = network2.layer(i).unwrap();
@@ -220,7 +211,6 @@ mod tests {
             .build_with_seed(123)
             .unwrap();
 
-        // Different seeds should produce different weights
         let layer1 = network1.layer(0).unwrap();
         let layer2 = network2.layer(0).unwrap();
         assert_ne!(layer1.weights(), layer2.weights());
@@ -228,7 +218,6 @@ mod tests {
 
     #[test]
     fn test_builder_rejects_hidden_softmax() {
-        // Softmax on a hidden layer should be rejected.
         let result = NetworkBuilder::new()
             .input(2)
             .hidden(4, Activation::Softmax)
@@ -239,7 +228,6 @@ mod tests {
             "expected InvalidBuilder, got {result:?}"
         );
 
-        // build_with_seed must enforce the same rule.
         let result = NetworkBuilder::new()
             .input(2)
             .hidden(4, Activation::Softmax)
@@ -253,7 +241,6 @@ mod tests {
 
     #[test]
     fn test_builder_output_softmax_is_allowed() {
-        // Softmax on the output layer must continue to work.
         let result = NetworkBuilder::new()
             .input(4)
             .hidden(8, Activation::ReLU)

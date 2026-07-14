@@ -19,9 +19,9 @@ use rand::SeedableRng;
 pub struct RlooConfig {
     /// Step size applied per policy-gradient update.
     pub learning_rate: f32,
-    /// Coefficient for the load-balance auxiliary loss (prevents routing collapse).
+    /// Load-balance auxiliary-loss coefficient.
     pub aux_loss_coeff: f32,
-    /// Coefficient for the router z-loss (discourages logit explosion).
+    /// Router z-loss coefficient.
     pub z_loss_coeff: f32,
 }
 
@@ -35,18 +35,15 @@ impl Default for RlooConfig {
     }
 }
 
-/// A policy-gradient trainer for selector gates with linear logits.
-///
-/// It applies softmax in the loss and leaves EWC composition to the caller.
-/// See [`docs/training.md`](../../docs/training.md#reinforce-with-leave-one-out-rloo) for the gate contract and loss terms.
+/// Policy-gradient trainer for selector gates with linear logits.
 pub struct RlooTrainer {
     config: RlooConfig,
-    /// RNG used for Gumbel-max sampling in the Phase-2 multi-sample path.
+    /// RNG for multi-sample Gumbel-max sampling.
     rng: rand::rngs::SmallRng,
 }
 
 impl RlooTrainer {
-    /// Create a new trainer, seeding the RNG from system entropy.
+    /// Creates a trainer seeded from system entropy.
     pub fn new(config: RlooConfig) -> Self {
         Self {
             config,
@@ -54,9 +51,7 @@ impl RlooTrainer {
         }
     }
 
-    /// Create a new trainer with a fixed RNG seed for deterministic behaviour.
-    ///
-    /// Prefer this constructor in tests to guarantee reproducible results.
+    /// Creates a trainer with a fixed RNG seed.
     pub fn with_seed(config: RlooConfig, seed: u64) -> Self {
         Self {
             config,
@@ -66,9 +61,7 @@ impl RlooTrainer {
 
     /// Applies one REINFORCE update for `action_idx` from a signed reward.
     ///
-    /// The reward sign controls policy direction and its magnitude controls update strength.
     /// Returns the scalar policy loss for logging.
-    /// See [`docs/training.md`](../../docs/training.md#phase-1-single-sample-reinforce-step-the-active-path) for reward semantics and the loss formula.
     pub fn step(
         &mut self,
         gate: &mut Network,
@@ -94,7 +87,7 @@ impl RlooTrainer {
             });
         }
 
-        // Gate output layer must be Linear (raw logits, softmax applied here).
+        // RLOO consumes raw logits and applies Softmax itself.
         {
             let layers = gate.layers();
             if !matches!(layers[num_layers - 1].activation(), Activation::Linear) {
@@ -104,7 +97,6 @@ impl RlooTrainer {
             }
         }
 
-        // Forward pass (populates activation buffers).
         let logits: Vec<f32> = gate.forward(context)?.to_vec();
 
         let probs = softmax(&logits);
@@ -112,10 +104,8 @@ impl RlooTrainer {
 
         let k = num_outputs;
         let sum_p_sq: f32 = probs.iter().map(|&p| p * p).sum();
-        // Scalar used in the load-balance gradient (computed once).
         let c = sum_p_sq - 1.0 / k as f32;
 
-        // Linear output makes this the pre-activation error; preserve reward polarity — see docs/training.md.
         let output_deltas: Vec<f32> = probs
             .iter()
             .enumerate()
@@ -131,16 +121,13 @@ impl RlooTrainer {
 
         self.backprop_and_apply(gate, context, &output_deltas, num_layers)?;
 
-        // Scalar policy loss for caller logging.
         let loss = -reward * probs[action_idx].max(1e-9).ln();
         Ok(loss)
     }
 
     /// Runs a Gumbel-top-`k` RLOO update with a leave-one-out baseline.
     ///
-    /// Pair its positive events with [`Self::step`] negative feedback; a positive-only stream is invalid.
     /// Returns the mean sampled reward or a validation error.
-    /// See [`docs/training.md`](../../docs/training.md#phase-2-multi-sample-rloo-rloo_step-not-the-default-path) for sampling and update details.
     pub fn rloo_step(
         &mut self,
         gate: &mut Network,
@@ -179,7 +166,7 @@ impl RlooTrainer {
             ));
         }
 
-        // Bound both caller-controlled capacities before allocation; checked multiplication prevents overflow.
+        // Bound both caller-controlled allocations.
         validate_allocation_size(m_samples)?;
         let subset_storage = m_samples.checked_mul(k).ok_or_else(|| {
             FannError::TrainingError(format!(
@@ -201,19 +188,17 @@ impl RlooTrainer {
         let probs = softmax(&logits);
         let lse = log_sum_exp(&logits);
 
-        // Draw `m_samples` Gumbel-top-`k` subsets — see docs/training.md.
         let mut rewards: Vec<f32> = Vec::with_capacity(m_samples);
         let mut subsets: Vec<Vec<usize>> = Vec::with_capacity(m_samples);
 
         for _ in 0..m_samples {
-            // Perturb each logit with independent Gumbel(0,1) noise.
             let mut perturbed: Vec<(f32, usize)> = logits
                 .iter()
                 .enumerate()
                 .map(|(i, &s)| {
                     let u: f32 = {
                         let raw: f32 = self.rng.r#gen::<f32>();
-                        // Clamp to open (0,1) to avoid ln(0).
+                        // Keep the Gumbel transform away from `ln(0)`.
                         raw.clamp(1e-38_f32, 1.0 - f32::EPSILON)
                     };
                     let gumbel_noise = -(-u.ln()).ln();
@@ -221,7 +206,6 @@ impl RlooTrainer {
                 })
                 .collect();
 
-            // Select top-k by perturbed logit (descending).
             perturbed.sort_unstable_by(|a, b| {
                 b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
             });
@@ -236,7 +220,6 @@ impl RlooTrainer {
             subsets.push(subset);
         }
 
-        // Build output-layer gradient with leave-one-out baseline.
         let reward_sum: f32 = rewards.iter().sum();
         let ko = num_outputs;
         let sum_p_sq: f32 = probs.iter().map(|&p| p * p).sum();
@@ -245,7 +228,6 @@ impl RlooTrainer {
         let mut output_deltas = vec![0.0_f32; ko];
 
         for (r_m, subset_m) in rewards.iter().zip(subsets.iter()) {
-            // Leave-one-out baseline: (ΣR − R_m) / (M − 1); 0 if M == 1.
             let baseline = if m_samples > 1 {
                 (reward_sum - r_m) / (m_samples - 1) as f32
             } else {
@@ -253,7 +235,6 @@ impl RlooTrainer {
             };
             let advantage = r_m - baseline;
 
-            // g[j] += -(1/M) * advantage * (count(j ∈ subset) − k · p[j])
             for j in 0..ko {
                 let in_subset: f32 = subset_m
                     .iter()
@@ -264,7 +245,6 @@ impl RlooTrainer {
             }
         }
 
-        // Aux and z-loss terms (identical to step).
         for (j, &pj) in probs.iter().enumerate() {
             let aux =
                 self.config.aux_loss_coeff * (2.0 / ko as f32) * pj * (pj - 1.0 / ko as f32 - c);
@@ -277,11 +257,7 @@ impl RlooTrainer {
         Ok(reward_sum / m_samples as f32)
     }
 
-    /// Backpropagate the output-layer delta through hidden layers and apply
-    /// a plain SGD update (no momentum, no weight decay).
-    ///
-    /// Mirrors `backprop.rs::compute_gradients` lines 94–152 (hidden-layer
-    /// backprop) and `apply_gradients` lines 170–191 (simplified, batch_size=1).
+    /// Backpropagates the output delta and applies plain SGD.
     fn backprop_and_apply(
         &self,
         gate: &mut Network,
@@ -289,15 +265,10 @@ impl RlooTrainer {
         output_deltas: &[f32],
         num_layers: usize,
     ) -> FannResult<()> {
-        // --- Phase 1: compute all layer deltas and accumulate gradients ---
-        // Both gate.layers() and gate.activations() are &self borrows and may
-        // coexist simultaneously; they are released before the mutable apply phase.
         let (weight_grads, bias_grads) = {
-            // Start with the output-layer delta (from caller).
             let mut deltas: Vec<Vec<f32>> = Vec::with_capacity(num_layers);
             deltas.push(output_deltas.to_vec());
 
-            // Mirror backprop.rs:94-121: propagate deltas backward through hidden layers.
             let layers = gate.layers(); // shared borrow: released at end of this block
             for layer_idx in (0..num_layers - 1).rev() {
                 let layer_activation = layers[layer_idx].activation();
@@ -310,7 +281,6 @@ impl RlooTrainer {
                     FannError::TrainingError("empty deltas during backpropagation".to_string())
                 })?;
 
-                // gate.activations() is also a &self borrow — OK alongside layers.
                 let layer_activations = gate.activations(layer_idx).ok_or_else(|| {
                     FannError::TrainingError(format!("missing activations for layer {layer_idx}"))
                 })?;
@@ -319,7 +289,6 @@ impl RlooTrainer {
                 for i in 0..layer_num_outputs {
                     let mut sum = 0.0_f32;
                     for j in 0..next_num_outputs {
-                        // Weight layout: row-major, row j, column i.
                         let weight = next_weights[j * next_num_inputs + i];
                         sum += weight * prev_deltas[j];
                     }
@@ -329,10 +298,8 @@ impl RlooTrainer {
 
                 deltas.push(layer_deltas);
             }
-            // Mirror backprop.rs:123-124: reverse to forward layer order.
             deltas.reverse();
 
-            // Allocate gradient buffers (mirror backprop.rs:126-152).
             let mut weight_grads: Vec<Vec<f32>> = layers
                 .iter()
                 .map(|l| vec![0.0_f32; l.weights().len()])
@@ -357,24 +324,20 @@ impl RlooTrainer {
                     })?
                 };
 
-                // dW[i,j] = delta[i] * input[j]
                 for (i, &d) in delta.iter().enumerate().take(num_o) {
                     for (j, &inp) in layer_input.iter().enumerate().take(num_i) {
                         weight_grads[layer_idx][i * num_i + j] += d * inp;
                     }
                 }
 
-                // dB[i] = delta[i]
                 for (i, &d) in delta.iter().enumerate().take(num_o) {
                     bias_grads[layer_idx][i] += d;
                 }
             }
 
             (weight_grads, bias_grads)
-            // `layers` (shared borrow) drops here — gate is free for mutation.
         };
 
-        // --- Phase 2: apply plain SGD (mirror backprop.rs:170-191, no momentum) ---
         let lr = self.config.learning_rate;
         for layer_idx in 0..num_layers {
             let Some(layer) = gate.layer_mut(layer_idx) else {
@@ -396,10 +359,7 @@ impl RlooTrainer {
     }
 }
 
-/// Load-balance auxiliary loss: `(1/K) Σ_i (p_i − 1/K)²`.
-///
-/// Penalises routing collapse where one adapter receives most probability mass.
-/// `probs` should be the softmax of the gate logits.
+/// Computes the load-balance loss for gate probabilities.
 pub fn load_balance_aux_loss(probs: &[f32]) -> f32 {
     if probs.is_empty() {
         return 0.0;
@@ -413,16 +373,11 @@ pub fn load_balance_aux_loss(probs: &[f32]) -> f32 {
         / k
 }
 
-/// Router z-loss: `(log Σ_i exp(s_i))²`.
-///
-/// Discourages logit explosion by penalising large log-sum-exp values.
-/// `logits` should be the raw gate output (pre-softmax).
+/// Computes the router z-loss from raw logits.
 pub fn router_z_loss(logits: &[f32]) -> f32 {
     let lse = log_sum_exp(logits);
     lse * lse
 }
-
-// --- Private helpers ---
 
 /// Numerically stable softmax: subtract max before exp to prevent overflow.
 fn softmax(logits: &[f32]) -> Vec<f32> {
@@ -433,7 +388,6 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
     let exps: Vec<f32> = logits.iter().map(|&s| (s - max_val).exp()).collect();
     let sum: f32 = exps.iter().sum();
     if sum == 0.0 {
-        // Degenerate case: return uniform distribution.
         vec![1.0 / logits.len() as f32; logits.len()]
     } else {
         exps.iter().map(|&e| e / sum).collect()
@@ -457,7 +411,6 @@ mod tests {
     use crate::error::MAX_ALLOWED_ELEMENTS;
     use crate::network::NetworkBuilder;
 
-    /// Build a deterministic 4-input → 8-hidden(ReLU) → 4-output(Linear) gate.
     fn test_gate() -> Network {
         NetworkBuilder::new()
             .input(4)
@@ -469,10 +422,6 @@ mod tests {
 
     const CTX: [f32; 4] = [0.1, -0.2, 0.3, 0.4];
 
-    /// A positive reward on action 2 must increase the logit for action 2.
-    ///
-    /// Mutation that fails this test: setting learning_rate to 0 or zeroing
-    /// the policy gradient term in `step`.
     #[test]
     fn rloo_positive_reward_increases_action_score() {
         let mut gate = test_gate();
@@ -488,11 +437,6 @@ mod tests {
         );
     }
 
-    /// A negative reward on action 1 must DECREASE the logit for action 1.
-    ///
-    /// This is the critical polarity test. Mutation that fails: dropping the
-    /// `reward *` factor (treating −1.0 as +1.0) or routing negative reward
-    /// through a cross-entropy call toward a different preferred index.
     #[test]
     fn rloo_negative_reward_decreases_action_score() {
         let mut gate = test_gate();
@@ -508,10 +452,6 @@ mod tests {
         );
     }
 
-    /// Load-balance loss must be nonzero for a peaked distribution and near
-    /// zero for a uniform distribution.
-    ///
-    /// Mutation that fails: returning 0.0 unconditionally.
     #[test]
     fn load_balance_aux_loss_nonzero_on_skewed() {
         let skewed_logits = [10.0_f32, -10.0, -10.0, -10.0];
@@ -530,9 +470,6 @@ mod tests {
         );
     }
 
-    /// Router z-loss must be strictly larger for large logits than for zero logits.
-    ///
-    /// Mutation that fails: returning 0.0 unconditionally.
     #[test]
     fn router_z_loss_nonzero_on_large_logits() {
         let large = [100.0_f32; 4];
@@ -549,7 +486,6 @@ mod tests {
         );
     }
 
-    /// Wrong context dimension must return Err, not panic.
     #[test]
     fn rloo_wrong_context_dim_errors() {
         let mut gate = test_gate();
@@ -562,10 +498,6 @@ mod tests {
         );
     }
 
-    /// Explicit reward (+1.0) must move the action logit more than implicit (+0.5).
-    ///
-    /// Mutation that fails: computing the gradient without the `reward *` scale
-    /// factor, or treating all rewards as +1.0.
     #[test]
     fn rloo_implicit_weaker_than_explicit() {
         let gate_base = test_gate();
@@ -595,11 +527,6 @@ mod tests {
         );
     }
 
-    // ---- Allocation-bound guard tests ---------------------------------------
-
-    /// rloo_step with m_samples > MAX_ALLOWED_ELEMENTS must return Err, not panic.
-    ///
-    /// Mutation that breaks this: removing the `validate_allocation_size(m_samples)?` call.
     #[test]
     fn rloo_step_m_samples_too_large_returns_err() {
         let mut gate = test_gate();
@@ -611,13 +538,6 @@ mod tests {
         );
     }
 
-    /// A per-call m_samples that is itself within bounds must still be rejected
-    /// when m_samples * k (the aggregate retained-subset storage) exceeds the cap.
-    /// Here m_samples = 30M passes the standalone m_samples guard (< 100M) but
-    /// 30M * 4 = 120M exceeds it, so only the product guard can produce the error.
-    ///
-    /// Mutation that breaks this: removing the `validate_allocation_size(subset_storage)?`
-    /// product check (the standalone m_samples guard alone admits this input).
     #[test]
     fn rloo_step_m_samples_times_k_product_too_large_returns_err() {
         let mut gate = test_gate();

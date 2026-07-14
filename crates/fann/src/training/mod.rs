@@ -22,27 +22,27 @@ pub use rloo::{RlooConfig, RlooTrainer};
 use crate::error::FannResult;
 use crate::network::Network;
 
-/// Configuration for training
+/// Training configuration.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TrainingConfig {
-    /// Learning rate
+    /// Learning rate.
     pub learning_rate: f32,
-    /// Momentum coefficient (0.0 = no momentum)
+    /// Momentum coefficient.
     pub momentum: f32,
-    /// L2 regularization coefficient (weight decay)
+    /// L2 weight-decay coefficient.
     pub weight_decay: f32,
-    /// Maximum number of epochs
+    /// Maximum epochs.
     pub max_epochs: usize,
-    /// Target error threshold for early stopping
+    /// Early-stop error threshold.
     pub target_error: f32,
-    /// Batch size (1 = stochastic gradient descent)
+    /// Batch size; `1` is stochastic gradient descent.
     pub batch_size: usize,
-    /// Whether to shuffle training data each epoch
+    /// Whether to shuffle each epoch.
     pub shuffle: bool,
-    /// Strategy for handling NaN/Inf gradients
+    /// Response to non-finite gradients.
     pub gradient_guard: GradientGuardStrategy,
-    /// Optional RNG seed for reproducible shuffling (None = use entropy)
+    /// Optional seed for reproducible shuffling.
     pub seed: Option<u64>,
 }
 
@@ -63,89 +63,83 @@ impl Default for TrainingConfig {
 }
 
 impl TrainingConfig {
-    /// Create a new training configuration with default values
+    /// Creates the default training configuration.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set learning rate
+    /// Sets the learning rate.
     pub fn learning_rate(mut self, lr: f32) -> Self {
         self.learning_rate = lr;
         self
     }
 
-    /// Set momentum
+    /// Sets momentum.
     pub fn momentum(mut self, m: f32) -> Self {
         self.momentum = m;
         self
     }
 
-    /// Set weight decay
+    /// Sets weight decay.
     pub fn weight_decay(mut self, wd: f32) -> Self {
         self.weight_decay = wd;
         self
     }
 
-    /// Set maximum epochs
+    /// Sets maximum epochs.
     pub fn max_epochs(mut self, epochs: usize) -> Self {
         self.max_epochs = epochs;
         self
     }
 
-    /// Set target error
+    /// Sets the target error.
     pub fn target_error(mut self, error: f32) -> Self {
         self.target_error = error;
         self
     }
 
-    /// Set batch size
+    /// Sets the batch size.
     pub fn batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;
         self
     }
 
-    /// Set shuffle flag
+    /// Sets epoch shuffling.
     pub fn shuffle(mut self, shuffle: bool) -> Self {
         self.shuffle = shuffle;
         self
     }
 
-    /// Set gradient guard strategy
+    /// Sets the gradient guard strategy.
     pub fn gradient_guard(mut self, strategy: GradientGuardStrategy) -> Self {
         self.gradient_guard = strategy;
         self
     }
 
-    /// Set RNG seed for reproducible training
+    /// Sets the shuffle seed.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
 }
 
-/// Training result containing metrics
+/// Training metrics.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TrainingResult {
-    /// Final mean squared error
+    /// Final mean squared error.
     pub final_error: f32,
-    /// Number of epochs trained
+    /// Completed epochs.
     pub epochs_trained: usize,
-    /// Error history per epoch
+    /// Error after each epoch.
     pub error_history: Vec<f32>,
-    /// Whether target error was reached
+    /// Whether the target error was reached.
     pub converged: bool,
 }
 
-/// Trait for training algorithms
+/// Training algorithm.
 pub trait Trainer {
-    /// Train the network on the given data
-    ///
-    /// # Arguments
-    /// * `network` - The network to train
-    /// * `inputs` - Training input vectors
-    /// * `targets` - Target output vectors
-    /// * `config` - Training configuration
+    /// Trains `network` on input-target pairs.
     fn train(
         &mut self,
         network: &mut Network,
@@ -155,19 +149,14 @@ pub trait Trainer {
     ) -> FannResult<TrainingResult>;
 }
 
-// Structural reachability test: when online-router is enabled the public types
-// must be importable through the training module path.  Without the feature the
-// entire ewc/rloo sub-modules are absent, so the check is compile-time only.
 #[cfg(all(test, feature = "online-router"))]
 mod online_router_reachability {
     use super::{DiagonalFisher, RlooConfig, RlooTrainer};
 
     #[test]
     fn online_router_types_are_reachable() {
-        // Merely naming the types proves the feature gate exposes them.
         let _: Option<DiagonalFisher> = None;
         let _config = RlooConfig::default();
-        // RlooTrainer::new is non-Copy but constructible — just confirm the path resolves.
         let _trainer = RlooTrainer::new(RlooConfig::default());
     }
 }
@@ -205,7 +194,6 @@ mod tests {
         let config = TrainingConfig::new().gradient_guard(GradientGuardStrategy::SkipBatch);
         assert_eq!(config.gradient_guard, GradientGuardStrategy::SkipBatch);
 
-        // Default should be Error
         let default_config = TrainingConfig::default();
         assert_eq!(default_config.gradient_guard, GradientGuardStrategy::Error);
     }
