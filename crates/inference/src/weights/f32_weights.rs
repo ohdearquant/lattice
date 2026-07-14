@@ -362,6 +362,27 @@ impl SafetensorsFile {
             }
         }
 
+        let mut ranges: Vec<_> = tensors
+            .iter()
+            .map(|(name, meta)| (meta.start, meta.end, name.as_str()))
+            .collect();
+        ranges.sort_unstable();
+        let mut previous_end = 0usize;
+        for &(start, end, name) in &ranges {
+            if start != previous_end {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "tensor {name} has non-contiguous data offsets: expected start={previous_end}, \
+                     got [{start}, {end})"
+                )));
+            }
+            previous_end = end;
+        }
+        if previous_end != data_len {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "data section is {data_len} bytes but tensors cover {previous_end} bytes"
+            )));
+        }
+
         Ok(Self {
             data,
             data_offset,
@@ -1981,6 +2002,35 @@ mod tests {
             .expect_err("one-byte-extra payload should be rejected at open");
         assert!(
             err.to_string().contains("byte length mismatch"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_rejects_aliased_tensor_ranges() {
+        let path = temp_path("lattice_weights_aliased_ranges");
+        let header = r#"{
+            "key": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+            "value": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}
+        }"#
+        .replace(['\n', ' '], "");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let mut file = File::create(&path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+        drop(file);
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("aliased tensor byte ranges must be rejected at open");
+        assert!(
+            err.to_string().contains("non-contiguous"),
             "unexpected error: {err}"
         );
 

@@ -791,7 +791,8 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
 ///
 /// # Errors
 ///
-/// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
+/// Returns an error on I/O failure, malformed dimensions, unrecognized magic bytes, or
+/// unsupported version.
 pub fn load_f16_tensor_file(
     path: &std::path::Path,
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
@@ -828,6 +829,16 @@ pub fn load_f16_tensor_file(
 
     f.read_exact(&mut b8)?;
     let numel = u64::from_le_bytes(b8) as usize;
+
+    let shape_product = shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or("shape dims overflow usize")?;
+    if shape_product != numel {
+        return Err(
+            format!("shape product {shape_product} (shape={shape:?}) != numel {numel}").into(),
+        );
+    }
 
     let raw_len = checked_alloc_bytes(numel, 2, file_len, "f16 data")?;
     let mut raw = vec![0u8; raw_len];
@@ -2253,7 +2264,7 @@ mod tests {
         buf.extend_from_slice(b"KHF1");
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
-        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&(1u64 << 63).to_le_bytes()); // shape[0]
         buf.extend_from_slice(&(1u64 << 63).to_le_bytes()); // numel
         let path = std::path::PathBuf::from("/tmp/test_f16_huge_numel.f16");
         std::fs::write(&path, &buf).unwrap();
@@ -2262,6 +2273,27 @@ mod tests {
         assert!(
             r.is_err(),
             "2^63 numel must be rejected, not silently truncated to empty"
+        );
+    }
+
+    #[test]
+    fn test_f16_rejects_shape_numel_mismatch() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes()); // ndim
+        buf.extend_from_slice(&2u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&2u64.to_le_bytes()); // shape[1]
+        buf.extend_from_slice(&1u64.to_le_bytes()); // numel
+        buf.extend_from_slice(&0u16.to_le_bytes()); // one valid f16 payload value
+        let path = std::path::PathBuf::from("/tmp/test_f16_shape_numel_mismatch.f16");
+        std::fs::write(&path, &buf).unwrap();
+        let r = load_f16_tensor_file(&path);
+        std::fs::remove_file(&path).ok();
+        let err = r.expect_err("shape product != numel must be rejected");
+        assert!(
+            err.to_string().contains("shape product"),
+            "unexpected error: {err}"
         );
     }
 
@@ -2326,7 +2358,7 @@ mod tests {
         buf.extend_from_slice(b"KHF1");
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
-        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&(huge as u64).to_le_bytes()); // shape[0]
         buf.extend_from_slice(&(huge as u64).to_le_bytes()); // numel
         let path = std::path::PathBuf::from("/tmp/test_f16_numel_exceeds_file_len.f16");
         std::fs::write(&path, &buf).unwrap();
@@ -2355,7 +2387,7 @@ mod tests {
         buf.extend_from_slice(b"KHF1");
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
-        buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
+        buf.extend_from_slice(&(huge as u64).to_le_bytes()); // shape[0]
         buf.extend_from_slice(&(huge as u64).to_le_bytes()); // numel
         // Trailing filler: `huge * 2` wraps to a small residue (10 bytes) if
         // `checked_mul` is bypassed, so pad enough real bytes that a buggy

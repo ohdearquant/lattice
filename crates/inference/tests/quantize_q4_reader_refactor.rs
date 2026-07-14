@@ -20,6 +20,7 @@ const GATE_PROJ_GOLDEN: &[u8] =
     include_bytes!("fixtures/quantize_q4_reader_refactor/gate_proj_golden.q4");
 const K_PROJ_GOLDEN: &[u8] =
     include_bytes!("fixtures/quantize_q4_reader_refactor/k_proj_golden.q4");
+const CONFIG_JSON: &str = "{\n  \"model_type\": \"fixture\"\n}\n";
 
 /// BF16 bit pattern for an arbitrary finite `f32`: truncate to the top 16
 /// bits, matching `QuarotTensorReader`'s BF16 decode (`f32::from_bits((bits
@@ -134,6 +135,7 @@ fn fixture_tensors() -> Vec<(&'static str, Vec<usize>, Vec<f32>)> {
 
 fn write_sharded_fixture(model_dir: &Path) {
     std::fs::create_dir_all(model_dir).expect("create model dir");
+    std::fs::write(model_dir.join("config.json"), CONFIG_JSON).expect("write config");
     let shard_name = "model-00001-of-00001.safetensors";
     write_safetensors(&model_dir.join(shard_name), &fixture_tensors());
 
@@ -159,6 +161,7 @@ fn write_sharded_fixture(model_dir: &Path) {
 
 fn write_single_file_fixture(model_dir: &Path) {
     std::fs::create_dir_all(model_dir).expect("create model dir");
+    std::fs::write(model_dir.join("config.json"), CONFIG_JSON).expect("write config");
     write_safetensors(&model_dir.join("model.safetensors"), &fixture_tensors());
 }
 
@@ -230,6 +233,20 @@ fn single_file_fixture_matches_same_q4_golden() {
     assert_q4_matches_golden(&output_dir);
 }
 
+#[test]
+fn output_includes_source_config_json_verbatim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model_dir = dir.path().join("model");
+    let output_dir = dir.path().join("out");
+    write_single_file_fixture(&model_dir);
+
+    run_quantize_q4(&model_dir, &output_dir);
+
+    let output_config = std::fs::read_to_string(output_dir.join("config.json"))
+        .expect("quantized artifact includes config.json");
+    assert_eq!(output_config, CONFIG_JSON);
+}
+
 /// Parses the kept-tensor `.f16` output format `quantize_q4` writes: magic
 /// `KHF1` + version `u32` + ndim `u32` + shape dims (`u64` each) + numel
 /// (`u64`) + raw little-endian f16 bit patterns — returns the bit patterns.
@@ -259,6 +276,7 @@ fn f16_source_subnormals_survive_kept_tensor_round_trip() {
     let model_dir = dir.path().join("model");
     let output_dir = dir.path().join("out");
     std::fs::create_dir_all(&model_dir).expect("create model dir");
+    std::fs::write(model_dir.join("config.json"), CONFIG_JSON).expect("write config");
 
     let values: Vec<u16> = vec![
         0x0001, // smallest positive subnormal
