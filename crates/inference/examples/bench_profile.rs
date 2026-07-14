@@ -4,7 +4,7 @@
 //! RoPE, attention, O proj, FFN, final norm, pool, L2 normalize.
 //!
 //! Usage:
-//!   cargo run --release --features f16 --bin bench_profile
+//!   cargo run --release --features f16 --example bench_profile
 
 use lattice_inference::QwenModel;
 use std::time::Instant;

@@ -4,9 +4,9 @@
 //! structured results that can be consumed by the krons autoresearch pipeline.
 //!
 //! Usage:
-//!   cargo run --release -p lattice-inference --bin bench_suite
-//!   cargo run --release -p lattice-inference --bin bench_suite -- --json
-//!   cargo run --release -p lattice-inference --bin bench_suite -- --json --baseline benchmarks/baseline.json
+//!   cargo run --release -p lattice-inference --example bench_suite
+//!   cargo run --release -p lattice-inference --example bench_suite -- --json
+//!   cargo run --release -p lattice-inference --example bench_suite -- --json --baseline benchmarks/baseline.json
 
 use std::time::Instant;
 
