@@ -24,39 +24,32 @@ pub mod lora;
 pub mod registry;
 pub mod train;
 
-// Re-exports for convenience
 pub use error::{Result, TuneError};
 
-// Data re-exports
 pub use data::{
     Batch, Dataset, DatasetConfig, DatasetStats, ExampleMetadata, IntentLabels, TrainingExample,
 };
 
-// Distill re-exports
 pub use distill::{
     DistillationConfig, DistillationPipeline, DistillationStats, EndpointSecurity, LabelingResult,
     TeacherConfig, TeacherConfigBuilder, TeacherProvider,
 };
 
-// Train re-exports
 pub use train::{
     Checkpoint, EarlyStopping, EpochMetrics, JitAdapter, JitConfig, JitResult, JitStrategy,
     LRSchedule, LoggingCallback, NoOpCallback, Optimizer, OptimizerConfig, RegularizationConfig,
     TrainingCallback, TrainingConfig, TrainingLoop, TrainingMetrics, TrainingState, freeze,
 };
 
-// GPU training re-exports (when feature enabled)
 #[cfg(feature = "gpu")]
 pub use train::{GpuTrainer, GpuTrainerBuilder};
 
-// LoRA re-exports
 #[cfg(all(feature = "safetensors", feature = "serde"))]
 pub use lora::LoadedAdapter;
 #[cfg(feature = "serde")]
 pub use lora::{AdapterId, LoraManifest, ManifestEntry};
 pub use lora::{LoraAdapter, LoraConfig, LoraLayer, blend_lora_adapters};
 
-// Registry re-exports
 pub use registry::{
     LiveModel, ModelMetadata, ModelQuery, ModelRegistry, ModelStatus, RegisteredModel,
     RollbackController, RollbackRecord, ShadowComparison, ShadowConfig, ShadowSession, ShadowState,
@@ -94,7 +87,6 @@ mod tests {
 
     #[test]
     fn test_end_to_end_workflow() {
-        // 1. Create training examples
         let examples: Vec<TrainingExample> = (0..100)
             .map(|i| {
                 let label = match i % 6 {
@@ -113,7 +105,6 @@ mod tests {
             })
             .collect();
 
-        // 2. Create dataset
         let mut dataset = Dataset::from_examples(examples);
         let config = DatasetConfig::with_batch_size(16).shuffle(true).seed(42);
         dataset.set_config(config).unwrap();
@@ -122,14 +113,12 @@ mod tests {
         assert_eq!(stats.num_examples, 100);
         assert_eq!(stats.embedding_dim, 3);
 
-        // 3. Configure training
         let train_config = TrainingConfig::quick();
         assert!(train_config.validate().is_ok());
 
-        // 4. Create training loop
         let mut trainer = TrainingLoop::new(train_config).unwrap();
 
-        // 5. The placeholder loop must fail instead of fabricating metrics
+        // The placeholder loop must fail instead of fabricating metrics.
         let error = trainer.train(&mut dataset).unwrap_err();
         assert!(matches!(
             error,
@@ -137,7 +126,6 @@ mod tests {
         ));
         let metrics = TrainingMetrics::default();
 
-        // 6. Create model for registry
         let metadata = ModelMetadata::classifier(3, 6, 1000)
             .dataset("test_dataset", 100)
             .training_metrics(metrics);
@@ -146,12 +134,10 @@ mod tests {
             .with_metadata(metadata)
             .with_description("Test model from end-to-end workflow");
 
-        // 7. Register in registry
         let registry = ModelRegistry::in_memory();
         let weights = vec![0u8; 1000];
         let id = registry.register(model, &weights).unwrap();
 
-        // 8. Verify registration
         let loaded = registry.get("intent_classifier", "0.1.0").unwrap();
         assert_eq!(loaded.id, id);
         assert_eq!(loaded.metadata.num_training_examples, 100);
@@ -159,30 +145,24 @@ mod tests {
 
     #[test]
     fn test_distillation_workflow() {
-        // 1. Create raw examples
         let raw = distill::RawExample::new(
             vec!["Hello".to_string(), "How are you?".to_string()],
             "What's the weather like?",
         );
 
-        // 2. Verify prompt generation
         let prompt = raw.to_prompt();
         assert!(prompt.contains("Context"));
         assert!(prompt.contains("weather"));
 
-        // 3. Create teacher config
         let teacher = TeacherConfig::claude_sonnet();
         assert!(teacher.validate().is_ok());
 
-        // 4. Create pipeline
         let mut pipeline = DistillationPipeline::with_teacher(teacher).unwrap();
 
-        // 5. Label (placeholder)
         let result = pipeline.label_single(&raw).unwrap();
         assert!(result.is_success());
         assert!(result.confidence > 0.0);
 
-        // 6. Check stats
         let stats = pipeline.stats();
         assert_eq!(stats.successful, 1);
     }

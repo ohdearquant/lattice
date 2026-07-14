@@ -13,8 +13,7 @@ use chrono::Utc;
 
 /// Distillation pipeline that orchestrates labeling from teacher models
 ///
-/// This is a placeholder implementation. The actual API calls would need
-/// to be implemented with a proper HTTP client like `reqwest`.
+/// Formats prompts and records simulated labels; it does not call a teacher API.
 pub struct DistillationPipeline {
     /// Teacher model configuration
     teacher: TeacherConfig,
@@ -70,11 +69,8 @@ impl DistillationPipeline {
     pub fn label_single(&mut self, raw: &RawExample) -> Result<LabelingResult> {
         let start = std::time::Instant::now();
 
-        // The simulated result preserves the future client boundary — see docs/distill.md.
-
         let _prompt = raw.to_prompt();
 
-        // Simulate labels (in production, these come from teacher)
         let mut labels = IntentLabels {
             continuation: 0.4,
             topic_shift: 0.1,
@@ -93,7 +89,6 @@ impl DistillationPipeline {
         let confidence = 0.85; // Would come from teacher response
         let latency_ms = start.elapsed().as_millis() as u64;
 
-        // Check confidence threshold
         if let Some(min_conf) = self.config.min_confidence
             && confidence < min_conf
         {
@@ -160,7 +155,6 @@ impl DistillationPipeline {
                 result.labels.clone(),
             );
 
-            // Add metadata about the labeling
             let metadata = ExampleMetadata::with_source(result.example_id.to_string())
                 .teacher(self.teacher.display_name())
                 .labeled_at(Utc::now())

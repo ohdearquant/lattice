@@ -26,15 +26,12 @@ fn test_teacher_config_builder() {
 fn test_teacher_config_validation() {
     let mut config = TeacherConfig::default();
 
-    // Valid config
     assert!(config.validate().is_ok());
 
-    // Invalid temperature
     config.temperature = 3.0;
     assert!(config.validate().is_err());
     config.temperature = 0.3;
 
-    // Invalid model_id
     config.model_id = String::new();
     assert!(config.validate().is_err());
 }
@@ -64,8 +61,6 @@ fn test_preset_configs() {
     assert!(gemini.validate().is_ok());
 }
 
-// Endpoint Security Tests
-
 #[test]
 fn test_endpoint_security_default_secure() {
     let security = EndpointSecurity::default_secure();
@@ -93,10 +88,8 @@ fn test_endpoint_verification_tls_required() {
         ..Default::default()
     };
 
-    // HTTPS should pass
     assert!(security.verify_endpoint("https://api.example.com").is_ok());
 
-    // HTTP should fail
     assert!(security.verify_endpoint("http://api.example.com").is_err());
 }
 
@@ -111,7 +104,6 @@ fn test_endpoint_verification_domain_whitelist() {
         ..Default::default()
     };
 
-    // Allowed domains should pass
     assert!(
         security
             .verify_endpoint("https://api.anthropic.com/v1")
@@ -123,7 +115,6 @@ fn test_endpoint_verification_domain_whitelist() {
             .is_ok()
     );
 
-    // Disallowed domains should fail
     assert!(
         security
             .verify_endpoint("https://evil.example.com/v1")
@@ -139,23 +130,19 @@ fn test_endpoint_verification_no_restrictions() {
         ..Default::default()
     };
 
-    // Any endpoint should pass
     assert!(security.verify_endpoint("http://any.example.com").is_ok());
     assert!(security.verify_endpoint("https://any.example.com").is_ok());
 }
 
 #[test]
 fn test_cert_fingerprint_validation() {
-    // Valid 64-char hex fingerprint
     let security = EndpointSecurity::default()
         .with_cert_fingerprint("a94a8fe5ccb19ba61c4c0873d391e987982fbbd3a94a8fe5ccb19ba61c4c0873");
     assert!(security.validate_cert_fingerprint("").is_ok());
 
-    // Invalid length
     let security = EndpointSecurity::default().with_cert_fingerprint("tooshort");
     assert!(security.validate_cert_fingerprint("").is_err());
 
-    // Invalid characters
     let security = EndpointSecurity::default()
         .with_cert_fingerprint("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
     assert!(security.validate_cert_fingerprint("").is_err());
@@ -166,10 +153,8 @@ fn test_model_checksum_verification() {
     let expected = "abc123def456";
     let security = EndpointSecurity::default().with_model_checksum(expected);
 
-    // Matching checksum should pass
     assert!(security.verify_model_checksum(expected).is_ok());
 
-    // Mismatched checksum should fail
     assert!(security.verify_model_checksum("wrong_checksum").is_err());
 }
 
@@ -180,7 +165,6 @@ fn test_teacher_config_with_invalid_custom_endpoint() {
         .security(EndpointSecurity::default_secure())
         .build();
 
-    // Should fail validation because TLS is required but endpoint is HTTP
     assert!(config.validate().is_err());
 }
 
@@ -193,7 +177,6 @@ fn test_teacher_config_with_valid_custom_endpoint() {
         .security(security)
         .build();
 
-    // Should pass validation
     assert!(config.validate().is_ok());
 }
 
@@ -201,7 +184,6 @@ fn test_teacher_config_with_valid_custom_endpoint() {
 fn test_local_config_security() {
     let config = TeacherConfig::local("llama2", "http://localhost:11434");
 
-    // Local config should allow HTTP localhost
     assert!(config.validate().is_ok());
 }
 

@@ -104,12 +104,6 @@ fn test_registry_delete() {
     assert!(registry.is_empty());
 }
 
-// ------------------------------------------------------------------
-// load_weights / load_weights_verified integrity (#504 remaining slice 3:
-// close the registry raw-load bypass — `load_weights` no longer silently
-// skips the checksum check when a hash is on record).
-// ------------------------------------------------------------------
-
 #[test]
 fn test_load_weights_verifies_when_hash_present() {
     let registry = ModelRegistry::in_memory();
@@ -123,7 +117,6 @@ fn test_load_weights_verifies_when_hash_present() {
         "register() must always record a weights_hash"
     );
 
-    // Untampered load succeeds via both entry points.
     assert_eq!(registry.load_weights(&registered).unwrap(), weights);
     assert_eq!(
         registry.load_weights_verified(&registered).unwrap(),
@@ -133,11 +126,7 @@ fn test_load_weights_verifies_when_hash_present() {
 
 #[test]
 fn test_load_weights_rejects_tampered_bytes_on_disk() {
-    // #504 remaining slice 3: previously `load_weights` was a pure raw
-    // read with zero checksum check — a byte flipped on disk (or a
-    // truncated file, or a full swap) would load silently. It must now
-    // be rejected via the SAME entry point a naive caller reaches for,
-    // not only via `load_weights_verified`.
+    // `load_weights` must verify a recorded checksum, not just the stricter API.
     let tmp = tempfile::tempdir().unwrap();
     let registry = ModelRegistry::with_path(tmp.path()).unwrap();
     let model = RegisteredModel::new("test", "1.0.0");
@@ -146,8 +135,6 @@ fn test_load_weights_rejects_tampered_bytes_on_disk() {
     let id = registry.register(model, &weights).unwrap();
     let registered = registry.get_by_id(&id).unwrap();
 
-    // Tamper with the on-disk weights file directly (flip one byte,
-    // same length — the size-only-adjacent failure mode).
     let weights_path = tmp.path().join("test/1.0.0/weights.bin");
     let mut tampered = weights.clone();
     tampered[3] ^= 0xFF;
@@ -161,7 +148,6 @@ fn test_load_weights_rejects_tampered_bytes_on_disk() {
         "expected WeightIntegrityError, got: {err:?}"
     );
 
-    // load_weights_verified must reject the same tampered artifact too.
     let err = registry
         .load_weights_verified(&registered)
         .expect_err("load_weights_verified must reject tampered bytes");
@@ -173,12 +159,7 @@ fn test_load_weights_rejects_tampered_bytes_on_disk() {
 
 #[test]
 fn test_load_weights_rejects_mutated_clone_hash() {
-    // `RegisteredModel` is a cloned DTO with public `weights_path`/
-    // `weights_hash` fields. If verification trusted the CALLER's value, a
-    // caller could tamper weights.bin on disk, set its clone's hash to
-    // sha256(tampered bytes), and have both entry points "verify" the
-    // tampered artifact. Verification must anchor to the canonical
-    // registry record and reject a disagreeing argument outright.
+    // Verification must use the canonical record, never caller-mutated fields.
     let tmp = tempfile::tempdir().unwrap();
     let registry = ModelRegistry::with_path(tmp.path()).unwrap();
     let model = RegisteredModel::new("test", "1.0.0");
@@ -186,8 +167,6 @@ fn test_load_weights_rejects_mutated_clone_hash() {
 
     let id = registry.register(model, &weights).unwrap();
 
-    // Tamper the on-disk artifact, then forge the clone's hash to match
-    // the tampered bytes.
     let weights_path = tmp.path().join("test/1.0.0/weights.bin");
     let mut tampered = weights.clone();
     tampered[0] ^= 0xFF;
@@ -211,8 +190,6 @@ fn test_load_weights_rejects_mutated_clone_hash() {
         "expected canonical-record disagreement rejection, got: {err:?}"
     );
 
-    // Blanking the clone's hash must not re-open the pre-#504 raw-load
-    // path either — the canonical record still carries a hash.
     let mut hashless = registry.get_by_id(&id).unwrap();
     hashless.weights_hash = None;
     let err = registry
@@ -230,8 +207,6 @@ fn test_load_weights_rejects_mutated_clone_hash() {
         "expected canonical-record disagreement rejection, got: {err:?}"
     );
 
-    // The honest canonical record still rejects the tampered disk bytes
-    // via the checksum itself.
     let canonical = registry.get_by_id(&id).unwrap();
     let err = registry
         .load_weights(&canonical)
@@ -244,11 +219,7 @@ fn test_load_weights_rejects_mutated_clone_hash() {
 
 #[test]
 fn test_load_weights_rejects_mutated_clone_path() {
-    // Path half of the canonical-record disagreement guard. The redirected
-    // file holds byte-identical content and the clone's hash is left
-    // canonical, so if the `weights_path` predicate were removed the load
-    // would wrongly SUCCEED (canonical path + canonical hash still line
-    // up) — the hash comparison cannot mask this test.
+    // A path mismatch must reject even when bytes and hash match.
     let tmp = tempfile::tempdir().unwrap();
     let registry = ModelRegistry::with_path(tmp.path()).unwrap();
     let model = RegisteredModel::new("test", "1.0.0");
@@ -280,8 +251,7 @@ fn test_load_weights_rejects_mutated_clone_path() {
 
 #[test]
 fn test_load_weights_rejects_unregistered_model() {
-    // A RegisteredModel value that was never registered (or was deleted)
-    // has no canonical record to verify against — it must not load at all.
+    // A missing canonical record must never load.
     let registry = ModelRegistry::in_memory();
     let mut ghost = RegisteredModel::new("ghost", "1.0.0");
     ghost.weights_path = Some("ghost/1.0.0/weights.bin".to_string());
@@ -326,13 +296,7 @@ fn test_load_weights_rejects_truncated_file_on_disk() {
 
 #[test]
 fn test_load_weights_verified_rejects_missing_hash() {
-    // A model with weights on disk but no recorded hash at all (e.g.
-    // registered via `register_metadata` and given a weights_path
-    // out-of-band, or a legacy pre-hash record) has nothing to verify
-    // against. `load_weights` still loads it (there is no check to
-    // perform), but `load_weights_verified` — the entry point that
-    // promises verification — must refuse rather than silently return
-    // an unverified load.
+    // The verified API must reject records with no checksum.
     let registry = ModelRegistry::in_memory();
     let mut model = RegisteredModel::new("test", "1.0.0");
     model.weights_path = Some("test/1.0.0/weights.bin".to_string());
@@ -567,22 +531,11 @@ mod sqlite_tests {
         assert!(storage.load("../evil/path").is_err());
     }
 
-    // ========================================================================
-    // #1392: Upgrade regression test — models.metadata_json → metadata
-    //
-    // Verifies that an existing DB whose `models` table was created with the
-    // OLD `metadata_json` column name is transparently upgraded on open, so
-    // that rows inserted under the old name are readable via the new column.
-    // Also verifies idempotency (reopening an already-migrated DB succeeds).
-    // ========================================================================
-
     #[test]
     fn upgrade_from_old_schema_renames_models_metadata_json_to_metadata() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("old_schema.db");
 
-        // Phase 1: Manually create a DB with the OLD column name `metadata_json`.
-        // This simulates a production DB created before the column was renamed.
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -622,17 +575,11 @@ mod sqlite_tests {
             .unwrap();
         }
 
-        // Phase 2: Open the DB via SqliteStorage::new() — this must trigger the
-        // migrate_models_metadata_json_to_metadata() migration transparently.
         let _storage = SqliteStorage::new(&db_path).unwrap();
 
-        // Phase 3: Verify via a separate raw connection that the column was renamed
-        // and data survived.  SqliteStorage wraps the connection privately, so we
-        // open a second connection directly for introspection.
         {
             let verify_conn = rusqlite::Connection::open(&db_path).unwrap();
 
-            // New column must be present and hold the original data.
             let metadata: String = verify_conn
                 .query_row(
                     "SELECT metadata FROM models WHERE id = 'test-id-001'",
@@ -645,7 +592,6 @@ mod sqlite_tests {
                 "metadata content must survive upgrade, got: {metadata}"
             );
 
-            // Old column must no longer exist.
             let old_col_result = verify_conn.query_row(
                 "SELECT metadata_json FROM models WHERE id = 'test-id-001'",
                 [],
@@ -657,32 +603,15 @@ mod sqlite_tests {
             );
         }
 
-        // Phase 4: Idempotency — reopening the already-migrated DB must succeed.
-        // SqliteStorage::new() will call migrate_models_metadata_json_to_metadata()
-        // again, which must be a no-op (not an error).
         let _storage2 =
             SqliteStorage::new(&db_path).expect("reopening already-migrated DB must not fail");
     }
-
-    // ========================================================================
-    // #1389: Upgrade regression test — models.registered_at / updated_at
-    //        TEXT (RFC 3339) → INTEGER (epoch microseconds)
-    //
-    // Verifies that an existing DB whose `models` table was created with the
-    // OLD TEXT column types for timestamps is transparently upgraded on open,
-    // so rows inserted under the old schema remain accessible and the column
-    // types are corrected.  Also verifies idempotency (reopening an already-
-    // migrated DB succeeds without error).
-    // ========================================================================
 
     #[test]
     fn upgrade_from_old_schema_converts_timestamps_text_to_integer() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("old_timestamps.db");
 
-        // Phase 1: Manually create a DB with the OLD TEXT timestamp columns.
-        // This simulates a production DB created before the column types were
-        // corrected.
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             conn.execute_batch(
@@ -705,7 +634,6 @@ mod sqlite_tests {
             )
             .unwrap();
 
-            // Insert a row with RFC 3339 TEXT timestamps (old format).
             conn.execute(
                 "INSERT INTO models
                  (id, name, version, status, metadata, registered_at, updated_at)
@@ -723,14 +651,8 @@ mod sqlite_tests {
             .unwrap();
         }
 
-        // Phase 2: Open the DB via SqliteStorage::new() — this must trigger the
-        // migrate_models_timestamps_text_to_integer() migration transparently.
         let _storage = SqliteStorage::new(&db_path).unwrap();
 
-        // Phase 3: Verify via a raw connection that:
-        //   a) The row is still present.
-        //   b) registered_at and updated_at are now INTEGER (epoch microseconds).
-        //   c) The values are in the correct ballpark (non-zero, positive).
         {
             let verify_conn = rusqlite::Connection::open(&db_path).unwrap();
 
@@ -742,21 +664,16 @@ mod sqlite_tests {
                 )
                 .expect("row must be readable after timestamp migration");
 
-            // 2024-01-15T10:30:00Z in epoch seconds is 1705314600.
-            // In epoch microseconds: 1705314600 * 1_000_000 = 1_705_314_600_000_000.
             assert_eq!(
                 reg_at, 1_705_314_600_000_000_i64,
                 "registered_at must be epoch microseconds, got: {reg_at}"
             );
 
-            // 2024-01-16T08:00:00Z in epoch seconds is 1705392000.
-            // In epoch microseconds: 1705392000 * 1_000_000 = 1_705_392_000_000_000.
             assert_eq!(
                 upd_at, 1_705_392_000_000_000_i64,
                 "updated_at must be epoch microseconds, got: {upd_at}"
             );
 
-            // Verify declared column type is now INTEGER via PRAGMA table_info.
             let col_types: Vec<(String, String)> = verify_conn
                 .prepare("PRAGMA table_info(models)")
                 .unwrap()
@@ -776,13 +693,9 @@ mod sqlite_tests {
             }
         }
 
-        // Phase 4: Idempotency — reopening the already-migrated DB must succeed
-        // without error.  The migration inspects column type and exits early
-        // when it sees INTEGER.
         let _storage2 =
             SqliteStorage::new(&db_path).expect("reopening already-migrated DB must not fail");
 
-        // Phase 5: Writing a new model after migration must succeed (INTEGER path).
         {
             let mut storage3 = SqliteStorage::new(&db_path).unwrap();
             let model = RegisteredModel::new("post_migration_model", "2.0.0");
@@ -794,15 +707,12 @@ mod sqlite_tests {
 
     #[test]
     fn upgrade_timestamps_handles_mixed_integer_rows_safely() {
-        // Verifies the per-row typeof() guard: a DB can have some rows already
-        // storing INTEGER values (if partially migrated or written by new code
-        // before migration ran) alongside TEXT rows without corruption.
+        // A mixed old/new timestamp column must preserve integer rows.
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("mixed_timestamps.db");
 
         {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
-            // Create table with TEXT column type (old schema).
             conn.execute_batch(
                 "CREATE TABLE models (
                     id TEXT PRIMARY KEY,
@@ -823,7 +733,6 @@ mod sqlite_tests {
             )
             .unwrap();
 
-            // Row A: TEXT RFC 3339 timestamps.
             conn.execute(
                 "INSERT INTO models
                  (id, name, version, status, metadata, registered_at, updated_at)
@@ -833,8 +742,6 @@ mod sqlite_tests {
             )
             .unwrap();
 
-            // Row B: INTEGER timestamps stored despite TEXT column type
-            // (SQLite dynamic typing permits this).
             conn.execute(
                 "INSERT INTO models
                  (id, name, version, status, metadata, registered_at, updated_at)
@@ -845,14 +752,11 @@ mod sqlite_tests {
             .unwrap();
         }
 
-        // Open via SqliteStorage — migration must handle both rows safely.
         let _storage = SqliteStorage::new(&db_path).unwrap();
 
         {
             let verify_conn = rusqlite::Connection::open(&db_path).unwrap();
 
-            // Row A was TEXT: expect epoch-micro conversion.
-            // 2024-03-01T00:00:00Z = 1709251200 seconds → 1_709_251_200_000_000 µs.
             let (ra_reg, ra_upd): (i64, i64) = verify_conn
                 .query_row(
                     "SELECT registered_at, updated_at FROM models WHERE id = 'row-a'",
@@ -863,7 +767,6 @@ mod sqlite_tests {
             assert_eq!(ra_reg, 1_709_251_200_000_000_i64, "row-a registered_at");
             assert_eq!(ra_upd, 1_709_251_200_000_000_i64, "row-a updated_at");
 
-            // Row B was already INTEGER: must pass through unchanged.
             let (rb_reg, rb_upd): (i64, i64) = verify_conn
                 .query_row(
                     "SELECT registered_at, updated_at FROM models WHERE id = 'row-b'",

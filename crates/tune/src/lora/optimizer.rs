@@ -60,7 +60,6 @@ impl AdamState {
         );
         let n = params.len();
 
-        // Lazily initialise moment vectors to zero.
         let m = self
             .m
             .entry(key.to_string())
@@ -70,35 +69,30 @@ impl AdamState {
             .entry(key.to_string())
             .or_insert_with(|| vec![0.0f32; n]);
 
-        // Advance only this tensor's timestep for correct bias correction.
+        // Bias correction uses a timestep per tensor, never a shared counter.
         let t = {
             let c = self.t.entry(key.to_string()).or_insert(0);
             *c += 1;
             *c
         };
 
-        // Bias-correction denominators (this key's own t).
         let bc1 = 1.0 - beta1.powi(t as i32);
         let bc2 = 1.0 - beta2.powi(t as i32);
 
         for i in 0..n {
             let g = grads[i];
 
-            // Update biased first moment: m = β₁·m + (1-β₁)·g
             m[i] = beta1 * m[i] + (1.0 - beta1) * g;
-            // Update biased second moment: v = β₂·v + (1-β₂)·g²
             v[i] = beta2 * v[i] + (1.0 - beta2) * g * g;
 
-            // Bias-corrected estimates.
             let m_hat = m[i] / bc1;
             let v_hat = v[i] / bc2;
 
-            // AdamW: decoupled weight decay applied before the gradient step.
+            // AdamW decouples weight decay from the gradient update.
             if decoupled && weight_decay != 0.0 {
                 params[i] -= lr * weight_decay * params[i];
             }
 
-            // θ -= lr · m̂ / (√v̂ + ε)
             params[i] -= lr * m_hat / (v_hat.sqrt() + eps);
         }
     }
@@ -109,8 +103,6 @@ impl Default for AdamState {
         Self::new()
     }
 }
-
-// ─── Gradient computation ────────────────────────────────────────────────────
 
 /// Gradients of the LoRA MSE loss with respect to a single layer's A and B matrices.
 #[derive(Debug)]
@@ -159,14 +151,12 @@ pub fn compute_lora_gradients(
         });
     }
 
-    // Forward: intermediate = A @ input  (rank,)
     let mut intermediate = vec![0.0f32; rank];
     for r in 0..rank {
         let row = &lora.a[r * d_in..(r + 1) * d_in];
         intermediate[r] = row.iter().zip(input.iter()).map(|(a, x)| a * x).sum();
     }
 
-    // Forward: delta = scale * B @ intermediate  (d_out,)
     let mut delta = vec![0.0f32; d_out];
     for i in 0..d_out {
         let row = &lora.b[i * rank..(i + 1) * rank];
@@ -178,7 +168,6 @@ pub fn compute_lora_gradients(
         delta[i] = scale * acc;
     }
 
-    // Residual and loss (sum of squared errors, matching adapt_step).
     let error: Vec<f32> = delta
         .iter()
         .zip(target_delta.iter())
@@ -186,7 +175,6 @@ pub fn compute_lora_gradients(
         .collect();
     let loss: f32 = error.iter().map(|e| e * e).sum();
 
-    // dL/dB[i*rank + r] = 2 * scale * error[i] * intermediate[r]
     let mut grad_b = vec![0.0f32; d_out * rank];
     for i in 0..d_out {
         for r in 0..rank {
@@ -194,13 +182,11 @@ pub fn compute_lora_gradients(
         }
     }
 
-    // bt_error[r] = Σ_i B[i*rank + r] * error[i]
     let mut bt_error = vec![0.0f32; rank];
     for r in 0..rank {
         bt_error[r] = (0..d_out).map(|i| lora.b[i * rank + r] * error[i]).sum();
     }
 
-    // dL/dA[r*d_in + j] = 2 * scale * bt_error[r] * input[j]
     let mut grad_a = vec![0.0f32; rank * d_in];
     for r in 0..rank {
         for j in 0..d_in {
@@ -248,8 +234,6 @@ mod tests {
         LoraAdapter::new(config, layers).expect("valid adapter config")
     }
 
-    // ─── gradient computation tests ────────────────────────────────────────
-
     #[test]
     fn test_gradient_computation() {
         let adapter = make_small_adapter();
@@ -259,17 +243,13 @@ mod tests {
         let grads = compute_lora_gradients(&adapter, 0, "q_proj", &input, &target_delta)
             .expect("compute_lora_gradients must succeed");
 
-        // grad_b shape: d_out * rank = 2 * 2 = 4
         assert_eq!(
             grads.grad_b.len(),
             4,
             "grad_b must have d_out*rank elements"
         );
-        // grad_a shape: rank * d_in = 2 * 3 = 6
         assert_eq!(grads.grad_a.len(), 6, "grad_a must have rank*d_in elements");
-        // Loss must be positive because delta != target.
         assert!(grads.loss > 0.0, "loss must be positive");
-        // At least one gradient element must be non-zero.
         assert!(
             grads.grad_b.iter().any(|&g| g.abs() > 1e-9)
                 || grads.grad_a.iter().any(|&g| g.abs() > 1e-9),
@@ -291,7 +271,6 @@ mod tests {
     #[test]
     fn test_gradient_computation_dimension_mismatch() {
         let adapter = make_small_adapter();
-        // input too short (d_in=3, passing 2)
         let err = compute_lora_gradients(&adapter, 0, "q_proj", &[1.0, 2.0], &[1.0, 1.0])
             .expect_err("wrong input length must return Err");
         assert!(
@@ -299,8 +278,6 @@ mod tests {
             "expected DimensionMismatch, got {err:?}"
         );
     }
-
-    // ─── Adam state tests ───────────────────────────────────────────────────
 
     #[test]
     fn test_adam_step_updates_params() {
@@ -345,7 +322,6 @@ mod tests {
         let mut pc = vec![3.0f32, 3.0];
         let mut pd = vec![4.0f32, 4.0];
 
-        // Step each key once.
         for (key, params) in [
             ("a", &mut pa),
             ("b", &mut pb),
@@ -360,7 +336,6 @@ mod tests {
         assert_eq!(state.t["c"], 1, "key 'c' must be at t=1 after one step");
         assert_eq!(state.t["d"], 1, "key 'd' must be at t=1 after one step");
 
-        // Step only "a" a second time.
         state.step("a", &mut pa, &grads, 0.01, 0.9, 0.999, 1e-8, 0.0, false);
 
         assert_eq!(
@@ -380,7 +355,4 @@ mod tests {
             "key 'd' must not advance when only 'a' is stepped"
         );
     }
-
-    // Integration tests for AdamW weight decay and Adam-vs-SGD convergence
-    // require the train_lora loop (issue #88). They will land alongside that.
 }

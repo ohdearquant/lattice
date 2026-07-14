@@ -103,12 +103,10 @@ fn test_pipeline_label_batch() {
 
 #[test]
 fn test_sanitize_strips_control_chars() {
-    // Create input with control characters
     let input_with_control = "Hello\x00World\x07Test";
     let raw = RawExample::new(vec![], input_with_control);
     let prompt = raw.to_prompt();
 
-    // Control chars should be stripped
     assert!(!prompt.contains('\x00'));
     assert!(!prompt.contains('\x07'));
     assert!(prompt.contains("HelloWorldTest"));
@@ -120,7 +118,6 @@ fn test_sanitize_preserves_newlines() {
     let raw = RawExample::new(vec![], input);
     let prompt = raw.to_prompt();
 
-    // Newlines, tabs, and carriage returns should be preserved
     assert!(prompt.contains('\n'));
     assert!(prompt.contains('\t'));
     assert!(prompt.contains('\r'));
@@ -132,20 +129,17 @@ fn test_sanitize_truncates_long_message() {
     let raw = RawExample::new(vec![], long_message.clone());
     let prompt = raw.to_prompt();
 
-    // Should be truncated to MAX_MESSAGE_LENGTH
     assert!(prompt.len() <= MAX_PROMPT_LENGTH + 20); // +20 for formatting
 }
 
 #[test]
 fn test_sanitize_truncates_long_prompt() {
-    // Create enough context to exceed MAX_PROMPT_LENGTH
     let long_context: Vec<String> = (0..1000)
         .map(|i| format!("Context message {i} with some content"))
         .collect();
     let raw = RawExample::new(long_context, "Final message");
     let prompt = raw.to_prompt();
 
-    // Should be truncated with marker
     assert!(prompt.len() <= MAX_PROMPT_LENGTH + 20);
     assert!(prompt.contains("[truncated]") || prompt.len() <= MAX_PROMPT_LENGTH);
 }

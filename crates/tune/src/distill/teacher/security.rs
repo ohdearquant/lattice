@@ -14,16 +14,13 @@ pub struct EndpointSecurity {
     /// Require TLS for remote connections
     pub require_tls: bool,
 
-    /// Expected SHA-256 certificate fingerprint (hex string)
-    /// If set, validates the server certificate fingerprint
+    /// Expected SHA-256 certificate fingerprint in hexadecimal.
     pub expected_cert_fingerprint: Option<String>,
 
-    /// Allowed endpoint domains (whitelist)
-    /// If set, only these domains are permitted
+    /// Endpoint host allowlist.
     pub allowed_domains: Option<Vec<String>>,
 
-    /// Model weight checksum (SHA-256 hex) for local models
-    /// Used to verify model integrity
+    /// Expected SHA-256 checksum for local model weights.
     pub model_checksum: Option<String>,
 }
 
@@ -75,17 +72,14 @@ impl EndpointSecurity {
     ///
     /// Returns Ok(()) if the endpoint passes all checks, Err with reason otherwise.
     pub fn verify_endpoint(&self, endpoint: &str) -> Result<(), String> {
-        // Parse the URL
         let endpoint_lower = endpoint.to_lowercase();
 
-        // Check TLS requirement
         if self.require_tls && !endpoint_lower.starts_with("https://") {
             return Err(format!(
                 "TLS required but endpoint uses insecure protocol: {endpoint}"
             ));
         }
 
-        // Check domain whitelist
         if let Some(ref allowed) = self.allowed_domains {
             let domain = Self::extract_domain(endpoint);
             if !allowed.iter().any(|d| domain == d.as_str()) {
@@ -110,8 +104,7 @@ impl EndpointSecurity {
             .unwrap_or(url)
     }
 
-    /// Validate certificate fingerprint (placeholder - actual implementation
-    /// would need TLS library integration)
+    /// Validate the configured certificate fingerprint's format.
     pub fn validate_cert_fingerprint(&self, _actual_fingerprint: &str) -> Result<(), String> {
         if let Some(ref expected) = self.expected_cert_fingerprint {
             // A live client must compare the format-validated value to its peer certificate.

@@ -124,7 +124,6 @@ impl DistillationStats {
                 + result.confidence)
                 / self.successful as f32;
 
-            // Update label distribution
             if self.label_distribution.is_empty() {
                 self.label_distribution = vec![0; IntentLabels::NUM_CLASSES];
             }
@@ -215,7 +214,6 @@ impl RawExample {
             "Current message to classify:\n{sanitized_message}"
         ));
 
-        // Truncate total prompt if needed
         if prompt.len() > MAX_PROMPT_LENGTH {
             prompt.truncate(MAX_PROMPT_LENGTH);
             prompt.push_str("\n[truncated]");
@@ -229,7 +227,6 @@ impl RawExample {
     /// - Strips control characters (except \n, \t, \r)
     /// - Truncates to [`MAX_MESSAGE_LENGTH`]
     fn sanitize_input(input: &str) -> String {
-        // Truncate first to avoid processing huge strings
         let truncated = if input.len() > MAX_MESSAGE_LENGTH {
             let boundary = input
                 .char_indices()
@@ -242,7 +239,6 @@ impl RawExample {
             input
         };
 
-        // Remove control characters except newlines, tabs, carriage returns
         truncated
             .chars()
             .filter(|c| !c.is_control() || *c == '\n' || *c == '\t' || *c == '\r')

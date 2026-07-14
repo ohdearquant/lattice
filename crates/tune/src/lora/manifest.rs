@@ -118,7 +118,7 @@ impl LoraManifest {
     /// allocation-DoS from an attacker-supplied or symlinked giant path.
     pub fn load(path: &Path) -> Result<Self> {
         use std::io::Read;
-        // Fast-path: stat before open (cheap; avoids opening a known-huge file).
+        // Check size before opening an untrusted path.
         let file_size = std::fs::metadata(path).map_err(TuneError::Io)?.len();
         if file_size > MAX_MANIFEST_SIZE {
             return Err(TuneError::Io(std::io::Error::new(
@@ -128,7 +128,7 @@ impl LoraManifest {
                 ),
             )));
         }
-        // Bounded read: +1 sentinel detects a file that grew after the stat.
+        // The extra byte detects growth after the metadata check.
         let f = std::fs::File::open(path).map_err(TuneError::Io)?;
         let mut buf = Vec::new();
         f.take(MAX_MANIFEST_SIZE + 1)
@@ -205,9 +205,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_required_field() {
-        // `id` is omitted — serde must reject this. `owner`/`dtype` are
-        // filled in (even though they're also required) so `id` remains the
-        // *sole* deliberately-missing field, matching this test's name.
+        // Populate every other required field so only `id` is missing.
         let json = r#"{
             "version": 1,
             "adapters": [{
@@ -247,9 +245,7 @@ mod tests {
             (AdapterStatus::Revoked, "revoked"),
         ] {
             assert_eq!(status.as_str(), expected);
-            // `as_str()` must never drift from the serde wire format, since
-            // callers (e.g. the safetensors header writer) use it as a
-            // stand-in for JSON serialization.
+            // `as_str()` is used as the safetensors wire-format value.
             assert_eq!(
                 serde_json::to_string(&status).unwrap(),
                 format!("\"{expected}\"")
@@ -259,8 +255,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_status() {
-        // `owner`/`dtype` are filled in so the failure is unambiguously
-        // about the bad `status` value, not an incidental missing field.
+        // Populate other fields so this rejects only the bad status.
         let json = r#"{
             "id": "x", "name": "n", "owner": "team-test", "uri": "u",
             "integrity_sha256": "h",
@@ -310,10 +305,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big_manifest.json");
 
-        // Produce a file whose stat length is MAX_MANIFEST_SIZE + 1 without
-        // writing 64 MiB: seek past the cap and write one byte. On every major
-        // filesystem this yields a sparse file (one real disk sector) whose
-        // reported length crosses the cap, exercising the guard cheaply.
+        // A sparse file crosses the cap without allocating its full length.
         {
             let mut f = std::fs::File::create(&path).unwrap();
             use std::io::Seek;

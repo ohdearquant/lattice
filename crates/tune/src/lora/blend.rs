@@ -36,7 +36,6 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         }
     }
 
-    // Group the union of projection keys with their folded source scales.
     let mut grouped: HashMap<(usize, String), Vec<(&LoraLayer, f32)>> = HashMap::new();
     for (adapter, weight) in adapters {
         let s_e = adapter.config().scale();
@@ -49,7 +48,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         }
     }
 
-    // Reject aggregate allocation overflow or budget excess before allocating.
+    // Check aggregate allocation before creating blend buffers.
     let mut planned_elems: usize = 0;
     for ((layer_idx, module), entries) in &grouped {
         let (first, _) = entries[0]; // each key was inserted with >=1 layer
@@ -84,14 +83,13 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         )));
     }
 
-    // Blend each (layer_idx, module) group independently.
     let mut blended_layers: HashMap<(usize, String), LoraLayer> = HashMap::new();
     for ((layer_idx, module), entries) in &grouped {
         let blended = blend_layer_entries(entries, &(layer_idx, module))?;
         blended_layers.insert((*layer_idx, module.clone()), blended);
     }
 
-    // Set alpha = rank so the returned adapter's scale is one.
+    // Folding source scales lets the returned adapter use scale one.
     let total_rank: usize = blended_layers.values().map(|l| l.rank).max().unwrap_or(0);
     let target_modules: Vec<String> = {
         let mut mods: Vec<String> = grouped
@@ -124,7 +122,6 @@ fn blend_layer_entries(
     let d_in = first_layer.d_in;
     let d_out = first_layer.d_out;
 
-    // Validate that all entries share the same projection shape.
     for (idx, (layer, _)) in entries.iter().enumerate() {
         if layer.d_in != d_in || layer.d_out != d_out {
             return Err(TuneError::Validation(format!(
@@ -135,7 +132,7 @@ fn blend_layer_entries(
         }
     }
 
-    // Accumulate rank_total with overflow protection and a hard cap.
+    // Bound the combined rank before allocating.
     let mut rank_total: usize = 0;
     for (layer, _) in entries {
         rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
@@ -149,7 +146,6 @@ fn blend_layer_entries(
         )));
     }
 
-    // Validate source buffers before copying their declared row-major shapes.
     for (idx, (layer, _)) in entries.iter().enumerate() {
         let expected_a = layer.rank.checked_mul(d_in).ok_or_else(|| {
             TuneError::Validation("blend_layer_entries: rank*d_in overflowed usize".into())
@@ -184,13 +180,11 @@ fn blend_layer_entries(
         TuneError::Validation("blend_layer_entries: d_out * rank_total overflowed usize".into())
     })?;
 
-    // Stack A blocks vertically in source order.
     let mut a_blend = Vec::with_capacity(a_buf_len);
     for (layer, _) in entries {
         a_blend.extend_from_slice(&layer.a);
     }
 
-    // Concatenate scaled B blocks horizontally in each row.
     let mut b_blend = vec![0.0f32; b_buf_len];
     let mut col_offset = 0usize;
     for (layer, eff_weight) in entries {
@@ -293,10 +287,6 @@ mod tests {
         delta
     }
 
-    // -----------------------------------------------------------------------
-    // Required assertion 1: single adapter at weight 1.0 is numerically
-    // identical to that adapter (max-diff 0.0 or < 1e-6).
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_single_adapter_identity() {
         let rank = 2;
@@ -306,11 +296,9 @@ mod tests {
 
         let blended = blend_lora_adapters(&[(&adapter, 1.0)]).unwrap();
 
-        // Generate a test input vector.
         let x: Vec<f32> = (0..d_in).map(|i| (i + 1) as f32).collect();
 
         let delta_orig = lora_delta(&adapter, &x);
-        // Blended adapter has scale=1.0 (alpha=rank_total).
         let blended_layer = blended.layers().get(&(0, "q_proj".to_string())).unwrap();
         let delta_blend = layer_delta(blended_layer, blended.config().scale(), &x);
 
@@ -326,10 +314,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Required assertion 2: blend of two adapters equals explicit sum.
-    // w1·Δ1(x) + w2·Δ2(x) matches the blended adapter's output (max-diff < 1e-5).
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_two_adapters_equals_sum() {
         let rank = 3;
@@ -347,7 +331,6 @@ mod tests {
 
         let d1 = lora_delta(&adapter1, &x);
         let d2 = lora_delta(&adapter2, &x);
-        // Expected: w1*Δ1 + w2*Δ2
         let expected: Vec<f32> = d1.iter().zip(&d2).map(|(a, b)| w1 * a + w2 * b).collect();
 
         let blended_layer = blended.layers().get(&(0, "q_proj".to_string())).unwrap();
@@ -365,9 +348,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Required assertion 3: rank of blended adapter equals Σr_e.
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_rank_equals_sum_of_ranks() {
         let adapter1 = make_adapter(1, 4, 4, 0.0);
@@ -383,18 +363,12 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Edge-case: empty adapters slice returns an error.
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_empty_returns_error() {
         let result: Result<LoraAdapter> = blend_lora_adapters(&[]);
         assert!(result.is_err(), "empty adapters should return an error");
     }
 
-    // -----------------------------------------------------------------------
-    // Edge-case: non-finite weight returns an error.
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_non_finite_weight_returns_error() {
         let adapter = make_adapter(1, 4, 4, 0.0);
@@ -402,13 +376,9 @@ mod tests {
         assert!(result.is_err(), "NaN weight should return an error");
     }
 
-    // -----------------------------------------------------------------------
-    // Summed rank exceeding MAX_BLEND_RANK_TOTAL returns an error.
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_rank_exceeds_cap_returns_error() {
         use super::MAX_BLEND_RANK_TOTAL;
-        // rank = cap + 1; d_in=1, d_out=1 → A and B are tiny (~32 KB total).
         let rank = MAX_BLEND_RANK_TOTAL + 1;
         let d_in = 1;
         let d_out = 1;
@@ -441,15 +411,11 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Mismatched A slice length returns an error.
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_mismatched_a_length_returns_error() {
         let rank = 2;
         let d_in = 4;
         let d_out = 4;
-        // A is one element short of the required rank * d_in.
         let a: Vec<f32> = vec![0.0f32; rank * d_in - 1];
         let b: Vec<f32> = vec![0.0f32; d_out * rank];
         let mut layers = HashMap::new();
@@ -479,16 +445,12 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Mismatched B slice length returns an error.
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_mismatched_b_length_returns_error() {
         let rank = 2;
         let d_in = 4;
         let d_out = 4;
         let a: Vec<f32> = vec![0.0f32; rank * d_in];
-        // B is one element short of the required d_out * rank.
         let b: Vec<f32> = vec![0.0f32; d_out * rank - 1];
         let mut layers = HashMap::new();
         layers.insert(
@@ -517,12 +479,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // alpha != rank causes scale() to be folded exactly once into B.
-    //
-    // With alpha=4, rank=2 → scale=2.0.  Blending a single adapter at
-    // mixture weight w should produce: w * scale * B @ (A @ x).
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_folds_alpha_rank_scale_once() {
         let rank = 2usize;
@@ -560,7 +516,6 @@ mod tests {
         let x: Vec<f32> = (0..d_in).map(|i| (i + 1) as f32).collect();
         let scale = alpha / rank as f32; // = 2.0
 
-        // Reference: w * scale * B @ (A @ x) — scale folded exactly once.
         let mut inter = vec![0.0f32; rank];
         for r in 0..rank {
             inter[r] = (0..d_in).map(|c| a[r * d_in + c] * x[c]).sum();
@@ -569,7 +524,6 @@ mod tests {
             .map(|row| w * scale * (0..rank).map(|c| b[row * rank + c] * inter[c]).sum::<f32>())
             .collect();
 
-        // Blended adapter has alpha=rank_total so scale()=1.0; use layer_delta directly.
         let actual = layer_delta(blended_layer, blended.config().scale(), &x);
 
         let max_diff = expected
@@ -584,9 +538,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Edge-case: adapters with different ranks blend correctly.
-    // -----------------------------------------------------------------------
     #[test]
     fn blend_asymmetric_ranks() {
         let r1 = 1;
@@ -624,15 +575,7 @@ mod tests {
         assert!(max_diff < 1e-5, "asymmetric-rank blend max-diff={max_diff}");
     }
 
-    // -----------------------------------------------------------------------
-    // Contract: a malformed huge dimension returns Err, never panics.
-    //
-    // rank=2, d_in=usize::MAX/2+1, d_out=1 with empty a and b=[0.0;2].
-    // Through the public entry the aggregate pre-pass catches it first
-    // (rank_total*(d_in+d_out) overflows usize via checked_mul → Err); the
-    // per-entry checked_mul is defense-in-depth for the same overflow class,
-    // isolated directly by blend_layer_entries_per_entry_product_overflow.
-    // -----------------------------------------------------------------------
+    // Malformed huge dimensions must return an error without allocating.
     #[test]
     fn blend_malformed_huge_dim_returns_err_not_panic() {
         let rank = 2usize;
@@ -659,24 +602,13 @@ mod tests {
         )
         .expect("valid adapter config");
         let result = blend_lora_adapters(&[(&adapter, 1.0)]);
-        // The pre-pass catches the overflow in rank_total*(d_in+d_out); the
-        // per-entry checked_mul is defense-in-depth for the same class.
         assert!(
             result.is_err(),
             "malformed huge dim must return Err, not panic"
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Isolates the per-entry rank*d_in checked_mul directly. Through the public
-    // blend_lora_adapters the aggregate pre-pass catches this overflow class
-    // first; calling the per-group helper with a single malformed entry
-    // (rank_total below the per-projection cap, no aggregate stage) reaches the
-    // per-entry guard as the first and only overflow check. Pinning the error
-    // message makes it mutation-sensitive: reverting the checked_mul makes the
-    // overflow either panic (debug) or surface via a different guard (release),
-    // both of which fail this assertion.
-    // -----------------------------------------------------------------------
+    // Exercise the per-entry overflow guard without the aggregate pre-pass.
     #[test]
     fn blend_layer_entries_per_entry_product_overflow_returns_err() {
         let rank = 2usize;
@@ -702,14 +634,7 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Contract: an aggregate element budget overrun returns Err before alloc.
-    //
-    // 65 layers each with rank=4096, d_in=2048, d_out=2048, empty a/b so the
-    // test allocates nothing. Per-group: rank_total=4096 == cap (passes the
-    // per-projection check). Aggregate: 4096*(2048+2048)*65 = 1,090,519,040
-    // > MAX_BLEND_TOTAL_ELEMENTS (1<<30 = 1,073,741,824).
-    // -----------------------------------------------------------------------
+    // Aggregate allocation limits must reject before any layer buffer exists.
     #[test]
     fn blend_aggregate_budget_exceeded_returns_err() {
         use super::MAX_BLEND_TOTAL_ELEMENTS;

@@ -263,11 +263,9 @@ impl LoraAdapter {
     }
 }
 
-// Delegate inference hooks to the adapter's application path.
 #[cfg(feature = "inference-hook")]
 impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
     fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]) {
-        // Delegate to the existing apply method
         LoraAdapter::apply(self, layer_idx, module, x, output);
     }
 }
@@ -285,8 +283,6 @@ mod tests {
 
         let mut layers = HashMap::new();
 
-        // Layer 0, q_proj: rank=2, d_in=4, d_out=4
-        // A = identity-like (first 2 components), B = scale
         layers.insert(
             (0, "q_proj".into()),
             LoraLayer {
@@ -362,11 +358,6 @@ mod tests {
     fn test_adapter_apply() {
         let adapter = make_test_adapter();
 
-        // x = [1, 2, 3, 4], base = [0, 0, 0, 0]
-        // A @ x = [1, 2] (picks first 2 components)
-        // B @ [1, 2] = [1, 2, 0, 0]
-        // scale = 2.0
-        // output = [0, 0, 0, 0] + 2.0 * [1, 2, 0, 0] = [2, 4, 0, 0]
         let x = [1.0, 2.0, 3.0, 4.0];
         let mut output = [0.0f32; 4];
         adapter.apply(0, "q_proj", &x, &mut output);
@@ -383,7 +374,6 @@ mod tests {
 
         let x = [1.0, 2.0, 3.0, 4.0];
         let mut output = [10.0, 20.0, 30.0, 40.0];
-        // v_proj at layer 0 has no adapter -> should be a no-op
         adapter.apply(0, "v_proj", &x, &mut output);
 
         assert!((output[0] - 10.0).abs() < 1e-6);
@@ -396,7 +386,6 @@ mod tests {
 
         let x = [1.0, 2.0, 3.0, 4.0];
         let mut output = [10.0, 20.0, 30.0, 40.0];
-        // layer 1 has no adapter -> should be a no-op
         adapter.apply(1, "q_proj", &x, &mut output);
 
         assert!((output[0] - 10.0).abs() < 1e-6);
@@ -413,7 +402,6 @@ mod tests {
     #[test]
     fn test_num_parameters() {
         let adapter = make_test_adapter();
-        // A: 2*4 = 8, B: 4*2 = 8 => total 16
         assert_eq!(adapter.num_parameters(), 16);
     }
 
@@ -503,7 +491,6 @@ mod tests {
         #[test]
         fn test_validate_against_layer_out_of_bounds() {
             let cfg = Qwen35Config::qwen35_0_8b();
-            // layer 999 does not exist
             let adapter = make_adapter_for_layer(999, "q_proj", 1024, 4096);
             assert!(adapter.validate_against(&cfg).is_err());
         }
@@ -511,9 +498,6 @@ mod tests {
         #[test]
         fn test_validate_against_dim_mismatch() {
             let cfg = Qwen35Config::qwen35_0_8b();
-            // 0.8b: hidden=1024, full_q_dim=8*256=2048 → q_proj expects (1024, 4096)
-            // Supply 2b dims (hidden=2048, full_q_dim=4096 → d_out=8192) — wrong for 0.8b.
-            // Layer 3 is full-attention in the 24-layer 0.8b config.
             let adapter = make_adapter_for_layer(3, "q_proj", 2048, 8192);
             assert!(adapter.validate_against(&cfg).is_err());
         }
@@ -521,7 +505,6 @@ mod tests {
         #[test]
         fn test_validate_against_correct_dims_passes() {
             let cfg = Qwen35Config::qwen35_0_8b();
-            // Layer 3 is full-attention; q_proj: d_in=hidden=1024, d_out=2*full_q_dim=4096.
             let adapter = make_adapter_for_layer(3, "q_proj", 1024, 4096);
             assert!(adapter.validate_against(&cfg).is_ok());
         }
@@ -529,7 +512,6 @@ mod tests {
         #[test]
         fn test_validate_against_mlp_correct() {
             let cfg = Qwen35Config::qwen35_0_8b();
-            // gate_proj on any layer: d_in=hidden=1024, d_out=intermediate=3584.
             let adapter = make_adapter_for_layer(0, "gate_proj", 1024, 3584);
             assert!(adapter.validate_against(&cfg).is_ok());
         }
@@ -544,11 +526,7 @@ mod tests {
 
         #[test]
         fn test_validate_against_gdn_all_modules_pass() {
-            // Regression: train_grad_full --save emits all five GDN LoRA modules
-            // (in_proj_qkv/z/b/a, out_proj). The forward applies every one of them
-            // (gdn_fused.rs), so validate_against must accept each with the dims the
-            // loader and trainer use. Dims are derived from the config, not hardcoded,
-            // so this stays correct if the reference dims change.
+            // All GDN LoRA dimensions must come from the model configuration.
             let cfg = Qwen35Config::qwen35_0_8b();
             let gdn_layer = (0..cfg.num_hidden_layers)
                 .find(|&i| !cfg.is_full_attention(i))
@@ -586,13 +564,11 @@ mod tests {
                 .expect("config has linear-attention layers");
             let h = cfg.hidden_size;
 
-            // Correct dims (value_heads=32) must validate.
             let ok_b = make_adapter_for_layer(gdn_layer, "in_proj_b", h, 32);
             assert!(ok_b.validate_against(&cfg).is_ok());
             let ok_a = make_adapter_for_layer(gdn_layer, "in_proj_a", h, 32);
             assert!(ok_a.validate_against(&cfg).is_ok());
 
-            // The old (wrong) key-head dim (16) must be rejected.
             let bad_b = make_adapter_for_layer(gdn_layer, "in_proj_b", h, 16);
             assert!(
                 bad_b.validate_against(&cfg).is_err(),
@@ -615,13 +591,11 @@ mod tests {
                 .expect("config has linear-attention layers");
             let h = cfg.hidden_size;
 
-            // Correct dims (value_heads=48) must validate.
             let ok_b = make_adapter_for_layer(gdn_layer, "in_proj_b", h, 48);
             assert!(ok_b.validate_against(&cfg).is_ok());
             let ok_a = make_adapter_for_layer(gdn_layer, "in_proj_a", h, 48);
             assert!(ok_a.validate_against(&cfg).is_ok());
 
-            // The old (wrong) key-head dim (16) must be rejected.
             let bad_b = make_adapter_for_layer(gdn_layer, "in_proj_b", h, 16);
             assert!(
                 bad_b.validate_against(&cfg).is_err(),

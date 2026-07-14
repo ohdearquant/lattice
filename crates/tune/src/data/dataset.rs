@@ -205,7 +205,6 @@ impl Dataset {
     pub fn with_config(examples: Vec<TrainingExample>, config: DatasetConfig) -> Result<Self> {
         config.validate()?;
 
-        // Filter examples based on context size requirements
         let filtered: Vec<TrainingExample> = examples
             .into_iter()
             .filter(|e| {
@@ -302,7 +301,7 @@ impl Dataset {
 
     /// Shuffle indices using simple Fisher-Yates
     fn shuffle_indices(&mut self) {
-        // Simple LCG for deterministic shuffling when seed is provided
+        // The LCG keeps seeded shuffles reproducible without an RNG dependency.
         let mut state = self.config.seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -311,7 +310,6 @@ impl Dataset {
         });
 
         for i in (1..self.indices.len()).rev() {
-            // LCG: state = (a * state + c) mod m
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             let j = (state as usize) % (i + 1);
             self.indices.swap(i, j);
@@ -327,7 +325,6 @@ impl Dataset {
         let batch_size = self.config.batch_size;
         let end_idx = (self.current_idx + batch_size).min(self.examples.len());
 
-        // Skip incomplete final batch if drop_last is true
         if self.config.drop_last && (end_idx - self.current_idx) < batch_size {
             self.current_idx = self.examples.len();
             return None;
@@ -374,7 +371,6 @@ impl Dataset {
         let min_context_size = *context_sizes.iter().min().unwrap_or(&0);
         let max_context_size = *context_sizes.iter().max().unwrap_or(&0);
 
-        // Count dominant labels
         let mut label_distribution = vec![0usize; 6];
         for example in &self.examples {
             let probs = example.labels.to_vec();
@@ -505,7 +501,6 @@ mod tests {
             .set_config(DatasetConfig::with_batch_size(10).seed(42))
             .unwrap();
 
-        // Same seed should produce same shuffle
         let batches1: Vec<Batch> = dataset1.batches().collect();
         let batches2: Vec<Batch> = dataset2.batches().collect();
 

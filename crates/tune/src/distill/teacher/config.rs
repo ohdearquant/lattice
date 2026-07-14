@@ -185,7 +185,6 @@ Respond ONLY with the JSON object, no other text."#.to_string()
             return Err("timeout_ms must be > 0".to_string());
         }
 
-        // Validate endpoint security if custom endpoint is provided
         if let Some(ref endpoint) = self.endpoint {
             self.security.verify_endpoint(endpoint)?;
         }
@@ -198,7 +197,7 @@ Respond ONLY with the JSON object, no other text."#.to_string()
     /// This performs no network I/O and only validates the format of a configured
     /// certificate fingerprint. See [`docs/distill.md`](../../../docs/distill.md#teacherconfigverify_endpoint) for the client-side checks that remain.
     pub fn verify_endpoint(&self) -> Result<(), String> {
-        // Resolve the provider default before applying local policy.
+        // Apply policy to the resolved provider default as well as custom endpoints.
         let endpoint = self.get_endpoint();
         self.security.verify_endpoint(&endpoint)?;
 

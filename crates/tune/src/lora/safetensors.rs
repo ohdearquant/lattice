@@ -34,10 +34,8 @@ enum LoraMatrix {
 
 /// Parse a recognized PEFT or MLX LoRA tensor key, ignoring non-factor keys.
 fn parse_peft_key(key: &str) -> Option<PeftKey> {
-    // Strip the trailing `.weight` if present
     let key = key.strip_suffix(".weight").unwrap_or(key);
 
-    // Determine A or B (handles both PEFT uppercase and MLX lowercase)
     let (key, matrix, is_mlx) = if let Some(k) = key.strip_suffix(".lora_A") {
         (k, LoraMatrix::A, false)
     } else if let Some(k) = key.strip_suffix(".lora_B") {
@@ -50,19 +48,14 @@ fn parse_peft_key(key: &str) -> Option<PeftKey> {
         return None;
     };
 
-    // Find "layers.{i}" segment and extract what follows
     let layers_marker = ".layers.";
     let layers_pos = key.find(layers_marker)?;
     let after_layers = &key[layers_pos + layers_marker.len()..];
 
-    // Split: "{i}.{rest}" where rest is like "self_attn.q_proj" or "mlp.gate_proj"
     let dot_pos = after_layers.find('.')?;
     let layer_idx: usize = after_layers[..dot_pos].parse().ok()?;
     let rest = &after_layers[dot_pos + 1..];
 
-    // Extract the module name (last segment after the block qualifier).
-    // "self_attn.q_proj" -> "q_proj"
-    // "mlp.gate_proj" -> "gate_proj"
     let module = rest.rsplit('.').next()?.to_string();
     if module.is_empty() {
         return None;
@@ -158,22 +151,18 @@ fn f16_to_f32(bits: u16) -> f32 {
 
     if exp == 0 {
         if frac == 0 {
-            // Zero
             f32::from_bits(sign << 31)
         } else {
-            // Subnormal: value = (-1)^sign * 2^(-14) * (frac / 1024)
             let val = (frac as f32) / 1024.0 * (2.0f32).powi(-14);
             if sign == 1 { -val } else { val }
         }
     } else if exp == 31 {
-        // Inf or NaN
         if frac == 0 {
             f32::from_bits((sign << 31) | (0xff << 23))
         } else {
             f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
         }
     } else {
-        // Normalized: re-bias exponent from 15 to 127
         let f32_exp = exp + 127 - 15;
         f32::from_bits((sign << 31) | (f32_exp << 23) | (frac << 13))
     }
@@ -191,7 +180,6 @@ pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, T
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|e| TuneError::Serialization(format!("failed to parse safetensors: {e}")))?;
 
-    // Collect all parsed LoRA keys
     let names: Vec<String> = tensors.names().into_iter().map(String::from).collect();
     let mut a_tensors: HashMap<(usize, String), (Vec<f32>, Vec<usize>)> = HashMap::new();
     let mut b_tensors: HashMap<(usize, String), (Vec<f32>, Vec<usize>)> = HashMap::new();
@@ -203,8 +191,7 @@ pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, T
             let (data, shape) = read_tensor_f32(&tensors, name)?;
             target_modules.insert(peft_key.module.clone());
 
-            // MLX format stores transposed: A=(d_in, rank), B=(rank, d_out)
-            // PEFT format (what we expect): A=(rank, d_in), B=(d_out, rank)
+            // MLX stores factors transposed relative to PEFT.
             let (data, shape) = if peft_key.transposed && shape.len() == 2 {
                 let (rows, cols) = (shape[0], shape[1]);
                 let expected = rows.checked_mul(cols).ok_or_else(|| {
@@ -451,7 +438,6 @@ pub(crate) const MAX_LORA_SIZE: u64 = 10 * 1024 * 1024 * 1024;
 /// Returns I/O errors for metadata, over-limit, open, or read failures.
 /// See [`docs/lora-io.md`](../../docs/lora-io.md#read_lora_file_bounded) for the two-stage bound.
 pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<u8>, TuneError> {
-    // Reject a known-oversized file before allocation.
     let file_size = std::fs::metadata(path)
         .map_err(|e| {
             TuneError::Io(std::io::Error::new(
@@ -469,7 +455,6 @@ pub(crate) fn read_lora_file_bounded(path: &Path, max_bytes: u64) -> Result<Vec<
             ),
         )));
     }
-    // The one-byte sentinel catches growth after the metadata check.
     use std::io::Read;
     let f = std::fs::File::open(path).map_err(|e| {
         TuneError::Io(std::io::Error::new(
@@ -514,7 +499,6 @@ pub fn save_peft_safetensors(
 ) -> Result<(), TuneError> {
     adapter.config().validate()?;
 
-    // Collect owned byte buffers first; TensorView borrows from these.
     let mut byte_data: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
 
     for ((layer_idx, module), layer) in adapter.layers() {

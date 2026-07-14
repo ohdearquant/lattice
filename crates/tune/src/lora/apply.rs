@@ -24,8 +24,7 @@ pub fn apply_lora(lora: &LoraLayer, scale: f32, x: &[f32], output: &mut [f32]) {
     debug_assert_eq!(x.len(), lora.d_in, "x length must equal d_in");
     debug_assert!(output.len() >= lora.d_out, "output length must be >= d_out");
 
-    // Step 1: intermediate = A @ x  -> shape (rank,)
-    // A is row-major (rank, d_in), so row r dot x gives intermediate[r].
+    // `A` is row-major `(rank, d_in)`.
     let rank = lora.rank;
     let d_in = lora.d_in;
     let d_out = lora.d_out;
@@ -37,8 +36,7 @@ pub fn apply_lora(lora: &LoraLayer, scale: f32, x: &[f32], output: &mut [f32]) {
         *inter = acc;
     }
 
-    // Step 2: output += scale * B @ intermediate  -> accumulate into (d_out,)
-    // B is row-major (d_out, rank), so row r dot intermediate gives the contribution.
+    // `B` is row-major `(d_out, rank)`.
     for (r, out) in output[..d_out].iter_mut().enumerate() {
         let row = &lora.b[r * rank..(r + 1) * rank];
         let acc: f32 = row
@@ -56,13 +54,6 @@ mod tests {
 
     #[test]
     fn test_apply_lora_identity_like() {
-        // rank=1, d_in=3, d_out=2
-        // A = [[1, 0, 0]]  (1x3)
-        // B = [[1], [0]]    (2x1)
-        // x = [5, 3, 1]
-        // A @ x = [5]
-        // B @ [5] = [5, 0]
-        // scale = 2.0 => output += [10, 0]
         let lora = LoraLayer {
             a: vec![1.0, 0.0, 0.0],
             b: vec![1.0, 0.0],
@@ -81,13 +72,6 @@ mod tests {
 
     #[test]
     fn test_apply_lora_rank2() {
-        // rank=2, d_in=2, d_out=2
-        // A = [[1, 0], [0, 1]]  (2x2, identity)
-        // B = [[1, 2], [3, 4]]  (2x2)
-        // x = [1, 1]
-        // A @ x = [1, 1]
-        // B @ [1, 1] = [3, 7]
-        // scale = 0.5 => output += [1.5, 3.5]
         let lora = LoraLayer {
             a: vec![1.0, 0.0, 0.0, 1.0],
             b: vec![1.0, 2.0, 3.0, 4.0],
@@ -118,7 +102,6 @@ mod tests {
         let mut output = [10.0, 20.0];
         apply_lora(&lora, 0.0, &x, &mut output);
 
-        // Output should be unchanged
         assert!((output[0] - 10.0).abs() < 1e-6);
         assert!((output[1] - 20.0).abs() < 1e-6);
     }

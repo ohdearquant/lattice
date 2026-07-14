@@ -45,7 +45,6 @@ pub fn adapt_step(
     target_delta: &[f32],
     learning_rate: f32,
 ) -> Result<AdaptStepResult, TuneError> {
-    // Extract scale before any mutable borrow of adapter layers.
     let scale = adapter.config().scale();
 
     let lora = adapter
@@ -70,16 +69,12 @@ pub fn adapt_step(
         });
     }
 
-    // Forward: intermediate = A @ input,  shape (rank,)
-    // A is row-major (rank, d_in): intermediate[r] = sum_j A[r*d_in + j] * input[j]
     let mut intermediate = vec![0.0f32; rank];
     for r in 0..rank {
         let row = &lora.a[r * d_in..(r + 1) * d_in];
         intermediate[r] = row.iter().zip(input.iter()).map(|(a, x)| a * x).sum();
     }
 
-    // Forward: delta = scale * B @ intermediate,  shape (d_out,)
-    // B is row-major (d_out, rank): delta[i] = scale * sum_r B[i*rank + r] * intermediate[r]
     let mut delta = vec![0.0f32; d_out];
     for i in 0..d_out {
         let row = &lora.b[i * rank..(i + 1) * rank];
@@ -91,7 +86,6 @@ pub fn adapt_step(
         delta[i] = scale * acc;
     }
 
-    // Residual and loss
     let residual: Vec<f32> = delta
         .iter()
         .zip(target_delta.iter())
@@ -99,7 +93,6 @@ pub fn adapt_step(
         .collect();
     let loss: f32 = residual.iter().map(|r| r * r).sum();
 
-    // dL/dB[i*rank + r] = 2 * scale * residual[i] * intermediate[r]
     let mut db = vec![0.0f32; d_out * rank];
     for i in 0..d_out {
         for r in 0..rank {
@@ -107,13 +100,11 @@ pub fn adapt_step(
         }
     }
 
-    // bt_residual[r] = sum_i B[i*rank + r] * residual[i]  (B^T @ residual)
     let mut bt_residual = vec![0.0f32; rank];
     for r in 0..rank {
         bt_residual[r] = (0..d_out).map(|i| lora.b[i * rank + r] * residual[i]).sum();
     }
 
-    // dL/dA[r*d_in + j] = 2 * scale * bt_residual[r] * input[j]
     let mut da = vec![0.0f32; rank * d_in];
     for r in 0..rank {
         for j in 0..d_in {
@@ -126,7 +117,6 @@ pub fn adapt_step(
         sq.sqrt()
     };
 
-    // SGD in-place update
     for (b_val, db_val) in lora.b.iter_mut().zip(db.iter()) {
         *b_val -= learning_rate * db_val;
     }
@@ -221,7 +211,6 @@ mod tests {
     fn test_adapt_step_dimension_mismatch() {
         let mut adapter = make_small_adapter();
 
-        // input too short (d_in=3, passing 2)
         let err = adapt_step(&mut adapter, 0, "q_proj", &[1.0, 2.0], &[1.0, 1.0], 0.01)
             .expect_err("wrong input length must return Err");
         assert!(
@@ -229,7 +218,6 @@ mod tests {
             "expected DimensionMismatch, got {err:?}"
         );
 
-        // target_delta wrong length (d_out=2, passing 3)
         let err = adapt_step(
             &mut adapter,
             0,

@@ -69,10 +69,8 @@ impl<'a> RunningRevisions<'a> {
         }
     }
 
-    /// Permissive revision context: mismatches are recorded on the loaded
-    /// adapter (`rev_mismatch_overridden`) but do not fail the load. Intended
-    /// for controlled migrations/backfills only — this reopens the silent
-    /// quality-loss gap Check 11 exists to close.
+    /// Permit revision mismatches for controlled migrations or backfills.
+    /// The loaded adapter records that this bypassed the usual rejection.
     pub fn permissive(base_model_rev: &'a str, tokenizer_rev: &'a str) -> Self {
         Self {
             base_model_rev,
@@ -93,7 +91,7 @@ pub fn load_adapters_from_manifest(
     >,
     running: Option<&RunningRevisions<'_>>,
 ) -> Result<Vec<LoadedAdapter>> {
-    // Reject a disallowed manifest before any adapter I/O — see docs/lora-io.md.
+    // Reject unapproved entries before any adapter I/O.
     for entry in &manifest.adapters {
         match entry.status {
             AdapterStatus::Quarantined => {
@@ -112,12 +110,10 @@ pub fn load_adapters_from_manifest(
         }
     }
 
-    // Allocate only after the admission pre-scan.
     let mut out = Vec::with_capacity(manifest.adapters.len());
 
     for entry in &manifest.adapters {
-        // Check 1: Status — defence-in-depth after the prescan above; can only
-        // fire if the manifest is mutated between the prescan and this loop.
+        // Recheck status in case the manifest changes after the pre-scan.
         match entry.status {
             AdapterStatus::Quarantined => {
                 return Err(TuneError::Validation(format!(
@@ -134,7 +130,7 @@ pub fn load_adapters_from_manifest(
             AdapterStatus::Approved => {}
         }
 
-        // Check 2: canonicalization must prove an untrusted URI remains in `base_dir`.
+        // Canonicalization must prove an untrusted URI remains in `base_dir`.
         let full_path = {
             let p = Path::new(&entry.uri);
             if p.is_absolute() {
@@ -152,7 +148,6 @@ pub fn load_adapters_from_manifest(
                 }
             }
             let joined = base_dir.join(p);
-            // Prove both endpoints before reading — see docs/lora-io.md.
             let canonical_base = std::fs::canonicalize(base_dir).map_err(|e| {
                 TuneError::Io(std::io::Error::new(
                     e.kind(),
@@ -176,7 +171,6 @@ pub fn load_adapters_from_manifest(
                     canonical_joined
                 }
                 Err(e) => {
-                    // Never fall back to an unproven lexical path.
                     return Err(TuneError::Io(std::io::Error::new(
                         e.kind(),
                         format!(
@@ -189,7 +183,7 @@ pub fn load_adapters_from_manifest(
             }
         };
 
-        // Checks 3–4: read the proven path once; bounded I/O and SHA-256 backstop races.
+        // Bound the verified-path read, then verify its checksum.
         let bytes = crate::lora::safetensors::read_lora_file_bounded(
             &full_path,
             crate::lora::safetensors::MAX_LORA_SIZE,
@@ -204,7 +198,6 @@ pub fn load_adapters_from_manifest(
             )));
         }
 
-        // Check 5: Parse safetensors bytes into a LoraAdapter.
         let adapter =
             crate::lora::safetensors::load_peft_safetensors_bytes(&bytes).map_err(|e| {
                 TuneError::Validation(format!(
@@ -213,7 +206,6 @@ pub fn load_adapters_from_manifest(
                 ))
             })?;
 
-        // Check 6: Rank must match the manifest entry.
         if adapter.config().rank != entry.rank {
             return Err(TuneError::Validation(format!(
                 "rank mismatch for '{}': manifest says {}, file has {}",
@@ -223,10 +215,9 @@ pub fn load_adapters_from_manifest(
             )));
         }
 
-        // Check 7: synthesized alpha also must match; omission cannot bypass the claim.
+        // Synthesized alpha must also match the manifest claim.
         validate_manifest_alpha(adapter.config().alpha, entry)?;
 
-        // Check 8: target_modules in adapter must be a subset of entry's list.
         for module in &adapter.config().target_modules {
             if !entry.target_modules.contains(module) {
                 return Err(TuneError::Validation(format!(
@@ -237,7 +228,6 @@ pub fn load_adapters_from_manifest(
             }
         }
 
-        // Check 9: Dimension validation against model config (inference-hook only).
         #[cfg(feature = "inference-hook")]
         if let Some(cfg) = model_config {
             adapter.validate_against(cfg).map_err(|e| {
@@ -248,7 +238,6 @@ pub fn load_adapters_from_manifest(
             })?;
         }
 
-        // Check 10: If safetensors header carries `adapter_id`, it must equal entry.id.
         let header_id = crate::lora::safetensors::read_peft_header_adapter_id(&bytes);
         if let Some(ref hid) = header_id
             && hid != &entry.id
@@ -259,7 +248,7 @@ pub fn load_adapters_from_manifest(
             )));
         }
 
-        // Check 11: reject silent serving-quality loss from revision drift — see docs/lora-io.md.
+        // Revision drift can silently degrade serving quality.
         let mut rev_mismatch_overridden = false;
         if let Some(running) = running {
             let mut mismatches = Vec::new();
@@ -468,7 +457,6 @@ mod tests {
         manifest.adapters.push(make_entry(
             "sha-mismatch-adapter",
             "adapter.safetensors",
-            // deliberately wrong hash
             "0000000000000000000000000000000000000000000000000000000000000000",
             4,
             8.0,
@@ -522,13 +510,11 @@ mod tests {
     fn loader_rejects_rank_mismatch() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("adapter.safetensors");
-        // File has rank=4
         write_test_adapter(&file_path, 4, 8.0, &["q_proj"], None);
         let bytes = std::fs::read(&file_path).unwrap();
         let sha = sha256_hash(&bytes);
 
         let mut manifest = LoraManifest::new();
-        // Manifest says rank=8 — mismatch
         manifest.adapters.push(make_entry(
             "rank-mismatch-adapter",
             "adapter.safetensors",
@@ -557,13 +543,11 @@ mod tests {
     fn loader_rejects_id_mismatch() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("adapter.safetensors");
-        // Write adapter with adapter_id = "file-id" in the safetensors header
         write_test_adapter(&file_path, 4, 8.0, &["q_proj"], Some("file-id"));
         let bytes = std::fs::read(&file_path).unwrap();
         let sha = sha256_hash(&bytes);
 
         let mut manifest = LoraManifest::new();
-        // Manifest entry has a different id — check 10 must reject this
         manifest.adapters.push(make_entry(
             "manifest-id",
             "adapter.safetensors",
@@ -628,7 +612,6 @@ mod tests {
     fn loader_ok_with_matching_header_id() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("adapter.safetensors");
-        // Header id matches entry id
         write_test_adapter(&file_path, 4, 8.0, &["q_proj"], Some("matching-id"));
         let bytes = std::fs::read(&file_path).unwrap();
         let sha = sha256_hash(&bytes);
@@ -672,19 +655,13 @@ mod tests {
         assert!(result.unwrap().is_empty());
     }
 
-    /// FIX-2 mutation-sensitive: a revoked entry that appears AFTER an approved
-    /// entry must cause rejection WITHOUT reading the approved entry's file.
-    /// The approved entry's URI points at a path that does not exist, so if the
-    /// prescan were removed the loader would attempt to read it and return a
-    /// different (IO/NotFound) error. The prescan fires first — the error must
-    /// contain "revoked", not "not found" or "does not exist".
+    /// A later revoked entry must reject the manifest before earlier adapter I/O.
     #[test]
     fn loader_prescan_rejects_revoked_without_reading_approved_file() {
         let dir = tempdir().unwrap();
         let mut manifest = LoraManifest::new();
 
-        // approved-A: file intentionally missing — if reached, the error would
-        // say "does not exist", not "revoked".
+        // This missing file proves the pre-scan runs before adapter I/O.
         manifest.adapters.push(make_entry(
             "approved-a",
             "approved_a_does_not_exist.safetensors",
@@ -694,7 +671,6 @@ mod tests {
             AdapterStatus::Approved,
             vec!["q_proj".to_string()],
         ));
-        // revoked-B appears after approved-A; prescan must reject before IO.
         manifest.adapters.push(make_entry(
             "revoked-b",
             "revoked_b.safetensors",
@@ -782,20 +758,13 @@ mod tests {
         );
     }
 
-    /// D4 (alpha synthesis): an adapter whose header omits alpha metadata
-    /// synthesises alpha = rank. The governed loader must reject it when the
-    /// manifest declares a different alpha. This test proves the alpha-agreement
-    /// check in Check 7 is not bypassed by the synthesis fallback.
-    ///
-    /// Mutation-sensitive: removing the Check 7 alpha comparison makes this test
-    /// pass (wrong), so the test fails when the guard is absent.
+    /// Manifest alpha must match the rank-derived fallback for omitted metadata.
     #[test]
     fn loader_alpha_synthesis_mismatch_is_rejected() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("no_alpha_meta.safetensors");
 
-        // Write an adapter with rank=16 but NO `alpha` key in the header.
-        // The loader's safetensors parser will synthesise alpha = rank = 16.
+        // Omitted metadata makes the parser synthesize `alpha = rank`.
         use safetensors::Dtype;
         use safetensors::tensor::{TensorView, serialize};
         use std::collections::HashMap;
@@ -814,7 +783,6 @@ mod tests {
             "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight".to_string(),
             TensorView::new(Dtype::F32, vec![d_out, rank], &b_bytes).unwrap(),
         );
-        // Deliberately omit `alpha` from metadata so synthesis fires.
         let mut meta: HashMap<String, String> = HashMap::new();
         meta.insert("rank".to_string(), rank.to_string());
         meta.insert("target_modules".to_string(), "q_proj".to_string());
@@ -823,7 +791,6 @@ mod tests {
 
         let sha = sha256_hash(&file_bytes);
 
-        // Manifest declares alpha=64, but the file synthesises alpha=16 — mismatch.
         let mut manifest = LoraManifest::new();
         manifest.adapters.push(make_entry(
             "alpha-mismatch",
@@ -866,23 +833,15 @@ mod tests {
         assert!(err.to_string().contains("alpha mismatch"));
     }
 
-    /// FIX-3 (round 2), mutation-sensitive: a symlink inside base_dir that points
-    /// to a real file OUTSIDE base_dir must not let an adapter escape confinement.
-    /// The canonicalized path resolves outside base, so the loader rejects it
-    /// rather than reading through the symlink. Removing the `starts_with`
-    /// confinement check makes this load the outside file (then fail later on the
-    /// "dummy" hash) — a different error — so this test fails when the guard is
-    /// absent.
+    /// A symlink within `base_dir` must not escape its canonicalized boundary.
     #[cfg(unix)]
     #[test]
     fn loader_rejects_symlink_escape() {
         use std::os::unix::fs::symlink;
         let base = tempdir().unwrap();
         let outside = tempdir().unwrap();
-        // A real adapter sits OUTSIDE base_dir.
         let secret = outside.path().join("secret.safetensors");
         write_test_adapter(&secret, 4, 8.0, &["q_proj"], None);
-        // base_dir/link.safetensors -> outside/secret.safetensors
         let link = base.path().join("link.safetensors");
         symlink(&secret, &link).unwrap();
 
@@ -914,15 +873,7 @@ mod tests {
         );
     }
 
-    /// Check 11, mutation-sensitive: an adapter stamped with a `base_model_rev`
-    /// that does not match the running context must be rejected, even though
-    /// every other check (status/path/hash/rank/alpha/modules/id) passes.
-    ///
-    /// Mutation-sensitive: removing the Check 11 block makes `running` inert
-    /// (the parameter is simply never consulted), so this load would return
-    /// `Ok` instead — the `result.is_err()` assertion fails when the guard is
-    /// absent. Verified by reverting the Check 11 addition and re-running:
-    /// this test fails (`Ok` returned) without the fix, passes with it.
+    /// A base-model revision mismatch must reject an otherwise valid adapter.
     #[test]
     fn loader_rejects_base_model_rev_mismatch() {
         let dir = tempdir().unwrap();
@@ -945,7 +896,6 @@ mod tests {
         entry.tokenizer_rev = "tok-rev-a".to_string();
         manifest.adapters.push(entry);
 
-        // Tokenizer rev matches; base_model_rev does not.
         let running = RunningRevisions::strict("running-rev-b", "tok-rev-a");
         let result = load_adapters_from_manifest(
             &manifest,
@@ -962,8 +912,7 @@ mod tests {
         );
     }
 
-    /// Symmetric to the base-rev test above: a `tokenizer_rev` mismatch alone
-    /// must also be rejected.
+    /// A tokenizer revision mismatch must also reject the adapter.
     #[test]
     fn loader_rejects_tokenizer_rev_mismatch() {
         let dir = tempdir().unwrap();
@@ -986,7 +935,6 @@ mod tests {
         entry.tokenizer_rev = "tok-rev-a".to_string();
         manifest.adapters.push(entry);
 
-        // base_model_rev matches; tokenizer_rev does not.
         let running = RunningRevisions::strict("trained-rev-a", "tok-rev-mismatch");
         let result = load_adapters_from_manifest(
             &manifest,
@@ -1003,8 +951,7 @@ mod tests {
         );
     }
 
-    /// Complement to the rejection tests: matching revisions must load fine —
-    /// Check 11 is a comparison, not an unconditional reject.
+    /// Matching revisions remain admissible.
     #[test]
     fn loader_accepts_matching_revs() {
         let dir = tempdir().unwrap();
