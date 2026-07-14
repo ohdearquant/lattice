@@ -183,8 +183,12 @@ impl Qwen35Model {
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
             engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
             // If the grammar blocked every token the sampler's non-finite-max
-            // short-circuit would silently return token 0. Fail closed instead.
+            // short-circuit would silently return token 0. An accepting state
+            // terminates normally; an incomplete state remains a hard error.
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                if engine.is_complete_without_continuation(gs) {
+                    return Ok(grammar_output(String::new(), &[], prompt_len, true, vec![]));
+                }
                 return Err(InferenceError::InvalidInput(
                     "grammar constraint blocked every token at step 0; \
                      no legal first token exists in the current grammar state"
@@ -204,19 +208,21 @@ impl Qwen35Model {
         // grammar has no valid continuation for the selected token, signalling the
         // end of grammar-constrained generation. Mirror the same early-return used
         // in crate::generate::generate for parity.
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-            && !engine.advance(gs, next_id)
-        {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: false,
-                stop_reason: Some(StopReason::Grammar),
-                token_logprobs: vec![],
-            });
-        }
+        let grammar_complete =
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                if !engine.advance(gs, next_id) {
+                    return Ok(grammar_output(
+                        String::new(),
+                        &[],
+                        prompt_len,
+                        false,
+                        vec![],
+                    ));
+                }
+                engine.is_complete_without_continuation(gs)
+            } else {
+                false
+            };
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             return Ok(GenerateOutput {
@@ -262,6 +268,15 @@ impl Qwen35Model {
         if gen_cfg.stop_strings.is_empty() {
             // Fast path: no string-level stops. Behaviour byte-for-byte identical
             // to before this feature was added; the e2e-parity CI gate pins this.
+            if grammar_complete {
+                return Ok(grammar_output(
+                    decode_tokens(&self.tokenizer, &generated_ids),
+                    &generated_ids,
+                    prompt_len,
+                    true,
+                    token_logprobs,
+                ));
+            }
             let (stopped, loop_stop_reason) = decode_loop(
                 self,
                 gen_cfg,
@@ -328,6 +343,20 @@ impl Qwen35Model {
                     stop_reason: Some(StopReason::Eos),
                     token_logprobs,
                 });
+            }
+
+            if grammar_complete {
+                let tail = detok.finish();
+                if !tail.is_empty() {
+                    full.push_str(&tail);
+                }
+                return Ok(grammar_output(
+                    full,
+                    &generated_ids,
+                    prompt_len,
+                    true,
+                    token_logprobs,
+                ));
             }
 
             let (stopped, loop_stop_reason) = decode_loop_with_stops(
@@ -608,6 +637,9 @@ impl Qwen35Model {
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
             engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                if engine.is_complete_without_continuation(gs) {
+                    return Ok(grammar_output(String::new(), &[], prompt_len, true, vec![]));
+                }
                 return Err(InferenceError::InvalidInput(
                     "grammar constraint blocked every token at step 0; \
                      no legal first token exists in the current grammar state"
@@ -638,19 +670,21 @@ impl Qwen35Model {
         );
 
         // Grammar advance after sampling the first token, mirroring generate().
-        if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state)
-            && !engine.advance(gs, next_id)
-        {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: false,
-                stop_reason: Some(StopReason::Grammar),
-                token_logprobs: vec![],
-            });
-        }
+        let grammar_complete =
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                if !engine.advance(gs, next_id) {
+                    return Ok(grammar_output(
+                        String::new(),
+                        &[],
+                        prompt_len,
+                        false,
+                        vec![],
+                    ));
+                }
+                engine.is_complete_without_continuation(gs)
+            } else {
+                false
+            };
 
         if should_stop_token(cfg, gen_cfg, next_id) {
             return Ok(GenerateOutput {
@@ -734,6 +768,16 @@ impl Qwen35Model {
                 });
             }
 
+            if grammar_complete {
+                return Ok(grammar_output(
+                    text,
+                    &generated_ids,
+                    prompt_len,
+                    true,
+                    token_logprobs,
+                ));
+            }
+
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
@@ -768,6 +812,11 @@ impl Qwen35Model {
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
                     if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                        if engine.is_complete_without_continuation(gs) {
+                            stopped = true;
+                            stop_reason = StopReason::Grammar;
+                            break;
+                        }
                         return Err(InferenceError::InvalidInput(
                             "grammar constraint blocked every token; \
                              no legal continuation exists in the current grammar state"
@@ -852,7 +901,14 @@ impl Qwen35Model {
                     StepOutcome::Emitted {
                         answer_budget_exhausted,
                         ..
-                    } => answer_budget_exhausted,
+                    } => {
+                        if grammar_complete_without_continuation(gen_cfg, &grammar_state) {
+                            stopped = true;
+                            stop_reason = StopReason::Grammar;
+                            break;
+                        }
+                        answer_budget_exhausted
+                    }
                 };
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
@@ -921,6 +977,17 @@ impl Qwen35Model {
                     token_logprobs,
                 });
             }
+            if grammar_complete {
+                let tail = detok.finish();
+                policy.finish_stop(&mut text, &tail, |s| on_token(s));
+                return Ok(grammar_output(
+                    text,
+                    &generated_ids,
+                    prompt_len,
+                    true,
+                    token_logprobs,
+                ));
+            }
 
             let mut stopped = false;
             let mut stopped_by_caller = false;
@@ -953,6 +1020,11 @@ impl Qwen35Model {
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
                     if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                        if engine.is_complete_without_continuation(gs) {
+                            stopped = true;
+                            stop_reason = StopReason::Grammar;
+                            break;
+                        }
                         return Err(InferenceError::InvalidInput(
                             "grammar constraint blocked every token; \
                              no legal continuation exists in the current grammar state"
@@ -1032,7 +1104,14 @@ impl Qwen35Model {
                     StepOutcome::Emitted {
                         answer_budget_exhausted,
                         ..
-                    } => answer_budget_exhausted,
+                    } => {
+                        if grammar_complete_without_continuation(gen_cfg, &grammar_state) {
+                            stopped = true;
+                            stop_reason = StopReason::Grammar;
+                            break;
+                        }
+                        answer_budget_exhausted
+                    }
                 };
 
                 // Answer-budget break: stop once max_new_tokens answer tokens follow </think>.
@@ -1723,6 +1802,34 @@ fn has_finite_logit(logits: &[f32]) -> bool {
     logits.iter().any(|&l| l > f32::NEG_INFINITY)
 }
 
+fn grammar_complete_without_continuation(
+    gen_cfg: &GenerateConfig,
+    grammar_state: &Option<GrammarState>,
+) -> bool {
+    match (&gen_cfg.grammar, grammar_state) {
+        (Some(engine), Some(state)) => engine.is_complete_without_continuation(state),
+        _ => false,
+    }
+}
+
+fn grammar_output(
+    text: String,
+    generated_ids: &[u32],
+    prompt_tokens: usize,
+    stopped: bool,
+    token_logprobs: Vec<TokenLogprob>,
+) -> GenerateOutput {
+    GenerateOutput {
+        text,
+        token_ids: generated_ids.to_vec(),
+        prompt_tokens,
+        generated_tokens: generated_ids.len(),
+        stopped,
+        stop_reason: Some(StopReason::Grammar),
+        token_logprobs,
+    }
+}
+
 fn initial_rng_state(seed: Option<u64>) -> u64 {
     match seed {
         Some(s) => {
@@ -1800,6 +1907,9 @@ fn decode_loop(
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
             engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                if engine.is_complete_without_continuation(gs) {
+                    return Ok((true, StopReason::Grammar));
+                }
                 return Err(InferenceError::InvalidInput(
                     "grammar constraint blocked every token; \
                      no legal continuation exists in the current grammar state"
@@ -1867,6 +1977,9 @@ fn decode_loop(
                 answer_budget_exhausted,
                 ..
             } => {
+                if grammar_complete_without_continuation(gen_cfg, grammar_state) {
+                    return Ok((true, StopReason::Grammar));
+                }
                 // Answer-budget break: stop once max_new_tokens answer tokens
                 // follow </think>.
                 if answer_budget_exhausted {
@@ -1922,6 +2035,11 @@ fn decode_loop_with_stops(
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
             engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
+                if engine.is_complete_without_continuation(gs) {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
                 return Err(InferenceError::InvalidInput(
                     "grammar constraint blocked every token; \
                      no legal continuation exists in the current grammar state"
@@ -2001,7 +2119,14 @@ fn decode_loop_with_stops(
             StepOutcome::Emitted {
                 token_id,
                 answer_budget_exhausted,
-            } => (token_id, answer_budget_exhausted),
+            } => {
+                if grammar_complete_without_continuation(gen_cfg, grammar_state) {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
+                (token_id, answer_budget_exhausted)
+            }
         };
 
         // Answer-budget break: stop once max_new_tokens answer tokens follow
@@ -2955,6 +3080,121 @@ mod tests {
             tokenizer,
             rope,
             lora: Box::new(NoopLoraHook),
+        }
+    }
+
+    const A_FIRST_TINY_TOK_JSON: &str = r#"{
+  "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
+  "normalizer":null,
+  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
+  "post_processor":null,
+  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
+    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+    "vocab":{"a":0,"<unk>":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
+}"#;
+
+    fn build_a_first_zero_model() -> Qwen35Model {
+        build_tiny_zero_model_tok(A_FIRST_TINY_TOK_JSON)
+    }
+
+    fn a_token_grammar(gbnf: &str) -> std::sync::Arc<crate::grammar::GrammarEngine> {
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+
+        let mut vocab_bytes = vec![Vec::new(); 97];
+        vocab_bytes[0] = b"a".to_vec();
+        std::sync::Arc::new(
+            GrammarEngine::new(&GrammarSpec::Gbnf(gbnf.to_string()), vocab_bytes)
+                .expect("test grammar compiles"),
+        )
+    }
+
+    fn grammar_config(gbnf: &str) -> GenerateConfig {
+        GenerateConfig {
+            max_new_tokens: 4,
+            temperature: 0.0,
+            grammar: Some(a_token_grammar(gbnf)),
+            stop_token_ids: vec![],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn completed_grammar_stops_before_remaining_budget_errors() {
+        let model = build_a_first_zero_model();
+        let result = model
+            .generate("b", &grammar_config("root ::= \"a\"\n"))
+            .expect("a completed grammar must stop successfully");
+
+        assert_eq!(result.text, "a");
+        assert_eq!(result.token_ids, vec![0]);
+        assert_eq!(result.generated_tokens, 1);
+        assert!(result.stopped);
+        assert_eq!(result.stop_reason, Some(StopReason::Grammar));
+    }
+
+    #[test]
+    fn shared_prefix_complete_state_stops_when_pda_has_no_continuation() {
+        let model = build_a_first_zero_model();
+        // The current no-rewind PDA commits to the first shared-prefix
+        // alternative after consuming "a", so "aa" is no longer viable from
+        // this accepting state. This pins a no-continuation stop, not a general
+        // stop-at-first-accepting-state policy.
+        let result = model
+            .generate("b", &grammar_config("root ::= \"a\" | \"aa\"\n"))
+            .expect("the accepting state must terminate without an all-masked error");
+
+        assert_eq!(result.text, "a");
+        assert_eq!(result.token_ids, vec![0]);
+        assert!(result.stopped);
+        assert_eq!(result.stop_reason, Some(StopReason::Grammar));
+    }
+
+    #[test]
+    fn completed_grammar_streaming_matches_nonstreaming() {
+        let model = build_a_first_zero_model();
+        let gen_cfg = grammar_config("root ::= \"a\"\n");
+        let nonstreaming = model
+            .generate("b", &gen_cfg)
+            .expect("non-streaming completion succeeds");
+        let mut streamed_text = String::new();
+        let streaming = model
+            .generate_streaming("b", &gen_cfg, |delta| streamed_text.push_str(delta))
+            .expect("streaming completion succeeds");
+
+        assert_eq!(streaming.text, streamed_text);
+        assert_eq!(streaming.text, nonstreaming.text);
+        assert_eq!(streaming.token_ids, nonstreaming.token_ids);
+        assert_eq!(streaming.generated_tokens, nonstreaming.generated_tokens);
+        assert_eq!(streaming.stopped, nonstreaming.stopped);
+        assert_eq!(streaming.stop_reason, nonstreaming.stop_reason);
+        assert_eq!(streaming.stop_reason, Some(StopReason::Grammar));
+    }
+
+    #[test]
+    fn grammar_completion_after_decode_step_covers_all_loop_siblings() {
+        let model = build_a_first_zero_model();
+
+        for stop_strings in [vec![], vec!["never".to_string()]] {
+            let mut gen_cfg = grammar_config("root ::= \"aa\"\n");
+            gen_cfg.stop_strings = stop_strings;
+
+            let nonstreaming = model
+                .generate("b", &gen_cfg)
+                .expect("non-streaming loop must stop on grammar completion");
+            let mut streamed_text = String::new();
+            let streaming = model
+                .generate_streaming("b", &gen_cfg, |delta| streamed_text.push_str(delta))
+                .expect("streaming loop must stop on grammar completion");
+
+            for result in [&nonstreaming, &streaming] {
+                assert_eq!(result.text, "aa");
+                assert_eq!(result.token_ids, vec![0, 0]);
+                assert_eq!(result.generated_tokens, 2);
+                assert!(result.stopped);
+                assert_eq!(result.stop_reason, Some(StopReason::Grammar));
+            }
+            assert_eq!(streaming.text, streamed_text);
         }
     }
 
