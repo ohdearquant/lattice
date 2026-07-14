@@ -1,26 +1,19 @@
-//! Test-only tiny zero-weight `Qwen35Model` construction, gated behind the
-//! `test-utils` Cargo feature (ADR-080 C2).
+//! Test-only tiny zero-weight `Qwen35Model` construction, gated behind
+//! `cfg(any(test, feature = "test-utils"))` (ADR-080 C2, #816).
 //!
 //! `crates/inference/src/model/qwen35/generation.rs`'s `#[cfg(test)] mod
-//! tests` already builds an all-zero-weight tiny model for its own
-//! mutation-sensitive `StopReason` tests; that helper is `#[cfg(test)]`-only
-//! and therefore invisible outside this crate's own library test build --
-//! specifically, invisible to `crates/inference/src/bin/lattice.rs`'s test
-//! module, which is a *separate* compilation unit that links against this
-//! crate as an ordinary (non-test) dependency. The HTTP-level disconnect
-//! test that `lattice.rs`'s `chat_completions`
-//! handler needs a real (but tiny, fast, deterministic) `ModelBackend::Cpu`
-//! to exercise the actual streaming composition end to end, so this function
-//! is the one library-side seam that makes it constructible from the bin's
-//! test module too -- via `--features test-utils`, never a default feature.
-//!
-//! Intentionally mirrors `generation.rs`'s private `build_tiny_zero_model_tok`
-//! rather than having one call the other: keeping them as two small,
-//! independently-readable copies avoids threading a `test-utils`-feature
-//! dependency into the library's own always-on `#[cfg(test)]` build, and the
-//! "deliberate copy" convention already applies elsewhere in this crate for
-//! exactly this kind of test-fixture code, matching the parity-safety
-//! guidance this repo follows for `generate`/`generate_streaming`.
+//! tests` builds an all-zero-weight tiny model for its own
+//! mutation-sensitive `StopReason` tests, reaching this module through the
+//! plain `cfg(test)` arm of the gate below. `crates/inference/src/bin/lattice.rs`'s
+//! test module is a *separate* compilation unit that links against this
+//! crate as an ordinary (non-test) dependency, so it cannot see anything
+//! gated on `cfg(test)` alone; it reaches this same module through the
+//! `feature = "test-utils"` arm instead. The HTTP-level disconnect test that
+//! `lattice.rs`'s `chat_completions` handler needs a real (but tiny, fast,
+//! deterministic) `ModelBackend::Cpu` to exercise the actual streaming
+//! composition end to end, so this function is the one library-side seam
+//! that makes it constructible from the bin's test module too -- via
+//! `--features test-utils`, never a default feature.
 
 use super::Qwen35Model;
 use super::weights::{

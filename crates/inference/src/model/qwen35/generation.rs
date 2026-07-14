@@ -2938,149 +2938,43 @@ mod tests {
     // Build helper: all-zero weights → all logits == 0.0 after any forward
     // pass → greedy sampling always picks token 0 (first-wins on equal logits).
     // This gives deterministic sampling without relying on random-weight outputs.
+    //
+    // The zero-weight fixture itself lives in `qwen35::test_support`
+    // (reachable here via its `cfg(any(test, feature = "test-utils"))`
+    // gate), so this crate's own library tests and `bin/lattice.rs`'s
+    // separate `--features test-utils` compilation unit build the identical
+    // fixture from one definition instead of two copies (#816).
+    use super::super::test_support::{
+        tiny_zero_model as build_tiny_zero_model,
+        tiny_zero_model_with_tokenizer as build_tiny_zero_model_tok,
+    };
 
-    const DEFAULT_TINY_TOK_JSON: &str = r#"{
-  "version":"1.0","truncation":null,"padding":null,"added_tokens":[],
-  "normalizer":null,
-  "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true},
-  "post_processor":null,
-  "decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
-  "model":{"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,
-    "end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
-    "vocab":{"<unk>":0,"a":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
-}"#;
-
-    fn build_tiny_zero_model() -> Qwen35Model {
-        build_tiny_zero_model_tok(DEFAULT_TINY_TOK_JSON)
-    }
-
-    fn build_tiny_zero_model_tok(tok_json: &str) -> Qwen35Model {
-        use crate::attention::gdn::GatedDeltaNetWeights;
-        use crate::lora_hook::NoopLoraHook;
-        use crate::model::qwen35::{
-            AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
-            FullAttentionLayerWeights, ModelWeights,
-        };
-        use crate::model::qwen35_config::{LayerType, compute_layer_types};
-        use crate::rope::RopeTable;
-        use crate::tokenizer::bpe::BpeTokenizer;
-
-        const H: usize = 64;
-        const VOCAB: usize = 97;
-        const I: usize = 128;
-        const NUM_LAYERS: usize = 4;
-        const FULL_INTERVAL: usize = 4;
-        const HEAD_DIM: usize = 16;
-        const LINEAR_KH: usize = 4;
-        const KERNEL: usize = 4;
-
-        let cfg = Qwen35Config {
-            hidden_size: H,
-            num_hidden_layers: NUM_LAYERS,
-            vocab_size: VOCAB,
-            intermediate_size: I,
-            rms_norm_eps: 1e-6,
-            num_attention_heads: 4,
-            num_key_value_heads: 2,
-            head_dim: HEAD_DIM,
-            rope_theta: 10_000_000.0,
-            partial_rotary_factor: 0.25,
-            rope_parameters: None,
-            linear_num_key_heads: LINEAR_KH,
-            linear_num_value_heads: Some(LINEAR_KH),
-            linear_key_head_dim: HEAD_DIM,
-            linear_value_head_dim: HEAD_DIM,
-            linear_conv_kernel_dim: KERNEL,
-            num_experts: None,
-            num_experts_per_tok: None,
-            moe_intermediate_size: None,
-            shared_expert_intermediate_size: None,
-            output_router_logits: false,
-            router_aux_loss_coef: None,
-            tie_word_embeddings: true,
-            full_attention_interval: FULL_INTERVAL,
-            layer_types: compute_layer_types(NUM_LAYERS, FULL_INTERVAL),
-            layer_mask: vec![true; NUM_LAYERS],
-            eos_token_id: (VOCAB - 1) as u32,
-            max_position_embeddings: 1024,
-            mtp_num_hidden_layers: 0,
-            mtp_use_dedicated_embeddings: false,
-            quarot_rotation_seed: None,
-        };
-
-        let z = |len: usize| vec![0.0_f32; len];
-        let qkv_dim = cfg.linear_qkv_dim();
-        let out_dim = cfg.linear_output_dim();
-        let q_dim = cfg.full_q_dim();
-        let kv_dim = cfg.full_kv_dim();
-
-        let mut layers = Vec::with_capacity(NUM_LAYERS);
-        for lt in &cfg.layer_types {
-            let common = CommonLayerWeights {
-                input_layernorm: z(H),
-                post_attention_layernorm: z(H),
-                ffn: FeedForwardWeights::Dense(DenseFfnWeights {
-                    gate_proj: z(I * H),
-                    up_proj: z(I * H),
-                    down_proj: z(H * I),
-                }),
-            };
-            let attn = match lt {
-                LayerType::LinearAttention => AttentionWeights::Linear(GatedDeltaNetWeights {
-                    in_proj_qkv: z(qkv_dim * H),
-                    in_proj_qkv_rows: qkv_dim,
-                    in_proj_qkv_cols: H,
-                    in_proj_z: z(out_dim * H),
-                    in_proj_z_rows: out_dim,
-                    in_proj_z_cols: H,
-                    in_proj_b: z(LINEAR_KH * H),
-                    in_proj_b_rows: LINEAR_KH,
-                    in_proj_b_cols: H,
-                    in_proj_a: z(LINEAR_KH * H),
-                    in_proj_a_rows: LINEAR_KH,
-                    in_proj_a_cols: H,
-                    a_log: z(LINEAR_KH),
-                    dt_bias: z(LINEAR_KH),
-                    conv1d_weight: z(qkv_dim * KERNEL),
-                    conv_dim: qkv_dim,
-                    kernel_size: KERNEL,
-                    norm_weight: z(out_dim),
-                    out_proj: z(H * out_dim),
-                    out_proj_rows: H,
-                    out_proj_cols: out_dim,
-                }),
-                LayerType::FullAttention => AttentionWeights::Full(FullAttentionLayerWeights {
-                    q_proj: z(2 * q_dim * H),
-                    k_proj: z(kv_dim * H),
-                    v_proj: z(kv_dim * H),
-                    o_proj: z(H * q_dim),
-                    q_norm: z(HEAD_DIM),
-                    k_norm: z(HEAD_DIM),
-                }),
-            };
-            layers.push((attn, common));
-        }
-
-        let tokenizer =
-            BpeTokenizer::from_tokenizer_json_str(tok_json).expect("test tokenizer parses");
-        let rope = RopeTable::new(
-            cfg.rope_dim(),
-            cfg.max_position_embeddings.min(8192),
-            cfg.rope_theta,
+    /// `qwen35::test_support` must be reachable from this crate's own
+    /// library tests via plain `cfg(test)`, without enabling the
+    /// `test-utils` feature — otherwise `generation.rs`'s `StopReason`
+    /// tests would have no zero-weight fixture to build against in a
+    /// default `cargo test -p lattice-inference` run (#816).
+    ///
+    /// Mutation sensitivity: revert `test_support`'s gate on
+    /// `qwen35/mod.rs` from `cfg(any(test, feature = "test-utils"))` back
+    /// to `cfg(feature = "test-utils")` alone → this module fails to
+    /// compile under a default (no `--features test-utils`) `cargo test`,
+    /// so this test (and every other test in this module using
+    /// `build_tiny_zero_model`/`build_tiny_zero_model_tok`) fails closed
+    /// with a compile error rather than silently reintroducing a private
+    /// duplicate fixture.
+    #[test]
+    fn test_support_zero_model_reachable_without_test_utils_feature() {
+        let via_alias = build_tiny_zero_model();
+        let via_direct_path = super::super::test_support::tiny_zero_model();
+        assert_eq!(
+            via_alias.config.hidden_size,
+            via_direct_path.config.hidden_size
         );
-
-        Qwen35Model {
-            config: cfg.clone(),
-            weights: ModelWeights {
-                embed_tokens: z(VOCAB * H),
-                lm_head: None,
-                final_norm: z(H),
-                layers,
-            },
-            tokenizer,
-            rope,
-            lora: Box::new(NoopLoraHook),
-        }
+        assert_eq!(
+            via_alias.weights.embed_tokens,
+            via_direct_path.weights.embed_tokens
+        );
     }
 
     const A_FIRST_TINY_TOK_JSON: &str = r#"{
