@@ -289,9 +289,7 @@ impl RlooTrainer {
         output_deltas: &[f32],
         num_layers: usize,
     ) -> FannResult<()> {
-        // --- Phase 1: compute all layer deltas and accumulate gradients ---
-        // Both gate.layers() and gate.activations() are &self borrows and may
-        // coexist simultaneously; they are released before the mutable apply phase.
+        // Shared borrows end before the mutable update phase.
         let (weight_grads, bias_grads) = {
             // Start with the output-layer delta (from caller).
             let mut deltas: Vec<Vec<f32>> = Vec::with_capacity(num_layers);

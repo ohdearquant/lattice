@@ -115,7 +115,6 @@ impl ShaderManager {
     pub fn with_warmup(device: Arc<wgpu::Device>) -> GpuResult<Self> {
         let manager = Self::new(device);
 
-        // Precompile common inference shaders
         let warmup_shaders = [
             ShaderType::MatrixVectorMultiply,
             ShaderType::MatrixVectorMultiplyRelu,

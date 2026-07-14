@@ -17,22 +17,16 @@ impl Network {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
 
-        // Magic number "FANN"
         bytes.extend_from_slice(b"FANN");
 
-        // Version (1)
         bytes.extend_from_slice(&1u32.to_le_bytes());
 
-        // Number of layers
         bytes.extend_from_slice(&(self.layers().len() as u32).to_le_bytes());
 
-        // Each layer
         for layer in self.layers() {
-            // Dimensions
             bytes.extend_from_slice(&(layer.num_inputs() as u32).to_le_bytes());
             bytes.extend_from_slice(&(layer.num_outputs() as u32).to_le_bytes());
 
-            // Activation type
             match layer.activation() {
                 Activation::Linear => bytes.push(0),
                 Activation::Sigmoid => bytes.push(1),
@@ -45,12 +39,10 @@ impl Network {
                 Activation::Softmax => bytes.push(5),
             }
 
-            // Weights
             for &w in layer.weights() {
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
 
-            // Biases
             for &b in layer.biases() {
                 bytes.extend_from_slice(&b.to_le_bytes());
             }
@@ -325,8 +317,6 @@ mod tests {
             assert!((orig - rest).abs() < 1e-6);
         }
     }
-
-    // ── FIX 2: bounds-before-allocation + trailing-bytes tests ──────────────
 
     /// A header with num_layers = 0xFFFFFFFF and a short buffer must return
     /// Err(FannError::InvalidBuilder) without attempting any large allocation.

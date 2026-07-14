@@ -158,7 +158,6 @@ impl GpuContext {
                 _ => 256,       // Maximize throughput for element-wise
             }
         } else {
-            // Generic defaults
             match operation {
                 "matmul" => 64,
                 _ => 256,
@@ -261,7 +260,6 @@ mod tests {
     #[test]
     #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires GPU hardware")]
     fn test_context_creation() {
-        // Skip if no GPU
         if !super::super::is_gpu_available() {
             println!("Skipping GPU test - no GPU available");
             return;

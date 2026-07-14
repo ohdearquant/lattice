@@ -53,8 +53,7 @@ impl BackpropTrainer {
         let output: Vec<f32> = network.forward(input)?.to_vec();
         let output_len = output.len();
 
-        // After forward returns, reborrow network immutably.
-        // Reference layers and activations directly — no cloning needed.
+        // Reborrow immutably to reference layer data without cloning.
         let layers = network.layers();
 
         // Compute output error (MSE derivative)

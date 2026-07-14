@@ -54,7 +54,6 @@ unsafe fn simd_relu_neon(values: &mut [f32]) {
         vst1q_f32(p.add(offset), result);
         offset += 4;
     }
-    // Scalar tail
     for i in offset..n {
         let val = *p.add(i);
         if val < 0.0 {
@@ -85,7 +84,6 @@ unsafe fn simd_relu_avx2(values: &mut [f32]) {
         _mm256_storeu_ps(p.add(offset), result);
         offset += 8;
     }
-    // Scalar tail
     for i in offset..n {
         let val = *p.add(i);
         if val < 0.0 {
@@ -124,7 +122,6 @@ unsafe fn simd_leaky_relu_neon(values: &mut [f32], alpha: f32) {
         vst1q_f32(p.add(offset), result);
         offset += 4;
     }
-    // Scalar tail
     for i in offset..n {
         let val = *p.add(i);
         if val < 0.0 {
@@ -163,7 +160,6 @@ unsafe fn simd_leaky_relu_avx2(values: &mut [f32], alpha: f32) {
         _mm256_storeu_ps(p.add(offset), result);
         offset += 8;
     }
-    // Scalar tail
     for i in offset..n {
         let val = *p.add(i);
         if val < 0.0 {
