@@ -2192,26 +2192,10 @@ where
 ///
 /// The generated token IDs (excluding the prompt).
 ///
-/// # Empty-prompt exception (#856/#915)
+/// # Errors
 ///
-/// Every Qwen3.5 generation entry point rejects an empty prompt with a
-/// typed `Err(InferenceError::Inference("empty prompt"))` via a shared
-/// preflight (`model::qwen35::generation::check_prompt_not_empty`,
-/// see `docs/generation-entrypoint-matrix.md`). **This function is an
-/// intentional, documented exception to that unified contract**: it
-/// returns `Vec<u32>`, not a `Result`, so it cannot reject anything --
-/// an empty `prompt_tokens` returns `Vec::new()` (a vacuous success, not
-/// an error), locked in by
-/// `generate_with_speculation_empty_prompt_returns_empty` below.
-///
-/// This is not the intended long-term shape: it is kept as-is here only
-/// because `lattice-inference` v0.6.1 just shipped, and turning this
-/// public free function fallible (`Result<Vec<u32>, InferenceError>`) is
-/// a breaking signature change that does not belong in a same-version
-/// bugfix. Tracked for the next semver-major-eligible release in
-/// <https://github.com/ohdearquant/lattice/issues/916> (targets 0.7.0),
-/// which will change this to reject an empty `prompt_tokens` the same
-/// way every other entry point does.
+/// Returns [`crate::error::InferenceError::Inference`] with the message
+/// `"empty prompt"` when `prompt_tokens` is empty.
 pub fn generate_with_speculation<F>(
     prompt_tokens: &[u32],
     max_new_tokens: usize,
@@ -2219,15 +2203,14 @@ pub fn generate_with_speculation<F>(
     mut forward_fn: F,
     max_ngram: usize,
     max_draft: usize,
-) -> Vec<u32>
+) -> Result<Vec<u32>, crate::error::InferenceError>
 where
     F: FnMut(u32, usize) -> Vec<f32>,
 {
-    // An empty prompt cannot seed the n-gram speculator or the decode history,
-    // so there is nothing to generate from. Return early instead of panicking on
-    // `all_tokens.last()` in the first decode step.
     if prompt_tokens.is_empty() {
-        return Vec::new();
+        return Err(crate::error::InferenceError::Inference(
+            "empty prompt".into(),
+        ));
     }
 
     let speculator = NgramSpeculator::new(prompt_tokens.to_vec(), max_ngram, max_draft);
@@ -2249,10 +2232,10 @@ where
         // Commit the accepted draft tokens (each == greedy by verify_draft's contract).
         for &t in &draft[..accepted] {
             if generated.len() == max_new_tokens {
-                return generated;
+                return Ok(generated);
             }
             if t == eos_token {
-                return generated;
+                return Ok(generated);
             }
             generated.push(t);
             all_tokens.push(t);
@@ -2272,7 +2255,7 @@ where
         }
     }
 
-    generated
+    Ok(generated)
 }
 
 // ---------------------------------------------------------------------------
@@ -2904,7 +2887,8 @@ mod tests {
             },
             5,
             4,
-        );
+        )
+        .expect("non-empty prompt must generate successfully");
         assert_eq!(result.len(), 3);
     }
 
@@ -2923,7 +2907,8 @@ mod tests {
             },
             5,
             4,
-        );
+        )
+        .expect("non-empty prompt must generate successfully");
         assert!(result.is_empty());
     }
 
@@ -2954,7 +2939,8 @@ mod tests {
             },
             5,
             4,
-        );
+        )
+        .expect("non-empty prompt must generate successfully");
         // Should produce exactly 5 tokens
         assert_eq!(result.len(), 5);
     }
@@ -2974,7 +2960,8 @@ mod tests {
             },
             5,
             4,
-        );
+        )
+        .expect("non-empty prompt must generate successfully");
         assert_eq!(result.len(), 10);
     }
 
@@ -3003,7 +2990,8 @@ mod tests {
                 },
                 5,
                 4,
-            );
+            )
+            .expect("non-empty prompt must generate successfully");
             assert!(
                 out.len() <= max_new,
                 "budget {max_new} overrun: produced {} tokens {:?}",
@@ -3048,7 +3036,8 @@ mod tests {
             },
             5,
             4,
-        );
+        )
+        .expect("non-empty prompt must generate successfully");
 
         // [2, 3] emitted normally, then draft[0]=99=EOS terminates generation
         assert_eq!(result, vec![2, 3]);
@@ -3075,7 +3064,8 @@ mod tests {
             },
             5,
             4,
-        );
+        )
+        .expect("non-empty prompt must generate successfully");
         // Greedy emits [0]; the old buggy code emitted [1] (draft committed unverified).
         assert_eq!(result, vec![0]);
     }
@@ -3116,7 +3106,8 @@ mod tests {
             l[((tok + 1) % 10) as usize] = 1.0;
             l
         };
-        let spec_out = generate_with_speculation(&prompt, max_new, eos, spec_fwd, 5, 4);
+        let spec_out = generate_with_speculation(&prompt, max_new, eos, spec_fwd, 5, 4)
+            .expect("non-empty prompt must generate successfully");
 
         assert_eq!(
             spec_out, greedy_out,
@@ -3168,7 +3159,8 @@ mod tests {
             ref_tokens.push(t);
         }
 
-        let spec_out = generate_with_speculation(&prompt, max_new, eos, tied_fwd, 5, 4);
+        let spec_out = generate_with_speculation(&prompt, max_new, eos, tied_fwd, 5, 4)
+            .expect("non-empty prompt must generate successfully");
 
         assert_eq!(
             spec_out, greedy_out,
@@ -4529,19 +4521,19 @@ mod tests {
     }
 
     #[test]
-    fn generate_with_speculation_empty_prompt_returns_empty() {
-        // Empty prompt cannot seed speculation; must return empty, not panic on
-        // `all_tokens.last()` in the first decode step.
-        //
-        // This locks in the *documented* empty-input -> empty-output
-        // sentinel described on `generate_with_speculation` above (the
-        // one intentional exception to the #856/#915 unified
-        // empty-prompt-Err contract, tracked for a fallible signature at
-        // https://github.com/ohdearquant/lattice/issues/916, targets
-        // 0.7.0). If/when that issue lands, this assertion flips to
-        // expect `Err(InferenceError::Inference("empty prompt"))`.
-        let out = generate_with_speculation(&[], 8, 999, |_tok, _pos| vec![0.0; 4], 3, 4);
-        assert!(out.is_empty());
+    fn generate_with_speculation_empty_prompt_returns_error() {
+        let result = generate_with_speculation(
+            &[],
+            8,
+            999,
+            |_tok, _pos| panic!("forward must not run for an empty prompt"),
+            3,
+            4,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::error::InferenceError::Inference(ref message)) if message == "empty prompt"
+        ));
     }
 
     /// ADR-080 C1 (#785): `MtpVerifier::forward_one`'s own GQA

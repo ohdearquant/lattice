@@ -350,17 +350,22 @@ impl BatchWorker {
         let id = self.seq_manager.next_id();
         let mut sampler = Sampler::new(request.sampling.clone());
         sampler.seed_history(&request.prompt_ids);
-        let seq = Sequence::new(
+        let mut seq = Sequence::new(
             id,
             request.prompt_ids,
             request.sampling,
             request.lora_adapter,
             request.max_new_tokens,
         );
+        if request.max_new_tokens == 0 {
+            seq.state = SequenceState::Finished(FinishReason::MaxLength);
+        }
         let page_size = self.kv_pool_page_size();
         self.seq_manager.add(seq, page_size);
-        self.samplers.insert(id, sampler);
-        self.scheduler.enqueue(id);
+        if request.max_new_tokens > 0 {
+            self.samplers.insert(id, sampler);
+            self.scheduler.enqueue(id);
+        }
         Some(id)
     }
 
@@ -788,6 +793,37 @@ mod tests {
         let mut worker = test_worker();
         let out = worker.step(|_input, _pool| vec![0.0f32; 8]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn step_zero_token_budget_emits_nothing() {
+        let mut worker = test_worker();
+        assert!(
+            worker
+                .submit(InferenceRequest {
+                    prompt_ids: vec![10, 11, 12],
+                    sampling: SamplingConfig::greedy(),
+                    lora_adapter: None,
+                    max_new_tokens: 0,
+                })
+                .is_some()
+        );
+
+        let mut forward_called = false;
+        let out = worker.step(|_input, _pool| {
+            forward_called = true;
+            dummy_logits(5, 8)
+        });
+
+        assert!(
+            out.is_empty(),
+            "a zero-token budget must emit no token event"
+        );
+        assert!(
+            !forward_called,
+            "a zero-token budget must finish before prefill or sampling"
+        );
+        assert!(worker.is_idle());
     }
 
     #[test]

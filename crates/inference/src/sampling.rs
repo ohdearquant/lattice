@@ -492,6 +492,13 @@ impl Sampler {
             self.apply_penalty_to_logit_scratch(penalty);
         }
 
+        let (has_nan, max_logit) = scan_nan_or_nonfinite_max(&self.logit_scratch);
+        if has_nan || !max_logit.is_finite() {
+            let token = argmax_f32(&self.logit_scratch);
+            self.push_token(token);
+            return token;
+        }
+
         let inv_temp = if self.config.temperature != 1.0 {
             1.0 / self.config.temperature
         } else {
@@ -844,7 +851,7 @@ pub(crate) fn compute_step_logprobs(
     (token_logprob, top)
 }
 
-/// Fail-closed pre-scan for `sample_full_logits`: detects whether `logits`
+/// Fail-closed pre-scan for full-logit sampling paths: detects whether `logits`
 /// contains any NaN and computes the NaN-ignoring ("numeric") max in a
 /// single pass, so the caller can fall back to `argmax_f32` before
 /// `select_top_k`'s scalar/NEON seed phases sanitize a NaN to `NEG_INFINITY`
@@ -1253,6 +1260,24 @@ mod tests {
                 "temperature {bad} must fall back to argmax, not collapse to token 0"
             );
         }
+    }
+
+    #[test]
+    fn test_sampler_nan_fails_closed_to_argmax() {
+        let config = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+        let mut sampler = Sampler::new(config).with_seed(0x5eed_f00d_1234_5678);
+        let logits = [0.0, f32::NAN, 0.0];
+
+        assert_eq!(
+            sampler.sample(&logits),
+            0,
+            "a NaN anywhere in the distribution must fall back to the finite argmax"
+        );
     }
 
     #[test]
