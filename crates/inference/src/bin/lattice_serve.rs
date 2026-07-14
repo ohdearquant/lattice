@@ -23,6 +23,10 @@
 //! - `POST /v1/chat/completions` — streaming (SSE) and non-streaming, OpenAI shape
 //! - `GET  /v1/models`           — advertises the single loaded model
 //! - `GET  /health`              — liveness probe (`ok`)
+//! - `GET  /metrics`             — Prometheus text-format metrics (issue #583):
+//!   request count + latency histogram by route/status, prompt/completion
+//!   token counters, error count by code, queue-depth/in-flight gauge, all
+//!   labeled with the loaded model id
 //!
 //! # Design
 //!
@@ -79,6 +83,7 @@ mod imp {
         ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
         WorkerMetadata,
     };
+    use lattice_inference::serve::metrics::ServeMetrics;
     /// Only used by the test module's `.tokenize(..)` calls on a real (tiny)
     /// tokenizer; production code never tokenizes outside the shared worker
     /// (`lattice_inference::serve::metal_worker`), hence the test feature gate.
@@ -152,6 +157,15 @@ mod imp {
         /// exact KV cache length `load_model` allocated, never a hard-coded
         /// constant. See `model_context_from_config` and `build_cfg`.
         model_max_context: usize,
+        /// The shared worker's outstanding-job admission cap (issue #932),
+        /// needed alongside `jobs.available_permits()` to compute the
+        /// `/metrics` (#583) queue-depth/in-flight gauge as `max_pending -
+        /// available_permits()`.
+        max_pending: usize,
+        /// Process-wide Prometheus metrics registry (#583), `Arc`-shared so
+        /// every clone of `AppState` (one per request) records into the same
+        /// counters.
+        metrics: Arc<ServeMetrics>,
     }
 
     // ─── OpenAI request shapes ───────────────────────────────────────────────
@@ -1025,31 +1039,37 @@ mod imp {
 
     // ─── HTTP handlers ───────────────────────────────────────────────────────
 
-    async fn health() -> &'static str {
+    async fn health(State(s): State<AppState>) -> &'static str {
         let t = Instant::now();
         emit_serve_event(
+            &s.metrics,
             "GET",
             "/health",
             200,
             None,
+            None,
             t.elapsed().as_secs_f64() * 1000.0,
             false,
+            None,
         );
         "ok"
     }
 
-    async fn root() -> Json<Value> {
+    async fn root(State(s): State<AppState>) -> Json<Value> {
         let t = Instant::now();
         // ADR-080 C2: shared with lattice.rs's equivalent route so
         // both binaries advertise the same engine-identity document.
         let body = lattice_inference::serve::root_body();
         emit_serve_event(
+            &s.metrics,
             "GET",
             "/",
             200,
             None,
+            None,
             t.elapsed().as_secs_f64() * 1000.0,
             false,
+            None,
         );
         Json(body)
     }
@@ -1060,36 +1080,63 @@ mod imp {
         // binaries advertise the single loaded model in byte-identical shape.
         let body = lattice_inference::serve::models_list_body(s.model_id.as_ref(), unix_secs());
         emit_serve_event(
+            &s.metrics,
             "GET",
             "/v1/models",
             200,
             None,
+            None,
             t.elapsed().as_secs_f64() * 1000.0,
             false,
+            None,
         );
         Json(body)
     }
 
+    /// `GET /metrics` (issue #583): Prometheus text-exposition-format
+    /// metrics for this server -- request counts/latency by route+status,
+    /// prompt/completion token counters, error counts by code (all labeled
+    /// with the loaded model id), and a live queue-depth/in-flight gauge
+    /// read directly off the shared worker's admission semaphore (issue
+    /// #932's cap), not a separately-tracked counter that could drift from
+    /// the real admission state.
+    async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
+        let in_flight = s.max_pending.saturating_sub(s.jobs.available_permits());
+        let body = s.metrics.render(s.model_id.as_ref(), in_flight);
+        (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )],
+            body,
+        )
+    }
+
     /// Phase machine for the SSE token stream.
-    /// `Body`, `Done`, and `End` carry the completion token count so failure
-    /// paths preserve the deltas emitted before the worker failed.
+    /// `Body`, `Done`, and `End` carry the (completion_tokens, prompt_tokens)
+    /// pair so failure paths preserve the deltas emitted before the worker
+    /// failed, and `/metrics` (issue #583) gets prompt-token counts even for
+    /// streaming responses.
     enum Phase {
         Start,
         Body(usize),
-        Done(usize), // holds completion_tokens from worker
-        End(usize),  // holds completion_tokens; emits telemetry then stream ends
+        Done(usize, usize), // completion_tokens, prompt_tokens
+        End(usize, usize),  // completion_tokens, prompt_tokens; emits telemetry then stream ends
     }
 
     async fn chat_completions(State(s): State<AppState>, body: Body) -> Response {
         let timer = Instant::now();
         let Ok(body) = to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await else {
             emit_serve_event(
+                &s.metrics,
                 "POST",
                 "/v1/chat/completions",
                 413,
                 None,
+                None,
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
+                Some("request_body_too_large"),
             );
             // ADR-080 C2: previously mapped to
             // HTTP 400 + generic "invalid_request", diverging from
@@ -1105,24 +1152,30 @@ mod imp {
             Ok(req) => req,
             Err(err) => {
                 emit_serve_event(
+                    &s.metrics,
                     "POST",
                     "/v1/chat/completions",
                     400,
                     None,
+                    None,
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
+                    Some(err.code()),
                 );
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
         if let Err(err) = reject_unsupported(&req) {
             emit_serve_event(
+                &s.metrics,
                 "POST",
                 "/v1/chat/completions",
                 400,
                 None,
+                None,
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
+                Some(err.code()),
             );
             return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
         }
@@ -1130,12 +1183,15 @@ mod imp {
             && requested_model != s.model_id.as_ref()
         {
             emit_serve_event(
+                &s.metrics,
                 "POST",
                 "/v1/chat/completions",
                 400,
                 None,
+                None,
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
+                Some("model_not_found"),
             );
             return err_response(
                 StatusCode::BAD_REQUEST,
@@ -1148,12 +1204,15 @@ mod imp {
         }
         if req.messages.is_empty() {
             emit_serve_event(
+                &s.metrics,
                 "POST",
                 "/v1/chat/completions",
                 400,
                 None,
+                None,
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
+                Some("invalid_messages"),
             );
             // Matches lattice.rs's `validate_chat_request` code for the
             // identical empty-messages condition (ADR-080 C2).
@@ -1168,12 +1227,15 @@ mod imp {
             Ok(messages) => messages,
             Err(err) => {
                 emit_serve_event(
+                    &s.metrics,
                     "POST",
                     "/v1/chat/completions",
                     400,
                     None,
+                    None,
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
+                    Some(err.code()),
                 );
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
@@ -1182,12 +1244,15 @@ mod imp {
             Ok(cfg) => cfg,
             Err(err) => {
                 emit_serve_event(
+                    &s.metrics,
                     "POST",
                     "/v1/chat/completions",
                     400,
                     None,
+                    None,
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
+                    Some(err.code()),
                 );
                 // ADR-080 C2: `build_cfg` already
                 // returns the shared `lattice_inference::serve::ApiError`
@@ -1217,12 +1282,15 @@ mod imp {
             Ok(rx) => rx,
             Err(api_err) => {
                 emit_serve_event(
+                    &s.metrics,
                     "POST",
                     "/v1/chat/completions",
                     503,
                     None,
+                    None,
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
+                    Some(api_err.code()),
                 );
                 return api_err.into_response();
             }
@@ -1251,12 +1319,15 @@ mod imp {
             // state machine (`pending`) so it isn't silently dropped.
             let Some(first_ev) = rx.recv().await.map(normalize_cancelled) else {
                 emit_serve_event(
+                    &s.metrics,
                     "POST",
                     "/v1/chat/completions",
                     500,
                     None,
+                    None,
                     timer.elapsed().as_secs_f64() * 1000.0,
                     true,
+                    Some("internal_error"),
                 );
                 return err_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1267,24 +1338,30 @@ mod imp {
             let first_ev = match first_ev {
                 WorkerEvent::Rejected(api_err) => {
                     emit_serve_event(
+                        &s.metrics,
                         "POST",
                         "/v1/chat/completions",
                         400,
                         None,
+                        None,
                         timer.elapsed().as_secs_f64() * 1000.0,
                         true,
+                        Some(api_err.code()),
                     );
                     return api_err.into_response();
                 }
                 WorkerEvent::Failed(message) => {
                     eprintln!("generation error (streaming): {message}");
                     emit_serve_event(
+                        &s.metrics,
                         "POST",
                         "/v1/chat/completions",
                         500,
                         None,
+                        None,
                         timer.elapsed().as_secs_f64() * 1000.0,
                         true,
+                        Some("internal_error"),
                     );
                     return err_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1297,9 +1374,10 @@ mod imp {
                     unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
                 }
             };
+            let metrics = s.metrics.clone();
             let stream = futures::stream::unfold(
-                (rx, Phase::Start, cancel_guard, Some(first_ev)),
-                move |(mut rx, phase, cancel_guard, mut pending)| {
+                (rx, Phase::Start, cancel_guard, Some(first_ev), metrics),
+                move |(mut rx, phase, cancel_guard, mut pending, metrics)| {
                     let id = id.clone();
                     let model = model_id.clone();
                     async move {
@@ -1314,7 +1392,7 @@ mod imp {
                                     Ok::<Event, std::convert::Infallible>(
                                         Event::default().data(chunk.to_string()),
                                     ),
-                                    (rx, Phase::Body(0), cancel_guard, pending),
+                                    (rx, Phase::Body(0), cancel_guard, pending, metrics),
                                 ))
                             }
                             Phase::Body(completion_tokens) => match match pending.take() {
@@ -1336,6 +1414,7 @@ mod imp {
                                             Phase::Body(completion_tokens.saturating_add(1)),
                                             cancel_guard,
                                             None,
+                                            metrics,
                                         ),
                                     ))
                                 }
@@ -1357,9 +1436,13 @@ mod imp {
                                         Ok(Event::default().data(chunk.to_string())),
                                         (
                                             rx,
-                                            Phase::Done(output.generated_tokens),
+                                            Phase::Done(
+                                                output.generated_tokens,
+                                                output.prompt_tokens,
+                                            ),
                                             cancel_guard,
                                             None,
+                                            metrics,
                                         ),
                                     ))
                                 }
@@ -1383,7 +1466,13 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(error.to_string())),
-                                        (rx, Phase::Done(completion_tokens), cancel_guard, None),
+                                        (
+                                            rx,
+                                            Phase::Done(completion_tokens, 0),
+                                            cancel_guard,
+                                            None,
+                                            metrics,
+                                        ),
                                     ))
                                 }
                                 Some(WorkerEvent::Rejected(api_err)) => {
@@ -1412,7 +1501,13 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(error.to_string())),
-                                        (rx, Phase::Done(completion_tokens), cancel_guard, None),
+                                        (
+                                            rx,
+                                            Phase::Done(completion_tokens, 0),
+                                            cancel_guard,
+                                            None,
+                                            metrics,
+                                        ),
                                     ))
                                 }
                                 Some(WorkerEvent::Cancelled) => unreachable!(
@@ -1429,22 +1524,31 @@ mod imp {
                                     });
                                     Some((
                                         Ok(Event::default().data(error.to_string())),
-                                        (rx, Phase::Done(completion_tokens), cancel_guard, None),
+                                        (
+                                            rx,
+                                            Phase::Done(completion_tokens, 0),
+                                            cancel_guard,
+                                            None,
+                                            metrics,
+                                        ),
                                     ))
                                 }
                             },
-                            Phase::Done(ct) => Some((
+                            Phase::Done(ct, pt) => Some((
                                 Ok(Event::default().data("[DONE]")),
-                                (rx, Phase::End(ct), cancel_guard, None),
+                                (rx, Phase::End(ct, pt), cancel_guard, None, metrics),
                             )),
-                            Phase::End(ct) => {
+                            Phase::End(ct, pt) => {
                                 emit_serve_event(
+                                    &metrics,
                                     "POST",
                                     "/v1/chat/completions",
                                     200,
+                                    Some(pt),
                                     Some(ct),
                                     timer.elapsed().as_secs_f64() * 1000.0,
                                     true,
+                                    None,
                                 );
                                 None
                             }
@@ -1469,12 +1573,15 @@ mod imp {
             // 500 this binary has always returned for that condition.
             let Some(first_ev) = rx.recv().await.map(normalize_cancelled) else {
                 emit_serve_event(
+                    &s.metrics,
                     "POST",
                     "/v1/chat/completions",
                     500,
                     None,
+                    None,
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
+                    Some("internal_error"),
                 );
                 return err_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1507,12 +1614,15 @@ mod imp {
                         // contract the CPU/Metal handlers in `lattice.rs` use.
                         eprintln!("generation error: {message}");
                         emit_serve_event(
+                            &s.metrics,
                             "POST",
                             "/v1/chat/completions",
                             500,
                             None,
+                            None,
                             timer.elapsed().as_secs_f64() * 1000.0,
                             false,
+                            Some("internal_error"),
                         );
                         return err_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1528,12 +1638,15 @@ mod imp {
                         // committed yet, so this surfaces as a real 400 with
                         // the specific reason, not a generic 500.
                         emit_serve_event(
+                            &s.metrics,
                             "POST",
                             "/v1/chat/completions",
                             400,
                             None,
+                            None,
                             timer.elapsed().as_secs_f64() * 1000.0,
                             false,
+                            Some(api_err.code()),
                         );
                         // Matches lattice.rs's `check_context_window` code
                         // for the analogous prompt-plus-budget-exceeds-window
@@ -1564,12 +1677,15 @@ mod imp {
                 },
             });
             emit_serve_event(
+                &s.metrics,
                 "POST",
                 "/v1/chat/completions",
                 200,
+                Some(prompt_tokens),
                 Some(completion_tokens),
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
+                None,
             );
             Json(body).into_response()
         }
@@ -1610,15 +1726,29 @@ mod imp {
         api_err.into_response()
     }
 
-    /// Print a structured telemetry line to stdout for the app bridge to parse.
+    /// Prints a structured telemetry line to stdout for the app bridge to
+    /// parse, AND records the same observation into the process's
+    /// `/metrics` registry (issue #583) -- the single call site both
+    /// consumers (the stdout bridge, the Prometheus scrape endpoint) share,
+    /// so they can never observe a different request count for the same
+    /// traffic.
+    #[allow(clippy::too_many_arguments)]
     fn emit_serve_event(
+        metrics: &ServeMetrics,
         method: &str,
         route: &str,
         status: u16,
-        tokens: Option<usize>,
+        prompt_tokens: Option<usize>,
+        completion_tokens: Option<usize>,
         dur_ms: f64,
         stream: bool,
+        error_code: Option<&str>,
     ) {
+        metrics.record_request(method, route, status, dur_ms / 1000.0);
+        metrics.record_tokens(prompt_tokens.unwrap_or(0), completion_tokens.unwrap_or(0));
+        if let Some(code) = error_code {
+            metrics.record_error(code);
+        }
         println!(
             "@@lattice {}",
             json!({
@@ -1626,7 +1756,8 @@ mod imp {
                 "method": method,
                 "route": route,
                 "status": status,
-                "tokens": tokens,
+                "tokens": completion_tokens,
+                "prompt_tokens": prompt_tokens,
                 "dur_ms": dur_ms,
                 "stream": stream,
             })
@@ -1720,6 +1851,7 @@ mod imp {
             .route("/health", get(health))
             .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
+            .route("/metrics", get(metrics_handler))
             .with_state(state)
     }
 
@@ -1856,6 +1988,8 @@ mod imp {
             model_id,
             defaults,
             model_max_context,
+            max_pending,
+            metrics: Arc::new(ServeMetrics::default()),
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1868,7 +2002,9 @@ mod imp {
                 .await
                 .map_err(|e| format!("bind {addr} failed: {e}"))?;
             eprintln!("[lattice_serve] OpenAI-compatible API on http://{addr}/v1");
-            eprintln!("[lattice_serve]   POST /v1/chat/completions   GET /v1/models   GET /health");
+            eprintln!(
+                "[lattice_serve]   POST /v1/chat/completions   GET /v1/models   GET /health   GET /metrics"
+            );
             println!("@@lattice {}", json!({"ev": "ready", "port": port}));
             axum::serve(listener, app)
                 .await
@@ -1941,6 +2077,8 @@ mod imp {
                         reasoning_budget: None,
                     },
                     model_max_context: 4096,
+                    max_pending: 1_000_000,
+                    metrics: Arc::new(ServeMetrics::default()),
                 }
             }
             let (jobs, _rx) = test_client_and_jobs();
@@ -2215,6 +2353,8 @@ mod imp {
                     reasoning_budget: None,
                 },
                 model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
             }
         }
 
@@ -2450,6 +2590,8 @@ mod imp {
                     reasoning_budget: None,
                 },
                 model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
             };
             (state, jobs_rx)
         }
@@ -2503,6 +2645,75 @@ mod imp {
             // length-capped or cancelled completion was misreported as an
             // explicit stop condition (#746).
             assert_eq!(non_streaming_finish_reason_for(false).await, "length");
+        }
+
+        /// #583: `GET /metrics` must reflect REAL traffic recorded through
+        /// `emit_serve_event`, not a static template -- mutation check: if
+        /// `emit_serve_event` stops forwarding into `ServeMetrics` (or
+        /// `metrics_handler` stops rendering it), every assertion below
+        /// regresses to "0"/absent while the route itself would still
+        /// return 200, so this would NOT be caught by a route-existence
+        /// check alone.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn metrics_endpoint_reports_requests_tokens_and_errors() {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.reply(WorkerEvent::Complete(GenerateOutput {
+                        text: "hi".to_string(),
+                        token_ids: vec![0],
+                        prompt_tokens: 3,
+                        generated_tokens: 2,
+                        stopped: true,
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    }));
+                }
+            });
+            let ok_body =
+                Body::from(r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string());
+            let ok_response = chat_completions(State(state.clone()), ok_body).await;
+            assert_eq!(ok_response.status(), StatusCode::OK);
+
+            let bad_body = Body::from(r#"{"messages":[]}"#.to_string());
+            let bad_response = chat_completions(State(state.clone()), bad_body).await;
+            assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
+
+            let _ = health(State(state.clone())).await;
+
+            let metrics_response = metrics_handler(State(state.clone())).await.into_response();
+            let bytes = axum::body::to_bytes(metrics_response.into_body(), usize::MAX)
+                .await
+                .expect("metrics body must be readable");
+            let body = String::from_utf8(bytes.to_vec()).expect("metrics body must be UTF-8");
+
+            assert!(
+                body.contains(
+                    "lattice_http_requests_total{method=\"POST\",route=\"/v1/chat/completions\",status=\"200\",model=\"test-model\"} 1"
+                ),
+                "missing successful chat_completions counter:\n{body}"
+            );
+            assert!(
+                body.contains(
+                    "lattice_http_requests_total{method=\"GET\",route=\"/health\",status=\"200\",model=\"test-model\"} 1"
+                ),
+                "missing health counter:\n{body}"
+            );
+            assert!(
+                body.contains("lattice_prompt_tokens_total{model=\"test-model\"} 3"),
+                "missing prompt token count:\n{body}"
+            );
+            assert!(
+                body.contains("lattice_completion_tokens_total{model=\"test-model\"} 2"),
+                "missing completion token count:\n{body}"
+            );
+            assert!(
+                body.contains(
+                    "lattice_errors_total{code=\"invalid_messages\",model=\"test-model\"} 1"
+                ),
+                "missing invalid_messages error count:\n{body}"
+            );
         }
 
         /// Same round-trip as above, but through the SSE streaming path
@@ -2756,6 +2967,8 @@ mod imp {
                         reasoning_budget: None,
                     },
                     model_max_context,
+                    max_pending: 1_000_000,
+                    metrics: Arc::new(ServeMetrics::default()),
                 }
             }
 
@@ -2858,6 +3071,8 @@ mod imp {
                         reasoning_budget: None,
                     },
                     model_max_context: 4096,
+                    max_pending: 1_000_000,
+                    metrics: Arc::new(ServeMetrics::default()),
                 };
                 (state, unblock_tx, started_rx)
             }
@@ -3091,6 +3306,8 @@ mod imp {
                         reasoning_budget: None,
                     },
                     model_max_context,
+                    max_pending: 1_000_000,
+                    metrics: Arc::new(ServeMetrics::default()),
                 }
             }
 
@@ -3281,6 +3498,8 @@ mod imp {
                         reasoning_budget: None,
                     },
                     model_max_context,
+                    max_pending: 1_000_000,
+                    metrics: Arc::new(ServeMetrics::default()),
                 };
                 let body = Body::from(
                     r#"{"messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#
