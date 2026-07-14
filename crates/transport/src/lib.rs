@@ -52,7 +52,7 @@ pub mod transport_plan;
 pub mod unbalanced;
 
 #[cfg(test)]
-mod bench;
+mod reference_cases;
 #[cfg(test)]
 mod tests;
 

@@ -17,7 +17,6 @@ pub struct ReferenceCase {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct ReferenceComparison {
     pub name: &'static str,
     pub expected_exact_cost: f32,
