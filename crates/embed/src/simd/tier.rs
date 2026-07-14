@@ -319,6 +319,7 @@ pub fn approximate_cosine_distance_prepared_with_meta(
     if meta.norm == NormalizationHint::Unit
         && stored_norm == NormalizationHint::Unit
         && let (PreparedQuery::Full(q), QuantizedData::Full(s)) = (&meta.query, stored)
+        && is_unit_norm(s)
     {
         let dot = dot_product(q, s);
         return Ok(1.0 - dot.clamp(-1.0, 1.0));
@@ -842,6 +843,27 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, EmbedError::TierMismatch { .. }));
+    }
+
+    #[test]
+    fn test_cosine_distance_prepared_with_meta_validates_stored_unit_norm() {
+        let query = vec![std::f32::consts::FRAC_1_SQRT_2; 2];
+        let meta = PreparedQueryWithMeta::from_f32(
+            &query,
+            QuantizationTier::Full,
+            NormalizationHint::Unit,
+        );
+        let stored = QuantizedData::Full(vec![2.0, 0.0]);
+
+        let got =
+            approximate_cosine_distance_prepared_with_meta(&meta, &stored, NormalizationHint::Unit)
+                .unwrap();
+        let expected = approximate_cosine_distance_prepared(&meta.query, &stored).unwrap();
+
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "got={got}, expected={expected}"
+        );
     }
 
     #[test]
