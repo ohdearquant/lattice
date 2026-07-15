@@ -204,6 +204,48 @@ fn s5b_golden_fixture_is_valid() {
     );
 }
 
+/// Resolve the safetensors file for `load_f16_weights`, which needs a single
+/// `SafetensorsFile`. A local checkout may expose a convenience
+/// `model.safetensors` (often a symlink), but a raw HuggingFace snapshot — what
+/// CI materializes via `snapshot_download` — has only the sharded file(s) named
+/// in `model.safetensors.index.json` and no plain `model.safetensors`. This
+/// 0.8B checkpoint is a single shard, so fall back to the one shard the index
+/// points at. Mirrors `Qwen35Model::from_safetensors`'s plain-then-index
+/// precedence, but resolves the concrete shard path this single-file gate needs.
+#[cfg(feature = "f16")]
+fn resolve_safetensors_path(model_dir: &Path) -> PathBuf {
+    let plain = model_dir.join("model.safetensors");
+    if plain.exists() {
+        return plain;
+    }
+    let index_path = model_dir.join("model.safetensors.index.json");
+    let bytes = std::fs::read(&index_path).unwrap_or_else(|e| {
+        panic!(
+            "no model.safetensors in {} and cannot read {}: {e}",
+            model_dir.display(),
+            index_path.display()
+        )
+    });
+    let index: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("parsing model.safetensors.index.json");
+    let mut shards: Vec<&str> = index["weight_map"]
+        .as_object()
+        .expect("model.safetensors.index.json has a weight_map object")
+        .values()
+        .filter_map(|v| v.as_str())
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+    match shards.as_slice() {
+        [one] => model_dir.join(one),
+        [] => panic!("empty weight_map in {}", index_path.display()),
+        _ => panic!(
+            "multi-shard checkpoint ({} shards) is not supported by this single-file gate",
+            shards.len()
+        ),
+    }
+}
+
 #[cfg(feature = "f16")]
 fn run_s5b_gate(model_dir: &Path) {
     use lattice_inference::forward::cpu_f16::generate_multimodal_f16;
@@ -277,8 +319,8 @@ fn run_s5b_gate(model_dir: &Path) {
         manifest.num_image_placeholder_tokens
     );
 
-    let model_path = model_dir.join("model.safetensors");
-    let sf = SafetensorsFile::open(&model_path).expect("opening model.safetensors");
+    let model_path = resolve_safetensors_path(model_dir);
+    let sf = SafetensorsFile::open(&model_path).expect("opening the resolved safetensors file");
     let weights = load_f16_weights(&sf, &cfg).expect("real f16 decoder weights must load");
 
     // Pure greedy, matching the fixture's HF reference (manifest.json's `decode` section):

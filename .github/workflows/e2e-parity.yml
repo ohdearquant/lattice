@@ -664,13 +664,24 @@ jobs:
           LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
           LATTICE_VISION_S3_GATE_ENFORCE: '1'
         run: |
-          # tee (not > redirect) so cargo output is streamed to the CI log even
-          # on failure; the default GitHub shell is `bash -eo pipefail`, so a
-          # cargo test failure still fails this step after the output is visible.
-          cargo test --release -p lattice-inference --features f16 \
+          # Capture to a file, then always print it — but preserve cargo's exit
+          # status so a test failure fails the step. A `... | tee` pipeline would
+          # NOT work here: this step sets no `shell:`, so it runs under GitHub's
+          # default `bash -e {0}` (no `pipefail`), where the pipeline takes tee's
+          # zero exit and the failure is masked. The old `> file` + bare `cat`
+          # was the opposite bug: `-e` aborted before the `cat`, hiding the
+          # output. This if/else does both — visible output AND fail-closed.
+          if cargo test --release -p lattice-inference --features f16 \
             --test vision_s3_vit_forward_test \
             --test vision_s4_merger_test \
-            --test vision_s5b_e2e_gate_test -- --nocapture 2>&1 | tee vision-s3-gate.log
+            --test vision_s5b_e2e_gate_test -- --nocapture > vision-s3-gate.log 2>&1
+          then
+            cat vision-s3-gate.log
+          else
+            status=$?
+            cat vision-s3-gate.log
+            exit "$status"
+          fi
           grep -q 'LATTICE_VISION_S3_COSINE' vision-s3-gate.log
           grep -q 'LATTICE_VISION_S3_MUTATION_COSINE' vision-s3-gate.log
           grep -q 'LATTICE_VISION_S4_COSINE' vision-s3-gate.log
