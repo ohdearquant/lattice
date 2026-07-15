@@ -9,10 +9,18 @@
 //! a build-time indirection map, so KV memory scales with the non-shared
 //! layer count rather than the full layer count.
 //!
-//! Donor slots are ordinary slots, sized per their own attention type:
-//! sliding-type slots retain only the last `sliding_window` positions
-//! (window-truncated, matching the reference `Cache` a sliding donor reads
-//! through); global-type slots retain the full context. Shared layers read
+//! Donor slots are ordinary slots, sized per their own attention type.
+//! Global-type slots retain the full context. Sliding-type slots implement
+//! the *publish* rule that a differential probe against the pinned reference
+//! established (a naive "read view == window" model does not match the
+//! reference during prefill): on each append, the slot first compacts its
+//! existing content down to the last `sliding_window - 1` positions, then
+//! appends the entire incoming chunk; the read view is the whole resulting
+//! buffer. Truncation to `sliding_window - 1` therefore happens lazily, at
+//! the *next* append, not at read time -- a prefill chunk publishes its full
+//! length, and only a subsequent append trims the prior tail. Repeated
+//! single-token decode steps converge on exactly `sliding_window` published
+//! positions (`sliding_window - 1` retained + 1 new). Shared layers read
 //! their donor's slot directly -- there is no side buffer and no copy, and
 //! the public API has no writer for a shared layer's "own" state, since it
 //! has none.
@@ -28,7 +36,8 @@ use crate::model::gemma4_config::Gemma4Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotKind {
-    /// Window-truncated retention: only the last `capacity` positions survive.
+    /// Lazy window-minus-one retention published in full per chunk -- see
+    /// the module docs for the exact rule.
     Sliding,
     /// Full-context retention up to `capacity` positions.
     Global,
@@ -39,9 +48,14 @@ struct Slot {
     kind: SlotKind,
     /// Per-position width: `num_key_value_heads * attn_head_dim(owner_layer)`.
     kv_dim: usize,
-    /// Sliding: `sliding_window`. Global: the cache's `max_seq_len`.
+    /// Sliding: `sliding_window` (the retention bound used in the append
+    /// rule, not a hard cap on buffer size). Global: the cache's
+    /// `max_seq_len` (a hard cap -- `append` rejects an overflow).
     capacity: usize,
-    /// `[capacity * kv_dim]`; valid data occupies `[0, seq_len * kv_dim)`.
+    /// Global: fixed size `[capacity * kv_dim]`. Sliding: grows on demand to
+    /// hold the retained tail plus the current chunk (transient, per-chunk
+    /// -- see [`Slot::append`]). Valid data always occupies
+    /// `[0, seq_len * kv_dim)`.
     k: Vec<f32>,
     v: Vec<f32>,
     seq_len: usize,
@@ -76,12 +90,16 @@ impl Slot {
 
     /// Append a chunk of `q_len = k.len() / kv_dim` tokens (`q_len >= 1`).
     ///
-    /// Global slots reject an append that would exceed `capacity`. Sliding
-    /// slots implement window-truncated retention: once the slot would hold
-    /// more than `capacity` positions, the oldest positions are shifted out
-    /// (or, when the incoming chunk alone is >= `capacity`, only its own
-    /// tail survives) so that a read always sees exactly the most recent
-    /// `min(total_appended, capacity)` positions in order.
+    /// Global slots reject an append that would exceed `capacity`.
+    ///
+    /// Sliding slots implement the measured publish rule (differentially
+    /// probed against the pinned reference, see the module docs): first
+    /// compact any existing content down to its last `capacity - 1`
+    /// positions, then append the entire incoming chunk. The read view
+    /// after this call is the whole resulting buffer -- a prefill chunk
+    /// therefore publishes its full length, and window retention to
+    /// `capacity - 1` is applied lazily, at the *next* append. The backing
+    /// buffer grows as needed to hold `capacity - 1 + q_len` positions.
     fn append(&mut self, k: &[f32], v: &[f32]) -> Result<(), InferenceError> {
         if k.len() != v.len() {
             return Err(InferenceError::InvalidInput(format!(
@@ -122,30 +140,36 @@ impl Slot {
                 self.seq_len = new_len;
             }
             SlotKind::Sliding => {
-                if q_len >= self.capacity {
-                    // The incoming chunk alone fills (or overflows) the
-                    // window: only its own last `capacity` tokens survive,
-                    // discarding all prior state.
-                    let start_tok = q_len - self.capacity;
-                    let k_tail = &k[start_tok * self.kv_dim..];
-                    let v_tail = &v[start_tok * self.kv_dim..];
-                    self.k[..k_tail.len()].copy_from_slice(k_tail);
-                    self.v[..v_tail.len()].copy_from_slice(v_tail);
-                    self.seq_len = self.capacity;
-                } else {
-                    let total_new = self.seq_len + q_len;
-                    if total_new > self.capacity {
-                        let drop = total_new - self.capacity;
-                        let valid_end = self.seq_len * self.kv_dim;
-                        self.k.copy_within((drop * self.kv_dim)..valid_end, 0);
-                        self.v.copy_within((drop * self.kv_dim)..valid_end, 0);
-                        self.seq_len -= drop;
-                    }
-                    let off = self.seq_len * self.kv_dim;
-                    self.k[off..off + k.len()].copy_from_slice(k);
-                    self.v[off..off + v.len()].copy_from_slice(v);
-                    self.seq_len += q_len;
+                // Compact existing content to its last `capacity - 1`
+                // positions before publishing the incoming chunk.
+                let retain = self.seq_len.min(self.capacity.saturating_sub(1));
+                if retain < self.seq_len {
+                    let drop = self.seq_len - retain;
+                    let valid_end = self.seq_len * self.kv_dim;
+                    self.k.copy_within((drop * self.kv_dim)..valid_end, 0);
+                    self.v.copy_within((drop * self.kv_dim)..valid_end, 0);
                 }
+                self.seq_len = retain;
+
+                let new_len = self.seq_len.checked_add(q_len).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "gemma4 kv cache: sliding slot seq_len overflow".to_string(),
+                    )
+                })?;
+                let needed_elems = new_len.checked_mul(self.kv_dim).ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "gemma4 kv cache: sliding slot buffer size overflow".to_string(),
+                    )
+                })?;
+                if self.k.len() < needed_elems {
+                    self.k.resize(needed_elems, 0.0);
+                    self.v.resize(needed_elems, 0.0);
+                }
+
+                let off = self.seq_len * self.kv_dim;
+                self.k[off..off + k.len()].copy_from_slice(k);
+                self.v[off..off + v.len()].copy_from_slice(v);
+                self.seq_len = new_len;
             }
         }
         Ok(())
@@ -178,17 +202,26 @@ impl Gemma4KvCache {
     /// # Errors
     /// Returns `InferenceError` (never panics) if:
     /// - `cfg.num_hidden_layers` is `0`;
+    /// - `cfg.layer_types.len()` does not equal `cfg.num_hidden_layers` (a
+    ///   short `layer_types` would otherwise silently classify the missing
+    ///   trailing entries as sliding);
+    /// - `cfg.num_key_value_heads`, `cfg.head_dim`, or `cfg.global_head_dim`
+    ///   is `0`;
+    /// - `cfg.sliding_window` is `0` while at least one layer is a sliding
+    ///   layer, or `max_seq_len` is `0`;
+    /// - `cfg.num_key_value_heads * cfg.attn_head_dim(layer)` overflows
+    ///   `usize` for any non-shared layer;
     /// - any shared layer has no non-shared donor layer of the same
     ///   attention type among the non-shared layers (a config/checkpoint
     ///   structural disagreement -- there is no valid donor to fall back
     ///   to, so this is rejected rather than silently paired cross-type);
-    /// - the derived slot count does not equal the number of non-shared
-    ///   layers, or any layer's resolved donor disagrees on attention type
-    ///   (both are internal build-time asserts: they should be unreachable
-    ///   given the construction above, but are checked explicitly per the
-    ///   "hard error, not debug_assert" contract);
-    /// - `cfg.sliding_window` is `0`, `max_seq_len` is `0`, or a slot's
-    ///   `capacity * kv_dim` product overflows `usize`.
+    /// - any layer's resolved donor disagrees on attention type, or the
+    ///   completed slot count disagrees with the independently-filtered
+    ///   non-shared layer count (both are internal build-time asserts:
+    ///   they should be unreachable given the construction above, but are
+    ///   checked explicitly per the "hard error, not debug_assert"
+    ///   contract);
+    /// - a slot's `capacity * kv_dim` product overflows `usize`.
     pub fn new(cfg: &Gemma4Config, max_seq_len: usize) -> Result<Self, InferenceError> {
         let n = cfg.num_hidden_layers;
         if n == 0 {
@@ -196,6 +229,43 @@ impl Gemma4KvCache {
                 "gemma4 kv cache: num_hidden_layers must be > 0".to_string(),
             ));
         }
+        // Structural validation happens before any allocation: a
+        // directly-constructed (not `Gemma4Config::validate`-checked) config
+        // must fail closed rather than silently misclassify or overflow.
+        if cfg.layer_types.len() != n {
+            return Err(InferenceError::InvalidInput(format!(
+                "gemma4 kv cache: layer_types has {} entries but num_hidden_layers is {n}",
+                cfg.layer_types.len()
+            )));
+        }
+        if cfg.num_key_value_heads == 0 {
+            return Err(InferenceError::InvalidInput(
+                "gemma4 kv cache: num_key_value_heads must be > 0".to_string(),
+            ));
+        }
+        if cfg.head_dim == 0 {
+            return Err(InferenceError::InvalidInput(
+                "gemma4 kv cache: head_dim must be > 0".to_string(),
+            ));
+        }
+        if cfg.global_head_dim == 0 {
+            return Err(InferenceError::InvalidInput(
+                "gemma4 kv cache: global_head_dim must be > 0".to_string(),
+            ));
+        }
+        if max_seq_len == 0 {
+            return Err(InferenceError::InvalidInput(
+                "gemma4 kv cache: max_seq_len must be > 0".to_string(),
+            ));
+        }
+        let any_sliding_layer = (0..n).any(|l| !cfg.is_global_layer(l));
+        if any_sliding_layer && cfg.sliding_window == 0 {
+            return Err(InferenceError::InvalidInput(
+                "gemma4 kv cache: sliding_window must be > 0 when any layer is a sliding layer"
+                    .to_string(),
+            ));
+        }
+
         let first_shared = cfg.first_kv_shared_layer_idx();
 
         // Non-shared layers 0..first_shared each get their own slot, in
@@ -205,17 +275,10 @@ impl Gemma4KvCache {
             *slot = layer;
         }
 
-        // Build-time assert: slot count == non-shared layer count. Derived
-        // independently from `is_kv_shared_layer` (rather than reusing
-        // `first_shared` on both sides) so this assert is not tautological.
-        let actual_non_shared = (0..n).filter(|&l| !cfg.is_kv_shared_layer(l)).count();
-        if first_shared != actual_non_shared {
-            return Err(InferenceError::Inference(format!(
-                "gemma4 kv cache: build-time slot-count assert failed: derived slot count \
-                 {first_shared} != non-shared layer count {actual_non_shared} \
-                 (num_hidden_layers={n})"
-            )));
-        }
+        // Independently-filtered owner list, used below for the
+        // post-allocation slot-count assert (not a restatement of the
+        // formula that produced `first_shared`).
+        let owner_layers: Vec<usize> = (0..n).filter(|&l| !cfg.is_kv_shared_layer(l)).collect();
 
         // Last non-shared donor layer seen per attention type, scanning the
         // non-shared prefix in layer order.
@@ -267,13 +330,35 @@ impl Gemma4KvCache {
 
         let mut slots = Vec::with_capacity(first_shared);
         for owner_layer in 0..first_shared {
-            let kv_dim = cfg.num_key_value_heads * cfg.attn_head_dim(owner_layer);
+            let kv_dim = cfg
+                .num_key_value_heads
+                .checked_mul(cfg.attn_head_dim(owner_layer))
+                .ok_or_else(|| {
+                    InferenceError::InvalidInput(format!(
+                        "gemma4 kv cache: num_key_value_heads ({}) * attn_head_dim ({}) \
+                         overflows usize for layer {owner_layer}",
+                        cfg.num_key_value_heads,
+                        cfg.attn_head_dim(owner_layer)
+                    ))
+                })?;
             let (kind, capacity) = if cfg.is_global_layer(owner_layer) {
                 (SlotKind::Global, max_seq_len)
             } else {
                 (SlotKind::Sliding, cfg.sliding_window)
             };
             slots.push(Slot::try_new(kind, kv_dim, capacity)?);
+        }
+
+        // Build-time assert: the actually-completed slot count matches the
+        // independently-filtered owner list, not a restatement of the
+        // formula that produced the `0..first_shared` allocation loop bound.
+        if slots.len() != owner_layers.len() {
+            return Err(InferenceError::Inference(format!(
+                "gemma4 kv cache: build-time slot-count assert failed: allocated {} slots but \
+                 the independently-filtered non-shared layer count is {} (num_hidden_layers={n})",
+                slots.len(),
+                owner_layers.len()
+            )));
         }
 
         Ok(Self {
@@ -481,10 +566,10 @@ mod tests {
             .expect("donor layer write must succeed");
     }
 
-    // -- Test 3: sliding window truncation -----------------------------------
+    // -- Test 3: sliding-window publish rule ---------------------------------
 
     #[test]
-    fn sliding_window_truncation_keeps_last_window_in_order() {
+    fn sliding_prefill_publishes_full_chunk_then_retains_window_minus_one() {
         let cfg = tiny_config(8);
         let mut cache = Gemma4KvCache::new(&cfg, 64).unwrap();
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim; // sliding width
@@ -492,20 +577,33 @@ mod tests {
 
         let k: Vec<f32> = (0..PROMPT_LEN * kv_dim).map(|i| i as f32).collect();
         let v: Vec<f32> = (0..PROMPT_LEN * kv_dim)
-            .map(|i| (i as f32) + 1000.0)
+            .map(|i| (i as f32) + 10_000.0)
             .collect();
 
-        // Layer 3 is a non-shared sliding layer (the sliding donor).
+        // Layer 3 is a non-shared sliding layer (the sliding donor). A
+        // single append -- even one far larger than the window -- publishes
+        // the whole chunk: measured against the pinned reference, retention
+        // to window-1 happens lazily at the *next* append, not at read time.
         cache.append_kv(3, &k, &v).unwrap();
 
-        assert_eq!(cache.seq_len(3).unwrap(), 8);
-        let k_view = cache.k_view(3).unwrap();
-        assert_eq!(k_view.len(), 8 * kv_dim);
+        assert_eq!(cache.seq_len(3).unwrap(), PROMPT_LEN);
+        assert_eq!(cache.k_view(3).unwrap(), k.as_slice());
+        assert_eq!(cache.v_view(3).unwrap(), v.as_slice());
 
-        let expected: Vec<f32> = ((PROMPT_LEN - 8) * kv_dim..PROMPT_LEN * kv_dim)
-            .map(|i| i as f32)
-            .collect();
-        assert_eq!(k_view, expected.as_slice());
+        // The next append (one decode token) first compacts the retained
+        // tail to window-1=7 positions, then appends the new token: view =
+        // last 7 of the prefill + the new token, 8 total.
+        let k_next = vec![9_999.0f32; kv_dim];
+        let v_next = vec![8_888.0f32; kv_dim];
+        cache.append_kv(3, &k_next, &v_next).unwrap();
+
+        assert_eq!(cache.seq_len(3).unwrap(), 8);
+        let mut expected_k = k[(PROMPT_LEN - 7) * kv_dim..].to_vec();
+        expected_k.extend_from_slice(&k_next);
+        let mut expected_v = v[(PROMPT_LEN - 7) * kv_dim..].to_vec();
+        expected_v.extend_from_slice(&v_next);
+        assert_eq!(cache.k_view(3).unwrap(), expected_k.as_slice());
+        assert_eq!(cache.v_view(3).unwrap(), expected_v.as_slice());
     }
 
     // -- Test 4: donor/shared read identity -----------------------------------
@@ -535,36 +633,57 @@ mod tests {
     // -- Test 5: chunk-boundary -------------------------------------------
 
     #[test]
-    fn chunk_boundary_shared_layer_sees_current_chunk() {
-        // window=6, chunks of 5 then 3 tokens: total=8 > 6, genuinely crosses
-        // the window boundary (drops 2 of the first chunk's tokens).
-        let cfg = tiny_config(6);
+    fn chunk_boundary_publishes_retained_tail_plus_whole_chunk() {
+        // window=4 (retention bound = window-1=3). chunk1=5 tokens: the
+        // donor's first-ever append always publishes the whole chunk
+        // regardless of window size. chunk2=3 tokens then genuinely crosses
+        // the window boundary on the *next* append.
+        let cfg = tiny_config(4);
         let mut cache = Gemma4KvCache::new(&cfg, 64).unwrap();
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
 
-        let chunk1: Vec<f32> = (0..5 * kv_dim).map(|i| i as f32).collect();
-        cache.append_kv(3, &chunk1, &chunk1).unwrap();
+        let k1: Vec<f32> = (0..5 * kv_dim).map(|i| i as f32).collect();
+        let v1: Vec<f32> = (0..5 * kv_dim).map(|i| (i as f32) + 500.0).collect();
+        cache.append_kv(3, &k1, &v1).unwrap();
         assert_eq!(cache.seq_len(3).unwrap(), 5);
-        // Shared layer 5 already sees chunk 1 via its donor (layer 3).
-        assert_eq!(cache.k_view(5).unwrap(), chunk1.as_slice());
+        assert_eq!(cache.k_view(3).unwrap(), k1.as_slice());
+        assert_eq!(cache.v_view(3).unwrap(), v1.as_slice());
+        // Shared layer 5 already sees the whole chunk 1 via its donor.
+        assert_eq!(cache.k_view(5).unwrap(), k1.as_slice());
+        assert_eq!(cache.v_view(5).unwrap(), v1.as_slice());
 
-        let chunk2: Vec<f32> = (100..100 + 3 * kv_dim).map(|i| i as f32).collect();
-        cache.append_kv(3, &chunk2, &chunk2).unwrap();
+        let k2: Vec<f32> = (1000..1000 + 3 * kv_dim).map(|i| i as f32).collect();
+        let v2: Vec<f32> = (2000..2000 + 3 * kv_dim).map(|i| i as f32).collect();
+        cache.append_kv(3, &k2, &v2).unwrap();
+
+        // Retain the last (window-1)=3 positions of chunk1, then publish the
+        // whole 3-token chunk2: 3 + 3 = 6 positions total.
+        let mut expected_k = k1[2 * kv_dim..].to_vec();
+        expected_k.extend_from_slice(&k2);
+        let mut expected_v = v1[2 * kv_dim..].to_vec();
+        expected_v.extend_from_slice(&v2);
+        assert_eq!(expected_k.len(), 6 * kv_dim);
+
         assert_eq!(cache.seq_len(3).unwrap(), 6);
-
-        // total appended = 8 tokens, capacity = 6 -> drop the oldest 2 of
-        // chunk1's 5 tokens, keeping its last 3 + all 3 of chunk2.
-        let mut expected = chunk1[2 * kv_dim..].to_vec();
-        expected.extend_from_slice(&chunk2);
-        assert_eq!(expected.len(), 6 * kv_dim);
-
-        assert_eq!(cache.k_view(3).unwrap(), expected.as_slice());
+        assert_eq!(cache.k_view(3).unwrap(), expected_k.as_slice());
+        assert_eq!(cache.v_view(3).unwrap(), expected_v.as_slice());
         // Shared layer's view after chunk 2 includes chunk 2's data.
         assert_eq!(
             cache.k_view(5).unwrap(),
-            expected.as_slice(),
+            expected_k.as_slice(),
             "shared layer must see donor's chunk-2 append, not a stale chunk-1-only view"
         );
+        assert_eq!(cache.v_view(5).unwrap(), expected_v.as_slice());
+
+        // Repeated one-token decodes settle at exactly window (4) positions.
+        for step in 0..3usize {
+            let kd = vec![(9_000 + step) as f32; kv_dim];
+            let vd = vec![(9_500 + step) as f32; kv_dim];
+            cache.append_kv(3, &kd, &vd).unwrap();
+            assert_eq!(cache.seq_len(3).unwrap(), 4);
+            assert_eq!(cache.k_view(3).unwrap().len(), 4 * kv_dim);
+            assert_eq!(cache.v_view(3).unwrap().len(), 4 * kv_dim);
+        }
     }
 
     // -- Test 6: build-time assert negatives ---------------------------------
@@ -604,6 +723,75 @@ mod tests {
         assert!(
             err.to_string().contains("donor"),
             "error must describe the missing donor: {err}"
+        );
+    }
+
+    // -- Test 6b: fail-closed structural validation --------------------------
+
+    #[test]
+    fn undersized_layer_types_errors() {
+        // 5 entries for num_hidden_layers=6: without an explicit length
+        // check, `is_global_layer` treats the missing trailing entry as
+        // sliding rather than rejecting the malformed config.
+        let mut cfg = tiny_config(8);
+        cfg.layer_types.pop();
+        let err = Gemma4KvCache::new(&cfg, 64)
+            .expect_err("layer_types shorter than num_hidden_layers must be a hard error");
+        assert!(
+            err.to_string().contains("layer_types"),
+            "error must name layer_types: {err}"
+        );
+    }
+
+    #[test]
+    fn overflowing_kv_dim_errors() {
+        let mut cfg = tiny_config(8);
+        cfg.num_key_value_heads = usize::MAX;
+        let err = Gemma4KvCache::new(&cfg, 64).expect_err(
+            "num_key_value_heads * attn_head_dim overflowing usize must be a hard error",
+        );
+        assert!(
+            err.to_string().contains("overflow"),
+            "error must describe the overflow: {err}"
+        );
+    }
+
+    fn assert_zeroed_field_errors(cfg: Gemma4Config, field: &str) {
+        let err = Gemma4KvCache::new(&cfg, 64)
+            .err()
+            .unwrap_or_else(|| panic!("zeroed {field} must be a hard error"));
+        assert!(
+            err.to_string().contains(field),
+            "error for zeroed {field} must mention it: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_dimension_fields_error_before_allocation() {
+        let mut cfg = tiny_config(8);
+        cfg.num_key_value_heads = 0;
+        assert_zeroed_field_errors(cfg, "num_key_value_heads");
+
+        let mut cfg = tiny_config(8);
+        cfg.head_dim = 0;
+        assert_zeroed_field_errors(cfg, "head_dim");
+
+        let mut cfg = tiny_config(8);
+        cfg.global_head_dim = 0;
+        assert_zeroed_field_errors(cfg, "global_head_dim");
+
+        let mut cfg = tiny_config(8);
+        cfg.sliding_window = 0;
+        assert_zeroed_field_errors(cfg, "sliding_window");
+    }
+
+    #[test]
+    fn zero_max_seq_len_errors() {
+        let cfg = tiny_config(8);
+        let err = Gemma4KvCache::new(&cfg, 0).expect_err("max_seq_len=0 must be a hard error");
+        assert!(
+            err.to_string().contains("max_seq_len"),
+            "error must name max_seq_len: {err}"
         );
     }
 
