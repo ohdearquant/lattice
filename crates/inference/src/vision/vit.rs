@@ -90,7 +90,7 @@ pub struct ViT {
 // ---------------------------------------------------------------------------
 
 /// Matrix-vector multiply: y = A x where A is [rows, cols] row-major, x is [cols].
-fn matvec(a: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+pub(crate) fn matvec(a: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     // ADR-080 C4: modeled as C = A @ B with m=rows, k=cols, n=1 (A is the "a" operand, x is
     // the "b" operand, y is the not-yet-allocated "c" operand — y.len() will be exactly
     // `rows` below, matching m*n = rows*1, so it's safe to pass `rows` directly rather than
@@ -112,7 +112,7 @@ fn matvec(a: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 
 /// Batch matrix-vector: A [rows, cols] applied to each column of X [n, cols].
 /// Output is [n, rows].
-fn batch_matvec(a: &[f32], x: &[f32], n: usize, rows: usize, cols: usize) -> Vec<f32> {
+pub(crate) fn batch_matvec(a: &[f32], x: &[f32], n: usize, rows: usize, cols: usize) -> Vec<f32> {
     // Guard the output allocation itself against usize overflow (ADR-080 C4, same rationale
     // as `matmul()` in forward/cpu/matmul.rs): an unchecked `n * rows` can wrap in release,
     // producing a too-small allocation that would then pass a subsequent `>=` length check
@@ -151,7 +151,7 @@ fn batch_matvec(a: &[f32], x: &[f32], n: usize, rows: usize, cols: usize) -> Vec
 }
 
 /// LayerNorm: normalize x by (x - mean) / sqrt(var + eps), then scale by weight + bias.
-fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
+pub(crate) fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
     let n = x.len();
     assert_eq!(weight.len(), n);
     assert_eq!(bias.len(), n);
@@ -169,7 +169,7 @@ fn layer_norm(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
 ///
 /// gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 #[inline(always)]
-fn gelu(x: f32) -> f32 {
+pub(crate) fn gelu(x: f32) -> f32 {
     let c = (2.0_f32 / std::f32::consts::PI).sqrt();
     0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())
 }
@@ -189,7 +189,7 @@ fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
 /// row-finalizer (#741). Previously this had NO guard at all — a NaN or
 /// `+inf` logit propagated NaN through the unconditional division into every
 /// element of the row and onward through the rest of the ViT forward pass.
-fn softmax_inplace(x: &mut [f32]) {
+pub(crate) fn softmax_inplace(x: &mut [f32]) {
     let (max, any_nan) = crate::attention::softmax_row::row_max_and_any_nan(x);
     if crate::attention::softmax_row::row_fails_closed_pre_exp(max, any_nan) {
         x.fill(0.0);

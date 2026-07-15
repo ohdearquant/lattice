@@ -8,9 +8,10 @@
 //! temporal_patch_size, patch_size, patch_size]`, vs. the scaffold's
 //! `[d_model, patch_size^2 * 3]` assumption with no temporal factor) and dropping
 //! the scaffold's windowed-attention assumption (the real checkpoint has no
-//! window-specific weights) — is ADR-069 stage S3 ("Metal ViT forward"), not S1/S2.
-//! This module only loads the real tensors as flat data; it does not wire them into
-//! any forward pass.
+//! window-specific weights) — is ADR-069 stage S3a (CPU reference; the Metal
+//! port is a separate S3b fast-follow gated against this CPU reference), not
+//! S1/S2. This module only loads the real tensors as flat data; it does not
+//! wire them into any forward pass.
 
 use std::collections::HashMap;
 use std::path::Path;
