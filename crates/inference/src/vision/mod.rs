@@ -80,6 +80,7 @@ pub mod merger;
 pub mod multimodal;
 pub mod preprocess;
 pub mod qwen35_merger;
+pub mod qwen35_mrope;
 pub mod qwen35_vit;
 pub mod qwen35_vit_metal;
 pub mod vit;
