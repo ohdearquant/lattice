@@ -54,8 +54,12 @@ pub struct MRopeTables {
 /// image run consumes the next entry in `grids`, starts all axes at the
 /// current position, sweeps the merged `(T, H/m, W/m)` grid row-major, and
 /// advances the shared position counter by `max(H, W) / m` afterward — not
-/// by the number of image-pad tokens consumed. See RECON sec. 2
-/// "Position-id construction".
+/// by the number of image-pad tokens consumed.
+///
+/// Fails closed (`InvalidInput`) on: empty `input_ids`, zero merge size,
+/// zero-dimension grids, grids not divisible by the merge size, image runs
+/// whose length does not match their grid, missing or leftover grids, and
+/// any arithmetic that would overflow the position space.
 pub fn build_position_ids(
     input_ids: &[u32],
     image_token_id: u32,
@@ -67,7 +71,23 @@ pub fn build_position_ids(
             "spatial_merge_size must be > 0".to_string(),
         ));
     }
+    if input_ids.is_empty() {
+        return Err(InferenceError::InvalidInput(
+            "input_ids must not be empty".to_string(),
+        ));
+    }
     let m = spatial_merge_size;
+
+    fn advance(pos: u32, by: usize, what: &str) -> Result<u32, InferenceError> {
+        u32::try_from(by)
+            .ok()
+            .and_then(|v| pos.checked_add(v))
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "position overflow advancing {what} by {by} from {pos}"
+                ))
+            })
+    }
 
     let mut positions = Vec::with_capacity(input_ids.len());
     let mut current_pos: u32 = 0;
@@ -85,14 +105,31 @@ pub fn build_position_ids(
             })?;
             grid_idx += 1;
 
+            if grid.t == 0 || grid.h == 0 || grid.w == 0 {
+                return Err(InferenceError::InvalidInput(format!(
+                    "grid {grid:?} has a zero dimension"
+                )));
+            }
             if !grid.h.is_multiple_of(m) || !grid.w.is_multiple_of(m) {
                 return Err(InferenceError::InvalidInput(format!(
                     "grid {grid:?} is not divisible by spatial_merge_size {m}"
                 )));
             }
             let (lt, lh, lw) = (grid.t, grid.h / m, grid.w / m);
-            let run_len = lt * lh * lw;
-            let run_end = i + run_len;
+            let run_len = lt
+                .checked_mul(lh)
+                .and_then(|x| x.checked_mul(lw))
+                .filter(|&len| len > 0)
+                .ok_or_else(|| {
+                    InferenceError::InvalidInput(format!(
+                        "grid {grid:?} with m={m} yields an overflowing or zero merged run length"
+                    ))
+                })?;
+            let run_end = i.checked_add(run_len).ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "image-pad run at physical index {i} with length {run_len} overflows"
+                ))
+            })?;
 
             if run_end > input_ids.len()
                 || input_ids[i..run_end].iter().any(|&t| t != image_token_id)
@@ -107,19 +144,19 @@ pub fn build_position_ids(
                 for h in 0..lh {
                     for w in 0..lw {
                         positions.push((
-                            current_pos + t as u32,
-                            current_pos + h as u32,
-                            current_pos + w as u32,
+                            advance(current_pos, t, "image T axis")?,
+                            advance(current_pos, h, "image H axis")?,
+                            advance(current_pos, w, "image W axis")?,
                         ));
                     }
                 }
             }
 
-            current_pos += lh.max(lw) as u32;
+            current_pos = advance(current_pos, lh.max(lw), "post-image position")?;
             i = run_end;
         } else {
             positions.push((current_pos, current_pos, current_pos));
-            current_pos += 1;
+            current_pos = advance(current_pos, 1, "text position")?;
             i += 1;
         }
     }
@@ -167,15 +204,37 @@ pub fn build_cos_sin(
         )));
     }
 
-    let rope_dim = (head_dim as f32 * partial_rotary_factor) as usize;
-    if rope_dim == 0 || !rope_dim.is_multiple_of(2) {
+    if !theta.is_finite() || theta <= 0.0 {
         return Err(InferenceError::InvalidInput(format!(
-            "head_dim*partial_rotary_factor must be a positive even integer, got {rope_dim}"
+            "theta must be finite and positive, got {theta}"
+        )));
+    }
+
+    let rope_dim_exact = head_dim as f64 * f64::from(partial_rotary_factor);
+    if !rope_dim_exact.is_finite()
+        || rope_dim_exact <= 0.0
+        || rope_dim_exact.fract() != 0.0
+        || rope_dim_exact > head_dim as f64
+    {
+        return Err(InferenceError::InvalidInput(format!(
+            "head_dim*partial_rotary_factor must be a positive integer <= head_dim, \
+             got {rope_dim_exact} (head_dim={head_dim}, factor={partial_rotary_factor})"
+        )));
+    }
+    let rope_dim = rope_dim_exact as usize;
+    if !rope_dim.is_multiple_of(2) {
+        return Err(InferenceError::InvalidInput(format!(
+            "head_dim*partial_rotary_factor must be even, got {rope_dim}"
         )));
     }
     let rope_half = rope_dim / 2;
 
-    let section_sum: usize = mrope_section.iter().sum();
+    let section_sum = mrope_section
+        .iter()
+        .try_fold(0usize, |acc, &c| acc.checked_add(c))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!("mrope_section {mrope_section:?} sum overflows"))
+        })?;
     if section_sum != rope_half {
         return Err(InferenceError::InvalidInput(format!(
             "mrope_section {mrope_section:?} sums to {section_sum}, expected rope_half={rope_half}"
@@ -229,13 +288,23 @@ pub fn build_cos_sin(
 /// generated token, given the physical KV-cache length and the prefill's
 /// `rope_delta`. Physical cache length counts every physical token
 /// (including image pads and delimiters) and is not itself a RoPE
-/// coordinate — see RECON sec. 3.
+/// coordinate. Errors when the result is negative or exceeds `u32::MAX`.
 pub fn decode_position(physical_cache_len: usize, rope_delta: i64) -> Result<u32, InferenceError> {
-    let raw = physical_cache_len as i64 + rope_delta;
+    let len = i64::try_from(physical_cache_len).map_err(|_| {
+        InferenceError::InvalidInput(format!(
+            "physical_cache_len={physical_cache_len} is not representable as i64"
+        ))
+    })?;
+    let raw = len.checked_add(rope_delta).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "decode position overflow: physical_cache_len={physical_cache_len} + \
+             rope_delta={rope_delta}"
+        ))
+    })?;
     u32::try_from(raw).map_err(|_| {
         InferenceError::InvalidInput(format!(
-            "decode position underflow: physical_cache_len={physical_cache_len} + \
-             rope_delta={rope_delta} = {raw} is negative"
+            "decode position {raw} (physical_cache_len={physical_cache_len} + \
+             rope_delta={rope_delta}) is not representable as a u32 coordinate"
         ))
     })
 }
@@ -498,6 +567,91 @@ mod tests {
     #[test]
     fn decode_position_rejects_negative() {
         let err = decode_position(0, -5).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_zero_dimension_grid_instead_of_looping() {
+        // A zero-sized grid used to produce a zero-length run that never
+        // advanced the scan cursor (infinite loop). Must fail closed.
+        for grid in [
+            GridThw { t: 0, h: 2, w: 2 },
+            GridThw { t: 1, h: 0, w: 2 },
+            GridThw { t: 1, h: 2, w: 0 },
+        ] {
+            let err = build_position_ids(&[IMAGE_PAD], IMAGE_PAD, &[grid], 2).unwrap_err();
+            assert!(matches!(err, InferenceError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn rejects_overflowing_grid_arithmetic() {
+        // run_end = i + run_len must not wrap: usize::MAX * 1 * 1 run.
+        let input_ids = [TOKEN_A, IMAGE_PAD];
+        let grids = [GridThw {
+            t: usize::MAX,
+            h: 1,
+            w: 1,
+        }];
+        let err = build_position_ids(&input_ids, IMAGE_PAD, &grids, 1).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+
+        // lt * lh * lw itself must not wrap either.
+        let grids = [GridThw {
+            t: usize::MAX,
+            h: 2,
+            w: 2,
+        }];
+        let err = build_position_ids(&input_ids, IMAGE_PAD, &grids, 1).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_empty_input_ids() {
+        let err = build_position_ids(&[], IMAGE_PAD, &[], 2).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_fractional_rope_dim() {
+        // 256 * 0.3 = 76.8 must error, not silently truncate to 76.
+        let positions = MRopePositions {
+            positions: vec![(0, 0, 0)],
+            rope_delta: 0,
+        };
+        let err = build_cos_sin(&positions, 256, 0.3, 1e7, &[13, 13, 12]).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_non_finite_or_non_positive_theta() {
+        let positions = MRopePositions {
+            positions: vec![(0, 0, 0)],
+            rope_delta: 0,
+        };
+        for theta in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            let err = build_cos_sin(&positions, 256, 0.25, theta, &[11, 11, 10]).unwrap_err();
+            assert!(matches!(err, InferenceError::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn rejects_mrope_section_sum_overflow() {
+        let positions = MRopePositions {
+            positions: vec![(0, 0, 0)],
+            rope_delta: 0,
+        };
+        let err = build_cos_sin(&positions, 256, 0.25, 1e7, &[usize::MAX, 1, 1]).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn decode_position_rejects_out_of_range() {
+        // usize::MAX must not wrap through i64 into a small Ok value.
+        let err = decode_position(usize::MAX, 2).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+        // A positive result above u32::MAX is out of range, not "negative".
+        let err = decode_position(u32::MAX as usize + 10, 0).unwrap_err();
         assert!(matches!(err, InferenceError::InvalidInput(_)));
     }
 }
