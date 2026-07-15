@@ -137,6 +137,35 @@ def sha256_file(path: str) -> str:
     return sha256_bytes(Path(path).read_bytes())
 
 
+# SHA-256 of the committed manifest.json, byte-exact. The manifest is the
+# immutable provenance contract (seeds, shapes, tolerances, floors, rationale,
+# source hashes); the generator refuses to run -- in EVERY mode, before any
+# fixture write -- unless the manifest on disk hashes to exactly this value.
+# Changing ANY declared manifest value therefore requires a paired edit to
+# this constant, making a coordinated manifest+payload rewrite visible as two
+# hunks in review instead of a silent regeneration.
+MANIFEST_CONTRACT_SHA256 = "cc7088a3f7d0228abe7ab025c822bc81f69ed2a7a557ebb6da2ff01dfbdc02df"
+
+
+def verify_manifest_contract() -> None:
+    found = sha256_file(str(MANIFEST_PATH))
+    if found != MANIFEST_CONTRACT_SHA256:
+        print(
+            "FATAL: manifest.json does not hash-match the reviewed contract "
+            f"digest.\n  expected {MANIFEST_CONTRACT_SHA256}\n  found    "
+            f"{found}\n"
+            "The manifest is an immutable provenance contract: seeds, "
+            "shapes, tolerances, mutation floors, rationale, and source "
+            "hashes are all declared there and must not drift alongside a "
+            "fixture regeneration. If a declared value legitimately needs "
+            "to change, edit the manifest AND update "
+            "MANIFEST_CONTRACT_SHA256 in this script in the same reviewed "
+            "change.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def load_manifest() -> dict[str, Any]:
     if not MANIFEST_PATH.exists():
         print(
@@ -682,6 +711,7 @@ def main() -> int:
     args = parser.parse_args()
 
     manifest = load_manifest()
+    verify_manifest_contract()
     verify_source_pins(manifest)
     verify_runtime_versions(manifest)
     rope_params = verify_rope_reference(manifest)
