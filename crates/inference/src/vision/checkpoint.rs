@@ -114,6 +114,10 @@ pub fn load_qwen35_vision_weights(
     model_dir: &Path,
     vision_cfg: &VisionModelConfig,
 ) -> Result<Qwen35VisionWeights, InferenceError> {
+    // Callers can construct `VisionModelConfig` directly (it's a public struct), so this
+    // boundary re-validates rather than trusting that every caller went through
+    // `Qwen35Config::from_config_json_str`'s parse-time check.
+    vision_cfg.validate()?;
     if model_dir.join("quantize_index.json").exists() {
         load_from_q4_dir(model_dir, vision_cfg)
     } else if model_dir.join("model.safetensors.index.json").exists() {
@@ -169,10 +173,32 @@ fn load_from_fp16_dir(
     let index_path = model_dir.join("model.safetensors.index.json");
     let mut reader = ShardedSafetensors::open_index(&index_path)?;
 
-    let mut tensors = HashMap::with_capacity(tensor_names(vision_cfg).len());
-    for name in tensor_names(vision_cfg) {
-        let (data, _shape) = reader.get_f32_tensor_owned(&name)?;
-        tensors.insert(name, data);
+    let expected_names = tensor_names(vision_cfg);
+    // Inventory-exactness: this path only ever fetches the names it asks for, so an
+    // insufficient `depth` (or other geometry field) would silently ignore the rest of
+    // the checkpoint's `model.visual.*` tensors rather than erroring. Compare the count
+    // this vision_cfg expects against how many `model.visual.*` entries the index
+    // actually has.
+    let actual_visual_count = reader
+        .index()
+        .weight_map
+        .keys()
+        .filter(|name| name.starts_with("model.visual."))
+        .count();
+    if actual_visual_count != expected_names.len() {
+        return Err(InferenceError::Inference(format!(
+            "vision checkpoint inventory mismatch in {}: found {actual_visual_count} \
+             model.visual.* tensor(s) but vision_config (depth={}) expects exactly {}",
+            index_path.display(),
+            vision_cfg.depth,
+            expected_names.len(),
+        )));
+    }
+
+    let mut tensors = HashMap::with_capacity(expected_names.len());
+    for name in expected_names {
+        let (data, shape) = reader.get_f32_tensor_owned(&name)?;
+        tensors.insert(name, (data, shape));
     }
     assemble(tensors, vision_cfg)
 }
@@ -202,7 +228,7 @@ fn load_from_q4_dir(
         .filter(|e| e.name.starts_with("model.visual."))
     {
         let file_path = model_dir.join(&entry.file);
-        let data = if entry.quantized.unwrap_or(false) {
+        let (data, shape) = if entry.quantized.unwrap_or(false) {
             let q4 = load_q4_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
                     "failed to load q4 tensor {} from {}: {e}",
@@ -210,28 +236,40 @@ fn load_from_q4_dir(
                     file_path.display()
                 ))
             })?;
-            dequantize_q4_to_f32(&q4)
+            // The manifest's own recorded shape (when present) must agree with the
+            // shape carried in the tensor's `.q4` header; a mismatch means the
+            // manifest and the on-disk tensor have drifted apart.
+            if let Some(manifest_shape) = &entry.shape
+                && manifest_shape != &q4.shape
+            {
+                return Err(InferenceError::ShapeMismatch {
+                    name: entry.name.clone(),
+                    expected: q4.shape.clone(),
+                    actual: manifest_shape.clone(),
+                });
+            }
+            let shape = q4.shape.clone();
+            (dequantize_q4_to_f32(&q4), shape)
         } else {
-            let (data, _shape) = load_f16_tensor_file(&file_path).map_err(|e| {
+            load_f16_tensor_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
                     "failed to load f16 tensor {} from {}: {e}",
                     entry.name,
                     file_path.display()
                 ))
-            })?;
-            data
+            })?
         };
-        tensors.insert(entry.name.clone(), data);
+        tensors.insert(entry.name.clone(), (data, shape));
     }
     assemble(tensors, vision_cfg)
 }
 
-/// Pull the 153 expected tensors out of a name→data map, validating each one's length
-/// against the shape derived from `vision_cfg`, and assemble them into
-/// [`Qwen35VisionWeights`]. Shared by both the fp16 and q4 load paths so shape
-/// validation only lives in one place.
+/// Pull the 153 expected tensors out of a name→(data, shape) map, validating each one's
+/// full shape (not just its element count) against the shape derived from `vision_cfg`,
+/// and assemble them into [`Qwen35VisionWeights`]. Shared by both the fp16 and q4 load
+/// paths so shape validation only lives in one place.
 fn assemble(
-    mut tensors: HashMap<String, Vec<f32>>,
+    mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)>,
     vision_cfg: &VisionModelConfig,
 ) -> Result<Qwen35VisionWeights, InferenceError> {
     let hidden = vision_cfg.hidden_size;
@@ -244,15 +282,18 @@ fn assemble(
     let merge_in = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size * hidden;
     let out_hidden = vision_cfg.out_hidden_size;
 
-    let mut take = |name: String, expected_len: usize| -> Result<Vec<f32>, InferenceError> {
-        let v = tensors
+    let mut take = |name: String, expected_shape: Vec<usize>| -> Result<Vec<f32>, InferenceError> {
+        let (v, actual_shape) = tensors
             .remove(&name)
             .ok_or_else(|| InferenceError::MissingTensor(name.clone()))?;
-        if v.len() != expected_len {
+        // A same-numel transposition (e.g. FC2 stored as [in, out] instead of
+        // [out, in]) has an identical element count but a different shape vector —
+        // comparing the full shape (not just `v.len()`) is what rejects it.
+        if actual_shape != expected_shape {
             return Err(InferenceError::ShapeMismatch {
                 name,
-                expected: vec![expected_len],
-                actual: vec![v.len()],
+                expected: expected_shape,
+                actual: actual_shape,
             });
         }
         Ok(v)
@@ -265,53 +306,82 @@ fn assemble(
         vision_cfg.patch_size,
         vision_cfg.patch_size,
     ];
-    let patch_embed_weight_len: usize = patch_embed_weight_shape.iter().product();
     let patch_embed_weight = take(
         "model.visual.patch_embed.proj.weight".to_string(),
-        patch_embed_weight_len,
+        patch_embed_weight_shape.clone(),
     )?;
-    let patch_embed_bias = take("model.visual.patch_embed.proj.bias".to_string(), hidden)?;
+    let patch_embed_bias = take(
+        "model.visual.patch_embed.proj.bias".to_string(),
+        vec![hidden],
+    )?;
     let pos_embed = take(
         "model.visual.pos_embed.weight".to_string(),
-        vision_cfg.num_position_embeddings * hidden,
+        vec![vision_cfg.num_position_embeddings, hidden],
     )?;
 
     let mut blocks = Vec::with_capacity(vision_cfg.depth);
     for i in 0..vision_cfg.depth {
         let name = |suffix: &str| format!("model.visual.blocks.{i}.{suffix}");
         blocks.push(VisualBlockWeights {
-            qkv_weight: take(name("attn.qkv.weight"), qkv_out * hidden)?,
-            qkv_bias: take(name("attn.qkv.bias"), qkv_out)?,
-            proj_weight: take(name("attn.proj.weight"), hidden * hidden)?,
-            proj_bias: take(name("attn.proj.bias"), hidden)?,
-            fc1_weight: take(name("mlp.linear_fc1.weight"), mlp_intermediate * hidden)?,
-            fc1_bias: take(name("mlp.linear_fc1.bias"), mlp_intermediate)?,
-            fc2_weight: take(name("mlp.linear_fc2.weight"), hidden * mlp_intermediate)?,
-            fc2_bias: take(name("mlp.linear_fc2.bias"), hidden)?,
-            norm1_weight: take(name("norm1.weight"), hidden)?,
-            norm1_bias: take(name("norm1.bias"), hidden)?,
-            norm2_weight: take(name("norm2.weight"), hidden)?,
-            norm2_bias: take(name("norm2.bias"), hidden)?,
+            qkv_weight: take(name("attn.qkv.weight"), vec![qkv_out, hidden])?,
+            qkv_bias: take(name("attn.qkv.bias"), vec![qkv_out])?,
+            proj_weight: take(name("attn.proj.weight"), vec![hidden, hidden])?,
+            proj_bias: take(name("attn.proj.bias"), vec![hidden])?,
+            fc1_weight: take(
+                name("mlp.linear_fc1.weight"),
+                vec![mlp_intermediate, hidden],
+            )?,
+            fc1_bias: take(name("mlp.linear_fc1.bias"), vec![mlp_intermediate])?,
+            fc2_weight: take(
+                name("mlp.linear_fc2.weight"),
+                vec![hidden, mlp_intermediate],
+            )?,
+            fc2_bias: take(name("mlp.linear_fc2.bias"), vec![hidden])?,
+            norm1_weight: take(name("norm1.weight"), vec![hidden])?,
+            norm1_bias: take(name("norm1.bias"), vec![hidden])?,
+            norm2_weight: take(name("norm2.weight"), vec![hidden])?,
+            norm2_bias: take(name("norm2.bias"), vec![hidden])?,
         });
     }
 
     let merger = VisualMergerWeights {
         fc1_weight: take(
             "model.visual.merger.linear_fc1.weight".to_string(),
-            merge_in * merge_in,
+            vec![merge_in, merge_in],
         )?,
-        fc1_bias: take("model.visual.merger.linear_fc1.bias".to_string(), merge_in)?,
+        fc1_bias: take(
+            "model.visual.merger.linear_fc1.bias".to_string(),
+            vec![merge_in],
+        )?,
         fc2_weight: take(
             "model.visual.merger.linear_fc2.weight".to_string(),
-            out_hidden * merge_in,
+            vec![out_hidden, merge_in],
         )?,
         fc2_bias: take(
             "model.visual.merger.linear_fc2.bias".to_string(),
-            out_hidden,
+            vec![out_hidden],
         )?,
-        norm_weight: take("model.visual.merger.norm.weight".to_string(), hidden)?,
-        norm_bias: take("model.visual.merger.norm.bias".to_string(), hidden)?,
+        norm_weight: take("model.visual.merger.norm.weight".to_string(), vec![hidden])?,
+        norm_bias: take("model.visual.merger.norm.bias".to_string(), vec![hidden])?,
     };
+
+    // Inventory-exactness: every tensor fetched must be accounted for by the expected
+    // set above. The q4 path loads every `model.visual.*` entry in the manifest up
+    // front (not just the names `vision_cfg` implies), so a checkpoint that carries
+    // more real block tensors than `vision_cfg.depth` implies (e.g. a full 153-entry
+    // checkpoint paired with `depth: 0`) would otherwise silently return a truncated
+    // `Qwen35VisionWeights` instead of erroring.
+    if !tensors.is_empty() {
+        let mut leftover: Vec<&String> = tensors.keys().collect();
+        leftover.sort();
+        return Err(InferenceError::Inference(format!(
+            "vision checkpoint has {} unconsumed model.visual.* tensor(s) not accounted for \
+             by vision_config (depth={}): {:?}",
+            tensors.len(),
+            vision_cfg.depth,
+            leftover.into_iter().take(5).collect::<Vec<_>>(),
+        )));
+    }
 
     Ok(Qwen35VisionWeights {
         patch_embed_weight,
@@ -361,6 +431,363 @@ mod tests {
         let cfg = real_vision_cfg();
         // 2 (patch_embed) + 1 (pos_embed) + 12 * 12 (blocks) + 6 (merger) = 153.
         assert_eq!(tensor_names(&cfg).len(), 153);
+    }
+
+    #[test]
+    fn depth_zero_vision_config_rejected_at_loader_boundary() {
+        // `load_qwen35_vision_weights` is public, so a caller can hand it a directly
+        // constructed `VisionModelConfig` that never went through
+        // `Qwen35Config::from_config_json_str`'s parse-time validation. depth: 0 must
+        // still fail closed here, before the (nonexistent) directory is even touched.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = real_vision_cfg();
+        cfg.depth = 0;
+        let err = load_qwen35_vision_weights(tmp.path(), &cfg)
+            .expect_err("depth: 0 must be rejected at the public loader boundary");
+        assert!(
+            err.to_string().contains("depth"),
+            "error must name depth: {err}"
+        );
+    }
+
+    #[test]
+    fn num_heads_zero_vision_config_rejected_at_loader_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = real_vision_cfg();
+        cfg.num_heads = 0;
+        let err = load_qwen35_vision_weights(tmp.path(), &cfg)
+            .expect_err("num_heads: 0 must be rejected at the public loader boundary");
+        assert!(
+            err.to_string().contains("num_heads"),
+            "error must name num_heads: {err}"
+        );
+    }
+
+    #[test]
+    fn q4_full_inventory_with_depth_zero_is_rejected() {
+        // A checkpoint that genuinely carries the full 153-tensor real inventory, paired
+        // with a (malformed) vision_config claiming depth: 0, must error rather than
+        // silently returning a nine-tensor `Qwen35VisionWeights` (the S1/S2 review's
+        // exact failure scenario).
+        let tmp = tempfile::tempdir().unwrap();
+        let full_cfg = real_vision_cfg();
+        let entries: Vec<String> = tensor_names(&full_cfg)
+            .into_iter()
+            .map(|name| format!(r#"{{"name":"{name}","file":"missing.f16","quantized":false}}"#))
+            .collect();
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!("[{}]", entries.join(",")),
+        )
+        .expect("test setup: write manifest");
+
+        let mut depth_zero_cfg = full_cfg;
+        depth_zero_cfg.depth = 0;
+        let err = load_qwen35_vision_weights(tmp.path(), &depth_zero_cfg)
+            .expect_err("depth: 0 with a full 153-entry inventory present must still be rejected");
+        assert!(
+            err.to_string().contains("depth"),
+            "error must name depth: {err}"
+        );
+    }
+
+    fn tiny_vision_cfg() -> VisionModelConfig {
+        VisionModelConfig {
+            depth: 1,
+            hidden_size: 4,
+            num_heads: 2,
+            patch_size: 2,
+            spatial_merge_size: 1,
+            out_hidden_size: 4,
+            temporal_patch_size: 1,
+            num_position_embeddings: 2,
+            in_channels: 1,
+            deepstack_visual_indexes: vec![],
+        }
+    }
+
+    /// The 21 expected (name, shape) pairs for [`tiny_vision_cfg`], computed
+    /// independently of `assemble`'s derivation so a fixture bug can't cancel out a
+    /// production bug.
+    fn tiny_expected_shapes() -> Vec<(String, Vec<usize>)> {
+        let hidden = 4;
+        let qkv_out = 3 * hidden;
+        let mlp_intermediate = 4 * hidden;
+        let merge_in = hidden; // spatial_merge_size^2 (1) * hidden
+        let out_hidden = 4;
+        let mut v = vec![
+            (
+                "model.visual.patch_embed.proj.weight".to_string(),
+                vec![hidden, 1, 1, 2, 2],
+            ),
+            (
+                "model.visual.patch_embed.proj.bias".to_string(),
+                vec![hidden],
+            ),
+            ("model.visual.pos_embed.weight".to_string(), vec![2, hidden]),
+            (
+                "model.visual.merger.linear_fc1.weight".to_string(),
+                vec![merge_in, merge_in],
+            ),
+            (
+                "model.visual.merger.linear_fc1.bias".to_string(),
+                vec![merge_in],
+            ),
+            (
+                "model.visual.merger.linear_fc2.weight".to_string(),
+                vec![out_hidden, merge_in],
+            ),
+            (
+                "model.visual.merger.linear_fc2.bias".to_string(),
+                vec![out_hidden],
+            ),
+            ("model.visual.merger.norm.weight".to_string(), vec![hidden]),
+            ("model.visual.merger.norm.bias".to_string(), vec![hidden]),
+        ];
+        for (suffix, shape) in [
+            ("attn.qkv.weight", vec![qkv_out, hidden]),
+            ("attn.qkv.bias", vec![qkv_out]),
+            ("attn.proj.weight", vec![hidden, hidden]),
+            ("attn.proj.bias", vec![hidden]),
+            ("mlp.linear_fc1.weight", vec![mlp_intermediate, hidden]),
+            ("mlp.linear_fc1.bias", vec![mlp_intermediate]),
+            ("mlp.linear_fc2.weight", vec![hidden, mlp_intermediate]),
+            ("mlp.linear_fc2.bias", vec![hidden]),
+            ("norm1.weight", vec![hidden]),
+            ("norm1.bias", vec![hidden]),
+            ("norm2.weight", vec![hidden]),
+            ("norm2.bias", vec![hidden]),
+        ] {
+            v.push((format!("model.visual.blocks.0.{suffix}"), shape));
+        }
+        v
+    }
+
+    /// Corrupt the FC2 weight entry in `shapes` to a same-numel transposition
+    /// (`[hidden, mlp_intermediate]` -> `[mlp_intermediate, hidden]`; both have 64
+    /// elements for [`tiny_vision_cfg`]).
+    fn transpose_fc2_weight(shapes: &mut [(String, Vec<usize>)]) {
+        for (name, shape) in shapes.iter_mut() {
+            if name == "model.visual.blocks.0.mlp.linear_fc2.weight" {
+                assert_eq!(
+                    *shape,
+                    vec![4, 16],
+                    "fixture assumption for tiny_vision_cfg"
+                );
+                *shape = vec![16, 4];
+                return;
+            }
+        }
+        panic!("fc2 weight entry not found in fixture");
+    }
+
+    fn write_multi_f32_tensor_shard(path: &Path, tensors: &[(String, Vec<usize>, Vec<f32>)]) {
+        let mut header_parts = Vec::new();
+        let mut data: Vec<u8> = Vec::new();
+        for (name, shape, values) in tensors {
+            let start = data.len();
+            for v in values {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            let end = data.len();
+            let shape_str = shape
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            header_parts.push(format!(
+                r#""{name}":{{"dtype":"F32","shape":[{shape_str}],"data_offsets":[{start},{end}]}}"#
+            ));
+        }
+        let header = format!("{{{}}}", header_parts.join(","));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(path, &bytes).expect("test setup: write shard");
+    }
+
+    fn assert_fc2_shape_mismatch(result: Result<Qwen35VisionWeights, InferenceError>) {
+        let err = result.expect_err("transposed FC2 (same numel, wrong shape) must be rejected");
+        match err {
+            InferenceError::ShapeMismatch { name, .. } => {
+                assert!(
+                    name.contains("fc2"),
+                    "expected FC2 shape mismatch, got {name}"
+                )
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fp16_same_numel_transposed_fc2_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_vision_cfg();
+        let mut shapes = tiny_expected_shapes();
+        transpose_fc2_weight(&mut shapes);
+
+        let shard = tmp.path().join("model-00001-of-00001.safetensors");
+        let tensors: Vec<(String, Vec<usize>, Vec<f32>)> = shapes
+            .iter()
+            .map(|(name, shape)| {
+                let numel: usize = shape.iter().product();
+                (name.clone(), shape.clone(), vec![0.5f32; numel])
+            })
+            .collect();
+        write_multi_f32_tensor_shard(&shard, &tensors);
+
+        let weight_map = shapes
+            .iter()
+            .map(|(name, _)| format!(r#""{name}":"model-00001-of-00001.safetensors""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            format!(r#"{{"weight_map":{{{weight_map}}}}}"#),
+        )
+        .expect("test setup: write index");
+
+        assert_fc2_shape_mismatch(load_qwen35_vision_weights(tmp.path(), &cfg));
+    }
+
+    #[test]
+    fn q4_same_numel_transposed_fc2_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_vision_cfg();
+        let mut shapes = tiny_expected_shapes();
+        transpose_fc2_weight(&mut shapes);
+
+        let mut manifest_entries = Vec::new();
+        for (i, (name, shape)) in shapes.iter().enumerate() {
+            let numel: usize = shape.iter().product();
+            let data: Vec<f64> = vec![0.25_f64; numel];
+            let q4 = crate::weights::q4_weights::quantize_f64_to_q4(&data, shape)
+                .expect("quantize succeeds");
+            let file_name = format!("t{i}.q4");
+            crate::weights::q4_weights::save_q4_file(&tmp.path().join(&file_name), &q4)
+                .expect("test setup: write q4 file");
+            manifest_entries.push(format!(
+                r#"{{"name":"{name}","file":"{file_name}","quantized":true}}"#
+            ));
+        }
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!("[{}]", manifest_entries.join(",")),
+        )
+        .expect("test setup: write manifest");
+
+        assert_fc2_shape_mismatch(load_qwen35_vision_weights(tmp.path(), &cfg));
+    }
+
+    fn write_khf1_f16_file(path: &Path, shape: &[usize], values: &[f32]) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+        for d in shape {
+            buf.extend_from_slice(&(*d as u64).to_le_bytes());
+        }
+        buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for v in values {
+            buf.extend_from_slice(&crate::weights::half_bits::f32_to_f16_bits(*v).to_le_bytes());
+        }
+        std::fs::write(path, &buf).expect("test setup: write f16 file");
+    }
+
+    #[test]
+    fn f16_companion_same_numel_transposed_fc2_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_vision_cfg();
+        let mut shapes = tiny_expected_shapes();
+        transpose_fc2_weight(&mut shapes);
+
+        let mut manifest_entries = Vec::new();
+        for (i, (name, shape)) in shapes.iter().enumerate() {
+            let numel: usize = shape.iter().product();
+            let values = vec![0.5f32; numel];
+            let file_name = format!("t{i}.f16");
+            write_khf1_f16_file(&tmp.path().join(&file_name), shape, &values);
+            manifest_entries.push(format!(
+                r#"{{"name":"{name}","file":"{file_name}","quantized":false}}"#
+            ));
+        }
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!("[{}]", manifest_entries.join(",")),
+        )
+        .expect("test setup: write manifest");
+
+        assert_fc2_shape_mismatch(load_qwen35_vision_weights(tmp.path(), &cfg));
+    }
+
+    #[test]
+    fn assemble_rejects_unconsumed_leftover_tensors_when_depth_understates_inventory() {
+        // The q4 path loads every `model.visual.*` manifest entry up front, not just the
+        // names `vision_cfg.depth` implies. If the checkpoint has more real block tensors
+        // than `depth` accounts for, the leftovers must be a hard error, not silently
+        // dropped. The 21 tensors `small_cfg` (depth=1) does expect are given correct
+        // shapes so this test exercises the leftover check specifically, not the
+        // per-tensor shape check above it.
+        let full_cfg = real_vision_cfg(); // depth 12, 153 real tensors
+        let mut small_cfg = full_cfg.clone();
+        small_cfg.depth = 1;
+
+        let hidden = full_cfg.hidden_size;
+        let qkv_out = 3 * hidden;
+        let mlp_intermediate = 4 * hidden;
+        let merge_in = full_cfg.spatial_merge_size * full_cfg.spatial_merge_size * hidden;
+        let out_hidden = full_cfg.out_hidden_size;
+        let shape_for = |name: &str| -> Vec<usize> {
+            match name {
+                "model.visual.patch_embed.proj.weight" => vec![
+                    hidden,
+                    full_cfg.in_channels,
+                    full_cfg.temporal_patch_size,
+                    full_cfg.patch_size,
+                    full_cfg.patch_size,
+                ],
+                "model.visual.pos_embed.weight" => vec![full_cfg.num_position_embeddings, hidden],
+                "model.visual.merger.linear_fc1.weight" => vec![merge_in, merge_in],
+                "model.visual.merger.linear_fc1.bias" => vec![merge_in],
+                "model.visual.merger.linear_fc2.weight" => vec![out_hidden, merge_in],
+                "model.visual.merger.linear_fc2.bias" => vec![out_hidden],
+                n if n.ends_with("attn.qkv.weight") => vec![qkv_out, hidden],
+                n if n.ends_with("attn.qkv.bias") => vec![qkv_out],
+                n if n.ends_with("attn.proj.weight") => vec![hidden, hidden],
+                n if n.ends_with("mlp.linear_fc1.weight") => vec![mlp_intermediate, hidden],
+                n if n.ends_with("mlp.linear_fc1.bias") => vec![mlp_intermediate],
+                n if n.ends_with("mlp.linear_fc2.weight") => vec![hidden, mlp_intermediate],
+                _ => vec![hidden], // *.bias, norm1/2.*, merger.norm.*
+            }
+        };
+
+        let expected_names: std::collections::HashSet<String> =
+            tensor_names(&small_cfg).into_iter().collect();
+        let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+        for name in tensor_names(&full_cfg) {
+            if expected_names.contains(&name) {
+                let shape = shape_for(&name);
+                let numel: usize = shape.iter().product();
+                tensors.insert(name, (vec![0.0_f32; numel], shape));
+            } else {
+                // A leftover tensor beyond small_cfg's depth=1 — its shape is irrelevant
+                // because it must never be consumed by `take`.
+                tensors.insert(name, (vec![0.0_f32], vec![1]));
+            }
+        }
+
+        let err = assemble(tensors, &small_cfg)
+            .expect_err("leftover model.visual.* tensors beyond depth=1 must be rejected");
+        match err {
+            InferenceError::Inference(msg) => {
+                assert!(
+                    msg.contains("unconsumed"),
+                    "expected an unconsumed-tensor inventory error, got: {msg}"
+                );
+            }
+            other => panic!("expected InferenceError::Inference, got {other:?}"),
+        }
     }
 
     // Reading BF16/F16 safetensors tensors requires the `f16` feature (not default);

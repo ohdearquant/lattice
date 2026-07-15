@@ -73,6 +73,111 @@ pub struct VisionModelConfig {
     pub deepstack_visual_indexes: Vec<usize>,
 }
 
+impl VisionModelConfig {
+    /// Validate structural invariants before this config is used to derive expected
+    /// tensor shapes. A present-but-malformed `vision_config` (e.g. `depth: 0` or
+    /// `num_heads: 0`) is syntactically valid JSON and would otherwise load a subset
+    /// of `model.visual.*` tensors (or none) without any error — this must fail
+    /// closed both here (parse boundary) and again at the `load_qwen35_vision_weights`
+    /// public boundary, since callers can construct this struct directly.
+    pub fn validate(&self) -> Result<(), InferenceError> {
+        if self.depth == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: depth must be > 0".to_string(),
+            ));
+        }
+        if self.hidden_size == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: hidden_size must be > 0".to_string(),
+            ));
+        }
+        if self.num_heads == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: num_heads must be > 0".to_string(),
+            ));
+        }
+        if self.patch_size == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: patch_size must be > 0".to_string(),
+            ));
+        }
+        if self.spatial_merge_size == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: spatial_merge_size must be > 0".to_string(),
+            ));
+        }
+        if self.out_hidden_size == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: out_hidden_size must be > 0".to_string(),
+            ));
+        }
+        if self.temporal_patch_size == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: temporal_patch_size must be > 0".to_string(),
+            ));
+        }
+        if self.num_position_embeddings == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: num_position_embeddings must be > 0".to_string(),
+            ));
+        }
+        if self.in_channels == 0 {
+            return Err(InferenceError::Inference(
+                "invalid vision_config: in_channels must be > 0".to_string(),
+            ));
+        }
+        if !self.hidden_size.is_multiple_of(self.num_heads) {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: hidden_size ({}) must be divisible by num_heads ({})",
+                self.hidden_size, self.num_heads
+            )));
+        }
+        for &idx in &self.deepstack_visual_indexes {
+            if idx >= self.depth {
+                return Err(InferenceError::Inference(format!(
+                    "invalid vision_config: deepstack_visual_indexes entry {idx} is out of \
+                     range for depth {}",
+                    self.depth
+                )));
+            }
+        }
+        self.checked_derived_sizes()?;
+        Ok(())
+    }
+
+    /// Checked arithmetic for the tensor-shape sizes the checkpoint loader derives from
+    /// this config, so a pathological combination of large fields overflows into a typed
+    /// error here rather than silently wrapping into an undersized allocation downstream.
+    fn checked_derived_sizes(&self) -> Result<(), InferenceError> {
+        let overflow = || {
+            InferenceError::Inference(
+                "invalid vision_config: a derived tensor size overflows usize".to_string(),
+            )
+        };
+        self.hidden_size.checked_mul(3).ok_or_else(overflow)?; // qkv_out
+        self.hidden_size.checked_mul(4).ok_or_else(overflow)?; // mlp_intermediate
+        let merge_in = self
+            .spatial_merge_size
+            .checked_mul(self.spatial_merge_size)
+            .and_then(|sq| sq.checked_mul(self.hidden_size))
+            .ok_or_else(overflow)?;
+        merge_in.checked_mul(merge_in).ok_or_else(overflow)?; // merger fc1
+        self.out_hidden_size
+            .checked_mul(merge_in)
+            .ok_or_else(overflow)?; // merger fc2
+        self.hidden_size
+            .checked_mul(self.in_channels)
+            .and_then(|v| v.checked_mul(self.temporal_patch_size))
+            .and_then(|v| v.checked_mul(self.patch_size))
+            .and_then(|v| v.checked_mul(self.patch_size))
+            .ok_or_else(overflow)?; // patch_embed_weight
+        self.num_position_embeddings
+            .checked_mul(self.hidden_size)
+            .ok_or_else(overflow)?; // pos_embed
+        Ok(())
+    }
+}
+
 /// **Unstable**: Qwen hybrid attention model configuration; fields evolving with model variants.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(default)]
@@ -617,6 +722,13 @@ impl Qwen35Config {
                 "invalid Qwen config.json: linear_num_value_heads ({value_heads}) must be a \
                  positive multiple of linear_num_key_heads ({key_heads})"
             )));
+        }
+        // A present `vision_config` must be structurally valid (ADR-069 S1/S2 review
+        // feedback): a present-but-malformed object (e.g. `depth: 0`) is syntactically
+        // valid JSON and would otherwise silently load a truncated subset of
+        // `model.visual.*` tensors instead of failing closed.
+        if let Some(vision_cfg) = &cfg.vision_config {
+            vision_cfg.validate()?;
         }
 
         Ok(cfg)
@@ -1761,6 +1873,86 @@ mod tests {
         let rope_params = cfg.rope_parameters.clone().unwrap_or_default();
         assert!(rope_params.mrope_section.is_none());
         assert!(rope_params.mrope_interleaved.is_none());
+    }
+
+    /// Minimal text_config JSON (parses cleanly on its own, per
+    /// `test_text_only_config_has_no_vision_fields`) plus a top-level `vision_config`
+    /// object with every field valid except the ones the caller overrides.
+    fn config_json_with_vision(vision_config_body: &str) -> String {
+        format!(
+            r#"{{
+                "text_config": {{
+                    "hidden_size": 1024,
+                    "num_hidden_layers": 4,
+                    "vocab_size": 1000,
+                    "intermediate_size": 2048,
+                    "rms_norm_eps": 1e-6,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 2,
+                    "head_dim": 256,
+                    "rope_theta": 10000000.0,
+                    "partial_rotary_factor": 0.25,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 16,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 4,
+                    "full_attention_interval": 4,
+                    "eos_token_id": 999,
+                    "max_position_embeddings": 4096
+                }},
+                "vision_config": {vision_config_body}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_depth_zero() {
+        // A present-but-malformed vision_config (depth: 0) is syntactically valid JSON
+        // and, before this fix, would silently load a truncated tensor set later. It must
+        // be rejected here, at parse time.
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 0,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }"#,
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("depth: 0 vision_config must be rejected at parse time");
+        assert!(
+            err.to_string().contains("depth"),
+            "error must name depth: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_num_heads_zero() {
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 12,
+                "hidden_size": 768,
+                "num_heads": 0,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }"#,
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("num_heads: 0 vision_config must be rejected at parse time");
+        assert!(
+            err.to_string().contains("num_heads"),
+            "error must name num_heads: {err}"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────
