@@ -1,0 +1,109 @@
+{
+  "op": "qk_norm_v_unscaled",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:1208-1213 (q_norm/k_norm/v_norm construction), 1240-1260 (application order: q_norm then RoPE, k_norm then RoPE, v_norm with no RoPE)",
+  "shape": [
+    1,
+    3,
+    4,
+    16
+  ],
+  "eps": 1e-06,
+  "q_input": {
+    "bin": "qk_norm_v_unscaled_q_input.bin",
+    "shape": [
+      1,
+      3,
+      4,
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "d9490270f62a712a17f088d03220d3b02bed34ea9cbf94d4bb3ee0ff8c038683",
+    "num_elements": 192
+  },
+  "k_input": {
+    "bin": "qk_norm_v_unscaled_k_input.bin",
+    "shape": [
+      1,
+      3,
+      4,
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "9f7afe3f9edc6f04b5b501df0fa15aba93118a5a3aee22249917f143bcb36227",
+    "num_elements": 192
+  },
+  "v_input": {
+    "bin": "qk_norm_v_unscaled_v_input.bin",
+    "shape": [
+      1,
+      3,
+      4,
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "34ea0b45973d29eeb559ad32f9ba087d8d5abcecd972da93994e055253f21677",
+    "num_elements": 192
+  },
+  "q_norm_weight": {
+    "bin": "qk_norm_v_unscaled_q_norm_weight.bin",
+    "shape": [
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "340590e3deb09c369839434e6e3be118c3c5fa737f2701c94174162bd3ca3e5c",
+    "num_elements": 16
+  },
+  "k_norm_weight": {
+    "bin": "qk_norm_v_unscaled_k_norm_weight.bin",
+    "shape": [
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "56572b3a317e36da88b4a40e29a863d8911b2ca60c34d2c396248ba355232c7f",
+    "num_elements": 16
+  },
+  "q_output": {
+    "bin": "qk_norm_v_unscaled_q_output.bin",
+    "shape": [
+      1,
+      3,
+      4,
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "38fefb5d5df974e3512cd515ed4616617c347dbb930787c4064e9976648a8623",
+    "num_elements": 192
+  },
+  "k_output": {
+    "bin": "qk_norm_v_unscaled_k_output.bin",
+    "shape": [
+      1,
+      3,
+      4,
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "ec91550fcff3ce41ffb3df419a7a8cf1ab963b030b1a53eb415fc93863343aa1",
+    "num_elements": 192
+  },
+  "v_output": {
+    "bin": "qk_norm_v_unscaled_v_output.bin",
+    "shape": [
+      1,
+      3,
+      4,
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "a8a160495f66394f794d9e05a680cfdaddea44f1ef9a26fb9b675b966635aa48",
+    "num_elements": 192
+  }
+}

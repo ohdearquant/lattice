@@ -1,0 +1,34 @@
+{
+  "op": "logit_softcap",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:1888-1892",
+  "shape": [
+    2,
+    5,
+    40
+  ],
+  "cap": 30.0,
+  "input": {
+    "bin": "logit_softcap_input.bin",
+    "shape": [
+      2,
+      5,
+      40
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "0ffadccdadbf017f7bad30c851aabe459ea322147a7686a9dfc1b3d8a9db52f1",
+    "num_elements": 400
+  },
+  "output": {
+    "bin": "logit_softcap_output.bin",
+    "shape": [
+      2,
+      5,
+      40
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "11ff89aff7eb20c905ebe279401f11fb1bf74930f143e54fa4862741ede25a2d",
+    "num_elements": 400
+  }
+}

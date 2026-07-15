@@ -1,0 +1,99 @@
+{
+  "op": "dual_rope",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:780-806 (rotate_half, apply_rotary_pos_emb), 1093-1173 (Gemma4TextRotaryEmbedding); transformers/modeling_rope_utils.py:187-252 (_compute_proportional_rope_parameters)",
+  "shape_local": [
+    1,
+    6,
+    2,
+    16
+  ],
+  "shape_global": [
+    1,
+    6,
+    2,
+    32
+  ],
+  "theta_local": 10000.0,
+  "theta_global": 1000000.0,
+  "partial_rotary_factor": 0.25,
+  "position_ids": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "local_input": {
+    "bin": "dual_rope_local_input.bin",
+    "shape": [
+      1,
+      6,
+      2,
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "7d32f94eecd3d4b81ac4ecbf70606eb1d2cb553c783990fb99889b7944dea27e",
+    "num_elements": 192
+  },
+  "global_input": {
+    "bin": "dual_rope_global_input.bin",
+    "shape": [
+      1,
+      6,
+      2,
+      32
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "1b03cb326ec8756a96152ed3485889310fd66cd49807fd760a934c4d7cd1c2ed",
+    "num_elements": 384
+  },
+  "local_inv_freq": {
+    "bin": "dual_rope_local_inv_freq.bin",
+    "shape": [
+      8
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "dc0f132eed2f8955fe1077d0ccde8dd576d43efe05e3e8dbb806db0539a0c3eb",
+    "num_elements": 8
+  },
+  "global_inv_freq": {
+    "bin": "dual_rope_global_inv_freq.bin",
+    "shape": [
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "f0bd7938d1dd4c10cd274c6a6c18a99b1f023c19c6a6656172aa60c71f283ab0",
+    "num_elements": 16
+  },
+  "local_output": {
+    "bin": "dual_rope_local_output.bin",
+    "shape": [
+      1,
+      6,
+      2,
+      16
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "82fe13ef4b43801732a36ea30cf14a3d9db4d2e850467d24abcca08a61b3fff1",
+    "num_elements": 192
+  },
+  "global_output": {
+    "bin": "dual_rope_global_output.bin",
+    "shape": [
+      1,
+      6,
+      2,
+      32
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "e04b5f8a1b4b703cd740f05a15469e8ab46f0cdb45e48ea5828d5f301ee020b9",
+    "num_elements": 384
+  }
+}

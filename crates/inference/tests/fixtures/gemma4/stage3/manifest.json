@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "adr": "ADR-082 Stage 3 (G6-G10)",
+  "generator": "scripts/gemma4_stage3_goldens.py",
+  "reference_module": "transformers.models.gemma4.modeling_gemma4",
+  "adr_evidence_commit": "ab1771c9e42891d893189978a8009426d70b4688",
+  "runtime_versions": {
+    "torch": "2.13.0",
+    "transformers": "5.12.1",
+    "numpy": "2.4.6",
+    "python": "3.11.12"
+  },
+  "fixture_format": "Each op has a <op>.json sidecar (shapes/scalars/tensor refs) plus one <op>_<field>.bin per tensor field (raw little-endian float32, shape/sha256 recorded in the sidecar's ref).",
+  "ops": {
+    "rms_norm": {
+      "file": "rms_norm.json",
+      "tolerance_max_abs_diff": 1e-06,
+      "tolerance_justification": "Elementwise reduction over hidden=64 in float32, single op (square, mean, +eps, pow(-0.5), multiply) with no matmul reassociation -- f32 round-trip precision, no accumulation-order sensitivity expected. Empirically measured max-abs-diff on the Rust implementation was ~4.8e-7."
+    },
+    "geglu_mlp": {
+      "file": "geglu_mlp.json",
+      "tolerance_max_abs_diff": 1e-05,
+      "tolerance_justification": "Two hidden x intermediate matmuls (gate_proj, up_proj) and one intermediate x hidden matmul (down_proj), each a 64/96-wide reduction. Reference uses torch's BLAS; the lattice kernel under test uses Accelerate/AMX or a scalar/SIMD fallback -- reduction order (and therefore rounding) can differ from torch's, per this repo's f32-reassociation-reorder bug class. 1e-5 accommodates that reordering (empirically measured max-abs-diff ~1.2e-7) while still catching a wrong-formula or wrong-activation bug (which would produce differences many orders of magnitude larger)."
+    },
+    "scaled_embedding": {
+      "file": "scaled_embedding.json",
+      "tolerance_max_abs_diff": 1e-06,
+      "tolerance_justification": "A table lookup (exact copy, no arithmetic) followed by one scalar multiply (embed_scale = sqrt(hidden_size), computed once) -- no reduction, no reassociation risk. Empirically measured max-abs-diff was 0."
+    },
+    "qk_norm_v_unscaled": {
+      "file": "qk_norm_v_unscaled.json",
+      "tolerance_max_abs_diff": 1e-06,
+      "tolerance_justification": "Same elementwise-reduction shape as rms_norm, applied per-head over head_dim in {16, 32} (well within f32 exactness for this op). Empirically measured max-abs-diff was ~2.4e-7 (q/v), 0 (k)."
+    },
+    "logit_softcap": {
+      "file": "logit_softcap.json",
+      "tolerance_max_abs_diff": 3e-06,
+      "tolerance_justification": "Two scalar multiplies and one tanh, elementwise, no reduction -- but Rust's f32::tanh and PyTorch's libm tanh are two different correctly-rounded-to-a-few-ULPs implementations, not the same routine, so their outputs differ by a few ULPs rather than being bit-identical. Empirically measured max-abs-diff on the Rust implementation was ~1.9e-6 at cap=30 with logits up to +/-60; 3e-6 keeps headroom for that while still catching a wrong-formula or disabled-softcap bug (orders of magnitude larger, see the disabled-softcap negative test)."
+    },
+    "dual_rope": {
+      "file": "dual_rope.json",
+      "tolerance_max_abs_diff": 1e-06,
+      "tolerance_justification": "cos/sin evaluated once per (position, frequency) pair then combined via two multiplies and one add per element (rotate_half) -- elementwise, no reduction; matches the reference's own float32 RoPE math exactly. Empirically measured max-abs-diff was ~2.4e-7 (local), ~1.2e-7 (global)."
+    }
+  }
+}

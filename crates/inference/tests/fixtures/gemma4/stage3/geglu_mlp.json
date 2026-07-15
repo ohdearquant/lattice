@@ -1,0 +1,68 @@
+{
+  "op": "geglu_mlp",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:1066-1082 (Gemma4TextMLP)",
+  "shape": [
+    2,
+    3,
+    64
+  ],
+  "hidden": 64,
+  "intermediate": 96,
+  "input": {
+    "bin": "geglu_mlp_input.bin",
+    "shape": [
+      2,
+      3,
+      64
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "d48f7e10848b1f86512b7b363c102bb8d9193b31d37959eb0dadfa8b20ca276c",
+    "num_elements": 384
+  },
+  "gate_proj_weight": {
+    "bin": "geglu_mlp_gate_proj_weight.bin",
+    "shape": [
+      96,
+      64
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "cb38f04cf5c39530c2c486e2aad77f85950488e5103917dce9618493159ca6a6",
+    "num_elements": 6144
+  },
+  "up_proj_weight": {
+    "bin": "geglu_mlp_up_proj_weight.bin",
+    "shape": [
+      96,
+      64
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "19cef9d272423f381d81294f646003a6cee510e95469eb04903f7e5406cd563e",
+    "num_elements": 6144
+  },
+  "down_proj_weight": {
+    "bin": "geglu_mlp_down_proj_weight.bin",
+    "shape": [
+      64,
+      96
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "d9f96e46472321c19829103410fe6585c15d1785bfb3e1e846d1094eb72aae47",
+    "num_elements": 6144
+  },
+  "output": {
+    "bin": "geglu_mlp_output.bin",
+    "shape": [
+      2,
+      3,
+      64
+    ],
+    "dtype": "float32",
+    "endianness": "little",
+    "sha256": "d77d6898486b568c19d7d1d4a27417c370d7eb79f6ecf9100a0c8f8ce3fa0c05",
+    "num_elements": 384
+  }
+}
