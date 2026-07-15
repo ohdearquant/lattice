@@ -784,7 +784,7 @@ pub fn audio_marker_expansion_tokens_from_samples(num_samples: u32) -> u32 {
 /// for callers that only have a duration in milliseconds: converts to a
 /// sample count at [`GEMMA4_AUDIO_SAMPLING_RATE_HZ`] — mirroring HF's own
 /// `_get_num_multimodal_tokens`, which reads `audio_lengths` in samples
-/// "assum[ing] default sampling rate" — before applying the exact
+/// assuming the default sampling rate — before applying the exact
 /// post-subsampling arithmetic.
 pub fn audio_marker_expansion_tokens(duration_ms: u32) -> u32 {
     let num_samples = u64::from(duration_ms) * u64::from(GEMMA4_AUDIO_SAMPLING_RATE_HZ) / 1000;
