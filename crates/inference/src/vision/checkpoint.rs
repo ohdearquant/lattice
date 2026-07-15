@@ -792,6 +792,64 @@ mod tests {
     }
 
     #[test]
+    fn fp16_sharded_index_duplicate_raw_weight_map_key_is_rejected() {
+        // A raw `weight_map` JSON object can name the same tensor twice, mapped to two
+        // different shards. Ordinary map deserialization collapses that to one
+        // `HashMap` entry (last member wins) *before* the inventory-count check ever
+        // runs, so the count stays exact and the loader silently resolves the tensor
+        // from whichever shard happened to be the last raw JSON member -- raw-member-
+        // order-dependent, not a deterministic error. All 21 tiny names resolve to
+        // shard A; one name (`dup_name`) is additionally repeated, resolving to shard B
+        // with a different (but shape-correct) value, so a silent last-write-wins
+        // collapse would succeed with B's value instead of failing.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_vision_cfg();
+        let shapes = tiny_expected_shapes();
+
+        let shard_a = tmp.path().join("model-00001-of-00002.safetensors");
+        let tensors_a: Vec<(String, Vec<usize>, Vec<f32>)> = shapes
+            .iter()
+            .map(|(name, shape)| {
+                let numel: usize = shape.iter().product();
+                (name.clone(), shape.clone(), vec![0.5f32; numel])
+            })
+            .collect();
+        write_multi_f32_tensor_shard(&shard_a, &tensors_a);
+
+        let (dup_name, dup_shape) = shapes[0].clone();
+        let dup_numel: usize = dup_shape.iter().product();
+        let shard_b = tmp.path().join("model-00002-of-00002.safetensors");
+        write_multi_f32_tensor_shard(
+            &shard_b,
+            &[(dup_name.clone(), dup_shape, vec![9.0f32; dup_numel])],
+        );
+
+        let mut weight_map_members: Vec<String> = shapes
+            .iter()
+            .map(|(name, _)| format!(r#""{name}":"model-00001-of-00002.safetensors""#))
+            .collect();
+        // Duplicate raw member for `dup_name`, pointing at the second shard.
+        weight_map_members.push(format!(
+            r#""{dup_name}":"model-00002-of-00002.safetensors""#
+        ));
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            format!(r#"{{"weight_map":{{{}}}}}"#, weight_map_members.join(",")),
+        )
+        .expect("test setup: write index");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &cfg).expect_err(
+            "a duplicate raw weight_map key routed to a second shard must be rejected, \
+             not silently resolved by raw member order",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate") && msg.contains(&dup_name),
+            "expected a duplicate-key error naming {dup_name}, got: {msg}"
+        );
+    }
+
+    #[test]
     fn assemble_rejects_unconsumed_leftover_tensors_when_depth_understates_inventory() {
         // The q4 path loads every `model.visual.*` manifest entry up front, not just the
         // names `vision_cfg.depth` implies. If the checkpoint has more real block tensors

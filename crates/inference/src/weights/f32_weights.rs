@@ -970,7 +970,50 @@ pub struct SafetensorsIndex {
     #[serde(default)]
     pub metadata: Value,
     /// Maps tensor name → shard filename (e.g. `"model-00001-of-00026.safetensors"`).
+    #[serde(deserialize_with = "deserialize_weight_map_no_duplicates")]
     pub weight_map: HashMap<String, String>,
+}
+
+/// Deserializes `weight_map` from the raw JSON object, rejecting a repeated
+/// tensor-name key before it collapses into the `HashMap`.
+///
+/// A raw JSON object can carry the same key twice (e.g. mapped to two
+/// different shard files); ordinary map deserialization silently keeps
+/// whichever value visits last, so a downstream inventory-count check over
+/// the resulting `HashMap` can never observe the duplicate. Counting raw
+/// member visits here, before collapse, closes that gap.
+fn deserialize_weight_map_no_duplicates<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct WeightMapVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for WeightMapVisitor {
+        type Value = HashMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map of tensor name to shard filename")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((name, shard)) = map.next_entry::<String, String>()? {
+                if out.insert(name.clone(), shard).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate tensor name in weight_map: {name}"
+                    )));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(WeightMapVisitor)
 }
 
 /// Owned tensor with f32 data and shape, returned by `load_sharded`.
