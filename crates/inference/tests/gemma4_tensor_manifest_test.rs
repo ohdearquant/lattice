@@ -95,6 +95,13 @@ fn load_manifest_str(data: &str) -> Result<Manifest, String> {
     serde_json::from_str(data).map_err(|e| format!("bad manifest JSON: {e}"))
 }
 
+fn expected_buckets_map() -> HashMap<String, u64> {
+    EXPECTED_BUCKETS
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect()
+}
+
 fn load_committed_manifest() -> Manifest {
     let path = fixture_path();
     let data = std::fs::read_to_string(&path)
@@ -121,13 +128,26 @@ fn validate_manifest(m: &Manifest) -> Option<String> {
             m.total_tensors
         ));
     }
-    for (bucket, expected_count) in EXPECTED_BUCKETS {
-        let actual = m.bucket_counts.get(*bucket).copied();
-        if actual != Some(*expected_count) {
-            return Some(format!(
-                "bucket {bucket} count {actual:?} != expected {expected_count}"
-            ));
+    let expected_buckets = expected_buckets_map();
+    if m.bucket_counts != expected_buckets {
+        let mut diffs = Vec::new();
+        for (bucket, expected_count) in &expected_buckets {
+            let actual = m.bucket_counts.get(bucket).copied();
+            if actual != Some(*expected_count) {
+                diffs.push(format!(
+                    "bucket {bucket} count {actual:?} != expected {expected_count}"
+                ));
+            }
         }
+        for bucket in m.bucket_counts.keys() {
+            if !expected_buckets.contains_key(bucket) {
+                diffs.push(format!(
+                    "unexpected bucket {bucket} present with count {}",
+                    m.bucket_counts[bucket]
+                ));
+            }
+        }
+        return Some(diffs.join("; "));
     }
     if m.metadata.source_repo != EXPECTED_SOURCE_REPO {
         return Some(format!(
@@ -178,13 +198,11 @@ fn gemma4_manifest_total_tensor_count_is_2011() {
 #[test]
 fn gemma4_manifest_bucket_counts_match_adr_082_g16() {
     let m = load_committed_manifest();
-    for (bucket, expected_count) in EXPECTED_BUCKETS {
-        assert_eq!(
-            m.bucket_counts.get(*bucket).copied(),
-            Some(*expected_count),
-            "bucket {bucket} count mismatch"
-        );
-    }
+    assert_eq!(
+        m.bucket_counts,
+        expected_buckets_map(),
+        "bucket_counts must exactly match EXPECTED_BUCKETS — no missing or extra keys"
+    );
     let declared_total: u64 = EXPECTED_BUCKETS.iter().map(|(_, c)| c).sum();
     assert_eq!(
         declared_total, EXPECTED_TOTAL,
@@ -352,6 +370,27 @@ fn gemma4_manifest_wrong_bucket_count_fails_validation() {
         "a wrong model.language_model bucket count must fail validate_manifest"
     );
     assert!(failure.unwrap().contains("model.language_model"));
+}
+
+/// Fail-closed negative test: an extra, unlisted bucket key must fail
+/// validation even when every expected bucket is still present at its
+/// correct count — `bucket_counts` must match `EXPECTED_BUCKETS` exactly,
+/// not just be a superset of it.
+#[test]
+fn gemma4_manifest_unexpected_bucket_key_fails_validation() {
+    let mut m = load_committed_manifest();
+    assert!(
+        validate_manifest(&m).is_none(),
+        "sanity: committed manifest should validate cleanly before mutation"
+    );
+
+    m.bucket_counts.insert("unexpected".to_string(), 0);
+    let failure = validate_manifest(&m);
+    assert!(
+        failure.is_some(),
+        "an unexpected bucket key must fail validate_manifest even with count 0"
+    );
+    assert!(failure.unwrap().contains("unexpected"));
 }
 
 /// Fail-closed negative test: a changed pinned revision must fail

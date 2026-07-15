@@ -84,16 +84,24 @@ def _http_get_range(
     size cap of `requested_length + 1` so a streaming body larger than
     declared is rejected — the extra byte is only ever used to detect
     overrun, never retained. `remaining_budget` is checked *before* issuing
-    the request so both range reads in `fetch_header` are jointly bounded by
-    `MAX_FETCH_BYTES`, not just individually.
+    the request, against `requested_length + 1` (not just `requested_length`)
+    so the overrun-probe byte itself is reserved in the budget — the read
+    call never asks the socket for more than what's left of
+    `MAX_FETCH_BYTES`, even when detecting an overlong body. This means both
+    range reads in `fetch_header` are jointly bounded by `MAX_FETCH_BYTES`,
+    not just individually, and an otherwise-maximum-sized header is rejected
+    conservatively rather than letting the probe byte push the true fetch
+    past the cap.
 
     Returns (data, new_remaining_budget).
     """
     expected_len = end_inclusive - start + 1
-    if expected_len > remaining_budget:
+    read_cap = expected_len + 1
+    if read_cap > remaining_budget:
         raise RuntimeError(
-            f"requested range {start}-{end_inclusive} ({expected_len} bytes) exceeds "
-            f"the remaining fetch budget ({remaining_budget} bytes)"
+            f"requested range {start}-{end_inclusive} ({expected_len} bytes, "
+            f"{read_cap} bytes including the overrun probe) exceeds the "
+            f"remaining fetch budget ({remaining_budget} bytes)"
         )
     req = urllib.request.Request(
         url, headers={"Range": f"bytes={start}-{end_inclusive}"}
@@ -120,7 +128,7 @@ def _http_get_range(
         # Read at most one byte past what was requested: if that succeeds,
         # the body is longer than declared and must be rejected before any
         # of it is retained.
-        data = resp.read(expected_len + 1)
+        data = resp.read(read_cap)
         if len(data) > expected_len:
             raise RuntimeError(
                 f"response body for range {start}-{end_inclusive} exceeded the "
@@ -144,10 +152,16 @@ def fetch_header(url: str = SAFETENSORS_URL) -> tuple[dict[str, Any], bytes, int
             f"expected 8 bytes for the safetensors header-length prefix, got {len(len_bytes)}"
         )
     header_len = struct.unpack("<Q", len_bytes)[0]
-    if 8 + header_len > MAX_FETCH_BYTES:
+    # Reserve the second request's one-byte overrun probe in this check too
+    # (see `_http_get_range`): a header exactly `MAX_FETCH_BYTES - 8` bytes
+    # long would otherwise pass this guard and then have its overrun-probe
+    # read pull one byte past the global cap before the per-request budget
+    # check below catches it. Reject it here instead, conservatively.
+    if 8 + header_len + 1 > MAX_FETCH_BYTES:
         raise RuntimeError(
             f"declared header length {header_len} bytes would push total fetch past "
-            f"the {MAX_FETCH_BYTES}-byte cap — refusing to fetch further"
+            f"the {MAX_FETCH_BYTES}-byte cap (including the overrun probe byte) — "
+            "refusing to fetch further"
         )
 
     header_bytes, remaining = _http_get_range(url, 8, 8 + header_len - 1, remaining)
@@ -211,6 +225,12 @@ IMMUTABLE_METADATA_FIELDS = (
 )
 
 
+def _is_plain_int(v: Any) -> bool:
+    """True for a genuine JSON number deserialized as `int`, false for a
+    JSON boolean (Python `bool` is an `int` subclass, so `True == 1`)."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def diff_against_fixture(
     manifest: dict[str, Any], fixture: dict[str, Any]
 ) -> list[str]:
@@ -252,12 +272,21 @@ def diff_against_fixture(
 
     # Exact map equality: a bucket dropped from either side, an extra bucket
     # on either side, or a wrong count are all drift — not just the buckets
-    # the fixture happens to still enumerate.
+    # the fixture happens to still enumerate. Values must also be *plain*
+    # ints: `bool` is a subclass of `int` in Python, so `True == 1` would
+    # otherwise let a JSON `true` silently pass as a count of 1.
     fetched_buckets = manifest.get("bucket_counts", {})
     fixture_buckets = fixture.get("bucket_counts", {})
     for bucket in sorted(set(fetched_buckets) | set(fixture_buckets)):
         f_count = fetched_buckets.get(bucket)
         x_count = fixture_buckets.get(bucket)
+        if not _is_plain_int(f_count) or not _is_plain_int(x_count):
+            errors.append(
+                f"bucket {bucket} count is not a plain int (fetched={f_count!r} "
+                f"fixture={x_count!r}) — JSON booleans/floats are not valid "
+                "tensor counts"
+            )
+            continue
         if f_count != x_count:
             errors.append(
                 f"bucket {bucket} count drift: fetched={f_count} fixture={x_count}"
@@ -404,6 +433,60 @@ def _run_bounded_read_selftest() -> list[str]:
     finally:
         _stop_scenario_server(server)
 
+    # (d) Exact-budget boundary: a request whose declared length leaves no
+    # room for the reserved overrun-probe byte (expected_len == budget) must
+    # be rejected before any request is issued at all — the read call
+    # itself must never be allowed to ask for more than the remaining
+    # budget, even when the requested length alone would fit.
+    budget = 1000
+    try:
+        _http_get_range("http://127.0.0.1:1/", 8, 8 + budget - 1, budget)
+    except RuntimeError as e:
+        if "exceeds the remaining fetch budget" not in str(e):
+            failures.append(
+                f"exact-budget-no-probe-room: expected budget-exceeded message, got: {e}"
+            )
+    else:
+        failures.append("exact-budget-no-probe-room: expected RuntimeError, got success")
+
+    # (e) Same boundary, one byte smaller (expected_len == budget - 1, the
+    # max allowed once the probe byte is reserved): an overlong second-range
+    # response — reproducing the header-sized (not just 8-byte) request in
+    # `fetch_header` — must still be rejected, and the reserved budget check
+    # means the read call can pull at most `budget` bytes total, never past
+    # the cap.
+    server = _start_scenario_server("206-overlong-body")
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/"
+        try:
+            data, _ = _http_get_range(url, 8, 8 + (budget - 1) - 1, budget)
+        except RuntimeError:
+            pass
+        else:
+            failures.append(
+                f"exact-budget-overlong-second-range: expected RuntimeError, got {len(data)} bytes"
+            )
+    finally:
+        _stop_scenario_server(server)
+
+    # (f) fetch_header end to end: a header whose declared length is exactly
+    # `MAX_FETCH_BYTES - 8` (the previously-buggy "otherwise maximum-sized
+    # header" that left zero budget for the second request's overrun probe)
+    # must be rejected before the second Range request is ever issued.
+    huge_header_len = MAX_FETCH_BYTES - 8
+    len_bytes_payload = struct.pack("<Q", huge_header_len)
+    server = _start_scenario_server("ok", ok_payload=len_bytes_payload)
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/"
+        try:
+            fetch_header(url)
+        except RuntimeError:
+            pass
+        else:
+            failures.append("max-sized-header: expected RuntimeError, got success")
+    finally:
+        _stop_scenario_server(server)
+
     # Valid two-range success case must still work end to end.
     header_obj = {
         "model.dummy.weight": {
@@ -491,6 +574,11 @@ def _run_drift_mutation_selftest() -> list[str]:
             "changed-header-sha",
             lambda f: f["metadata"].__setitem__("header_sha256", "b" * 64),
             "metadata.header_sha256",
+        ),
+        (
+            "bucket-count-json-bool-not-int",
+            lambda f: f["bucket_counts"].__setitem__("model.audio_tower", True),
+            "bucket model.audio_tower",
         ),
     ]
     for label, mutator, expected_substring in cases:
