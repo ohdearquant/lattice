@@ -154,6 +154,10 @@ pub use crate::pool::BertPooling;
 pub use crate::stop_reason::StopReason;
 /// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::BpeTokenizer;
+/// Additive Gemma-family BPE tokenizer (literal-space `Split` + `▁` metaspace normalizer),
+/// explicitly selected — never reached via [`load_tokenizer`]'s model-type sniffing. See
+/// [`Tokenizer`] and ADR-082 G17.
+pub use crate::tokenizer::GemmaBpeTokenizer;
 /// `SentencePiece` tokenizer implementation. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::SentencePieceTokenizer;
 /// Padded token IDs and the real (unpadded) sequence length returned by tokenizers. See
@@ -169,3 +173,12 @@ pub use crate::tokenizer::load_tokenizer;
 /// `tokenizer.json`-text tokenizer loader (no filesystem access). See
 /// [`Tokenizer`], [`tokenizer`], and [`BertModel::from_bytes`].
 pub use crate::tokenizer::tokenizer_from_json_str;
+/// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17): `<|image|>`/`<|audio|>`
+/// placeholder-to-soft-token-count contract, independent of the in-sequence scatter itself.
+pub use crate::tokenizer::{
+    GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES, GEMMA4_AUDIO_HOP_LENGTH_SAMPLES,
+    GEMMA4_AUDIO_MAX_SOFT_TOKENS, GEMMA4_AUDIO_MS_PER_SOFT_TOKEN, GEMMA4_AUDIO_SAMPLING_RATE_HZ,
+    GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE, audio_marker_expansion_tokens,
+    audio_marker_expansion_tokens_from_samples, image_marker_expansion_tokens,
+    total_audio_marker_expansion_tokens,
+};

@@ -839,7 +839,12 @@ fn parse_merges_txt(text: &str) -> Vec<(String, String)> {
     merges
 }
 
-fn parse_merges_json(value: &JsonValue) -> Result<Vec<(String, String)>, InferenceError> {
+/// Shared with the additive Gemma BPE path (`tokenizer::gemma_bpe`), which
+/// parses the same `tokenizer.json` `model.merges` shape but builds its own
+/// merge-rank table and pretokenization pipeline; see ADR-082 G17.
+pub(crate) fn parse_merges_json(
+    value: &JsonValue,
+) -> Result<Vec<(String, String)>, InferenceError> {
     let array = value.as_array().ok_or_else(|| {
         InferenceError::Tokenizer("expected tokenizer.json model.merges array".into())
     })?;

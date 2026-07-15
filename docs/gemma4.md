@@ -102,3 +102,31 @@ fetched — see manifest `metadata`):
 Every stage from 3 onward downloads real weight bytes and must place them under
 `$LATTICE_MODEL_CACHE`, consistent with `ensure_model_files`'s existing cache-then-download flow
 and `LATTICE_OFFLINE`'s fail-closed behavior on a cache miss.
+
+## Tokenizer + prompt-template parity (Stage 1, G17)
+
+[`crates/inference/tests/fixtures/gemma4/tokenizer/`](../crates/inference/tests/fixtures/gemma4/tokenizer/)
+commits the target tokenizer assets verbatim — `tokenizer.json` (~32.2 MB; large for a fixture but
+still a small text/JSON file with zero weight bytes, matching the Stage-0 table above), plus
+`tokenizer_config.json` and `chat_template.jinja` — alongside `manifest.json` (source revision +
+per-file SHA-256 + generator runtime versions) and two derived golden files:
+`corpus_goldens.json` (exact HF token IDs over a declared corpus: ordinary text, Unicode,
+whitespace runs, byte-fallback cases, and the image/audio/thought/tool markers) and
+`chat_template_golden.json` (the rendered 2-turn instruction-template string plus its token IDs).
+
+**Generator / drift gate**: [`scripts/gemma4_tokenizer_goldens.py`](../scripts/gemma4_tokenizer_goldens.py),
+same fetch discipline as Stage 0's manifest script (pinned `/resolve/<revision>/` URLs, a hard fetch
+cap, `--write-fixture` vs. default-verify modes) plus a runtime-version pin on the HF `tokenizers`
+and `jinja2` packages used to generate the goldens.
+
+Read directly from the downloaded `tokenizer.json` (not guessed): `model.type == "BPE"` with
+`byte_fallback: true`, a `Replace(" " -> "▁")` normalizer, and a literal-string `Split`
+pre-tokenizer (`pattern.String`, not the regex `pattern.Regex` shape the existing Qwen BPE loader
+accepts). `crates/inference/src/tokenizer/gemma_bpe.rs` implements this as a new, additive
+`GemmaBpeTokenizer` — selected by an explicit constructor call, never reached through
+`load_tokenizer`'s model-type sniffing. The existing loader's `validate_bpe_pretokenizer`
+continues to reject this same `tokenizer.json` (`crates/inference/tests/gemma4_tokenizer_goldens_test.rs::existing_qwen_bpe_loader_rejects_gemma_tokenizer_json`),
+proving the new path is additive rather than a silent widening of the general loader.
+
+Config/loader wiring (an explicit `Gemma4E2bConfig` branch that selects `GemmaBpeTokenizer`) is
+Stage 2 scope, not this stage.

@@ -1,0 +1,29 @@
+{
+  "source_repo": "google/gemma-4-E2B-it",
+  "revision": "9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf",
+  "url_form": "https://huggingface.co/google/gemma-4-E2B-it/resolve/9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf/<file>",
+  "files": {
+    "tokenizer.json": {
+      "bytes": 32169626,
+      "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+    },
+    "tokenizer_config.json": {
+      "bytes": 2095,
+      "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df"
+    },
+    "chat_template.jinja": {
+      "bytes": 17336,
+      "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+    },
+    "processor_config.json": {
+      "bytes": 1689,
+      "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c"
+    }
+  },
+  "runtime_versions": {
+    "tokenizers": "0.22.2",
+    "jinja2": "3.1.6"
+  },
+  "generator": "scripts/gemma4_tokenizer_goldens.py",
+  "adr": "ADR-082 Stage 1 (G17)"
+}

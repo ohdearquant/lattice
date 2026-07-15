@@ -8,6 +8,7 @@
 # `target/`, so the exclusion is explicit rather than incidental.
 extend-exclude = [
     "crates/inference/tests/fixtures/tokenizers/**",
+    "crates/inference/tests/fixtures/gemma4/tokenizer/**",
     "crates/inference/benchmarks/golden_logits/**",
     "crates/embed/tests/fixtures/**",
     "docs/bench_results/**",

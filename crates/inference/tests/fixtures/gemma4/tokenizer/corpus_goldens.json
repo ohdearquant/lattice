@@ -1,0 +1,570 @@
+[
+  {
+    "id": "ascii_ordinary",
+    "category": "text",
+    "text": "The quick brown fox jumps over the lazy dog.",
+    "ids": [
+      818,
+      3823,
+      8864,
+      37423,
+      38167,
+      1024,
+      506,
+      31770,
+      4799,
+      236761
+    ],
+    "tokens": [
+      "The",
+      "▁quick",
+      "▁brown",
+      "▁fox",
+      "▁jumps",
+      "▁over",
+      "▁the",
+      "▁lazy",
+      "▁dog",
+      "."
+    ],
+    "decoded": "The quick brown fox jumps over the lazy dog."
+  },
+  {
+    "id": "ascii_punctuation",
+    "category": "text",
+    "text": "Hello, world! How are you? (fine, thanks) -- 100% sure.",
+    "ids": [
+      9259,
+      236764,
+      1902,
+      236888,
+      2088,
+      659,
+      611,
+      236881,
+      568,
+      35022,
+      236764,
+      8863,
+      236768,
+      2617,
+      236743,
+      236770,
+      236771,
+      236771,
+      236908,
+      2889,
+      236761
+    ],
+    "tokens": [
+      "Hello",
+      ",",
+      "▁world",
+      "!",
+      "▁How",
+      "▁are",
+      "▁you",
+      "?",
+      "▁(",
+      "fine",
+      ",",
+      "▁thanks",
+      ")",
+      "▁--",
+      "▁",
+      "1",
+      "0",
+      "0",
+      "%",
+      "▁sure",
+      "."
+    ],
+    "decoded": "Hello, world! How are you? (fine, thanks) -- 100% sure."
+  },
+  {
+    "id": "unicode_cjk",
+    "category": "unicode",
+    "text": "短い日本語のテストです。今日は良い天気ですね。",
+    "ids": [
+      209499,
+      94951,
+      236945,
+      88733,
+      3652,
+      236924,
+      90082,
+      32485,
+      228212,
+      31875,
+      236924
+    ],
+    "tokens": [
+      "短い",
+      "日本語",
+      "の",
+      "テスト",
+      "です",
+      "。",
+      "今日は",
+      "良い",
+      "天気",
+      "ですね",
+      "。"
+    ],
+    "decoded": "短い日本語のテストです。今日は良い天気ですね。"
+  },
+  {
+    "id": "unicode_emoji",
+    "category": "unicode",
+    "text": "Great job! 😀🚀🎉 family: 👨‍👩‍👧",
+    "ids": [
+      20418,
+      3195,
+      236888,
+      163543,
+      242015,
+      242061,
+      2523,
+      236787,
+      236743,
+      243874,
+      237243,
+      243767,
+      237243,
+      244814
+    ],
+    "tokens": [
+      "Great",
+      "▁job",
+      "!",
+      "▁😀",
+      "🚀",
+      "🎉",
+      "▁family",
+      ":",
+      "▁",
+      "👨",
+      "‍",
+      "👩",
+      "‍",
+      "👧"
+    ],
+    "decoded": "Great job! 😀🚀🎉 family: 👨‍👩‍👧"
+  },
+  {
+    "id": "unicode_combining",
+    "category": "unicode",
+    "text": "combining: é vs é (decomposed e + U+0301 vs precomposed)",
+    "ids": [
+      20024,
+      4049,
+      236787,
+      545,
+      238288,
+      7728,
+      1559,
+      568,
+      893,
+      138107,
+      545,
+      900,
+      749,
+      236862,
+      236771,
+      236800,
+      236771,
+      236770,
+      7728,
+      877,
+      138107,
+      236768
+    ],
+    "tokens": [
+      "comb",
+      "ining",
+      ":",
+      "▁e",
+      "́",
+      "▁vs",
+      "▁é",
+      "▁(",
+      "de",
+      "composed",
+      "▁e",
+      "▁+",
+      "▁U",
+      "+",
+      "0",
+      "3",
+      "0",
+      "1",
+      "▁vs",
+      "▁pre",
+      "composed",
+      ")"
+    ],
+    "decoded": "combining: é vs é (decomposed e + U+0301 vs precomposed)"
+  },
+  {
+    "id": "unicode_mixed",
+    "category": "unicode",
+    "text": "Café résumé naïve façade -- 日本語 mixed with emoji 😀",
+    "ids": [
+      160319,
+      236859,
+      118515,
+      120362,
+      96008,
+      2617,
+      33375,
+      238582,
+      9726,
+      607,
+      64334,
+      163543
+    ],
+    "tokens": [
+      "Caf",
+      "é",
+      "▁résumé",
+      "▁naïve",
+      "▁façade",
+      "▁--",
+      "▁日本",
+      "語",
+      "▁mixed",
+      "▁with",
+      "▁emoji",
+      "▁😀"
+    ],
+    "decoded": "Café résumé naïve façade -- 日本語 mixed with emoji 😀"
+  },
+  {
+    "id": "whitespace_multi_space",
+    "category": "whitespace",
+    "text": "a  b   c    d",
+    "ids": [
+      236746,
+      138,
+      236763,
+      139,
+      236755,
+      140,
+      236753
+    ],
+    "tokens": [
+      "a",
+      "▁▁",
+      "b",
+      "▁▁▁",
+      "c",
+      "▁▁▁▁",
+      "d"
+    ],
+    "decoded": "a  b   c    d"
+  },
+  {
+    "id": "whitespace_tabs_newlines",
+    "category": "whitespace",
+    "text": "line1\tcol2\nline2\n\nline4",
+    "ids": [
+      1257,
+      236770,
+      255968,
+      1475,
+      236778,
+      107,
+      1257,
+      236778,
+      108,
+      1257,
+      236812
+    ],
+    "tokens": [
+      "line",
+      "1",
+      "\t",
+      "col",
+      "2",
+      "\n",
+      "line",
+      "2",
+      "\n\n",
+      "line",
+      "4"
+    ],
+    "decoded": "line1\tcol2\nline2\n\nline4"
+  },
+  {
+    "id": "whitespace_leading_trailing",
+    "category": "whitespace",
+    "text": "   leading and trailing spaces   ",
+    "ids": [
+      139,
+      26016,
+      532,
+      45330,
+      9952,
+      139
+    ],
+    "tokens": [
+      "▁▁▁",
+      "leading",
+      "▁and",
+      "▁trailing",
+      "▁spaces",
+      "▁▁▁"
+    ],
+    "decoded": "   leading and trailing spaces   "
+  },
+  {
+    "id": "whitespace_only",
+    "category": "whitespace",
+    "text": "   ",
+    "ids": [
+      139
+    ],
+    "tokens": [
+      "▁▁▁"
+    ],
+    "decoded": "   "
+  },
+  {
+    "id": "empty",
+    "category": "whitespace",
+    "text": "",
+    "ids": [],
+    "tokens": [],
+    "decoded": ""
+  },
+  {
+    "id": "byte_fallback_rare_char",
+    "category": "byte_fallback",
+    "text": "rare: 𐌀 old italic letter",
+    "ids": [
+      43128,
+      236787,
+      236743,
+      478,
+      382,
+      378,
+      366,
+      2255,
+      103147,
+      6064
+    ],
+    "tokens": [
+      "rare",
+      ":",
+      "▁",
+      "<0xF0>",
+      "<0x90>",
+      "<0x8C>",
+      "<0x80>",
+      "▁old",
+      "▁italic",
+      "▁letter"
+    ],
+    "decoded": "rare: 𐌀 old italic letter"
+  },
+  {
+    "id": "byte_fallback_private_use",
+    "category": "byte_fallback",
+    "text": "pua:  chars",
+    "ids": [
+      236758,
+      3271,
+      236787,
+      236743,
+      245863,
+      247368,
+      56256
+    ],
+    "tokens": [
+      "p",
+      "ua",
+      ":",
+      "▁",
+      "",
+      "",
+      "▁chars"
+    ],
+    "decoded": "pua:  chars"
+  },
+  {
+    "id": "byte_fallback_replacement_char",
+    "category": "byte_fallback",
+    "text": "bad: � sequence",
+    "ids": [
+      15242,
+      236787,
+      58588,
+      7501
+    ],
+    "tokens": [
+      "bad",
+      ":",
+      "▁�",
+      "▁sequence"
+    ],
+    "decoded": "bad: � sequence"
+  },
+  {
+    "id": "marker_image",
+    "category": "marker",
+    "text": "<|image|>",
+    "ids": [
+      258880
+    ],
+    "tokens": [
+      "<|image|>"
+    ],
+    "decoded": ""
+  },
+  {
+    "id": "marker_audio",
+    "category": "marker",
+    "text": "<|audio|>",
+    "ids": [
+      258881
+    ],
+    "tokens": [
+      "<|audio|>"
+    ],
+    "decoded": ""
+  },
+  {
+    "id": "marker_image_audio_combo",
+    "category": "marker",
+    "text": "<|image|> describe this <|audio|> transcribe this",
+    "ids": [
+      258880,
+      9779,
+      672,
+      236743,
+      258881,
+      226476,
+      672
+    ],
+    "tokens": [
+      "<|image|>",
+      "▁describe",
+      "▁this",
+      "▁",
+      "<|audio|>",
+      "▁transcribe",
+      "▁this"
+    ],
+    "decoded": " describe this  transcribe this"
+  },
+  {
+    "id": "marker_boi_eoi",
+    "category": "marker",
+    "text": "<|image>content<image|>",
+    "ids": [
+      255999,
+      3955,
+      258882
+    ],
+    "tokens": [
+      "<|image>",
+      "content",
+      "<image|>"
+    ],
+    "decoded": "content"
+  },
+  {
+    "id": "marker_boa_eoa",
+    "category": "marker",
+    "text": "<|audio>content<audio|>",
+    "ids": [
+      256000,
+      3955,
+      258883
+    ],
+    "tokens": [
+      "<|audio>",
+      "content",
+      "<audio|>"
+    ],
+    "decoded": "content"
+  },
+  {
+    "id": "marker_video",
+    "category": "marker",
+    "text": "<|video|>",
+    "ids": [
+      258884
+    ],
+    "tokens": [
+      "<|video|>"
+    ],
+    "decoded": ""
+  },
+  {
+    "id": "thought_tool_markers",
+    "category": "marker",
+    "text": "<|think|><|channel>thought\nreasoning\n<channel|><|turn>model\nanswer<turn|><|tool>declaration<tool|><|tool_call>call:foo{}<tool_call|><|tool_response>response:foo{}<tool_response|>",
+    "ids": [
+      98,
+      100,
+      45518,
+      107,
+      27388,
+      522,
+      107,
+      101,
+      105,
+      4368,
+      107,
+      14433,
+      106,
+      46,
+      163688,
+      47,
+      48,
+      6639,
+      236787,
+      26537,
+      16454,
+      49,
+      50,
+      6275,
+      236787,
+      26537,
+      16454,
+      51
+    ],
+    "tokens": [
+      "<|think|>",
+      "<|channel>",
+      "thought",
+      "\n",
+      "reason",
+      "ing",
+      "\n",
+      "<channel|>",
+      "<|turn>",
+      "model",
+      "\n",
+      "answer",
+      "<turn|>",
+      "<|tool>",
+      "declaration",
+      "<tool|>",
+      "<|tool_call>",
+      "call",
+      ":",
+      "foo",
+      "{}",
+      "<tool_call|>",
+      "<|tool_response>",
+      "response",
+      ":",
+      "foo",
+      "{}",
+      "<tool_response|>"
+    ],
+    "decoded": "thought\nreasoning\nmodel\nanswerdeclarationcall:foo{}response:foo{}"
+  }
+]
