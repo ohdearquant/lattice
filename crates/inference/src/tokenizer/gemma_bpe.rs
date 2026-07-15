@@ -565,37 +565,58 @@ fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
         ));
     }
 
-    let decoder = root.get("decoder");
-    let is_gemma_decoder = decoder.is_some_and(|d| {
-        d.get("type").and_then(JsonValue::as_str) == Some("Sequence")
-            && d.get("decoders")
-                .and_then(JsonValue::as_array)
-                .is_some_and(is_gemma_decoder_sequence)
-    });
-    if !is_gemma_decoder {
+    let decoders = root
+        .get("decoder")
+        .filter(|d| d.get("type").and_then(JsonValue::as_str) == Some("Sequence"))
+        .and_then(|d| d.get("decoders"))
+        .and_then(JsonValue::as_array);
+    let Some(decoders) = decoders else {
         return Err(InferenceError::Tokenizer(
             "GemmaBpeTokenizer expects decoder == Sequence[Replace(\"\u{2581}\" -> \
-             \" \"), ByteFallback, Fuse] in exactly that order; tokenizer.json \
+             \" \"), ByteFallback, Fuse]; tokenizer.json declares a different \
+             shape, refusing to guess"
+                .into(),
+        ));
+    };
+    validate_gemma_decoder_sequence(decoders)?;
+
+    let model = root.get("model").unwrap_or(&JsonValue::Null);
+    if !is_null_or_absent(model.get("dropout")) {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects model.dropout == null (this loader \
+             always applies BPE merges); tokenizer.json declares a different \
+             shape, refusing to guess"
+                .into(),
+        ));
+    }
+    if !is_null_or_absent(model.get("continuing_subword_prefix")) {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects model.continuing_subword_prefix == null \
+             (this loader never affix-wraps a subword); tokenizer.json declares \
+             a different shape, refusing to guess"
+                .into(),
+        ));
+    }
+    if !is_null_or_absent(model.get("end_of_word_suffix")) {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects model.end_of_word_suffix == null (this \
+             loader never affix-wraps a subword); tokenizer.json declares a \
+             different shape, refusing to guess"
+                .into(),
+        ));
+    }
+    if model.get("fuse_unk").and_then(JsonValue::as_bool) != Some(true) {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects model.fuse_unk == true; tokenizer.json \
              declares a different shape, refusing to guess"
                 .into(),
         ));
     }
-
-    let model = root.get("model");
-    let model_matches_assumed_shape = model.is_some_and(|m| {
-        is_null_or_absent(m.get("dropout"))
-            && is_null_or_absent(m.get("continuing_subword_prefix"))
-            && is_null_or_absent(m.get("end_of_word_suffix"))
-            && m.get("fuse_unk").and_then(JsonValue::as_bool) == Some(true)
-            && m.get("ignore_merges").and_then(JsonValue::as_bool) == Some(false)
-    });
-    if !model_matches_assumed_shape {
+    if model.get("ignore_merges").and_then(JsonValue::as_bool) != Some(false) {
         return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.dropout/continuing_subword_prefix/\
-             end_of_word_suffix == null, model.fuse_unk == true, and \
-             model.ignore_merges == false (this loader always applies BPE \
-             merges and never affix-wraps a subword); tokenizer.json declares \
-             a different shape, refusing to guess"
+            "GemmaBpeTokenizer expects model.ignore_merges == false (this \
+             loader always applies BPE merges); tokenizer.json declares a \
+             different shape, refusing to guess"
                 .into(),
         ));
     }
@@ -610,21 +631,57 @@ fn is_null_or_absent(value: Option<&JsonValue>) -> bool {
     matches!(value, None | Some(JsonValue::Null))
 }
 
-/// `true` if `decoders` is exactly `[Replace("\u{2581}" -> " "), ByteFallback, Fuse]`
-/// in that order — the declared decoder sequence this loader's run-based
-/// byte-fallback decode (see [`flush_byte_fallback_run`]) is built against.
-fn is_gemma_decoder_sequence(decoders: &[JsonValue]) -> bool {
+/// Fails closed unless `decoders` is exactly `[Replace("\u{2581}" -> " "),
+/// ByteFallback, Fuse]` in that order — the declared decoder sequence this
+/// loader's run-based byte-fallback decode (see [`flush_byte_fallback_run`])
+/// is built against. Each mismatch names the specific stage/field so a
+/// rejection is attributable to the exact declared shape that diverged.
+fn validate_gemma_decoder_sequence(decoders: &[JsonValue]) -> Result<(), InferenceError> {
     let [replace, byte_fallback, fuse] = decoders else {
-        return false;
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects exactly three decoder stages \
+             [Replace, ByteFallback, Fuse]; tokenizer.json declares a \
+             different shape, refusing to guess"
+                .into(),
+        ));
     };
-    let is_replace = replace.get("type").and_then(JsonValue::as_str) == Some("Replace")
-        && json_path(replace, &["pattern", "String"]).and_then(JsonValue::as_str)
-            == Some("\u{2581}")
-        && replace.get("content").and_then(JsonValue::as_str) == Some(" ");
-    let is_byte_fallback =
-        byte_fallback.get("type").and_then(JsonValue::as_str) == Some("ByteFallback");
-    let is_fuse = fuse.get("type").and_then(JsonValue::as_str) == Some("Fuse");
-    is_replace && is_byte_fallback && is_fuse
+    if replace.get("type").and_then(JsonValue::as_str) != Some("Replace") {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects decoder[0].type == \"Replace\"; \
+             tokenizer.json declares a different shape, refusing to guess"
+                .into(),
+        ));
+    }
+    if json_path(replace, &["pattern", "String"]).and_then(JsonValue::as_str) != Some("\u{2581}") {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects decoder[0].pattern.String == \
+             \"\u{2581}\"; tokenizer.json declares a different shape, \
+             refusing to guess"
+                .into(),
+        ));
+    }
+    if replace.get("content").and_then(JsonValue::as_str) != Some(" ") {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects decoder[0].content == \" \"; \
+             tokenizer.json declares a different shape, refusing to guess"
+                .into(),
+        ));
+    }
+    if byte_fallback.get("type").and_then(JsonValue::as_str) != Some("ByteFallback") {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects decoder[1].type == \"ByteFallback\"; \
+             tokenizer.json declares a different shape, refusing to guess"
+                .into(),
+        ));
+    }
+    if fuse.get("type").and_then(JsonValue::as_str) != Some("Fuse") {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects decoder[2].type == \"Fuse\"; \
+             tokenizer.json declares a different shape, refusing to guess"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Vision soft tokens per `<|image|>` placeholder (ADR-082 G11): the

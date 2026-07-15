@@ -498,6 +498,22 @@ fn assert_rejects(value: &serde_json::Value, context: &str) {
     );
 }
 
+/// Like [`assert_rejects`], but additionally proves the rejection came from
+/// the intended guard: the error message must name the exact mutated field,
+/// so a rejection by some *other* validation cannot masquerade as coverage.
+fn assert_rejects_naming(value: &serde_json::Value, context: &str, expected_fragment: &str) {
+    let text = value.to_string();
+    let Err(err) = GemmaBpeTokenizer::from_tokenizer_json_str(&text) else {
+        panic!("{context}: expected construction to fail closed, but it succeeded")
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains(expected_fragment),
+        "{context}: rejection error does not name the guarded field \
+         {expected_fragment:?}; got: {msg}"
+    );
+}
+
 #[test]
 fn minimal_valid_tokenizer_json_constructs() {
     assert_constructs(&minimal_valid_tokenizer_json(), "unmutated baseline");
@@ -576,30 +592,43 @@ fn constructor_rejects_non_null_continuing_subword_prefix() {
 fn constructor_rejects_byte_fallback_false() {
     let mut mutated = minimal_valid_tokenizer_json();
     mutated["model"]["byte_fallback"] = serde_json::json!(false);
-    assert_rejects(&mutated, "model.byte_fallback == false");
+    assert_rejects_naming(
+        &mutated,
+        "model.byte_fallback == false",
+        "model.byte_fallback",
+    );
 }
 
 #[test]
 fn constructor_rejects_non_null_end_of_word_suffix() {
     let mut mutated = minimal_valid_tokenizer_json();
     mutated["model"]["end_of_word_suffix"] = serde_json::json!("</w>");
-    assert_rejects(&mutated, "model.end_of_word_suffix == \"</w>\"");
+    assert_rejects_naming(
+        &mutated,
+        "model.end_of_word_suffix == \"</w>\"",
+        "model.end_of_word_suffix",
+    );
 }
 
 #[test]
 fn constructor_rejects_decoder_replace_wrong_content() {
     let mut mutated = minimal_valid_tokenizer_json();
     mutated["decoder"]["decoders"][0]["content"] = serde_json::json!("_");
-    assert_rejects(&mutated, "decoder[0].content == \"_\" (not \" \")");
+    assert_rejects_naming(
+        &mutated,
+        "decoder[0].content == \"_\" (not \" \")",
+        "decoder[0].content",
+    );
 }
 
 #[test]
 fn constructor_rejects_decoder_replace_wrong_pattern() {
     let mut mutated = minimal_valid_tokenizer_json();
     mutated["decoder"]["decoders"][0]["pattern"]["String"] = serde_json::json!("_");
-    assert_rejects(
+    assert_rejects_naming(
         &mutated,
         "decoder[0].pattern.String == \"_\" (not \"\u{2581}\")",
+        "decoder[0].pattern.String",
     );
 }
 
