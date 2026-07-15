@@ -171,9 +171,22 @@ jobs:
           header: e2e-parity
           path: parity-report.md
 
-  # REQUIRED Metal attention/KV-cache parity leg (issue #239, promoted per
-  # ADR-066 F2 after a 2-week clean streak: 89/89 executed main-branch runs
-  # green, 2026-07-04 through 2026-07-15, zero reds of any kind). e2e-parity
+  # REQUIRED Metal parity RATCHET leg (issue #239, promoted per ADR-066 F2
+  # after a 2-week clean streak: 89/89 executed main-branch runs green,
+  # 2026-07-04 through 2026-07-15, zero reds of any kind).
+  #
+  # RATCHET, not full-parity certification: scripts/e2e_parity_check.py
+  # carries a deliberate, content-anchored waiver (METAL_EXPECTED_DIVERGENCE)
+  # for the long-prefill prompt, where Metal deterministically diverges from
+  # HF at the first token (open issue #535). What this required job certifies
+  # is therefore: Metal dispatch path-proof, binary health, and greedy token
+  # parity on every prompt EXCEPT the #535-waived one. Any NEW divergence on
+  # any prompt still fails closed. The waiver self-reports: if the waived
+  # prompt starts passing, the run prints XPASS and the entry gets deleted
+  # (see the METAL_EXPECTED_DIVERGENCE comment in the script). Do not read
+  # this gate as full Metal parity until #535 is fixed and the waiver removed.
+  #
+  # e2e-parity
   # only ever exercised the CPU (qwen35_generate) path above; this job exists
   # to prove the Metal attention/KV dispatch helpers actually ran, not just
   # that a Metal device was present.
@@ -198,7 +211,7 @@ jobs:
   # enforcement point, and the gate explicitly accepts skipped-on-merge-group
   # (and only that) as non-failing.
   metal-parity:
-    name: metal attention parity
+    name: metal parity ratchet (#535 waived)
     needs: changes
     if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: macos-latest
@@ -786,10 +799,11 @@ jobs:
   # did not change (nothing to verify); mirrors the parity, embed-drift,
   # wasm-parity, wasm-simd128-parity, q4-composed, vision-s3-gate,
   # ppl-gate-selftest, q4-ppl-quality, and metal-parity verdicts when it did.
-  # Fails closed if change-detection itself errored. metal-parity is required
-  # on PR runs (promoted per ADR-066 F2, issue #239); on merge-group events it
-  # is skipped by design and the gate accepts exactly that skip — see its
-  # comment above. q4-ppl-quality is now armed
+  # Fails closed if change-detection itself errored. metal-parity (the metal
+  # parity RATCHET — #535 is deliberately waived in the script; see the job
+  # comment above) is required on PR runs (promoted per ADR-066 F2, issue
+  # #239); on merge-group events it is skipped by design and the gate accepts
+  # exactly that skip. q4-ppl-quality is now armed
   # (golden captured on run 28841919096) and gates the shipping Q4 tier for
   # regressions.
   parity-gate:
@@ -869,7 +883,7 @@ jobs:
             if [ "$EVENT_NAME" = "merge_group" ] && [ "$METAL_RESULT" = "skipped" ]; then
               echo "metal-parity skipped on merge_group by design — its enforcement point is the PR run."
             else
-              echo "::error::Engine changed and metal attention parity did not succeed (result=$METAL_RESULT)."
+              echo "::error::Engine changed and the metal parity ratchet did not succeed (result=$METAL_RESULT)."
               exit 1
             fi
           fi
