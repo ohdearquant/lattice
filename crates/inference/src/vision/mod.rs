@@ -34,6 +34,7 @@
 //! // state.generate_multimodal(mm_input, gen_cfg);
 //! ```
 
+pub mod checkpoint;
 pub mod config;
 pub mod merger;
 pub mod multimodal;
