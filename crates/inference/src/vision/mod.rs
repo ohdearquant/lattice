@@ -12,14 +12,21 @@
 //! `tests/vision_s3_vit_forward_test.rs`, wired as a required CI job).
 //! [`qwen35_vit_metal::qwen35_vit_forward_metal`] is the Metal port (S3b),
 //! gated against the S3a CPU reference under the machine GPU lock in
-//! `tests/vision_s3b_vit_metal_gate_test.rs`. S4 (spatial-merger +
-//! image-token expansion) and S5 (decoder injection + M-RoPE) are
+//! `tests/vision_s3b_vit_metal_gate_test.rs`.
+//! [`qwen35_merger::qwen35_merger_forward`] runs the spatial-merge +
+//! projection MLP over the pre-merger hidden states, producing the
+//! post-merger visual embeddings `[num_patches / spatial_merge_size^2,
+//! out_hidden_size]` that the decoder consumes (S4 — gated at cosine >
+//! 0.999 vs a committed HF differential golden in
+//! `tests/vision_s4_merger_test.rs`). S5 (decoder injection + M-RoPE) is
 //! unimplemented — **this is the path future vision work should build on.**
 //!
 //! ```text
 //! image bytes → preprocess_qwen35_image → qwen35_vit_forward
 //!   → [num_patches, hidden_size] pre-merger hidden states
-//!   (S4/S5 not yet implemented: no merger, no decoder injection)
+//!   → qwen35_merger_forward
+//!   → [num_patches / spatial_merge_size^2, out_hidden_size] post-merger visual embeddings
+//!   (S5 not yet implemented: no decoder injection)
 //! ```
 //!
 //! ## The inert scaffold: hypothetical Qwen3-VL 7B (ADR-049)
@@ -72,6 +79,7 @@ pub mod config;
 pub mod merger;
 pub mod multimodal;
 pub mod preprocess;
+pub mod qwen35_merger;
 pub mod qwen35_vit;
 pub mod qwen35_vit_metal;
 pub mod vit;
