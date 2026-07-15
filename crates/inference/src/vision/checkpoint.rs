@@ -227,6 +227,19 @@ fn load_from_q4_dir(
         .iter()
         .filter(|e| e.name.starts_with("model.visual."))
     {
+        // `HashMap::insert` below would silently let a later duplicate-named entry
+        // overwrite an earlier one, making `tensors.is_empty()` (the inventory-exactness
+        // check in `assemble`) blind to a manifest that names the same tensor twice.
+        // Reject the duplicate here, before reading its file, so a corrupted manifest
+        // fails deterministically instead of depending on entry order.
+        if tensors.contains_key(&entry.name) {
+            return Err(InferenceError::Inference(format!(
+                "vision checkpoint manifest in {}: duplicate entry for tensor {} -- \
+                 each model.visual.* tensor name must appear exactly once",
+                model_dir.display(),
+                entry.name,
+            )));
+        }
         let file_path = model_dir.join(&entry.file);
         let (data, shape) = if entry.quantized.unwrap_or(false) {
             let q4 = load_q4_file(&file_path).map_err(|e| {
@@ -719,6 +732,63 @@ mod tests {
         .expect("test setup: write manifest");
 
         assert_fc2_shape_mismatch(load_qwen35_vision_weights(tmp.path(), &cfg));
+    }
+
+    #[test]
+    fn q4_manifest_duplicate_visual_tensor_name_is_rejected() {
+        // A tiny valid q4 inventory (all 21 entries `tiny_vision_cfg` expects, each with
+        // a correct shape) plus one repeated `model.visual.*` name must be rejected
+        // before `assemble`'s inventory-exactness check ever runs -- otherwise
+        // `HashMap::insert` would silently let the duplicate's file overwrite the
+        // first's, and the loader would return `Ok` depending on manifest entry order.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_vision_cfg();
+        let shapes = tiny_expected_shapes();
+
+        let mut manifest_entries = Vec::new();
+        for (i, (name, shape)) in shapes.iter().enumerate() {
+            let numel: usize = shape.iter().product();
+            let data: Vec<f64> = vec![0.25_f64; numel];
+            let q4 = crate::weights::q4_weights::quantize_f64_to_q4(&data, shape)
+                .expect("quantize succeeds");
+            let file_name = format!("t{i}.q4");
+            crate::weights::q4_weights::save_q4_file(&tmp.path().join(&file_name), &q4)
+                .expect("test setup: write q4 file");
+            manifest_entries.push(format!(
+                r#"{{"name":"{name}","file":"{file_name}","quantized":true}}"#
+            ));
+        }
+        // Duplicate: same name and shape as an existing entry, written to a distinct
+        // file so a naive "does the file exist" check would not catch it.
+        let (dup_name, dup_shape) = &shapes[0];
+        let dup_numel: usize = dup_shape.iter().product();
+        let dup_q4 =
+            crate::weights::q4_weights::quantize_f64_to_q4(&vec![0.5_f64; dup_numel], dup_shape)
+                .expect("quantize succeeds");
+        let dup_file_name = "dup.q4";
+        crate::weights::q4_weights::save_q4_file(&tmp.path().join(dup_file_name), &dup_q4)
+            .expect("test setup: write duplicate q4 file");
+        manifest_entries.push(format!(
+            r#"{{"name":"{dup_name}","file":"{dup_file_name}","quantized":true}}"#
+        ));
+
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!("[{}]", manifest_entries.join(",")),
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &cfg)
+            .expect_err("a duplicate model.visual.* manifest entry must be rejected");
+        match err {
+            InferenceError::Inference(msg) => {
+                assert!(
+                    msg.contains("duplicate") && msg.contains(dup_name),
+                    "expected a duplicate-entry error naming {dup_name}, got: {msg}"
+                );
+            }
+            other => panic!("expected InferenceError::Inference, got {other:?}"),
+        }
     }
 
     #[test]
