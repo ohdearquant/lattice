@@ -6,8 +6,12 @@
 //! have a committed cross-framework target before any lattice vision
 //! forward-pass code exists. This test exercises the fixture-reading side of
 //! that contract — `manifest.json` parses, the two raw little-endian f32
-//! `.bin` tensors round-trip to their recorded shape/sha256/finiteness, and
-//! the JSON side-fixtures cross-check against the manifest — WITHOUT running
+//! `.bin` tensors round-trip to their recorded shape/sha256/finiteness, the
+//! golden PNG hash/dimension-verifies, the image-token id is counted end to
+//! end, the documented M-RoPE position-id properties are checked across their
+//! FULL ranges (not a single prefix position), and a block of hardcoded
+//! anchor constants (`anchors` module below) cross-checks the fixtures
+//! independently of anything `manifest.json` itself claims — WITHOUT running
 //! any engine forward pass. It exists so fixture-loading code is written and
 //! exercised in CI before S3 needs it, not after.
 
@@ -15,6 +19,38 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+/// Reviewed anchor constants for the pinned HF source + generation
+/// methodology. Deliberately NOT read from `manifest.json`: a corrupted or
+/// maliciously "self-consistent" regeneration that mutates both a fixture
+/// file and the manifest entry describing it must still be caught here,
+/// because these values are fixed at review time and only change as part of
+/// an explicitly reviewed fixture refresh (bump them by hand, in this file).
+mod anchors {
+    // Fixed filenames, not read from the manifest's `path` fields, so an
+    // edited manifest can't redirect these checks onto a different file.
+    pub const GOLDEN_IMAGE_FILE: &str = "golden_image.png";
+    pub const VIT_PRE_MERGER_FILE: &str = "vit_pre_merger_f32.bin";
+    pub const VIT_POST_MERGER_FILE: &str = "vit_post_merger_f32.bin";
+
+    pub const HF_PROCESSOR_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
+    pub const PROMPT: &str = "Describe this image.";
+
+    /// `<|image_pad|>` token id (see `tests/fixtures/vision/README.md`).
+    pub const IMAGE_TOKEN_ID: i64 = 248056;
+    pub const NUM_IMAGE_TOKENS: usize = 64;
+
+    pub const VIT_PRE_MERGER_SHA256: &str =
+        "1a82b0bb6c873fb6aa62b35e33ad7c6c0bc50f028b119e3e4862f6bc0bdf62d3";
+    pub const VIT_POST_MERGER_SHA256: &str =
+        "6b5ef28b198a370449bbbcd7bdfcf5cbe82b5d03fdd750e91336fb38fa4cacf9";
+    pub const GOLDEN_IMAGE_SHA256: &str =
+        "d5083740a73e5d90cce9f75c7e7eac7efcb965ae9ad0f173ded2e370e6d7924b";
+    pub const GOLDEN_IMAGE_WIDTH: u32 = 256;
+    pub const GOLDEN_IMAGE_HEIGHT: u32 = 256;
+
+    pub const GREEDY_TOKENS: [i64; 8] = [1919, 2099, 369, 264, 2972, 12896, 518, 19556];
+}
 
 #[derive(Deserialize)]
 struct TensorManifest {
@@ -33,11 +69,19 @@ struct JsonFileManifest {
 }
 
 #[derive(Deserialize)]
+struct ImageManifest {
+    path: String,
+    size: [u32; 2],
+    sha256: String,
+}
+
+#[derive(Deserialize)]
 struct Manifest {
     schema_version: u32,
     adr: String,
     image_grid_thw: Vec<[u64; 3]>,
     num_image_placeholder_tokens: usize,
+    image: ImageManifest,
     vit_pre_merger: TensorManifest,
     vit_post_merger: TensorManifest,
     input_ids: JsonFileManifest,
@@ -108,6 +152,25 @@ fn load_f32_tensor(dir: &Path, tm: &TensorManifest) -> Vec<f32> {
         .collect();
     assert_eq!(values.len(), tm.num_elements);
     values
+}
+
+/// Parse a PNG's IHDR chunk directly (no image-decoding dependency needed for
+/// a plain, uncompressed-metadata dimension check): 8-byte signature, then a
+/// 4-byte chunk length, `b"IHDR"`, 4-byte width, 4-byte height (both
+/// big-endian), bit depth, color type.
+fn png_dimensions(bytes: &[u8]) -> (u32, u32, u8, u8) {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    assert!(
+        bytes.len() >= 26,
+        "file too short to contain a PNG IHDR chunk"
+    );
+    assert_eq!(&bytes[0..8], &SIGNATURE, "missing PNG signature");
+    assert_eq!(&bytes[12..16], b"IHDR", "first PNG chunk is not IHDR");
+    let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+    let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+    let bit_depth = bytes[24];
+    let color_type = bytes[25];
+    (width, height, bit_depth, color_type)
 }
 
 fn load_json_checked(dir: &Path, jm: &JsonFileManifest) -> Value {
@@ -236,4 +299,228 @@ fn token_and_position_fixtures_are_internally_consistent() {
         "greedy_tokens.json max_new_tokens must match the recorded token count"
     );
     assert!(!token_ids.is_empty(), "expected at least one greedy token");
+}
+
+#[test]
+fn image_fixture_hash_and_dimensions_verified() {
+    let dir = fixture_dir();
+    let manifest: Manifest =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+
+    let path = dir.join(&manifest.image.path);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
+
+    assert_eq!(
+        sha256_hex(&bytes),
+        manifest.image.sha256,
+        "golden_image.png sha256 mismatch vs manifest.json (fixture replaced or deleted without updating the manifest)"
+    );
+
+    let (width, height, bit_depth, color_type) = png_dimensions(&bytes);
+    assert_eq!(
+        [width, height],
+        manifest.image.size,
+        "PNG dimensions mismatch vs manifest.json"
+    );
+    assert_eq!(width, 256, "expected a 256x256 golden image");
+    assert_eq!(height, 256, "expected a 256x256 golden image");
+    assert_eq!(bit_depth, 8, "expected an 8-bit-depth PNG");
+    assert_eq!(
+        color_type, 2,
+        "expected PNG color type 2 (RGB truecolor, no alpha)"
+    );
+}
+
+#[test]
+fn image_token_id_count_and_position_id_full_range_properties() {
+    let dir = fixture_dir();
+    let manifest: Manifest =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+
+    let input_ids_json = load_json_checked(&dir, &manifest.input_ids);
+    let input_ids: Vec<i64> = input_ids_json
+        .as_array()
+        .expect("input_ids.json is a JSON array")
+        .iter()
+        .map(|v| v.as_i64().expect("input_ids entries are integers"))
+        .collect();
+
+    let image_positions: Vec<usize> = input_ids
+        .iter()
+        .enumerate()
+        .filter(|&(_, &tok)| tok == anchors::IMAGE_TOKEN_ID)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        image_positions.len(),
+        anchors::NUM_IMAGE_TOKENS,
+        "expected exactly {} occurrences of image token id {} in input_ids",
+        anchors::NUM_IMAGE_TOKENS,
+        anchors::IMAGE_TOKEN_ID
+    );
+    assert_eq!(
+        image_positions.len(),
+        manifest.num_image_placeholder_tokens,
+        "image token count must match manifest.num_image_placeholder_tokens"
+    );
+
+    let position_ids_json = load_json_checked(&dir, &manifest.position_ids);
+    let axis_values = |i: usize| -> Vec<i64> {
+        position_ids_json["values"][i]
+            .as_array()
+            .unwrap_or_else(|| panic!("position_ids.values[{i}] missing"))
+            .iter()
+            .map(|v| v.as_i64().expect("position id entries are integers"))
+            .collect()
+    };
+    let t = axis_values(0);
+    let h = axis_values(1);
+    let w = axis_values(2);
+    assert_eq!(t.len(), input_ids.len());
+    assert_eq!(h.len(), input_ids.len());
+    assert_eq!(w.len(), input_ids.len());
+
+    // Image span must be contiguous, since the M-RoPE grid-sweep check below
+    // assumes an unbroken run of merged-grid positions.
+    let first_image_pos = *image_positions.first().unwrap();
+    let last_image_pos = *image_positions.last().unwrap();
+    assert_eq!(
+        image_positions,
+        (first_image_pos..=last_image_pos).collect::<Vec<_>>(),
+        "image token positions must be contiguous"
+    );
+
+    // FULL-range prefix collapse: every position strictly before the image
+    // span must have t == h == w (not just position 0).
+    for i in 0..first_image_pos {
+        assert_eq!(
+            (t[i], h[i]),
+            (w[i], w[i]),
+            "text-prefix position {i} did not collapse to 1-D (t == h == w)"
+        );
+    }
+
+    // FULL-range image-span divergence + merged-grid sweep pattern: t stays
+    // constant across the whole image span while h/w sweep the merged
+    // grid_h x grid_w grid (spatial_merge_size = 2), as documented in
+    // tests/fixtures/vision/README.md.
+    let [_grid_t, grid_h, grid_w] = manifest.image_grid_thw[0];
+    let merge = 2u64;
+    let merged_h = grid_h / merge;
+    let merged_w = grid_w / merge;
+    assert_eq!(
+        (merged_h * merged_w) as usize,
+        anchors::NUM_IMAGE_TOKENS,
+        "merged grid size must equal the image token count"
+    );
+    let t_image = t[first_image_pos];
+    let h0 = h[first_image_pos];
+    let w0 = w[first_image_pos];
+    for (k, &pos) in image_positions.iter().enumerate() {
+        let k = k as u64;
+        assert_eq!(
+            t[pos], t_image,
+            "image-span position {pos} t axis must stay constant"
+        );
+        assert_eq!(
+            h[pos] as u64,
+            h0 as u64 + k / merged_w,
+            "image-span position {pos} h axis does not match the merged-grid sweep"
+        );
+        assert_eq!(
+            w[pos] as u64,
+            w0 as u64 + k % merged_w,
+            "image-span position {pos} w axis does not match the merged-grid sweep"
+        );
+    }
+    // Divergence across the whole span (not necessarily at every single
+    // position — the grid sweep above pins the exact per-position values,
+    // which is strictly stronger; this just also checks the h/w axes are not
+    // *identical arrays* across the span, matching the generator's own
+    // `image_span_positions_diverge` sanity check).
+    assert_ne!(
+        image_positions.iter().map(|&i| h[i]).collect::<Vec<_>>(),
+        image_positions.iter().map(|&i| w[i]).collect::<Vec<_>>(),
+        "image-span h and w axes must diverge somewhere across the span"
+    );
+
+    // FULL-range trailing-text reconvergence: every position after the image
+    // span collapses back to 1-D and continues incrementing by 1.
+    for i in (last_image_pos + 1)..t.len() {
+        assert_eq!(
+            (t[i], h[i]),
+            (w[i], w[i]),
+            "trailing-text position {i} did not reconverge to 1-D (t == h == w)"
+        );
+    }
+    for i in (last_image_pos + 2)..t.len() {
+        assert_eq!(
+            t[i],
+            t[i - 1] + 1,
+            "trailing-text position ids did not increment by 1 at position {i}"
+        );
+    }
+}
+
+#[test]
+fn anchored_reference_values_match_reviewed_constants() {
+    let dir = fixture_dir();
+
+    // Deliberately re-parsed as raw JSON (not the `Manifest` struct) and
+    // cross-checked against `anchors`, so a mutation to `manifest.json`
+    // itself cannot make this test pass — these constants are fixed here,
+    // independent of anything the manifest claims about itself.
+    let manifest_raw: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest_raw["source"]["hf_processor_revision"].as_str(),
+        Some(anchors::HF_PROCESSOR_REVISION),
+        "pinned HF source revision drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        manifest_raw["prompt"].as_str(),
+        Some(anchors::PROMPT),
+        "fixture prompt drifted from the reviewed anchor"
+    );
+
+    let image_bytes = std::fs::read(dir.join(anchors::GOLDEN_IMAGE_FILE))
+        .unwrap_or_else(|e| panic!("reading {}: {e}", anchors::GOLDEN_IMAGE_FILE));
+    assert_eq!(
+        sha256_hex(&image_bytes),
+        anchors::GOLDEN_IMAGE_SHA256,
+        "golden_image.png content drifted from the reviewed anchor digest"
+    );
+    let (width, height, _bit_depth, _color_type) = png_dimensions(&image_bytes);
+    assert_eq!(width, anchors::GOLDEN_IMAGE_WIDTH);
+    assert_eq!(height, anchors::GOLDEN_IMAGE_HEIGHT);
+
+    let pre_bytes = std::fs::read(dir.join(anchors::VIT_PRE_MERGER_FILE))
+        .unwrap_or_else(|e| panic!("reading {}: {e}", anchors::VIT_PRE_MERGER_FILE));
+    assert_eq!(
+        sha256_hex(&pre_bytes),
+        anchors::VIT_PRE_MERGER_SHA256,
+        "vit_pre_merger_f32.bin content drifted from the reviewed anchor digest"
+    );
+
+    let post_bytes = std::fs::read(dir.join(anchors::VIT_POST_MERGER_FILE))
+        .unwrap_or_else(|e| panic!("reading {}: {e}", anchors::VIT_POST_MERGER_FILE));
+    assert_eq!(
+        sha256_hex(&post_bytes),
+        anchors::VIT_POST_MERGER_SHA256,
+        "vit_post_merger_f32.bin content drifted from the reviewed anchor digest"
+    );
+
+    let manifest: Manifest = serde_json::from_value(manifest_raw).unwrap();
+    let greedy = load_json_checked(&dir, &manifest.greedy_tokens);
+    let token_ids: Vec<i64> = greedy["token_ids"]
+        .as_array()
+        .expect("greedy_tokens.token_ids")
+        .iter()
+        .map(|v| v.as_i64().expect("greedy token ids are integers"))
+        .collect();
+    assert_eq!(
+        token_ids,
+        anchors::GREEDY_TOKENS.to_vec(),
+        "greedy decode tokens drifted from the reviewed anchor"
+    );
 }

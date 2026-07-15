@@ -55,6 +55,7 @@ import urllib.request
 from pathlib import Path
 
 import numpy as np
+import PIL
 from PIL import Image, ImageDraw
 
 HF_MODEL_ID = "Qwen/Qwen3.5-0.8B"
@@ -74,6 +75,24 @@ IMAGE_SEED = 20260714
 PROMPT = "Describe this image."
 MAX_NEW_TOKENS = 8
 SCHEMA_VERSION = 1
+
+# Runtime versions this fixture set was actually generated with (pinned exactly
+# in pyproject.toml `[tool.uv] dev-dependencies`). `validate_runtime_versions`
+# rejects any drift from these BEFORE the model is loaded, so a `uv run` that
+# resolves a newer torch/torchvision/pillow/transformers fails closed instead
+# of silently regenerating a fixture with different CPU numerics.
+REFERENCE_VERSIONS = {
+    "torch": "2.13.0",
+    "torchvision": "0.28.0",
+    "pillow": "12.3.0",
+    "transformers": "5.12.1",
+}
+
+# Files whose byte-identity to the pinned HF Hub revision is load-bearing: the
+# checkpoint's own weight layout (`model.safetensors.index.json`) and config
+# must both match, or `build_merged_dir` would silently symlink shards from a
+# checkpoint that has drifted from the pinned revision.
+PINNED_HUB_FILES = ("config.json", "model.safetensors.index.json")
 
 
 def sha256_file(path: Path) -> str:
@@ -123,16 +142,57 @@ def make_golden_image(path: Path) -> None:
     img.save(path, format="PNG", optimize=False, compress_level=6)
 
 
-def verify_checkpoint_matches_hub(model_dir: Path) -> None:
-    url = f"https://huggingface.co/{HF_MODEL_ID}/raw/{HF_PROCESSOR_REVISION}/config.json"
+def _fetch_hub_raw(name: str) -> bytes:
+    url = f"https://huggingface.co/{HF_MODEL_ID}/raw/{HF_PROCESSOR_REVISION}/{name}"
     with urllib.request.urlopen(url, timeout=30) as resp:
-        remote_config = resp.read()
-    local_config = (model_dir / "config.json").read_bytes()
-    if remote_config != local_config:
+        return resp.read()
+
+
+def _compare_pinned_files(model_dir: Path, fetch) -> None:
+    """Byte-compare every file in `PINNED_HUB_FILES` against the pinned Hub
+    revision. `fetch` is injected (name -> bytes) so this is unit-testable
+    offline; production callers pass `_fetch_hub_raw`.
+
+    Checks BOTH `config.json` and `model.safetensors.index.json` so a
+    checkpoint that kept a matching config but drifted its shard layout
+    (index.json) is rejected too, not just a config-only drift.
+    """
+    for name in PINNED_HUB_FILES:
+        remote = fetch(name)
+        local = (model_dir / name).read_bytes()
+        if remote != local:
+            raise RuntimeError(
+                f"{model_dir}/{name} does not match HF Hub {HF_MODEL_ID}@{HF_PROCESSOR_REVISION}; "
+                "the checkpoint has drifted from the pinned revision (or the pinned processor files "
+                "fetched below would not correspond to this checkpoint). "
+                "Re-pin HF_PROCESSOR_REVISION to a commit matching your local checkpoint, or restore "
+                "the pinned checkpoint."
+            )
+
+
+def verify_checkpoint_matches_hub(model_dir: Path) -> None:
+    _compare_pinned_files(model_dir, _fetch_hub_raw)
+
+
+def validate_runtime_versions(actual: dict) -> None:
+    """Reject a runtime whose torch/torchvision/pillow/transformers versions
+    differ from `REFERENCE_VERSIONS` — called BEFORE the model is loaded.
+
+    The manifest still records the actual versions observed (provenance), but
+    that recording is not itself a drift signal: this check is the drift
+    signal, and it fails closed before any fixture bytes are produced.
+    """
+    mismatches = {
+        name: {"expected": expected, "actual": actual.get(name)}
+        for name, expected in REFERENCE_VERSIONS.items()
+        if actual.get(name) != expected
+    }
+    if mismatches:
         raise RuntimeError(
-            f"{model_dir}/config.json does not match HF Hub {HF_MODEL_ID}@{HF_PROCESSOR_REVISION}; "
-            "the pinned processor files fetched below would not correspond to this checkpoint. "
-            "Re-pin HF_PROCESSOR_REVISION to a commit matching your local config.json."
+            "runtime dependency versions differ from the pinned reference this fixture set was "
+            f"generated with: {mismatches}. Install the exact pins from pyproject.toml, or if this "
+            "is an intentional upgrade, update REFERENCE_VERSIONS and regenerate+re-review the "
+            "fixtures (version drift can change CPU forward-pass numerics)."
         )
 
 
@@ -202,8 +262,20 @@ def write_json(path: Path, obj) -> dict:
 
 def run(model_dir: Path, out_dir: Path) -> None:
     import torch
+    import torchvision
     import transformers
     from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    # Fail closed on runtime drift BEFORE the model is loaded or any output is
+    # created — a version mismatch can silently change CPU forward-pass numerics.
+    validate_runtime_versions(
+        {
+            "torch": torch.__version__,
+            "torchvision": torchvision.__version__,
+            "pillow": PIL.__version__,
+            "transformers": transformers.__version__,
+        }
+    )
 
     torch.manual_seed(IMAGE_SEED)
     torch.set_num_threads(1)
@@ -266,6 +338,8 @@ def run(model_dir: Path, out_dir: Path) -> None:
 
         transformers_version = transformers.__version__
         torch_version = torch.__version__
+        torchvision_version = torchvision.__version__
+        pillow_version = PIL.__version__
         python_version = sys.version.split()[0]
 
     # --- sanity checks (also recorded in manifest.json / asserted by the caller) ---
@@ -295,6 +369,8 @@ def run(model_dir: Path, out_dir: Path) -> None:
             "model_dir_safetensors_index_sha256": sha256_file(model_dir / "model.safetensors.index.json"),
             "transformers_version": transformers_version,
             "torch_version": torch_version,
+            "torchvision_version": torchvision_version,
+            "pillow_version": pillow_version,
             "python_version": python_version,
         },
         "image": {
@@ -349,15 +425,87 @@ def run(model_dir: Path, out_dir: Path) -> None:
     print(json.dumps(manifest["sanity_checks"], indent=2))
 
 
+def self_test() -> None:
+    """Offline unit tests for the fail-closed regeneration guards. No network
+    access, no model load — exercises `_compare_pinned_files` and
+    `validate_runtime_versions` directly with injected/synthetic data.
+
+    Exits non-zero (via AssertionError) on the first guard that does not fail
+    closed the way it is supposed to.
+    """
+    # --- _compare_pinned_files: matching files pass; a drifted index.json or
+    # config.json must each fail BEFORE any output would be created. ---
+    with tempfile.TemporaryDirectory(prefix="vision-goldens-selftest-") as tmp:
+        model_dir = Path(tmp)
+        (model_dir / "config.json").write_bytes(b'{"model_type": "qwen3_5_vl"}')
+        (model_dir / "model.safetensors.index.json").write_bytes(b'{"weight_map": {}}')
+
+        def fetch_matching(name: str) -> bytes:
+            return (model_dir / name).read_bytes()
+
+        _compare_pinned_files(model_dir, fetch_matching)  # must not raise
+
+        def fetch_drifted_index(name: str) -> bytes:
+            if name == "model.safetensors.index.json":
+                return b'{"weight_map": {"drifted": "yes"}}'
+            return (model_dir / name).read_bytes()
+
+        try:
+            _compare_pinned_files(model_dir, fetch_drifted_index)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(
+                "_compare_pinned_files did not fail closed on a drifted model.safetensors.index.json"
+            )
+
+        def fetch_drifted_config(name: str) -> bytes:
+            if name == "config.json":
+                return b'{"model_type": "something_else"}'
+            return (model_dir / name).read_bytes()
+
+        try:
+            _compare_pinned_files(model_dir, fetch_drifted_config)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("_compare_pinned_files did not fail closed on a drifted config.json")
+
+    # --- validate_runtime_versions: exact reference match passes; any single
+    # dependency drifting from REFERENCE_VERSIONS must fail. ---
+    validate_runtime_versions(dict(REFERENCE_VERSIONS))  # must not raise
+
+    for name in REFERENCE_VERSIONS:
+        drifted = dict(REFERENCE_VERSIONS)
+        drifted[name] = "0.0.0-selftest-drift"
+        try:
+            validate_runtime_versions(drifted)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"validate_runtime_versions did not fail closed on {name!r} drift")
+
+    print("self-test: OK (checkpoint-drift guard and version guard both fail closed as expected)")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-dir", type=Path, default=Path("~/.lattice/models/qwen3.5-0.8b").expanduser())
     p.add_argument("--out", type=Path, default=Path("tests/fixtures/vision/"))
+    p.add_argument(
+        "--self-test",
+        action="store_true",
+        help="Run offline unit tests for the fail-closed regeneration guards and exit "
+        "(no network, no model load, no --model-dir/--out required).",
+    )
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.self_test:
+        self_test()
+        return
     model_dir = args.model_dir.expanduser().resolve()
     if not model_dir.exists():
         raise SystemExit(f"--model-dir {model_dir} does not exist")
