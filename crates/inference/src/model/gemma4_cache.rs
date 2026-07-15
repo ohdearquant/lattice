@@ -268,6 +268,36 @@ impl Gemma4KvCache {
 
         let first_shared = cfg.first_kv_shared_layer_idx();
 
+        // Size-arithmetic preflight, still before any allocation: every
+        // owner slot's `kv_dim` and `capacity * kv_dim` products must be
+        // representable. `Slot::try_new` re-checks these defensively, but by
+        // then the map/owner vectors below would already have been allocated
+        // for a config that is going to be rejected.
+        for owner_layer in 0..first_shared {
+            let head_dim = cfg.attn_head_dim(owner_layer);
+            let kv_dim = cfg
+                .num_key_value_heads
+                .checked_mul(head_dim)
+                .ok_or_else(|| {
+                    InferenceError::InvalidInput(format!(
+                        "gemma4 kv cache: num_key_value_heads ({}) * attn_head_dim ({head_dim}) \
+                         overflows usize for layer {owner_layer}",
+                        cfg.num_key_value_heads
+                    ))
+                })?;
+            let capacity = if cfg.is_global_layer(owner_layer) {
+                max_seq_len
+            } else {
+                cfg.sliding_window
+            };
+            capacity.checked_mul(kv_dim).ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "gemma4 kv cache: capacity ({capacity}) * kv_dim ({kv_dim}) overflows usize \
+                     for layer {owner_layer}"
+                ))
+            })?;
+        }
+
         // Non-shared layers 0..first_shared each get their own slot, in
         // order, so slot index == layer index for every non-shared layer.
         let mut layer_kv_slot = vec![0usize; n];
