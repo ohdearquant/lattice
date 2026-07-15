@@ -38,6 +38,25 @@ mod anchors {
     pub const HF_PROCESSOR_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
     pub const PROMPT: &str = "Describe this image.";
 
+    // Every load-bearing `source` field, fixed at review time. A
+    // self-consistent edit that changes `hf_model_id`, either checkpoint
+    // digest, or any runtime/Python version — while leaving the payload
+    // files and the manifest's own digests mutually consistent — must still
+    // be caught here, because `Source` (below) is deserialized and checked
+    // field-by-field against these constants, not against anything
+    // `manifest.json` claims about itself.
+    pub const HF_MODEL_ID: &str = "Qwen/Qwen3.5-0.8B";
+    pub const MODEL_DIR_CONFIG_SHA256: &str =
+        "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204";
+    pub const MODEL_DIR_SAFETENSORS_INDEX_SHA256: &str =
+        "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e";
+    pub const TORCH_VERSION: &str = "2.13.0";
+    pub const TORCHVISION_VERSION: &str = "0.28.0";
+    pub const PILLOW_VERSION: &str = "12.3.0";
+    pub const TRANSFORMERS_VERSION: &str = "5.12.1";
+    pub const NUMPY_VERSION: &str = "2.4.6";
+    pub const PYTHON_VERSION: &str = "3.11.12";
+
     /// `<|image_pad|>` token id (see `tests/fixtures/vision/README.md`).
     pub const IMAGE_TOKEN_ID: i64 = 248056;
     pub const NUM_IMAGE_TOKENS: usize = 64;
@@ -88,10 +107,29 @@ struct ImageManifest {
     sha256: String,
 }
 
+/// The full `source` provenance object, deserialized as a typed struct (not
+/// read field-by-field out of `Value`) so that adding a new load-bearing
+/// field to the generator without also anchoring it here is a compile error
+/// at the call site below, not a silent gap.
+#[derive(Deserialize)]
+struct Source {
+    hf_model_id: String,
+    hf_processor_revision: String,
+    model_dir_config_sha256: String,
+    model_dir_safetensors_index_sha256: String,
+    transformers_version: String,
+    torch_version: String,
+    torchvision_version: String,
+    pillow_version: String,
+    numpy_version: String,
+    python_version: String,
+}
+
 #[derive(Deserialize)]
 struct Manifest {
     schema_version: u32,
     adr: String,
+    source: Source,
     image_grid_thw: Vec<[u64; 3]>,
     num_image_placeholder_tokens: usize,
     image: ImageManifest,
@@ -478,22 +516,78 @@ fn image_token_id_count_and_position_id_full_range_properties() {
 #[test]
 fn anchored_reference_values_match_reviewed_constants() {
     let dir = fixture_dir();
+    let manifest_bytes = std::fs::read(dir.join("manifest.json")).unwrap();
 
-    // Deliberately re-parsed as raw JSON (not the `Manifest` struct) and
-    // cross-checked against `anchors`, so a mutation to `manifest.json`
-    // itself cannot make this test pass — these constants are fixed here,
-    // independent of anything the manifest claims about itself.
-    let manifest_raw: Value =
-        serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(
-        manifest_raw["source"]["hf_processor_revision"].as_str(),
-        Some(anchors::HF_PROCESSOR_REVISION),
-        "pinned HF source revision drifted from the reviewed anchor"
-    );
+    // Deliberately re-parsed as raw JSON (not the `Manifest` struct) for the
+    // one field (`prompt`) that isn't part of `Source`, and cross-checked
+    // against `anchors`, so a mutation to `manifest.json` itself cannot make
+    // this test pass — these constants are fixed here, independent of
+    // anything the manifest claims about itself.
+    let manifest_raw: Value = serde_json::from_slice(&manifest_bytes).unwrap();
     assert_eq!(
         manifest_raw["prompt"].as_str(),
         Some(anchors::PROMPT),
         "fixture prompt drifted from the reviewed anchor"
+    );
+
+    // Every load-bearing `source` field, deserialized as the full typed
+    // `Source` struct (not partial `Value` indexing) and checked against a
+    // reviewed anchor: model ID, processor revision, both checkpoint
+    // digests, and all six runtime/Python versions. A self-consistent edit
+    // that changes any of these together (e.g. a different `hf_model_id`
+    // plus a matching runtime version bump) must fail here even though it
+    // wouldn't touch any payload file's bytes.
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes).unwrap();
+    let source = &manifest.source;
+    assert_eq!(
+        source.hf_model_id,
+        anchors::HF_MODEL_ID,
+        "hf_model_id drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.hf_processor_revision,
+        anchors::HF_PROCESSOR_REVISION,
+        "pinned HF source revision drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.model_dir_config_sha256,
+        anchors::MODEL_DIR_CONFIG_SHA256,
+        "checkpoint config.json digest drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.model_dir_safetensors_index_sha256,
+        anchors::MODEL_DIR_SAFETENSORS_INDEX_SHA256,
+        "checkpoint model.safetensors.index.json digest drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.torch_version,
+        anchors::TORCH_VERSION,
+        "torch runtime version drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.torchvision_version,
+        anchors::TORCHVISION_VERSION,
+        "torchvision runtime version drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.pillow_version,
+        anchors::PILLOW_VERSION,
+        "pillow runtime version drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.transformers_version,
+        anchors::TRANSFORMERS_VERSION,
+        "transformers runtime version drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.numpy_version,
+        anchors::NUMPY_VERSION,
+        "numpy runtime version drifted from the reviewed anchor"
+    );
+    assert_eq!(
+        source.python_version,
+        anchors::PYTHON_VERSION,
+        "python runtime version drifted from the reviewed anchor"
     );
 
     let image_bytes = std::fs::read(dir.join(anchors::GOLDEN_IMAGE_FILE))
@@ -544,7 +638,6 @@ fn anchored_reference_values_match_reviewed_constants() {
         "position_ids.json content drifted from the reviewed anchor digest"
     );
 
-    let manifest: Manifest = serde_json::from_value(manifest_raw).unwrap();
     let greedy = load_json_checked(&dir, &manifest.greedy_tokens);
     let token_ids: Vec<i64> = greedy["token_ids"]
         .as_array()

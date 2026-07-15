@@ -59,6 +59,7 @@
     "hf_processor_revision": "2fc06364715b967f1860aea9cf38778875588b17",
     "model_dir_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
     "model_dir_safetensors_index_sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e",
+    "numpy_version": "2.4.6",
     "pillow_version": "12.3.0",
     "python_version": "3.11.12",
     "torch_version": "2.13.0",

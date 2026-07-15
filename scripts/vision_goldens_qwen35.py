@@ -200,20 +200,34 @@ def validate_runtime_versions(actual: dict) -> None:
 
 
 def preflight(model_dir: Path, actual_versions: dict, fetch=_fetch_hub_raw) -> None:
-    """Fail-closed guards that MUST complete, in this order, before `run()`
-    creates `out_dir` or loads the checkpoint: reject runtime dependency
-    drift, then verify the checkpoint's pinned files are byte-identical to
-    the pinned Hub revision.
-
-    This is the exact function `run()` calls before `out_dir.mkdir`, and
-    `self_test()` calls it directly (with an injected `fetch`) so a
-    regression that reorders `run()` to create output before this check
-    completes is caught offline, not just discovered live — a bare unit test
-    of `_compare_pinned_files`/`validate_runtime_versions` in isolation
-    cannot see the orchestration order in `run()` at all.
+    """Fail-closed guards that MUST complete before any output is created or
+    the checkpoint is loaded: reject runtime dependency drift, then verify
+    the checkpoint's pinned files are byte-identical to the pinned Hub
+    revision.
     """
     validate_runtime_versions(actual_versions)
     _compare_pinned_files(model_dir, fetch)
+
+
+def prepare_output(
+    model_dir: Path, out_dir: Path, actual_versions: dict, fetch=_fetch_hub_raw
+) -> None:
+    """The exact pre-output-creation portion of `run()`: run `preflight`
+    (fail-closed guards), then create `out_dir` — in that order, and ONLY in
+    that order.
+
+    `run()` calls this helper directly (passing its real `out_dir`) instead
+    of inlining `preflight(...)` followed by `out_dir.mkdir(...)`, so
+    `self_test()` can exercise the orchestration order itself: a regression
+    that moves `out_dir.mkdir` before `preflight` (inside this helper) is
+    caught offline, because `self_test()` calls this same helper with a
+    real, initially-absent `out_dir` and asserts it stays absent when the
+    guards raise. A bare unit test of `preflight`/`_compare_pinned_files`/
+    `validate_runtime_versions` in isolation cannot see this ordering at
+    all, since none of them take an `out_dir` argument.
+    """
+    preflight(model_dir, actual_versions, fetch=fetch)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
 
 def fetch_processor_files(merged_dir: Path) -> None:
@@ -299,12 +313,10 @@ def run(model_dir: Path, out_dir: Path) -> None:
     # any output is created: runtime dependency drift can silently change CPU
     # forward-pass numerics, and a drifted checkpoint must not leave a
     # newly-created (and then abandoned) output directory behind.
-    preflight(model_dir, actual_versions)
+    prepare_output(model_dir, out_dir, actual_versions)
 
     torch.manual_seed(IMAGE_SEED)
     torch.set_num_threads(1)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     image_path = out_dir / "golden_image.png"
     make_golden_image(image_path)
@@ -445,8 +457,8 @@ def run(model_dir: Path, out_dir: Path) -> None:
 def self_test() -> None:
     """Offline unit tests for the fail-closed regeneration guards. No network
     access, no model load — exercises `_compare_pinned_files`,
-    `validate_runtime_versions`, and `preflight` (the orchestration-order
-    guard `run()` calls before `out_dir.mkdir`) directly with
+    `validate_runtime_versions`, and `prepare_output` (the exact
+    pre-output-creation helper `run()` calls) directly with
     injected/synthetic data.
 
     Exits non-zero (via AssertionError) on the first guard that does not fail
@@ -504,13 +516,21 @@ def self_test() -> None:
         else:
             raise AssertionError(f"validate_runtime_versions did not fail closed on {name!r} drift")
 
-    # --- preflight orchestration order: `preflight` is the exact function
-    # `run()` calls before `out_dir.mkdir`. Proving it raises is not enough —
-    # a supplied, initially-absent output directory must REMAIN absent after
-    # it raises, since `run()` never reaches `out_dir.mkdir` in that case.
-    # This is what the isolated `_compare_pinned_files`/
-    # `validate_runtime_versions` calls above cannot detect: they say nothing
-    # about what `run()` does before/after calling them. ---
+    # --- prepare_output orchestration order: `prepare_output` is the exact
+    # helper `run()` calls, and it takes a real `out_dir` argument (unlike
+    # `preflight`), so this self-test can exercise the actual output-creation
+    # boundary rather than just the guards in isolation. Proving the guards
+    # raise is not enough — a supplied, initially-absent output directory
+    # must REMAIN absent after `prepare_output` raises for EITHER drift kind
+    # (version drift, checkpoint-index drift), since it never reaches
+    # `out_dir.mkdir` in that case; and the directory MUST be created when
+    # both guards pass, proving `prepare_output` really does perform the
+    # mkdir step and isn't just a stricter no-op guard. A regression that
+    # reorders `out_dir.mkdir` before the guards inside `prepare_output`
+    # makes both drift cases fail (the directory would exist when it must
+    # not), which the isolated `_compare_pinned_files`/
+    # `validate_runtime_versions` calls above cannot detect at all, since
+    # neither of them touches an output path. ---
     with tempfile.TemporaryDirectory(prefix="vision-goldens-selftest-order-") as tmp:
         tmp_path = Path(tmp)
         model_dir = tmp_path / "model"
@@ -531,35 +551,45 @@ def self_test() -> None:
         drifted_versions = dict(REFERENCE_VERSIONS)
         drifted_versions["numpy"] = "0.0.0-selftest-drift"
         try:
-            preflight(model_dir, drifted_versions, fetch=fetch_matching)
+            prepare_output(model_dir, out_dir_a, drifted_versions, fetch=fetch_matching)
         except RuntimeError:
             pass
         else:
-            raise AssertionError("preflight did not fail closed on a drifted runtime version")
+            raise AssertionError("prepare_output did not fail closed on a drifted runtime version")
         assert not out_dir_a.exists(), (
-            "preflight raised on a version drift but a supplied, initially-absent output "
-            "directory was created anyway (orchestration-order regression)"
+            "prepare_output raised on a version drift but a supplied, initially-absent output "
+            "directory was created anyway (orchestration-order regression: out_dir.mkdir moved "
+            "before preflight inside prepare_output)"
         )
 
         # Case B: matching runtime version but a drifted checkpoint index.
         out_dir_b = tmp_path / "out_checkpoint_drift"  # deliberately not created
         try:
-            preflight(model_dir, dict(REFERENCE_VERSIONS), fetch=fetch_drifted_index)
+            prepare_output(
+                model_dir, out_dir_b, dict(REFERENCE_VERSIONS), fetch=fetch_drifted_index
+            )
         except RuntimeError:
             pass
         else:
-            raise AssertionError("preflight did not fail closed on a drifted checkpoint index")
+            raise AssertionError("prepare_output did not fail closed on a drifted checkpoint index")
         assert not out_dir_b.exists(), (
-            "preflight raised on a drifted checkpoint but a supplied, initially-absent output "
+            "prepare_output raised on a drifted checkpoint but a supplied, initially-absent output "
             "directory was created anyway (orchestration-order regression: out_dir.mkdir moved "
-            "before preflight in run())"
+            "before preflight inside prepare_output)"
         )
 
-        # Matching checkpoint + matching versions must not raise.
-        preflight(model_dir, dict(REFERENCE_VERSIONS), fetch=fetch_matching)
+        # Case C: matching checkpoint + matching versions must not raise, and
+        # must CREATE the supplied out_dir — proving prepare_output performs
+        # the mkdir step at all (a helper that only ever raised, or always
+        # left out_dir absent, would vacuously pass cases A and B above).
+        out_dir_c = tmp_path / "out_success"  # deliberately not created
+        prepare_output(model_dir, out_dir_c, dict(REFERENCE_VERSIONS), fetch=fetch_matching)
+        assert out_dir_c.is_dir(), (
+            "prepare_output did not create the supplied out_dir when both guards passed"
+        )
 
     print(
-        "self-test: OK (checkpoint-drift guard, version guard, and preflight orchestration "
+        "self-test: OK (checkpoint-drift guard, version guard, and prepare_output orchestration "
         "order all fail closed as expected)"
     )
 
