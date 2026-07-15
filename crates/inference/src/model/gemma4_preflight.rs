@@ -17,7 +17,7 @@
 
 use crate::error::InferenceError;
 use crate::model::gemma4_config::{GEMMA4_EXPECTED_DTYPE, Gemma4Config};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One tensor entry from a safetensors header / manifest: dtype and shape.
 /// Deliberately narrower than a real safetensors header entry (no
@@ -236,6 +236,35 @@ pub fn preflight_check(
                 &mut report,
             )?;
         }
+    }
+
+    // Exhaustiveness (ADR-082 Amendment 1 / review finding 3): every
+    // supplied language-model tensor must have been consumed above, either
+    // by loading or by the shared-KV tolerate-and-skip category. A name
+    // that matches neither -- an extra, misspelled, or otherwise unexpected
+    // language-model tensor -- is unconsumed and must fail closed, naming
+    // the tensor, rather than passing silently. Non-language-model tensors
+    // (vision/audio towers) are out of this preflight's scope and are not
+    // checked here.
+    let consumed: HashSet<&str> = report
+        .loaded
+        .iter()
+        .chain(report.skipped_shared_kv.iter())
+        .map(String::as_str)
+        .collect();
+    let mut unconsumed: Vec<&str> = tensors
+        .keys()
+        .filter(|name| name.starts_with(LM_PREFIX) && !consumed.contains(name.as_str()))
+        .map(String::as_str)
+        .collect();
+    unconsumed.sort_unstable();
+    if let Some(&name) = unconsumed.first() {
+        return Err(InferenceError::Inference(format!(
+            "gemma4 preflight: unconsumed language-model tensor {name:?} was present in the \
+             supplied inventory but not required by any layer or the shared-KV skip category \
+             ({} unconsumed tensor(s) total)",
+            unconsumed.len()
+        )));
     }
 
     Ok(report)
@@ -463,6 +492,56 @@ mod tests {
         }
         // 600 total lm tensors - 60 skipped shared K/V = 540 loaded.
         assert_eq!(report.loaded.len(), 540);
+        assert_eq!(report.skipped_shared_kv.len(), 60);
+        // Exhaustiveness: every supplied language-model tensor was consumed
+        // exactly once, either loaded or skipped-as-shared-KV -- the input
+        // inventory count equals loaded + skipped with nothing left over.
+        assert_eq!(
+            tensors.len(),
+            report.loaded.len() + report.skipped_shared_kv.len()
+        );
+    }
+
+    #[test]
+    fn mutation_unexpected_language_model_tensor_fails_naming_tensor() {
+        let cfg = Gemma4Config::e2b();
+        let mut tensors = load_language_model_tensors();
+        let name = format!("{LM_PREFIX}layers.0.self_attn.mystery_proj.weight");
+        tensors.insert(
+            name.clone(),
+            TensorInfo {
+                dtype: GEMMA4_EXPECTED_DTYPE.to_string(),
+                shape: vec![1],
+            },
+        );
+
+        let err = preflight_check(&cfg, &tensors)
+            .expect_err("an unexpected language-model tensor must fail closed as unconsumed");
+        assert!(
+            err.to_string().contains(&name),
+            "error must name the unconsumed tensor {name}: {err}"
+        );
+    }
+
+    #[test]
+    fn mutation_shared_layer_kv_missing_entry_is_tolerated_and_absent_from_skip_report() {
+        let cfg = Gemma4Config::e2b();
+        let mut tensors = load_language_model_tensors();
+        let name = format!("{LM_PREFIX}layers.20.self_attn.k_proj.weight");
+        tensors.remove(&name);
+
+        let report = preflight_check(&cfg, &tensors)
+            .expect("a missing shared-layer K/V entry must be tolerated, not fail closed");
+        assert!(
+            !report.skipped_shared_kv.contains(&name),
+            "a missing shared-layer tensor must not appear in the skip report: {name}"
+        );
+        assert_eq!(report.skipped_shared_kv.len(), 59);
+        assert_eq!(
+            tensors.len(),
+            report.loaded.len() + report.skipped_shared_kv.len(),
+            "exhaustiveness must still hold with one fewer supplied and skipped tensor"
+        );
     }
 
     #[test]

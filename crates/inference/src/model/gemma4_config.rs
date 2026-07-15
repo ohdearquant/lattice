@@ -9,6 +9,15 @@
 //! layers, `global_head_dim` on global layers) rather than by sharing. This
 //! module parses and validates the config; [`crate::model::gemma4_preflight`]
 //! is what applies the resulting per-layer geometry to a tensor inventory.
+//!
+//! Parsing is fail-closed by construction: every forward-relevant field is
+//! read from an explicit, non-defaulted raw struct that mirrors the pinned
+//! target `config.json` (`google/gemma-4-E2B-it` @
+//! `9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf`, fixture
+//! `tests/fixtures/gemma4/e2b_config.json`) field-for-field, including the
+//! two nested `rope_parameters` records. A missing or wrong-shaped field is a
+//! serde error naming that field; there is no substitution of the E2B preset
+//! for an absent or partial `text_config`.
 
 use crate::error::InferenceError;
 use std::path::Path;
@@ -16,6 +25,20 @@ use std::path::Path;
 /// Expected safetensors dtype for every Gemma 4 E2B language-model tensor
 /// (header-verified, ADR-082 G16/G5).
 pub const GEMMA4_EXPECTED_DTYPE: &str = "BF16";
+
+/// The only `hidden_activation` value this loader supports (ADR-082 G7).
+const EXPECTED_HIDDEN_ACTIVATION: &str = "gelu_pytorch_tanh";
+
+/// The only `final_logit_softcapping` value this loader supports (ADR-082
+/// G10, target `config.json`).
+const EXPECTED_FINAL_LOGIT_SOFTCAPPING: f32 = 30.0;
+
+/// Binding E2B global-layer schedule (ADR-082 G3, header/config-verified):
+/// `full_attention` at exactly these zero-based indices, `sliding_attention`
+/// everywhere else. This is an exact observable of the pinned checkpoint, not
+/// a permissive default -- a checkpoint-provided `layer_types` that disagrees
+/// at any position is rejected, never repaired.
+const EXPECTED_GLOBAL_LAYER_INDICES: &[usize] = &[4, 9, 14, 19, 24, 29, 34];
 
 /// Per-layer attention kind (ADR-082 G3). Orthogonal to KV sharing: sharing
 /// is keyed on layer *index* (the final `num_kv_shared_layers` layers),
@@ -28,11 +51,11 @@ pub enum Gemma4LayerType {
 }
 
 /// **Unstable**: Gemma 4 E2B text-decoder configuration; fields evolving with
-/// model variants. Parsed from the `text_config` object of a Gemma 4 E2B
-/// `config.json` (vision/audio towers are out of scope for this stage; see
-/// ADR-082 stages 5-9).
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(default)]
+/// model variants. Built exclusively via [`Self::from_config_json_str`] (or
+/// its file-path wrappers) or [`Self::e2b`] -- there is no `Deserialize`
+/// impl on this type itself, so a caller cannot bypass the fail-closed raw
+/// parse in [`HfGemma4TextConfig`] by deserializing this struct directly.
+#[derive(Debug, Clone)]
 pub struct Gemma4Config {
     // --- Core dimensions (G2) ---
     pub hidden_size: usize,
@@ -51,24 +74,34 @@ pub struct Gemma4Config {
     /// Head width on `full_attention` (global) layers.
     pub global_head_dim: usize,
     pub sliding_window: usize,
+    /// `attention_k_eq_v` from the target config: whether K and V share
+    /// weights. E2B is `false` (G4) -- the family-card's general "K=V"
+    /// description does not apply to this checkpoint; `true` is unsupported
+    /// by this loader and rejected in [`Self::validate`].
+    pub attention_k_eq_v: bool,
+    /// `attention_bias` from the target config. E2B is `false`; `true` is
+    /// unsupported by this loader and rejected in [`Self::validate`].
+    pub attention_bias: bool,
 
     // --- Dual RoPE (G8) ---
-    /// Global-layer RoPE base (proportional, over `partial_rotary_factor` of
-    /// `global_head_dim`).
+    /// Global-layer RoPE base, from `rope_parameters.full_attention.rope_theta`
+    /// (proportional, over `partial_rotary_factor` of `global_head_dim`).
     pub rope_theta: f64,
-    /// Sliding-layer RoPE base (standard, full `head_dim`).
+    /// Sliding-layer RoPE base, from
+    /// `rope_parameters.sliding_attention.rope_theta` (standard, full
+    /// `head_dim`).
     pub rope_local_base_freq: f64,
-    /// Fraction of `global_head_dim` rotated on global layers. Sliding layers
-    /// always use full rotary (`head_dim`, not scaled by this factor).
+    /// Fraction of `global_head_dim` rotated on global layers, from
+    /// `rope_parameters.full_attention.partial_rotary_factor`. Sliding
+    /// layers always use full rotary (`head_dim`, not scaled by this
+    /// factor).
     pub partial_rotary_factor: f32,
 
     // --- Layer schedule (G3) ---
-    /// Every Nth layer (1-indexed) is `full_attention`; the rest are
-    /// `sliding_attention`. Used to derive `layer_types` when the checkpoint
-    /// config omits (or mis-sizes) the explicit array.
-    pub sliding_window_pattern: usize,
-    /// Precomputed per-layer attention kind, length = `num_hidden_layers`.
-    #[serde(default)]
+    /// Per-layer attention kind, length = `num_hidden_layers`. Parsed
+    /// verbatim from the checkpoint's own `layer_types` array and checked in
+    /// [`Self::validate`] against the exact binding E2B schedule -- never
+    /// regenerated from a pattern.
     pub layer_types: Vec<Gemma4LayerType>,
 
     // --- KV sharing (G5, Amendment 1) ---
@@ -78,17 +111,34 @@ pub struct Gemma4Config {
     /// on these layers — see [`Self::first_kv_shared_layer_idx`].
     pub num_kv_shared_layers: usize,
 
+    /// Raw `use_double_wide_mlp` flag from the target config. Cross-checked
+    /// in [`Self::validate`] against `num_kv_shared_layers`: this loader
+    /// requires it `true` whenever any layer is KV-shared, since the
+    /// reference runtime sets the double-wide MLP identically to
+    /// `is_kv_shared_layer` (Amendment 1, "G2/G7 corroboration") and a raw
+    /// `false` here would silently disagree with that invariant. See
+    /// [`Self::use_double_wide_mlp`].
+    pub use_double_wide_mlp_raw: bool,
+
     // --- Per-layer embeddings / PLE (G9) ---
     /// Width of the per-layer identity embedding gated into each layer.
     pub hidden_size_per_layer_input: usize,
 
+    // --- Output (G10) ---
+    /// MLP/activation nonlinearity name. Only `"gelu_pytorch_tanh"` is
+    /// supported by this loader; any other value is rejected in
+    /// [`Self::validate`].
+    pub hidden_activation: String,
+    /// Tanh soft-cap applied to final logits. Only `30.0` (the target
+    /// config's value) is supported by this loader; any other value is
+    /// rejected in [`Self::validate`].
+    pub final_logit_softcapping: f32,
+
     // --- Embedding/output projection ---
-    #[serde(default = "default_tie_word_embeddings")]
     pub tie_word_embeddings: bool,
 
     // --- Generation ---
     pub eos_token_id: u32,
-    #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
 }
 
@@ -100,32 +150,85 @@ fn default_max_position_embeddings() -> usize {
     131_072
 }
 
-// Private helper for the HF config.json structure: Gemma 4's text decoder
-// fields live under a `text_config` object, a sibling of `vision_config` /
-// `audio_config` (out of scope here) at the top level — the same wrapper
-// shape as Qwen3.5's `HfQwenConfigFile` in `qwen35_config.rs`.
+/// Raw `text_config` shape, mirroring the pinned target `config.json`
+/// field-for-field (`tests/fixtures/gemma4/e2b_config.json`). No
+/// container-level `#[serde(default)]`: every field here that affects
+/// forward-pass shape or numerics is required, so a missing or mistyped
+/// field is a serde error naming that field rather than a silent
+/// substitution. Only genuinely optional fields (`tie_word_embeddings`,
+/// `max_position_embeddings`) carry an explicit field-level default.
 #[derive(Debug, serde::Deserialize)]
-struct HfGemma4ConfigFile {
-    #[serde(default)]
-    text_config: Option<Gemma4Config>,
-    #[serde(default)]
-    tie_word_embeddings: Option<bool>,
+struct HfGemma4TextConfig {
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    vocab_size: usize,
+    intermediate_size: usize,
+    rms_norm_eps: f32,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    global_head_dim: usize,
+    sliding_window: usize,
+    attention_k_eq_v: bool,
+    attention_bias: bool,
+    rope_parameters: HfRopeParameters,
+    layer_types: Vec<Gemma4LayerType>,
+    num_kv_shared_layers: usize,
+    use_double_wide_mlp: bool,
+    hidden_size_per_layer_input: usize,
+    hidden_activation: String,
+    final_logit_softcapping: f32,
+    eos_token_id: u32,
+    #[serde(default = "default_tie_word_embeddings")]
+    tie_word_embeddings: bool,
+    #[serde(default = "default_max_position_embeddings")]
+    max_position_embeddings: usize,
 }
 
-impl Default for Gemma4Config {
-    fn default() -> Self {
-        Self::e2b()
-    }
+/// Raw `text_config.rope_parameters`: two nested per-attention-type RoPE
+/// records, as the target `config.json` actually nests them (ADR-082
+/// Amendment 1 / review finding 1) -- not the flat `rope_theta` /
+/// `rope_local_base_freq` shape this loader previously (incorrectly)
+/// expected at the top level of `text_config`.
+#[derive(Debug, serde::Deserialize)]
+struct HfRopeParameters {
+    full_attention: HfRopeParamFullAttention,
+    sliding_attention: HfRopeParamSlidingAttention,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HfRopeParamFullAttention {
+    rope_theta: f64,
+    partial_rotary_factor: f32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HfRopeParamSlidingAttention {
+    rope_theta: f64,
+}
+
+/// Private helper for the HF config.json structure: Gemma 4's text decoder
+/// fields live under a required `text_config` object, a sibling of
+/// `vision_config` / `audio_config` (out of scope here) at the top level —
+/// the same wrapper shape as Qwen3.5's `HfQwenConfigFile` in
+/// `qwen35_config.rs`. `text_config` is *not* `Option`: an absent
+/// `text_config` (e.g. `{}`) is a hard parse error naming `text_config`,
+/// never a silent substitution of the E2B preset.
+#[derive(Debug, serde::Deserialize)]
+struct HfGemma4ConfigFile {
+    text_config: HfGemma4TextConfig,
 }
 
 impl Gemma4Config {
     /// **Unstable**: default `google/gemma-4-E2B-it` text-decoder configuration
     /// (ADR-082 G2-G9; layer-schedule and KV-sharing indices header-verified
-    /// against the committed Stage-0 tensor manifest, PR #991).
+    /// against the committed Stage-0 tensor manifest, PR #991). Used as a
+    /// hardcoded starting point for tests and callers that want the known-good
+    /// preset directly rather than parsing a `config.json`; parsing a real
+    /// `config.json` never falls back to this value on missing/partial input.
     pub fn e2b() -> Self {
         let num_hidden_layers = 35;
-        let sliding_window_pattern = 5;
-        let layer_types = compute_layer_types(num_hidden_layers, sliding_window_pattern);
+        let layer_types = compute_layer_types(num_hidden_layers, 5);
 
         Self {
             hidden_size: 1536,
@@ -138,13 +241,17 @@ impl Gemma4Config {
             head_dim: 256,
             global_head_dim: 512,
             sliding_window: 512,
+            attention_k_eq_v: false,
+            attention_bias: false,
             rope_theta: 1_000_000.0,
             rope_local_base_freq: 10_000.0,
             partial_rotary_factor: 0.25,
-            sliding_window_pattern,
             layer_types,
             num_kv_shared_layers: 20,
+            use_double_wide_mlp_raw: true,
             hidden_size_per_layer_input: 256,
+            hidden_activation: EXPECTED_HIDDEN_ACTIVATION.to_string(),
+            final_logit_softcapping: EXPECTED_FINAL_LOGIT_SOFTCAPPING,
             tie_word_embeddings: true,
             eos_token_id: 1,
             max_position_embeddings: 131_072,
@@ -174,27 +281,43 @@ impl Gemma4Config {
         Self::from_config_json(&config_path)
     }
 
-    /// Parse HF Gemma 4 `config.json` text into a `Gemma4Config`.
+    /// Parse HF Gemma 4 `config.json` text into a `Gemma4Config`. Fail-closed:
+    /// `text_config` and every forward-relevant field within it are required
+    /// by [`HfGemma4TextConfig`]'s schema (no container-level
+    /// `#[serde(default)]`), so a missing or partial `text_config` is a
+    /// serde error naming the absent field rather than a silently-completed
+    /// E2B preset.
     pub fn from_config_json_str(json: &str) -> Result<Self, InferenceError> {
         let parsed: HfGemma4ConfigFile = serde_json::from_str(json)
             .map_err(|e| InferenceError::Inference(format!("invalid Gemma 4 config.json: {e}")))?;
-        let mut cfg = parsed.text_config.unwrap_or_else(Gemma4Config::e2b);
+        let raw = parsed.text_config;
 
-        if let Some(tie) = parsed.tie_word_embeddings {
-            cfg.tie_word_embeddings = tie;
-        }
-
-        if cfg.layer_types.len() != cfg.num_hidden_layers {
-            if cfg.sliding_window_pattern == 0 {
-                return Err(InferenceError::Inference(
-                    "invalid Gemma 4 config.json: sliding_window_pattern must be > 0 when \
-                     layer_types is absent or its length differs from num_hidden_layers"
-                        .to_string(),
-                ));
-            }
-            cfg.layer_types =
-                compute_layer_types(cfg.num_hidden_layers, cfg.sliding_window_pattern);
-        }
+        let cfg = Gemma4Config {
+            hidden_size: raw.hidden_size,
+            num_hidden_layers: raw.num_hidden_layers,
+            vocab_size: raw.vocab_size,
+            intermediate_size: raw.intermediate_size,
+            rms_norm_eps: raw.rms_norm_eps,
+            num_attention_heads: raw.num_attention_heads,
+            num_key_value_heads: raw.num_key_value_heads,
+            head_dim: raw.head_dim,
+            global_head_dim: raw.global_head_dim,
+            sliding_window: raw.sliding_window,
+            attention_k_eq_v: raw.attention_k_eq_v,
+            attention_bias: raw.attention_bias,
+            rope_theta: raw.rope_parameters.full_attention.rope_theta,
+            rope_local_base_freq: raw.rope_parameters.sliding_attention.rope_theta,
+            partial_rotary_factor: raw.rope_parameters.full_attention.partial_rotary_factor,
+            layer_types: raw.layer_types,
+            num_kv_shared_layers: raw.num_kv_shared_layers,
+            use_double_wide_mlp_raw: raw.use_double_wide_mlp,
+            hidden_size_per_layer_input: raw.hidden_size_per_layer_input,
+            hidden_activation: raw.hidden_activation,
+            final_logit_softcapping: raw.final_logit_softcapping,
+            tie_word_embeddings: raw.tie_word_embeddings,
+            eos_token_id: raw.eos_token_id,
+            max_position_embeddings: raw.max_position_embeddings,
+        };
 
         cfg.validate()?;
         Ok(cfg)
@@ -271,6 +394,12 @@ impl Gemma4Config {
                 "invalid Gemma 4 config.json: hidden_size_per_layer_input must be > 0".to_string(),
             ));
         }
+        // layer_types is an exact observable of the pinned E2B checkpoint
+        // (ADR-082 G3), not a repairable default: length must match
+        // num_hidden_layers AND the global-layer positions must match the
+        // binding schedule exactly. A same-length schedule with a global
+        // layer at the wrong index is rejected here, naming layer_types --
+        // it is never regenerated from a pattern.
         if self.layer_types.len() != self.num_hidden_layers {
             return Err(InferenceError::Inference(format!(
                 "invalid Gemma 4 config.json: layer_types has {} entries but \
@@ -279,12 +408,63 @@ impl Gemma4Config {
                 self.num_hidden_layers
             )));
         }
+        let global_indices: Vec<usize> = (0..self.layer_types.len())
+            .filter(|&i| self.layer_types[i] == Gemma4LayerType::FullAttention)
+            .collect();
+        if global_indices != EXPECTED_GLOBAL_LAYER_INDICES {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: layer_types full_attention indices {global_indices:?} \
+                 do not match the binding Gemma 4 E2B schedule {EXPECTED_GLOBAL_LAYER_INDICES:?}"
+            )));
+        }
         if self.num_kv_shared_layers > self.num_hidden_layers {
             return Err(InferenceError::Inference(format!(
                 "invalid Gemma 4 config.json: num_kv_shared_layers ({}) must be <= \
                  num_hidden_layers ({})",
                 self.num_kv_shared_layers, self.num_hidden_layers
             )));
+        }
+        // Amendment 1 / review finding 1: use_double_wide_mlp must not be a
+        // tautological function of is_kv_shared_layer. The raw checkpoint
+        // flag is required to agree with the derived KV-shared set: the
+        // reference runtime sets it identically (Amendment 1, "G2/G7
+        // corroboration"), so a raw `false` while any layer is KV-shared is
+        // a structural config/checkpoint disagreement, not a valid variant.
+        if self.num_kv_shared_layers > 0 && !self.use_double_wide_mlp_raw {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: use_double_wide_mlp is false but \
+                 num_kv_shared_layers ({}) implies is_kv_shared_layer is true for {} layer(s) -- \
+                 Gemma 4 E2B requires use_double_wide_mlp=true whenever KV-shared layers exist",
+                self.num_kv_shared_layers, self.num_kv_shared_layers
+            )));
+        }
+        if self.hidden_activation != EXPECTED_HIDDEN_ACTIVATION {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: hidden_activation ({:?}) is unsupported -- only \
+                 {EXPECTED_HIDDEN_ACTIVATION:?} is implemented",
+                self.hidden_activation
+            )));
+        }
+        if self.final_logit_softcapping != EXPECTED_FINAL_LOGIT_SOFTCAPPING {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: final_logit_softcapping ({}) is unsupported -- \
+                 only {EXPECTED_FINAL_LOGIT_SOFTCAPPING} is implemented",
+                self.final_logit_softcapping
+            )));
+        }
+        if self.attention_k_eq_v {
+            return Err(InferenceError::Inference(
+                "invalid Gemma 4 config.json: attention_k_eq_v=true is unsupported -- the \
+                 Gemma 4 E2B checkpoint this loader targets has attention_k_eq_v=false"
+                    .to_string(),
+            ));
+        }
+        if self.attention_bias {
+            return Err(InferenceError::Inference(
+                "invalid Gemma 4 config.json: attention_bias=true is unsupported -- the \
+                 Gemma 4 E2B checkpoint this loader targets has attention_bias=false"
+                    .to_string(),
+            ));
         }
         if !(self.rope_theta.is_finite() && self.rope_theta > 0.0) {
             return Err(InferenceError::Inference(format!(
@@ -369,14 +549,17 @@ impl Gemma4Config {
     }
 
     /// Whether `layer_idx` uses the double-wide (`2 * intermediate_size`)
-    /// MLP. Per ADR-082 Amendment 1 ("G2/G7 corroboration"), the reference
-    /// runtime sets this identically to [`Self::is_kv_shared_layer`] — the
-    /// checkpoint's own `mlp.*` shapes are therefore an independent,
-    /// second structural observable for the shared-layer set, which
-    /// [`crate::model::gemma4_preflight::preflight_check`] cross-checks
-    /// against this config-derived value.
+    /// MLP: the raw checkpoint `use_double_wide_mlp` flag AND `layer_idx`
+    /// being KV-shared. Not a tautological restatement of
+    /// [`Self::is_kv_shared_layer`] -- [`Self::validate`] rejects any config
+    /// where the raw flag disagrees with the KV-shared set, so by the time
+    /// this is called on a validated config the two conjuncts already agree,
+    /// but the raw flag is still an observed input, not a derived constant.
+    /// [`crate::model::gemma4_preflight::preflight_check`] cross-checks this
+    /// against the checkpoint's own `mlp.*` shapes as a second, independent
+    /// structural observable (Amendment 1, "G2/G7 corroboration").
     pub fn use_double_wide_mlp(&self, layer_idx: usize) -> bool {
-        self.is_kv_shared_layer(layer_idx)
+        self.use_double_wide_mlp_raw && self.is_kv_shared_layer(layer_idx)
     }
 
     /// Number of RoPE dimensions rotated on global (full-attention) layers.
@@ -388,7 +571,9 @@ impl Gemma4Config {
 /// Compute the layer type pattern: every `interval`-th layer (1-indexed) is
 /// full (global) attention, the rest are sliding. For interval=5 over 35
 /// layers this yields global layers at indices 4, 9, 14, 19, 24, 29, 34 —
-/// the header-verified ADR-082 G3 schedule.
+/// the header-verified ADR-082 G3 schedule. Used only to build the hardcoded
+/// [`Gemma4Config::e2b`] preset -- checkpoint-provided `layer_types` is never
+/// regenerated this way (see [`Gemma4Config::validate`]).
 pub(crate) fn compute_layer_types(num_layers: usize, interval: usize) -> Vec<Gemma4LayerType> {
     (0..num_layers)
         .map(|i| {
@@ -404,6 +589,23 @@ pub(crate) fn compute_layer_types(num_layers: usize, interval: usize) -> Vec<Gem
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("gemma4")
+            .join("e2b_config.json")
+    }
+
+    fn pinned_config_json() -> String {
+        std::fs::read_to_string(fixture_path()).expect("read committed pinned target config.json")
+    }
+
+    fn pinned_config_value() -> serde_json::Value {
+        serde_json::from_str(&pinned_config_json()).expect("pinned fixture is valid JSON")
+    }
 
     #[test]
     fn e2b_preset_matches_adr_082_dimensions() {
@@ -469,37 +671,30 @@ mod tests {
         assert_eq!(cfg.attn_head_dim(0), 256);
     }
 
-    fn minimal_config_json() -> String {
-        r#"{
-            "text_config": {
-                "hidden_size": 1536,
-                "num_hidden_layers": 35,
-                "vocab_size": 262144,
-                "intermediate_size": 6144,
-                "rms_norm_eps": 1e-6,
-                "num_attention_heads": 8,
-                "num_key_value_heads": 1,
-                "head_dim": 256,
-                "global_head_dim": 512,
-                "sliding_window": 512,
-                "rope_theta": 1000000.0,
-                "rope_local_base_freq": 10000.0,
-                "partial_rotary_factor": 0.25,
-                "sliding_window_pattern": 5,
-                "num_kv_shared_layers": 20,
-                "hidden_size_per_layer_input": 256,
-                "eos_token_id": 1
-            }
-        }"#
-        .to_string()
-    }
-
     #[test]
-    fn minimal_config_json_parses_and_derives_layer_types() {
-        let cfg = Gemma4Config::from_config_json_str(&minimal_config_json())
-            .expect("minimal Gemma 4 config.json parses");
-        assert_eq!(cfg.layer_types.len(), 35);
-        assert_eq!(cfg.first_kv_shared_layer_idx(), 15);
+    fn pinned_config_fixture_parses_and_matches_adr_082() {
+        let cfg = Gemma4Config::from_config_json_str(&pinned_config_json())
+            .expect("committed pinned google/gemma-4-E2B-it config.json must parse");
+        assert_eq!(cfg.hidden_size, 1536);
+        assert_eq!(cfg.num_hidden_layers, 35);
+        assert_eq!(cfg.vocab_size, 262_144);
+        assert_eq!(cfg.intermediate_size, 6144);
+        assert_eq!(cfg.num_attention_heads, 8);
+        assert_eq!(cfg.num_key_value_heads, 1);
+        assert_eq!(cfg.head_dim, 256);
+        assert_eq!(cfg.global_head_dim, 512);
+        assert_eq!(cfg.sliding_window, 512);
+        assert_eq!(cfg.num_kv_shared_layers, 20);
+        assert_eq!(cfg.hidden_size_per_layer_input, 256);
+        assert!(cfg.tie_word_embeddings);
+        assert_eq!(cfg.rope_theta, 1_000_000.0);
+        assert_eq!(cfg.rope_local_base_freq, 10_000.0);
+        assert_eq!(cfg.partial_rotary_factor, 0.25);
+        assert!(cfg.use_double_wide_mlp_raw);
+        assert_eq!(cfg.hidden_activation, "gelu_pytorch_tanh");
+        assert_eq!(cfg.final_logit_softcapping, 30.0);
+        assert!(!cfg.attention_k_eq_v);
+        assert!(!cfg.attention_bias);
         let global_indices: Vec<usize> = (0..cfg.num_hidden_layers)
             .filter(|&i| cfg.is_global_layer(i))
             .collect();
@@ -507,30 +702,200 @@ mod tests {
     }
 
     #[test]
-    fn zero_sliding_window_pattern_errors_not_panics() {
-        let mut json: serde_json::Value = serde_json::from_str(&minimal_config_json()).unwrap();
-        json["text_config"]["sliding_window_pattern"] = serde_json::json!(0);
-        json["text_config"]
-            .as_object_mut()
-            .unwrap()
-            .remove("layer_types");
-        let err = Gemma4Config::from_config_json_str(&json.to_string())
-            .expect_err("sliding_window_pattern: 0 must yield an InferenceError, not panic");
-        assert!(err.to_string().contains("sliding_window_pattern"));
+    fn absent_text_config_errors_naming_field() {
+        let err = Gemma4Config::from_config_json_str("{}")
+            .expect_err("an absent text_config must yield an InferenceError, not the E2B preset");
+        assert!(
+            err.to_string().contains("text_config"),
+            "error must name text_config: {err}"
+        );
     }
 
     #[test]
-    fn zero_num_key_value_heads_errors_naming_field() {
-        let mut json: serde_json::Value = serde_json::from_str(&minimal_config_json()).unwrap();
-        json["text_config"]["num_key_value_heads"] = serde_json::json!(0);
+    fn partial_text_config_errors_naming_missing_field() {
+        // A text_config present but missing a forward-relevant field (here
+        // rope_parameters) must be rejected naming that field, not silently
+        // completed from the E2B preset.
+        let json = r#"{"text_config": {"hidden_size": 1536}}"#;
+        let err = Gemma4Config::from_config_json_str(json)
+            .expect_err("a partial text_config must yield an InferenceError");
+        assert!(
+            err.to_string().contains("rope_parameters")
+                || err.to_string().contains("num_hidden_layers"),
+            "error must name a missing required field: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_nested_rope_full_attention_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["rope_parameters"]
+            .as_object_mut()
+            .unwrap()
+            .remove("full_attention");
         let err = Gemma4Config::from_config_json_str(&json.to_string())
-            .expect_err("num_key_value_heads: 0 must yield an InferenceError");
-        assert!(err.to_string().contains("num_key_value_heads"));
+            .expect_err("a missing rope_parameters.full_attention must yield an InferenceError");
+        assert!(
+            err.to_string().contains("full_attention"),
+            "error must name full_attention: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_nested_rope_sliding_attention_theta_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["rope_parameters"]["sliding_attention"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rope_theta");
+        let err = Gemma4Config::from_config_json_str(&json.to_string()).expect_err(
+            "a missing rope_parameters.sliding_attention.rope_theta must yield an InferenceError",
+        );
+        assert!(
+            err.to_string().contains("rope_theta"),
+            "error must name rope_theta: {err}"
+        );
+    }
+
+    #[test]
+    fn nested_rope_theta_mutation_is_observed_not_ignored() {
+        let mut json = pinned_config_value();
+        json["text_config"]["rope_parameters"]["full_attention"]["rope_theta"] =
+            serde_json::json!(42.0);
+        let cfg = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect("a plausible rope_theta mutation still parses");
+        assert_eq!(
+            cfg.rope_theta, 42.0,
+            "nested rope_parameters.full_attention.rope_theta must flow through, not be \
+             silently replaced by the E2B preset's 1_000_000.0"
+        );
+    }
+
+    #[test]
+    fn use_double_wide_mlp_false_errors_naming_both_fields() {
+        let mut json = pinned_config_value();
+        json["text_config"]["use_double_wide_mlp"] = serde_json::json!(false);
+        let err = Gemma4Config::from_config_json_str(&json.to_string()).expect_err(
+            "use_double_wide_mlp=false while KV-shared layers exist must yield an InferenceError",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("use_double_wide_mlp"),
+            "must name use_double_wide_mlp: {msg}"
+        );
+        assert!(
+            msg.contains("is_kv_shared_layer") || msg.contains("num_kv_shared_layers"),
+            "must name the KV-shared-layer field: {msg}"
+        );
+    }
+
+    #[test]
+    fn wrong_hidden_activation_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["hidden_activation"] = serde_json::json!("gelu");
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("an unsupported hidden_activation must yield an InferenceError");
+        assert!(
+            err.to_string().contains("hidden_activation"),
+            "error must name hidden_activation: {err}"
+        );
+    }
+
+    #[test]
+    fn wrong_final_logit_softcapping_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["final_logit_softcapping"] = serde_json::json!(50.0);
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("an unsupported final_logit_softcapping must yield an InferenceError");
+        assert!(
+            err.to_string().contains("final_logit_softcapping"),
+            "error must name final_logit_softcapping: {err}"
+        );
+    }
+
+    #[test]
+    fn attention_k_eq_v_true_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["attention_k_eq_v"] = serde_json::json!(true);
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("attention_k_eq_v=true must yield an InferenceError for this checkpoint");
+        assert!(
+            err.to_string().contains("attention_k_eq_v"),
+            "error must name attention_k_eq_v: {err}"
+        );
+    }
+
+    #[test]
+    fn attention_bias_true_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["attention_bias"] = serde_json::json!(true);
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("attention_bias=true must yield an InferenceError for this checkpoint");
+        assert!(
+            err.to_string().contains("attention_bias"),
+            "error must name attention_bias: {err}"
+        );
+    }
+
+    #[test]
+    fn layer_types_length_34_errors_naming_field() {
+        let mut json = pinned_config_value();
+        let arr = json["text_config"]["layer_types"].as_array_mut().unwrap();
+        arr.pop();
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("a length-34 layer_types must yield an InferenceError");
+        assert!(
+            err.to_string().contains("layer_types"),
+            "error must name layer_types: {err}"
+        );
+    }
+
+    #[test]
+    fn layer_types_length_36_errors_naming_field() {
+        let mut json = pinned_config_value();
+        let arr = json["text_config"]["layer_types"].as_array_mut().unwrap();
+        arr.push(serde_json::json!("sliding_attention"));
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("a length-36 layer_types must yield an InferenceError");
+        assert!(
+            err.to_string().contains("layer_types"),
+            "error must name layer_types: {err}"
+        );
+    }
+
+    #[test]
+    fn layer_types_wrong_first_global_index_errors_naming_field() {
+        let mut json = pinned_config_value();
+        let arr = json["text_config"]["layer_types"].as_array_mut().unwrap();
+        // Move the first global layer from index 4 to index 3.
+        arr[3] = serde_json::json!("full_attention");
+        arr[4] = serde_json::json!("sliding_attention");
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("a layer_types with the wrong first global index must be rejected");
+        assert!(
+            err.to_string().contains("layer_types"),
+            "error must name layer_types: {err}"
+        );
+    }
+
+    #[test]
+    fn layer_types_wrong_final_layer_type_errors_naming_field() {
+        let mut json = pinned_config_value();
+        let arr = json["text_config"]["layer_types"].as_array_mut().unwrap();
+        // Layer 34 must be full_attention (final, forced global); flip it.
+        let last = arr.len() - 1;
+        arr[last] = serde_json::json!("sliding_attention");
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("a layer_types with the wrong final layer type must be rejected");
+        assert!(
+            err.to_string().contains("layer_types"),
+            "error must name layer_types: {err}"
+        );
     }
 
     #[test]
     fn num_kv_shared_layers_exceeding_total_errors_naming_field() {
-        let mut json: serde_json::Value = serde_json::from_str(&minimal_config_json()).unwrap();
+        let mut json = pinned_config_value();
         json["text_config"]["num_kv_shared_layers"] = serde_json::json!(36);
         let err = Gemma4Config::from_config_json_str(&json.to_string())
             .expect_err("num_kv_shared_layers > num_hidden_layers must yield an InferenceError");
@@ -539,7 +904,7 @@ mod tests {
 
     #[test]
     fn zero_head_dim_errors_naming_field() {
-        let mut json: serde_json::Value = serde_json::from_str(&minimal_config_json()).unwrap();
+        let mut json = pinned_config_value();
         json["text_config"]["head_dim"] = serde_json::json!(0);
         let err = Gemma4Config::from_config_json_str(&json.to_string())
             .expect_err("head_dim: 0 must yield an InferenceError");
@@ -548,7 +913,7 @@ mod tests {
 
     #[test]
     fn zero_global_head_dim_errors_naming_field() {
-        let mut json: serde_json::Value = serde_json::from_str(&minimal_config_json()).unwrap();
+        let mut json = pinned_config_value();
         json["text_config"]["global_head_dim"] = serde_json::json!(0);
         let err = Gemma4Config::from_config_json_str(&json.to_string())
             .expect_err("global_head_dim: 0 must yield an InferenceError");
@@ -557,8 +922,9 @@ mod tests {
 
     #[test]
     fn partial_rotary_factor_zero_errors_naming_field() {
-        let mut json: serde_json::Value = serde_json::from_str(&minimal_config_json()).unwrap();
-        json["text_config"]["partial_rotary_factor"] = serde_json::json!(0.0);
+        let mut json = pinned_config_value();
+        json["text_config"]["rope_parameters"]["full_attention"]["partial_rotary_factor"] =
+            serde_json::json!(0.0);
         let err = Gemma4Config::from_config_json_str(&json.to_string())
             .expect_err("partial_rotary_factor: 0.0 must yield an InferenceError");
         assert!(err.to_string().contains("partial_rotary_factor"));
@@ -566,8 +932,9 @@ mod tests {
 
     #[test]
     fn partial_rotary_factor_above_one_errors_naming_field() {
-        let mut json: serde_json::Value = serde_json::from_str(&minimal_config_json()).unwrap();
-        json["text_config"]["partial_rotary_factor"] = serde_json::json!(1.5);
+        let mut json = pinned_config_value();
+        json["text_config"]["rope_parameters"]["full_attention"]["partial_rotary_factor"] =
+            serde_json::json!(1.5);
         let err = Gemma4Config::from_config_json_str(&json.to_string())
             .expect_err("partial_rotary_factor > 1.0 must yield an InferenceError");
         assert!(err.to_string().contains("partial_rotary_factor"));
@@ -586,7 +953,7 @@ mod tests {
     #[test]
     fn from_model_dir_loads_a_real_config_json() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("config.json"), minimal_config_json()).unwrap();
+        std::fs::write(tmp.path().join("config.json"), pinned_config_json()).unwrap();
         let cfg = Gemma4Config::from_model_dir(tmp.path())
             .expect("a directory with a valid config.json must load");
         assert_eq!(cfg.hidden_size, 1536);
