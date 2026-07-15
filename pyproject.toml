@@ -24,8 +24,12 @@ dev-dependencies = [
     # stack that could change CPU forward-pass numerics; see tests/fixtures/vision/README.md.
     # `validate_runtime_versions` in the generator rejects drift from these at runtime too, so
     # this pin and that check must be updated together (REFERENCE_VERSIONS in the script).
+    # numpy is also pinned exactly here (the top-level `dependencies` entry above stays
+    # `>=1.26` for other project scripts) because the generator uses numpy directly
+    # (`np.random.default_rng`, `np.linspace`) to build the deterministic procedural PNG.
     "torch==2.13.0",
     "torchvision==0.28.0",
     "pillow==12.3.0",
     "transformers==5.12.1",
+    "numpy==2.4.6",
 ]

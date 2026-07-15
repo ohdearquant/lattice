@@ -61,7 +61,7 @@ from PIL import Image, ImageDraw
 HF_MODEL_ID = "Qwen/Qwen3.5-0.8B"
 # Pinned HF Hub commit for the four processor/tokenizer config files the local
 # checkpoint directory does not ship. Verified byte-identical `config.json`
-# against this same commit before use (see `verify_checkpoint_matches_hub`).
+# against this same commit before use (see `preflight` / `_compare_pinned_files`).
 HF_PROCESSOR_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
 PROCESSOR_FILES = [
     "tokenizer_config.json",
@@ -76,16 +76,23 @@ PROMPT = "Describe this image."
 MAX_NEW_TOKENS = 8
 SCHEMA_VERSION = 1
 
-# Runtime versions this fixture set was actually generated with (pinned exactly
-# in pyproject.toml `[tool.uv] dev-dependencies`). `validate_runtime_versions`
-# rejects any drift from these BEFORE the model is loaded, so a `uv run` that
-# resolves a newer torch/torchvision/pillow/transformers fails closed instead
-# of silently regenerating a fixture with different CPU numerics.
+# Runtime versions this fixture set was actually generated with (torch/
+# torchvision/pillow/transformers pinned exactly in pyproject.toml
+# `[tool.uv] dev-dependencies`; numpy pinned there too even though the
+# top-level `dependencies` entry stays `>=1.26` for other project scripts).
+# `validate_runtime_versions` rejects any drift from these BEFORE the model
+# is loaded or the checkpoint is touched, so a `uv run` that resolves a newer
+# torch/torchvision/pillow/transformers/numpy, or runs under a different
+# Python, fails closed instead of silently regenerating a fixture with
+# different CPU numerics (numpy drives the procedural PNG; Python's own
+# floating-point/libm behavior can differ across point releases).
 REFERENCE_VERSIONS = {
     "torch": "2.13.0",
     "torchvision": "0.28.0",
     "pillow": "12.3.0",
     "transformers": "5.12.1",
+    "numpy": "2.4.6",
+    "python": "3.11.12",
 }
 
 # Files whose byte-identity to the pinned HF Hub revision is load-bearing: the
@@ -170,10 +177,6 @@ def _compare_pinned_files(model_dir: Path, fetch) -> None:
             )
 
 
-def verify_checkpoint_matches_hub(model_dir: Path) -> None:
-    _compare_pinned_files(model_dir, _fetch_hub_raw)
-
-
 def validate_runtime_versions(actual: dict) -> None:
     """Reject a runtime whose torch/torchvision/pillow/transformers versions
     differ from `REFERENCE_VERSIONS` — called BEFORE the model is loaded.
@@ -194,6 +197,23 @@ def validate_runtime_versions(actual: dict) -> None:
             "is an intentional upgrade, update REFERENCE_VERSIONS and regenerate+re-review the "
             "fixtures (version drift can change CPU forward-pass numerics)."
         )
+
+
+def preflight(model_dir: Path, actual_versions: dict, fetch=_fetch_hub_raw) -> None:
+    """Fail-closed guards that MUST complete, in this order, before `run()`
+    creates `out_dir` or loads the checkpoint: reject runtime dependency
+    drift, then verify the checkpoint's pinned files are byte-identical to
+    the pinned Hub revision.
+
+    This is the exact function `run()` calls before `out_dir.mkdir`, and
+    `self_test()` calls it directly (with an injected `fetch`) so a
+    regression that reorders `run()` to create output before this check
+    completes is caught offline, not just discovered live — a bare unit test
+    of `_compare_pinned_files`/`validate_runtime_versions` in isolation
+    cannot see the orchestration order in `run()` at all.
+    """
+    validate_runtime_versions(actual_versions)
+    _compare_pinned_files(model_dir, fetch)
 
 
 def fetch_processor_files(merged_dir: Path) -> None:
@@ -266,23 +286,25 @@ def run(model_dir: Path, out_dir: Path) -> None:
     import transformers
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
-    # Fail closed on runtime drift BEFORE the model is loaded or any output is
-    # created — a version mismatch can silently change CPU forward-pass numerics.
-    validate_runtime_versions(
-        {
-            "torch": torch.__version__,
-            "torchvision": torchvision.__version__,
-            "pillow": PIL.__version__,
-            "transformers": transformers.__version__,
-        }
-    )
+    actual_versions = {
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
+        "pillow": PIL.__version__,
+        "transformers": transformers.__version__,
+        "numpy": np.__version__,
+        "python": sys.version.split()[0],
+    }
+
+    # Fail closed BEFORE the model is loaded, the checkpoint is touched, or
+    # any output is created: runtime dependency drift can silently change CPU
+    # forward-pass numerics, and a drifted checkpoint must not leave a
+    # newly-created (and then abandoned) output directory behind.
+    preflight(model_dir, actual_versions)
 
     torch.manual_seed(IMAGE_SEED)
     torch.set_num_threads(1)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    verify_checkpoint_matches_hub(model_dir)
 
     image_path = out_dir / "golden_image.png"
     make_golden_image(image_path)
@@ -336,12 +358,6 @@ def run(model_dir: Path, out_dir: Path) -> None:
         pixel_values_np = enc["pixel_values"].to(torch.float32).numpy()
         position_ids_np = pos_ids[:, 0, :].to(torch.int64).numpy()  # (3, seq_len)
 
-        transformers_version = transformers.__version__
-        torch_version = torch.__version__
-        torchvision_version = torchvision.__version__
-        pillow_version = PIL.__version__
-        python_version = sys.version.split()[0]
-
     # --- sanity checks (also recorded in manifest.json / asserted by the caller) ---
     text_prefix_len = min(
         i for i, t in enumerate(input_ids) if t == model.config.vision_start_token_id
@@ -367,11 +383,12 @@ def run(model_dir: Path, out_dir: Path) -> None:
             "hf_processor_revision": HF_PROCESSOR_REVISION,
             "model_dir_config_sha256": sha256_file(model_dir / "config.json"),
             "model_dir_safetensors_index_sha256": sha256_file(model_dir / "model.safetensors.index.json"),
-            "transformers_version": transformers_version,
-            "torch_version": torch_version,
-            "torchvision_version": torchvision_version,
-            "pillow_version": pillow_version,
-            "python_version": python_version,
+            "transformers_version": actual_versions["transformers"],
+            "torch_version": actual_versions["torch"],
+            "torchvision_version": actual_versions["torchvision"],
+            "pillow_version": actual_versions["pillow"],
+            "numpy_version": actual_versions["numpy"],
+            "python_version": actual_versions["python"],
         },
         "image": {
             "path": image_path.name,
@@ -427,8 +444,10 @@ def run(model_dir: Path, out_dir: Path) -> None:
 
 def self_test() -> None:
     """Offline unit tests for the fail-closed regeneration guards. No network
-    access, no model load — exercises `_compare_pinned_files` and
-    `validate_runtime_versions` directly with injected/synthetic data.
+    access, no model load — exercises `_compare_pinned_files`,
+    `validate_runtime_versions`, and `preflight` (the orchestration-order
+    guard `run()` calls before `out_dir.mkdir`) directly with
+    injected/synthetic data.
 
     Exits non-zero (via AssertionError) on the first guard that does not fail
     closed the way it is supposed to.
@@ -485,7 +504,64 @@ def self_test() -> None:
         else:
             raise AssertionError(f"validate_runtime_versions did not fail closed on {name!r} drift")
 
-    print("self-test: OK (checkpoint-drift guard and version guard both fail closed as expected)")
+    # --- preflight orchestration order: `preflight` is the exact function
+    # `run()` calls before `out_dir.mkdir`. Proving it raises is not enough —
+    # a supplied, initially-absent output directory must REMAIN absent after
+    # it raises, since `run()` never reaches `out_dir.mkdir` in that case.
+    # This is what the isolated `_compare_pinned_files`/
+    # `validate_runtime_versions` calls above cannot detect: they say nothing
+    # about what `run()` does before/after calling them. ---
+    with tempfile.TemporaryDirectory(prefix="vision-goldens-selftest-order-") as tmp:
+        tmp_path = Path(tmp)
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_bytes(b'{"model_type": "qwen3_5_vl"}')
+        (model_dir / "model.safetensors.index.json").write_bytes(b'{"weight_map": {}}')
+
+        def fetch_matching(name: str) -> bytes:
+            return (model_dir / name).read_bytes()
+
+        def fetch_drifted_index(name: str) -> bytes:
+            if name == "model.safetensors.index.json":
+                return b'{"weight_map": {"drifted": "yes"}}'
+            return (model_dir / name).read_bytes()
+
+        # Case A: matching checkpoint but a drifted runtime version.
+        out_dir_a = tmp_path / "out_version_drift"  # deliberately not created
+        drifted_versions = dict(REFERENCE_VERSIONS)
+        drifted_versions["numpy"] = "0.0.0-selftest-drift"
+        try:
+            preflight(model_dir, drifted_versions, fetch=fetch_matching)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("preflight did not fail closed on a drifted runtime version")
+        assert not out_dir_a.exists(), (
+            "preflight raised on a version drift but a supplied, initially-absent output "
+            "directory was created anyway (orchestration-order regression)"
+        )
+
+        # Case B: matching runtime version but a drifted checkpoint index.
+        out_dir_b = tmp_path / "out_checkpoint_drift"  # deliberately not created
+        try:
+            preflight(model_dir, dict(REFERENCE_VERSIONS), fetch=fetch_drifted_index)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("preflight did not fail closed on a drifted checkpoint index")
+        assert not out_dir_b.exists(), (
+            "preflight raised on a drifted checkpoint but a supplied, initially-absent output "
+            "directory was created anyway (orchestration-order regression: out_dir.mkdir moved "
+            "before preflight in run())"
+        )
+
+        # Matching checkpoint + matching versions must not raise.
+        preflight(model_dir, dict(REFERENCE_VERSIONS), fetch=fetch_matching)
+
+    print(
+        "self-test: OK (checkpoint-drift guard, version guard, and preflight orchestration "
+        "order all fail closed as expected)"
+    )
 
 
 def parse_args() -> argparse.Namespace:

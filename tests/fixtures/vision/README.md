@@ -18,10 +18,13 @@ uv run python scripts/vision_goldens_qwen35.py \
   `model.safetensors.index.json` are verified byte-identical to HF Hub
   `Qwen/Qwen3.5-0.8B` commit `2fc06364715b967f1860aea9cf38778875588b17` at generation time
   (the script re-checks this every run and fails closed on drift).
-- **Runtime**: `transformers==5.12.1`, `torch==2.13.0`, `torchvision==0.28.0`, Python 3.11.12,
-  CPU, float32, single BLAS thread (`torch.set_num_threads(1)`). Exact versions are re-recorded
-  in `manifest.json["source"]` on every regeneration — trust that field over this prose if they
-  disagree.
+- **Runtime**: `transformers==5.12.1`, `torch==2.13.0`, `torchvision==0.28.0`, `pillow==12.3.0`,
+  `numpy==2.4.6`, Python 3.11.12, CPU, float32, single BLAS thread
+  (`torch.set_num_threads(1)`). All six are pinned exactly and validated before any output is
+  created or the checkpoint is touched (`validate_runtime_versions`/`preflight` in the script);
+  numpy is included because it drives the deterministic procedural PNG. Exact versions are
+  re-recorded in `manifest.json["source"]` on every regeneration — trust that field over this
+  prose if they disagree.
 - **Image**: `golden_image.png`, 256x256, generated in-script from a fixed seed (`20260714`) —
   an RGB gradient background plus four solid shapes with a small seeded coordinate jitter. Fully
   deterministic; no camera/network image is used.

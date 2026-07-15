@@ -32,6 +32,8 @@ mod anchors {
     pub const GOLDEN_IMAGE_FILE: &str = "golden_image.png";
     pub const VIT_PRE_MERGER_FILE: &str = "vit_pre_merger_f32.bin";
     pub const VIT_POST_MERGER_FILE: &str = "vit_post_merger_f32.bin";
+    pub const INPUT_IDS_FILE: &str = "input_ids.json";
+    pub const POSITION_IDS_FILE: &str = "position_ids.json";
 
     pub const HF_PROCESSOR_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
     pub const PROMPT: &str = "Describe this image.";
@@ -48,6 +50,17 @@ mod anchors {
         "d5083740a73e5d90cce9f75c7e7eac7efcb965ae9ad0f173ded2e370e6d7924b";
     pub const GOLDEN_IMAGE_WIDTH: u32 = 256;
     pub const GOLDEN_IMAGE_HEIGHT: u32 = 256;
+
+    // Anchored directly, NOT via `manifest.json`'s `input_ids`/`position_ids`
+    // `sha256` fields: a self-consistent tamper (edit the fixture, then
+    // update the manifest's own digest to match) would otherwise still pass
+    // `load_json_checked`. These constants are fixed at review time from the
+    // committed files and only change as part of an explicitly reviewed
+    // fixture refresh.
+    pub const INPUT_IDS_SHA256: &str =
+        "9beda884e9b718c0ce58c657c7ac5535936582f20d2141a8b03f75b7ab0adfd5";
+    pub const POSITION_IDS_SHA256: &str =
+        "f1407311a976e23e559e32edb8eafe47bcd4213c3b4dad5561b0ee8b5404fe3d";
 
     pub const GREEDY_TOKENS: [i64; 8] = [1919, 2099, 369, 264, 2972, 12896, 518, 19556];
 }
@@ -508,6 +521,27 @@ fn anchored_reference_values_match_reviewed_constants() {
         sha256_hex(&post_bytes),
         anchors::VIT_POST_MERGER_SHA256,
         "vit_post_merger_f32.bin content drifted from the reviewed anchor digest"
+    );
+
+    // input_ids.json / position_ids.json: fixed filenames + reviewed digests,
+    // independent of `manifest.json`'s own (mutable) `sha256` fields for
+    // these files — closes the self-consistent-tamper gap where an edited
+    // token or position id plus an updated manifest digest would otherwise
+    // still pass `load_json_checked` in the other tests.
+    let input_ids_bytes = std::fs::read(dir.join(anchors::INPUT_IDS_FILE))
+        .unwrap_or_else(|e| panic!("reading {}: {e}", anchors::INPUT_IDS_FILE));
+    assert_eq!(
+        sha256_hex(&input_ids_bytes),
+        anchors::INPUT_IDS_SHA256,
+        "input_ids.json content drifted from the reviewed anchor digest"
+    );
+
+    let position_ids_bytes = std::fs::read(dir.join(anchors::POSITION_IDS_FILE))
+        .unwrap_or_else(|e| panic!("reading {}: {e}", anchors::POSITION_IDS_FILE));
+    assert_eq!(
+        sha256_hex(&position_ids_bytes),
+        anchors::POSITION_IDS_SHA256,
+        "position_ids.json content drifted from the reviewed anchor digest"
     );
 
     let manifest: Manifest = serde_json::from_value(manifest_raw).unwrap();
