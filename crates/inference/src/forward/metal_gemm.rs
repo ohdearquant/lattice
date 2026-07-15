@@ -191,7 +191,7 @@ mod gpu {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub use gpu::{metal_matmul, metal_matmul_bt};
+pub use gpu::{is_available, metal_matmul, metal_matmul_bt};
 
 // Stubs for non-macOS or non-metal builds.
 /// **Unstable**: Metal matmul B^T stub; returns false when metal-gpu feature is disabled.
