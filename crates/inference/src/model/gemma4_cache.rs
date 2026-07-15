@@ -383,18 +383,12 @@ mod tests {
         Gemma4Config::from_config_json_str(&json).expect("pinned e2b fixture must parse")
     }
 
-    /// A small config for cheap unit tests: 7 layers, layer_types
-    /// [S,F,S,S,F,S,F] (globals at 1, 4, 6), 3 KV-shared trailing layers
-    /// (shared: 4[F],5[S],6[F] -> first_kv_shared_layer_idx=4), sliding
-    /// donor=3, global donor=4... wait layer 4 is itself shared. Recompute
-    /// below in `tiny_config` directly instead of in this comment to avoid
-    /// drift.
+    /// A small config for cheap unit tests. 6 layers, types
+    /// [S, F, S, S, F, S], num_kv_shared_layers=2 ->
+    /// first_kv_shared_layer_idx=4. Non-shared prefix layers 0..4 =
+    /// [S, F, S, S]: sliding donor = layer 3 (last S), global donor =
+    /// layer 1 (last F). Shared layers: 4 (F) -> donor 1; 5 (S) -> donor 3.
     fn tiny_config(sliding_window: usize) -> Gemma4Config {
-        // 6 layers: types [S, F, S, S, F, S], num_kv_shared_layers=2 ->
-        // first_kv_shared_layer_idx=4. Non-shared prefix: layers 0..4 =
-        // [S, F, S, S] -> sliding donor = layer 2 (last S before layer 4;
-        // layer 3 is S too, so donor = 3), global donor = layer 1.
-        // Shared layers: 4 (F) -> donor 1 (global); 5 (S) -> donor 3 (sliding).
         let layer_types = vec![
             Gemma4LayerType::SlidingAttention, // 0
             Gemma4LayerType::FullAttention,    // 1 (global donor)
