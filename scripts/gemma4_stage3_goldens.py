@@ -2,61 +2,78 @@
 """HF differential golden fixtures for the Gemma 4 E2B text math kernels
 (ADR-082 Stage 3, G6-G10).
 
-Unlike the Stage-0/1 scripts, this script never touches the network and never
-loads the ~10.25 GB E2B checkpoint. Stage 3 is pure per-op math (RMSNorm,
-GeGLU MLP, scaled embedding, Q/K-norm-V-unscaled, logit softcap, dual RoPE) --
-it instantiates the pinned `transformers` Gemma 4 modeling classes directly
-with small, deterministic, seeded synthetic weights and inputs, and records
-each op's input/output tensors as a committed fixture.
+Unlike the Stage-0/1 scripts, this script never touches the network for the
+model itself and never loads the ~10.25 GB E2B checkpoint. Stage 3 is pure
+per-op math (RMSNorm, GeGLU MLP, scaled embedding, Q/K-norm-V-unscaled,
+logit softcap, dual RoPE) -- it instantiates the pinned `transformers`
+Gemma 4 modeling classes directly with small, deterministic, seeded
+synthetic weights and inputs, and records each op's input/output tensors as
+a committed fixture.
 
 Fixture format follows `scripts/vision_goldens_qwen35.py`'s convention:
 raw little-endian float32 `.bin` files (one per tensor) plus a small JSON
-sidecar per op recording shapes/scalars/`.bin` refs (path, shape, sha256),
-and a top-level `manifest.json` with provenance and predeclared per-op
-tolerances. Embedding large arrays directly as nested JSON lists was tried
-first and produced a 1.3 MB `geglu_mlp.json` (one line per float under
-`json.dumps(indent=2)`) -- `.bin` is ~5x smaller and matches how every other
-tensor-heavy golden in this repo is committed.
+sidecar per op recording shapes/scalars/`.bin` refs (path, shape, sha256).
 
-Reference module: `transformers.models.gemma4.modeling_gemma4` /
-`transformers.modeling_rope_utils`, installed at pinned version
-`transformers==5.12.1` (pyproject.toml `[tool.uv] dev-dependencies`, the same
-runtime pin `scripts/vision_goldens_qwen35.py` uses). This is the first
-Stage-3+ script to import the Gemma 4 *modeling* code (Stages 0/1 used only
-safetensors-header extraction and the `tokenizers`/`jinja2` libraries) -- the
-line numbers cited in this script's docstrings are read directly from the
-installed package (`transformers/models/gemma4/modeling_gemma4.py`,
-`transformers/modeling_rope_utils.py`) and cross-checked against ADR-082's
-G6-G10 findings, which were themselves sourced from `transformers` commit
-`ab1771c9e42891d893189978a8009426d70b4688` -- both describe the same
-architecture and formulas (verified line-by-line below); no behavioral drift
-was found between the two.
+Provenance model (read this before touching tolerances or fixtures):
+`crates/inference/tests/fixtures/gemma4/stage3/manifest.json` is a COMMITTED,
+HAND-AUTHORED, IMMUTABLE spec -- not an output of this script. It records the
+pinned reference source commit and per-module SHA-256 hashes, the expected
+reference-derived RoPE parameters, per-op seeds, tolerances (with rationale
+independent of any observed lattice result), and mutation-separation floors.
+This script only ever *reads* that manifest and *verifies* against it:
+
+  1. `verify_source_pins`: hashes the actually-imported `modeling_gemma4.py`,
+     `modeling_rope_utils.py`, and `configuration_gemma4.py` and aborts
+     (before writing anything) unless they match the manifest's
+     `pinned_source_hashes`. This is why the invocations below use
+     `uv run --with "transformers @ git+...@<pinned commit>"` instead of the
+     project's released `transformers==5.12.1` pin (used by the other,
+     unrelated Stage-0/1 vision golden scripts): the release tag and the
+     ADR's pinned commit diverge, so the installed release must never be
+     silently accepted as the reference.
+  2. `verify_rope_reference`: loads the committed pinned E2B config fixture
+     (`tests/fixtures/gemma4/e2b_config.json`) through the real
+     `Gemma4TextConfig`, and asserts the resulting `rope_parameters` match
+     the manifest's `expected_rope_parameters` before deriving the
+     theta/partial-rotary-factor scalars the dual_rope golden's synthetic
+     (reduced-head_dim) tensors use.
+  3. `--write-fixture` only ever (re)writes the `<op>.json` + `<op>_*.bin`
+     fixture files, never `manifest.json`. Changing a tolerance, seed, or
+     rationale is a manifest edit, reviewed on its own, not a side effect of
+     regenerating fixtures.
 
 Shapes: real E2B ratios scaled down by 1/24 on `hidden_size` (1536 -> 64,
 preserving `num_attention_heads=8`) and by 1/16 on head width (`head_dim`
 256 -> 16, `global_head_dim` 512 -> 32, preserving the real 1:2 sliding:global
-ratio and `partial_rotary_factor=0.25`). `rms_norm_eps`, RoPE thetas
-(1e4 local / 1e6 global), and `final_logit_softcapping=30.0` are the real E2B
-config values, unscaled -- these are dimensionless/scale-sensitive constants,
-not shapes. The GeGLU MLP's `intermediate_size` uses a smaller-than-real
-ratio (1.5x hidden vs the real 4x) purely to keep the committed `.bin` files
-small -- intermediate width doesn't change which formula/op-order bug this
-golden catches, only its cost to store.
+ratio and `partial_rotary_factor=0.25`). `rms_norm_eps` and
+`final_logit_softcapping=30.0` are the real E2B config values, unscaled --
+dimensionless/scale-sensitive constants, not shapes. RoPE thetas are
+reference-derived (see `verify_rope_reference` above), not hardcoded. The
+GeGLU MLP's `intermediate_size` uses a smaller-than-real ratio (1.5x hidden
+vs the real 4x) purely to keep the committed `.bin` files small --
+intermediate width doesn't change which formula/op-order bug this golden
+catches, only its cost to store. `rms_norm_wide` additionally covers the
+real, unscaled E2B `hidden_size=1536` reduction width (medium-4: the reused
+lattice RMSNorm kernel is bounded f32 parity, not bit-for-bit, and that bound
+should be demonstrated at the real width, not only at a 64-wide reduction).
 
 Usage:
     # Regenerate the committed fixtures (deliberate, reviewable, never run by
-    # CI):
-    uv run python3 scripts/gemma4_stage3_goldens.py --write-fixture
+    # CI) under the pinned reference commit:
+    uv run --with "transformers @ git+https://github.com/huggingface/transformers@ab1771c9e42891d893189978a8009426d70b4688" \\
+        python3 scripts/gemma4_stage3_goldens.py --write-fixture
 
     # Verify (default): regenerate in-memory and diff against the committed
-    # JSON/bin. Fails closed on any drift. No network access.
-    uv run python3 scripts/gemma4_stage3_goldens.py
+    # JSON/bin. Fails closed on any drift, including source-pin drift.
+    uv run --with "transformers @ git+https://github.com/huggingface/transformers@ab1771c9e42891d893189978a8009426d70b4688" \\
+        python3 scripts/gemma4_stage3_goldens.py
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -75,95 +92,35 @@ FIXTURE_DIR = (
     / "stage3"
 )
 MANIFEST_PATH = FIXTURE_DIR / "manifest.json"
+E2B_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "crates"
+    / "inference"
+    / "tests"
+    / "fixtures"
+    / "gemma4"
+    / "e2b_config.json"
+)
 
-SCHEMA_VERSION = 1
-ADR = "ADR-082 Stage 3 (G6-G10)"
-
-# Runtime versions this fixture set was generated with -- same pin as
-# scripts/vision_goldens_qwen35.py (pyproject.toml `[tool.uv] dev-dependencies`).
-# A version drift changes CPU forward-pass numerics silently enough that
-# goldens generated under a different version are not trustworthy without
-# re-review -- fail closed rather than silently regenerate.
-REFERENCE_VERSIONS = {
-    "torch": "2.13.0",
-    "transformers": "5.12.1",
-    "numpy": "2.4.6",
-    "python": "3.11.12",
-}
-
-# Real E2B values (ADR-082 G2-G10), unscaled.
-RMS_NORM_EPS = 1e-6
-ROPE_THETA_LOCAL = 10_000.0
-ROPE_THETA_GLOBAL = 1_000_000.0
-PARTIAL_ROTARY_FACTOR = 0.25
-FINAL_LOGIT_SOFTCAPPING = 30.0
-
-# Scaled-down shapes (see module docstring for the derivation).
+# Synthetic shape reductions (see module docstring for the derivation). These
+# are deliberately script-local, not manifest-declared: the manifest's
+# provenance contract covers seeds/tolerances/rationale/source hashes/RoPE
+# values, not test-shape reductions (ADR-082 review round 2, major-3).
 HIDDEN = 64
 NUM_HEADS = 8
 HEAD_DIM_LOCAL = 16
 HEAD_DIM_GLOBAL = 32
-INTERMEDIATE = 96  # 1.5x hidden -- kept small to bound committed .bin size
+INTERMEDIATE = 96
 VOCAB = 40
+HIDDEN_WIDE = 1536  # real E2B hidden_size, for the rms_norm_wide golden
 
-# Per-op predeclared tolerances (max-abs-diff, f32 reference), justified in
-# the manifest and read by the Rust tests -- never loosened post-hoc.
-TOLERANCES: dict[str, float] = {
-    "rms_norm": 1e-6,
-    "geglu_mlp": 1e-5,
-    "scaled_embedding": 1e-6,
-    "qk_norm_v_unscaled": 1e-6,
-    "logit_softcap": 3e-6,
-    "dual_rope": 1e-6,
-}
-TOLERANCE_JUSTIFICATION: dict[str, str] = {
-    "rms_norm": (
-        "Elementwise reduction over hidden=64 in float32, single op (square, "
-        "mean, +eps, pow(-0.5), multiply) with no matmul reassociation -- f32 "
-        "round-trip precision, no accumulation-order sensitivity expected. "
-        "Empirically measured max-abs-diff on the Rust implementation was "
-        "~4.8e-7."
-    ),
-    "geglu_mlp": (
-        "Two hidden x intermediate matmuls (gate_proj, up_proj) and one "
-        "intermediate x hidden matmul (down_proj), each a 64/96-wide "
-        "reduction. Reference uses torch's BLAS; the lattice kernel under "
-        "test uses Accelerate/AMX or a scalar/SIMD fallback -- reduction "
-        "order (and therefore rounding) can differ from torch's, per this "
-        "repo's f32-reassociation-reorder bug class. 1e-5 accommodates that "
-        "reordering (empirically measured max-abs-diff ~1.2e-7) while still "
-        "catching a wrong-formula or wrong-activation bug (which would "
-        "produce differences many orders of magnitude larger)."
-    ),
-    "scaled_embedding": (
-        "A table lookup (exact copy, no arithmetic) followed by one scalar "
-        "multiply (embed_scale = sqrt(hidden_size), computed once) -- no "
-        "reduction, no reassociation risk. Empirically measured "
-        "max-abs-diff was 0."
-    ),
-    "qk_norm_v_unscaled": (
-        "Same elementwise-reduction shape as rms_norm, applied per-head over "
-        "head_dim in {16, 32} (well within f32 exactness for this op). "
-        "Empirically measured max-abs-diff was ~2.4e-7 (q/v), 0 (k)."
-    ),
-    "logit_softcap": (
-        "Two scalar multiplies and one tanh, elementwise, no reduction -- "
-        "but Rust's f32::tanh and PyTorch's libm tanh are two different "
-        "correctly-rounded-to-a-few-ULPs implementations, not the same "
-        "routine, so their outputs differ by a few ULPs rather than being "
-        "bit-identical. Empirically measured max-abs-diff on the Rust "
-        "implementation was ~1.9e-6 at cap=30 with logits up to +/-60; 3e-6 "
-        "keeps headroom for that while still catching a wrong-formula or "
-        "disabled-softcap bug (orders of magnitude larger, see the "
-        "disabled-softcap negative test)."
-    ),
-    "dual_rope": (
-        "cos/sin evaluated once per (position, frequency) pair then combined "
-        "via two multiplies and one add per element (rotate_half) -- "
-        "elementwise, no reduction; matches the reference's own float32 "
-        "RoPE math exactly. Empirically measured max-abs-diff was ~2.4e-7 "
-        "(local), ~1.2e-7 (global)."
-    ),
+RMS_NORM_EPS = 1e-6
+FINAL_LOGIT_SOFTCAPPING = 30.0
+
+SOURCE_MODULE_IMPORT_PATHS = {
+    "transformers/models/gemma4/modeling_gemma4.py": "transformers.models.gemma4.modeling_gemma4",
+    "transformers/modeling_rope_utils.py": "transformers.modeling_rope_utils",
+    "transformers/models/gemma4/configuration_gemma4.py": "transformers.models.gemma4.configuration_gemma4",
 }
 
 
@@ -172,32 +129,115 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-def validate_runtime_versions() -> None:
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: str) -> str:
+    return sha256_bytes(Path(path).read_bytes())
+
+
+def load_manifest() -> dict[str, Any]:
+    if not MANIFEST_PATH.exists():
+        print(
+            f"FATAL: {MANIFEST_PATH} does not exist -- manifest.json is a "
+            "committed provenance spec authored independently of this "
+            "generator; there is no bootstrap path that creates it "
+            "automatically",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return json.loads(MANIFEST_PATH.read_text())
+
+
+def verify_source_pins(manifest: dict[str, Any]) -> None:
+    """Major-1 fix: fail closed unless the transformers install actually
+    executing this script hash-matches the manifest's pinned-source commit.
+    Never falls back to a version-string check -- the released version tag
+    and the ADR's pinned commit are known to diverge in these exact files.
+    """
+    import importlib
+
+    expected = manifest["pinned_source_hashes"]
+    mismatches: list[str] = []
+    for key, dotted in SOURCE_MODULE_IMPORT_PATHS.items():
+        want = expected.get(key)
+        if want is None:
+            mismatches.append(f"{key}: manifest has no expected hash recorded")
+            continue
+        try:
+            mod = importlib.import_module(dotted)
+            found = sha256_file(inspect.getfile(mod))
+        except Exception as exc:  # noqa: BLE001 -- fail closed, report found=<error>
+            mismatches.append(f"{key}: expected {want}, could not hash installed module ({exc})")
+            continue
+        if found != want:
+            mismatches.append(f"{key}: expected {want}, found {found}")
+
+    if mismatches:
+        pinned_commit = manifest["pinned_source_commit"]
+        print(
+            "FATAL: the transformers install executing this script does not "
+            f"hash-match the pinned reference commit {pinned_commit} -- "
+            "goldens generated under it would not be reference-verified. "
+            "Re-run under the pinned source, e.g.:\n"
+            '  uv run --with "transformers @ git+https://github.com/'
+            f'huggingface/transformers@{pinned_commit}" '
+            "scripts/gemma4_stage3_goldens.py --write-fixture\n"
+            "Mismatches (found vs expected):\n  " + "\n  ".join(mismatches),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def verify_runtime_versions(manifest: dict[str, Any]) -> None:
     import platform
 
+    expected = manifest["runtime_versions"]
     actual = {
         "torch": torch.__version__,
-        "transformers": __import__("transformers").__version__,
         "numpy": np.__version__,
         "python": platform.python_version(),
     }
     mismatches = [
-        f"{name}: expected {REFERENCE_VERSIONS[name]}, got {actual[name]}"
-        for name in REFERENCE_VERSIONS
-        if actual[name] != REFERENCE_VERSIONS[name]
+        f"{name}: expected {expected[name]}, got {actual[name]}"
+        for name in expected
+        if actual[name] != expected[name]
     ]
     if mismatches:
         print(
-            "FATAL: runtime version drift from the pinned reference "
-            f"({ADR}) -- goldens would not be reproducible:\n  "
+            "FATAL: runtime version drift from the manifest's declared "
+            "runtime -- goldens would not be reproducible:\n  "
             + "\n  ".join(mismatches),
             file=sys.stderr,
         )
         sys.exit(1)
 
 
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def verify_rope_reference(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Major-3 fix: derive the dual-RoPE theta/partial-rotary-factor records
+    from the real `Gemma4TextConfig`, parsing the committed pinned E2B config
+    fixture -- not from hardcoded literals or an inert stub config.
+    """
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+    if not E2B_CONFIG_PATH.exists():
+        print(f"FATAL: {E2B_CONFIG_PATH} does not exist", file=sys.stderr)
+        sys.exit(1)
+    full_config = json.loads(E2B_CONFIG_PATH.read_text())
+    cfg = Gemma4TextConfig(**full_config["text_config"])
+    actual = cfg.rope_parameters
+    expected = manifest["expected_rope_parameters"]
+    if actual != expected:
+        print(
+            "FATAL: rope_parameters derived from the pinned E2B config "
+            "fixture via the reference Gemma4TextConfig do not match the "
+            "manifest's expected_rope_parameters -- refusing to write "
+            f"fixtures.\n  derived:  {actual}\n  expected: {expected}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return actual
 
 
 class TensorRef:
@@ -239,10 +279,10 @@ def materialize_op(op: str, fields: dict[str, Any]) -> dict[str, Any]:
 #   out = (normed * weight.float()).type_as(x)   [with_scale=True]
 # Plain gamma scaling -- NOT lattice's Qwen3.5 shifted `(1 + gamma)` variant.
 # ---------------------------------------------------------------------------
-def gen_rms_norm() -> dict[str, Any]:
+def gen_rms_norm(seed: int) -> dict[str, Any]:
     from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm
 
-    set_seed(1)
+    set_seed(seed)
     batch, seq = 2, 3
     x = torch.randn(batch, seq, HIDDEN, dtype=torch.float32)
     norm = Gemma4RMSNorm(dim=HIDDEN, eps=RMS_NORM_EPS, with_scale=True)
@@ -251,8 +291,34 @@ def gen_rms_norm() -> dict[str, Any]:
     out = norm(x)
     return {
         "op": "rms_norm",
-        "source": "transformers/models/gemma4/modeling_gemma4.py:193-210 (Gemma4RMSNorm)",
+        "source": "transformers/models/gemma4/modeling_gemma4.py:197-215 (Gemma4RMSNorm)",
         "shape": [batch, seq, HIDDEN],
+        "eps": RMS_NORM_EPS,
+        "input": TensorRef(x),
+        "weight": TensorRef(norm.weight),
+        "output": TensorRef(out),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Medium-4: same op as G6, at the real E2B hidden_size=1536 reduction width
+# (the other rms_norm golden above uses the 1/24-scaled synthetic width=64;
+# this one demonstrates the bounded-f32-parity claim at the real width).
+# ---------------------------------------------------------------------------
+def gen_rms_norm_wide(seed: int) -> dict[str, Any]:
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm
+
+    set_seed(seed)
+    batch, seq = 1, 2
+    x = torch.randn(batch, seq, HIDDEN_WIDE, dtype=torch.float32)
+    norm = Gemma4RMSNorm(dim=HIDDEN_WIDE, eps=RMS_NORM_EPS, with_scale=True)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(HIDDEN_WIDE, dtype=torch.float32) * 0.5 + 1.0)
+    out = norm(x)
+    return {
+        "op": "rms_norm_wide",
+        "source": "transformers/models/gemma4/modeling_gemma4.py:197-215 (Gemma4RMSNorm), hidden_size=1536 (real E2B width)",
+        "shape": [batch, seq, HIDDEN_WIDE],
         "eps": RMS_NORM_EPS,
         "input": TensorRef(x),
         "weight": TensorRef(norm.weight),
@@ -264,7 +330,7 @@ def gen_rms_norm() -> dict[str, Any]:
 # G7: GeGLU MLP (modeling_gemma4.py: class Gemma4TextMLP, `forward`).
 #   down_proj(act_fn(gate_proj(x)) * up_proj(x)), act_fn = gelu_pytorch_tanh
 # ---------------------------------------------------------------------------
-def gen_geglu_mlp() -> dict[str, Any]:
+def gen_geglu_mlp(seed: int) -> dict[str, Any]:
     from transformers.models.gemma4.modeling_gemma4 import Gemma4TextMLP
 
     class MiniMlpConfig:
@@ -275,7 +341,7 @@ def gen_geglu_mlp() -> dict[str, Any]:
         num_kv_shared_layers = 0
         use_double_wide_mlp = False
 
-    set_seed(2)
+    set_seed(seed)
     batch, seq = 2, 3
     x = torch.randn(batch, seq, HIDDEN, dtype=torch.float32)
     mlp = Gemma4TextMLP(MiniMlpConfig(), layer_idx=0)
@@ -289,7 +355,7 @@ def gen_geglu_mlp() -> dict[str, Any]:
     out = mlp(x)
     return {
         "op": "geglu_mlp",
-        "source": "transformers/models/gemma4/modeling_gemma4.py:1066-1082 (Gemma4TextMLP)",
+        "source": "transformers/models/gemma4/modeling_gemma4.py:1074-1090 (Gemma4TextMLP)",
         "shape": [batch, seq, HIDDEN],
         "hidden": HIDDEN,
         "intermediate": INTERMEDIATE,
@@ -308,12 +374,12 @@ def gen_geglu_mlp() -> dict[str, Any]:
 #   (a python float; here computed and applied in float32 -- see
 #   Gemma4TextScaledWordEmbedding.forward: `.to(self.weight.dtype)`).
 # ---------------------------------------------------------------------------
-def gen_scaled_embedding() -> dict[str, Any]:
+def gen_scaled_embedding(seed: int) -> dict[str, Any]:
     from transformers.models.gemma4.modeling_gemma4 import (
         Gemma4TextScaledWordEmbedding,
     )
 
-    set_seed(3)
+    set_seed(seed)
     batch, seq = 2, 5
     embed_scale = float(HIDDEN**0.5)
     emb = Gemma4TextScaledWordEmbedding(
@@ -328,9 +394,8 @@ def gen_scaled_embedding() -> dict[str, Any]:
     return {
         "op": "scaled_embedding",
         "source": (
-            "transformers/models/gemma4/modeling_gemma4.py:1458-1469 "
-            "(Gemma4TextScaledWordEmbedding), instantiated at "
-            "modeling_gemma4.py:1601-1602 with embed_scale=hidden_size**0.5"
+            "transformers/models/gemma4/modeling_gemma4.py:1465-1476 "
+            "(Gemma4TextScaledWordEmbedding)"
         ),
         "vocab": VOCAB,
         "hidden": HIDDEN,
@@ -343,18 +408,17 @@ def gen_scaled_embedding() -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # G4/G6: Q/K norm with V unscaled (modeling_gemma4.py: Gemma4TextAttention
-# __init__ / forward, lines 1208-1213 construct q_norm/k_norm (with_scale
-# default True) and v_norm (with_scale=False, no weight); forward applies
-# q_norm before RoPE (line 1240-1241), k_norm before RoPE (line 1257), and
-# v_norm with no RoPE at all (line 1260) -- V never rotates.
+# __init__ / forward: q_norm/k_norm (with_scale default True) and v_norm
+# (with_scale=False, no weight); forward applies q_norm before RoPE, k_norm
+# before RoPE, and v_norm with no RoPE at all -- V never rotates.
 # This op golden covers the per-head-norm step in isolation; dual_rope below
 # covers the RoPE step in isolation. Uses local head_dim=16, representative
 # of a sliding-attention layer's per-head width.
 # ---------------------------------------------------------------------------
-def gen_qk_norm_v_unscaled() -> dict[str, Any]:
+def gen_qk_norm_v_unscaled(seed: int) -> dict[str, Any]:
     from transformers.models.gemma4.modeling_gemma4 import Gemma4RMSNorm
 
-    set_seed(4)
+    set_seed(seed)
     batch, seq, heads = 1, 3, 4
     q = torch.randn(batch, seq, heads, HEAD_DIM_LOCAL, dtype=torch.float32)
     k = torch.randn(batch, seq, heads, HEAD_DIM_LOCAL, dtype=torch.float32)
@@ -373,9 +437,9 @@ def gen_qk_norm_v_unscaled() -> dict[str, Any]:
     return {
         "op": "qk_norm_v_unscaled",
         "source": (
-            "transformers/models/gemma4/modeling_gemma4.py:1208-1213 "
-            "(q_norm/k_norm/v_norm construction), 1240-1260 (application "
-            "order: q_norm then RoPE, k_norm then RoPE, v_norm with no RoPE)"
+            "transformers/models/gemma4/modeling_gemma4.py (q_norm/k_norm/"
+            "v_norm construction and application order in "
+            "Gemma4TextAttention)"
         ),
         "shape": [batch, seq, heads, HEAD_DIM_LOCAL],
         "eps": RMS_NORM_EPS,
@@ -391,26 +455,87 @@ def gen_qk_norm_v_unscaled() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# G10b: final logit softcapping (modeling_gemma4.py:1888-1892).
+# G10b: final logit softcapping (modeling_gemma4.py:
+# Gemma4ForCausalLM.forward, after self.lm_head):
 #   logits = logits / cap; logits = tanh(logits); logits = logits * cap
+#
+# Major-2 fix: this golden previously re-derived the three-op formula
+# locally (three bare torch calls, no Gemma4 class involved at all) --
+# exactly the same-implementation-on-both-sides failure mode goldens exist
+# to prevent. This now builds a real `Gemma4ForCausalLM` from a real
+# `Gemma4TextConfig` and captures logits from *its own* `forward`, so the
+# softcap placement/condition/formula is whatever the pinned source actually
+# does, not a hand-copy of it. The only stub is `model.model` (the decoder
+# stack) -- swapped for a fixed hidden_states tensor so this golden stays a
+# cheap, isolated per-op test rather than a full forward pass; `lm_head` and
+# the softcap branch are the real `Gemma4ForCausalLM.forward` code path.
 # ---------------------------------------------------------------------------
-def gen_logit_softcap() -> dict[str, Any]:
-    set_seed(5)
+def gen_logit_softcap(seed: int) -> dict[str, Any]:
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM
+
+    set_seed(seed)
     batch, seq = 2, 5
+    cfg = Gemma4TextConfig(
+        vocab_size=VOCAB,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        num_hidden_layers=1,
+        num_attention_heads=NUM_HEADS,
+        num_key_value_heads=NUM_HEADS,
+        head_dim=HEAD_DIM_LOCAL,
+        global_head_dim=HEAD_DIM_GLOBAL,
+        final_logit_softcapping=FINAL_LOGIT_SOFTCAPPING,
+        tie_word_embeddings=False,
+    )
+    model = Gemma4ForCausalLM(cfg)
+    model.eval()
+
     # Wide range (includes |logit| >> cap) so tanh saturation actually bites
     # -- otherwise a disabled-softcap negative test could stay within
     # tolerance by accident for small logits.
-    logits = (torch.rand(batch, seq, VOCAB, dtype=torch.float32) - 0.5) * 120.0
-    cap = FINAL_LOGIT_SOFTCAPPING
-    out = logits / cap
-    out = torch.tanh(out)
-    out = out * cap
+    hidden = (torch.rand(batch, seq, HIDDEN, dtype=torch.float32) - 0.5) * 8.0
+
+    class _StubDecoderOutput:
+        def __init__(self, last_hidden_state: torch.Tensor):
+            self.last_hidden_state = last_hidden_state
+            self.past_key_values = None
+            self.hidden_states = None
+            self.attentions = None
+            self.shared_kv_states = None
+
+    def _stub_decoder_forward(*_args: Any, **_kwargs: Any) -> _StubDecoderOutput:
+        return _StubDecoderOutput(hidden)
+
+    # Bypass only the decoder stack (self.model) -- lm_head + the softcap
+    # branch below run as the real Gemma4ForCausalLM.forward code.
+    model.model.forward = _stub_decoder_forward
+
+    with torch.no_grad():
+        lm_head_weight = torch.randn(VOCAB, HIDDEN, dtype=torch.float32) * 2.0
+        model.lm_head.weight.copy_(lm_head_weight)
+        input_ids = torch.randint(0, VOCAB, (batch, seq), dtype=torch.long)
+        result = model(input_ids=input_ids, use_cache=False)
+
+    out = result.logits
+    # The pre-softcap logits (lm_head(hidden) before the cap/tanh/uncap
+    # branch) double as the uncapped-negative-test input: recompute them via
+    # the same real lm_head weight, matching what Gemma4ForCausalLM.forward
+    # feeds into its softcap branch.
+    with torch.no_grad():
+        pre_softcap = model.lm_head(hidden)
+
     return {
         "op": "logit_softcap",
-        "source": "transformers/models/gemma4/modeling_gemma4.py:1888-1892",
+        "source": (
+            "transformers/models/gemma4/modeling_gemma4.py "
+            "(Gemma4ForCausalLM.forward, lm_head then final_logit_softcapping "
+            "branch), executed via a real Gemma4ForCausalLM/Gemma4TextConfig "
+            "with only the decoder stack (self.model) stubbed"
+        ),
         "shape": [batch, seq, VOCAB],
-        "cap": cap,
-        "input": TensorRef(logits),
+        "cap": FINAL_LOGIT_SOFTCAPPING,
+        "input": TensorRef(pre_softcap),
         "output": TensorRef(out),
     }
 
@@ -418,23 +543,33 @@ def gen_logit_softcap() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # G8: dual RoPE (modeling_gemma4.py: Gemma4TextRotaryEmbedding.forward /
 # compute_default_rope_parameters, transformers/modeling_rope_utils.py:
-# _compute_proportional_rope_parameters; rotate_half + apply_rotary_pos_emb
-# at modeling_gemma4.py:780-806).
+# _compute_proportional_rope_parameters; rotate_half + apply_rotary_pos_emb).
 #
 # rotate_half pairing convention (verified against the pinned source, this
 # repo's worst historical bug class): x1 = x[..., :dim//2], x2 =
 # x[..., dim//2:], rotate = cat(-x2, x1) -- i.e. dimension i is paired with
 # dimension (dim//2 + i) ("stride-half"), NOT the interleaved (2i, 2i+1)
 # convention. Local (sliding) layers use the "default" RoPE type: standard
-# full-head_dim inv_freq, theta=1e4. Global (full-attention) layers use the
+# full-head_dim inv_freq. Global (full-attention) layers use the
 # "proportional" RoPE type (_compute_proportional_rope_parameters): only the
 # first `int(partial_rotary_factor * head_dim // 2)` of the head_dim//2
-# frequency slots are non-zero (theta=1e6); the rest are exactly zero,
-# which under cos(0)=1/sin(0)=0 makes those dimension-pairs a no-op
-# (pass-through) rather than truncating the tensor -- cos/sin are always
-# head_dim-wide.
+# frequency slots are non-zero; the rest are exactly zero, which under
+# cos(0)=1/sin(0)=0 makes those dimension-pairs a no-op (pass-through)
+# rather than truncating the tensor -- cos/sin are always head_dim-wide.
+#
+# Major-3 fix: `theta_local`/`theta_global`/`partial_rotary_factor` are no
+# longer hardcoded literals -- they are the values `verify_rope_reference`
+# derived from the real `Gemma4TextConfig` parsing the pinned E2B config
+# fixture (asserted equal to the manifest's `expected_rope_parameters`
+# before this function is even called). Only the head_dim/hidden_size/
+# num_attention_heads inputs to the `MiniRopeConfig` stand-in below are
+# synthetic reductions (per the module docstring); the `standardize_rope_params`
+# no-op mirrors the base config method's role for this already-standardized
+# `rope_parameters` dict shape.
 # ---------------------------------------------------------------------------
-def gen_dual_rope() -> dict[str, Any]:
+def gen_dual_rope(
+    seed: int, theta_local: float, theta_global: float, partial_rotary_factor: float
+) -> dict[str, Any]:
     from transformers.modeling_rope_utils import _compute_proportional_rope_parameters
     from transformers.models.gemma4.modeling_gemma4 import (
         Gemma4TextRotaryEmbedding,
@@ -453,28 +588,28 @@ def gen_dual_rope() -> dict[str, Any]:
         def standardize_rope_params(self) -> None:
             return None
 
-    set_seed(6)
+    set_seed(seed)
     batch, seq, heads = 1, 6, 2
     position_ids = torch.arange(seq, dtype=torch.long).unsqueeze(0)
 
-    # Local (sliding): "default" rope_type, full head_dim, theta=1e4.
+    # Local (sliding): "default" rope_type, full head_dim.
     local_cfg = MiniRopeConfig(
         HEAD_DIM_LOCAL,
-        {"sliding_attention": {"rope_type": "default", "rope_theta": ROPE_THETA_LOCAL}},
+        {"sliding_attention": {"rope_type": "default", "rope_theta": theta_local}},
     )
     local_inv_freq, local_scaling = Gemma4TextRotaryEmbedding.compute_default_rope_parameters(
         local_cfg, layer_type="sliding_attention"
     )
 
-    # Global (full-attention): "proportional" rope_type, theta=1e6,
-    # partial_rotary_factor=0.25 over global_head_dim.
+    # Global (full-attention): "proportional" rope_type, reference-derived
+    # theta and partial_rotary_factor over global_head_dim.
     global_cfg = MiniRopeConfig(
         HEAD_DIM_GLOBAL,
         {
             "full_attention": {
                 "rope_type": "proportional",
-                "rope_theta": ROPE_THETA_GLOBAL,
-                "partial_rotary_factor": PARTIAL_ROTARY_FACTOR,
+                "rope_theta": theta_global,
+                "partial_rotary_factor": partial_rotary_factor,
             }
         },
     )
@@ -483,7 +618,7 @@ def gen_dual_rope() -> dict[str, Any]:
     )
 
     def cos_sin(inv_freq: torch.Tensor, scaling: float) -> tuple[torch.Tensor, torch.Tensor]:
-        # Mirrors Gemma4TextRotaryEmbedding.forward (modeling_gemma4.py:1160-1173).
+        # Mirrors Gemma4TextRotaryEmbedding.forward.
         inv_freq_expanded = inv_freq[None, :, None].float().expand(batch, -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
         freqs = (inv_freq_expanded @ position_ids_expanded).transpose(1, 2)
@@ -501,17 +636,18 @@ def gen_dual_rope() -> dict[str, Any]:
     return {
         "op": "dual_rope",
         "source": (
-            "transformers/models/gemma4/modeling_gemma4.py:780-806 "
-            "(rotate_half, apply_rotary_pos_emb), 1093-1173 "
-            "(Gemma4TextRotaryEmbedding); "
-            "transformers/modeling_rope_utils.py:187-252 "
-            "(_compute_proportional_rope_parameters)"
+            "transformers/models/gemma4/modeling_gemma4.py "
+            "(rotate_half, apply_rotary_pos_emb, Gemma4TextRotaryEmbedding); "
+            "transformers/modeling_rope_utils.py "
+            "(_compute_proportional_rope_parameters); theta/partial-factor "
+            "values reference-derived from tests/fixtures/gemma4/"
+            "e2b_config.json via Gemma4TextConfig (see verify_rope_reference)"
         ),
         "shape_local": [batch, seq, heads, HEAD_DIM_LOCAL],
         "shape_global": [batch, seq, heads, HEAD_DIM_GLOBAL],
-        "theta_local": ROPE_THETA_LOCAL,
-        "theta_global": ROPE_THETA_GLOBAL,
-        "partial_rotary_factor": PARTIAL_ROTARY_FACTOR,
+        "theta_local": theta_local,
+        "theta_global": theta_global,
+        "partial_rotary_factor": partial_rotary_factor,
         "position_ids": position_ids.squeeze(0).tolist(),
         "local_input": TensorRef(local_x),
         "global_input": TensorRef(global_x),
@@ -522,37 +658,21 @@ def gen_dual_rope() -> dict[str, Any]:
     }
 
 
-GENERATORS = {
-    "rms_norm": gen_rms_norm,
-    "geglu_mlp": gen_geglu_mlp,
-    "scaled_embedding": gen_scaled_embedding,
-    "qk_norm_v_unscaled": gen_qk_norm_v_unscaled,
-    "logit_softcap": gen_logit_softcap,
-    "dual_rope": gen_dual_rope,
-}
-
-
-def build_manifest(op_files: dict[str, str]) -> dict[str, Any]:
+def build_all_ops(manifest: dict[str, Any], rope_params: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    ops_spec = manifest["ops"]
+    theta_local = rope_params["sliding_attention"]["rope_theta"]
+    theta_global = rope_params["full_attention"]["rope_theta"]
+    partial_rotary_factor = rope_params["full_attention"]["partial_rotary_factor"]
     return {
-        "schema_version": SCHEMA_VERSION,
-        "adr": ADR,
-        "generator": "scripts/gemma4_stage3_goldens.py",
-        "reference_module": "transformers.models.gemma4.modeling_gemma4",
-        "adr_evidence_commit": "ab1771c9e42891d893189978a8009426d70b4688",
-        "runtime_versions": REFERENCE_VERSIONS,
-        "fixture_format": (
-            "Each op has a <op>.json sidecar (shapes/scalars/tensor refs) "
-            "plus one <op>_<field>.bin per tensor field (raw little-endian "
-            "float32, shape/sha256 recorded in the sidecar's ref)."
+        "rms_norm": gen_rms_norm(ops_spec["rms_norm"]["seed"]),
+        "rms_norm_wide": gen_rms_norm_wide(ops_spec["rms_norm_wide"]["seed"]),
+        "geglu_mlp": gen_geglu_mlp(ops_spec["geglu_mlp"]["seed"]),
+        "scaled_embedding": gen_scaled_embedding(ops_spec["scaled_embedding"]["seed"]),
+        "qk_norm_v_unscaled": gen_qk_norm_v_unscaled(ops_spec["qk_norm_v_unscaled"]["seed"]),
+        "logit_softcap": gen_logit_softcap(ops_spec["logit_softcap"]["seed"]),
+        "dual_rope": gen_dual_rope(
+            ops_spec["dual_rope"]["seed"], theta_local, theta_global, partial_rotary_factor
         ),
-        "ops": {
-            op: {
-                "file": fname,
-                "tolerance_max_abs_diff": TOLERANCES[op],
-                "tolerance_justification": TOLERANCE_JUSTIFICATION[op],
-            }
-            for op, fname in op_files.items()
-        },
     }
 
 
@@ -561,34 +681,33 @@ def main() -> int:
     parser.add_argument("--write-fixture", action="store_true")
     args = parser.parse_args()
 
-    validate_runtime_versions()
+    manifest = load_manifest()
+    verify_source_pins(manifest)
+    verify_runtime_versions(manifest)
+    rope_params = verify_rope_reference(manifest)
 
-    op_files = {op: f"{op}.json" for op in GENERATORS}
-    manifest = build_manifest(op_files)
+    op_files = {op: spec["file"] for op, spec in manifest["ops"].items()}
 
     if args.write_fixture:
         FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
-        for op, fn in GENERATORS.items():
-            data = materialize_op(op, fn())
+        all_ops = build_all_ops(manifest, rope_params)
+        for op, data in all_ops.items():
+            materialized = materialize_op(op, data)
             path = FIXTURE_DIR / op_files[op]
-            path.write_text(json.dumps(data, indent=2) + "\n")
+            path.write_text(json.dumps(materialized, indent=2) + "\n")
             print(f"wrote {path}")
-        MANIFEST_PATH.write_text(json.dumps(manifest, indent=2) + "\n")
-        print(f"wrote {MANIFEST_PATH}")
+        print(
+            "NOTE: manifest.json was NOT written by this run -- it is a "
+            "committed, hand-authored provenance spec; edit it directly if "
+            "a seed/tolerance/rationale needs to change."
+        )
         return 0
 
     # Verify mode: diff in-memory regeneration against committed fixtures.
     ok = True
-    if not MANIFEST_PATH.exists():
-        print(f"FATAL: {MANIFEST_PATH} does not exist -- run with --write-fixture first", file=sys.stderr)
-        return 1
-    committed_manifest = json.loads(MANIFEST_PATH.read_text())
-    if committed_manifest != manifest:
-        print("FATAL: manifest drift between regenerated and committed", file=sys.stderr)
-        ok = False
-
-    for op, fn in GENERATORS.items():
-        data = materialize_op(f"_verify_{op}", fn())
+    all_ops = build_all_ops(manifest, rope_params)
+    for op, data in all_ops.items():
+        materialized = materialize_op(f"_verify_{op}", data)
         path = FIXTURE_DIR / op_files[op]
         if not path.exists():
             print(f"FATAL: {path} does not exist", file=sys.stderr)
@@ -599,11 +718,11 @@ def main() -> int:
         # freshly-regenerated (`_verify_<op>_*.bin`) refs to the committed
         # naming scheme, then diff bin bytes directly (not their paths).
         drift = False
-        if set(committed.keys()) != set(data.keys()):
+        if set(committed.keys()) != set(materialized.keys()):
             drift = True
         else:
             for key, val in committed.items():
-                new_val = data[key]
+                new_val = materialized[key]
                 if isinstance(val, dict) and "bin" in val:
                     committed_bytes = (FIXTURE_DIR / val["bin"]).read_bytes()
                     new_bytes = (FIXTURE_DIR / new_val["bin"]).read_bytes()
@@ -618,7 +737,11 @@ def main() -> int:
 
     if not ok:
         return 1
-    print("OK: all Stage-3 goldens match the committed fixtures byte-for-byte")
+    print(
+        "OK: all Stage-3 goldens match the committed fixtures byte-for-byte "
+        "(source pins, runtime versions, and reference-derived RoPE "
+        "parameters verified against the committed manifest)"
+    )
     return 0
 
 

@@ -1,6 +1,6 @@
 {
   "op": "dual_rope",
-  "source": "transformers/models/gemma4/modeling_gemma4.py:780-806 (rotate_half, apply_rotary_pos_emb), 1093-1173 (Gemma4TextRotaryEmbedding); transformers/modeling_rope_utils.py:187-252 (_compute_proportional_rope_parameters)",
+  "source": "transformers/models/gemma4/modeling_gemma4.py (rotate_half, apply_rotary_pos_emb, Gemma4TextRotaryEmbedding); transformers/modeling_rope_utils.py (_compute_proportional_rope_parameters); theta/partial-factor values reference-derived from tests/fixtures/gemma4/e2b_config.json via Gemma4TextConfig (see verify_rope_reference)",
   "shape_local": [
     1,
     6,

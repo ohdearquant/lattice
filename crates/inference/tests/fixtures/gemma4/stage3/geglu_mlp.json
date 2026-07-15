@@ -1,6 +1,6 @@
 {
   "op": "geglu_mlp",
-  "source": "transformers/models/gemma4/modeling_gemma4.py:1066-1082 (Gemma4TextMLP)",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:1074-1090 (Gemma4TextMLP)",
   "shape": [
     2,
     3,

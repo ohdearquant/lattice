@@ -1,6 +1,6 @@
 {
   "op": "scaled_embedding",
-  "source": "transformers/models/gemma4/modeling_gemma4.py:1458-1469 (Gemma4TextScaledWordEmbedding), instantiated at modeling_gemma4.py:1601-1602 with embed_scale=hidden_size**0.5",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:1465-1476 (Gemma4TextScaledWordEmbedding)",
   "vocab": 40,
   "hidden": 64,
   "embed_scale": 8.0,

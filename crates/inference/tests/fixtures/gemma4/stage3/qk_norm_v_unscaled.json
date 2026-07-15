@@ -1,6 +1,6 @@
 {
   "op": "qk_norm_v_unscaled",
-  "source": "transformers/models/gemma4/modeling_gemma4.py:1208-1213 (q_norm/k_norm/v_norm construction), 1240-1260 (application order: q_norm then RoPE, k_norm then RoPE, v_norm with no RoPE)",
+  "source": "transformers/models/gemma4/modeling_gemma4.py (q_norm/k_norm/v_norm construction and application order in Gemma4TextAttention)",
   "shape": [
     1,
     3,

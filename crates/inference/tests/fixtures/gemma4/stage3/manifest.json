@@ -1,46 +1,82 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "adr": "ADR-082 Stage 3 (G6-G10)",
   "generator": "scripts/gemma4_stage3_goldens.py",
   "reference_module": "transformers.models.gemma4.modeling_gemma4",
-  "adr_evidence_commit": "ab1771c9e42891d893189978a8009426d70b4688",
+  "pinned_source_commit": "ab1771c9e42891d893189978a8009426d70b4688",
+  "pinned_source_hashes": {
+    "transformers/models/gemma4/modeling_gemma4.py": "ccab8e2dd80b71e9ca34e2c87291e17c40a27c755006e554da2ebf70d6616916",
+    "transformers/modeling_rope_utils.py": "9592ba129bf723ed3fa54afcc48ddd3d40d2dac2947ce5cc37803c496ca320e8",
+    "transformers/models/gemma4/configuration_gemma4.py": "1c5c4ae484625f93f4d754b62b0c4e359b30978f5b85245526393f65a2bbc54e"
+  },
+  "pinned_source_hash_note": "SHA-256 of the three source modules the generator imports, as they exist at pinned_source_commit. The generator fails closed (no fixture writes) unless the transformers install it actually imports hashes to these exact values -- computed once by fetching each file's raw content at the pinned commit and hashing it; regenerate by running under `uv run --with \"transformers @ git+https://github.com/huggingface/transformers@ab1771c9e42891d893189978a8009426d70b4688\"`, which installs exactly this commit.",
   "runtime_versions": {
     "torch": "2.13.0",
-    "transformers": "5.12.1",
     "numpy": "2.4.6",
     "python": "3.11.12"
   },
+  "e2b_config_fixture": "crates/inference/tests/fixtures/gemma4/e2b_config.json",
+  "expected_rope_parameters": {
+    "sliding_attention": {
+      "rope_type": "default",
+      "rope_theta": 10000.0
+    },
+    "full_attention": {
+      "rope_type": "proportional",
+      "rope_theta": 1000000.0,
+      "partial_rotary_factor": 0.25
+    }
+  },
+  "expected_rope_parameters_note": "Gemma4TextConfig(**e2b_config.json['text_config']).rope_parameters, computed by the pinned reference config class from the committed E2B config fixture. The generator asserts the live reference-derived value equals this before deriving the theta/partial-factor scalars used by the dual_rope golden's synthetic (reduced-head_dim) tensors, and before writing any fixture.",
+  "mutation_separation_floor_multiplier": 10.0,
+  "mutation_separation_floor_note": "Predeclared per-op minimum required max-abs-diff for a mutation (wrong-implementation) negative test to pass, independent of any observed lattice result: tolerance_max_abs_diff * mutation_separation_floor_multiplier. A negative test asserting only `diff > tolerance` is decorative near the boundary; `diff >= mutation_separation_floor` demands the mutation diverge by a full order of magnitude past the golden's own noise floor.",
   "fixture_format": "Each op has a <op>.json sidecar (shapes/scalars/tensor refs) plus one <op>_<field>.bin per tensor field (raw little-endian float32, shape/sha256 recorded in the sidecar's ref).",
   "ops": {
     "rms_norm": {
       "file": "rms_norm.json",
+      "seed": 1,
       "tolerance_max_abs_diff": 1e-06,
-      "tolerance_justification": "Elementwise reduction over hidden=64 in float32, single op (square, mean, +eps, pow(-0.5), multiply) with no matmul reassociation -- f32 round-trip precision, no accumulation-order sensitivity expected. Empirically measured max-abs-diff on the Rust implementation was ~4.8e-7."
+      "mutation_separation_floor": 1e-05,
+      "tolerance_justification": "Elementwise reduction (square, mean, +eps, pow(-0.5), multiply) over a width-64 f32 accumulator, single reduction pass, no matmul reassociation. For an n=64 naive summation of O(1)-scale inputs, worst-case f32 round-off accumulates roughly linearly in n and per-element unit roundoff (~1.19e-7), placing the bound an order of magnitude below 1e-6. The lattice kernel computes sqrt(mean+eps) then reciprocal rather than the reference's single pow(x,-0.5) call -- two rounding steps instead of one -- which the declared tolerance also covers; this is bounded f32 parity, not bit-for-bit equivalence (see gemma4_ops.rs's RMSNorm doc comment)."
+    },
+    "rms_norm_wide": {
+      "file": "rms_norm_wide.json",
+      "seed": 7,
+      "tolerance_max_abs_diff": 5e-05,
+      "tolerance_justification": "Same op as rms_norm, at the real E2B hidden_size=1536 reduction width (24x the other RMSNorm golden's width=64). Naive-summation round-off accumulates roughly linearly in reduction width; scaling the width=64 structural bound by that ratio, and adding headroom for reduction-order differences between torch's summation and the lattice SIMD partial-sum tree (four-wide NEON accumulators merged pairwise, a different association order than a linear scan), yields a conservative ceiling that stays several orders of magnitude below the O(1)-scale divergence a wrong-formula or reduction-order bug would produce."
     },
     "geglu_mlp": {
       "file": "geglu_mlp.json",
+      "seed": 2,
       "tolerance_max_abs_diff": 1e-05,
-      "tolerance_justification": "Two hidden x intermediate matmuls (gate_proj, up_proj) and one intermediate x hidden matmul (down_proj), each a 64/96-wide reduction. Reference uses torch's BLAS; the lattice kernel under test uses Accelerate/AMX or a scalar/SIMD fallback -- reduction order (and therefore rounding) can differ from torch's, per this repo's f32-reassociation-reorder bug class. 1e-5 accommodates that reordering (empirically measured max-abs-diff ~1.2e-7) while still catching a wrong-formula or wrong-activation bug (which would produce differences many orders of magnitude larger)."
+      "tolerance_justification": "Two hidden x intermediate matmuls (gate_proj, up_proj, 64x96 reduction) and one intermediate x hidden matmul (down_proj, 96x64 reduction), chained through one tanh-GELU nonlinearity. The reference uses torch's BLAS reduction order; the lattice kernel under test uses Accelerate/AMX or a scalar/SIMD fallback, so reduction order (and therefore rounding) can differ from torch's at each of the three matmuls, per this repo's f32-reassociation-reorder bug class. The declared tolerance accommodates that reordering compounding across a 3-matmul chain while remaining orders of magnitude below a wrong-formula, wrong-activation, or wrong-branch-order bug."
     },
     "scaled_embedding": {
       "file": "scaled_embedding.json",
+      "seed": 3,
       "tolerance_max_abs_diff": 1e-06,
-      "tolerance_justification": "A table lookup (exact copy, no arithmetic) followed by one scalar multiply (embed_scale = sqrt(hidden_size), computed once) -- no reduction, no reassociation risk. Empirically measured max-abs-diff was 0."
+      "tolerance_justification": "A table lookup (exact copy, no arithmetic) followed by one scalar multiply by a precomputed constant (embed_scale = sqrt(hidden_size)) -- no reduction, no accumulation, no reassociation risk; a single f32 multiply is exact to rounding for this magnitude range, so the declared tolerance is dominated by that one rounding step."
     },
     "qk_norm_v_unscaled": {
       "file": "qk_norm_v_unscaled.json",
+      "seed": 4,
       "tolerance_max_abs_diff": 1e-06,
-      "tolerance_justification": "Same elementwise-reduction shape as rms_norm, applied per-head over head_dim in {16, 32} (well within f32 exactness for this op). Empirically measured max-abs-diff was ~2.4e-7 (q/v), 0 (k)."
+      "mutation_separation_floor": 1e-05,
+      "tolerance_justification": "Same elementwise-reduction shape and formula as rms_norm, applied per-head over head_dim in {16, 32} -- narrower than rms_norm's width-64 reduction, so its structural round-off bound is at least as tight as that op's."
     },
     "logit_softcap": {
       "file": "logit_softcap.json",
+      "seed": 5,
       "tolerance_max_abs_diff": 3e-06,
-      "tolerance_justification": "Two scalar multiplies and one tanh, elementwise, no reduction -- but Rust's f32::tanh and PyTorch's libm tanh are two different correctly-rounded-to-a-few-ULPs implementations, not the same routine, so their outputs differ by a few ULPs rather than being bit-identical. Empirically measured max-abs-diff on the Rust implementation was ~1.9e-6 at cap=30 with logits up to +/-60; 3e-6 keeps headroom for that while still catching a wrong-formula or disabled-softcap bug (orders of magnitude larger, see the disabled-softcap negative test)."
+      "mutation_separation_floor": 3e-05,
+      "tolerance_justification": "Two scalar multiplies and one tanh, elementwise, no reduction. Rust's f32::tanh and PyTorch's libm tanh are both correctly-rounded-to-a-few-ULPs implementations of the same mathematical function but not the same routine, so outputs can differ by a small constant number of ULPs across the operating range (including the saturation region where |logits/cap| is large); the tolerance is set to a small multiple of f32 ULP magnitude at cap=30 scale, several orders of magnitude below the divergence a disabled or misordered softcap would produce."
     },
     "dual_rope": {
       "file": "dual_rope.json",
+      "seed": 6,
       "tolerance_max_abs_diff": 1e-06,
-      "tolerance_justification": "cos/sin evaluated once per (position, frequency) pair then combined via two multiplies and one add per element (rotate_half) -- elementwise, no reduction; matches the reference's own float32 RoPE math exactly. Empirically measured max-abs-diff was ~2.4e-7 (local), ~1.2e-7 (global)."
+      "mutation_separation_floor": 1e-05,
+      "tolerance_justification": "cos/sin evaluated once per (position, frequency) pair via a single sin/cos call each, then combined via two multiplies and one add per element (rotate_half) -- elementwise, no reduction, matching the reference's own float32 RoPE math term-for-term. The only source of divergence is per-call transcendental (sin/cos) ULP differences between Rust's libm and PyTorch's, several orders of magnitude below the divergence a pairing-convention or theta bug would produce."
     }
   }
 }

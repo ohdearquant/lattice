@@ -27,10 +27,20 @@ use crate::forward::cpu::{elementwise_mul, matmul_bt, rms_norm};
 /// (`crate::model::qwen35::qwen35_rms_norm`), which is this stage's
 /// declared negative test (`tests::mutation_shifted_rms_norm_fails_golden`).
 ///
-/// Reuses `crate::forward::cpu::rms_norm` as-is: verified bit-for-bit
-/// equivalent op order to `Gemma4RMSNorm.forward`
-/// (`transformers/models/gemma4/modeling_gemma4.py:202-210`: square, mean,
-/// `+eps`, `pow(-0.5)`, multiply by weight).
+/// Reuses `crate::forward::cpu::rms_norm` as-is: this is **bounded f32
+/// parity with `Gemma4RMSNorm.forward`, not bit-for-bit equivalence**. The
+/// reference computes `pow(mean(x^2) + eps, -0.5)` (a single `pow` call);
+/// this kernel computes `sqrt(mean(x^2) + eps)` then reciprocal (two
+/// rounding steps), and its NEON path reduces `sum(x^2)` in 4-wide partial
+/// sums merged pairwise -- a different accumulation order than either the
+/// reference or this kernel's own scalar fallback. The golden fixture set
+/// covers this at both a 1/24-scaled synthetic width (`rms_norm.json`,
+/// hidden=64) and the real E2B `hidden_size=1536` (`rms_norm_wide.json`,
+/// `tests::rms_norm_wide_matches_hf_golden`), each within its manifest's
+/// predeclared tolerance -- see
+/// `crates/inference/tests/fixtures/gemma4/stage3/manifest.json`'s
+/// `rms_norm`/`rms_norm_wide` `tolerance_justification` for the structural
+/// bound.
 pub fn gemma4_rms_norm(x: &mut [f32], gamma: &[f32], hidden: usize, eps: f32) {
     rms_norm(x, gamma, hidden, eps);
 }
@@ -342,6 +352,18 @@ mod tests {
             .unwrap_or_else(|| panic!("manifest missing tolerance for op {op}")) as f32
     }
 
+    /// Predeclared minimum required max-abs-diff for a mutation (negative)
+    /// test to pass (manifest.json's `mutation_separation_floor`) -- a
+    /// margin above the golden's own tolerance, not merely `diff > tol`,
+    /// so a mutation one ULP past the tolerance boundary can't pass by
+    /// accident. See manifest.json's `mutation_separation_floor_note`.
+    fn mutation_separation_floor(op: &str) -> f32 {
+        manifest()["ops"][op]["mutation_separation_floor"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("manifest missing mutation_separation_floor for op {op}"))
+            as f32
+    }
+
     /// Read a tensor-ref field (`{"bin": "<file>", "shape": [...], ...}`,
     /// written by `materialize_op`/`TensorRef` in
     /// `scripts/gemma4_stage3_goldens.py`) as a `Vec<f32>`: raw
@@ -416,7 +438,7 @@ mod tests {
         // test): substituting lattice's Qwen3.5 shifted `(1 + gamma)`
         // RMSNorm for the standard op must exceed the golden's tolerance.
         let fx = load_json("rms_norm.json");
-        let tol = tolerance("rms_norm");
+        let floor = mutation_separation_floor("rms_norm");
         let shape = dims(&fx, "shape");
         let hidden = shape[2];
         let eps = fx["eps"].as_f64().unwrap() as f32;
@@ -428,9 +450,40 @@ mod tests {
 
         let diff = max_abs_diff(&x, &expected);
         assert!(
-            diff > tol,
+            diff >= floor,
             "shifted (1+gamma) RMSNorm must diverge from the standard-RMSNorm golden \
-             (diff {diff}, tolerance {tol}) -- this test is decorative if it doesn't"
+             by at least the predeclared mutation-separation floor \
+             (diff {diff}, floor {floor}) -- this test is decorative if it doesn't"
+        );
+    }
+
+    // -- Medium-4: RMSNorm at the real E2B hidden_size=1536 width ---------------
+
+    #[test]
+    fn rms_norm_wide_matches_hf_golden() {
+        // Same op as `rms_norm_matches_hf_golden`, at the real (unscaled)
+        // E2B hidden_size=1536 reduction width, demonstrating the bounded
+        // f32 parity claim (see `gemma4_rms_norm`'s doc comment) holds at
+        // real width, not only at the stage's 1/24-scaled synthetic width.
+        let fx = load_json("rms_norm_wide.json");
+        let tol = tolerance("rms_norm_wide");
+        let shape = dims(&fx, "shape");
+        let hidden = shape[2];
+        assert_eq!(
+            hidden, 1536,
+            "rms_norm_wide fixture must use the real E2B hidden_size"
+        );
+        let eps = fx["eps"].as_f64().unwrap() as f32;
+        let mut x = load_bin(&fx, "input");
+        let gamma = load_bin(&fx, "weight");
+        let expected = load_bin(&fx, "output");
+
+        gemma4_rms_norm(&mut x, &gamma, hidden, eps);
+
+        let diff = max_abs_diff(&x, &expected);
+        assert!(
+            diff <= tol,
+            "rms_norm_wide max-abs-diff {diff} exceeds tolerance {tol}"
         );
     }
 
@@ -534,7 +587,7 @@ mod tests {
         // V (instead of the real unscaled norm) must diverge from the V
         // golden beyond tolerance.
         let fx = load_json("qk_norm_v_unscaled.json");
-        let tol = tolerance("qk_norm_v_unscaled");
+        let floor = mutation_separation_floor("qk_norm_v_unscaled");
         let shape = dims(&fx, "shape");
         let head_dim = shape[3];
         let eps = fx["eps"].as_f64().unwrap() as f32;
@@ -549,8 +602,9 @@ mod tests {
 
         let diff = max_abs_diff(&v, &expected_v);
         assert!(
-            diff > tol,
-            "a scaled V-norm must diverge from the unscaled-V golden (diff {diff}, tolerance {tol})"
+            diff >= floor,
+            "a scaled V-norm must diverge from the unscaled-V golden by at least the \
+             predeclared mutation-separation floor (diff {diff}, floor {floor})"
         );
     }
 
@@ -580,14 +634,15 @@ mod tests {
         // logits deliberately span well past +/-cap so saturation is
         // material, not a rounding-noise-sized difference.
         let fx = load_json("logit_softcap.json");
-        let tol = tolerance("logit_softcap");
+        let floor = mutation_separation_floor("logit_softcap");
         let logits = load_bin(&fx, "input");
         let expected = load_bin(&fx, "output");
 
         let diff = max_abs_diff(&logits, &expected);
         assert!(
-            diff > tol,
-            "uncapped logits must diverge from the softcapped golden (diff {diff}, tolerance {tol})"
+            diff >= floor,
+            "uncapped logits must diverge from the softcapped golden by at least the \
+             predeclared mutation-separation floor (diff {diff}, floor {floor})"
         );
     }
 
@@ -661,7 +716,7 @@ mod tests {
         // this exact failure mode): swapping local/global RoPE thetas must
         // make both outputs diverge from their respective goldens.
         let fx = load_json("dual_rope.json");
-        let tol = tolerance("dual_rope");
+        let floor = mutation_separation_floor("dual_rope");
         let theta_local = fx["theta_local"].as_f64().unwrap();
         let theta_global = fx["theta_global"].as_f64().unwrap();
         let factor = fx["partial_rotary_factor"].as_f64().unwrap() as f32;
@@ -678,8 +733,9 @@ mod tests {
         );
         let diff_local = max_abs_diff(&actual_local, &expected_local);
         assert!(
-            diff_local > tol,
-            "local RoPE fed the global theta must diverge (diff {diff_local}, tolerance {tol})"
+            diff_local >= floor,
+            "local RoPE fed the global theta must diverge by at least the predeclared \
+             mutation-separation floor (diff {diff_local}, floor {floor})"
         );
 
         // Global layer, but fed the local theta (still with the real
@@ -694,16 +750,18 @@ mod tests {
         );
         let diff_global = max_abs_diff(&actual_global, &expected_global);
         assert!(
-            diff_global > tol,
-            "global RoPE fed the local theta must diverge (diff {diff_global}, tolerance {tol})"
+            diff_global >= floor,
+            "global RoPE fed the local theta must diverge by at least the predeclared \
+             mutation-separation floor (diff {diff_global}, floor {floor})"
         );
     }
 
     #[test]
-    fn stage3_manifest_declares_all_six_ops() {
+    fn stage3_manifest_declares_all_ops() {
         let m = manifest();
         for op in [
             "rms_norm",
+            "rms_norm_wide",
             "geglu_mlp",
             "scaled_embedding",
             "qk_norm_v_unscaled",

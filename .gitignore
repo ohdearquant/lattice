@@ -57,6 +57,9 @@ Thumbs.db
 !crates/inference/tests/fixtures/gemma4/stage3/rms_norm_input.bin
 !crates/inference/tests/fixtures/gemma4/stage3/rms_norm_output.bin
 !crates/inference/tests/fixtures/gemma4/stage3/rms_norm_weight.bin
+!crates/inference/tests/fixtures/gemma4/stage3/rms_norm_wide_input.bin
+!crates/inference/tests/fixtures/gemma4/stage3/rms_norm_wide_output.bin
+!crates/inference/tests/fixtures/gemma4/stage3/rms_norm_wide_weight.bin
 !crates/inference/tests/fixtures/gemma4/stage3/scaled_embedding_embed_weight.bin
 !crates/inference/tests/fixtures/gemma4/stage3/scaled_embedding_output.bin
 

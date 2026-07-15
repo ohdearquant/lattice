@@ -1,6 +1,6 @@
 {
   "op": "rms_norm",
-  "source": "transformers/models/gemma4/modeling_gemma4.py:193-210 (Gemma4RMSNorm)",
+  "source": "transformers/models/gemma4/modeling_gemma4.py:197-215 (Gemma4RMSNorm)",
   "shape": [
     2,
     3,

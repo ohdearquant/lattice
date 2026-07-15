@@ -1,6 +1,6 @@
 {
   "op": "logit_softcap",
-  "source": "transformers/models/gemma4/modeling_gemma4.py:1888-1892",
+  "source": "transformers/models/gemma4/modeling_gemma4.py (Gemma4ForCausalLM.forward, lm_head then final_logit_softcapping branch), executed via a real Gemma4ForCausalLM/Gemma4TextConfig with only the decoder stack (self.model) stubbed",
   "shape": [
     2,
     5,
@@ -16,7 +16,7 @@
     ],
     "dtype": "float32",
     "endianness": "little",
-    "sha256": "0ffadccdadbf017f7bad30c851aabe459ea322147a7686a9dfc1b3d8a9db52f1",
+    "sha256": "39efed43798d05a46645ebf57572fe5016bfeeb97cff6c7275b4387f15171109",
     "num_elements": 400
   },
   "output": {
@@ -28,7 +28,7 @@
     ],
     "dtype": "float32",
     "endianness": "little",
-    "sha256": "11ff89aff7eb20c905ebe279401f11fb1bf74930f143e54fa4862741ede25a2d",
+    "sha256": "c6a6c806203622575fd3abc4e426a5774211cabb0a9e912c68b21255019a3316",
     "num_elements": 400
   }
 }
