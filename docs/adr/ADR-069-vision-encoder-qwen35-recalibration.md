@@ -128,9 +128,12 @@ config and weight-loading preparation, and the runtime compute stages S3-S5 exec
   dropping them). Gate: unit test round-trips the 0.8B config fields.
 - **S2 — Weight loading.** Load the 153 `model.visual.*` tensors (fp16 and q4) into `VisionWeights`.
   Gate: loads `qwen3.5-0.8b` and `qwen3.5-0.8b-q4` without error; tensor-count and shape assertions.
-- **S3 — Metal ViT forward.** Adapt the scaffold ViT to depth-12 / hidden-768 with real weights.
-  Gate: cosine > 0.999 vs the HF ViT patch embeddings on a fixed test image (the ADR-049 R1
-  criterion), under the GPU lock.
+- **S3 — ViT forward (split by Amendment 1 into S3a CPU reference + S3b Metal port).**
+  S3a: a CPU-reference forward over the real depth-12 / hidden-768 weights. Gate: cosine > 0.999
+  vs the HF pre-merger hidden states on the fixed golden image, enforced in required CI (the gate
+  must fail loud, never skip-pass, when the checkpoint is absent on an enforcing runner).
+  S3b: the Metal port of the same forward. Gate: matches the S3a CPU reference at cosine > 0.999
+  on the same golden image, under the GPU lock.
 - **S4 — Merger + image-token expansion.** Run `merge_and_project` on real weights; expand
   `image_token_id` placeholder spans in the input pipeline to the merged `visual_tokens` count.
   Gate: token-stream shape matches the HF processor for the same image + prompt.
@@ -198,3 +201,26 @@ load-bearing points; on acceptance, ADR-049's Status line gains a pointer
 - Lattice code: `crates/inference/src/vision/`, `metal_qwen35.rs:11318` (`generate_multimodal`),
   `metal_qwen35.rs:11492-11498` (injection point), `qwen35_config.rs` (config parser),
   `forward.rs:417-422` (1-D partial RoPE).
+
+## Amendment 1 — S3 split into S3a (CPU reference) + S3b (Metal port) (2026-07-15)
+
+The original Scope labeled S3 "Metal ViT forward" with a single cosine gate under the GPU lock.
+Implementation review established that the stage bundles two independently verifiable deliverables
+with different failure modes, and that landing them as one unreviewable unit is worse than staging
+them:
+
+- **S3a — CPU-reference ViT forward.** The convention-bearing work (temporal-patch fold order,
+  block-major spatial-merge ordering, bilinear position-embedding interpolation, rotate-half
+  2-axis vision RoPE, biased LayerNorm, GELU-tanh) lands as a plain-Rust forward gated at
+  cosine > 0.999 against the committed HF pre-merger golden (from the S-goldens fixtures).
+  The gate is a required CI job that provisions the pinned checkpoint and runs with enforcement
+  armed — a runner without the checkpoint fails loud rather than skip-passing. This is the
+  numerical contract every later stage (and the Metal port) verifies against.
+- **S3b — Metal port.** The same forward on Metal, gated against the S3a CPU reference at
+  cosine > 0.999 on the same golden image, under the machine GPU lock (`gpu_test_lock()`).
+  No Metal-side convention decisions are permitted — divergence from the CPU reference is a bug
+  by definition.
+
+R1's "before merging S3" reading maps to: the cosine-vs-HF criterion binds S3a; S3b's criterion is
+parity with the verified CPU reference. S4-S6 stage definitions are unchanged; S5's injection work
+composes with S3b (Metal) for the end-to-end path but may develop against S3a outputs.
