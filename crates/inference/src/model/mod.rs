@@ -2,6 +2,9 @@
 pub mod bert;
 pub mod bitnet_config;
 pub mod cross_encoder;
+pub mod gemma4_config;
+pub mod gemma4_ops;
+pub mod gemma4_preflight;
 pub mod qwen;
 pub mod qwen35;
 pub mod qwen35_config;

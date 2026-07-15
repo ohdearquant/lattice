@@ -171,7 +171,25 @@ jobs:
           header: e2e-parity
           path: parity-report.md
 
-  # Non-required Metal attention/KV-cache parity leg (issue #239). e2e-parity
+  # REQUIRED Metal parity RATCHET leg (issue #239, promoted per ADR-066 F2
+  # after a 2-week clean streak: 89/89 executed main-branch runs green,
+  # 2026-07-04 through 2026-07-15, zero reds of any kind).
+  #
+  # RATCHET, not full-parity certification: scripts/e2e_parity_check.py
+  # carries a deliberate, content-anchored waiver (METAL_EXPECTED_DIVERGENCE)
+  # for the long-prefill prompt, where Metal deterministically diverges from
+  # HF at the first token (open issue #535). What this required job certifies
+  # is therefore: Metal dispatch path-proof, binary health, and greedy token
+  # parity on every prompt EXCEPT the #535-waived one. Any divergence on any
+  # NON-WAIVED prompt fails closed; the waiver is keyed by prompt content, so
+  # the entire waived prompt — including a different or new divergence on it —
+  # stays green while the entry exists. The waiver self-reports: if the waived
+  # prompt starts passing, the run prints XPASS and instructs a maintainer to
+  # delete the entry (advisory — nothing removes it automatically; see the
+  # METAL_EXPECTED_DIVERGENCE comment in the script). Do not read this gate
+  # as full Metal parity until #535 is fixed and the waiver removed.
+  #
+  # e2e-parity
   # only ever exercised the CPU (qwen35_generate) path above; this job exists
   # to prove the Metal attention/KV dispatch helpers actually ran, not just
   # that a Metal device was present.
@@ -190,13 +208,13 @@ jobs:
   # kernels despite this, switch only `runs-on` to
   # `[self-hosted, macOS, ARM64, metal]` and document why.
   #
-  # Deliberately NOT added to parity-gate.needs below: this is an informational
-  # signal only. Making it required is a maintainer decision (repo branch
-  # protection), out of scope for this change. It is also skipped on merge-group
-  # events so this non-required macOS work cannot delay the required queue jobs;
-  # the PR run remains its observation point.
+  # Wired into parity-gate.needs below: on engine-change PR runs the gate
+  # fails unless this job succeeded. It remains skipped on merge-group events
+  # so the macOS leg cannot delay the required queue jobs — the PR run is its
+  # enforcement point, and the gate explicitly accepts skipped-on-merge-group
+  # (and only that) as non-failing.
   metal-parity:
-    name: metal attention parity (informational)
+    name: metal parity ratchet (#535 waived)
     needs: changes
     if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: macos-latest
@@ -794,9 +812,12 @@ jobs:
   # REQUIRED status check. Always runs, always reports. Passes when the engine
   # did not change (nothing to verify); mirrors the parity, embed-drift,
   # wasm-parity, wasm-simd128-parity, q4-composed, vision-s3-gate,
-  # ppl-gate-selftest, and q4-ppl-quality verdicts when it did. Fails closed
-  # if change-detection itself errored. metal-parity is deliberately excluded
-  # (informational — see its comment above). q4-ppl-quality is now armed
+  # ppl-gate-selftest, q4-ppl-quality, and metal-parity verdicts when it did.
+  # Fails closed if change-detection itself errored. metal-parity (the metal
+  # parity RATCHET — #535 is deliberately waived in the script; see the job
+  # comment above) is required on PR runs (promoted per ADR-066 F2, issue
+  # #239); on merge-group events it is skipped by design and the gate accepts
+  # exactly that skip. q4-ppl-quality is now armed
   # (golden captured on run 28841919096) and gates the shipping Q4 tier for
   # regressions.
   parity-gate:
@@ -812,6 +833,7 @@ jobs:
         vision-s3-gate,
         ppl-gate-selftest,
         q4-ppl-quality,
+        metal-parity,
       ]
     if: always()
     runs-on: ubuntu-latest
@@ -828,7 +850,9 @@ jobs:
           VISION_S3_RESULT="${{ needs.vision-s3-gate.result }}"
           PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
           Q4PPL_RESULT="${{ needs.q4-ppl-quality.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT"
+          METAL_RESULT="${{ needs.metal-parity.result }}"
+          EVENT_NAME="${{ github.event_name }}"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT metal-parity=$METAL_RESULT event=$EVENT_NAME"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -869,5 +893,13 @@ jobs:
             echo "::error::Engine changed and q4-ppl-quality regression gate did not succeed (result=$Q4PPL_RESULT)."
             exit 1
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, q4-composed, vision-s3-gate, ppl-gate-selftest, and q4-ppl-quality all PASSED."
+          if [ "$METAL_RESULT" != "success" ]; then
+            if [ "$EVENT_NAME" = "merge_group" ] && [ "$METAL_RESULT" = "skipped" ]; then
+              echo "metal-parity skipped on merge_group by design — its enforcement point is the PR run."
+            else
+              echo "::error::Engine changed and the metal parity ratchet did not succeed (result=$METAL_RESULT)."
+              exit 1
+            fi
+          fi
+          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, q4-composed, vision-s3-gate, ppl-gate-selftest, q4-ppl-quality, and metal-parity all PASSED."
           exit 0

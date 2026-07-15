@@ -2,20 +2,22 @@
 //! not share weights, config, or forward-pass code, and nothing in the tree
 //! bridges between them.
 //!
-//! ## The real path: Qwen3.5-0.8B (ADR-069, S1-S3a shipped)
+//! ## The real path: Qwen3.5-0.8B (ADR-069, S1-S3b shipped)
 //!
 //! [`checkpoint::load_qwen35_vision_weights`] loads the real
 //! `model.visual.*` tensors (S1/S2); [`qwen35_vit::qwen35_vit_forward`] runs
 //! the depth-12/hidden-768 forward pass over them, producing pre-merger
 //! hidden states `[num_patches, hidden_size]` (S3a — CPU reference, gated at
 //! cosine > 0.999 vs a committed HF differential golden in
-//! `tests/vision_s3_vit_forward_test.rs`, wired as a required CI job). S3b
-//! (a Metal port verified against this CPU reference under the GPU lock) is
-//! a separate fast-follow. [`qwen35_merger::qwen35_merger_forward`] runs the
-//! spatial-merge + projection MLP over the pre-merger hidden states,
-//! producing the post-merger visual embeddings `[num_patches /
-//! spatial_merge_size^2, out_hidden_size]` that the decoder consumes (S4 —
-//! gated at cosine > 0.999 vs a committed HF differential golden in
+//! `tests/vision_s3_vit_forward_test.rs`, wired as a required CI job).
+//! [`qwen35_vit_metal::qwen35_vit_forward_metal`] is the Metal port (S3b),
+//! gated against the S3a CPU reference under the machine GPU lock in
+//! `tests/vision_s3b_vit_metal_gate_test.rs`.
+//! [`qwen35_merger::qwen35_merger_forward`] runs the spatial-merge +
+//! projection MLP over the pre-merger hidden states, producing the
+//! post-merger visual embeddings `[num_patches / spatial_merge_size^2,
+//! out_hidden_size]` that the decoder consumes (S4 — gated at cosine >
+//! 0.999 vs a committed HF differential golden in
 //! `tests/vision_s4_merger_test.rs`). S5 (decoder injection + M-RoPE) is
 //! unimplemented — **this is the path future vision work should build on.**
 //!
@@ -79,6 +81,7 @@ pub mod multimodal;
 pub mod preprocess;
 pub mod qwen35_merger;
 pub mod qwen35_vit;
+pub mod qwen35_vit_metal;
 pub mod vit;
 
 pub use config::VisionConfig;

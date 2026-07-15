@@ -193,10 +193,12 @@ PROMPTS: list[tuple[str, int]] = [
 # and GDN prefill mode both excluded as causes; the CPU leg passes the same
 # prompt and still gates on it).
 #
-# The metal parity job is informational (deliberately not a required check),
-# but a plain FAIL turns the whole workflow run red on every engine PR,
-# burying new signal in known noise. Marking the prompt expected-divergent
-# keeps the job green while #535 is open WITHOUT weakening anything else:
+# The metal parity job is a required RATCHET gate (promoted per ADR-066 F2,
+# issue #239) precisely BECAUSE this waiver is here: what it certifies is
+# Metal path-proof, binary health, and token parity on every prompt except
+# this #535-waived one — not full Metal parity. Its CI display name says so.
+# Marking the prompt expected-divergent keeps the job green while #535 is
+# open WITHOUT weakening anything else:
 # missing path-proof, binary failures, and divergence on any other prompt
 # still fail closed, and the report still prints the divergence in full.
 # If the prompt starts PASSING on Metal, the run reports XPASS (still green)

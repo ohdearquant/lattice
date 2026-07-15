@@ -210,7 +210,12 @@ fn bilinear_pos_embed(
 /// `cos`/`sin` each `[head_dim]` (matches `apply_rotary_pos_emb_vision` in
 /// the HF reference: `x_embed = x * cos + rotate_half(x) * sin`, where
 /// `rotate_half(x) = cat(-x[half:], x[:half])`).
-fn apply_rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
+///
+/// `pub(crate)` so the S3b Metal port (`qwen35_vit_metal.rs`) can reuse this
+/// exact function for its own RoPE application rather than re-deriving the
+/// rotate-half convention (ADR-069 S3b's "zero independent convention
+/// decisions" contract).
+pub(crate) fn apply_rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     let half = x.len() / 2;
     let mut rotated = vec![0.0f32; x.len()];
     for i in 0..half {
@@ -220,6 +225,85 @@ fn apply_rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     for i in 0..x.len() {
         x[i] = x[i] * cos[i] + rotated[i] * sin[i];
     }
+}
+
+/// Build the per-patch bilinear-interpolated position-embedding contribution
+/// (`[n * hidden]`, to be added into the patch-embedded hidden states) and
+/// the per-patch 2-axis vision RoPE `cos`/`sin` tables (`[n * head_dim]`
+/// each), from the same block-major (spatial-merge-block-outer) patch order
+/// `preprocess_qwen35_image` produces. Factored out of [`qwen35_vit_forward`]
+/// so the S3b Metal port can reuse this exact CPU setup logic (cheap,
+/// deterministic table construction — not the heavy compute the Metal port
+/// targets) instead of re-deriving the interpolation/RoPE conventions.
+pub(crate) fn build_pos_embed_and_rope_tables(
+    weights: &Qwen35VisionWeights,
+    cfg: &VisionModelConfig,
+    grid: GridThw,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let hidden = cfg.hidden_size;
+    let n = grid.num_patches();
+    let side = (cfg.num_position_embeddings as f64).sqrt().round() as usize;
+    let merge = cfg.spatial_merge_size;
+    let head_dim = hidden / cfg.num_heads;
+    let rope_dim = head_dim / 2; // matches Qwen3_5VisionRotaryEmbedding(head_dim // 2)
+    let rope_half = rope_dim / 2; // inv_freq has rope_dim/2 entries (arange(0, rope_dim, 2))
+    let theta = 10_000.0_f32;
+    let inv_freq: Vec<f32> = (0..rope_half)
+        .map(|i| 1.0 / theta.powf((2 * i) as f32 / rope_dim as f32))
+        .collect();
+
+    let mut pos_embed_contrib = vec![0.0f32; n * hidden];
+    let mut cos_table = vec![0.0f32; n * head_dim];
+    let mut sin_table = vec![0.0f32; n * head_dim];
+
+    let blocks_h = grid.h / merge;
+    let blocks_w = grid.w / merge;
+    let mut patch_idx = 0usize;
+    for block_row in 0..blocks_h {
+        for block_col in 0..blocks_w {
+            for sub_row in 0..merge {
+                for sub_col in 0..merge {
+                    let h_idx = block_row * merge + sub_row;
+                    let w_idx = block_col * merge + sub_col;
+
+                    let pos_slice =
+                        &mut pos_embed_contrib[patch_idx * hidden..(patch_idx + 1) * hidden];
+                    bilinear_pos_embed(
+                        &weights.pos_embed,
+                        hidden,
+                        side,
+                        grid.h,
+                        grid.w,
+                        h_idx,
+                        w_idx,
+                        pos_slice,
+                    );
+
+                    // rotary = concat(h*inv_freq, w*inv_freq)  [rope_dim]
+                    // emb = concat(rotary, rotary)             [head_dim]
+                    let mut rotary = vec![0.0f32; rope_dim];
+                    for i in 0..rope_half {
+                        rotary[i] = h_idx as f32 * inv_freq[i];
+                        rotary[rope_half + i] = w_idx as f32 * inv_freq[i];
+                    }
+                    let cos_row = &mut cos_table[patch_idx * head_dim..(patch_idx + 1) * head_dim];
+                    let sin_row = &mut sin_table[patch_idx * head_dim..(patch_idx + 1) * head_dim];
+                    for i in 0..rope_dim {
+                        let (s, c) = rotary[i].sin_cos();
+                        cos_row[i] = c;
+                        cos_row[rope_dim + i] = c;
+                        sin_row[i] = s;
+                        sin_row[rope_dim + i] = s;
+                    }
+
+                    patch_idx += 1;
+                }
+            }
+        }
+    }
+    debug_assert_eq!(patch_idx, n);
+
+    (pos_embed_contrib, cos_table, sin_table)
 }
 
 /// Run the real Qwen3.5 ViT forward pass over one image's preprocessed pixel
@@ -271,65 +355,12 @@ pub fn qwen35_vit_forward(
     // `preprocess_qwen35_image` already produced, so no separate reorder
     // permutation is needed here (unlike the HF reference, which computes
     // patches in plain raster order and permutes afterward). ----
-    let side = (cfg.num_position_embeddings as f64).sqrt().round() as usize;
-    let merge = cfg.spatial_merge_size;
     let head_dim = hidden / cfg.num_heads;
-    let rope_dim = head_dim / 2; // matches Qwen3_5VisionRotaryEmbedding(head_dim // 2)
-    let rope_half = rope_dim / 2; // inv_freq has rope_dim/2 entries (arange(0, rope_dim, 2))
-    let theta = 10_000.0_f32;
-    let inv_freq: Vec<f32> = (0..rope_half)
-        .map(|i| 1.0 / theta.powf((2 * i) as f32 / rope_dim as f32))
-        .collect();
-
-    let mut cos_table = vec![0.0f32; n * head_dim];
-    let mut sin_table = vec![0.0f32; n * head_dim];
-
-    let blocks_h = grid.h / merge;
-    let blocks_w = grid.w / merge;
-    let mut patch_idx = 0usize;
-    for block_row in 0..blocks_h {
-        for block_col in 0..blocks_w {
-            for sub_row in 0..merge {
-                for sub_col in 0..merge {
-                    let h_idx = block_row * merge + sub_row;
-                    let w_idx = block_col * merge + sub_col;
-
-                    let pos_slice =
-                        &mut hidden_states[patch_idx * hidden..(patch_idx + 1) * hidden];
-                    bilinear_pos_embed(
-                        &weights.pos_embed,
-                        hidden,
-                        side,
-                        grid.h,
-                        grid.w,
-                        h_idx,
-                        w_idx,
-                        pos_slice,
-                    );
-
-                    // rotary = concat(h*inv_freq, w*inv_freq)  [rope_dim]
-                    // emb = concat(rotary, rotary)             [head_dim]
-                    let mut rotary = vec![0.0f32; rope_dim];
-                    for i in 0..rope_half {
-                        rotary[i] = h_idx as f32 * inv_freq[i];
-                        rotary[rope_half + i] = w_idx as f32 * inv_freq[i];
-                    }
-                    let cos_row = &mut cos_table[patch_idx * head_dim..(patch_idx + 1) * head_dim];
-                    let sin_row = &mut sin_table[patch_idx * head_dim..(patch_idx + 1) * head_dim];
-                    for i in 0..rope_dim {
-                        let (s, c) = rotary[i].sin_cos();
-                        cos_row[i] = c;
-                        cos_row[rope_dim + i] = c;
-                        sin_row[i] = s;
-                        sin_row[rope_dim + i] = s;
-                    }
-
-                    patch_idx += 1;
-                }
-            }
-        }
+    let (pos_embed_contrib, cos_table, sin_table) =
+        build_pos_embed_and_rope_tables(weights, cfg, grid);
+    for i in 0..n * hidden {
+        hidden_states[i] += pos_embed_contrib[i];
     }
-    debug_assert_eq!(patch_idx, n);
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let n_heads = cfg.num_heads;
