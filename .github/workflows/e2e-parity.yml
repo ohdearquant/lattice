@@ -570,8 +570,9 @@ jobs:
   # land while every required check stayed green (skip-as-green gate
   # failure). LATTICE_VISION_S3_GATE_ENFORCE=1 makes the test panic (not
   # skip) if the model dir is missing or invalid — same fail-closed shape as
-  # embed-drift and q4-composed. `set -o pipefail` keeps the `tee` capture
-  # from masking a non-zero `cargo test` exit; the grep assertions below
+  # embed-drift and q4-composed. The gating `cargo test` writes directly to
+  # a log file (no pipeline), so its own non-zero exit aborts the `bash -e`
+  # step before the log is printed; the grep assertions below
   # additionally prove the real numerical path executed (not just that the
   # process exited 0), so a future control-flow change that turns the
   # computation into an early return cannot silently pass this job.
