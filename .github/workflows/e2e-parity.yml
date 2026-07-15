@@ -671,6 +671,7 @@ jobs:
           grep -q 'LATTICE_VISION_S4_COSINE' vision-s3-gate.log
           grep -q 'LATTICE_VISION_S4_MUTATION_COSINE' vision-s3-gate.log
           grep -q 'LATTICE_VISION_S4_E2E_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S4_E2E_MUTATION_COSINE' vision-s3-gate.log
 
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —

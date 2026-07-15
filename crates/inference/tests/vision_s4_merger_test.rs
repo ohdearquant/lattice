@@ -296,7 +296,24 @@ fn run_s4_e2e_gate(model_dir: &Path) {
         "ADR-069 S4 end-to-end gate failed: cosine similarity {cos} vs committed golden must \
          exceed 0.999"
     );
-    let _ = merger_weights; // already exercised above; keeps ownership explicit
+
+    // Mutation-sensitivity proof, same shape as the isolated gate: negating a
+    // single merger weight tensor must drop the end-to-end gate below
+    // threshold, proving the pipeline output actually flows through the
+    // merger weights rather than short-circuiting to something golden-like.
+    let mut mutated_weights = merger_weights;
+    for w in mutated_weights.fc1_weight.iter_mut() {
+        *w *= -1.0;
+    }
+    let mutated_out = qwen35_merger_forward(&mutated_weights, &vision_cfg, &pre_merger)
+        .expect("mutated end-to-end merger forward");
+    let mutated_cos = cosine_similarity(&mutated_out, &post_golden);
+    eprintln!("LATTICE_VISION_S4_E2E_MUTATION_COSINE cosine={mutated_cos:.8}");
+    assert!(
+        mutated_cos < 0.999,
+        "end-to-end mutation-sensitivity check failed: negating merger.fc1_weight did not fail \
+         the cosine>0.999 gate (baseline={cos}, mutated={mutated_cos})"
+    );
 }
 
 #[cfg(not(feature = "f16"))]
