@@ -23,9 +23,11 @@
 //!    the pinned checkpoint's `processor_config.json`-derived goldens.
 
 use lattice_inference::{
-    BpeTokenizer, GEMMA4_AUDIO_MAX_SOFT_TOKENS, GEMMA4_AUDIO_MS_PER_SOFT_TOKEN,
+    BpeTokenizer, GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES, GEMMA4_AUDIO_HOP_LENGTH_SAMPLES,
+    GEMMA4_AUDIO_MAX_SOFT_TOKENS, GEMMA4_AUDIO_MS_PER_SOFT_TOKEN, GEMMA4_AUDIO_SAMPLING_RATE_HZ,
     GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE, GemmaBpeTokenizer, Tokenizer,
     audio_marker_expansion_tokens, image_marker_expansion_tokens,
+    total_audio_marker_expansion_tokens,
 };
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -79,6 +81,9 @@ struct ExpansionProvenance {
     image_seq_length: u32,
     audio_ms_per_token: u32,
     audio_seq_length: u32,
+    audio_sampling_rate_hz: u32,
+    audio_frame_length_samples: u32,
+    audio_hop_length_samples: u32,
 }
 
 #[derive(Deserialize)]
@@ -332,6 +337,18 @@ fn marker_expansion_arithmetic_matches_processor_config_goldens() {
         GEMMA4_AUDIO_MAX_SOFT_TOKENS, goldens.provenance.audio_seq_length,
         "GEMMA4_AUDIO_MAX_SOFT_TOKENS drifted from processor_config.json"
     );
+    assert_eq!(
+        GEMMA4_AUDIO_SAMPLING_RATE_HZ, goldens.provenance.audio_sampling_rate_hz,
+        "GEMMA4_AUDIO_SAMPLING_RATE_HZ drifted from processor_config.json"
+    );
+    assert_eq!(
+        GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES, goldens.provenance.audio_frame_length_samples,
+        "GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES drifted from processor_config.json"
+    );
+    assert_eq!(
+        GEMMA4_AUDIO_HOP_LENGTH_SAMPLES, goldens.provenance.audio_hop_length_samples,
+        "GEMMA4_AUDIO_HOP_LENGTH_SAMPLES drifted from processor_config.json"
+    );
 
     assert!(goldens.image_cases.iter().any(|c| c.marker_count == 0));
     assert!(goldens.image_cases.iter().any(|c| c.marker_count == 1));
@@ -367,6 +384,32 @@ fn marker_expansion_arithmetic_matches_processor_config_goldens() {
                 "audio duration_ms={duration_ms} expansion mismatch"
             );
         }
+        // total_audio_marker_expansion_tokens must agree with the per-marker
+        // sum for zero, one, and multiple markers alike (each `case` here
+        // covers exactly one of those shapes -- see the `any()` asserts
+        // above).
+        assert_eq!(
+            total_audio_marker_expansion_tokens(&case.durations_ms) as u64,
+            case.expected_tokens.iter().map(|&t| t as u64).sum::<u64>(),
+            "total_audio_marker_expansion_tokens mismatch for durations_ms={:?}",
+            case.durations_ms
+        );
+    }
+
+    // Exact post-subsampling boundary arithmetic (ADR-082 G15, transformers @
+    // ab1771c9, processing_gemma4.py:260-298): 16 kHz post-subsampling token
+    // counts do NOT follow `ceil(duration_ms / 40)` at these durations --
+    // 1-10 ms clips have zero mel frames (0 tokens, not 1), and 40-41 ms
+    // clips reduce to exactly one soft token after the two stride-2 Conv2d
+    // layers (not 2). These are asserted independently of the fixture above
+    // so a fixture regeneration bug can't silently launder a wrong formula.
+    let exact_boundary_cases: &[(u32, u32)] = &[(0, 0), (1, 0), (10, 0), (11, 1), (40, 1), (41, 1)];
+    for &(duration_ms, expected) in exact_boundary_cases {
+        assert_eq!(
+            audio_marker_expansion_tokens(duration_ms),
+            expected,
+            "audio duration_ms={duration_ms} exact post-subsampling expansion mismatch"
+        );
     }
 
     // Explicit boundary check: a duration well past the 30s card limit must
@@ -376,6 +419,20 @@ fn marker_expansion_arithmetic_matches_processor_config_goldens() {
         GEMMA4_AUDIO_MAX_SOFT_TOKENS
     );
     assert_eq!(image_marker_expansion_tokens(0), 0);
+
+    // total_audio_marker_expansion_tokens over zero/one/multiple markers,
+    // independent of the fixture-driven loop above.
+    assert_eq!(total_audio_marker_expansion_tokens(&[]), 0);
+    assert_eq!(
+        total_audio_marker_expansion_tokens(&[1_000]),
+        audio_marker_expansion_tokens(1_000) as usize
+    );
+    assert_eq!(
+        total_audio_marker_expansion_tokens(&[41, 1_000, 40_000]),
+        audio_marker_expansion_tokens(41) as usize
+            + audio_marker_expansion_tokens(1_000) as usize
+            + audio_marker_expansion_tokens(40_000) as usize
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -513,6 +570,37 @@ fn constructor_rejects_non_null_continuing_subword_prefix() {
     let mut mutated = minimal_valid_tokenizer_json();
     mutated["model"]["continuing_subword_prefix"] = serde_json::json!("##");
     assert_rejects(&mutated, "model.continuing_subword_prefix == \"##\"");
+}
+
+#[test]
+fn constructor_rejects_byte_fallback_false() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["model"]["byte_fallback"] = serde_json::json!(false);
+    assert_rejects(&mutated, "model.byte_fallback == false");
+}
+
+#[test]
+fn constructor_rejects_non_null_end_of_word_suffix() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["model"]["end_of_word_suffix"] = serde_json::json!("</w>");
+    assert_rejects(&mutated, "model.end_of_word_suffix == \"</w>\"");
+}
+
+#[test]
+fn constructor_rejects_decoder_replace_wrong_content() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["decoder"]["decoders"][0]["content"] = serde_json::json!("_");
+    assert_rejects(&mutated, "decoder[0].content == \"_\" (not \" \")");
+}
+
+#[test]
+fn constructor_rejects_decoder_replace_wrong_pattern() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["decoder"]["decoders"][0]["pattern"]["String"] = serde_json::json!("_");
+    assert_rejects(
+        &mutated,
+        "decoder[0].pattern.String == \"_\" (not \"\u{2581}\")",
+    );
 }
 
 // Small helper trait to expose raw (unpadded) tokenize-to-ids for golden

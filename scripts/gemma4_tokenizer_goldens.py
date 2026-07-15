@@ -295,31 +295,57 @@ def generate_goldens(
 # ADR-082 Stage-1 marker-expansion arithmetic (G11/G15/G17): every
 # `<|image|>` marker expands to a fixed vision soft-token count; every
 # `<|audio|>` marker expands to a duration-derived count capped at the
-# processor's declared maximum. Mirrors `Gemma4Processor.replace_image_token`
-# / `_compute_audio_num_tokens`'s documented `ceil(duration_ms /
-# audio_ms_per_token)` cap in HF `transformers`
-# (`processing_gemma4.py`) -- the full mel-framing + conv-subsampling detail
-# behind that cap is Stage 6/9 (vision/audio end-to-end) scope, not Stage 1.
+# processor's declared maximum. The audio arithmetic mirrors HF
+# `Gemma4Processor._compute_audio_num_tokens` bit-for-bit (transformers @
+# ab1771c9e42891d893189978a8009426d70b4688,
+# src/transformers/models/gemma4/processing_gemma4.py:260-298): mel-frame
+# count from the feature extractor's semicausal framing, then two stride-2
+# Conv2d subsampling reductions (Gemma4AudioSubSampleConvProjection;
+# kernel=3, stride=2, padding=1 -- architectural constants transcribed from
+# the pinned source, not exposed via Gemma4AudioConfig), then the cap. A
+# plain `ceil(duration_ms / audio_ms_per_token)` disagrees with this at
+# valid durations (e.g. 41 ms -> 1 token, not 2; 1-10 ms -> 0 tokens, not 1).
 def generate_expansion_goldens(processor_config_bytes: bytes) -> dict[str, Any]:
     config = json.loads(processor_config_bytes)
     image_seq_length = config["image_seq_length"]
     audio_ms_per_token = config["audio_ms_per_token"]
     audio_seq_length = config["audio_seq_length"]
+    feature_extractor = config["feature_extractor"]
+    sampling_rate = feature_extractor["sampling_rate"]
+    frame_length = feature_extractor["frame_length"]
+    hop_length = feature_extractor["hop_length"]
+
+    def audio_tokens_for_samples(num_samples: int) -> int:
+        frame_size_for_unfold = frame_length + 1
+        pad_left = frame_length // 2  # semicausal time padding
+        num_mel_frames = (num_samples + pad_left - frame_size_for_unfold) // hop_length + 1
+        if num_mel_frames <= 0:
+            return 0
+
+        # Two stride-2 Conv2d subsampling layers (kernel=3, stride=2,
+        # padding=1) from Gemma4AudioSubSampleConvProjection.
+        t = num_mel_frames
+        for _ in range(2):
+            t = (t + 2 * 1 - 3) // 2 + 1
+
+        return min(t, audio_seq_length)
 
     def audio_tokens_for(duration_ms: int) -> int:
-        return min(-(-duration_ms // audio_ms_per_token), audio_seq_length)
+        num_samples = duration_ms * sampling_rate // 1000
+        return audio_tokens_for_samples(num_samples)
 
     image_cases = [
         {"marker_count": 0, "expected_tokens": 0},
         {"marker_count": 1, "expected_tokens": image_seq_length},
         {"marker_count": 3, "expected_tokens": 3 * image_seq_length},
     ]
+    boundary_durations_ms = [0, 1, 10, 11, 40, 41, 1000, 40_000]
     audio_cases = [
         {"durations_ms": [], "expected_tokens": []},
         {"durations_ms": [1000], "expected_tokens": [audio_tokens_for(1000)]},
         {
-            "durations_ms": [1000, 40_000],
-            "expected_tokens": [audio_tokens_for(1000), audio_tokens_for(40_000)],
+            "durations_ms": boundary_durations_ms,
+            "expected_tokens": [audio_tokens_for(d) for d in boundary_durations_ms],
         },
     ]
     return {
@@ -327,6 +353,9 @@ def generate_expansion_goldens(processor_config_bytes: bytes) -> dict[str, Any]:
             "image_seq_length": image_seq_length,
             "audio_ms_per_token": audio_ms_per_token,
             "audio_seq_length": audio_seq_length,
+            "audio_sampling_rate_hz": sampling_rate,
+            "audio_frame_length_samples": frame_length,
+            "audio_hop_length_samples": hop_length,
         },
         "image_cases": image_cases,
         "audio_cases": audio_cases,

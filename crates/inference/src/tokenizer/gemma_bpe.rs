@@ -635,15 +635,33 @@ fn is_gemma_decoder_sequence(decoders: &[JsonValue]) -> bool {
 /// output and `tests/fixtures/gemma4/tokenizer/processor_config.json`.
 pub const GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE: u32 = 280;
 
-/// Milliseconds of audio collapsed into one `<|audio|>` soft token
-/// (ADR-082 G15), read from the pinned checkpoint's
-/// `processor_config.json` (`audio_ms_per_token`).
+/// Milliseconds of audio nominally collapsed into one `<|audio|>` soft
+/// token (ADR-082 G15), read from the pinned checkpoint's
+/// `processor_config.json` (`audio_ms_per_token`). This is the processor's
+/// own documented nominal rate, kept here as a cross-checked provenance
+/// constant; the actual per-segment token count is the exact post-
+/// subsampling arithmetic in [`audio_marker_expansion_tokens_from_samples`],
+/// not a direct division by this constant (see that function's doc comment
+/// for why a plain `ceil(duration_ms / 40)` disagrees with HF at valid
+/// durations).
 pub const GEMMA4_AUDIO_MS_PER_SOFT_TOKEN: u32 = 40;
 
 /// Upper bound on audio soft tokens for a single `<|audio|>` placeholder
 /// (ADR-082 G15; ≈ the card's 30 s audio limit), read from the pinned
 /// checkpoint's `processor_config.json` (`audio_seq_length`).
 pub const GEMMA4_AUDIO_MAX_SOFT_TOKENS: u32 = 750;
+
+/// Sampling rate (Hz) the pinned checkpoint's audio front end assumes, read
+/// from `processor_config.json`'s `feature_extractor.sampling_rate`.
+pub const GEMMA4_AUDIO_SAMPLING_RATE_HZ: u32 = 16_000;
+
+/// Mel-frame analysis window length in samples, read from
+/// `processor_config.json`'s `feature_extractor.frame_length`.
+pub const GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES: u32 = 320;
+
+/// Mel-frame hop length in samples, read from `processor_config.json`'s
+/// `feature_extractor.hop_length`.
+pub const GEMMA4_AUDIO_HOP_LENGTH_SAMPLES: u32 = 160;
 
 /// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17): the number of
 /// vision soft tokens `image_marker_count` `<|image|>` placeholders expand
@@ -656,19 +674,64 @@ pub fn image_marker_expansion_tokens(image_marker_count: usize) -> usize {
     image_marker_count * GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE as usize
 }
 
-/// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17): the number of
-/// audio soft tokens one `<|audio|>` placeholder expands to, given its
-/// audio segment's duration in milliseconds —
-/// `ceil(duration_ms / GEMMA4_AUDIO_MS_PER_SOFT_TOKEN)`, capped at
-/// [`GEMMA4_AUDIO_MAX_SOFT_TOKENS`]. This is HF `Gemma4Processor`'s own
-/// documented placeholder-count contract; the mel-framing + two-stride-2-Conv
-/// subsampling arithmetic `_compute_audio_num_tokens` mirrors to land on the
-/// same count from a raw waveform is Stage 9 (audio end-to-end) scope, not
-/// Stage 1's.
-pub fn audio_marker_expansion_tokens(duration_ms: u32) -> u32 {
-    duration_ms
-        .div_ceil(GEMMA4_AUDIO_MS_PER_SOFT_TOKEN)
+/// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17): the exact
+/// number of audio soft tokens one `<|audio|>` placeholder expands to for a
+/// `num_samples`-sample raw waveform, mirroring HF
+/// `Gemma4Processor._compute_audio_num_tokens` bit-for-bit (transformers @
+/// `ab1771c9e42891d893189978a8009426d70b4688`,
+/// `src/transformers/models/gemma4/processing_gemma4.py:260-298`):
+///
+/// 1. Mel-frame count from the feature extractor's semicausal framing —
+///    `frame_size_for_unfold = frame_length + 1`, `pad_left = frame_length /
+///    2`, `num_mel_frames = floor((num_samples + pad_left -
+///    frame_size_for_unfold) / hop_length) + 1`, clamped to zero if
+///    non-positive.
+/// 2. Two stride-2 `Conv2d` subsampling reductions
+///    (`Gemma4AudioSubSampleConvProjection`; kernel=3, stride=2, padding=1 —
+///    architectural constants transcribed from the pinned source, not
+///    exposed via `Gemma4AudioConfig`): `t = floor((t + 2*padding - kernel) /
+///    stride) + 1`, applied twice.
+/// 3. Capped at [`GEMMA4_AUDIO_MAX_SOFT_TOKENS`].
+///
+/// A plain `ceil(duration_ms / GEMMA4_AUDIO_MS_PER_SOFT_TOKEN)` disagrees
+/// with this at valid durations — e.g. at 16 kHz a 41 ms clip is 656
+/// samples -> 4 mel frames -> 2 -> 1 soft token, not `ceil(41/40) = 2`; a
+/// 1-10 ms clip is 0 mel frames -> 0 soft tokens, not 1.
+pub fn audio_marker_expansion_tokens_from_samples(num_samples: u32) -> u32 {
+    let frame_size_for_unfold = i64::from(GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES) + 1;
+    let pad_left = i64::from(GEMMA4_AUDIO_FRAME_LENGTH_SAMPLES / 2);
+    let hop = i64::from(GEMMA4_AUDIO_HOP_LENGTH_SAMPLES);
+
+    let mel_frame_numerator = i64::from(num_samples) + pad_left - frame_size_for_unfold;
+    let num_mel_frames = mel_frame_numerator.div_euclid(hop) + 1;
+    if num_mel_frames <= 0 {
+        return 0;
+    }
+
+    const SSCP_KERNEL: i64 = 3;
+    const SSCP_STRIDE: i64 = 2;
+    const SSCP_PADDING: i64 = 1;
+    const SSCP_LAYERS: u32 = 2;
+
+    let mut t = num_mel_frames;
+    for _ in 0..SSCP_LAYERS {
+        t = (t + 2 * SSCP_PADDING - SSCP_KERNEL).div_euclid(SSCP_STRIDE) + 1;
+    }
+
+    u32::try_from(t)
+        .unwrap_or(0)
         .min(GEMMA4_AUDIO_MAX_SOFT_TOKENS)
+}
+
+/// Convenience wrapper over [`audio_marker_expansion_tokens_from_samples`]
+/// for callers that only have a duration in milliseconds: converts to a
+/// sample count at [`GEMMA4_AUDIO_SAMPLING_RATE_HZ`] — mirroring HF's own
+/// `_get_num_multimodal_tokens`, which reads `audio_lengths` in samples
+/// "assum[ing] default sampling rate" — before applying the exact
+/// post-subsampling arithmetic.
+pub fn audio_marker_expansion_tokens(duration_ms: u32) -> u32 {
+    let num_samples = u64::from(duration_ms) * u64::from(GEMMA4_AUDIO_SAMPLING_RATE_HZ) / 1000;
+    audio_marker_expansion_tokens_from_samples(u32::try_from(num_samples).unwrap_or(u32::MAX))
 }
 
 /// Total audio soft tokens across every `<|audio|>` placeholder's duration

@@ -2,7 +2,10 @@
   "provenance": {
     "image_seq_length": 280,
     "audio_ms_per_token": 40,
-    "audio_seq_length": 750
+    "audio_seq_length": 750,
+    "audio_sampling_rate_hz": 16000,
+    "audio_frame_length_samples": 320,
+    "audio_hop_length_samples": 160
   },
   "image_cases": [
     {
@@ -33,10 +36,22 @@
     },
     {
       "durations_ms": [
+        0,
+        1,
+        10,
+        11,
+        40,
+        41,
         1000,
         40000
       ],
       "expected_tokens": [
+        0,
+        0,
+        0,
+        1,
+        1,
+        1,
         25,
         750
       ]
