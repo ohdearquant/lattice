@@ -81,7 +81,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -563,28 +563,35 @@ jobs:
             --features "f16,metal-gpu" \
             -- --nocapture
 
-  # ADR-069 S3a required gate: real Qwen3.5-0.8B ViT forward (CPU reference)
-  # vs the committed HF differential golden (cosine > 0.999). Closes the gap
-  # a static review found: the checkpoint-gated test only ran locally, never
-  # in CI, so a patch-fold/RoPE/normalization/activation regression could
-  # land while every required check stayed green (skip-as-green gate
-  # failure). LATTICE_VISION_S3_GATE_ENFORCE=1 makes the test panic (not
-  # skip) if the model dir is missing or invalid — same fail-closed shape as
-  # embed-drift and q4-composed. The gating `cargo test` writes directly to
-  # a log file (no pipeline), so its own non-zero exit aborts the `bash -e`
-  # step before the log is printed; the grep assertions below
-  # additionally prove the real numerical path executed (not just that the
-  # process exited 0), so a future control-flow change that turns the
-  # computation into an early return cannot silently pass this job.
+  # ADR-069 S3a + S4 required gate: real Qwen3.5-0.8B ViT forward (CPU
+  # reference) and patch-merger/projection vs the committed HF differential
+  # goldens (cosine > 0.999 each). Closes the gap a static review found: the
+  # checkpoint-gated test only ran locally, never in CI, so a
+  # patch-fold/RoPE/normalization/activation regression could land while
+  # every required check stayed green (skip-as-green gate failure).
+  # LATTICE_VISION_S3_GATE_ENFORCE=1 makes both tests panic (not skip) if the
+  # model dir is missing or invalid — same fail-closed shape as embed-drift
+  # and q4-composed. The gating `cargo test` writes directly to a log file
+  # (no pipeline), so its own non-zero exit aborts the `bash -e` step before
+  # the log is printed; the grep assertions below additionally prove the
+  # real numerical path executed for both stages (not just that the process
+  # exited 0), so a future control-flow change that turns either computation
+  # into an early return cannot silently pass this job.
   #
-  # S3a is the CPU-reference stage (this PR); S3b (Metal port vs this CPU
-  # reference under the GPU lock) is a separate fast-follow gate.
+  # S4 shares this job with S3a (same checkpoint, same env, one extra
+  # `--test` binary) rather than a separate job: it reuses the checkpoint
+  # this job already downloads, so a second full checkout+download job would
+  # only add ~2 min of duplicated setup for a step that runs in seconds.
+  #
+  # S3a/S4 are the CPU-reference stages (S4 lands in this PR); S3b (Metal
+  # port vs the S3a CPU reference under the GPU lock) is a separate
+  # fast-follow gate. S5 (decoder injection + M-RoPE) is unimplemented.
   #
   # NOTE: once this job has gone green on CI once, add "vision-s3-gate" to
   # the repository's required status checks alongside embed-drift and
   # q4-composed. That governance step is intentionally not automated here.
   vision-s3-gate:
-    name: vision S3a cosine gate
+    name: vision S3a+S4 cosine gate
     needs: changes
     if: needs.changes.outputs.engine == 'true'
     runs-on: macos-latest
@@ -632,16 +639,20 @@ jobs:
         with:
           shared-key: vision-s3-gate
 
-      - name: Run S3a cosine gate (fail-closed)
+      - name: Run S3a + S4 cosine gates (fail-closed)
         env:
           LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
           LATTICE_VISION_S3_GATE_ENFORCE: '1'
         run: |
           cargo test --release -p lattice-inference --features f16 \
-            --test vision_s3_vit_forward_test -- --nocapture > vision-s3-gate.log 2>&1
+            --test vision_s3_vit_forward_test \
+            --test vision_s4_merger_test -- --nocapture > vision-s3-gate.log 2>&1
           cat vision-s3-gate.log
           grep -q 'LATTICE_VISION_S3_COSINE' vision-s3-gate.log
           grep -q 'LATTICE_VISION_S3_MUTATION_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S4_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S4_MUTATION_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S4_E2E_COSINE' vision-s3-gate.log
 
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
