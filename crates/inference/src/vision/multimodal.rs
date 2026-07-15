@@ -250,22 +250,9 @@ impl Qwen35VisionRequest {
         ),
         crate::error::InferenceError,
     > {
-        use crate::error::InferenceError;
         use crate::vision::qwen35_mrope::{build_cos_sin, build_position_ids};
 
-        let rope_params = cfg.rope_parameters.as_ref().ok_or_else(|| {
-            InferenceError::InvalidInput(
-                "checkpoint has no rope_parameters; cannot build M-RoPE tables".to_string(),
-            )
-        })?;
-        let mrope_section = rope_params.mrope_section.as_ref().ok_or_else(|| {
-            InferenceError::InvalidInput(
-                "checkpoint rope_parameters has no mrope_section; not a vision-language config"
-                    .to_string(),
-            )
-        })?;
-        let partial_rotary_factor = rope_params.partial_rotary_factor.unwrap_or(0.25);
-        let theta = rope_params.rope_theta as f32;
+        let (mrope_section, theta, partial_rotary_factor) = Self::resolve_mrope_params(cfg)?;
 
         let positions = build_position_ids(
             &self.input_ids,
@@ -278,9 +265,61 @@ impl Qwen35VisionRequest {
             cfg.head_dim,
             partial_rotary_factor,
             theta,
-            mrope_section,
+            &mrope_section,
         )?;
         Ok((positions, tables))
+    }
+
+    /// Resolve the checkpoint's M-RoPE config fields (`mrope_section`,
+    /// `rope_theta`, `partial_rotary_factor`), shared by [`Self::build_mrope_tables`]
+    /// (the full prefill table) and [`Self::build_decode_cos_sin`] (a single
+    /// decode-time row), so both call the same checkpoint-field resolution.
+    fn resolve_mrope_params(
+        cfg: &crate::model::qwen35_config::Qwen35Config,
+    ) -> Result<(Vec<usize>, f32, f32), crate::error::InferenceError> {
+        use crate::error::InferenceError;
+
+        let rope_params = cfg.rope_parameters.as_ref().ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "checkpoint has no rope_parameters; cannot build M-RoPE tables".to_string(),
+            )
+        })?;
+        let mrope_section = rope_params.mrope_section.clone().ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "checkpoint rope_parameters has no mrope_section; not a vision-language config"
+                    .to_string(),
+            )
+        })?;
+        let partial_rotary_factor = rope_params.partial_rotary_factor.unwrap_or(0.25);
+        let theta = rope_params.rope_theta as f32;
+        Ok((mrope_section, theta, partial_rotary_factor))
+    }
+
+    /// Build the M-RoPE cos/sin row for a single decode-time position (all
+    /// three axes equal — the physical-cache-length + `rope_delta` coordinate
+    /// from [`crate::vision::qwen35_mrope::decode_position`]), via the same
+    /// pure `build_cos_sin` builder [`Self::build_mrope_tables`] uses for the
+    /// prefill table.
+    pub fn build_decode_cos_sin(
+        &self,
+        cfg: &crate::model::qwen35_config::Qwen35Config,
+        position: u32,
+    ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
+        use crate::vision::qwen35_mrope::{MRopePositions, build_cos_sin};
+
+        let (mrope_section, theta, partial_rotary_factor) = Self::resolve_mrope_params(cfg)?;
+        let positions = MRopePositions {
+            positions: vec![(position, position, position)],
+            rope_delta: 0,
+        };
+        let tables = build_cos_sin(
+            &positions,
+            cfg.head_dim,
+            partial_rotary_factor,
+            theta,
+            &mrope_section,
+        )?;
+        Ok((tables.cos[0].clone(), tables.sin[0].clone()))
     }
 }
 

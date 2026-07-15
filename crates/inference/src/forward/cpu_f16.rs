@@ -233,6 +233,7 @@ fn full_attention_step_f16(
     cfg: &Qwen35Config,
     rope: &RopeTable,
     hidden: usize,
+    mrope_cos_sin: Option<(&[f32], &[f32])>,
 ) {
     // Read input from attn_out (where caller placed it)
     let input: Vec<f32> = scratch.attn_out[..hidden].to_vec();
@@ -301,30 +302,55 @@ fn full_attention_step_f16(
         );
     }
 
-    // Partial RoPE: stride-half pairing (i, half+i) — matches apply_partial_rope / HF rotate_half
+    // Partial RoPE: stride-half pairing (i, half+i) — matches apply_partial_rope / HF rotate_half.
+    // When `mrope_cos_sin` is supplied (Qwen3.5 vision M-RoPE, ADR-069 S5b), the per-token
+    // interleaved-axis cos/sin row replaces the 1-D `rope` table lookup; the rotation formula
+    // is identical either way, so text-only decode (mrope_cos_sin=None) is untouched.
     let half = rope_dim / 2;
     for h in 0..num_q_heads {
         let start = h * head_dim;
-        let base = position * half;
-        for i in 0..half {
-            let cos_val = rope.cos_at(base + i);
-            let sin_val = rope.sin_at(base + i);
-            let x0 = scratch.q_buf[start + i];
-            let x1 = scratch.q_buf[start + half + i];
-            scratch.q_buf[start + i] = x0 * cos_val - x1 * sin_val;
-            scratch.q_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
+        if let Some((cos_row, sin_row)) = mrope_cos_sin {
+            for i in 0..half {
+                let cos_val = cos_row[i];
+                let sin_val = sin_row[i];
+                let x0 = scratch.q_buf[start + i];
+                let x1 = scratch.q_buf[start + half + i];
+                scratch.q_buf[start + i] = x0 * cos_val - x1 * sin_val;
+                scratch.q_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
+            }
+        } else {
+            let base = position * half;
+            for i in 0..half {
+                let cos_val = rope.cos_at(base + i);
+                let sin_val = rope.sin_at(base + i);
+                let x0 = scratch.q_buf[start + i];
+                let x1 = scratch.q_buf[start + half + i];
+                scratch.q_buf[start + i] = x0 * cos_val - x1 * sin_val;
+                scratch.q_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
+            }
         }
     }
     for h in 0..num_kv_heads {
         let start = h * head_dim;
-        let base = position * half;
-        for i in 0..half {
-            let cos_val = rope.cos_at(base + i);
-            let sin_val = rope.sin_at(base + i);
-            let x0 = scratch.k_buf[start + i];
-            let x1 = scratch.k_buf[start + half + i];
-            scratch.k_buf[start + i] = x0 * cos_val - x1 * sin_val;
-            scratch.k_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
+        if let Some((cos_row, sin_row)) = mrope_cos_sin {
+            for i in 0..half {
+                let cos_val = cos_row[i];
+                let sin_val = sin_row[i];
+                let x0 = scratch.k_buf[start + i];
+                let x1 = scratch.k_buf[start + half + i];
+                scratch.k_buf[start + i] = x0 * cos_val - x1 * sin_val;
+                scratch.k_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
+            }
+        } else {
+            let base = position * half;
+            for i in 0..half {
+                let cos_val = rope.cos_at(base + i);
+                let sin_val = rope.sin_at(base + i);
+                let x0 = scratch.k_buf[start + i];
+                let x1 = scratch.k_buf[start + half + i];
+                scratch.k_buf[start + i] = x0 * cos_val - x1 * sin_val;
+                scratch.k_buf[start + half + i] = x0 * sin_val + x1 * cos_val;
+            }
         }
     }
 
@@ -686,17 +712,41 @@ pub(crate) fn forward_step_f16(
     gdn_states: &mut [GatedDeltaNetState],
     kv_cache: &mut KvCache,
     scratch: &mut ForwardScratch,
-) {
+    injected_embedding: Option<&[f32]>,
+    mrope_cos_sin: Option<(&[f32], &[f32])>,
+) -> Result<(), crate::error::InferenceError> {
     let hidden = cfg.hidden_size;
 
     scratch.ensure_capacity(cfg, kv_cache.seq_len + 1);
 
-    // Embedding lookup: f16 embed_tokens -> f32 hidden
-    let embed_start = token_id as usize * hidden;
-    f16_to_f32_slice(
-        &weights.embed_tokens[embed_start..embed_start + hidden],
-        &mut scratch.hidden[..hidden],
-    );
+    match injected_embedding {
+        // Qwen3.5 vision M-RoPE (ADR-069 S5b): REPLACE the token-embedding lookup with the
+        // caller-supplied post-merger visual row at an `<|image_pad|>` slot (HF's
+        // `masked_scatter` contract). Fail closed rather than poison the KV state with a
+        // wrong-shape or non-finite row.
+        Some(row) => {
+            if row.len() != hidden {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "injected_embedding length {} does not match hidden_size {hidden}",
+                    row.len()
+                )));
+            }
+            if let Some(bad) = row.iter().find(|v| !v.is_finite()) {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "injected_embedding contains a non-finite value: {bad}"
+                )));
+            }
+            scratch.hidden[..hidden].copy_from_slice(row);
+        }
+        None => {
+            // Embedding lookup: f16 embed_tokens -> f32 hidden
+            let embed_start = token_id as usize * hidden;
+            f16_to_f32_slice(
+                &weights.embed_tokens[embed_start..embed_start + hidden],
+                &mut scratch.hidden[..hidden],
+            );
+        }
+    }
 
     let mut linear_idx = 0usize;
     let mut full_idx = 0usize;
@@ -740,6 +790,7 @@ pub(crate) fn forward_step_f16(
                     cfg,
                     rope,
                     hidden,
+                    mrope_cos_sin,
                 );
                 full_idx += 1;
             }
@@ -810,6 +861,8 @@ pub(crate) fn forward_step_f16(
         hidden,
         cfg.vocab_size,
     );
+
+    Ok(())
 }
 
 /// Identity function for cache index -- full_idx IS the cache index.
@@ -933,7 +986,9 @@ pub fn generate_f16(
             &mut gdn_states,
             &mut kv_cache,
             &mut scratch,
-        );
+            None,
+            None,
+        )?;
         if pos < prompt_len - 1 {
             kv_cache.seq_len += 1;
         }
@@ -981,7 +1036,9 @@ pub fn generate_f16(
             &mut gdn_states,
             &mut kv_cache,
             &mut scratch,
-        );
+            None,
+            None,
+        )?;
         kv_cache.seq_len += 1;
 
         let next_id = sample_token(
@@ -1016,6 +1073,232 @@ pub fn generate_f16(
 }
 
 // ---------------------------------------------------------------------------
+// Generate multimodal (f16 weights, ADR-069 Stage 5b)
+// ---------------------------------------------------------------------------
+
+/// Greedy-decode a Qwen3.5 vision-language prompt through the CPU f16 forward
+/// path (ADR-069 Stage 5b): the decoder splice on top of [`generate_f16`].
+///
+/// Mirrors `generate_f16`'s prefill/decode loop, but drives it from
+/// [`crate::vision::multimodal::Qwen35VisionRequest`]'s already-expanded
+/// `input_ids` instead of a tokenizer call, injects each post-merger visual
+/// row at its `<|image_pad|>` slot (masked REPLACE, not add), and threads a
+/// per-token M-RoPE cos/sin row into every full-attention (GQA) layer in
+/// place of the 1-D `RopeTable`. GDN layers are untouched — they never
+/// receive rope. Fails closed via `request.validate()` before any decoder
+/// work begins.
+///
+/// No tokenizer is available here (the request already carries expanded
+/// token ids), so `GenerateOutput.text` is always empty; callers that need
+/// decoded text detokenize `token_ids` themselves.
+pub fn generate_multimodal_f16(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    request: &crate::vision::multimodal::Qwen35VisionRequest,
+    gen_cfg: &GenerateConfig,
+) -> Result<GenerateOutput, crate::error::InferenceError> {
+    request.validate().map_err(|e| {
+        crate::error::InferenceError::InvalidInput(format!(
+            "multimodal request failed validation: {e}"
+        ))
+    })?;
+
+    let (positions, tables) = request.build_mrope_tables(cfg)?;
+
+    let prompt_ids = &request.input_ids;
+    let prompt_len = prompt_ids.len();
+    crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+
+    if gen_cfg.max_new_tokens == 0 {
+        return Ok(GenerateOutput {
+            text: String::new(),
+            token_ids: vec![],
+            prompt_tokens: prompt_len,
+            generated_tokens: 0,
+            stopped: false,
+            stop_reason: Some(StopReason::Length),
+            token_logprobs: vec![],
+        });
+    }
+
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+    crate::model::qwen35::check_stop_strings_not_set(gen_cfg)?;
+    crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
+
+    let max_context = cfg.max_position_embeddings;
+    if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+        return Err(crate::error::InferenceError::Inference(format!(
+            "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+             model context window ({max_context})",
+            gen_cfg.max_new_tokens
+        )));
+    }
+
+    let mut rng_state = match gen_cfg.seed {
+        Some(s) => {
+            if s == 0 {
+                1
+            } else {
+                s
+            }
+        }
+        None => {
+            use std::time::SystemTime;
+            let t = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x12345678_9abcdef0);
+            if t == 0 { 1 } else { t }
+        }
+    };
+
+    let num_linear = cfg.num_linear_attention_layers();
+    let num_full = cfg.num_full_attention_layers();
+    let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+        .map(|_| GatedDeltaNetState::new(cfg))
+        .collect();
+    let mut kv_cache = KvCache::new(num_full);
+    let mut scratch = ForwardScratch::new();
+
+    // A request with no image runs needs no M-RoPE divergence: every position's 3 axes are
+    // trivially equal to the sequential index (rope_delta=0), so the plain 1-D `RopeTable`
+    // reproduces `build_cos_sin`'s output exactly in the f64-precomputed-table sense —
+    // `generate_f16`'s own path — rather than the fresh f32 per-call computation, which is
+    // only mathematically (not bit-) equivalent. Route text-only requests through the
+    // unchanged 1-D table so they are bit-identical to `generate_f16`, and reserve the M-RoPE
+    // table for requests that actually contain an image (where axes genuinely diverge).
+    let has_image = !request.image_grids.is_empty();
+    let rope = RopeTable::new(cfg.rope_dim(), max_context, cfg.rope_theta);
+
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
+    let mut all_ids = prompt_ids.clone();
+
+    // Prefill: inject a post-merger visual row at each `<|image_pad|>` slot, in the same
+    // sequential image-token order the request already concatenated `post_merger_rows` in
+    // (HF's masked_scatter contract, ADR-069 RECON sec. 1).
+    let mut visual_row = 0usize;
+    for (pos, &token_id) in prompt_ids.iter().enumerate() {
+        let injected = if token_id == request.image_token_id {
+            let start = visual_row * request.decoder_hidden_size;
+            let end = start + request.decoder_hidden_size;
+            visual_row += 1;
+            Some(&request.post_merger_rows[start..end])
+        } else {
+            None
+        };
+        let cos_sin = if has_image {
+            Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()))
+        } else {
+            None
+        };
+
+        forward_step_f16(
+            weights,
+            cfg,
+            &rope,
+            token_id,
+            pos,
+            &mut gdn_states,
+            &mut kv_cache,
+            &mut scratch,
+            injected,
+            cos_sin,
+        )?;
+        if pos < prompt_len - 1 {
+            kv_cache.seq_len += 1;
+        }
+    }
+    kv_cache.seq_len = prompt_len;
+
+    let next_id = sample_token(
+        &scratch.logits[..cfg.vocab_size],
+        gen_cfg,
+        &all_ids,
+        &mut rng_state,
+    );
+
+    if should_stop_token(cfg, gen_cfg, next_id) {
+        return Ok(GenerateOutput {
+            text: String::new(),
+            token_ids: vec![],
+            prompt_tokens: prompt_len,
+            generated_tokens: 0,
+            stopped: true,
+            stop_reason: Some(StopReason::Eos),
+            token_logprobs: vec![],
+        });
+    }
+
+    generated_ids.push(next_id);
+    all_ids.push(next_id);
+
+    let mut stopped = false;
+    let mut stop_reason = StopReason::Length;
+    // Autoregressive decode: the KV-cache index (`physical_pos`) stays contiguous/physical,
+    // while the M-RoPE coordinate is `physical_cache_len + rope_delta` (ADR-069 RECON sec. 3) —
+    // they diverge whenever the prompt contained an image.
+    for _ in 1..gen_cfg.max_new_tokens {
+        let physical_pos = kv_cache.seq_len;
+        let last_token = *all_ids
+            .last()
+            .expect("invariant: prompt or previous sample populated all_ids");
+
+        // Owns the M-RoPE row buffers for this iteration so both branches below can borrow
+        // from a value with the same lifetime as the `forward_step_f16` call.
+        let decode_cos_sin;
+        let mrope_cos_sin = if has_image {
+            let decode_axis =
+                crate::vision::qwen35_mrope::decode_position(physical_pos, positions.rope_delta)?;
+            decode_cos_sin = request.build_decode_cos_sin(cfg, decode_axis)?;
+            Some((decode_cos_sin.0.as_slice(), decode_cos_sin.1.as_slice()))
+        } else {
+            None
+        };
+
+        forward_step_f16(
+            weights,
+            cfg,
+            &rope,
+            last_token,
+            physical_pos,
+            &mut gdn_states,
+            &mut kv_cache,
+            &mut scratch,
+            None,
+            mrope_cos_sin,
+        )?;
+        kv_cache.seq_len += 1;
+
+        let next_id = sample_token(
+            &scratch.logits[..cfg.vocab_size],
+            gen_cfg,
+            &all_ids,
+            &mut rng_state,
+        );
+
+        if should_stop_token(cfg, gen_cfg, next_id) {
+            stopped = true;
+            stop_reason = StopReason::Eos;
+            break;
+        }
+
+        generated_ids.push(next_id);
+        all_ids.push(next_id);
+    }
+
+    Ok(GenerateOutput {
+        text: String::new(),
+        token_ids: generated_ids.clone(),
+        prompt_tokens: prompt_len,
+        generated_tokens: generated_ids.len(),
+        stopped,
+        stop_reason: Some(stop_reason),
+        token_logprobs: vec![],
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1040,7 +1323,9 @@ mod tests {
             &mut [GatedDeltaNetState],
             &mut KvCache,
             &mut ForwardScratch,
-        ) = forward_step_f16;
+            Option<&[f32]>,
+            Option<(&[f32], &[f32])>,
+        ) -> Result<(), crate::error::InferenceError> = forward_step_f16;
 
         // Verify gated_delta_net_step_fused_f16 signature
         let _gdn_fn_ptr: fn(
@@ -1183,6 +1468,7 @@ mod tests {
             &cfg,
             &rope,
             hidden,
+            None,
         );
 
         // Reference: reproduce the same matmul + QK-norm + stride-half RoPE.
@@ -1369,6 +1655,7 @@ mod tests {
             &cfg,
             &rope,
             hidden,
+            None,
         );
 
         assert!(
@@ -2095,6 +2382,457 @@ mod tests {
             out.stop_reason,
             Some(StopReason::Length),
             "max_new_tokens=0 must report stop_reason=Length"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-069 Stage 5b: visual injection + M-RoPE splice (pure CPU, no
+    // checkpoint required).
+    // -----------------------------------------------------------------
+
+    use crate::model::qwen35_config::{LayerType, RopeParams};
+    use crate::weights::f16_weights::{
+        F16CommonLayerWeights, F16FullAttentionLayerWeights, f32_to_f16_slice,
+    };
+
+    /// A minimal one-layer, full-attention-only (no GDN) config + f16 weight
+    /// set: small enough to hand-construct, but with non-trivial (identity)
+    /// Q/K/V/O projections so RoPE and embedding-source mutations actually
+    /// move the logits, unlike an all-zero model.
+    fn tiny_vision_splice_model() -> (Qwen35Config, F16ModelWeights) {
+        let hidden = 8usize;
+        let vocab = 4usize;
+
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 1,
+            vocab_size: vocab,
+            intermediate_size: 4,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: hidden,
+            rope_theta: 1.0e7,
+            partial_rotary_factor: 1.0, // rope_dim=8, half=4 (matches production theta scale)
+            rope_parameters: Some(RopeParams {
+                rope_theta: 1.0e7,
+                partial_rotary_factor: Some(1.0),
+                mrope_section: Some(vec![2, 1, 1]),
+                mrope_interleaved: Some(true),
+            }),
+            linear_num_key_heads: 2,
+            linear_num_value_heads: Some(2),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 1,
+            layer_types: vec![LayerType::FullAttention],
+            layer_mask: vec![true],
+            eos_token_id: 999,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: Some(3),
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
+        };
+
+        let to_f16 = |src: &[f32]| -> Vec<u16> {
+            let mut dst = vec![0u16; src.len()];
+            f32_to_f16_slice(src, &mut dst);
+            dst
+        };
+        let identity = |rows: usize, cols: usize| -> Vec<f32> {
+            let mut m = vec![0.0f32; rows * cols];
+            for i in 0..rows.min(cols) {
+                m[i * cols + i] = 1.0;
+            }
+            m
+        };
+
+        let embed_tokens_f32: Vec<f32> = (0..vocab * hidden)
+            .map(|k| ((k % 11) as f32) * 0.05 - 0.2)
+            .collect();
+
+        let q_dim = hidden;
+        let mut q_proj_f32 = vec![0.0f32; 2 * q_dim * hidden];
+        q_proj_f32[..q_dim * hidden].copy_from_slice(&identity(q_dim, hidden));
+
+        let full_weights = F16FullAttentionLayerWeights {
+            q_proj: to_f16(&q_proj_f32),
+            k_proj: to_f16(&identity(hidden, hidden)),
+            v_proj: to_f16(&identity(hidden, hidden)),
+            o_proj: to_f16(&identity(hidden, q_dim)),
+            q_norm: vec![0.0f32; hidden],
+            k_norm: vec![0.0f32; hidden],
+        };
+
+        let common = F16CommonLayerWeights {
+            input_layernorm: vec![0.0f32; hidden],
+            post_attention_layernorm: vec![0.0f32; hidden],
+            ffn: F16FeedForwardWeights::Dense {
+                gate_proj: to_f16(&vec![0.0f32; 4 * hidden]),
+                up_proj: to_f16(&vec![0.0f32; 4 * hidden]),
+                down_proj: to_f16(&vec![0.0f32; hidden * 4]),
+            },
+        };
+
+        let weights = F16ModelWeights {
+            embed_tokens: to_f16(&embed_tokens_f32),
+            final_norm: vec![0.0f32; hidden],
+            layers: vec![(F16AttentionWeights::Full(full_weights), common)],
+        };
+
+        (cfg, weights)
+    }
+
+    /// Injection reaches the decoder: a supplied embedding replaces the
+    /// token-id lookup (not adds to it), mutating the supplied row changes
+    /// the resulting logits, and mutating an unrelated vocab row leaves the
+    /// injected-slot output unchanged (proves the None-path embedding table
+    /// isn't consulted when `injected_embedding` is `Some`).
+    #[test]
+    fn injection_replaces_lookup_and_is_mutation_sensitive() {
+        let (cfg, mut weights) = tiny_vision_splice_model();
+        let hidden = cfg.hidden_size;
+
+        // Compares the pre-lm_head hidden state (not `scratch.logits`): `embed_tokens` is
+        // tied to the output projection too, so a logits comparison would show every vocab
+        // row mutation regardless of whether the *input* lookup was ever consulted. The
+        // decoder's final hidden state isolates exactly the quantity injection controls.
+        let run = |weights: &F16ModelWeights, injected: Option<&[f32]>| -> Vec<f32> {
+            let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+            let mut gdn_states: Vec<GatedDeltaNetState> = vec![];
+            let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+            let mut scratch = ForwardScratch::new();
+            forward_step_f16(
+                weights,
+                &cfg,
+                &rope,
+                0,
+                0,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+                injected,
+                None,
+            )
+            .expect("forward step succeeds");
+            scratch.hidden[..hidden].to_vec()
+        };
+
+        let baseline = run(&weights, None);
+
+        let mut visual_row = vec![0.9f32, -0.4, 0.2, 0.6, -0.1, 0.3, 0.7, -0.8];
+        let injected_hidden = run(&weights, Some(&visual_row));
+        assert_ne!(
+            injected_hidden, baseline,
+            "an injected embedding must produce a different hidden state than the token-id lookup"
+        );
+
+        // Mutate the supplied visual scalar: the image-pad-slot output must change.
+        visual_row[0] += 1.0;
+        let mutated_visual_hidden = run(&weights, Some(&visual_row));
+        assert_ne!(
+            mutated_visual_hidden, injected_hidden,
+            "mutating the supplied visual row must change the injected-slot hidden state"
+        );
+        visual_row[0] -= 1.0; // restore
+
+        // Mutate a non-pad vocab row in the embedding table: the injected-slot output
+        // (still using the ORIGINAL visual_row) must be unchanged.
+        let embed_start = hidden; // token id 1's row
+        let mutated_row_f32 = vec![1.0f32; hidden];
+        f32_to_f16_slice(
+            &mutated_row_f32,
+            &mut weights.embed_tokens[embed_start..embed_start + hidden],
+        );
+        let after_table_mutation = run(&weights, Some(&visual_row));
+        assert_eq!(
+            after_table_mutation, injected_hidden,
+            "mutating an unrelated embedding-table row must not affect the injected slot"
+        );
+
+        // Sanity: length mismatch and non-finite values must fail closed.
+        let mut gdn_states: Vec<GatedDeltaNetState> = vec![];
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        let mut scratch = ForwardScratch::new();
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let short_row = vec![0.0f32; hidden - 1];
+        assert!(
+            forward_step_f16(
+                &weights,
+                &cfg,
+                &rope,
+                0,
+                0,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+                Some(&short_row),
+                None,
+            )
+            .is_err(),
+            "wrong-length injected_embedding must be rejected"
+        );
+        let mut nan_row = vec![0.0f32; hidden];
+        nan_row[2] = f32::NAN;
+        assert!(
+            forward_step_f16(
+                &weights,
+                &cfg,
+                &rope,
+                0,
+                0,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+                Some(&nan_row),
+                None,
+            )
+            .is_err(),
+            "non-finite injected_embedding must be rejected"
+        );
+    }
+
+    /// The cos/sin actually applied inside the wired GQA path
+    /// (`full_attention_step_f16` via `forward_step_f16`) at an image-pad
+    /// token matches `build_cos_sin`'s output at that same (t,h,w) position —
+    /// exercised through the wired forward, not just the S5a unit builder.
+    #[test]
+    fn mrope_cos_sin_applied_in_wired_forward_matches_builder() {
+        use crate::vision::qwen35_mrope::{MRopePositions, build_cos_sin};
+
+        let (cfg, weights) = tiny_vision_splice_model();
+        let hidden = cfg.hidden_size;
+        let rope_params = cfg.rope_parameters.as_ref().unwrap();
+        let mrope_section = rope_params.mrope_section.as_ref().unwrap();
+
+        let positions = MRopePositions {
+            positions: vec![(2, 3, 5)],
+            rope_delta: 0,
+        };
+        let tables = build_cos_sin(
+            &positions,
+            cfg.head_dim,
+            rope_params.partial_rotary_factor.unwrap(),
+            rope_params.rope_theta as f32,
+            mrope_section,
+        )
+        .expect("builds tables");
+        let (cos_row, sin_row) = (tables.cos[0].as_slice(), tables.sin[0].as_slice());
+
+        let rope = RopeTable::new(cfg.rope_dim(), 8, cfg.rope_theta);
+        let mut gdn_states: Vec<GatedDeltaNetState> = vec![];
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        let mut scratch = ForwardScratch::new();
+
+        forward_step_f16(
+            &weights,
+            &cfg,
+            &rope,
+            1,
+            0,
+            &mut gdn_states,
+            &mut kv_cache,
+            &mut scratch,
+            None,
+            Some((cos_row, sin_row)),
+        )
+        .expect("forward step succeeds");
+
+        // Independently reproduce the K rotation using the SAME cos/sin row (identity
+        // k_proj means k_buf before rotation equals the RMSNorm'd embedding row).
+        let mut k_ref = vec![0.0f32; hidden];
+        f16_to_f32_slice(&weights.embed_tokens[hidden..2 * hidden], &mut k_ref);
+        let zero_norm = vec![0.0f32; hidden];
+        qwen35_rms_norm(&mut k_ref, &zero_norm, hidden, cfg.rms_norm_eps);
+        let half = cfg.rope_dim() / 2;
+        for i in 0..half {
+            let x0 = k_ref[i];
+            let x1 = k_ref[half + i];
+            k_ref[i] = x0 * cos_row[i] - x1 * sin_row[i];
+            k_ref[half + i] = x0 * sin_row[i] + x1 * cos_row[i];
+        }
+
+        let k_cached = &kv_cache.k[0][..hidden];
+        let max_diff = k_cached
+            .iter()
+            .zip(k_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-3,
+            "wired M-RoPE rotation diverges from build_cos_sin's own row: max_diff={max_diff}"
+        );
+    }
+
+    /// A text-only `Qwen35VisionRequest` (no image runs) driven through
+    /// `generate_multimodal_f16` must be bit-identical to the same token
+    /// sequence driven through `forward_step_f16` directly with the plain
+    /// 1-D `RopeTable` (mirroring `generate_f16`'s own prefill+decode loop) —
+    /// proving `generate_multimodal_f16`'s text-only path never falls
+    /// through to the M-RoPE table when the request has no image.
+    #[test]
+    fn generate_multimodal_text_only_matches_plain_forward_bit_identical() {
+        use crate::vision::multimodal::Qwen35VisionRequest;
+
+        let (cfg, weights) = tiny_vision_splice_model();
+        let input_ids: Vec<u32> = vec![0, 1, 2, 0];
+
+        let request = Qwen35VisionRequest {
+            input_ids: input_ids.clone(),
+            image_grids: vec![],
+            post_merger_rows: vec![],
+            image_token_id: 3,
+            spatial_merge_size: 2,
+            decoder_hidden_size: cfg.hidden_size,
+        };
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 2,
+            temperature: 0.0,
+            seed: Some(1),
+            stop_token_ids: vec![],
+            ..Default::default()
+        };
+
+        let multimodal_out = generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg)
+            .expect("text-only multimodal generate succeeds");
+
+        // Reference: hand-drive forward_step_f16 exactly like generate_f16's own loop,
+        // with the same seed and the plain 1-D RopeTable.
+        let rope = RopeTable::new(cfg.rope_dim(), 512, cfg.rope_theta);
+        let mut gdn_states: Vec<GatedDeltaNetState> = vec![];
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        let mut scratch = ForwardScratch::new();
+        for (pos, &token_id) in input_ids.iter().enumerate() {
+            forward_step_f16(
+                &weights,
+                &cfg,
+                &rope,
+                token_id,
+                pos,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+                None,
+                None,
+            )
+            .expect("reference forward step succeeds");
+            if pos < input_ids.len() - 1 {
+                kv_cache.seq_len += 1;
+            }
+        }
+        kv_cache.seq_len = input_ids.len();
+
+        let mut rng_state = 1u64;
+        let mut all_ids = input_ids.clone();
+        let mut ref_ids = Vec::new();
+
+        let next_id = sample_token(
+            &scratch.logits[..cfg.vocab_size],
+            &gen_cfg,
+            &all_ids,
+            &mut rng_state,
+        );
+        ref_ids.push(next_id);
+        all_ids.push(next_id);
+
+        for _ in 1..gen_cfg.max_new_tokens {
+            let pos = kv_cache.seq_len;
+            let last_token = *all_ids.last().unwrap();
+            forward_step_f16(
+                &weights,
+                &cfg,
+                &rope,
+                last_token,
+                pos,
+                &mut gdn_states,
+                &mut kv_cache,
+                &mut scratch,
+                None,
+                None,
+            )
+            .expect("reference decode step succeeds");
+            kv_cache.seq_len += 1;
+            let next_id = sample_token(
+                &scratch.logits[..cfg.vocab_size],
+                &gen_cfg,
+                &all_ids,
+                &mut rng_state,
+            );
+            ref_ids.push(next_id);
+            all_ids.push(next_id);
+        }
+
+        assert_eq!(
+            multimodal_out.token_ids, ref_ids,
+            "text-only generate_multimodal_f16 token ids must match the plain forward_step_f16 \
+             reference bit-for-bit"
+        );
+    }
+
+    /// `generate_multimodal_f16` fails closed on an invalid request (mismatched
+    /// image-pad count vs grid) before any decoder work begins — it delegates to
+    /// `Qwen35VisionRequest::validate()` rather than re-deriving the checks.
+    #[test]
+    fn generate_multimodal_f16_rejects_invalid_request() {
+        use crate::vision::multimodal::Qwen35VisionRequest;
+
+        let (cfg, weights) = tiny_vision_splice_model();
+        let request = Qwen35VisionRequest {
+            input_ids: vec![0, 3, 3, 1], // 2 image-pad tokens
+            image_grids: vec![crate::vision::qwen35_vit::GridThw { t: 1, h: 4, w: 4 }], // needs 4
+            post_merger_rows: vec![0.0f32; 2 * cfg.hidden_size],
+            image_token_id: 3,
+            spatial_merge_size: 2,
+            decoder_hidden_size: cfg.hidden_size,
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        assert!(
+            generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg).is_err(),
+            "a request whose image-pad count does not match its grid must be rejected"
+        );
+    }
+
+    /// `generate_multimodal_f16` fails closed when the prompt plus
+    /// `max_new_tokens` would exceed the model's context window, mirroring
+    /// `generate_f16`'s own preflight.
+    #[test]
+    fn generate_multimodal_f16_rejects_context_overflow() {
+        use crate::vision::multimodal::Qwen35VisionRequest;
+
+        let (mut cfg, weights) = tiny_vision_splice_model();
+        cfg.max_position_embeddings = 3;
+        let request = Qwen35VisionRequest {
+            input_ids: vec![0, 1, 2],
+            image_grids: vec![],
+            post_merger_rows: vec![],
+            image_token_id: 3,
+            spatial_merge_size: 2,
+            decoder_hidden_size: cfg.hidden_size,
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 5,
+            ..Default::default()
+        };
+        assert!(
+            generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg).is_err(),
+            "prompt_len + max_new_tokens exceeding max_position_embeddings must be rejected"
         );
     }
 }
