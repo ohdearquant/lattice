@@ -255,6 +255,7 @@ mod resolver_strictness_tests {
     use super::resolve_safetensors_path;
     use std::io::Write;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn write_index(dir: &Path, body: &str) {
         std::fs::create_dir_all(dir).expect("create temp model dir");
@@ -264,7 +265,15 @@ mod resolver_strictness_tests {
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("lv_s5b_resolver_{tag}"));
+        // Unique per process AND per invocation: a shared fixed name lets two
+        // concurrent runs of this test binary on a shared machine delete or
+        // overwrite each other's index, which could turn a malformed-index
+        // rejection test into a false pass (the panic would come from a
+        // concurrent deletion, not from strict parsing).
+        static NONCE: AtomicU64 = AtomicU64::new(0);
+        let n = NONCE.fetch_add(1, Ordering::Relaxed);
+        let d =
+            std::env::temp_dir().join(format!("lv_s5b_resolver_{tag}_{}_{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
