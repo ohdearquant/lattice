@@ -2,19 +2,24 @@
 """Generate/verify Gemma 4 E2B tokenizer + chat-template parity fixtures
 (ADR-082 Stage 1, G17).
 
-Downloads `tokenizer.json`, `tokenizer_config.json`, and `chat_template.jinja`
-from the checkpoint's pinned revision (the `/resolve/<commit>/` URL form, so
-the pin is real, not advisory), records their SHA-256 in a committed
-provenance manifest, and uses the HF `tokenizers` library (NOT
-`transformers.AutoTokenizer`, which does not know the `gemma4` architecture
-yet) plus `jinja2` to produce golden token IDs over a declared corpus and a
-2-turn chat-template rendering.
+Downloads `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`,
+and `processor_config.json` from the checkpoint's pinned revision (the
+`/resolve/<commit>/` URL form, so the pin is real, not advisory), records
+their SHA-256 in a committed provenance manifest, and uses the HF
+`tokenizers` library (NOT `transformers.AutoTokenizer`, which does not know
+the `gemma4` architecture yet) plus `jinja2` to produce golden token IDs over
+a declared corpus, a 2-turn chat-template rendering, exact byte-fallback
+decode goldens (including invalid/incomplete UTF-8 byte runs), and the
+Stage-1 marker-expansion arithmetic goldens (ADR-082 G11/G15/G17: image
+placeholders expand to a fixed vision soft-token count, audio placeholders
+to a duration-derived, capped count) sourced from the fetched
+`processor_config.json`, not hardcoded.
 
 Pinned checkpoint (ADR-082): `google/gemma-4-E2B-it` @ revision
 `9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf`.
 
 Usage:
-    # Verify (default): re-fetch the three files, diff their SHA-256 against
+    # Verify (default): re-fetch the four files, diff their SHA-256 against
     # the committed manifest, regenerate goldens in-memory and diff against
     # the committed golden JSON. Fails closed on any drift. Touches the
     # network — not run by CI, a manual/periodic drift check.
@@ -39,8 +44,8 @@ REPO = "google/gemma-4-E2B-it"
 REVISION = "9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf"
 BASE_URL = f"https://huggingface.co/{REPO}/resolve/{REVISION}"
 
-# Hard cap on total bytes fetched by this script across all three files.
-# tokenizer.json is ~32.2 MB; 40 MB leaves headroom for the two small
+# Hard cap on total bytes fetched by this script across all four files.
+# tokenizer.json is ~32.2 MB; 40 MB leaves headroom for the three small
 # sidecar files without coming remotely close to the ~10.25 GB weight
 # payload a mistargeted URL could otherwise pull in.
 MAX_FETCH_BYTES = 40_000_000
@@ -57,11 +62,34 @@ FIXTURE_DIR = (
 MANIFEST_PATH = FIXTURE_DIR / "manifest.json"
 CORPUS_GOLDENS_PATH = FIXTURE_DIR / "corpus_goldens.json"
 CHAT_TEMPLATE_GOLDEN_PATH = FIXTURE_DIR / "chat_template_golden.json"
+DECODE_GOLDENS_PATH = FIXTURE_DIR / "decode_goldens.json"
+EXPANSION_GOLDENS_PATH = FIXTURE_DIR / "expansion_goldens.json"
 TOKENIZER_JSON_PATH = FIXTURE_DIR / "tokenizer.json"
 TOKENIZER_CONFIG_PATH = FIXTURE_DIR / "tokenizer_config.json"
 CHAT_TEMPLATE_JINJA_PATH = FIXTURE_DIR / "chat_template.jinja"
+PROCESSOR_CONFIG_PATH = FIXTURE_DIR / "processor_config.json"
 
-FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]
+FILES = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "processor_config.json",
+]
+
+# Byte-fallback decode goldens (ADR-082 Stage 1 major finding): `<0xE5>` (id
+# 467) and `<0x8F>` (id 381) are the first two bytes of the 3-byte UTF-8
+# encoding of "叫" (id 409 = `<0xAB>`, the third byte). `[467]` and
+# `[467, 381]` are, respectively, a lone incomplete lead byte and a 2-byte
+# run still missing its final continuation byte -- both invalid on their
+# own. The ordinary-token id is resolved from the live vocab (`"a"`) rather
+# than hardcoded, since only the byte-fallback ids are pinned by the
+# required-goldens contract.
+DECODE_CASES: list[tuple[str, list[int]]] = [
+    ("decode_lone_incomplete_lead_byte", [467]),
+    ("decode_two_byte_incomplete_run", [467, 381]),
+    ("decode_valid_three_byte_fallback_run", [467, 381, 409]),
+    ("decode_incomplete_run_then_ordinary_token", [467, 381, "a"]),
+]
 
 # Runtime versions this script was validated against (pinned in uv.lock as
 # transitive deps of `transformers`). A version drift is not necessarily
@@ -204,10 +232,14 @@ def _validate_runtime_versions() -> None:
     )
 
 
-def generate_goldens(files: dict[str, bytes]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def generate_goldens(
+    files: dict[str, bytes],
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     from tokenizers import Tokenizer
 
-    tok = Tokenizer.from_file(str(_write_temp(files["tokenizer.json"])))
+    # `Tokenizer.from_str` loads directly from the fetched JSON text -- no
+    # temporary file is written or needs cleaning up.
+    tok = Tokenizer.from_str(files["tokenizer.json"].decode("utf-8"))
 
     corpus_goldens = []
     for case_id, category, text in CORPUS:
@@ -243,16 +275,62 @@ def generate_goldens(files: dict[str, bytes]) -> tuple[list[dict[str, Any]], dic
         "ids": rendered_ids,
     }
 
-    return corpus_goldens, chat_golden
+    vocab = tok.get_vocab()
+    decode_goldens = []
+    for case_id, ids in DECODE_CASES:
+        resolved_ids = [vocab[i] if isinstance(i, str) else i for i in ids]
+        decode_goldens.append(
+            {
+                "id": case_id,
+                "ids": resolved_ids,
+                "decoded": tok.decode(resolved_ids),
+            }
+        )
+
+    expansion_goldens = generate_expansion_goldens(files["processor_config.json"])
+
+    return corpus_goldens, chat_golden, decode_goldens, expansion_goldens
 
 
-def _write_temp(data: bytes) -> Path:
-    import tempfile
+# ADR-082 Stage-1 marker-expansion arithmetic (G11/G15/G17): every
+# `<|image|>` marker expands to a fixed vision soft-token count; every
+# `<|audio|>` marker expands to a duration-derived count capped at the
+# processor's declared maximum. Mirrors `Gemma4Processor.replace_image_token`
+# / `_compute_audio_num_tokens`'s documented `ceil(duration_ms /
+# audio_ms_per_token)` cap in HF `transformers`
+# (`processing_gemma4.py`) -- the full mel-framing + conv-subsampling detail
+# behind that cap is Stage 6/9 (vision/audio end-to-end) scope, not Stage 1.
+def generate_expansion_goldens(processor_config_bytes: bytes) -> dict[str, Any]:
+    config = json.loads(processor_config_bytes)
+    image_seq_length = config["image_seq_length"]
+    audio_ms_per_token = config["audio_ms_per_token"]
+    audio_seq_length = config["audio_seq_length"]
 
-    fd, path = tempfile.mkstemp(suffix=".json")
-    with open(fd, "wb") as f:
-        f.write(data)
-    return Path(path)
+    def audio_tokens_for(duration_ms: int) -> int:
+        return min(-(-duration_ms // audio_ms_per_token), audio_seq_length)
+
+    image_cases = [
+        {"marker_count": 0, "expected_tokens": 0},
+        {"marker_count": 1, "expected_tokens": image_seq_length},
+        {"marker_count": 3, "expected_tokens": 3 * image_seq_length},
+    ]
+    audio_cases = [
+        {"durations_ms": [], "expected_tokens": []},
+        {"durations_ms": [1000], "expected_tokens": [audio_tokens_for(1000)]},
+        {
+            "durations_ms": [1000, 40_000],
+            "expected_tokens": [audio_tokens_for(1000), audio_tokens_for(40_000)],
+        },
+    ]
+    return {
+        "provenance": {
+            "image_seq_length": image_seq_length,
+            "audio_ms_per_token": audio_ms_per_token,
+            "audio_seq_length": audio_seq_length,
+        },
+        "image_cases": image_cases,
+        "audio_cases": audio_cases,
+    }
 
 
 def build_manifest(files: dict[str, bytes]) -> dict[str, Any]:
@@ -298,15 +376,23 @@ def cmd_verify() -> int:
             )
             ok = False
 
-    corpus_goldens, chat_golden = generate_goldens(files)
+    corpus_goldens, chat_golden, decode_goldens, expansion_goldens = generate_goldens(files)
     committed_corpus = json.loads(CORPUS_GOLDENS_PATH.read_text())
     committed_chat = json.loads(CHAT_TEMPLATE_GOLDEN_PATH.read_text())
+    committed_decode = json.loads(DECODE_GOLDENS_PATH.read_text())
+    committed_expansion = json.loads(EXPANSION_GOLDENS_PATH.read_text())
 
     if corpus_goldens != committed_corpus:
         print("DRIFT: corpus_goldens.json does not match live generation", file=sys.stderr)
         ok = False
     if chat_golden != committed_chat:
         print("DRIFT: chat_template_golden.json does not match live generation", file=sys.stderr)
+        ok = False
+    if decode_goldens != committed_decode:
+        print("DRIFT: decode_goldens.json does not match live generation", file=sys.stderr)
+        ok = False
+    if expansion_goldens != committed_expansion:
+        print("DRIFT: expansion_goldens.json does not match live generation", file=sys.stderr)
         ok = False
 
     if not ok:
@@ -324,10 +410,13 @@ def cmd_write_fixture() -> int:
     TOKENIZER_JSON_PATH.write_bytes(files["tokenizer.json"])
     TOKENIZER_CONFIG_PATH.write_bytes(files["tokenizer_config.json"])
     CHAT_TEMPLATE_JINJA_PATH.write_bytes(files["chat_template.jinja"])
+    PROCESSOR_CONFIG_PATH.write_bytes(files["processor_config.json"])
 
-    corpus_goldens, chat_golden = generate_goldens(files)
+    corpus_goldens, chat_golden, decode_goldens, expansion_goldens = generate_goldens(files)
     CORPUS_GOLDENS_PATH.write_text(json.dumps(corpus_goldens, indent=2, ensure_ascii=False) + "\n")
     CHAT_TEMPLATE_GOLDEN_PATH.write_text(json.dumps(chat_golden, indent=2, ensure_ascii=False) + "\n")
+    DECODE_GOLDENS_PATH.write_text(json.dumps(decode_goldens, indent=2, ensure_ascii=False) + "\n")
+    EXPANSION_GOLDENS_PATH.write_text(json.dumps(expansion_goldens, indent=2, ensure_ascii=False) + "\n")
 
     manifest = build_manifest(files)
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2) + "\n")

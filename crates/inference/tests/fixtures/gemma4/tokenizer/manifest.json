@@ -14,6 +14,10 @@
     "chat_template.jinja": {
       "bytes": 17336,
       "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"
+    },
+    "processor_config.json": {
+      "bytes": 1689,
+      "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c"
     }
   },
   "runtime_versions": {

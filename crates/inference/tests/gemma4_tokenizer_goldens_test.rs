@@ -8,16 +8,25 @@
 //! (`google/gemma-4-E2B-it` @ `9dbdf8a839e4e9e0eb56ed80cc8886661d3817cf`,
 //! HF `tokenizers==0.22.2` / `jinja2==3.1.6` — see `manifest.json`).
 //!
-//! Three things are asserted:
+//! Four things are asserted:
 //! 1. `GemmaBpeTokenizer` (the new, additive path) reproduces the exact HF
 //!    token IDs for every corpus case and the 2-turn chat-template
-//!    rendering, plus a plain-text decode round trip.
+//!    rendering, plus exact byte-fallback decode goldens (including
+//!    invalid/incomplete UTF-8 byte runs).
 //! 2. The **existing** Qwen-oriented `BpeTokenizer::from_tokenizer_json_str`
 //!    still rejects this same `tokenizer.json` — proving the new path is
 //!    additive, not a silent widening of the general loader (ADR-082's
 //!    mandated negative test).
+//! 3. The constructor fails closed on a mutated pre-tokenizer, decoder, or
+//!    model field it depends on.
+//! 4. The Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17) matches
+//!    the pinned checkpoint's `processor_config.json`-derived goldens.
 
-use lattice_inference::{BpeTokenizer, GemmaBpeTokenizer, Tokenizer};
+use lattice_inference::{
+    BpeTokenizer, GEMMA4_AUDIO_MAX_SOFT_TOKENS, GEMMA4_AUDIO_MS_PER_SOFT_TOKEN,
+    GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE, GemmaBpeTokenizer, Tokenizer,
+    audio_marker_expansion_tokens, image_marker_expansion_tokens,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -59,6 +68,39 @@ struct ChatTemplateGolden {
 }
 
 #[derive(Deserialize)]
+struct DecodeCase {
+    id: String,
+    ids: Vec<u32>,
+    decoded: String,
+}
+
+#[derive(Deserialize)]
+struct ExpansionProvenance {
+    image_seq_length: u32,
+    audio_ms_per_token: u32,
+    audio_seq_length: u32,
+}
+
+#[derive(Deserialize)]
+struct ImageExpansionCase {
+    marker_count: usize,
+    expected_tokens: usize,
+}
+
+#[derive(Deserialize)]
+struct AudioExpansionCase {
+    durations_ms: Vec<u32>,
+    expected_tokens: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+struct ExpansionGoldens {
+    provenance: ExpansionProvenance,
+    image_cases: Vec<ImageExpansionCase>,
+    audio_cases: Vec<AudioExpansionCase>,
+}
+
+#[derive(Deserialize)]
 struct ManifestFile {
     bytes: u64,
     sha256: String,
@@ -78,6 +120,15 @@ fn load_corpus() -> Vec<CorpusCase> {
 fn load_chat_golden() -> ChatTemplateGolden {
     serde_json::from_str(&read_fixture("chat_template_golden.json"))
         .expect("valid chat_template_golden.json")
+}
+
+fn load_decode_goldens() -> Vec<DecodeCase> {
+    serde_json::from_str(&read_fixture("decode_goldens.json")).expect("valid decode_goldens.json")
+}
+
+fn load_expansion_goldens() -> ExpansionGoldens {
+    serde_json::from_str(&read_fixture("expansion_goldens.json"))
+        .expect("valid expansion_goldens.json")
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -158,6 +209,52 @@ fn corpus_goldens_decode_round_trips_plain_text() {
     }
 }
 
+// ---------------------------------------------------------------------
+// Byte-fallback decode goldens (exact HF decode parity for invalid/
+// incomplete UTF-8 byte-fallback runs; ADR-082 Stage 1 major finding)
+// ---------------------------------------------------------------------
+
+#[test]
+fn byte_fallback_decode_matches_exact_hf_output() {
+    let cases = load_decode_goldens();
+    assert!(
+        cases.len() >= 4,
+        "expected the required lone/incomplete/valid/mixed decode cases"
+    );
+    for case in &cases {
+        let decoded = TOKENIZER
+            .decode(&case.ids)
+            .expect("decode always returns Some");
+        assert_eq!(
+            decoded, case.decoded,
+            "case {:?} (ids={:?}) decoded {:?}, expected {:?}",
+            case.id, case.ids, decoded, case.decoded
+        );
+    }
+
+    // Pin the shape of the required cases directly (not just via the fixture),
+    // so a fixture regeneration that silently drops a case still fails loudly.
+    let by_id = |id: &str| {
+        cases
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("missing required decode case {id:?}"))
+    };
+    assert_eq!(
+        by_id("decode_lone_incomplete_lead_byte").decoded,
+        "\u{FFFD}"
+    );
+    assert_eq!(
+        by_id("decode_two_byte_incomplete_run").decoded,
+        "\u{FFFD}\u{FFFD}"
+    );
+    assert_eq!(by_id("decode_valid_three_byte_fallback_run").decoded, "叫");
+    assert_eq!(
+        by_id("decode_incomplete_run_then_ordinary_token").decoded,
+        "\u{FFFD}\u{FFFD}a"
+    );
+}
+
 #[test]
 fn image_and_audio_markers_tokenize_to_single_ids() {
     let cases = load_corpus();
@@ -211,6 +308,211 @@ fn existing_qwen_bpe_loader_rejects_gemma_tokenizer_json() {
 #[test]
 fn gemma_tokenizer_vocab_size_matches_checkpoint() {
     assert_eq!(TOKENIZER.vocab_size(), 262_144);
+}
+
+// ---------------------------------------------------------------------
+// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17)
+// ---------------------------------------------------------------------
+
+#[test]
+fn marker_expansion_arithmetic_matches_processor_config_goldens() {
+    let goldens = load_expansion_goldens();
+
+    // The committed Rust constants must not silently drift from the
+    // checkpoint's own `processor_config.json` the goldens were derived from.
+    assert_eq!(
+        GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE, goldens.provenance.image_seq_length,
+        "GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE drifted from processor_config.json"
+    );
+    assert_eq!(
+        GEMMA4_AUDIO_MS_PER_SOFT_TOKEN, goldens.provenance.audio_ms_per_token,
+        "GEMMA4_AUDIO_MS_PER_SOFT_TOKEN drifted from processor_config.json"
+    );
+    assert_eq!(
+        GEMMA4_AUDIO_MAX_SOFT_TOKENS, goldens.provenance.audio_seq_length,
+        "GEMMA4_AUDIO_MAX_SOFT_TOKENS drifted from processor_config.json"
+    );
+
+    assert!(goldens.image_cases.iter().any(|c| c.marker_count == 0));
+    assert!(goldens.image_cases.iter().any(|c| c.marker_count == 1));
+    assert!(goldens.image_cases.iter().any(|c| c.marker_count > 1));
+    for case in &goldens.image_cases {
+        assert_eq!(
+            image_marker_expansion_tokens(case.marker_count),
+            case.expected_tokens,
+            "image marker_count={} expansion mismatch",
+            case.marker_count
+        );
+    }
+
+    assert!(
+        goldens
+            .audio_cases
+            .iter()
+            .any(|c| c.durations_ms.is_empty())
+    );
+    assert!(
+        goldens
+            .audio_cases
+            .iter()
+            .any(|c| c.durations_ms.len() == 1)
+    );
+    assert!(goldens.audio_cases.iter().any(|c| c.durations_ms.len() > 1));
+    for case in &goldens.audio_cases {
+        assert_eq!(case.durations_ms.len(), case.expected_tokens.len());
+        for (&duration_ms, &expected) in case.durations_ms.iter().zip(&case.expected_tokens) {
+            assert_eq!(
+                audio_marker_expansion_tokens(duration_ms),
+                expected,
+                "audio duration_ms={duration_ms} expansion mismatch"
+            );
+        }
+    }
+
+    // Explicit boundary check: a duration well past the 30s card limit must
+    // clamp at the cap rather than grow unbounded.
+    assert_eq!(
+        audio_marker_expansion_tokens(1_000_000),
+        GEMMA4_AUDIO_MAX_SOFT_TOKENS
+    );
+    assert_eq!(image_marker_expansion_tokens(0), 0);
+}
+
+// ---------------------------------------------------------------------
+// Fail-closed constructor validation (ADR-082 Stage 1 medium finding):
+// mutating any field `validate_gemma_bpe_shape` checks must reject
+// construction, proving the constructor's fail-closed claim isn't
+// decorative.
+// ---------------------------------------------------------------------
+
+/// A minimal but complete Gemma-shaped `tokenizer.json`, built directly
+/// (not derived from the 32 MB committed fixture) so each mutation test
+/// stays fast and each mutated field is isolated from the others.
+fn minimal_valid_tokenizer_json() -> serde_json::Value {
+    serde_json::json!({
+        "normalizer": {
+            "type": "Replace",
+            "pattern": {"String": " "},
+            "content": "\u{2581}",
+        },
+        "pre_tokenizer": {
+            "type": "Split",
+            "pattern": {"String": " "},
+            "behavior": "MergedWithPrevious",
+            "invert": false,
+        },
+        "decoder": {
+            "type": "Sequence",
+            "decoders": [
+                {"type": "Replace", "pattern": {"String": "\u{2581}"}, "content": " "},
+                {"type": "ByteFallback"},
+                {"type": "Fuse"},
+            ],
+        },
+        "added_tokens": [],
+        "model": {
+            "type": "BPE",
+            "dropout": serde_json::Value::Null,
+            "unk_token": "<unk>",
+            "continuing_subword_prefix": serde_json::Value::Null,
+            "end_of_word_suffix": serde_json::Value::Null,
+            "fuse_unk": true,
+            "byte_fallback": true,
+            "ignore_merges": false,
+            "vocab": {"<unk>": 0, "a": 1, "<0x61>": 2, "\u{2581}": 3},
+            "merges": [],
+        },
+    })
+}
+
+fn assert_constructs(value: &serde_json::Value, context: &str) {
+    let text = value.to_string();
+    assert!(
+        GemmaBpeTokenizer::from_tokenizer_json_str(&text).is_ok(),
+        "{context}: expected construction to succeed"
+    );
+}
+
+fn assert_rejects(value: &serde_json::Value, context: &str) {
+    let text = value.to_string();
+    assert!(
+        GemmaBpeTokenizer::from_tokenizer_json_str(&text).is_err(),
+        "{context}: expected construction to fail closed, but it succeeded"
+    );
+}
+
+#[test]
+fn minimal_valid_tokenizer_json_constructs() {
+    assert_constructs(&minimal_valid_tokenizer_json(), "unmutated baseline");
+}
+
+#[test]
+fn constructor_rejects_wrong_split_pattern() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["pre_tokenizer"]["pattern"]["String"] = serde_json::json!("\t");
+    assert_rejects(&mutated, "pre_tokenizer.pattern.String == \"\\t\"");
+}
+
+#[test]
+fn constructor_rejects_wrong_split_behavior() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["pre_tokenizer"]["behavior"] = serde_json::json!("Isolated");
+    assert_rejects(&mutated, "pre_tokenizer.behavior == \"Isolated\"");
+}
+
+#[test]
+fn constructor_rejects_inverted_split() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["pre_tokenizer"]["invert"] = serde_json::json!(true);
+    assert_rejects(&mutated, "pre_tokenizer.invert == true");
+}
+
+#[test]
+fn constructor_rejects_reordered_decoder_sequence() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    let decoders = mutated["decoder"]["decoders"].as_array().unwrap().clone();
+    mutated["decoder"]["decoders"] = serde_json::json!([
+        decoders[1].clone(),
+        decoders[0].clone(),
+        decoders[2].clone()
+    ]);
+    assert_rejects(&mutated, "decoder order ByteFallback,Replace,Fuse");
+}
+
+#[test]
+fn constructor_rejects_missing_fuse_stage() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    let decoders = mutated["decoder"]["decoders"].as_array().unwrap().clone();
+    mutated["decoder"]["decoders"] = serde_json::json!([decoders[0].clone(), decoders[1].clone()]);
+    assert_rejects(&mutated, "decoder missing trailing Fuse");
+}
+
+#[test]
+fn constructor_rejects_ignore_merges_true() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["model"]["ignore_merges"] = serde_json::json!(true);
+    assert_rejects(&mutated, "model.ignore_merges == true");
+}
+
+#[test]
+fn constructor_rejects_fuse_unk_false() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["model"]["fuse_unk"] = serde_json::json!(false);
+    assert_rejects(&mutated, "model.fuse_unk == false");
+}
+
+#[test]
+fn constructor_rejects_non_null_dropout() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["model"]["dropout"] = serde_json::json!(0.1);
+    assert_rejects(&mutated, "model.dropout == 0.1");
+}
+
+#[test]
+fn constructor_rejects_non_null_continuing_subword_prefix() {
+    let mut mutated = minimal_valid_tokenizer_json();
+    mutated["model"]["continuing_subword_prefix"] = serde_json::json!("##");
+    assert_rejects(&mutated, "model.continuing_subword_prefix == \"##\"");
 }
 
 // Small helper trait to expose raw (unpadded) tokenize-to-ids for golden

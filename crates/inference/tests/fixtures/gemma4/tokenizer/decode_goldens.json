@@ -1,0 +1,35 @@
+[
+  {
+    "id": "decode_lone_incomplete_lead_byte",
+    "ids": [
+      467
+    ],
+    "decoded": "�"
+  },
+  {
+    "id": "decode_two_byte_incomplete_run",
+    "ids": [
+      467,
+      381
+    ],
+    "decoded": "��"
+  },
+  {
+    "id": "decode_valid_three_byte_fallback_run",
+    "ids": [
+      467,
+      381,
+      409
+    ],
+    "decoded": "叫"
+  },
+  {
+    "id": "decode_incomplete_run_then_ordinary_token",
+    "ids": [
+      467,
+      381,
+      236746
+    ],
+    "decoded": "��a"
+  }
+]

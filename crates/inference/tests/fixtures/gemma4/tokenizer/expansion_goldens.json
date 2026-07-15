@@ -1,0 +1,45 @@
+{
+  "provenance": {
+    "image_seq_length": 280,
+    "audio_ms_per_token": 40,
+    "audio_seq_length": 750
+  },
+  "image_cases": [
+    {
+      "marker_count": 0,
+      "expected_tokens": 0
+    },
+    {
+      "marker_count": 1,
+      "expected_tokens": 280
+    },
+    {
+      "marker_count": 3,
+      "expected_tokens": 840
+    }
+  ],
+  "audio_cases": [
+    {
+      "durations_ms": [],
+      "expected_tokens": []
+    },
+    {
+      "durations_ms": [
+        1000
+      ],
+      "expected_tokens": [
+        25
+      ]
+    },
+    {
+      "durations_ms": [
+        1000,
+        40000
+      ],
+      "expected_tokens": [
+        25,
+        750
+      ]
+    }
+  ]
+}

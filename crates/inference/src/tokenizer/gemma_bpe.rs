@@ -124,10 +124,12 @@ impl GemmaBpeTokenizer {
 
     /// **Unstable**: load from a Hugging Face `tokenizer.json` string.
     ///
-    /// Fails closed if the declared `model.type`, `normalizer`, or
-    /// `pre_tokenizer` do not match the Gemma shape this path was built
-    /// against (see module docs) — this constructor makes an explicit
-    /// structural claim about its input, rather than best-effort adapting.
+    /// Fails closed if the declared `model.type`, `normalizer`,
+    /// `pre_tokenizer`, `decoder`, or the `model` fields the encode/decode
+    /// logic depends on do not match the Gemma shape this path was built
+    /// against (see [`validate_gemma_bpe_shape`] and the module docs) — this
+    /// constructor makes an explicit structural claim about its input,
+    /// rather than best-effort adapting.
     pub fn from_tokenizer_json_str(text: &str) -> Result<Self, InferenceError> {
         let root = parse_json(text)?;
         validate_gemma_bpe_shape(&root)?;
@@ -389,12 +391,20 @@ impl GemmaBpeTokenizer {
         out
     }
 
-    fn token_bytes_for(&self, id: u32, out: &mut Vec<u8>) {
+    /// Appends the decoded text for one non-fallback token (`id`) to `out`,
+    /// first flushing any pending byte-fallback run. Mirrors the pinned HF
+    /// `tokenizers` decoder sequence `Replace -> ByteFallback -> Fuse`: the
+    /// `Replace("▁" -> " ")` step runs per-token here, and any
+    /// `<0xXX>` run is flushed (as its own `ByteFallback` step) before this
+    /// token's text is appended, so token order — not raw byte order — is
+    /// preserved across a run boundary.
+    fn append_token(&self, id: u32, pending_fallback: &mut Vec<u8>, out: &mut String) {
         if self.inner.special_skip_ids.contains(&id) {
             return;
         }
         if let Some(content) = self.inner.added_render.get(&id) {
-            out.extend_from_slice(content.as_bytes());
+            flush_byte_fallback_run(pending_fallback, out);
+            out.push_str(content);
             return;
         }
         let Some(tok) = self.inner.id_to_token.get(id as usize) else {
@@ -404,15 +414,35 @@ impl GemmaBpeTokenizer {
             return;
         }
         if let Some(byte) = parse_byte_fallback_token(tok) {
-            out.push(byte);
+            pending_fallback.push(byte);
             return;
         }
+        flush_byte_fallback_run(pending_fallback, out);
         for ch in tok.chars() {
             if ch == METASPACE {
-                out.push(b' ');
+                out.push(' ');
             } else {
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                out.push(ch);
+            }
+        }
+    }
+}
+
+/// Flushes a run of consecutive byte-fallback bytes accumulated across
+/// `<0xXX>` tokens, per the HF `tokenizers` v0.22.2 `ByteFallback` decoder
+/// (`decoders/byte_fallback.rs`): a valid UTF-8 run decodes as one string:
+/// an invalid run emits exactly one U+FFFD per byte in the run — never
+/// `str::from_utf8_lossy`'s maximal-subpart replacement, which can collapse
+/// several invalid bytes into a single U+FFFD and under-count HF's output.
+fn flush_byte_fallback_run(pending: &mut Vec<u8>, out: &mut String) {
+    if pending.is_empty() {
+        return;
+    }
+    match String::from_utf8(std::mem::take(pending)) {
+        Ok(valid) => out.push_str(&valid),
+        Err(err) => {
+            for _ in 0..err.into_bytes().len() {
+                out.push('\u{FFFD}');
             }
         }
     }
@@ -441,11 +471,13 @@ impl Tokenizer for GemmaBpeTokenizer {
     }
 
     fn decode(&self, ids: &[u32]) -> Option<String> {
-        let mut bytes = Vec::new();
+        let mut out = String::new();
+        let mut pending_fallback: Vec<u8> = Vec::new();
         for &id in ids {
-            self.token_bytes_for(id, &mut bytes);
+            self.append_token(id, &mut pending_fallback, &mut out);
         }
-        Some(String::from_utf8_lossy(&bytes).into_owned())
+        flush_byte_fallback_run(&mut pending_fallback, &mut out);
+        Some(out)
     }
 
     fn vocab_size(&self) -> usize {
@@ -472,10 +504,17 @@ fn parse_byte_fallback_token(tok: &str) -> Option<u8> {
 }
 
 /// Fails closed if `root` does not match the Gemma tokenizer shape this
-/// path was built against (ADR-082 G17): `model.type == "BPE"`,
-/// `model.byte_fallback == true`, a `Replace(" " -> "▁")` normalizer, and a
-/// literal-string `Split` pre-tokenizer (not a regex `Split`, which is the
-/// shape the existing Qwen loader accepts).
+/// path was built against (ADR-082 G17): `model.type == "BPE"`, a
+/// `Replace(" " -> "▁")` normalizer, a literal-string `Split` pre-tokenizer
+/// with the exact `pattern.String == " "` / `behavior ==
+/// "MergedWithPrevious"` / `invert == false` fields this loader's encode
+/// path assumes (not a regex `Split`, which is the shape the existing Qwen
+/// loader accepts), the exact `decoder == Sequence[Replace, ByteFallback,
+/// Fuse]` order the run-based decode in this module is built against, and
+/// the `model.{dropout,continuing_subword_prefix,end_of_word_suffix,
+/// fuse_unk,byte_fallback,ignore_merges}` fields the BPE merge/fallback
+/// logic depends on. Every field this constructor does *not* check is
+/// exactly the set this loader's encode/decode logic never reads.
 fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
     let model_type = json_path(root, &["model", "type"])
         .and_then(JsonValue::as_str)
@@ -512,16 +551,133 @@ fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
     let pre_tokenizer = root.get("pre_tokenizer");
     let is_gemma_pretokenizer = pre_tokenizer.is_some_and(|pt| {
         pt.get("type").and_then(JsonValue::as_str) == Some("Split")
-            && json_path(pt, &["pattern", "String"]).is_some()
+            && json_path(pt, &["pattern", "String"]).and_then(JsonValue::as_str) == Some(" ")
+            && pt.get("behavior").and_then(JsonValue::as_str) == Some("MergedWithPrevious")
+            && pt.get("invert").and_then(JsonValue::as_bool) == Some(false)
     });
     if !is_gemma_pretokenizer {
         return Err(InferenceError::Tokenizer(
             "GemmaBpeTokenizer expects a literal-string Split pre_tokenizer \
-             (pattern.String, not pattern.Regex); tokenizer.json declares a \
-             different shape, refusing to guess"
+             (pattern.String == \" \", behavior == \"MergedWithPrevious\", \
+             invert == false); tokenizer.json declares a different shape, \
+             refusing to guess"
+                .into(),
+        ));
+    }
+
+    let decoder = root.get("decoder");
+    let is_gemma_decoder = decoder.is_some_and(|d| {
+        d.get("type").and_then(JsonValue::as_str) == Some("Sequence")
+            && d.get("decoders")
+                .and_then(JsonValue::as_array)
+                .is_some_and(is_gemma_decoder_sequence)
+    });
+    if !is_gemma_decoder {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects decoder == Sequence[Replace(\"\u{2581}\" -> \
+             \" \"), ByteFallback, Fuse] in exactly that order; tokenizer.json \
+             declares a different shape, refusing to guess"
+                .into(),
+        ));
+    }
+
+    let model = root.get("model");
+    let model_matches_assumed_shape = model.is_some_and(|m| {
+        is_null_or_absent(m.get("dropout"))
+            && is_null_or_absent(m.get("continuing_subword_prefix"))
+            && is_null_or_absent(m.get("end_of_word_suffix"))
+            && m.get("fuse_unk").and_then(JsonValue::as_bool) == Some(true)
+            && m.get("ignore_merges").and_then(JsonValue::as_bool) == Some(false)
+    });
+    if !model_matches_assumed_shape {
+        return Err(InferenceError::Tokenizer(
+            "GemmaBpeTokenizer expects model.dropout/continuing_subword_prefix/\
+             end_of_word_suffix == null, model.fuse_unk == true, and \
+             model.ignore_merges == false (this loader always applies BPE \
+             merges and never affix-wraps a subword); tokenizer.json declares \
+             a different shape, refusing to guess"
                 .into(),
         ));
     }
 
     Ok(())
+}
+
+/// `true` if `value` is absent or JSON `null` — used for model fields this
+/// loader assumes are unset (`dropout`, `continuing_subword_prefix`,
+/// `end_of_word_suffix`) rather than silently ignoring a populated one.
+fn is_null_or_absent(value: Option<&JsonValue>) -> bool {
+    matches!(value, None | Some(JsonValue::Null))
+}
+
+/// `true` if `decoders` is exactly `[Replace("\u{2581}" -> " "), ByteFallback, Fuse]`
+/// in that order — the declared decoder sequence this loader's run-based
+/// byte-fallback decode (see [`flush_byte_fallback_run`]) is built against.
+fn is_gemma_decoder_sequence(decoders: &[JsonValue]) -> bool {
+    let [replace, byte_fallback, fuse] = decoders else {
+        return false;
+    };
+    let is_replace = replace.get("type").and_then(JsonValue::as_str) == Some("Replace")
+        && json_path(replace, &["pattern", "String"]).and_then(JsonValue::as_str)
+            == Some("\u{2581}")
+        && replace.get("content").and_then(JsonValue::as_str) == Some(" ");
+    let is_byte_fallback =
+        byte_fallback.get("type").and_then(JsonValue::as_str) == Some("ByteFallback");
+    let is_fuse = fuse.get("type").and_then(JsonValue::as_str) == Some("Fuse");
+    is_replace && is_byte_fallback && is_fuse
+}
+
+/// Vision soft tokens per `<|image|>` placeholder (ADR-082 G11): the
+/// `google/gemma-4-E2B-it` processor's default image-token budget, read
+/// from the pinned checkpoint's `processor_config.json`
+/// (`image_processor.image_seq_length` / `.max_soft_tokens`, both `280`) —
+/// see `scripts/gemma4_tokenizer_goldens.py`'s `expansion_goldens.json`
+/// output and `tests/fixtures/gemma4/tokenizer/processor_config.json`.
+pub const GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE: u32 = 280;
+
+/// Milliseconds of audio collapsed into one `<|audio|>` soft token
+/// (ADR-082 G15), read from the pinned checkpoint's
+/// `processor_config.json` (`audio_ms_per_token`).
+pub const GEMMA4_AUDIO_MS_PER_SOFT_TOKEN: u32 = 40;
+
+/// Upper bound on audio soft tokens for a single `<|audio|>` placeholder
+/// (ADR-082 G15; ≈ the card's 30 s audio limit), read from the pinned
+/// checkpoint's `processor_config.json` (`audio_seq_length`).
+pub const GEMMA4_AUDIO_MAX_SOFT_TOKENS: u32 = 750;
+
+/// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17): the number of
+/// vision soft tokens `image_marker_count` `<|image|>` placeholders expand
+/// to. Each placeholder expands to the fixed
+/// [`GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE`] budget — this is the processor's
+/// default image-token count, not a per-image-resolution computation (that
+/// resolution-dependent variant, and the actual in-sequence scatter, are
+/// Stage 5/6 scope per ADR-082's stage table).
+pub fn image_marker_expansion_tokens(image_marker_count: usize) -> usize {
+    image_marker_count * GEMMA4_IMAGE_SOFT_TOKENS_PER_IMAGE as usize
+}
+
+/// Stage-1 marker-expansion arithmetic (ADR-082 G11/G15/G17): the number of
+/// audio soft tokens one `<|audio|>` placeholder expands to, given its
+/// audio segment's duration in milliseconds —
+/// `ceil(duration_ms / GEMMA4_AUDIO_MS_PER_SOFT_TOKEN)`, capped at
+/// [`GEMMA4_AUDIO_MAX_SOFT_TOKENS`]. This is HF `Gemma4Processor`'s own
+/// documented placeholder-count contract; the mel-framing + two-stride-2-Conv
+/// subsampling arithmetic `_compute_audio_num_tokens` mirrors to land on the
+/// same count from a raw waveform is Stage 9 (audio end-to-end) scope, not
+/// Stage 1's.
+pub fn audio_marker_expansion_tokens(duration_ms: u32) -> u32 {
+    duration_ms
+        .div_ceil(GEMMA4_AUDIO_MS_PER_SOFT_TOKEN)
+        .min(GEMMA4_AUDIO_MAX_SOFT_TOKENS)
+}
+
+/// Total audio soft tokens across every `<|audio|>` placeholder's duration
+/// (one entry per marker, in encounter order); see
+/// [`audio_marker_expansion_tokens`].
+pub fn total_audio_marker_expansion_tokens(durations_ms: &[u32]) -> usize {
+    durations_ms
+        .iter()
+        .copied()
+        .map(|ms| audio_marker_expansion_tokens(ms) as usize)
+        .sum()
 }
