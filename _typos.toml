@@ -21,6 +21,7 @@ wht = "wht"     # Walsh-Hadamard Transform (QuaRot rotation)
 nax = "nax"     # MLX's own `_nax` GEMM dispatch suffix, quoted in docs/mlx_kernel_study.md
 tpe = "tpe"     # Tree-structured Parzen Estimator (hyperparameter search)
 thw = "thw"     # Qwen vision grid dims (temporal-height-width), the `grid_thw` field
+arange = "arange" # torch/numpy API name quoted in vision RoPE comments
 comput = "comput" # bibliographic abbreviation, "SIAM J. Sci. Comput."
 oll = "oll"     # ollama shell/plot variable abbreviation in bench scripts
 yhat = "yhat"   # statistics notation (predicted value)
