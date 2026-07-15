@@ -1,0 +1,91 @@
+{
+  "adr": "ADR-069",
+  "decode": {
+    "device": "cpu",
+    "dtype": "float32",
+    "max_new_tokens": 8,
+    "num_threads": 1,
+    "strategy": "greedy"
+  },
+  "greedy_tokens": {
+    "path": "greedy_tokens.json",
+    "sha256": "0a6848e33e01c112861a4a67f70a0ef81fa604a8dfbcb438b18b7280f6545484"
+  },
+  "image": {
+    "path": "golden_image.png",
+    "seed": 20260714,
+    "sha256": "d5083740a73e5d90cce9f75c7e7eac7efcb965ae9ad0f173ded2e370e6d7924b",
+    "size": [
+      256,
+      256
+    ]
+  },
+  "image_grid_thw": [
+    [
+      1,
+      16,
+      16
+    ]
+  ],
+  "input_ids": {
+    "path": "input_ids.json",
+    "sha256": "9beda884e9b718c0ce58c657c7ac5535936582f20d2141a8b03f75b7ab0adfd5"
+  },
+  "num_image_placeholder_tokens": 64,
+  "pixel_values_summary": {
+    "dtype": "float32",
+    "max": 1.0,
+    "mean": -0.03216345235705376,
+    "min": -1.0,
+    "shape": [
+      256,
+      1536
+    ],
+    "std": 0.5934170484542847
+  },
+  "position_ids": {
+    "path": "position_ids.json",
+    "sha256": "f1407311a976e23e559e32edb8eafe47bcd4213c3b4dad5561b0ee8b5404fe3d"
+  },
+  "prompt": "Describe this image.",
+  "sanity_checks": {
+    "image_span_positions_diverge": true,
+    "post_merger_count_matches_placeholder_count": true,
+    "text_prefix_positions_collapse_1d": true
+  },
+  "schema_version": 1,
+  "source": {
+    "hf_model_id": "Qwen/Qwen3.5-0.8B",
+    "hf_processor_revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "model_dir_config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+    "model_dir_safetensors_index_sha256": "d8a08838a613b025eb7952ed9db11696213e57e76a375661ef5c12f9dd5dcf4e",
+    "numpy_version": "2.4.6",
+    "pillow_version": "12.3.0",
+    "python_version": "3.11.12",
+    "torch_version": "2.13.0",
+    "torchvision_version": "0.28.0",
+    "transformers_version": "5.12.1"
+  },
+  "vit_post_merger": {
+    "dtype": "float32",
+    "endianness": "little",
+    "num_elements": 65536,
+    "path": "vit_post_merger_f32.bin",
+    "sha256": "6b5ef28b198a370449bbbcd7bdfcf5cbe82b5d03fdd750e91336fb38fa4cacf9",
+    "shape": [
+      64,
+      1024
+    ]
+  },
+  "vit_pre_merger": {
+    "dtype": "float32",
+    "endianness": "little",
+    "num_elements": 196608,
+    "path": "vit_pre_merger_f32.bin",
+    "sha256": "1a82b0bb6c873fb6aa62b35e33ad7c6c0bc50f028b119e3e4862f6bc0bdf62d3",
+    "shape": [
+      256,
+      768
+    ]
+  }
+}

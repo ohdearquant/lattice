@@ -27,6 +27,10 @@ Thumbs.db
 *.bin
 *.onnx
 *.gguf
+# ...except the two small committed HF differential golden tensors (ADR-069, ~1 MB total).
+# Exact paths only (not a glob) so an arbitrary future .bin dropped in this directory stays ignored.
+!tests/fixtures/vision/vit_pre_merger_f32.bin
+!tests/fixtures/vision/vit_post_merger_f32.bin
 
 # Review scratch artifacts (repo-root only)
 /review*.md
