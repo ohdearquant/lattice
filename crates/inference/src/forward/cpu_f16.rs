@@ -920,6 +920,19 @@ pub fn generate_f16(
     // `check_prompt_not_empty` (model::qwen35::generation).
     crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
 
+    // codex r1 blocker 1 (sibling of `generate_multimodal_f16`'s guard): tokenizer
+    // output is bounded by the tokenizer's own vocabulary, but this driver accepts
+    // `cfg` and `tokenizer` as independent parameters, so a mismatched pair can still
+    // produce a prompt id at or past `cfg.vocab_size` and panic in `forward_step_f16`'s
+    // embedding-table slice. Fail closed here, once, before any decoder state is
+    // allocated.
+    if let Some(&bad_id) = prompt_ids.iter().find(|&&id| id as usize >= cfg.vocab_size) {
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "prompt contains out-of-vocabulary token id {bad_id} (vocab_size={})",
+            cfg.vocab_size
+        )));
+    }
+
     // max_new_tokens == 0 means "generate nothing": return before sampling so
     // we never emit a token the caller did not ask for. Mirrors the guard in
     // Qwen35Model::generate (crates/inference/src/model/qwen35/generation.rs).
@@ -1103,7 +1116,84 @@ pub fn generate_multimodal_f16(
         ))
     })?;
 
+    // codex r1 blocker 1: caller-supplied `input_ids` must be bounded against the
+    // checkpoint vocabulary before any decoder allocation/work begins — an
+    // out-of-range id would otherwise panic in `forward_step_f16`'s embedding-table
+    // slice (`token_id * hidden`) instead of failing closed.
+    if let Some(&bad_id) = request
+        .input_ids
+        .iter()
+        .find(|&&id| id as usize >= cfg.vocab_size)
+    {
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "input_ids contains out-of-vocabulary token id {bad_id} (vocab_size={})",
+            cfg.vocab_size
+        )));
+    }
+
+    let has_image = !request.image_grids.is_empty();
+
+    // codex r1 major 3: `request.validate()` proves only internal consistency —
+    // bind the request to the *loaded checkpoint's* vision metadata before
+    // selecting image slots or building M-RoPE tables, otherwise an internally
+    // consistent request targeting the wrong checkpoint silently injects rows at
+    // the wrong slots / applies image M-RoPE where HF would treat them as text.
+    if has_image {
+        let cfg_image_token_id = cfg.image_token_id.ok_or_else(|| {
+            crate::error::InferenceError::InvalidInput(
+                "multimodal request supplied but checkpoint has no image_token_id".to_string(),
+            )
+        })?;
+        if cfg_image_token_id != request.image_token_id {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "request image_token_id {} does not match checkpoint image_token_id {cfg_image_token_id}",
+                request.image_token_id
+            )));
+        }
+        let vision_cfg = cfg.vision_config.as_ref().ok_or_else(|| {
+            crate::error::InferenceError::InvalidInput(
+                "multimodal request supplied but checkpoint has no vision_config".to_string(),
+            )
+        })?;
+        if vision_cfg.spatial_merge_size != request.spatial_merge_size {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "request spatial_merge_size {} does not match checkpoint \
+                 vision_config.spatial_merge_size {}",
+                request.spatial_merge_size, vision_cfg.spatial_merge_size
+            )));
+        }
+        if request.decoder_hidden_size != cfg.hidden_size {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "request decoder_hidden_size {} does not match checkpoint hidden_size {}",
+                request.decoder_hidden_size, cfg.hidden_size
+            )));
+        }
+        if vision_cfg.out_hidden_size != cfg.hidden_size {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "checkpoint vision_config.out_hidden_size {} does not match decoder \
+                 hidden_size {}",
+                vision_cfg.out_hidden_size, cfg.hidden_size
+            )));
+        }
+    }
+
     let (positions, tables) = request.build_mrope_tables(cfg)?;
+
+    // codex r1 major 4: the M-RoPE table builder resolves `partial_rotary_factor`
+    // from `cfg.rope_parameters`, while the attention loop derives its rotary
+    // half-width from the separately public `cfg.rope_dim()`
+    // (`cfg.partial_rotary_factor`). A constructible config where these diverge
+    // must fail closed here, before the first forward pass indexes `cos_row`/
+    // `sin_row` past the table's actual row width.
+    let expected_rope_half = cfg.rope_dim() / 2;
+    if tables.cos.iter().any(|row| row.len() != expected_rope_half)
+        || tables.sin.iter().any(|row| row.len() != expected_rope_half)
+    {
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "M-RoPE table row width does not match decoder rotary half-width: expected \
+             {expected_rope_half}"
+        )));
+    }
 
     let prompt_ids = &request.input_ids;
     let prompt_len = prompt_ids.len();
@@ -1168,7 +1258,8 @@ pub fn generate_multimodal_f16(
     // only mathematically (not bit-) equivalent. Route text-only requests through the
     // unchanged 1-D table so they are bit-identical to `generate_f16`, and reserve the M-RoPE
     // table for requests that actually contain an image (where axes genuinely diverge).
-    let has_image = !request.image_grids.is_empty();
+    // `has_image` was already computed above (before `build_mrope_tables`) for the
+    // checkpoint-binding guard; reused here rather than recomputed.
     let rope = RopeTable::new(cfg.rope_dim(), max_context, cfg.rope_theta);
 
     let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
@@ -1251,6 +1342,18 @@ pub fn generate_multimodal_f16(
             let decode_axis =
                 crate::vision::qwen35_mrope::decode_position(physical_pos, positions.rope_delta)?;
             decode_cos_sin = request.build_decode_cos_sin(cfg, decode_axis)?;
+            // codex r1 major 4 (decode-time sibling): the prefill table's row-width
+            // guard has no effect on this independently-built single-row decode
+            // table — check it here too, before it reaches the attention loop's
+            // `cos_row[i]`/`sin_row[i]` indexing.
+            if decode_cos_sin.0.len() != expected_rope_half
+                || decode_cos_sin.1.len() != expected_rope_half
+            {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "decode-time M-RoPE row width does not match decoder rotary \
+                     half-width: expected {expected_rope_half}"
+                )));
+            }
             Some((decode_cos_sin.0.as_slice(), decode_cos_sin.1.as_slice()))
         } else {
             None
@@ -2833,6 +2936,273 @@ mod tests {
         assert!(
             generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg).is_err(),
             "prompt_len + max_new_tokens exceeding max_position_embeddings must be rejected"
+        );
+    }
+
+    /// codex r1 blocker 1: a caller-supplied `input_ids` entry at or past
+    /// `cfg.vocab_size` must be rejected with `InvalidInput` before any decoder
+    /// allocation/work, not panic in `forward_step_f16`'s embedding-table slice.
+    /// Mutation check: removing the guard lets the request reach the None-branch
+    /// embedding lookup, which indexes `embed_tokens[token_id * hidden..]` past
+    /// the table's end and panics, turning this `expect_err` into a test-binary
+    /// abort rather than a clean assertion failure — either way the test fails.
+    #[test]
+    fn generate_multimodal_f16_rejects_out_of_vocab_input_id() {
+        use crate::vision::multimodal::Qwen35VisionRequest;
+
+        let (cfg, weights) = tiny_vision_splice_model();
+        let request = Qwen35VisionRequest {
+            input_ids: vec![0, 1, cfg.vocab_size as u32], // last id == vocab_size (OOV)
+            image_grids: vec![],
+            post_merger_rows: vec![],
+            image_token_id: 3,
+            spatial_merge_size: 2,
+            decoder_hidden_size: cfg.hidden_size,
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        let err = generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg)
+            .expect_err("an out-of-vocabulary input_id must be rejected, not panic");
+        assert!(
+            matches!(err, crate::error::InferenceError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    /// codex r1 blocker 1, sibling path: `generate_f16` accepts `cfg` and
+    /// `tokenizer` as independent parameters, so a mismatched pair can still
+    /// tokenize a prompt into an id at or past `cfg.vocab_size`. Simulates that
+    /// mismatch directly (a tokenizer vocab entry the fixture's 8-row embedding
+    /// table cannot cover) rather than relying on tokenizer internals to produce
+    /// an OOV id by accident.
+    /// Mutation check: removing the guard lets `forward_step_f16`'s prefill call
+    /// index `embed_tokens[8 * hidden..]` on a `vocab=8` table — out of bounds —
+    /// so the panic (or, pre-guard, a wrong-but-silent read) replaces this clean
+    /// `expect_err`, failing the test either way.
+    #[test]
+    fn test_generate_f16_rejects_out_of_vocab_prompt_id() {
+        use std::collections::HashMap;
+
+        let (cfg, weights, rope, _tokenizer) = zero_layer_f16_fixture();
+
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        // OOV against the fixture's cfg.vocab_size=8 embedding table -- a
+        // mismatched cfg/tokenizer pair, exactly the scenario the guard covers.
+        vocab_map.insert("z".to_string(), cfg.vocab_size as u32);
+        let mismatched_tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, vec![])
+            .expect("tokenizer with an OOV vocab entry still constructs");
+
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        let err = generate_f16(&weights, &cfg, &mismatched_tokenizer, &rope, "z", &gen_cfg)
+            .expect_err("an out-of-vocabulary prompt token id must be rejected, not panic");
+        assert!(
+            matches!(err, crate::error::InferenceError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    /// Build the [`tiny_vision_splice_model`] fixture plus a populated
+    /// `vision_config` (spatial_merge_size=2, out_hidden_size == decoder
+    /// hidden_size) so checkpoint-binding mismatches (codex r1 major 3) are
+    /// testable against a checkpoint that genuinely carries vision metadata.
+    fn tiny_vision_splice_model_with_vision_cfg() -> (Qwen35Config, F16ModelWeights) {
+        use crate::model::qwen35_config::VisionModelConfig;
+
+        let (mut cfg, weights) = tiny_vision_splice_model();
+        cfg.vision_config = Some(VisionModelConfig {
+            depth: 1,
+            hidden_size: 8,
+            num_heads: 1,
+            patch_size: 1,
+            spatial_merge_size: 2,
+            out_hidden_size: cfg.hidden_size,
+            temporal_patch_size: 1,
+            num_position_embeddings: 1,
+            in_channels: 1,
+            deepstack_visual_indexes: vec![],
+        });
+        (cfg, weights)
+    }
+
+    /// codex r1 major 3: an internally-consistent multimodal request whose
+    /// `image_token_id` does not match the loaded checkpoint's must be rejected
+    /// up front, before image slots are selected -- otherwise it silently
+    /// injects/rotates at the wrong slots against a real checkpoint.
+    /// Mutation check: removing just this guard branch (leaving the other FIX-3
+    /// checks in place) lets the request reach the decoder unmodified; since
+    /// `generate_multimodal_f16`'s own injection loop keys off the request's
+    /// (not the checkpoint's) `image_token_id`, the run completes with `Ok`,
+    /// flipping this `expect_err` to a failing assertion.
+    #[test]
+    fn generate_multimodal_f16_rejects_mismatched_image_token_id() {
+        use crate::vision::multimodal::Qwen35VisionRequest;
+        use crate::vision::qwen35_vit::GridThw;
+
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        assert_eq!(cfg.image_token_id, Some(3));
+
+        // Internally consistent (validate() passes): pad id 2, matching grid/rows,
+        // but 2 != the checkpoint's image_token_id (3).
+        let request = Qwen35VisionRequest {
+            input_ids: vec![0, 2, 2, 2, 2, 1],
+            image_grids: vec![GridThw { t: 1, h: 4, w: 4 }],
+            post_merger_rows: vec![0.1f32; 4 * cfg.hidden_size],
+            image_token_id: 2,
+            spatial_merge_size: 2,
+            decoder_hidden_size: cfg.hidden_size,
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        let err = generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg)
+            .expect_err("mismatched image_token_id must be rejected, not silently run");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("image_token_id"),
+            "error must name image_token_id; got: {msg}"
+        );
+    }
+
+    /// codex r1 major 3: a request whose `spatial_merge_size` does not match the
+    /// checkpoint's `vision_config.spatial_merge_size` must be rejected up front.
+    /// Mutation check: removing just this guard branch lets an internally
+    /// consistent (but checkpoint-mismatched) request run to completion (`Ok`),
+    /// since nothing downstream re-derives merge size from `cfg.vision_config`.
+    #[test]
+    fn generate_multimodal_f16_rejects_mismatched_spatial_merge_size() {
+        use crate::vision::multimodal::Qwen35VisionRequest;
+        use crate::vision::qwen35_vit::GridThw;
+
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        assert_eq!(cfg.vision_config.as_ref().unwrap().spatial_merge_size, 2);
+
+        // merge_size=1 (checkpoint says 2): 1*4*4/1^2 = 16 post-merger rows,
+        // internally consistent with the request's own spatial_merge_size.
+        let mut input_ids = vec![0u32];
+        input_ids.extend(std::iter::repeat_n(3u32, 16));
+        input_ids.push(1);
+        let request = Qwen35VisionRequest {
+            input_ids,
+            image_grids: vec![GridThw { t: 1, h: 4, w: 4 }],
+            post_merger_rows: vec![0.1f32; 16 * cfg.hidden_size],
+            image_token_id: 3,
+            spatial_merge_size: 1,
+            decoder_hidden_size: cfg.hidden_size,
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        let err = generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg)
+            .expect_err("mismatched spatial_merge_size must be rejected, not silently run");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("spatial_merge_size"),
+            "error must name spatial_merge_size; got: {msg}"
+        );
+    }
+
+    /// codex r1 major 3: a request whose `decoder_hidden_size` does not match
+    /// the checkpoint's `hidden_size` must be rejected up front by name, before
+    /// image slots are selected -- not only by the unrelated, later
+    /// `forward_step_f16` injected-row-length guard that happens to catch this
+    /// specific case too. Asserting the error text names `decoder_hidden_size`
+    /// keeps this test sensitive to *this* guard specifically.
+    /// Mutation check: removing just this guard branch still leaves the request
+    /// failing (via `forward_step_f16`'s unrelated length check deep in the
+    /// prefill loop), but the error text no longer mentions
+    /// `decoder_hidden_size` -- flipping the `contains` assertion to failing.
+    #[test]
+    fn generate_multimodal_f16_rejects_mismatched_decoder_hidden_size() {
+        use crate::vision::multimodal::Qwen35VisionRequest;
+        use crate::vision::qwen35_vit::GridThw;
+
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        assert_eq!(cfg.hidden_size, 8);
+
+        // decoder_hidden_size=4 (checkpoint hidden_size is 8): internally
+        // consistent request (post_merger_rows sized to 4 rows * 4), but wrong
+        // against this checkpoint.
+        let request = Qwen35VisionRequest {
+            input_ids: vec![0, 3, 3, 3, 3, 1],
+            image_grids: vec![GridThw { t: 1, h: 4, w: 4 }],
+            post_merger_rows: vec![0.1f32; 4 * 4],
+            image_token_id: 3,
+            spatial_merge_size: 2,
+            decoder_hidden_size: 4,
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        let err = generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg)
+            .expect_err("mismatched decoder_hidden_size must be rejected, not silently run");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("decoder_hidden_size"),
+            "error must name decoder_hidden_size (not just the unrelated downstream \
+             injected-row-length message); got: {msg}"
+        );
+    }
+
+    /// codex r1 major 4: the M-RoPE table builder resolves
+    /// `partial_rotary_factor` from `cfg.rope_parameters`, while the attention
+    /// loop derives its rotary half-width from the separately public
+    /// `cfg.rope_dim()` (`cfg.partial_rotary_factor`). A constructible config
+    /// where these diverge (`head_dim=256`, `cfg.partial_rotary_factor=0.5` ->
+    /// decoder half=64, but `rope_parameters.partial_rotary_factor=Some(0.25)`
+    /// with section `[11,11,10]` -> table half=32) must fail closed here, before
+    /// the first forward pass indexes `cos_row[32]`/`sin_row[32]` past the
+    /// table's actual 32-lane row and panics.
+    /// Mutation check: removing the guard lets `full_attention_step_f16` index
+    /// the 32-lane row at `half=64`, panicking mid-attention instead of
+    /// returning the clean `InvalidInput` this test expects.
+    #[test]
+    fn generate_multimodal_f16_rejects_mismatched_mrope_row_width() {
+        use crate::model::qwen35_config::RopeParams;
+        use crate::vision::multimodal::Qwen35VisionRequest;
+
+        let (mut cfg, weights) = tiny_vision_splice_model();
+        cfg.head_dim = 256;
+        cfg.partial_rotary_factor = 0.5; // decoder rotary half = 64
+        cfg.rope_parameters = Some(RopeParams {
+            rope_theta: 1.0e7,
+            partial_rotary_factor: Some(0.25), // table half = 32 (diverges from 64)
+            mrope_section: Some(vec![11, 11, 10]),
+            mrope_interleaved: Some(true),
+        });
+
+        // Text-only request: no image, so this exercises the guard on the
+        // prefill table path alone (the decode-time sibling guard covers the
+        // per-token `build_decode_cos_sin` path independently).
+        let request = Qwen35VisionRequest {
+            input_ids: vec![0, 1, 2],
+            image_grids: vec![],
+            post_merger_rows: vec![],
+            image_token_id: 3,
+            spatial_merge_size: 2,
+            decoder_hidden_size: cfg.hidden_size,
+        };
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+        let err = generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg).expect_err(
+            "a config whose rope_parameters and rope_dim() disagree on rotary width must be \
+             rejected, not panic at attention-lane indexing",
+        );
+        assert!(
+            matches!(err, crate::error::InferenceError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
         );
     }
 }
