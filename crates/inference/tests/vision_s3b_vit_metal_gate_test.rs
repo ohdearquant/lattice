@@ -46,7 +46,9 @@ mod gated {
         Qwen35VisionWeights, VisualBlockWeights, VisualMergerWeights,
     };
     use lattice_inference::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
-    use lattice_inference::vision::qwen35_vit_metal::qwen35_vit_forward_metal;
+    use lattice_inference::vision::qwen35_vit_metal::{
+        metal_dispatch_count, qwen35_vit_forward_metal, reset_metal_dispatch_count,
+    };
 
     fn fixture_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -205,8 +207,24 @@ mod gated {
         buf
     }
 
+    /// Number of `gemm_bt`/`gemm_nn` calls one `qwen35_vit_forward_metal` call
+    /// makes at this config: 1 patch-embed + per block (1 qkv + 2 per
+    /// attention head [`Q@K^T` then `scores@V`] + 1 output proj + 1 fc1 + 1
+    /// fc2). Every one of these shapes clears the Metal GEMM dispatch
+    /// threshold at the real S3b geometry (see module docs), so on a real
+    /// Metal device every call here must land on the GPU, not the CPU
+    /// fallback branch — that is exactly what the dispatch-count assertion
+    /// below proves cosine parity alone cannot.
+    fn expected_dispatch_count(cfg: &VisionModelConfig) -> u64 {
+        let per_block = 4 + 2 * cfg.num_heads;
+        (1 + cfg.depth * per_block) as u64
+    }
+
     /// The S3b gate: Metal forward vs S3a CPU reference forward, same
-    /// synthetic weights + committed golden image, cosine > 0.999.
+    /// synthetic weights + committed golden image, cosine > 0.999 — plus a
+    /// dispatch-count proof that every forward GEMM actually ran on the GPU
+    /// rather than silently taking the (mathematically identical) CPU
+    /// fallback branch in `gemm_bt`/`gemm_nn`.
     #[test]
     fn metal_vit_forward_matches_cpu_reference_cosine_gt_0999() {
         let _gpu = gpu_test_lock();
@@ -223,10 +241,24 @@ mod gated {
             preprocess_qwen35_image(&image_bytes, &cfg).expect("preprocess golden image");
         assert_eq!(grid.num_patches(), 256);
 
+        let expected_dispatches = expected_dispatch_count(&cfg);
+
         let cpu_out =
             qwen35_vit_forward(&weights, &cfg, &pixel_values, grid).expect("cpu reference forward");
+
+        reset_metal_dispatch_count();
         let metal_out =
             qwen35_vit_forward_metal(&weights, &cfg, &pixel_values, grid).expect("metal forward");
+        let dispatches = metal_dispatch_count();
+        eprintln!(
+            "LATTICE_VISION_S3B_METAL_DISPATCHES count={dispatches} expected={expected_dispatches}"
+        );
+        assert_eq!(
+            dispatches, expected_dispatches,
+            "ADR-069 S3b gate failed: only {dispatches}/{expected_dispatches} forward GEMMs \
+             dispatched to Metal — the rest silently took the CPU fallback branch, which cosine \
+             parity alone cannot detect"
+        );
 
         assert_eq!(cpu_out.len(), metal_out.len());
         assert!(metal_out.iter().all(|v| v.is_finite()));
@@ -241,13 +273,28 @@ mod gated {
 
         // Mutation-sensitivity proof (CLAUDE.md "Regression Tests Must Be
         // Mutation-Sensitive"): perturbing a single Metal-path-visible weight
-        // must drop the gate below threshold.
+        // must drop the gate below threshold. Dispatch accounting runs here
+        // too, so a future change that breaks GPU dispatch specifically for
+        // the mutated-weight path (rather than the baseline path) is also
+        // caught.
         let mut mutated = weights.clone();
         for w in mutated.blocks[0].qkv_weight.iter_mut() {
             *w *= -1.0;
         }
+        reset_metal_dispatch_count();
         let mutated_metal_out = qwen35_vit_forward_metal(&mutated, &cfg, &pixel_values, grid)
             .expect("mutated metal forward");
+        let mutated_dispatches = metal_dispatch_count();
+        eprintln!(
+            "LATTICE_VISION_S3B_METAL_DISPATCHES count={mutated_dispatches} \
+             expected={expected_dispatches}"
+        );
+        assert_eq!(
+            mutated_dispatches, expected_dispatches,
+            "mutation-branch dispatch accounting failed: only \
+             {mutated_dispatches}/{expected_dispatches} forward GEMMs dispatched to Metal"
+        );
+
         let mutated_cos = cosine_similarity(&cpu_out, &mutated_metal_out);
         eprintln!("LATTICE_VISION_S3B_MUTATION_COSINE cosine={mutated_cos:.8}");
         assert!(

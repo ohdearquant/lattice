@@ -49,6 +49,32 @@ mod gpu {
     use super::super::vit::{gelu, layer_norm, softmax_inplace};
     use crate::forward::metal_gemm::{metal_matmul, metal_matmul_bt};
     use crate::model::qwen35_config::VisionModelConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Test-only diagnostic (issue: S3b gate review — cosine parity alone
+    /// can't distinguish "every GEMM ran on Metal" from "every GEMM silently
+    /// fell back to the CPU loop below", since the fallback is exact). Counts
+    /// GEMM calls that actually dispatched to the GPU (`metal_matmul`/
+    /// `metal_matmul_bt` returned `true`), not calls that took the CPU
+    /// fallback branch. Global by design, mirroring the opt-in
+    /// `PathProofCounters` pattern in `forward/metal_qwen35.rs` (issue #239),
+    /// scoped down to a single atomic since this module has one dispatch
+    /// pair (`gemm_bt`/`gemm_nn`) rather than many distinct kernels. Read via
+    /// [`metal_dispatch_count`] / zeroed via [`reset_metal_dispatch_count`];
+    /// see `tests/vision_s3b_vit_metal_gate_test.rs`.
+    static METAL_DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Returns the number of Metal GEMM calls dispatched to the GPU (as
+    /// opposed to the CPU fallback branch) since the last
+    /// [`reset_metal_dispatch_count`] call. Test-only diagnostic.
+    pub fn metal_dispatch_count() -> u64 {
+        METAL_DISPATCH_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Resets the Metal GEMM dispatch counter to zero. Test-only diagnostic.
+    pub fn reset_metal_dispatch_count() {
+        METAL_DISPATCH_COUNT.store(0, Ordering::Relaxed);
+    }
 
     /// `C[m, n] = A[m, k] @ B[n, k]^T`, dispatched to Metal when the codebase's
     /// existing `metal_matmul_bt` accepts the shape (real ViT geometry always
@@ -59,7 +85,9 @@ mod gpu {
     /// `[n, k]` row-major, i.e. PyTorch `nn.Linear` layout).
     fn gemm_bt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
-        if !metal_matmul_bt(a, b, &mut c, m, k, n) {
+        if metal_matmul_bt(a, b, &mut c, m, k, n) {
+            METAL_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else {
             for i in 0..m {
                 let ai = &a[i * k..(i + 1) * k];
                 for j in 0..n {
@@ -76,10 +104,12 @@ mod gpu {
     }
 
     /// `C[m, n] = A[m, k] @ B[k, n]`, dispatched to Metal via `metal_matmul`;
-    /// same CPU-fallback contract as [`gemm_bt`].
+    /// same CPU-fallback contract and dispatch-counting as [`gemm_bt`].
     fn gemm_nn(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
-        if !metal_matmul(a, b, &mut c, m, k, n) {
+        if metal_matmul(a, b, &mut c, m, k, n) {
+            METAL_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else {
             for i in 0..m {
                 let ai = &a[i * k..(i + 1) * k];
                 for j in 0..n {
@@ -271,6 +301,10 @@ mod gpu {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use gpu::qwen35_vit_forward_metal;
+
+/// Test-only diagnostic re-exports — see [`gpu::metal_dispatch_count`] docs.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub use gpu::{metal_dispatch_count, reset_metal_dispatch_count};
 
 /// Stub for builds without the `metal-gpu` feature (or off macOS): returns a
 /// clear error instead of silently running a CPU-only re-implementation, so
