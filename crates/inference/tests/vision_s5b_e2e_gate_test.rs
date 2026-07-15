@@ -218,31 +218,104 @@ fn resolve_safetensors_path(model_dir: &Path) -> PathBuf {
     if plain.exists() {
         return plain;
     }
-    let index_path = model_dir.join("model.safetensors.index.json");
-    let bytes = std::fs::read(&index_path).unwrap_or_else(|e| {
+    // Reuse the production strict index parser so this gate rejects exactly what
+    // `Qwen35Model::from_safetensors` would. A loose `serde_json::Value` parse
+    // silently drops a non-string shard value and keeps only the last of a
+    // duplicated tensor-name key, so a malformed index could resolve to a shard
+    // the runtime loader refuses — a fail-open the gate must not have.
+    let index = lattice_inference::weights::parse_index(model_dir).unwrap_or_else(|e| {
         panic!(
-            "no model.safetensors in {} and cannot read {}: {e}",
-            model_dir.display(),
-            index_path.display()
+            "no model.safetensors in {} and no valid model.safetensors.index.json: {e}",
+            model_dir.display()
         )
     });
-    let index: serde_json::Value =
-        serde_json::from_slice(&bytes).expect("parsing model.safetensors.index.json");
-    let mut shards: Vec<&str> = index["weight_map"]
-        .as_object()
-        .expect("model.safetensors.index.json has a weight_map object")
-        .values()
-        .filter_map(|v| v.as_str())
-        .collect();
+    let mut shards: Vec<&str> = index.weight_map.values().map(String::as_str).collect();
     shards.sort_unstable();
     shards.dedup();
     match shards.as_slice() {
         [one] => model_dir.join(one),
-        [] => panic!("empty weight_map in {}", index_path.display()),
+        [] => panic!(
+            "empty weight_map in {}",
+            model_dir.join("model.safetensors.index.json").display()
+        ),
         _ => panic!(
             "multi-shard checkpoint ({} shards) is not supported by this single-file gate",
             shards.len()
         ),
+    }
+}
+
+/// Strictness guards for `resolve_safetensors_path`: it must reject the malformed
+/// indexes the runtime loader rejects, not silently accept them. Mutation-sensitive
+/// against the prior loose `serde_json::Value` + `filter_map(as_str)` parse, which
+/// dropped non-string values and collapsed duplicate keys. No checkpoint needed —
+/// each case writes a tiny index into a temp dir.
+#[cfg(feature = "f16")]
+mod resolver_strictness_tests {
+    use super::resolve_safetensors_path;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    fn write_index(dir: &Path, body: &str) {
+        std::fs::create_dir_all(dir).expect("create temp model dir");
+        let mut f =
+            std::fs::File::create(dir.join("model.safetensors.index.json")).expect("create index");
+        f.write_all(body.as_bytes()).expect("write index");
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("lv_s5b_resolver_{tag}"));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn resolve_result(dir: &Path) -> Result<PathBuf, Box<dyn std::any::Any + Send>> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resolve_safetensors_path(dir)
+        }))
+    }
+
+    #[test]
+    fn rejects_non_string_shard_value() {
+        let dir = tmp_dir("nonstring");
+        write_index(
+            &dir,
+            r#"{"weight_map":{"a":"model.safetensors-00001-of-00001.safetensors","b":123}}"#,
+        );
+        let r = resolve_result(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            r.is_err(),
+            "a non-string shard value must be rejected, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_key() {
+        let dir = tmp_dir("dupkey");
+        write_index(
+            &dir,
+            r#"{"weight_map":{"a":"s1.safetensors","a":"s2.safetensors"}}"#,
+        );
+        let r = resolve_result(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            r.is_err(),
+            "a duplicate tensor-name key must be rejected, not collapsed to the last value"
+        );
+    }
+
+    #[test]
+    fn accepts_single_shard_index() {
+        let dir = tmp_dir("single");
+        write_index(
+            &dir,
+            r#"{"weight_map":{"a":"only.safetensors","b":"only.safetensors"}}"#,
+        );
+        let p = resolve_safetensors_path(&dir);
+        let expected = dir.join("only.safetensors");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(p, expected);
     }
 }
 
