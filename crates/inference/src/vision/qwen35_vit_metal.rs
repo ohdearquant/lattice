@@ -49,6 +49,7 @@ mod gpu {
     use super::super::vit::{gelu, layer_norm, softmax_inplace};
     use crate::forward::metal_gemm::{metal_matmul, metal_matmul_bt};
     use crate::model::qwen35_config::VisionModelConfig;
+    #[cfg(feature = "test-utils")]
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Test-only diagnostic (issue: S3b gate review — cosine parity alone
@@ -56,22 +57,29 @@ mod gpu {
     /// fell back to the CPU loop below", since the fallback is exact). Counts
     /// GEMM calls that actually dispatched to the GPU (`metal_matmul`/
     /// `metal_matmul_bt` returned `true`), not calls that took the CPU
-    /// fallback branch. Global by design, mirroring the opt-in
-    /// `PathProofCounters` pattern in `forward/metal_qwen35.rs` (issue #239),
-    /// scoped down to a single atomic since this module has one dispatch
-    /// pair (`gemm_bt`/`gemm_nn`) rather than many distinct kernels. Read via
+    /// fallback branch. Compiled only under the non-default `test-utils`
+    /// feature (see `Cargo.toml`), so the normal production `metal-gpu` build
+    /// carries neither the storage nor the `fetch_add` at each dispatch site
+    /// — unlike the opt-in-flag `PathProofCounters` pattern in
+    /// `forward/metal_qwen35.rs` (issue #239), which stays compiled in and
+    /// gates the atomic op behind a runtime check instead. Read via
     /// [`metal_dispatch_count`] / zeroed via [`reset_metal_dispatch_count`];
     /// see `tests/vision_s3b_vit_metal_gate_test.rs`.
+    #[cfg(feature = "test-utils")]
     static METAL_DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
 
     /// Returns the number of Metal GEMM calls dispatched to the GPU (as
     /// opposed to the CPU fallback branch) since the last
-    /// [`reset_metal_dispatch_count`] call. Test-only diagnostic.
+    /// [`reset_metal_dispatch_count`] call. Test-only diagnostic, compiled
+    /// only under the `test-utils` feature.
+    #[cfg(feature = "test-utils")]
     pub fn metal_dispatch_count() -> u64 {
         METAL_DISPATCH_COUNT.load(Ordering::Relaxed)
     }
 
-    /// Resets the Metal GEMM dispatch counter to zero. Test-only diagnostic.
+    /// Resets the Metal GEMM dispatch counter to zero. Test-only diagnostic,
+    /// compiled only under the `test-utils` feature.
+    #[cfg(feature = "test-utils")]
     pub fn reset_metal_dispatch_count() {
         METAL_DISPATCH_COUNT.store(0, Ordering::Relaxed);
     }
@@ -86,6 +94,7 @@ mod gpu {
     fn gemm_bt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
         if metal_matmul_bt(a, b, &mut c, m, k, n) {
+            #[cfg(feature = "test-utils")]
             METAL_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         } else {
             for i in 0..m {
@@ -108,6 +117,7 @@ mod gpu {
     fn gemm_nn(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
         if metal_matmul(a, b, &mut c, m, k, n) {
+            #[cfg(feature = "test-utils")]
             METAL_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         } else {
             for i in 0..m {
@@ -303,7 +313,9 @@ mod gpu {
 pub use gpu::qwen35_vit_forward_metal;
 
 /// Test-only diagnostic re-exports — see [`gpu::metal_dispatch_count`] docs.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+/// Gated on `test-utils` in addition to `metal-gpu` so the normal production
+/// build carries neither the counter storage nor its `fetch_add` sites.
+#[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "test-utils"))]
 pub use gpu::{metal_dispatch_count, reset_metal_dispatch_count};
 
 /// Stub for builds without the `metal-gpu` feature (or off macOS): returns a

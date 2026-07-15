@@ -28,7 +28,17 @@
 //! `bin/bench_gdn_prefill_ab.rs`) before any Metal work, and runs
 //! `--test-threads=1`-safe (each test acquires its own lock instance).
 //!
-//! Run:
+//! The dispatch-count proof (see `expected_dispatch_count`/
+//! `assert_dispatch_count` below) is only compiled in under the non-default
+//! `test-utils` feature, since the counter it reads is itself feature-gated
+//! out of the production `metal-gpu` library build. Run the full gate
+//! (cosine + dispatch-count) with:
+//! ```bash
+//! cargo test --release -p lattice-inference --features f16,metal-gpu,test-utils \
+//!     --test vision_s3b_vit_metal_gate_test -- --nocapture --test-threads=1
+//! ```
+//! Without `test-utils`, the same command still compiles and runs the cosine
+//! gate, just without the dispatch-count assertion:
 //! ```bash
 //! cargo test --release -p lattice-inference --features f16,metal-gpu \
 //!     --test vision_s3b_vit_metal_gate_test -- --nocapture --test-threads=1
@@ -46,8 +56,10 @@ mod gated {
         Qwen35VisionWeights, VisualBlockWeights, VisualMergerWeights,
     };
     use lattice_inference::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
+    use lattice_inference::vision::qwen35_vit_metal::qwen35_vit_forward_metal;
+    #[cfg(feature = "test-utils")]
     use lattice_inference::vision::qwen35_vit_metal::{
-        metal_dispatch_count, qwen35_vit_forward_metal, reset_metal_dispatch_count,
+        metal_dispatch_count, reset_metal_dispatch_count,
     };
 
     fn fixture_dir() -> std::path::PathBuf {
@@ -220,6 +232,35 @@ mod gated {
         (1 + cfg.depth * per_block) as u64
     }
 
+    /// Dispatch-count accounting is only compiled into the library under the
+    /// non-default `test-utils` feature (review follow-up: the counter must
+    /// not run in a normal production `metal-gpu` build). These helpers make
+    /// that opt-in a no-op here too, so `cargo test --features f16,metal-gpu`
+    /// (without `test-utils`) still compiles and runs the cosine gate below,
+    /// just without the dispatch-count proof.
+    #[cfg(feature = "test-utils")]
+    fn reset_dispatch_count() {
+        reset_metal_dispatch_count();
+    }
+
+    #[cfg(not(feature = "test-utils"))]
+    fn reset_dispatch_count() {}
+
+    #[cfg(feature = "test-utils")]
+    fn assert_dispatch_count(expected: u64) {
+        let dispatches = metal_dispatch_count();
+        eprintln!("LATTICE_VISION_S3B_METAL_DISPATCHES count={dispatches} expected={expected}");
+        assert_eq!(
+            dispatches, expected,
+            "ADR-069 S3b gate failed: only {dispatches}/{expected} forward GEMMs dispatched to \
+             Metal — the rest silently took the CPU fallback branch, which cosine parity alone \
+             cannot detect"
+        );
+    }
+
+    #[cfg(not(feature = "test-utils"))]
+    fn assert_dispatch_count(_expected: u64) {}
+
     /// The S3b gate: Metal forward vs S3a CPU reference forward, same
     /// synthetic weights + committed golden image, cosine > 0.999 — plus a
     /// dispatch-count proof that every forward GEMM actually ran on the GPU
@@ -246,19 +287,10 @@ mod gated {
         let cpu_out =
             qwen35_vit_forward(&weights, &cfg, &pixel_values, grid).expect("cpu reference forward");
 
-        reset_metal_dispatch_count();
+        reset_dispatch_count();
         let metal_out =
             qwen35_vit_forward_metal(&weights, &cfg, &pixel_values, grid).expect("metal forward");
-        let dispatches = metal_dispatch_count();
-        eprintln!(
-            "LATTICE_VISION_S3B_METAL_DISPATCHES count={dispatches} expected={expected_dispatches}"
-        );
-        assert_eq!(
-            dispatches, expected_dispatches,
-            "ADR-069 S3b gate failed: only {dispatches}/{expected_dispatches} forward GEMMs \
-             dispatched to Metal — the rest silently took the CPU fallback branch, which cosine \
-             parity alone cannot detect"
-        );
+        assert_dispatch_count(expected_dispatches);
 
         assert_eq!(cpu_out.len(), metal_out.len());
         assert!(metal_out.iter().all(|v| v.is_finite()));
@@ -281,19 +313,10 @@ mod gated {
         for w in mutated.blocks[0].qkv_weight.iter_mut() {
             *w *= -1.0;
         }
-        reset_metal_dispatch_count();
+        reset_dispatch_count();
         let mutated_metal_out = qwen35_vit_forward_metal(&mutated, &cfg, &pixel_values, grid)
             .expect("mutated metal forward");
-        let mutated_dispatches = metal_dispatch_count();
-        eprintln!(
-            "LATTICE_VISION_S3B_METAL_DISPATCHES count={mutated_dispatches} \
-             expected={expected_dispatches}"
-        );
-        assert_eq!(
-            mutated_dispatches, expected_dispatches,
-            "mutation-branch dispatch accounting failed: only \
-             {mutated_dispatches}/{expected_dispatches} forward GEMMs dispatched to Metal"
-        );
+        assert_dispatch_count(expected_dispatches);
 
         let mutated_cos = cosine_similarity(&cpu_out, &mutated_metal_out);
         eprintln!("LATTICE_VISION_S3B_MUTATION_COSINE cosine={mutated_cos:.8}");
