@@ -182,6 +182,22 @@ pub fn build_cos_sin(
         )));
     }
 
+    // The cyclic T,H,W,T,H,W,... lane schedule below assigns axis `a` exactly
+    // ceil((rope_half - a) / 3) lanes. Only sections matching those counts
+    // (e.g. [11,11,10] for rope_half=32) have been verified against the
+    // reference; any other split would silently rotate lanes with the wrong
+    // axis, so reject it rather than guess.
+    for (axis, &count) in mrope_section.iter().enumerate() {
+        let cyclic_count = (0..rope_half).filter(|i| i % 3 == axis).count();
+        if count != cyclic_count {
+            return Err(InferenceError::InvalidInput(format!(
+                "mrope_section {mrope_section:?} does not match the interleaved \
+                 cyclic schedule for rope_half={rope_half} (axis {axis}: got {count}, \
+                 cyclic schedule assigns {cyclic_count}); this split is unverified"
+            )));
+        }
+    }
+
     let inv_freq: Vec<f32> = (0..rope_half)
         .map(|i| theta.powf(-2.0 * i as f32 / rope_dim as f32))
         .collect();
@@ -452,6 +468,20 @@ mod tests {
             rope_delta: 0,
         };
         let err = build_cos_sin(&positions, 256, 0.25, 1e7, &[10, 10, 10]).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn rejects_mrope_section_not_matching_cyclic_schedule() {
+        // Sums to rope_half=32 but is not the cyclic schedule's [11,11,10]
+        // split; must fail closed rather than rotate lanes with wrong axes.
+        let positions = MRopePositions {
+            positions: vec![(0, 0, 0)],
+            rope_delta: 0,
+        };
+        let err = build_cos_sin(&positions, 256, 0.25, 1e7, &[20, 6, 6]).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+        let err = build_cos_sin(&positions, 256, 0.25, 1e7, &[10, 11, 11]).unwrap_err();
         assert!(matches!(err, InferenceError::InvalidInput(_)));
     }
 
