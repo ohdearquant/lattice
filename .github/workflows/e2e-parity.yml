@@ -563,6 +563,85 @@ jobs:
             --features "f16,metal-gpu" \
             -- --nocapture
 
+  # ADR-069 S3a required gate: real Qwen3.5-0.8B ViT forward (CPU reference)
+  # vs the committed HF differential golden (cosine > 0.999). Closes the gap
+  # a static review found: the checkpoint-gated test only ran locally, never
+  # in CI, so a patch-fold/RoPE/normalization/activation regression could
+  # land while every required check stayed green (skip-as-green gate
+  # failure). LATTICE_VISION_S3_GATE_ENFORCE=1 makes the test panic (not
+  # skip) if the model dir is missing or invalid — same fail-closed shape as
+  # embed-drift and q4-composed. `set -o pipefail` keeps the `tee` capture
+  # from masking a non-zero `cargo test` exit; the grep assertions below
+  # additionally prove the real numerical path executed (not just that the
+  # process exited 0), so a future control-flow change that turns the
+  # computation into an early return cannot silently pass this job.
+  #
+  # S3a is the CPU-reference stage (this PR); S3b (Metal port vs this CPU
+  # reference under the GPU lock) is a separate fast-follow gate.
+  #
+  # NOTE: once this job has gone green on CI once, add "vision-s3-gate" to
+  # the repository's required status checks alongside embed-drift and
+  # q4-composed. That governance step is intentionally not automated here.
+  vision-s3-gate:
+    name: vision S3a cosine gate
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: e2e-pip-${{ runner.os }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-v1
+
+      - name: Install Python deps
+        run: pip install "huggingface_hub==1.20.1"
+
+      - name: Download Qwen3.5-0.8B weights
+        run: |
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
+          "
+
+      - name: Setup lattice model dir
+        run: |
+          MODEL_CACHE=$(python3 -c "
+          from huggingface_hub import snapshot_download
+          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          ")
+          mkdir -p ~/.lattice/models
+          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: vision-s3-gate
+
+      - name: Run S3a cosine gate (fail-closed)
+        env:
+          LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
+          LATTICE_VISION_S3_GATE_ENFORCE: '1'
+        run: |
+          set -o pipefail
+          cargo test --release -p lattice-inference --features f16 \
+            --test vision_s3_vit_forward_test -- --nocapture 2>&1 | tee vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S3_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S3_MUTATION_COSINE' vision-s3-gate.log
+
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
   # unlike q4-ppl-quality, whose PPL golden bootstraps on the runner — this has
@@ -702,11 +781,12 @@ jobs:
 
   # REQUIRED status check. Always runs, always reports. Passes when the engine
   # did not change (nothing to verify); mirrors the parity, embed-drift,
-  # wasm-parity, wasm-simd128-parity, q4-composed, ppl-gate-selftest, and
-  # q4-ppl-quality verdicts when it did. Fails closed if change-detection
-  # itself errored. metal-parity is deliberately excluded (informational — see
-  # its comment above). q4-ppl-quality is now armed (golden captured on run
-  # 28841919096) and gates the shipping Q4 tier for regressions.
+  # wasm-parity, wasm-simd128-parity, q4-composed, vision-s3-gate,
+  # ppl-gate-selftest, and q4-ppl-quality verdicts when it did. Fails closed
+  # if change-detection itself errored. metal-parity is deliberately excluded
+  # (informational — see its comment above). q4-ppl-quality is now armed
+  # (golden captured on run 28841919096) and gates the shipping Q4 tier for
+  # regressions.
   parity-gate:
     name: parity-gate
     needs:
@@ -717,6 +797,7 @@ jobs:
         wasm-parity,
         wasm-simd128-parity,
         q4-composed,
+        vision-s3-gate,
         ppl-gate-selftest,
         q4-ppl-quality,
       ]
@@ -732,9 +813,10 @@ jobs:
           WASM_RESULT="${{ needs.wasm-parity.result }}"
           WASM_SIMD128_RESULT="${{ needs.wasm-simd128-parity.result }}"
           Q4_RESULT="${{ needs.q4-composed.result }}"
+          VISION_S3_RESULT="${{ needs.vision-s3-gate.result }}"
           PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
           Q4PPL_RESULT="${{ needs.q4-ppl-quality.result }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -763,6 +845,10 @@ jobs:
             echo "::error::Engine changed and q4-composed golden did not succeed (result=$Q4_RESULT)."
             exit 1
           fi
+          if [ "$VISION_S3_RESULT" != "success" ]; then
+            echo "::error::Engine changed and vision S3a cosine gate did not succeed (result=$VISION_S3_RESULT)."
+            exit 1
+          fi
           if [ "$PPL_SELFTEST_RESULT" != "success" ]; then
             echo "::error::Engine changed and ppl-gate self-test did not succeed (result=$PPL_SELFTEST_RESULT)."
             exit 1
@@ -771,5 +857,5 @@ jobs:
             echo "::error::Engine changed and q4-ppl-quality regression gate did not succeed (result=$Q4PPL_RESULT)."
             exit 1
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, q4-composed, ppl-gate-selftest, and q4-ppl-quality all PASSED."
+          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, q4-composed, vision-s3-gate, ppl-gate-selftest, and q4-ppl-quality all PASSED."
           exit 0

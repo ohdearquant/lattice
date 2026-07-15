@@ -1,5 +1,7 @@
-//! ADR-069 S3 gate: real Qwen3.5-0.8B ViT forward pass vs the committed HF
-//! differential golden (cosine > 0.999 on the fixed golden image).
+//! ADR-069 S3a gate: real Qwen3.5-0.8B ViT forward pass (CPU reference) vs
+//! the committed HF differential golden (cosine > 0.999 on the fixed golden
+//! image). S3b (Metal port vs this CPU reference, under the machine GPU
+//! lock) is a separate fast-follow gate.
 //!
 //! **Fail-closed contract** (mirrors `quarot_q4_composed_golden.rs`): with
 //! `LATTICE_VISION_S3_MODEL_DIR` unset or pointing at a missing path, this
@@ -116,7 +118,7 @@ fn require_env_model_dir() -> Option<PathBuf> {
             } else if enforce() {
                 panic!(
                     "{VAR}={} does not exist, and LATTICE_VISION_S3_GATE_ENFORCE=1 — \
-                     the S3 ViT gate must fail closed on a missing checkpoint",
+                     the S3a ViT gate must fail closed on a missing checkpoint",
                     path.display()
                 );
             } else {
@@ -195,7 +197,7 @@ fn run_s3_gate(model_dir: &Path) {
     eprintln!("LATTICE_VISION_S3_COSINE cosine={cos:.8}");
     assert!(
         cos > 0.999,
-        "ADR-069 S3 gate failed: cosine similarity {cos} vs committed golden must exceed 0.999"
+        "ADR-069 S3a gate failed: cosine similarity {cos} vs committed golden must exceed 0.999"
     );
 
     // Mutation-sensitivity proof (CLAUDE.md "Regression Tests Must Be
@@ -229,7 +231,7 @@ fn run_s3_gate(_model_dir: &Path) {
     eprintln!("LATTICE_VISION_S3_SKIPPED reason=f16_feature_disabled");
 }
 
-/// The S3 gate: real fp16 checkpoint -> `load_qwen35_vision_weights` ->
+/// The S3a gate: real fp16 checkpoint -> `load_qwen35_vision_weights` ->
 /// `qwen35_vit_forward` -> cosine > 0.999 vs the committed HF golden.
 #[test]
 fn qwen35_vit_forward_matches_hf_golden_cosine_gt_0999() {

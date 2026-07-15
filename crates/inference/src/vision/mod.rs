@@ -1,6 +1,38 @@
-//! Vision encoder module for Qwen3-VL multimodal inference (ADR-049).
+//! Vision encoder module. Two independent vision paths live here — they do
+//! not share weights, config, or forward-pass code, and nothing in the tree
+//! bridges between them.
 //!
-//! ## Architecture
+//! ## The real path: Qwen3.5-0.8B (ADR-069, S1-S3a shipped)
+//!
+//! [`checkpoint::load_qwen35_vision_weights`] loads the real
+//! `model.visual.*` tensors (S1/S2); [`qwen35_vit::qwen35_vit_forward`] runs
+//! the depth-12/hidden-768 forward pass over them, producing pre-merger
+//! hidden states `[num_patches, hidden_size]` (S3a — CPU reference, gated at
+//! cosine > 0.999 vs a committed HF differential golden in
+//! `tests/vision_s3_vit_forward_test.rs`, wired as a required CI job). S3b
+//! (a Metal port verified against this CPU reference under the GPU lock) is
+//! the next fast-follow. S4 (spatial-merger + image-token expansion) and S5
+//! (decoder injection + M-RoPE) are unimplemented — **this is the path
+//! future vision work should build on.**
+//!
+//! ```text
+//! image bytes → preprocess_qwen35_image → qwen35_vit_forward
+//!   → [num_patches, hidden_size] pre-merger hidden states
+//!   (S4/S5 not yet implemented: no merger, no decoder injection)
+//! ```
+//!
+//! ## The inert scaffold: hypothetical Qwen3-VL 7B (ADR-049)
+//!
+//! [`vit::ViT`] + [`merger::MlpMerger`] + [`preprocess`] + [`VisionEncoder`]
+//! below implement a *different*, structurally incompatible forward pass
+//! (three separate Q/K/V projections with per-head RMSNorm, windowed
+//! attention, a from-scratch 2D RoPE, ImageNet normalization stats) for a
+//! 7B-parameter checkpoint shape that has never been loaded against real
+//! weights. Nothing in the tree calls `VisionEncoder::new` outside its own
+//! unit tests below. It is kept for a future 7B checkpoint if one is
+//! targeted; do not extend it to consume the Qwen3.5-0.8B checkpoint — the
+//! two attention/normalization conventions are incompatible (see
+//! `checkpoint.rs` and `qwen35_vit.rs` module docs for the specific deltas).
 //!
 //! ```text
 //! image bytes
@@ -12,14 +44,14 @@
 //!   → generate_multimodal (prepend visual to text embeddings → decode loop)
 //! ```
 //!
-//! ## v0 scope (per ADR-049)
+//! ### Scaffold v0 scope (per ADR-049)
 //!
 //! - Fixed resolution: 448×448, 16×16 patches, spatial_merge_size=2
 //! - Qwen3-VL only — no multi-family generalization
 //! - CPU-side ViT forward pass (Metal GPU path is a v1 item)
 //! - No dynamic resolution tiling, no multi-image inputs, no video
 //!
-//! ## Usage
+//! ### Scaffold usage
 //!
 //! ```no_run
 //! use lattice_inference::vision::{VisionEncoder, VisionConfig, MultimodalInput};

@@ -1,7 +1,8 @@
-//! Real Qwen3.5-0.8B ViT forward pass (ADR-069 S3): depth-12 / hidden-768
-//! encoder over the checkpoint's `model.visual.*` weights
-//! ([`super::checkpoint::Qwen35VisionWeights`]), producing the pre-merger
-//! hidden states `[num_patches, hidden_size]`.
+//! Real Qwen3.5-0.8B ViT forward pass (ADR-069 S3a — CPU reference; the
+//! Metal port is a separate S3b fast-follow gated against this module):
+//! depth-12 / hidden-768 encoder over the checkpoint's `model.visual.*`
+//! weights ([`super::checkpoint::Qwen35VisionWeights`]), producing the
+//! pre-merger hidden states `[num_patches, hidden_size]`.
 //!
 //! Deliberately independent from `vit.rs`'s ADR-049 7B-scaffold `ViT` (fused
 //! Q/K/V is a *single* `qkv` projection here vs. three separate ones there;
@@ -19,7 +20,7 @@
 //! `transformers.vision_utils.{get_vision_bilinear_indices_and_weights,
 //! get_vision_position_ids, get_vision_cu_seqlens}`) via a differential
 //! script run locally against the real `Qwen/Qwen3.5-0.8B` checkpoint before
-//! this module was written (ADR-069 S3; CLAUDE.md "Differential Test First").
+//! this module was written (ADR-069 S3a; CLAUDE.md "Differential Test First").
 //! The committed gate is `tests/vision_s3_vit_forward_test.rs`.
 
 use super::VisionError;
@@ -60,7 +61,7 @@ impl GridThw {
 /// temporal_patch_size * patch_size * patch_size]`, row-major over patches in
 /// block-major spatial-merge order (matching [`GridThw`] / the HF processor).
 ///
-/// Scope limitation (ADR-069 S3, matches the ADR's own "dynamic-resolution
+/// Scope limitation (ADR-069 S3a, matches the ADR's own "dynamic-resolution
 /// tiling" deferral): this does NOT implement the HF processor's
 /// `smart_resize` — it requires the input image's pixel dimensions to
 /// already be exact multiples of `patch_size * spatial_merge_size` (the
@@ -96,7 +97,7 @@ pub fn preprocess_qwen35_image(
     if !height.is_multiple_of(factor) || !width.is_multiple_of(factor) {
         return Err(VisionError::InvalidConfig(format!(
             "image {width}x{height} is not a multiple of patch_size*spatial_merge_size={factor} \
-             (dynamic resize is out of scope for ADR-069 S3)"
+             (dynamic resize is out of scope for ADR-069 S3a)"
         )));
     }
 
