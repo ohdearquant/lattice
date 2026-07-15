@@ -180,11 +180,14 @@ jobs:
   # for the long-prefill prompt, where Metal deterministically diverges from
   # HF at the first token (open issue #535). What this required job certifies
   # is therefore: Metal dispatch path-proof, binary health, and greedy token
-  # parity on every prompt EXCEPT the #535-waived one. Any NEW divergence on
-  # any prompt still fails closed. The waiver self-reports: if the waived
-  # prompt starts passing, the run prints XPASS and the entry gets deleted
-  # (see the METAL_EXPECTED_DIVERGENCE comment in the script). Do not read
-  # this gate as full Metal parity until #535 is fixed and the waiver removed.
+  # parity on every prompt EXCEPT the #535-waived one. Any divergence on any
+  # NON-WAIVED prompt fails closed; the waiver is keyed by prompt content, so
+  # the entire waived prompt — including a different or new divergence on it —
+  # stays green while the entry exists. The waiver self-reports: if the waived
+  # prompt starts passing, the run prints XPASS and instructs a maintainer to
+  # delete the entry (advisory — nothing removes it automatically; see the
+  # METAL_EXPECTED_DIVERGENCE comment in the script). Do not read this gate
+  # as full Metal parity until #535 is fixed and the waiver removed.
   #
   # e2e-parity
   # only ever exercised the CPU (qwen35_generate) path above; this job exists
