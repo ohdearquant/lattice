@@ -39,6 +39,7 @@ pub mod config;
 pub mod merger;
 pub mod multimodal;
 pub mod preprocess;
+pub mod qwen35_vit;
 pub mod vit;
 
 pub use config::VisionConfig;
