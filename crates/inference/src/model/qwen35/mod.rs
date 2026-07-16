@@ -10,7 +10,7 @@
 //! - GatedDeltaNet recurrent state for linear layers, KV cache for full layers
 
 mod cache;
-mod debug;
+pub(crate) mod debug;
 pub(crate) mod detokenize;
 mod eval;
 mod forward;

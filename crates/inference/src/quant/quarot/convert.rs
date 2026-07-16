@@ -2526,6 +2526,187 @@ mod tests {
         squared_error.sqrt() / squared_reference.sqrt().max(f64::MIN_POSITIVE)
     }
 
+    #[derive(Debug)]
+    struct Fp16GateMetrics {
+        mean_base_nll: f64,
+        mean_candidate_nll: f64,
+        nll_delta: f64,
+        ppl_delta: f64,
+        logits_rel_l2: f64,
+        logits_max_abs: f32,
+        first_mixer_residual_rel_l2: f64,
+        first_block_residual_rel_l2: f64,
+        later_residual_max_rel_l2: f64,
+        replay_max_abs: f32,
+        gdn_traces: Option<(
+            crate::model::qwen35::debug::GdnMixerTrace,
+            crate::model::qwen35::debug::GdnMixerTrace,
+        )>,
+    }
+
+    fn fp16_gate_metrics(
+        baseline: &crate::model::qwen35::Qwen35Model,
+        candidate: &crate::model::qwen35::Qwen35Model,
+        tokens: &[u32],
+        rotation: &RandomizedHadamard,
+        gdn_boundary_rotation: bool,
+    ) -> Result<Fp16GateMetrics, Box<dyn std::error::Error>> {
+        let mut base_nll = Vec::new();
+        let mut candidate_nll = Vec::new();
+        let mut logit_reference = Vec::new();
+        let mut logit_candidate = Vec::new();
+        let mut final_trace = None;
+
+        for prefix_len in 1..tokens.len() {
+            let base_trace = baseline.forward_prompt_residual_trace_debug(&tokens[..prefix_len])?;
+            let candidate_trace = if gdn_boundary_rotation {
+                candidate.forward_prompt_residual_trace_debug_with_gdn_boundary(
+                    &tokens[..prefix_len],
+                    Some(rotation),
+                )?
+            } else {
+                candidate.forward_prompt_residual_trace_debug(&tokens[..prefix_len])?
+            };
+            let base_logits = &base_trace.logits;
+            let candidate_logits = &candidate_trace.logits;
+            assert_eq!(base_logits.len(), candidate_logits.len());
+            base_nll.push(nll(base_logits, tokens[prefix_len]));
+            candidate_nll.push(nll(candidate_logits, tokens[prefix_len]));
+            logit_reference.extend_from_slice(base_logits);
+            logit_candidate.extend_from_slice(candidate_logits);
+            if prefix_len + 1 == tokens.len() {
+                final_trace = Some((base_trace, candidate_trace));
+            }
+        }
+
+        let (base_trace, candidate_trace) = final_trace.ok_or("missing final residual trace")?;
+        assert_eq!(
+            base_trace.mixer_residuals.len(),
+            candidate_trace.mixer_residuals.len()
+        );
+        assert_eq!(
+            base_trace.block_residuals.len(),
+            candidate_trace.block_residuals.len()
+        );
+
+        let mut aligned_mixer_trace = candidate_trace.mixer_residuals.clone();
+        for residual in &mut aligned_mixer_trace {
+            rotation.apply_inverse(residual)?;
+        }
+        let mut aligned_block_trace = candidate_trace.block_residuals.clone();
+        for residual in &mut aligned_block_trace {
+            rotation.apply_inverse(residual)?;
+        }
+
+        let mean_base_nll = base_nll.iter().sum::<f64>() / base_nll.len() as f64;
+        let mean_candidate_nll = candidate_nll.iter().sum::<f64>() / candidate_nll.len() as f64;
+        let nll_delta = mean_candidate_nll - mean_base_nll;
+        let ppl_delta = mean_candidate_nll.exp() - mean_base_nll.exp();
+        let logits_rel_l2 = rel_l2(&logit_reference, &logit_candidate);
+        let logits_max_abs = logit_reference
+            .iter()
+            .zip(&logit_candidate)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let first_mixer_residual_rel_l2 =
+            rel_l2(&base_trace.mixer_residuals[0], &aligned_mixer_trace[0]);
+        let first_block_residual_rel_l2 =
+            rel_l2(&base_trace.block_residuals[0], &aligned_block_trace[0]);
+        let later_residual_max_rel_l2 = base_trace
+            .mixer_residuals
+            .iter()
+            .zip(&aligned_mixer_trace)
+            .skip(1)
+            .map(|(base, aligned)| rel_l2(base, aligned))
+            .chain(
+                base_trace
+                    .block_residuals
+                    .iter()
+                    .zip(&aligned_block_trace)
+                    .skip(1)
+                    .map(|(base, aligned)| rel_l2(base, aligned)),
+            )
+            .fold(0.0_f64, f64::max);
+        let replay_logits = baseline
+            .forward_prompt_residual_trace_debug(&tokens[..tokens.len() - 1])?
+            .logits;
+        let replay_max_abs = replay_logits
+            .iter()
+            .zip(logit_reference.iter().rev().take(replay_logits.len()).rev())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        let gdn_traces = match (base_trace.gdn_layer0, candidate_trace.gdn_layer0) {
+            (Some(base), Some(candidate)) => Some((base, candidate)),
+            (None, None) => None,
+            _ => return Err("incomplete layer-0 GDN trace".into()),
+        };
+
+        Ok(Fp16GateMetrics {
+            mean_base_nll,
+            mean_candidate_nll,
+            nll_delta,
+            ppl_delta,
+            logits_rel_l2,
+            logits_max_abs,
+            first_mixer_residual_rel_l2,
+            first_block_residual_rel_l2,
+            later_residual_max_rel_l2,
+            replay_max_abs,
+            gdn_traces,
+        })
+    }
+
+    fn print_fp16_gate_metrics(label: &str, metrics: &Fp16GateMetrics) {
+        println!(
+            "{label} mean_nll_base={:.9} mean_nll_candidate={:.9} nll_delta={:.9}",
+            metrics.mean_base_nll, metrics.mean_candidate_nll, metrics.nll_delta
+        );
+        println!(
+            "{label} ppl_delta={:.9} logits_rel_l2={:.9e} logits_max_abs={:.9e}",
+            metrics.ppl_delta, metrics.logits_rel_l2, metrics.logits_max_abs
+        );
+        println!(
+            "{label} first_mixer_residual_rel_l2={:.9e} first_block_residual_rel_l2={:.9e} later_residual_max_rel_l2={:.9e} replay_max_abs={:.9e}",
+            metrics.first_mixer_residual_rel_l2,
+            metrics.first_block_residual_rel_l2,
+            metrics.later_residual_max_rel_l2,
+            metrics.replay_max_abs
+        );
+    }
+
+    fn print_gdn_trace_metrics(
+        base: &crate::model::qwen35::debug::GdnMixerTrace,
+        candidate: &crate::model::qwen35::debug::GdnMixerTrace,
+        rotation: &RandomizedHadamard,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for (name, reference, observed) in [
+            ("in_proj_q", &base.q, &candidate.q),
+            ("in_proj_k", &base.k, &candidate.k),
+            ("in_proj_v", &base.v, &candidate.v),
+            ("in_proj_z", &base.z, &candidate.z),
+            ("in_proj_a", &base.a, &candidate.a),
+            ("in_proj_b", &base.b, &candidate.b),
+            ("conv1d", &base.conv, &candidate.conv),
+            ("recurrent_state", &base.state, &candidate.state),
+            ("gated_into_out_proj", &base.gated, &candidate.gated),
+        ] {
+            println!(
+                "FP16_GDN_TRACE tensor={name} rel_l2={:.9e}",
+                rel_l2(reference, observed)
+            );
+        }
+
+        let unaligned = rel_l2(&base.out_proj, &candidate.out_proj);
+        let mut aligned = candidate.out_proj.clone();
+        rotation.apply_inverse(&mut aligned)?;
+        println!(
+            "FP16_GDN_TRACE tensor=post_out_proj rel_l2_unaligned={unaligned:.9e} rel_l2_aligned={:.9e}",
+            rel_l2(&base.out_proj, &aligned)
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires LATTICE_QUAROT_REAL_MODEL_DIR and writes two temporary F16 0.8B artifacts"]
     fn real_qwen35_fp16_rotation_gate() -> Result<(), Box<dyn std::error::Error>> {
@@ -2575,130 +2756,108 @@ mod tests {
             );
         }
 
+        let gdn_boundary_dir = output_root.join("rotated-gdn-boundary-diagnostic");
+        if !gdn_boundary_dir.exists() {
+            let mut gdn_boundary = rotated.clone();
+            for layer_i in 0..config.num_hidden_layers {
+                if config.is_full_attention(layer_i) {
+                    continue;
+                }
+                let prefix = format!("model.language_model.layers.{layer_i}");
+                for suffix in [
+                    "input_layernorm.weight",
+                    "linear_attn.in_proj_qkv.weight",
+                    "linear_attn.in_proj_z.weight",
+                    "linear_attn.in_proj_b.weight",
+                    "linear_attn.in_proj_a.weight",
+                    "linear_attn.A_log",
+                    "linear_attn.dt_bias",
+                    "linear_attn.conv1d.weight",
+                    "linear_attn.norm.weight",
+                    "linear_attn.out_proj.weight",
+                ] {
+                    let name = format!("{prefix}.{suffix}");
+                    let original_tensor = original
+                        .get(&name)
+                        .ok_or_else(|| format!("missing original GDN diagnostic tensor {name}"))?;
+                    gdn_boundary.insert(name, original_tensor.clone());
+                }
+            }
+            write_cpu_f16_gate_artifact(
+                &gdn_boundary_dir,
+                &gate_config,
+                &input_dir.join("tokenizer.json"),
+                &gdn_boundary,
+            )?;
+        } else {
+            assert!(
+                gdn_boundary_dir.join("model.safetensors").is_file(),
+                "FP16 GDN boundary diagnostic artifact is incomplete: {}",
+                gdn_boundary_dir.display()
+            );
+        }
+
         let baseline =
             crate::model::qwen35::Qwen35Model::from_safetensors(&output_root.join("baseline"))?;
         let candidate =
             crate::model::qwen35::Qwen35Model::from_safetensors(&output_root.join("rotated"))?;
+        let gdn_boundary_candidate =
+            crate::model::qwen35::Qwen35Model::from_safetensors(&gdn_boundary_dir)?;
         let tokenizer = BpeTokenizer::from_tokenizer_json(&input_dir.join("tokenizer.json"))?;
         let tokenized = tokenizer.tokenize(PROMPT);
         let tokens = tokenized.input_ids[..tokenized.real_length.min(8)].to_vec();
         assert!(tokens.len() >= 2, "FP16 gate prompt tokenized too short");
-        let mut base_nll = Vec::new();
-        let mut rotated_nll = Vec::new();
-        let mut logit_reference = Vec::new();
-        let mut logit_candidate = Vec::new();
-        let mut final_trace = None;
-
-        for prefix_len in 1..tokens.len() {
-            let base_trace = baseline.forward_prompt_residual_trace_debug(&tokens[..prefix_len])?;
-            let candidate_trace =
-                candidate.forward_prompt_residual_trace_debug(&tokens[..prefix_len])?;
-            let base_logits = &base_trace.logits;
-            let candidate_logits = &candidate_trace.logits;
-            assert_eq!(base_logits.len(), candidate_logits.len());
-            base_nll.push(nll(base_logits, tokens[prefix_len]));
-            rotated_nll.push(nll(candidate_logits, tokens[prefix_len]));
-            logit_reference.extend_from_slice(base_logits);
-            logit_candidate.extend_from_slice(candidate_logits);
-            if prefix_len + 1 == tokens.len() {
-                final_trace = Some((base_trace, candidate_trace));
-            }
-        }
-
-        let (base_trace, rotated_trace) = final_trace.ok_or("missing final residual trace")?;
-        assert_eq!(base_trace.mixer_residuals.len(), config.num_hidden_layers);
-        assert_eq!(
-            rotated_trace.mixer_residuals.len(),
-            config.num_hidden_layers
-        );
-        assert_eq!(base_trace.block_residuals.len(), config.num_hidden_layers);
-        assert_eq!(
-            rotated_trace.block_residuals.len(),
-            config.num_hidden_layers
-        );
-        let mut aligned_mixer_trace = Vec::with_capacity(rotated_trace.mixer_residuals.len());
-        for mut residual in rotated_trace.mixer_residuals {
-            rotation.apply_inverse(&mut residual)?;
-            aligned_mixer_trace.push(residual);
-        }
-        let mut aligned_block_trace = Vec::with_capacity(rotated_trace.block_residuals.len());
-        for mut residual in rotated_trace.block_residuals {
-            rotation.apply_inverse(&mut residual)?;
-            aligned_block_trace.push(residual);
-        }
-
-        let mean_base_nll = base_nll.iter().sum::<f64>() / base_nll.len() as f64;
-        let mean_rotated_nll = rotated_nll.iter().sum::<f64>() / rotated_nll.len() as f64;
-        let nll_delta = mean_rotated_nll - mean_base_nll;
-        let ppl_delta = mean_rotated_nll.exp() - mean_base_nll.exp();
-        let logits_rel_l2 = rel_l2(&logit_reference, &logit_candidate);
-        let logits_max_abs = logit_reference
-            .iter()
-            .zip(&logit_candidate)
-            .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
-        let first_mixer_residual_rel_l2 =
-            rel_l2(&base_trace.mixer_residuals[0], &aligned_mixer_trace[0]);
-        let first_block_residual_rel_l2 =
-            rel_l2(&base_trace.block_residuals[0], &aligned_block_trace[0]);
-        let later_residual_max_rel_l2 = base_trace
-            .mixer_residuals
-            .iter()
-            .zip(&aligned_mixer_trace)
-            .skip(1)
-            .map(|(base, aligned)| rel_l2(base, aligned))
-            .chain(
-                base_trace
-                    .block_residuals
-                    .iter()
-                    .zip(&aligned_block_trace)
-                    .skip(1)
-                    .map(|(base, aligned)| rel_l2(base, aligned)),
-            )
-            .fold(0.0_f64, f64::max);
-        let replay_logits = baseline
-            .forward_prompt_residual_trace_debug(&tokens[..tokens.len() - 1])?
-            .logits;
-        let replay_max_abs = replay_logits
-            .iter()
-            .zip(logit_reference.iter().rev().take(replay_logits.len()).rev())
-            .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
+        let rotated_metrics = fp16_gate_metrics(&baseline, &candidate, &tokens, &rotation, false)?;
+        let boundary_metrics =
+            fp16_gate_metrics(&baseline, &gdn_boundary_candidate, &tokens, &rotation, true)?;
 
         println!(
             "FP16_GATE seed=0x{SEED:08x} prompt={PROMPT:?} tokens={tokens:?} scored_tokens={}",
-            base_nll.len()
+            tokens.len() - 1
         );
-        println!(
-            "FP16_GATE mean_nll_base={mean_base_nll:.9} mean_nll_rotated={mean_rotated_nll:.9} nll_delta={nll_delta:.9}"
-        );
-        println!(
-            "FP16_GATE ppl_delta={ppl_delta:.9} logits_rel_l2={logits_rel_l2:.9e} logits_max_abs={logits_max_abs:.9e}"
-        );
-        println!(
-            "FP16_GATE first_mixer_residual_rel_l2={first_mixer_residual_rel_l2:.9e} first_block_residual_rel_l2={first_block_residual_rel_l2:.9e} later_residual_max_rel_l2={later_residual_max_rel_l2:.9e} replay_max_abs={replay_max_abs:.9e}"
-        );
+        print_fp16_gate_metrics("FP16_GATE", &rotated_metrics);
+        let (base_gdn_trace, rotated_gdn_trace) = rotated_metrics
+            .gdn_traces
+            .as_ref()
+            .ok_or("missing layer-0 GDN trace")?;
+        print_gdn_trace_metrics(base_gdn_trace, rotated_gdn_trace, &rotation)?;
+        print_fp16_gate_metrics("FP16_GDN_BOUNDARY_DIAGNOSTIC", &boundary_metrics);
         println!("FP16_GATE artifacts={}", output_root.display());
 
-        assert!(nll_delta.abs() <= 1e-3, "FP16 NLL gate failed: {nll_delta}");
-        assert!(ppl_delta.abs() <= 1e-2, "FP16 PPL gate failed: {ppl_delta}");
         assert!(
-            logits_rel_l2 <= 5e-4,
-            "FP16 logit relative-L2 gate failed: {logits_rel_l2}"
+            rotated_metrics.nll_delta.abs() <= 1e-3,
+            "FP16 NLL gate failed: {}",
+            rotated_metrics.nll_delta
         );
         assert!(
-            logits_max_abs <= 5e-3,
-            "FP16 max-logit gate failed: {logits_max_abs}"
+            rotated_metrics.ppl_delta.abs() <= 1e-2,
+            "FP16 PPL gate failed: {}",
+            rotated_metrics.ppl_delta
         );
         assert!(
-            first_mixer_residual_rel_l2 <= 1e-4,
-            "FP16 first-residual gate failed: {first_mixer_residual_rel_l2}"
+            rotated_metrics.logits_rel_l2 <= 5e-4,
+            "FP16 logit relative-L2 gate failed: {}",
+            rotated_metrics.logits_rel_l2
         );
         assert!(
-            later_residual_max_rel_l2 <= 5e-4,
-            "FP16 later-residual gate failed: {later_residual_max_rel_l2}"
+            rotated_metrics.logits_max_abs <= 5e-3,
+            "FP16 max-logit gate failed: {}",
+            rotated_metrics.logits_max_abs
         );
-        assert_eq!(replay_max_abs, 0.0, "baseline repeatability gate failed");
+        assert!(
+            rotated_metrics.first_mixer_residual_rel_l2 <= 1e-4,
+            "FP16 first-residual gate failed: {}",
+            rotated_metrics.first_mixer_residual_rel_l2
+        );
+        assert!(
+            rotated_metrics.later_residual_max_rel_l2 <= 5e-4,
+            "FP16 later-residual gate failed: {}",
+            rotated_metrics.later_residual_max_rel_l2
+        );
+        assert_eq!(
+            rotated_metrics.replay_max_abs, 0.0,
+            "baseline repeatability gate failed"
+        );
         Ok(())
     }
 }

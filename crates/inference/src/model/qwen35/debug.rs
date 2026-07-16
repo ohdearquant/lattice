@@ -4,15 +4,39 @@ use super::model::Qwen35Model;
 use super::norm::qwen35_rms_norm;
 use super::weights::{AttentionWeights, FeedForwardWeights};
 use crate::attention::gdn::GatedDeltaNetState;
+#[cfg(test)]
+use crate::attention::gdn::GatedDeltaNetWeights;
+#[cfg(test)]
+use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use crate::attention::gdn_fused::gated_delta_net_step_fused;
 use crate::error::InferenceError;
 use crate::forward::cpu::matmul_bt;
+#[cfg(test)]
+use crate::quant::quarot::hadamard::RandomizedHadamard;
 
 #[cfg(test)]
+#[derive(Debug, Clone)]
 pub(crate) struct ForwardTrace {
     pub(crate) mixer_residuals: Vec<Vec<f32>>,
     pub(crate) block_residuals: Vec<Vec<f32>>,
     pub(crate) logits: Vec<f32>,
+    pub(crate) gdn_layer0: Option<GdnMixerTrace>,
+}
+
+/// Test-only capture of the first GDN mixer's first-divergence boundary.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct GdnMixerTrace {
+    pub(crate) q: Vec<f32>,
+    pub(crate) k: Vec<f32>,
+    pub(crate) v: Vec<f32>,
+    pub(crate) z: Vec<f32>,
+    pub(crate) a: Vec<f32>,
+    pub(crate) b: Vec<f32>,
+    pub(crate) conv: Vec<f32>,
+    pub(crate) state: Vec<f32>,
+    pub(crate) gated: Vec<f32>,
+    pub(crate) out_proj: Vec<f32>,
 }
 
 impl Qwen35Model {
@@ -195,6 +219,19 @@ impl Qwen35Model {
         &self,
         prompt_ids: &[u32],
     ) -> Result<ForwardTrace, InferenceError> {
+        self.forward_prompt_residual_trace_debug_with_gdn_boundary(prompt_ids, None)
+    }
+
+    /// Runs the test-only trace path with an optional exact GDN boundary conversion.
+    ///
+    /// The optional rotation is a diagnostic control only: it cancels the residual
+    /// rotation around every GDN mixer while the GDN tensors remain unrotated.
+    #[cfg(test)]
+    pub(crate) fn forward_prompt_residual_trace_debug_with_gdn_boundary(
+        &self,
+        prompt_ids: &[u32],
+        gdn_boundary_rotation: Option<&RandomizedHadamard>,
+    ) -> Result<ForwardTrace, InferenceError> {
         if prompt_ids.is_empty() {
             return Err(InferenceError::Inference(
                 "forward_prompt_residual_trace_debug: prompt_ids must not be empty".into(),
@@ -218,6 +255,7 @@ impl Qwen35Model {
         let mut scratch = ForwardScratch::new();
         let mut mixer_trace = Vec::with_capacity(cfg.num_hidden_layers);
         let mut block_trace = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut gdn_layer0 = None;
 
         for (position, &token_id) in prompt_ids.iter().enumerate() {
             scratch.ensure_capacity(cfg, kv_cache.seq_len + 1);
@@ -230,23 +268,75 @@ impl Qwen35Model {
             for layer_i in 0..cfg.num_hidden_layers {
                 let (attn_weights, common) = &self.weights.layers[layer_i];
                 scratch.residual[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
-                qwen35_rms_norm(
-                    &mut scratch.hidden[..hidden],
-                    &common.input_layernorm,
-                    hidden,
-                    cfg.rms_norm_eps,
-                );
-                self.run_attention_layer(
-                    layer_i,
-                    attn_weights,
-                    &mut linear_idx,
-                    &mut full_idx,
-                    position,
-                    &mut gdn_states,
-                    &mut kv_cache,
-                    &mut scratch,
-                    hidden,
-                );
+                let gdn_state_idx = match attn_weights {
+                    AttentionWeights::Linear(_) => Some(linear_idx),
+                    AttentionWeights::Full(_) => None,
+                };
+                if let (Some(rotation), AttentionWeights::Linear(gdn_w)) =
+                    (gdn_boundary_rotation, attn_weights)
+                {
+                    // Diagnostic only: this cancels the residual basis before the
+                    // original-basis GDN and restores it for the residual add.
+                    scratch.hidden[..hidden].copy_from_slice(&scratch.residual[..hidden]);
+                    rotation.apply_inverse(&mut scratch.hidden[..hidden])?;
+                    qwen35_rms_norm(
+                        &mut scratch.hidden[..hidden],
+                        &common.input_layernorm,
+                        hidden,
+                        cfg.rms_norm_eps,
+                    );
+                    gated_delta_net_step_fused(
+                        &scratch.hidden[..hidden],
+                        &mut gdn_states[linear_idx],
+                        gdn_w,
+                        cfg,
+                        &mut scratch.gdn_scratch,
+                        &mut scratch.attn_out[..hidden],
+                        self.lora.as_ref(),
+                        layer_i,
+                    );
+                    rotation.apply(&mut scratch.attn_out[..hidden])?;
+                    linear_idx += 1;
+                } else {
+                    qwen35_rms_norm(
+                        &mut scratch.hidden[..hidden],
+                        &common.input_layernorm,
+                        hidden,
+                        cfg.rms_norm_eps,
+                    );
+                    self.run_attention_layer(
+                        layer_i,
+                        attn_weights,
+                        &mut linear_idx,
+                        &mut full_idx,
+                        position,
+                        &mut gdn_states,
+                        &mut kv_cache,
+                        &mut scratch,
+                        hidden,
+                    );
+                }
+                if position + 1 == prompt_ids.len()
+                    && layer_i == 0
+                    && let (Some(gdn_w), Some(state_idx)) = (
+                        match attn_weights {
+                            AttentionWeights::Linear(weights) => Some(weights),
+                            AttentionWeights::Full(_) => None,
+                        },
+                        gdn_state_idx,
+                    )
+                {
+                    gdn_layer0 = Some(capture_gdn_mixer_trace(
+                        &scratch.hidden[..hidden],
+                        &gdn_states[state_idx],
+                        gdn_w,
+                        cfg,
+                        &scratch.gdn_scratch,
+                        &scratch.attn_out[..hidden],
+                        self.lora.as_ref(),
+                        layer_i,
+                    ));
+                }
                 for i in 0..hidden {
                     scratch.hidden[i] = scratch.residual[i] + scratch.attn_out[i];
                 }
@@ -296,7 +386,47 @@ impl Qwen35Model {
             mixer_residuals: mixer_trace,
             block_residuals: block_trace,
             logits: scratch.logits[..cfg.vocab_size].to_vec(),
+            gdn_layer0,
         })
+    }
+}
+
+#[cfg(test)]
+fn capture_gdn_mixer_trace(
+    input: &[f32],
+    state: &GatedDeltaNetState,
+    weights: &GatedDeltaNetWeights,
+    cfg: &crate::model::qwen35_config::Qwen35Config,
+    scratch: &GatedDeltaNetFusedScratch,
+    output: &[f32],
+    lora: &dyn crate::lora_hook::LoraHook,
+    layer_idx: usize,
+) -> GdnMixerTrace {
+    let hidden = cfg.hidden_size;
+    let num_heads = cfg.linear_num_key_heads;
+    let key_dim = cfg.linear_key_head_dim;
+    let q_total = num_heads * key_dim;
+    let k_total = q_total;
+    let v_offset = q_total + k_total;
+    let qkv_dim = cfg.linear_qkv_dim();
+    let output_dim = cfg.linear_output_dim();
+    let value_heads = cfg.linear_num_value_heads();
+
+    let mut b = vec![0.0; value_heads];
+    matmul_bt(input, &weights.in_proj_b, &mut b, 1, hidden, value_heads);
+    lora.apply(layer_idx, "in_proj_b", input, &mut b);
+
+    GdnMixerTrace {
+        q: scratch.qkv_proj[..q_total].to_vec(),
+        k: scratch.qkv_proj[q_total..v_offset].to_vec(),
+        v: scratch.qkv_proj[v_offset..qkv_dim].to_vec(),
+        z: scratch.z_proj[..output_dim].to_vec(),
+        a: scratch.alpha_proj[..value_heads].to_vec(),
+        b,
+        conv: scratch.conv_output[..qkv_dim].to_vec(),
+        state: state.s_matrices.clone(),
+        gated: scratch.gated_norm_buf[..output_dim].to_vec(),
+        out_proj: output[..hidden].to_vec(),
     }
 }
 
