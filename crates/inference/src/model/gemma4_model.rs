@@ -59,6 +59,16 @@ pub(crate) struct Gemma4Scratch {
     residual3: Vec<f32>,
     gate: Vec<f32>,
     proj: Vec<f32>,
+    /// MLP gate/up projections, sized once to the widest
+    /// [`Gemma4Config::mlp_intermediate_size`] across all layers (the
+    /// double-wide KV-shared layers) and reused by every layer's
+    /// [`gemma4_geglu_mlp`] call instead of allocating fresh per layer.
+    mlp_gate: Vec<f32>,
+    mlp_up: Vec<f32>,
+    /// All-ones weight for the unscaled V RMSNorm (G4), sized to the widest
+    /// attention head width across sliding/global layers and reused every
+    /// layer instead of allocating a fresh `vec![1.0; head_w]` per call.
+    v_norm_ones: Vec<f32>,
     /// Post-softcap logits, `[vocab_size]`. `forward_step` writes here
     /// instead of returning an owned vector; callers that need an owned
     /// copy across the generation boundary clone out of this once, not on
@@ -77,6 +87,10 @@ impl Gemma4Scratch {
         let widest_head = cfg.head_dim.max(cfg.global_head_dim);
         let q_dim_max = cfg.num_attention_heads * widest_head;
         let kv_dim_max = cfg.num_key_value_heads * widest_head;
+        let widest_mlp_intermediate = (0..cfg.num_hidden_layers)
+            .map(|layer_idx| cfg.mlp_intermediate_size(layer_idx))
+            .max()
+            .unwrap_or(cfg.intermediate_size);
         Self {
             hidden: vec![0f32; hidden_size],
             residual: vec![0f32; hidden_size],
@@ -93,6 +107,9 @@ impl Gemma4Scratch {
             residual3: vec![0f32; hidden_size],
             gate: vec![0f32; cfg.hidden_size_per_layer_input],
             proj: vec![0f32; hidden_size],
+            mlp_gate: vec![0f32; widest_mlp_intermediate],
+            mlp_up: vec![0f32; widest_mlp_intermediate],
+            v_norm_ones: vec![1.0f32; widest_head],
             logits: vec![0f32; cfg.vocab_size],
         }
     }
@@ -321,10 +338,9 @@ impl Gemma4Model {
                 gemma4_apply_rope(&mut scratch.k[..kv_dim], cos, sin, 1, num_kv_heads, head_w);
                 for h in 0..num_kv_heads {
                     let start = h * head_w;
-                    let ones = vec![1.0f32; head_w];
                     rms_norm(
                         &mut scratch.v[start..start + head_w],
-                        &ones,
+                        &scratch.v_norm_ones[..head_w],
                         head_w,
                         cfg.rms_norm_eps,
                     );
@@ -402,6 +418,8 @@ impl Gemma4Model {
                 1,
                 hidden_size,
                 mlp_dim,
+                &mut scratch.mlp_gate[..mlp_dim],
+                &mut scratch.mlp_up[..mlp_dim],
                 &mut scratch.ffn_out[..hidden_size],
             );
             gemma4_rms_norm(

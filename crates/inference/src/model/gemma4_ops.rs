@@ -84,6 +84,13 @@ pub fn gemma4_gelu_tanh(x: &mut [f32]) {
 /// `[hidden, intermediate]` (`nn.Linear` weight layout, `[out, in]`) --
 /// exactly the layout `crate::forward::cpu::matmul_bt` expects as its `B`
 /// argument.
+///
+/// `gate_scratch`/`up_scratch` are caller-provided `tokens*intermediate`
+/// buffers (their contents on entry are irrelevant -- both are fully
+/// overwritten by the first `matmul_bt` before being read) so that a
+/// per-layer caller can reuse one allocation across every layer of a
+/// forward pass instead of allocating two fresh vectors per call.
+#[allow(clippy::too_many_arguments)]
 pub fn gemma4_geglu_mlp(
     x: &[f32],
     gate_w: &[f32],
@@ -92,6 +99,8 @@ pub fn gemma4_geglu_mlp(
     tokens: usize,
     hidden: usize,
     intermediate: usize,
+    gate_scratch: &mut [f32],
+    up_scratch: &mut [f32],
     out: &mut [f32],
 ) {
     assert_eq!(x.len(), tokens * hidden, "x must be tokens*hidden");
@@ -111,16 +120,24 @@ pub fn gemma4_geglu_mlp(
         "down_w must be hidden*intermediate"
     );
     assert_eq!(out.len(), tokens * hidden, "out must be tokens*hidden");
+    assert_eq!(
+        gate_scratch.len(),
+        tokens * intermediate,
+        "gate_scratch must be tokens*intermediate"
+    );
+    assert_eq!(
+        up_scratch.len(),
+        tokens * intermediate,
+        "up_scratch must be tokens*intermediate"
+    );
 
-    let mut gate = vec![0f32; tokens * intermediate];
-    let mut up = vec![0f32; tokens * intermediate];
-    matmul_bt(x, gate_w, &mut gate, tokens, hidden, intermediate);
-    matmul_bt(x, up_w, &mut up, tokens, hidden, intermediate);
-    for v in gate.iter_mut() {
+    matmul_bt(x, gate_w, gate_scratch, tokens, hidden, intermediate);
+    matmul_bt(x, up_w, up_scratch, tokens, hidden, intermediate);
+    for v in gate_scratch.iter_mut() {
         *v = gelu_tanh_exact(*v);
     }
-    elementwise_mul(&mut gate, &up);
-    matmul_bt(&gate, down_w, out, tokens, intermediate, hidden);
+    elementwise_mul(gate_scratch, up_scratch);
+    matmul_bt(gate_scratch, down_w, out, tokens, intermediate, hidden);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,19 +331,24 @@ pub fn gemma4_apply_rope(
         "sin must be seq_len*head_dim"
     );
     let half = head_dim / 2;
-    let mut rotated = vec![0f32; head_dim];
     for t in 0..seq_len {
         let cos_row = &cos[t * head_dim..(t + 1) * head_dim];
         let sin_row = &sin[t * head_dim..(t + 1) * head_dim];
         for h in 0..heads {
             let base = (t * heads + h) * head_dim;
             let row = &mut x[base..base + head_dim];
+            // Same arithmetic as materializing `rotate_half(row)` into a
+            // temporary buffer then computing `row * cos + rotated * sin`
+            // element-wise, just without the heap allocation: each pair
+            // `(i, half+i)` only reads its own pre-update values (`x1`,
+            // `x2`), so writing both outputs of a pair before moving to the
+            // next pair is order-independent and bit-identical to the
+            // original two-pass form.
             for i in 0..half {
-                rotated[i] = -row[half + i];
-                rotated[half + i] = row[i];
-            }
-            for i in 0..head_dim {
-                row[i] = row[i] * cos_row[i] + rotated[i] * sin_row[i];
+                let x1 = row[i];
+                let x2 = row[half + i];
+                row[i] = x1 * cos_row[i] - x2 * sin_row[i];
+                row[half + i] = x2 * cos_row[half + i] + x1 * sin_row[half + i];
             }
         }
     }
@@ -515,6 +537,8 @@ mod tests {
         let expected = load_bin(&fx, "output");
 
         let mut out = vec![0f32; tokens * hidden];
+        let mut gate_scratch = vec![0f32; tokens * intermediate];
+        let mut up_scratch = vec![0f32; tokens * intermediate];
         gemma4_geglu_mlp(
             &x,
             &gate_w,
@@ -523,6 +547,8 @@ mod tests {
             tokens,
             hidden,
             intermediate,
+            &mut gate_scratch,
+            &mut up_scratch,
             &mut out,
         );
 
