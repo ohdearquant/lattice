@@ -722,6 +722,7 @@ fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, I
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::qwen35::debug::ResidualBoundaryControl;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
@@ -2549,7 +2550,8 @@ mod tests {
         candidate: &crate::model::qwen35::Qwen35Model,
         tokens: &[u32],
         rotation: &RandomizedHadamard,
-        gdn_boundary_rotation: bool,
+        control: ResidualBoundaryControl,
+        candidate_residuals_rotated: bool,
     ) -> Result<Fp16GateMetrics, Box<dyn std::error::Error>> {
         let mut base_nll = Vec::new();
         let mut candidate_nll = Vec::new();
@@ -2559,14 +2561,12 @@ mod tests {
 
         for prefix_len in 1..tokens.len() {
             let base_trace = baseline.forward_prompt_residual_trace_debug(&tokens[..prefix_len])?;
-            let candidate_trace = if gdn_boundary_rotation {
-                candidate.forward_prompt_residual_trace_debug_with_gdn_boundary(
+            let candidate_trace = candidate
+                .forward_prompt_residual_trace_debug_with_boundary_control(
                     &tokens[..prefix_len],
-                    Some(rotation),
-                )?
-            } else {
-                candidate.forward_prompt_residual_trace_debug(&tokens[..prefix_len])?
-            };
+                    control,
+                    rotation,
+                )?;
             let base_logits = &base_trace.logits;
             let candidate_logits = &candidate_trace.logits;
             assert_eq!(base_logits.len(), candidate_logits.len());
@@ -2590,12 +2590,14 @@ mod tests {
         );
 
         let mut aligned_mixer_trace = candidate_trace.mixer_residuals.clone();
-        for residual in &mut aligned_mixer_trace {
-            rotation.apply_inverse(residual)?;
-        }
         let mut aligned_block_trace = candidate_trace.block_residuals.clone();
-        for residual in &mut aligned_block_trace {
-            rotation.apply_inverse(residual)?;
+        if candidate_residuals_rotated {
+            for residual in &mut aligned_mixer_trace {
+                rotation.apply_inverse(residual)?;
+            }
+            for residual in &mut aligned_block_trace {
+                rotation.apply_inverse(residual)?;
+            }
         }
 
         let mean_base_nll = base_nll.iter().sum::<f64>() / base_nll.len() as f64;
@@ -2707,6 +2709,365 @@ mod tests {
         Ok(())
     }
 
+    fn fp16_contract_passes(metrics: &Fp16GateMetrics) -> bool {
+        metrics.logits_max_abs <= 5e-3 && metrics.first_mixer_residual_rel_l2 <= 1e-4
+    }
+
+    fn write_gate_artifact_if_missing(
+        output_dir: &Path,
+        config_json: &str,
+        tokenizer_path: &Path,
+        tensors: &HashMap<String, TensorEntry>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if output_dir.exists() {
+            assert!(
+                output_dir.join("config.json").is_file()
+                    && output_dir.join("tokenizer.json").is_file()
+                    && output_dir.join("model.safetensors").is_file(),
+                "FP16 ladder artifact is incomplete: {}",
+                output_dir.display()
+            );
+        } else {
+            write_cpu_f16_gate_artifact(output_dir, config_json, tokenizer_path, tensors)?;
+        }
+        Ok(())
+    }
+
+    fn restore_original_tensor(
+        target: &mut HashMap<String, TensorEntry>,
+        original: &HashMap<String, TensorEntry>,
+        name: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let tensor = original
+            .get(&name)
+            .ok_or_else(|| format!("missing original ladder tensor {name}"))?;
+        target.insert(name, tensor.clone());
+        Ok(())
+    }
+
+    fn restore_original_gqa_tensors(
+        target: &mut HashMap<String, TensorEntry>,
+        original: &HashMap<String, TensorEntry>,
+        config: &Qwen35Config,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for layer_i in 0..config.num_hidden_layers {
+            if !config.is_full_attention(layer_i) {
+                continue;
+            }
+            let prefix = format!("model.language_model.layers.{layer_i}.self_attn");
+            for suffix in [
+                "q_proj.weight",
+                "k_proj.weight",
+                "v_proj.weight",
+                "o_proj.weight",
+            ] {
+                restore_original_tensor(target, original, format!("{prefix}.{suffix}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_original_gdn_tensors(
+        target: &mut HashMap<String, TensorEntry>,
+        original: &HashMap<String, TensorEntry>,
+        config: &Qwen35Config,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for layer_i in 0..config.num_hidden_layers {
+            if config.is_full_attention(layer_i) {
+                continue;
+            }
+            let prefix = format!("model.language_model.layers.{layer_i}");
+            for suffix in [
+                "input_layernorm.weight",
+                "linear_attn.in_proj_qkv.weight",
+                "linear_attn.in_proj_z.weight",
+                "linear_attn.in_proj_b.weight",
+                "linear_attn.in_proj_a.weight",
+                "linear_attn.A_log",
+                "linear_attn.dt_bias",
+                "linear_attn.conv1d.weight",
+                "linear_attn.norm.weight",
+                "linear_attn.out_proj.weight",
+            ] {
+                restore_original_tensor(target, original, format!("{prefix}.{suffix}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn f16_rotation_roundtrip_max_abs(
+        rotation: &RandomizedHadamard,
+    ) -> Result<f64, Box<dyn std::error::Error>> {
+        let mut max_abs = 0.0_f64;
+        for column in 0..rotation.dim() {
+            let mut basis = vec![0.0_f64; rotation.dim()];
+            basis[column] = 1.0;
+            rotation.apply_f64(&mut basis)?;
+            for value in basis {
+                let stored = crate::weights::q4_weights::q4_f16_to_f32(q4_f32_to_f16(value as f32));
+                max_abs = max_abs.max((value - f64::from(stored)).abs());
+            }
+        }
+        Ok(max_abs)
+    }
+
+    #[test]
+    #[ignore = "requires LATTICE_QUAROT_REAL_MODEL_DIR and writes test-only F16 0.8B ladder artifacts"]
+    fn real_qwen35_fp16_rotation_ladder_gate() -> Result<(), Box<dyn std::error::Error>> {
+        let input_dir = PathBuf::from(env::var("LATTICE_QUAROT_REAL_MODEL_DIR")?);
+        let output_root = PathBuf::from(env::var("LATTICE_QUAROT_FP16_GATE_DIR")?);
+
+        const SEED: u64 = 0x00C0_FFEE;
+        const PROMPT: &str = "The capital of France is Paris, and the capital of Japan is Tokyo.";
+        let config_json = fs::read_to_string(input_dir.join("config.json"))?;
+        let config = Qwen35Config::from_config_json_str(&config_json)?;
+        let reader = QuarotTensorReader::open(&input_dir)?;
+        let required_names = qwen_required_tensor_names(&config);
+        let mut original = load_tensors_f64(&reader, &required_names)?;
+        materialize_lm_head_for_qwen35(&mut original, &config)?;
+        let mut rotated = original.clone();
+        let mut full_fusion_plan = qwen35_per_layer_fusion_plan(&config)?;
+        full_fusion_plan.push(qwen35_final_norm_fusion_target());
+        let rotation = RandomizedHadamard::new(SEED, config.hidden_size)?;
+        fuse_rmsnorms(&mut rotated, &full_fusion_plan)?;
+        absorb_rotations(
+            &mut rotated,
+            &RotationPlan::qwen35_residual_stream_linear_layers(),
+            &rotation,
+        )?;
+
+        let gate_config = untie_word_embeddings_in_config_json(&config_json)?;
+        let baseline_dir = output_root.join("baseline");
+        let rotated_dir = output_root.join("rotated");
+        assert!(
+            baseline_dir.join("model.safetensors").is_file()
+                && rotated_dir.join("model.safetensors").is_file(),
+            "FP16 ladder requires the reusable baseline and rotated artifacts under {}",
+            output_root.display()
+        );
+        let baseline = crate::model::qwen35::Qwen35Model::from_safetensors(&baseline_dir)?;
+        let candidate = crate::model::qwen35::Qwen35Model::from_safetensors(&rotated_dir)?;
+        let tokenizer = BpeTokenizer::from_tokenizer_json(&input_dir.join("tokenizer.json"))?;
+        let tokenized = tokenizer.tokenize(PROMPT);
+        let tokens = tokenized.input_ids[..tokenized.real_length.min(8)].to_vec();
+        assert!(tokens.len() >= 2, "FP16 ladder prompt tokenized too short");
+
+        println!(
+            "FP16_LADDER seed=0x{SEED:08x} prompt={PROMPT:?} tokens={tokens:?} scored_tokens={}",
+            tokens.len() - 1
+        );
+        let rung0 = fp16_gate_metrics(
+            &baseline,
+            &candidate,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl::default(),
+            true,
+        )?;
+        print_fp16_gate_metrics("FP16_LADDER rung=0 family=fully_folded", &rung0);
+        if fp16_contract_passes(&rung0) {
+            println!(
+                "FP16_LADDER_DECISION first_passing_rung=0 mechanism=none_baseline_already_passes"
+            );
+            return Ok(());
+        }
+
+        let embed_name = "model.language_model.embed_tokens.weight".to_string();
+        let rung1_dir = output_root.join("ladder-rung1-embedding-boundary");
+        let mut rung1_tensors = rotated.clone();
+        restore_original_tensor(&mut rung1_tensors, &original, embed_name.clone())?;
+        write_gate_artifact_if_missing(
+            &rung1_dir,
+            &gate_config,
+            &input_dir.join("tokenizer.json"),
+            &rung1_tensors,
+        )?;
+        drop(rung1_tensors);
+        let rung1_model = crate::model::qwen35::Qwen35Model::from_safetensors(&rung1_dir)?;
+        let rung1 = fp16_gate_metrics(
+            &baseline,
+            &rung1_model,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl {
+                rotate_embedding_output: true,
+                ..ResidualBoundaryControl::default()
+            },
+            true,
+        )?;
+        print_fp16_gate_metrics("FP16_LADDER rung=1 family=embedding", &rung1);
+        if fp16_contract_passes(&rung1) {
+            println!(
+                "FP16_LADDER_DECISION first_passing_rung=1 mechanism=embedding_input_rotation"
+            );
+            return Ok(());
+        }
+
+        let rung2_dir = output_root.join("ladder-rung2-rmsnorm-boundary");
+        let mut rung2_tensors = original.clone();
+        fuse_rmsnorms(&mut rung2_tensors, &[qwen35_final_norm_fusion_target()])?;
+        absorb_rotations(
+            &mut rung2_tensors,
+            &RotationPlan::qwen35_residual_stream_linear_layers(),
+            &rotation,
+        )?;
+        restore_original_tensor(&mut rung2_tensors, &original, embed_name.clone())?;
+        write_gate_artifact_if_missing(
+            &rung2_dir,
+            &gate_config,
+            &input_dir.join("tokenizer.json"),
+            &rung2_tensors,
+        )?;
+        let rung2_model = crate::model::qwen35::Qwen35Model::from_safetensors(&rung2_dir)?;
+        let rung2 = fp16_gate_metrics(
+            &baseline,
+            &rung2_model,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl {
+                rotate_embedding_output: true,
+                original_rmsnorm_boundaries: true,
+                ..ResidualBoundaryControl::default()
+            },
+            true,
+        )?;
+        print_fp16_gate_metrics("FP16_LADDER rung=2 family=rmsnorm_fusion", &rung2);
+        if fp16_contract_passes(&rung2) {
+            println!("FP16_LADDER_DECISION first_passing_rung=2 mechanism=rmsnorm_fusion");
+            return Ok(());
+        }
+
+        let rung3_dir = output_root.join("ladder-rung3-gqa-boundary");
+        let mut rung3_tensors = rung2_tensors.clone();
+        restore_original_gqa_tensors(&mut rung3_tensors, &original, &config)?;
+        write_gate_artifact_if_missing(
+            &rung3_dir,
+            &gate_config,
+            &input_dir.join("tokenizer.json"),
+            &rung3_tensors,
+        )?;
+        drop(rung2_tensors);
+        drop(rung3_tensors);
+        let rung3_model = crate::model::qwen35::Qwen35Model::from_safetensors(&rung3_dir)?;
+        let rung3 = fp16_gate_metrics(
+            &baseline,
+            &rung3_model,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl {
+                rotate_embedding_output: true,
+                original_rmsnorm_boundaries: true,
+                original_gqa_boundaries: true,
+                ..ResidualBoundaryControl::default()
+            },
+            true,
+        )?;
+        print_fp16_gate_metrics("FP16_LADDER rung=3 family=gqa_folds", &rung3);
+        if fp16_contract_passes(&rung3) {
+            println!("FP16_LADDER_DECISION first_passing_rung=3 mechanism=gqa_folds");
+            return Ok(());
+        }
+
+        let rung4_dir = output_root.join("ladder-rung4-gdn-boundary");
+        let mut rung4_tensors = original.clone();
+        fuse_rmsnorms(&mut rung4_tensors, &[qwen35_final_norm_fusion_target()])?;
+        absorb_rotations(
+            &mut rung4_tensors,
+            &RotationPlan::qwen35_residual_stream_linear_layers(),
+            &rotation,
+        )?;
+        restore_original_tensor(&mut rung4_tensors, &original, embed_name.clone())?;
+        restore_original_gqa_tensors(&mut rung4_tensors, &original, &config)?;
+        restore_original_gdn_tensors(&mut rung4_tensors, &original, &config)?;
+        write_gate_artifact_if_missing(
+            &rung4_dir,
+            &gate_config,
+            &input_dir.join("tokenizer.json"),
+            &rung4_tensors,
+        )?;
+        drop(rung4_tensors);
+        let rung4_model = crate::model::qwen35::Qwen35Model::from_safetensors(&rung4_dir)?;
+        let rung4 = fp16_gate_metrics(
+            &baseline,
+            &rung4_model,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl {
+                rotate_embedding_output: true,
+                original_rmsnorm_boundaries: true,
+                original_gqa_boundaries: true,
+                original_gdn_boundaries: true,
+                ..ResidualBoundaryControl::default()
+            },
+            true,
+        )?;
+        print_fp16_gate_metrics("FP16_LADDER rung=4 family=gdn_folds", &rung4);
+        if fp16_contract_passes(&rung4) {
+            println!("FP16_LADDER_DECISION first_passing_rung=4 mechanism=gdn_folds");
+            return Ok(());
+        }
+
+        let rung5_dir = output_root.join("ladder-rung5-endpoint-isolation");
+        let mut rung5_tensors = original.clone();
+        for name in ["model.language_model.norm.weight", "lm_head.weight"] {
+            restore_original_tensor(&mut rung5_tensors, &rotated, name.to_string())?;
+        }
+        write_gate_artifact_if_missing(
+            &rung5_dir,
+            &gate_config,
+            &input_dir.join("tokenizer.json"),
+            &rung5_tensors,
+        )?;
+        drop(rung5_tensors);
+        let rung5_model = crate::model::qwen35::Qwen35Model::from_safetensors(&rung5_dir)?;
+        let rung5 = fp16_gate_metrics(
+            &baseline,
+            &rung5_model,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl {
+                rotate_endpoint_input: true,
+                ..ResidualBoundaryControl::default()
+            },
+            false,
+        )?;
+        print_fp16_gate_metrics(
+            "FP16_LADDER rung=5 family=dense_mlp_folds_endpoint_retained",
+            &rung5,
+        );
+        if fp16_contract_passes(&rung5) {
+            println!("FP16_LADDER_DECISION first_passing_rung=5 mechanism=dense_mlp_folds");
+            return Ok(());
+        }
+
+        let all_online = fp16_gate_metrics(
+            &baseline,
+            &baseline,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl {
+                rotate_embedding_output: true,
+                original_gqa_boundaries: true,
+                original_gdn_boundaries: true,
+                original_mlp_boundaries: true,
+                unrotate_endpoint_input: true,
+                ..ResidualBoundaryControl::default()
+            },
+            true,
+        )?;
+        print_fp16_gate_metrics("FP16_LADDER all_online=true", &all_online);
+        let rotation_f16_max_abs = f16_rotation_roundtrip_max_abs(&rotation)?;
+        println!("FP16_LADDER rotation_f16_roundtrip_max_abs={rotation_f16_max_abs:.9e}");
+        if fp16_contract_passes(&all_online) {
+            println!(
+                "FP16_LADDER_DECISION no_pre_endpoint_mechanism endpoint_materialization_or_fusion_remains"
+            );
+        } else {
+            println!("FP16_LADDER_DECISION no_mechanism_found online_rotation_or_trace_remains");
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires LATTICE_QUAROT_REAL_MODEL_DIR and writes two temporary F16 0.8B artifacts"]
     fn real_qwen35_fp16_rotation_gate() -> Result<(), Box<dyn std::error::Error>> {
@@ -2807,9 +3168,25 @@ mod tests {
         let tokenized = tokenizer.tokenize(PROMPT);
         let tokens = tokenized.input_ids[..tokenized.real_length.min(8)].to_vec();
         assert!(tokens.len() >= 2, "FP16 gate prompt tokenized too short");
-        let rotated_metrics = fp16_gate_metrics(&baseline, &candidate, &tokens, &rotation, false)?;
-        let boundary_metrics =
-            fp16_gate_metrics(&baseline, &gdn_boundary_candidate, &tokens, &rotation, true)?;
+        let rotated_metrics = fp16_gate_metrics(
+            &baseline,
+            &candidate,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl::default(),
+            true,
+        )?;
+        let boundary_metrics = fp16_gate_metrics(
+            &baseline,
+            &gdn_boundary_candidate,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl {
+                original_gdn_boundaries: true,
+                ..ResidualBoundaryControl::default()
+            },
+            true,
+        )?;
 
         println!(
             "FP16_GATE seed=0x{SEED:08x} prompt={PROMPT:?} tokens={tokens:?} scored_tokens={}",

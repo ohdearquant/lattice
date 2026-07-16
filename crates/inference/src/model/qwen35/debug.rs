@@ -39,6 +39,19 @@ pub(crate) struct GdnMixerTrace {
     pub(crate) out_proj: Vec<f32>,
 }
 
+/// Test-only residual-basis controls for the QuaRot FP16 localization ladder.
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ResidualBoundaryControl {
+    pub(crate) rotate_embedding_output: bool,
+    pub(crate) original_rmsnorm_boundaries: bool,
+    pub(crate) original_gqa_boundaries: bool,
+    pub(crate) original_gdn_boundaries: bool,
+    pub(crate) original_mlp_boundaries: bool,
+    pub(crate) rotate_endpoint_input: bool,
+    pub(crate) unrotate_endpoint_input: bool,
+}
+
 impl Qwen35Model {
     /// **Unstable**: debug single-token forward pass returning raw logits.
     pub fn forward_single_token_debug(&self, token_id: u32) -> Vec<f32> {
@@ -219,18 +232,21 @@ impl Qwen35Model {
         &self,
         prompt_ids: &[u32],
     ) -> Result<ForwardTrace, InferenceError> {
-        self.forward_prompt_residual_trace_debug_with_gdn_boundary(prompt_ids, None)
+        let rotation = RandomizedHadamard::new(0, self.config.hidden_size)?;
+        self.forward_prompt_residual_trace_debug_with_boundary_control(
+            prompt_ids,
+            ResidualBoundaryControl::default(),
+            &rotation,
+        )
     }
 
-    /// Runs the test-only trace path with an optional exact GDN boundary conversion.
-    ///
-    /// The optional rotation is a diagnostic control only: it cancels the residual
-    /// rotation around every GDN mixer while the GDN tensors remain unrotated.
+    /// Runs the test-only trace path with selected original-basis boundaries.
     #[cfg(test)]
-    pub(crate) fn forward_prompt_residual_trace_debug_with_gdn_boundary(
+    pub(crate) fn forward_prompt_residual_trace_debug_with_boundary_control(
         &self,
         prompt_ids: &[u32],
-        gdn_boundary_rotation: Option<&RandomizedHadamard>,
+        control: ResidualBoundaryControl,
+        rotation: &RandomizedHadamard,
     ) -> Result<ForwardTrace, InferenceError> {
         if prompt_ids.is_empty() {
             return Err(InferenceError::Inference(
@@ -262,6 +278,9 @@ impl Qwen35Model {
             let embed_start = token_id as usize * hidden;
             scratch.hidden[..hidden]
                 .copy_from_slice(&self.weights.embed_tokens[embed_start..embed_start + hidden]);
+            if control.rotate_embedding_output {
+                rotation.apply(&mut scratch.hidden[..hidden])?;
+            }
 
             let mut linear_idx = 0usize;
             let mut full_idx = 0usize;
@@ -272,11 +291,11 @@ impl Qwen35Model {
                     AttentionWeights::Linear(_) => Some(linear_idx),
                     AttentionWeights::Full(_) => None,
                 };
-                if let (Some(rotation), AttentionWeights::Linear(gdn_w)) =
-                    (gdn_boundary_rotation, attn_weights)
-                {
-                    // Diagnostic only: this cancels the residual basis before the
-                    // original-basis GDN and restores it for the residual add.
+                let original_attention_boundary = match attn_weights {
+                    AttentionWeights::Linear(_) => control.original_gdn_boundaries,
+                    AttentionWeights::Full(_) => control.original_gqa_boundaries,
+                };
+                if original_attention_boundary {
                     scratch.hidden[..hidden].copy_from_slice(&scratch.residual[..hidden]);
                     rotation.apply_inverse(&mut scratch.hidden[..hidden])?;
                     qwen35_rms_norm(
@@ -285,18 +304,39 @@ impl Qwen35Model {
                         hidden,
                         cfg.rms_norm_eps,
                     );
-                    gated_delta_net_step_fused(
-                        &scratch.hidden[..hidden],
-                        &mut gdn_states[linear_idx],
-                        gdn_w,
-                        cfg,
-                        &mut scratch.gdn_scratch,
-                        &mut scratch.attn_out[..hidden],
-                        self.lora.as_ref(),
+                    self.run_attention_layer(
                         layer_i,
+                        attn_weights,
+                        &mut linear_idx,
+                        &mut full_idx,
+                        position,
+                        &mut gdn_states,
+                        &mut kv_cache,
+                        &mut scratch,
+                        hidden,
                     );
                     rotation.apply(&mut scratch.attn_out[..hidden])?;
-                    linear_idx += 1;
+                } else if control.original_rmsnorm_boundaries {
+                    scratch.hidden[..hidden].copy_from_slice(&scratch.residual[..hidden]);
+                    rotation.apply_inverse(&mut scratch.hidden[..hidden])?;
+                    qwen35_rms_norm(
+                        &mut scratch.hidden[..hidden],
+                        &common.input_layernorm,
+                        hidden,
+                        cfg.rms_norm_eps,
+                    );
+                    rotation.apply(&mut scratch.hidden[..hidden])?;
+                    self.run_attention_layer(
+                        layer_i,
+                        attn_weights,
+                        &mut linear_idx,
+                        &mut full_idx,
+                        position,
+                        &mut gdn_states,
+                        &mut kv_cache,
+                        &mut scratch,
+                        hidden,
+                    );
                 } else {
                     qwen35_rms_norm(
                         &mut scratch.hidden[..hidden],
@@ -345,14 +385,40 @@ impl Qwen35Model {
                 }
 
                 scratch.residual[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
-                qwen35_rms_norm(
-                    &mut scratch.hidden[..hidden],
-                    &common.post_attention_layernorm,
-                    hidden,
-                    cfg.rms_norm_eps,
-                );
-                scratch.ffn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
-                self.run_ffn_layer(layer_i, common, &mut scratch, hidden);
+                if control.original_mlp_boundaries {
+                    scratch.hidden[..hidden].copy_from_slice(&scratch.residual[..hidden]);
+                    rotation.apply_inverse(&mut scratch.hidden[..hidden])?;
+                    qwen35_rms_norm(
+                        &mut scratch.hidden[..hidden],
+                        &common.post_attention_layernorm,
+                        hidden,
+                        cfg.rms_norm_eps,
+                    );
+                    scratch.ffn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+                    self.run_ffn_layer(layer_i, common, &mut scratch, hidden);
+                    rotation.apply(&mut scratch.ffn_out[..hidden])?;
+                } else {
+                    if control.original_rmsnorm_boundaries {
+                        scratch.hidden[..hidden].copy_from_slice(&scratch.residual[..hidden]);
+                        rotation.apply_inverse(&mut scratch.hidden[..hidden])?;
+                        qwen35_rms_norm(
+                            &mut scratch.hidden[..hidden],
+                            &common.post_attention_layernorm,
+                            hidden,
+                            cfg.rms_norm_eps,
+                        );
+                        rotation.apply(&mut scratch.hidden[..hidden])?;
+                    } else {
+                        qwen35_rms_norm(
+                            &mut scratch.hidden[..hidden],
+                            &common.post_attention_layernorm,
+                            hidden,
+                            cfg.rms_norm_eps,
+                        );
+                    }
+                    scratch.ffn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+                    self.run_ffn_layer(layer_i, common, &mut scratch, hidden);
+                }
                 for i in 0..hidden {
                     scratch.hidden[i] = scratch.residual[i] + scratch.ffn_out[i];
                 }
@@ -362,6 +428,12 @@ impl Qwen35Model {
                 }
             }
 
+            if control.rotate_endpoint_input {
+                rotation.apply(&mut scratch.hidden[..hidden])?;
+            }
+            if control.unrotate_endpoint_input {
+                rotation.apply_inverse(&mut scratch.hidden[..hidden])?;
+            }
             qwen35_rms_norm(
                 &mut scratch.hidden[..hidden],
                 &self.weights.final_norm,
