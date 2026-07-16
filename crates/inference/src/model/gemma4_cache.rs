@@ -480,6 +480,17 @@ impl Gemma4KvCache {
         let slot_idx = self.layer_slot(layer)?;
         Ok(&self.slots[slot_idx])
     }
+
+    /// Test-only: force `layer`'s resolved slot to `slot`, bypassing the
+    /// donor-map build logic in [`Self::new`]. Used to prove the donor
+    /// mapping is load-bearing (ADR-082 stage 5's mutation-sensitivity
+    /// gate) by pointing a shared layer at the wrong same-type owner's slot
+    /// and showing the forward output diverges, without touching the
+    /// weight-loading config the model was built against.
+    #[cfg(test)]
+    pub(crate) fn override_layer_slot_for_test(&mut self, layer: usize, slot: usize) {
+        self.layer_kv_slot[layer] = slot;
+    }
 }
 
 #[cfg(test)]

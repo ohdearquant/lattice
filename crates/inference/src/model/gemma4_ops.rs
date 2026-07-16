@@ -65,6 +65,18 @@ fn gelu_tanh_exact(x: f32) -> f32 {
     0.5 * x * (1.0 + inner.tanh())
 }
 
+/// In-place exact tanh-approximate GELU (`gelu_pytorch_tanh`) over a whole
+/// slice -- the same [`gelu_tanh_exact`] scalar op [`gemma4_geglu_mlp`] uses
+/// internally, exposed for the per-layer-embedding gate activation
+/// (`Gemma4TextDecoderLayer.forward`'s `self.act_fn(per_layer_input_gate(x))`,
+/// `modeling_gemma4.py:1451`), which is a plain activation with no MLP
+/// wiring around it.
+pub fn gemma4_gelu_tanh(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = gelu_tanh_exact(*v);
+    }
+}
+
 /// GeGLU MLP: `down(gelu_tanh(gate(x)) * up(x))`
 /// (`Gemma4TextMLP.forward`, `modeling_gemma4.py:1079-1081`).
 ///
