@@ -3,7 +3,7 @@
 //! Model loading is lazy and cancellation-safe; BERT-family and Qwen models take different
 //! loading and batching paths. See `docs/service.md` for lifecycle and persistence details.
 
-use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingService, MAX_TEXT_CHARS};
+use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingService, MAX_TEXT_BYTES};
 use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
@@ -309,10 +309,10 @@ impl EmbeddingService for NativeEmbeddingService {
             )));
         }
         for text in texts {
-            if text.len() > MAX_TEXT_CHARS {
+            if text.len() > MAX_TEXT_BYTES {
                 return Err(EmbedError::TextTooLong {
                     length: text.len(),
-                    max: MAX_TEXT_CHARS,
+                    max: MAX_TEXT_BYTES,
                 });
             }
         }

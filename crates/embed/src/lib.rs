@@ -30,7 +30,9 @@ pub mod wasm;
 pub use cache::{CacheStats, DEFAULT_CACHE_CAPACITY, EmbeddingCache, ShardStats};
 pub use error::{EmbedError, Result};
 pub use model::{EmbeddingModel, MIN_MRL_OUTPUT_DIM, ModelConfig, ModelProvenance};
-pub use service::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_CHARS};
+#[allow(deprecated)]
+pub use service::MAX_TEXT_CHARS;
+pub use service::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES};
 pub use simd::{SimdConfig, simd_config};
 
 #[cfg(feature = "native")]

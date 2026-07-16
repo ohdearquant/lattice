@@ -3,7 +3,7 @@
 //! It preserves caller order across partial cache hits and uses role-aware keys for asymmetric
 //! retrieval. See `docs/service.md` for the lookup and fill algorithm.
 
-use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_CHARS};
+use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES};
 use crate::error::Result;
 use crate::model::EmbeddingModel;
 use async_trait::async_trait;
@@ -116,10 +116,10 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
             )));
         }
         for text in texts {
-            if text.len() > MAX_TEXT_CHARS {
+            if text.len() > MAX_TEXT_BYTES {
                 return Err(EmbedError::TextTooLong {
                     length: text.len(),
-                    max: MAX_TEXT_CHARS,
+                    max: MAX_TEXT_BYTES,
                 });
             }
         }
@@ -195,5 +195,5 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
 // Suppress dead code warnings for constants that are used by other modules
 const _: () = {
     let _ = DEFAULT_MAX_BATCH_SIZE;
-    let _ = MAX_TEXT_CHARS;
+    let _ = MAX_TEXT_BYTES;
 };

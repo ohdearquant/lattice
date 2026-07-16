@@ -45,11 +45,11 @@ pub enum EmbedError {
     InvalidInput(String),
 
     /// Input text exceeds maximum allowed length.
-    #[error("text too long: {length} chars exceeds maximum {max} chars")]
+    #[error("text too long: {length} bytes exceeds maximum {max} bytes")]
     TextTooLong {
-        /// Actual length in characters.
+        /// Actual length in UTF-8 bytes.
         length: usize,
-        /// Maximum allowed length.
+        /// Maximum allowed length in UTF-8 bytes.
         max: usize,
     },
 

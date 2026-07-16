@@ -179,7 +179,7 @@ Sharded LRU cache for computed embeddings. Keys are BLAKE3 hashes of (model + in
 | Constant                 | Value   | Source              | Why                                                                                                                                                      |
 | ------------------------ | ------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `DEFAULT_MAX_BATCH_SIZE` | `1000`  | `service/mod.rs:25` | Prevents OOM from unbounded batch requests. 1000 × 512 tokens × 384 dims ≈ 750 MB peak memory — acceptable on modern hardware                            |
-| `MAX_TEXT_CHARS`         | `32768` | `service/mod.rs:31` | ~8K tokens at 4 chars/token. Inputs beyond this are rejected (return `EmbedError`). Covers Qwen3's 8192-token limit with margin for instruction prefixes |
+| `MAX_TEXT_BYTES`         | `32768` | `service/mod.rs:31` | UTF-8 byte length (`str::len()`), ~8K tokens at 4 bytes/token. Inputs beyond this are rejected (return `EmbedError`). Covers Qwen3's 8192-token limit with margin for instruction prefixes |
 
 Both are enforced in `NativeEmbeddingService::embed()` and `CachedEmbeddingService::embed()`.
 

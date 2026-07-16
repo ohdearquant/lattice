@@ -22,11 +22,11 @@ const MINILM_DIR = join(MODELS_DIR, 'all-minilm-l6-v2')
 const BGE_DIR = join(MODELS_DIR, 'bge-small-en-v1.5')
 
 // Input-size guardrails mirror crates/embed/src/service/mod.rs's
-// MAX_TEXT_CHARS (32768, measured as UTF-8 byte length -- see
+// MAX_TEXT_BYTES (32768, measured as UTF-8 byte length -- see
 // src/lib.rs's validate_text) and DEFAULT_MAX_BATCH_SIZE (1000), enforced
 // at the native binding boundary in validate_text/validate_texts BEFORE
 // tokenization or model execution.
-const MAX_TEXT_CHARS = 32768
+const MAX_TEXT_BYTES = 32768
 const DEFAULT_MAX_BATCH_SIZE = 1000
 
 const minilm = loadModelSync({ modelPath: MINILM_DIR })
@@ -204,34 +204,50 @@ test('loadModel (async) rejects a non-boolean normalize with FL_EMBED_BAD_OPTION
   )
 })
 
-test('embedSync rejects a text longer than MAX_TEXT_CHARS with FL_EMBED_INPUT_TOO_LARGE', () => {
-  const oversized = 'a'.repeat(MAX_TEXT_CHARS + 1)
+test('embedSync rejects a text longer than MAX_TEXT_BYTES with FL_EMBED_INPUT_TOO_LARGE', () => {
+  const oversized = 'a'.repeat(MAX_TEXT_BYTES + 1)
   assert.throws(
     () => minilm.embedSync(oversized),
     (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
   )
 })
 
-test('embed (async) rejects a text longer than MAX_TEXT_CHARS with FL_EMBED_INPUT_TOO_LARGE', async () => {
-  const oversized = 'a'.repeat(MAX_TEXT_CHARS + 1)
+test('embed (async) rejects a text longer than MAX_TEXT_BYTES with FL_EMBED_INPUT_TOO_LARGE', async () => {
+  const oversized = 'a'.repeat(MAX_TEXT_BYTES + 1)
   await assert.rejects(
     () => minilm.embed(oversized),
     (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
   )
 })
 
-test('embedBatchSync rejects a batch item longer than MAX_TEXT_CHARS with FL_EMBED_INPUT_TOO_LARGE', () => {
-  const oversized = 'a'.repeat(MAX_TEXT_CHARS + 1)
+test('embedBatchSync rejects a batch item longer than MAX_TEXT_BYTES with FL_EMBED_INPUT_TOO_LARGE', () => {
+  const oversized = 'a'.repeat(MAX_TEXT_BYTES + 1)
   assert.throws(
     () => minilm.embedBatchSync(['ok', oversized]),
     (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
   )
 })
 
-test('embedBatch (async) rejects a batch item longer than MAX_TEXT_CHARS with FL_EMBED_INPUT_TOO_LARGE', async () => {
-  const oversized = 'a'.repeat(MAX_TEXT_CHARS + 1)
+test('embedBatch (async) rejects a batch item longer than MAX_TEXT_BYTES with FL_EMBED_INPUT_TOO_LARGE', async () => {
+  const oversized = 'a'.repeat(MAX_TEXT_BYTES + 1)
   await assert.rejects(
     () => minilm.embedBatch(['ok', oversized]),
+    (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
+  )
+})
+
+// Discriminates BYTE-length from char-count semantics at the binding
+// boundary (same shape as crates/embed/src/service/tests.rs): 78 two-byte
+// 'é' + (MAX_TEXT_BYTES - 78) ASCII is exactly MAX_TEXT_BYTES characters
+// (admitted by a `>` char-count guard) but MAX_TEXT_BYTES + 78 bytes (over
+// the byte limit). A guard regressed to counting characters would ADMIT
+// this text; the byte guard rejects it.
+test('embedSync rejects multibyte text over the BYTE limit but at the char count', () => {
+  const multibyte = 'é'.repeat(78) + 'a'.repeat(MAX_TEXT_BYTES - 78)
+  assert.ok([...multibyte].length <= MAX_TEXT_BYTES, 'char count must not exceed the limit')
+  assert.ok(Buffer.byteLength(multibyte, 'utf8') > MAX_TEXT_BYTES, 'byte count must be over the limit')
+  assert.throws(
+    () => minilm.embedSync(multibyte),
     (err) => err.code === 'FL_EMBED_INPUT_TOO_LARGE',
   )
 })

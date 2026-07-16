@@ -65,7 +65,7 @@ causes construction to fail, not a delayed runtime error.
 **Request flow: `embed()` → `ensure_model()` → `encode_batch()`**
 
 1. Caller invokes `embed(texts, model)`.
-2. Validation: non-empty, batch size ≤ `DEFAULT_MAX_BATCH_SIZE`, each text ≤ `MAX_TEXT_CHARS`, model matches loaded model.
+2. Validation: non-empty, batch size ≤ `DEFAULT_MAX_BATCH_SIZE`, each text ≤ `MAX_TEXT_BYTES` (UTF-8 bytes), model matches loaded model.
 3. `ensure_model()` fast-path: if `OnceLock` is already set, return the reference immediately (no blocking, no contention).
 4. `ensure_model()` slow path: `spawn_blocking` runs `load_model_sync(model_config)` which calls either `BertModel::from_pretrained(name)` or `load_qwen_model(config)`.
 5. `BertModel::from_pretrained` resolves by name through the lattice-inference crate.

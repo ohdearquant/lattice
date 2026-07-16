@@ -32,7 +32,18 @@ pub const DEFAULT_MAX_BATCH_SIZE: usize = 1000;
 ///
 /// This limit prevents OOM attacks via extremely large input texts.
 /// 32KB is sufficient for most embedding use cases while preventing abuse.
-pub const MAX_TEXT_CHARS: usize = 32768;
+///
+/// Multibyte text can exceed this limit well before its `chars()` count does;
+/// the guard checks `str::len()` (bytes), not character count.
+pub const MAX_TEXT_BYTES: usize = 32768;
+
+/// Deprecated alias for [`MAX_TEXT_BYTES`] — the old name implied character
+/// count, but the guard has always counted UTF-8 bytes.
+#[deprecated(
+    since = "0.7.0",
+    note = "use MAX_TEXT_BYTES; this limit counts UTF-8 bytes, not chars"
+)]
+pub const MAX_TEXT_CHARS: usize = MAX_TEXT_BYTES;
 
 /// **Stable**: role of text in asymmetric retrieval.
 ///
