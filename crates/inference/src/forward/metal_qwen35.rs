@@ -1090,6 +1090,12 @@ mod inner {
 
     const MSL_Q4_TILED_SOURCE: &str = include_str!("shaders/gemm_q4_tiled.metal");
 
+    /// MSL source for the Q3 simdgroup-matrix tiled GEMM kernel (ADR-072 P1,
+    /// W3 MLP-only weight format, #420 Stage 2). Mirrors [`MSL_Q4_TILED_SOURCE`]
+    /// with the 16-byte plane-split 2+1 Q3 block payload substituted for Q4's
+    /// 20-byte asymmetric block. See `weights::q3_weights` for the on-disk format.
+    const MSL_Q3_TILED_SOURCE: &str = include_str!("shaders/gemm_q3_tiled.metal");
+
     /// MSL source for the Q8_0 simdgroup-matrix tiled GEMM kernel.
     ///
     /// Block layout: each Q8_0 block is 34 bytes — 2-byte f16 scale (little-endian)
@@ -1195,6 +1201,106 @@ mod inner {
         buf.set_label(label);
 
         Ok(Q4WeightBuf::from_mmap(buf, header.payload_offset, mmap))
+    }
+
+    /// A Q3-quantized weight buffer (ADR-072 P1, #420 Stage 2), paired with the
+    /// byte offset within `buffer` where the Q3 block payload starts.
+    ///
+    /// Restricted to MLP gate/up/down projections — see
+    /// [`crate::weights::q3_weights::validate_q3_mlp_role`]. Mirrors
+    /// [`Q4WeightBuf`]'s buffer/offset/mmap-lifetime structure exactly; kept as
+    /// a separate type (not a third `Q4WeightBuf` variant) so the MLP-only
+    /// role restriction is enforced at construction, not by convention.
+    pub(crate) struct Q3WeightBuf {
+        buffer: Buffer,
+        /// Byte offset of the Q3 payload within `buffer`.
+        payload_offset: u64,
+        // Keeps the mmap alive as long as the Metal buffer needs the memory.
+        _mmap: Option<memmap2::Mmap>,
+    }
+
+    impl Q3WeightBuf {
+        /// Wrap a normally-allocated Metal buffer (payload at offset 0).
+        ///
+        /// Mirrors `Q4WeightBuf::from_buffer` for API-shape parity; unused
+        /// until a non-mmap Q3 construction path (e.g. concatenated MoE-style
+        /// upload) exists — see w3_stage2_report.md "what shipped" for scope.
+        #[allow(dead_code)]
+        fn from_buffer(buffer: Buffer) -> Self {
+            Q3WeightBuf {
+                buffer,
+                payload_offset: 0,
+                _mmap: None,
+            }
+        }
+
+        /// Wrap a no-copy Metal buffer backed by `mmap` with a non-zero payload offset.
+        ///
+        /// Exercised today only by [`mmap_q3_weight`] and its tests; live
+        /// checkpoint loading does not yet route MLP tensors through it (see
+        /// w3_stage2_report.md "what shipped" for the scope decision).
+        #[allow(dead_code)]
+        fn from_mmap(buffer: Buffer, payload_offset: u64, mmap: memmap2::Mmap) -> Self {
+            Q3WeightBuf {
+                buffer,
+                payload_offset,
+                _mmap: Some(mmap),
+            }
+        }
+    }
+
+    /// Open `path`, mmap the whole file, and register it as a Metal no-copy
+    /// `StorageModeShared` buffer holding a Q3 tensor — mirrors [`mmap_q4_weight`].
+    ///
+    /// Fails closed on two independent conditions before the mmap ever reaches
+    /// the GPU: `tensor_name` must name an MLP gate/up/down projection (see
+    /// [`crate::weights::q3_weights::validate_q3_mlp_role`]), and the file's
+    /// declared header must not claim a payload larger than the file actually
+    /// holds (see `validate_q3_header_payload_bounds`) — the same truncation
+    /// hazard `mmap_q4_weight` guards against, since this path never reads the
+    /// payload bytes itself.
+    ///
+    /// # Safety invariant
+    /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
+    /// modified while the process is running.
+    ///
+    /// Not yet called from live checkpoint loading — see w3_stage2_report.md
+    /// "what shipped" for the scope decision (proven end-to-end by this
+    /// module's `mmap_q3_weight_*` tests instead).
+    #[cfg(feature = "metal-gpu")]
+    #[allow(dead_code)]
+    fn mmap_q3_weight(
+        device: &Device,
+        path: &std::path::Path,
+        tensor_name: &str,
+        label: &str,
+    ) -> Result<Q3WeightBuf, String> {
+        use crate::weights::q3_weights::validate_q3_mlp_role;
+
+        validate_q3_mlp_role(tensor_name).map_err(|e| e.to_string())?;
+
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        let header = crate::weights::q3_weights::read_q3_header(&mut file)
+            .map_err(|e| format!("failed to parse Q3 header {}: {e}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+            .len();
+        crate::weights::q3_weights::validate_q3_header_payload_bounds(&header, file_len, path)
+            .map_err(|e| format!("failed to validate Q3 payload {}: {e}", path.display()))?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+
+        let buf = device.new_buffer_with_bytes_no_copy(
+            mmap.as_ptr().cast(),
+            mmap.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        buf.set_label(label);
+
+        Ok(Q3WeightBuf::from_mmap(buf, header.payload_offset, mmap))
     }
 
     /// Weights for a GatedDeltaNet (linear attention) layer on GPU.
@@ -1611,6 +1717,8 @@ mod inner {
         gemv_q4: ComputePipelineState,
         gemm_q4: ComputePipelineState,
         gemm_q4_tiled: Option<ComputePipelineState>,
+        gemv_q3: ComputePipelineState,
+        gemm_q3_tiled: Option<ComputePipelineState>,
         conv1d_silu: ComputePipelineState,
         gdn_recurrence: ComputePipelineState,
         gdn_chunk_materialize_c32: ComputePipelineState,
@@ -3081,6 +3189,21 @@ mod inner {
                 device.new_compute_pipeline_state_with_function(&func).ok()
             };
 
+            let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
+                // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
+                // gemv_q3_decode-only (M=1) path on any device/compile failure.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
+                    return None;
+                }
+                let tiled_opts = CompileOptions::new();
+                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+                let lib = device
+                    .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
+                    .ok()?;
+                let func = lib.get_function("gemm_q3_tiled", None).ok()?;
+                device.new_compute_pipeline_state_with_function(&func).ok()
+            };
+
             let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
                 // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
                 if !device.supports_family(MTLGPUFamily::Apple7) {
@@ -3102,6 +3225,8 @@ mod inner {
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
+                gemv_q3: make_pipeline("gemv_q3_decode")?,
+                gemm_q3_tiled: make_optional_gemm_q3_tiled(),
                 rms_norm: make_pipeline("rms_norm_qwen35")?,
                 partial_rope: make_pipeline("partial_rope_interleaved")?,
                 per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
@@ -11975,6 +12100,72 @@ mod inner {
             }
         }
 
+        /// Dispatch a Q3 GEMV/GEMM (ADR-072 P1, #420 Stage 2), mirroring
+        /// `dispatch_gemm_q4` exactly: `gemv_q3_decode` for M=1 (the decode-path
+        /// kernel that matters — decode is weight-bandwidth-bound), the tiled
+        /// simdgroup-matrix `gemm_q3_tiled` for M>1.
+        ///
+        /// Unlike Q4/Q8, there is no naive fallback GEMM for M>1 — Stage 2 scope
+        /// is `gemv_q3_decode` + `gemm_q3_tiled` only (see #420 design note §3),
+        /// so `gemm_q3_tiled` must be present (Apple7+) whenever this is called
+        /// with M>1. Callers that need to support non-Apple7 prefill would need
+        /// a naive `gemm_q3` kernel, out of Stage 2 scope.
+        ///
+        /// # Panics
+        /// Panics if `k` is zero or not a multiple of 32, or if `m > 1` and
+        /// `gemm_q3_tiled` is unavailable (device is not Apple7+).
+        #[allow(dead_code)] // wired to real MLP dispatch is deferred past Stage 2 — see w3_stage2_report.md
+        fn dispatch_gemm_q3(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            x: &Buffer,
+            x_offset: u64,
+            qw: &Q3WeightBuf,
+            y: &Buffer,
+            y_offset: u64,
+            m: u32,
+            n: u32,
+            k: u32,
+        ) {
+            if m == 0 || n == 0 {
+                return;
+            }
+            assert!(
+                k > 0 && k.is_multiple_of(32),
+                "dispatch_gemm_q3 requires K to be non-zero and divisible by 32, got {k}"
+            );
+
+            if m == 1 {
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q3);
+                enc.set_buffer(0, Some(x), x_offset);
+                enc.set_buffer(1, Some(&qw.buffer), qw.payload_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &n as *const u32 as *const _);
+                enc.set_bytes(4, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(2) as u64, 1, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            } else {
+                let tiled = self.engine.pipelines.gemm_q3_tiled.as_ref().expect(
+                    "dispatch_gemm_q3 called with M>1 but gemm_q3_tiled is unavailable \
+                     (device is not Apple7+, or the tiled kernel failed to compile); \
+                     Stage 2 has no naive Q3 GEMM fallback",
+                );
+                enc.set_compute_pipeline_state(tiled);
+                enc.set_buffer(0, Some(&qw.buffer), qw.payload_offset);
+                enc.set_buffer(1, Some(x), x_offset);
+                enc.set_buffer(2, Some(y), y_offset);
+                enc.set_bytes(3, 4, &m as *const u32 as *const _);
+                enc.set_bytes(4, 4, &n as *const u32 as *const _);
+                enc.set_bytes(5, 4, &k as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            }
+        }
+
         // -----------------------------------------------------------------------
         // GDN chunked-scan helpers (default ON; LATTICE_GDN_CHUNKED=0 opts out)
         // -----------------------------------------------------------------------
@@ -14792,6 +14983,21 @@ mod inner {
                 device.new_compute_pipeline_state_with_function(&func).ok()
             };
 
+            let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
+                // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
+                // gemv_q3_decode-only (M=1) path on any device/compile failure.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
+                    return None;
+                }
+                let tiled_opts = CompileOptions::new();
+                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+                let lib = device
+                    .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
+                    .ok()?;
+                let func = lib.get_function("gemm_q3_tiled", None).ok()?;
+                device.new_compute_pipeline_state_with_function(&func).ok()
+            };
+
             let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
                 // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
                 if !device.supports_family(MTLGPUFamily::Apple7) {
@@ -14813,6 +15019,8 @@ mod inner {
                 gemv_q4: make_pipeline("gemv_q4_decode")?,
                 gemm_q4: make_pipeline("gemm_q4")?,
                 gemm_q4_tiled: make_optional_gemm_q4_tiled(),
+                gemv_q3: make_pipeline("gemv_q3_decode")?,
+                gemm_q3_tiled: make_optional_gemm_q3_tiled(),
                 rms_norm: make_pipeline("rms_norm_qwen35")?,
                 partial_rope: make_pipeline("partial_rope_interleaved")?,
                 per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
@@ -19957,6 +20165,379 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 result.is_ok(),
                 "mmap_q4_weight must accept a fully populated payload: {:?}",
                 result.err()
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Q3 MLP-only weight format (ADR-072 P1, #420 Stage 2): loader
+        // fail-closed gates for `mmap_q3_weight`.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn mmap_q3_weight_rejects_non_mlp_tensor_role() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("attn.q3");
+            let tensor = crate::weights::q3_weights::Q3Tensor {
+                blocks: vec![
+                    crate::weights::q3_weights::Q3Block {
+                        scale: 0,
+                        bias: 0,
+                        packed: [0u8; 12]
+                    };
+                    2
+                ],
+                shape: vec![64],
+                original_len: 64,
+            };
+            crate::weights::q3_weights::save_q3_file(&path, &tensor)
+                .expect("save well-formed q3 file");
+
+            let result = mmap_q3_weight(
+                &device,
+                &path,
+                "model.layers.0.self_attn.q_proj.weight",
+                "attn-role-rejected",
+            );
+            assert!(
+                result.is_err(),
+                "mmap_q3_weight must reject a non-MLP tensor role even with a well-formed payload"
+            );
+        }
+
+        #[test]
+        fn mmap_q3_weight_rejects_truncated_block_payload_before_dispatch() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("truncated_payload.q3");
+            let mut file = std::fs::File::create(&path).expect("create truncated q3");
+            use std::io::Write;
+            file.write_all(b"KHQ3").expect("write magic");
+            file.write_all(&1_u32.to_le_bytes()).expect("write version");
+            file.write_all(&1_u32.to_le_bytes()).expect("write ndim");
+            file.write_all(&64_u64.to_le_bytes()).expect("write shape");
+            file.write_all(&64_u64.to_le_bytes())
+                .expect("write original_len");
+            file.flush().expect("flush q3 header");
+            // original_len=64 -> 2 blocks -> 32 required payload bytes; file
+            // ends right at payload_offset, so the payload is entirely missing.
+
+            let result = mmap_q3_weight(
+                &device,
+                &path,
+                "model.layers.0.mlp.gate_proj.weight",
+                "truncated-payload-proof",
+            );
+            assert!(
+                result.is_err(),
+                "mmap_q3_weight must reject a KHQ3 header whose original_len requires \
+                 32 payload bytes but whose file ends at payload_offset"
+            );
+        }
+
+        #[test]
+        fn mmap_q3_weight_accepts_fully_populated_mlp_payload() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("full_payload.q3");
+            let tensor = crate::weights::q3_weights::Q3Tensor {
+                blocks: vec![
+                    crate::weights::q3_weights::Q3Block {
+                        scale: 0,
+                        bias: 0,
+                        packed: [0u8; 12]
+                    };
+                    2
+                ],
+                shape: vec![64],
+                original_len: 64,
+            };
+            crate::weights::q3_weights::save_q3_file(&path, &tensor)
+                .expect("save well-formed q3 file");
+
+            let result = mmap_q3_weight(
+                &device,
+                &path,
+                "model.layers.0.mlp.down_proj.weight",
+                "full-payload-accept",
+            );
+            assert!(
+                result.is_ok(),
+                "mmap_q3_weight must accept a well-formed MLP-role payload: {:?}",
+                result.err()
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Q3 Metal kernel parity (ADR-072 P1, #420 Stage 2): `gemv_q3_decode`
+        // and `gemm_q3_tiled` dequantize plane-split 2+1 Q3 blocks to f16 in
+        // -kernel and must match the CPU `gemv_q3_reference` / `gemm_q3_reference`
+        // oracle (`weights::q3_weights`) within an f16-accumulation-driven bound.
+        // -------------------------------------------------------------------
+
+        /// Build a Q3 weight buffer (row-major `[N, K]`, one row of packed
+        /// blocks per output neuron — matches `gemv_q3_decode`/`gemm_q3_tiled`'s
+        /// `QW[row * row_bytes + ...]` indexing) and its packed-bytes copy for
+        /// the CPU reference oracle. Deterministic LCG so runs are reproducible.
+        fn make_q3_weight_ref(device: &Device, seed: u64, n: usize, k: usize) -> (Buffer, Vec<u8>) {
+            assert_eq!(k % 32, 0, "K must be divisible by 32 for Q3 GEMV/GEMM");
+            let mut rng = seed;
+            let mut next = || -> f32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            let weights_f32: Vec<f32> = (0..n * k).map(|_| next()).collect();
+            use crate::weights::q3_weights::quantize_row_q3_0;
+            let mut packed_bytes = Vec::with_capacity(n * (k / 32) * 16);
+            for row in weights_f32.chunks_exact(k) {
+                packed_bytes.extend_from_slice(&quantize_row_q3_0(row).unwrap());
+            }
+            let buf = device.new_buffer_with_data(
+                packed_bytes.as_ptr() as *const _,
+                packed_bytes.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            buf.set_label("test_qw_q3");
+            (buf, packed_bytes)
+        }
+
+        /// Deterministic activation RNG shared by the Q3 GEMV/GEMM parity tests.
+        fn q3_test_activation(seed: u64, len: usize) -> Vec<f32> {
+            let mut rng = seed;
+            let mut next = || -> f32 {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((rng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+            };
+            (0..len).map(|_| next()).collect()
+        }
+
+        #[test]
+        fn gemv_q3_decode_matches_cpu_reference_across_shapes() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            let pipeline = &state.engine.pipelines.gemv_q3;
+            let queue = &state.engine.queue;
+
+            use crate::weights::q3_weights::gemv_q3_reference;
+
+            // Shapes exercising tile-adjacent geometry: N=1 (single output row),
+            // N=5 (odd, not a multiple of NR=2), N=33 with a 3-block K.
+            for &(n, k, seed) in &[
+                (1usize, 32usize, 0x1111_u64),
+                (5usize, 64usize, 0x2222_u64),
+                (33usize, 96usize, 0x3333_u64),
+            ] {
+                let (qw_buf, packed) = make_q3_weight_ref(&device, seed, n, k);
+                let x = q3_test_activation(seed ^ 0xABCD, k);
+                let x_buf = device.new_buffer_with_data(
+                    x.as_ptr() as *const _,
+                    (x.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let y_buf =
+                    device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipeline);
+                enc.set_buffer(0, Some(&x_buf), 0);
+                enc.set_buffer(1, Some(&qw_buf), 0);
+                enc.set_buffer(2, Some(&y_buf), 0);
+                enc.set_bytes(3, 4, &(n as u32) as *const u32 as *const _);
+                enc.set_bytes(4, 4, &(k as u32) as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((n as u64).div_ceil(2), 1, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                let y_gpu: &[f32] =
+                    unsafe { std::slice::from_raw_parts(y_buf.contents().cast::<f32>(), n) };
+                let y_ref = gemv_q3_reference(&x, &packed, n, k);
+
+                for i in 0..n {
+                    let diff = (y_gpu[i] - y_ref[i]).abs();
+                    assert!(
+                        diff < 5e-3,
+                        "shape N={n} K={k}: row {i}: gpu={} ref={} diff={diff}",
+                        y_gpu[i],
+                        y_ref[i]
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return;
+            }
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            // On Apple7+ the tiled pipeline MUST exist — a missing pipeline here
+            // is the exact regression this gate guards against, so fail loudly
+            // rather than `return` (mirrors `gemm_q4_tiled_vs_naive_numeric_differential`).
+            let tiled_pipeline = state.engine.pipelines.gemm_q3_tiled.as_ref().expect(
+                "gemm_q3_tiled must be present on Apple7+ (else this gate passes vacuously)",
+            );
+            let queue = &state.engine.queue;
+
+            use crate::weights::q3_weights::gemm_q3_reference;
+
+            // Shape A: M=64,N=64,K=64 exact tile multiples (BM=64, BN=32, BK=32).
+            // Shape B: M=72,N=48,K=64 non-multiple of BM/BN — exercises the
+            //   `gm<M`/`gn<N` boundary zero-pad guards in the tiled kernel.
+            // Shape C: M=5,N=9,K=96 small odd M/N with a 3-block K depth.
+            for &(m, n, k, seed) in &[
+                (64usize, 64usize, 64usize, 0xAAAA_u64),
+                (72usize, 48usize, 64usize, 0xBBBB_u64),
+                (5usize, 9usize, 96usize, 0xCCCC_u64),
+            ] {
+                let (qw_buf, packed) = make_q3_weight_ref(&device, seed, n, k);
+                let x = q3_test_activation(seed ^ 0xDEAD, m * k);
+                let x_buf = device.new_buffer_with_data(
+                    x.as_ptr() as *const _,
+                    (x.len() * 4) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let y_buf =
+                    device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(tiled_pipeline);
+                enc.set_buffer(0, Some(&qw_buf), 0);
+                enc.set_buffer(1, Some(&x_buf), 0);
+                enc.set_buffer(2, Some(&y_buf), 0);
+                enc.set_bytes(3, 4, &(m as u32) as *const u32 as *const _);
+                enc.set_bytes(4, 4, &(n as u32) as *const u32 as *const _);
+                enc.set_bytes(5, 4, &(k as u32) as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(64), 1),
+                    MTLSize::new(32, 4, 1),
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+
+                let y_gpu: &[f32] =
+                    unsafe { std::slice::from_raw_parts(y_buf.contents().cast::<f32>(), m * n) };
+                let y_ref = gemm_q3_reference(&x, &packed, m, n, k);
+
+                let mut max_diff = 0.0f32;
+                for i in 0..m * n {
+                    let d = (y_gpu[i] - y_ref[i]).abs();
+                    if d > max_diff {
+                        max_diff = d;
+                    }
+                }
+                // Tiled kernel stages X/W in half precision, same as
+                // gemm_q4_tiled (documented ~2.9e-3 half-staging error on top
+                // of quant error there); bound generously at ~15x that headroom
+                // since Q3's coarser 8-level quantization widens the per-weight
+                // step size relative to Q4's 16 levels.
+                assert!(
+                    max_diff < 0.05,
+                    "shape M={m} N={n} K={k}: max|gpu-ref| = {max_diff} exceeds bound"
+                );
+            }
+        }
+
+        #[test]
+        fn gemv_q3_decode_mutation_sensitive_high_plane_bit() {
+            // Guards the Metal kernel's high-plane read: if `gemv_q3_decode`
+            // had a bug that dropped the high-1-bit plane (silently truncating
+            // every dequant to the 0..=3 range), flipping a high-plane bit in
+            // the packed weight buffer would NOT change the kernel's output.
+            // This proves the kernel actually consumes `packed[8..12]`, not
+            // just `packed[0..8]` — the same bug class the Stage-1
+            // `plane_split_mutation_sensitive_high_bit` test guards at the
+            // pack/unpack level (weights/q3_weights.rs), now proven through the
+            // real GPU dispatch path this Stage adds.
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            let pipeline = &state.engine.pipelines.gemv_q3;
+            let queue = &state.engine.queue;
+
+            let (n, k) = (2usize, 32usize);
+            let (_qw_buf, packed) = make_q3_weight_ref(&device, 0x9999_u64, n, k);
+            let mut corrupted = packed.clone();
+            // Row 0's block occupies packed[0..16); its high-plane byte 0
+            // (values 0..8) is packed[12] (offset 4 header + 8 low-plane bytes).
+            corrupted[12] ^= 0x01;
+
+            let x = q3_test_activation(0x9999_u64 ^ 0x5A5A, k);
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let run = |packed_bytes: &[u8]| -> Vec<f32> {
+                let qw_buf = device.new_buffer_with_data(
+                    packed_bytes.as_ptr() as *const _,
+                    packed_bytes.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let y_buf =
+                    device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let cmd = queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipeline);
+                enc.set_buffer(0, Some(&x_buf), 0);
+                enc.set_buffer(1, Some(&qw_buf), 0);
+                enc.set_buffer(2, Some(&y_buf), 0);
+                enc.set_bytes(3, 4, &(n as u32) as *const u32 as *const _);
+                enc.set_bytes(4, 4, &(k as u32) as *const u32 as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((n as u64).div_ceil(2), 1, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                unsafe { std::slice::from_raw_parts(y_buf.contents().cast::<f32>(), n) }.to_vec()
+            };
+
+            let y_correct = run(&packed);
+            let y_corrupted = run(&corrupted);
+
+            assert_ne!(
+                y_correct[0], y_corrupted[0],
+                "flipping a high-plane bit in row 0's block must change gemv_q3_decode's \
+                 output for row 0 — if it doesn't, the kernel is not reading the \
+                 high-1-bit plane (packed[8..12])"
+            );
+            assert_eq!(
+                y_correct[1], y_corrupted[1],
+                "corrupting row 0's block must not affect row 1's output"
             );
         }
 

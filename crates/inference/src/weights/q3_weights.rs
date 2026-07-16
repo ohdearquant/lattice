@@ -488,6 +488,34 @@ pub fn save_q3_file(path: &std::path::Path, tensor: &Q3Tensor) -> std::io::Resul
     f.write_all(block_bytes)
 }
 
+/// Restrict Q3 loading to MLP gate/up/down projections (ADR-072 P1 scope).
+///
+/// The W3 format is a decode-bandwidth play for the MLP GEMM group only —
+/// attention and GDN stay Q4/Q8 (role-aware precision, #423). Any tensor name
+/// outside the MLP projection set is rejected closed rather than silently
+/// accepted, so a mixed checkpoint can never route an attention/GDN weight
+/// through the 3-bit path by mistake.
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if `tensor_name` does not name an
+/// MLP `gate_proj` / `up_proj` / `down_proj` / fused `gate_up_proj` tensor.
+pub fn validate_q3_mlp_role(tensor_name: &str) -> Result<(), InferenceError> {
+    let is_mlp_proj = tensor_name.contains(".mlp.gate_proj")
+        || tensor_name.contains(".mlp.up_proj")
+        || tensor_name.contains(".mlp.down_proj")
+        || tensor_name.contains(".mlp.gate_up_proj");
+    if is_mlp_proj {
+        Ok(())
+    } else {
+        Err(InferenceError::InvalidInput(format!(
+            "Q3 weight format is restricted to MLP gate/up/down projections \
+             (ADR-072 P1); tensor '{tensor_name}' is outside that set and must \
+             not be loaded as Q3"
+        )))
+    }
+}
+
 /// Header metadata returned by [`read_q3_header`] without allocating blocks.
 pub struct Q3FileHeader {
     /// Tensor shape.
@@ -582,6 +610,62 @@ pub fn read_q3_header(
     })
 }
 
+/// Validate a [`Q3FileHeader`] against the file's actual byte length before the
+/// payload is handed to a no-copy mmap buffer (the Metal loader never reads the
+/// payload itself, so a missing bounds check here would let a truncated
+/// on-disk checkpoint reach GPU dispatch and read past the mapped region).
+///
+/// Mirrors `q4_weights::validate_q4_header_payload_bounds` with the 16-byte
+/// Q3 block size in place of Q4's 20.
+///
+/// # Errors
+///
+/// Returns an error if `shape.iter().product()` disagrees with `original_len`,
+/// or if `file_len` is smaller than `payload_offset + n_blocks * 16`.
+///
+/// Only called from `mmap_q3_weight` (crates/inference/src/forward/metal_qwen35.rs)
+/// today, which live checkpoint loading does not yet reach — see
+/// w3_stage2_report.md "what shipped" for the scope decision.
+#[allow(dead_code)]
+pub(crate) fn validate_q3_header_payload_bounds(
+    header: &Q3FileHeader,
+    file_len: u64,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shape_product = header
+        .shape
+        .iter()
+        .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
+        .ok_or("shape dims overflow usize")?;
+    if shape_product != header.original_len {
+        return Err(format!(
+            "{}: shape product {shape_product} (shape={:?}) != original_len {}",
+            path.display(),
+            header.shape,
+            header.original_len
+        )
+        .into());
+    }
+
+    let payload_bytes = header
+        .original_len
+        .div_ceil(32)
+        .checked_mul(Q3_BLOCK_BYTES)
+        .ok_or("Q3 block payload byte count overflows usize")? as u64;
+    let required_len = header
+        .payload_offset
+        .checked_add(payload_bytes)
+        .ok_or("Q3 payload end offset overflows u64")?;
+    if file_len < required_len {
+        return Err(format!(
+            "{}: file truncated below Q3 block payload ({file_len} bytes < required {required_len})",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Load a [`Q3Tensor`] from a `.q3` file written by [`save_q3_file`].
 ///
 /// # Errors
@@ -654,6 +738,75 @@ pub fn load_q3_file(path: &std::path::Path) -> Result<Q3Tensor, Box<dyn std::err
         shape,
         original_len,
     })
+}
+
+// ---------------------------------------------------------------------------
+// CPU reference GEMV / GEMM — parity oracle for the Metal Q3 kernels
+// ---------------------------------------------------------------------------
+
+/// CPU reference GEMV: `y[n] = sum_k x[k] * dequant(qweight)[n, k]`.
+///
+/// `qweight` is `N` rows of packed Q3 blocks in the same row-major-per-row
+/// layout the Metal kernels read (`row_bytes = (K/32) * 16` per row, produced
+/// by calling [`quantize_row_q3_0`] once per output row). This is the
+/// straight-line f32 dequant-then-dot reference the Metal `gemv_q3_decode`
+/// kernel is checked against; it does no tiling and no reduced precision.
+///
+/// # Panics
+///
+/// Panics if `K` is not a multiple of 32, or if `qweight.len()` does not equal
+/// `N * (K / 32) * Q3_BLOCK_BYTES`.
+pub fn gemv_q3_reference(x: &[f32], qweight: &[u8], n: usize, k: usize) -> Vec<f32> {
+    assert_eq!(k % 32, 0, "K must be divisible by 32 for Q3 GEMV");
+    let row_bytes = (k / 32) * Q3_BLOCK_BYTES;
+    assert_eq!(
+        qweight.len(),
+        n * row_bytes,
+        "qweight length does not match N * (K/32) * Q3_BLOCK_BYTES"
+    );
+    let mut y = vec![0.0f32; n];
+    for (row_idx, row_bytes_slice) in qweight.chunks_exact(row_bytes).enumerate() {
+        let w = dequantize_row_q3_0(row_bytes_slice, k);
+        y[row_idx] = x.iter().zip(w.iter()).map(|(&xv, &wv)| xv * wv).sum();
+    }
+    y
+}
+
+/// CPU reference GEMM: `Y[m, n] = sum_k X[m, k] * dequant(qweight)[n, k]`.
+///
+/// `X` is row-major `[M, K]`, `qweight` is `N` rows of packed Q3 blocks (same
+/// per-row layout as [`gemv_q3_reference`]), `Y` is row-major `[M, N]`. The
+/// parity oracle for the Metal `gemm_q3_tiled` kernel.
+///
+/// # Panics
+///
+/// Panics if `K` is not a multiple of 32, or if `qweight.len()` does not equal
+/// `N * (K / 32) * Q3_BLOCK_BYTES`, or if `x.len()` does not equal `M * K`.
+pub fn gemm_q3_reference(x: &[f32], qweight: &[u8], m: usize, n: usize, k: usize) -> Vec<f32> {
+    assert_eq!(k % 32, 0, "K must be divisible by 32 for Q3 GEMM");
+    assert_eq!(x.len(), m * k, "x length does not match M * K");
+    let row_bytes = (k / 32) * Q3_BLOCK_BYTES;
+    assert_eq!(
+        qweight.len(),
+        n * row_bytes,
+        "qweight length does not match N * (K/32) * Q3_BLOCK_BYTES"
+    );
+    let w_deq: Vec<Vec<f32>> = qweight
+        .chunks_exact(row_bytes)
+        .map(|row| dequantize_row_q3_0(row, k))
+        .collect();
+    let mut y = vec![0.0f32; m * n];
+    for mi in 0..m {
+        let xrow = &x[mi * k..(mi + 1) * k];
+        for ni in 0..n {
+            y[mi * n + ni] = xrow
+                .iter()
+                .zip(w_deq[ni].iter())
+                .map(|(&xv, &wv)| xv * wv)
+                .sum();
+        }
+    }
+    y
 }
 
 #[cfg(test)]
@@ -881,5 +1034,155 @@ mod tests {
         // 32 weights in 16 bytes = 4.0 bits per weight (the ADR-072 W3 target).
         let bits_per_weight = (Q3_BLOCK_BYTES * 8) as f32 / 32.0;
         assert_eq!(bits_per_weight, 4.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // MLP-role fail-closed loader gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mlp_role_accepts_gate_up_down_and_fused() {
+        assert!(validate_q3_mlp_role("model.layers.3.mlp.gate_proj.weight").is_ok());
+        assert!(validate_q3_mlp_role("model.layers.3.mlp.up_proj.weight").is_ok());
+        assert!(validate_q3_mlp_role("model.layers.3.mlp.down_proj.weight").is_ok());
+        assert!(validate_q3_mlp_role("model.layers.3.mlp.gate_up_proj.weight").is_ok());
+    }
+
+    #[test]
+    fn mlp_role_rejects_attention_and_gdn_tensors() {
+        // Attention and GDN weights must stay Q4/Q8 (ADR-072 P1 scope) — any Q3
+        // claim on these tensor names must fail closed, not silently load.
+        for name in [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.layers.0.mlp.experts.gate_up_proj", // MoE routed experts, not the dense MLP path
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+        ] {
+            assert!(
+                validate_q3_mlp_role(name).is_err(),
+                "expected '{name}' to be rejected as outside the Q3 MLP role set"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Header payload-bounds fail-closed gate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn header_bounds_rejects_truncated_payload() {
+        let header = Q3FileHeader {
+            shape: vec![64],
+            original_len: 64, // 2 blocks * 16 bytes = 32 bytes required
+            payload_offset: 20,
+        };
+        // File is one byte short of the required 20 + 32 = 52 bytes.
+        let err = validate_q3_header_payload_bounds(&header, 51, std::path::Path::new("t.q3"));
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn header_bounds_accepts_exact_payload() {
+        let header = Q3FileHeader {
+            shape: vec![64],
+            original_len: 64,
+            payload_offset: 20,
+        };
+        assert!(
+            validate_q3_header_payload_bounds(&header, 52, std::path::Path::new("t.q3")).is_ok()
+        );
+    }
+
+    #[test]
+    fn header_bounds_rejects_shape_mismatch() {
+        let header = Q3FileHeader {
+            shape: vec![63], // disagrees with original_len
+            original_len: 64,
+            payload_offset: 20,
+        };
+        assert!(
+            validate_q3_header_payload_bounds(&header, 1_000, std::path::Path::new("t.q3"))
+                .is_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CPU reference GEMV/GEMM — parity oracle sanity + mutation sensitivity
+    // -----------------------------------------------------------------------
+
+    fn synth_q3_weight_matrix(seed: u64, n: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+        let mut rng = seed;
+        let mut next = || -> f32 {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((rng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let weights_f32: Vec<f32> = (0..n * k).map(|_| next()).collect();
+        let mut packed = Vec::with_capacity(n * (k / 32) * Q3_BLOCK_BYTES);
+        let mut deq = Vec::with_capacity(n * k);
+        for row in weights_f32.chunks_exact(k) {
+            let row_packed = quantize_row_q3_0(row).unwrap();
+            deq.extend_from_slice(&dequantize_row_q3_0(&row_packed, k));
+            packed.extend_from_slice(&row_packed);
+        }
+        (packed, deq)
+    }
+
+    #[test]
+    fn gemv_reference_matches_naive_dequant_dot_product() {
+        let (n, k) = (17usize, 64usize);
+        let (packed, deq) = synth_q3_weight_matrix(0x1234_5678, n, k);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01 - 0.32).collect();
+        let y = gemv_q3_reference(&x, &packed, n, k);
+        for (ni, &yv) in y.iter().enumerate() {
+            let expect: f32 = x
+                .iter()
+                .zip(&deq[ni * k..(ni + 1) * k])
+                .map(|(&xv, &wv)| xv * wv)
+                .sum();
+            assert!((yv - expect).abs() < 1e-3, "row {ni}: {yv} vs {expect}");
+        }
+    }
+
+    #[test]
+    fn gemm_reference_matches_gemv_reference_per_row() {
+        // GEMM with M=1 must reduce to GEMV — cross-checks the two oracles
+        // against each other in addition to the naive-dot check above.
+        let (n, k) = (9usize, 96usize);
+        let (packed, _deq) = synth_q3_weight_matrix(0xC0FF_EE11, n, k);
+        let x: Vec<f32> = (0..k).map(|i| ((i * 7) % 13) as f32 * 0.05 - 0.3).collect();
+        let y_gemv = gemv_q3_reference(&x, &packed, n, k);
+        let y_gemm = gemm_q3_reference(&x, &packed, 1, n, k);
+        assert_eq!(y_gemv, y_gemm);
+    }
+
+    #[test]
+    fn gemv_reference_mutation_sensitive_high_plane_bit() {
+        // Flip one high-plane bit in the packed weight buffer (the same class
+        // of bug the Stage-1 `plane_split_mutation_sensitive_high_bit` test
+        // guards at the pack/unpack level) and assert the GEMV parity oracle's
+        // output changes — this is the oracle the Metal kernel differential
+        // test compares against, so it must itself be sensitive to packing
+        // corruption or a corrupted kernel could pass parity vacuously.
+        let (n, k) = (4usize, 32usize);
+        let (mut packed, _deq) = synth_q3_weight_matrix(0xFEED_FACE, n, k);
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.02 - 0.3).collect();
+        let y_before = gemv_q3_reference(&x, &packed, n, k);
+
+        // Row 0's block: bytes [0..16) = [scale(2) bias(2) low2(8) hi(4)].
+        // Flip a bit in the high-plane byte at packed offset 4+8+0 = 12.
+        packed[12] ^= 0x01;
+
+        let y_after = gemv_q3_reference(&x, &packed, n, k);
+        assert_ne!(
+            y_before[0], y_after[0],
+            "flipping a high-plane bit must change the dequantized GEMV output \
+             for the row whose block it belongs to"
+        );
     }
 }
