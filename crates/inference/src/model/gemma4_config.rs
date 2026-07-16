@@ -374,15 +374,19 @@ impl Gemma4Config {
                 self.num_attention_heads, self.num_key_value_heads
             )));
         }
-        if self.head_dim == 0 {
-            return Err(InferenceError::Inference(
-                "invalid Gemma 4 config.json: head_dim must be > 0".to_string(),
-            ));
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: head_dim ({}) must be even and > 0 \
+                 (stride-half RoPE pairs (i, head_dim/2 + i))",
+                self.head_dim
+            )));
         }
-        if self.global_head_dim == 0 {
-            return Err(InferenceError::Inference(
-                "invalid Gemma 4 config.json: global_head_dim must be > 0".to_string(),
-            ));
+        if self.global_head_dim == 0 || !self.global_head_dim.is_multiple_of(2) {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: global_head_dim ({}) must be even and > 0 \
+                 (stride-half RoPE pairs (i, head_dim/2 + i))",
+                self.global_head_dim
+            )));
         }
         if self.sliding_window == 0 {
             return Err(InferenceError::Inference(
@@ -800,6 +804,35 @@ mod tests {
         assert!(
             msg.contains("is_kv_shared_layer") || msg.contains("num_kv_shared_layers"),
             "must name the KV-shared-layer field: {msg}"
+        );
+    }
+
+    #[test]
+    fn odd_head_dim_errors_naming_field() {
+        // gemma4_apply_rope's stride-half pairing requires even widths; an
+        // odd head_dim must die here with a typed error, not deep in the
+        // forward pass at the op-level assert.
+        let mut json = pinned_config_value();
+        json["text_config"]["head_dim"] = serde_json::json!(255);
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("an odd head_dim must yield an InferenceError");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("head_dim (255)") && msg.contains("even"),
+            "error must name head_dim and evenness: {msg}"
+        );
+    }
+
+    #[test]
+    fn odd_global_head_dim_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["global_head_dim"] = serde_json::json!(511);
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("an odd global_head_dim must yield an InferenceError");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("global_head_dim (511)") && msg.contains("even"),
+            "error must name global_head_dim and evenness: {msg}"
         );
     }
 

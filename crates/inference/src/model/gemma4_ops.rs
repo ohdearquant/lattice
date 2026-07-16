@@ -330,6 +330,13 @@ pub fn gemma4_apply_rope(
         seq_len * head_dim,
         "sin must be seq_len*head_dim"
     );
+    // Stride-half pairing requires an even head_dim; an odd width would
+    // leave the last lane outside every (i, half+i) pair and silently
+    // diverge from the rotate-half reference.
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "head_dim must be even and > 0 for stride-half RoPE, got {head_dim}"
+    );
     let half = head_dim / 2;
     for t in 0..seq_len {
         let cos_row = &cos[t * head_dim..(t + 1) * head_dim];
@@ -343,7 +350,8 @@ pub fn gemma4_apply_rope(
             // `(i, half+i)` only reads its own pre-update values (`x1`,
             // `x2`), so writing both outputs of a pair before moving to the
             // next pair is order-independent and bit-identical to the
-            // original two-pass form.
+            // original two-pass form (even head_dim enforced above; pairs
+            // are disjoint only in that domain).
             for i in 0..half {
                 let x1 = row[i];
                 let x2 = row[half + i];
@@ -792,6 +800,64 @@ mod tests {
             "global RoPE fed the local theta must diverge by at least the predeclared \
              mutation-separation floor (diff {diff_global}, floor {floor})"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "head_dim must be even")]
+    fn apply_rope_rejects_odd_head_dim() {
+        // The in-place stride-half loop pairs (i, half+i); an odd width has
+        // an unpaired last lane the loop would silently leave un-rotated
+        // (the removed two-pass form scaled it by cos). Reject, don't drift.
+        let head_dim = 5;
+        let mut x = vec![1.0_f32; head_dim];
+        let cos = vec![1.0_f32; head_dim];
+        let sin = vec![0.0_f32; head_dim];
+        gemma4_apply_rope(&mut x, &cos, &sin, 1, 1, head_dim);
+    }
+
+    #[test]
+    fn apply_rope_bit_identical_to_two_pass_reference() {
+        // Even-width exact-bit regression: the in-place pair loop must match
+        // the removed materialize-rotate-half-then-elementwise form to the
+        // bit on finite values (the claim the hot-path rewrite rests on).
+        let (seq_len, heads, head_dim) = (3, 2, 8);
+        let half = head_dim / 2;
+        let n = seq_len * heads * head_dim;
+        // Deterministic, sign-varied, non-round values.
+        let val = |i: usize| ((i as f32) * 0.7311 - 3.1).sin() * 2.3;
+        let x_orig: Vec<f32> = (0..n).map(val).collect();
+        let cos: Vec<f32> = (0..seq_len * head_dim).map(|i| val(i + 17)).collect();
+        let sin: Vec<f32> = (0..seq_len * head_dim).map(|i| val(i + 41)).collect();
+
+        // Reference: the old two-pass form.
+        let mut expected = x_orig.clone();
+        for t in 0..seq_len {
+            let cos_row = &cos[t * head_dim..(t + 1) * head_dim];
+            let sin_row = &sin[t * head_dim..(t + 1) * head_dim];
+            for h in 0..heads {
+                let base = (t * heads + h) * head_dim;
+                let row = &mut expected[base..base + head_dim];
+                let mut rotated = vec![0.0_f32; head_dim];
+                for i in 0..half {
+                    rotated[i] = -row[half + i];
+                    rotated[half + i] = row[i];
+                }
+                for i in 0..head_dim {
+                    row[i] = row[i] * cos_row[i] + rotated[i] * sin_row[i];
+                }
+            }
+        }
+
+        let mut actual = x_orig;
+        gemma4_apply_rope(&mut actual, &cos, &sin, seq_len, heads, head_dim);
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "lane {i}: in-place RoPE not bit-identical to two-pass reference \
+                 ({a} vs {e})"
+            );
+        }
     }
 
     #[test]
