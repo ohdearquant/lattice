@@ -690,6 +690,40 @@ jobs:
           grep -q 'LATTICE_VISION_S4_E2E_MUTATION_COSINE' vision-s3-gate.log
           grep -q 'LATTICE_VISION_S5B_GREEDY_TOKENS' vision-s3-gate.log
 
+      # MP2 Metal injection gate: `forward_step_injected_logits_differ_by_row_content`,
+      # `generate_multimodal_vision_injection_is_mutation_sensitive`,
+      # `injected_embedding_logits_are_independent_of_token_id`, and
+      # `injected_embedding_never_falls_back_to_token_lookup`
+      # (crates/inference/src/forward/metal_qwen35.rs) previously ran nowhere in
+      # CI: they early-returned on a missing Metal device or checkpoint instead
+      # of failing, and no workflow selected them (the macOS `feature-matrix`
+      # job's `--lib q4` filter does not match their names). This step reuses
+      # this job's already-downloaded checkpoint (no second ~2 min
+      # checkout+download job) and its macos-latest runner, which exposes a
+      # PARAVIRTUAL Metal device — sufficient here because none of these four
+      # tests touch the Apple7-gated tiled-GEMM path (decode-only GEMV/element-wise
+      # dispatch), the same reasoning the f16-KV-cache Metal gate in ci.yml
+      # documents. LATTICE_METAL_TEST_ENFORCE=1 makes a missing device or
+      # checkpoint a hard failure instead of the default dev-run skip; the
+      # `--lib inject` filter also matches two unrelated pre-existing tests
+      # (a QuaRot seed round-trip test and the CPU f16 injection oracle), so
+      # the exact-count grep below is 6, not 4 -- update it in the same PR
+      # if the `inject`-matching test surface changes.
+      - name: Run MP2 Metal injection gate (fail-closed)
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          if cargo test --release -p lattice-inference --features f16,metal-gpu \
+            --lib inject -- --nocapture --test-threads=1 > vision-mp2-inject-gate.log 2>&1
+          then
+            cat vision-mp2-inject-gate.log
+          else
+            status=$?
+            cat vision-mp2-inject-gate.log
+            exit "$status"
+          fi
+          grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
   # unlike q4-ppl-quality, whose PPL golden bootstraps on the runner — this has
