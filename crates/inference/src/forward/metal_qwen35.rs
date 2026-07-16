@@ -1070,6 +1070,7 @@ mod inner {
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
+    use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
     use metal::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5850,6 +5851,7 @@ mod inner {
                 capture_hidden,
                 false,
                 GdnStateTrafficScope::Decode,
+                None,
             )
         }
 
@@ -5865,7 +5867,30 @@ mod inner {
             capture_hidden: bool,
             scope: GdnStateTrafficScope,
         ) -> MetalStepOutput {
-            self.forward_step_inner_impl(token_id, position, capture_hidden, false, scope)
+            self.forward_step_inner_impl(token_id, position, capture_hidden, false, scope, None)
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal S5 / MP2): run a single decoder step with the
+        /// token-embedding lookup REPLACED by a caller-supplied row (HF `masked_scatter`
+        /// semantics — mirrors `cpu_f16::forward_step_f16`'s `injected_embedding` contract).
+        /// `token_id` is unused when injecting (the embedding lookup itself is skipped) but
+        /// is still required to size-check against `vocab_size` in the non-injected caller
+        /// paths that share `forward_step_inner_impl`; callers here pass `0` (always valid).
+        ///
+        /// The caller (`generate_multimodal_vision`) has already validated `embedding`'s
+        /// length and finiteness before this is reached — this is a private, non-`pub`
+        /// entry point, so that validation is not repeated per call.
+        fn forward_step_injected(&mut self, embedding: &[f32], position: usize) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner_impl(
+                0,
+                position,
+                false,
+                false,
+                GdnStateTrafficScope::Decode,
+                Some(embedding),
+            )
+            .logits
         }
 
         fn forward_step_inner_impl(
@@ -5875,6 +5900,7 @@ mod inner {
             capture_hidden: bool,
             skip_logits_readback: bool,
             _traffic_scope: GdnStateTrafficScope,
+            injected_embedding: Option<&[f32]>,
         ) -> MetalStepOutput {
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
@@ -5895,20 +5921,41 @@ mod inner {
             let step_start = std::time::Instant::now();
 
             // --- Embedding lookup (CPU, read f16 embed_tokens, write f32 hidden) ---
+            // Qwen3.5 vision (ADR-069 Metal S5 / MP2): `injected_embedding` REPLACES this
+            // lookup with a caller-supplied row (HF `masked_scatter`; mirrors
+            // `cpu_f16::forward_step_f16`'s contract) instead of reading `embed_tokens`.
             let t0 = std::time::Instant::now();
-            let embed_offset = token_id as usize * hidden;
-            assert!(
-                (token_id as usize) < cfg.vocab_size,
-                "forward_step: token_id {token_id} >= vocab_size {}",
-                cfg.vocab_size
-            );
-            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
-            // token_id validated < vocab_size above so embed_offset is in bounds.
-            unsafe {
-                let src = (self.engine.embed_tokens.contents() as *const u16).add(embed_offset);
-                let dst = self.session.activations.hidden.contents() as *mut f32;
-                // SAFETY: embed_tokens row has hidden u16 values; hidden buffer has hidden f32 values.
-                convert_f16_row(src, dst, hidden);
+            match injected_embedding {
+                Some(row) => {
+                    debug_assert_eq!(
+                        row.len(),
+                        hidden,
+                        "forward_step_injected: caller must pre-validate row length"
+                    );
+                    // SAFETY: hidden buffer is StorageModeShared f32, no GPU in flight;
+                    // caller (forward_step_injected) guarantees row.len() == hidden.
+                    unsafe {
+                        let dst = self.session.activations.hidden.contents() as *mut f32;
+                        std::ptr::copy_nonoverlapping(row.as_ptr(), dst, hidden);
+                    }
+                }
+                None => {
+                    let embed_offset = token_id as usize * hidden;
+                    assert!(
+                        (token_id as usize) < cfg.vocab_size,
+                        "forward_step: token_id {token_id} >= vocab_size {}",
+                        cfg.vocab_size
+                    );
+                    // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
+                    // token_id validated < vocab_size above so embed_offset is in bounds.
+                    unsafe {
+                        let src =
+                            (self.engine.embed_tokens.contents() as *const u16).add(embed_offset);
+                        let dst = self.session.activations.hidden.contents() as *mut f32;
+                        // SAFETY: embed_tokens row has hidden u16 values; hidden buffer has hidden f32 values.
+                        convert_f16_row(src, dst, hidden);
+                    }
+                }
             }
 
             if profiling {
@@ -6324,6 +6371,7 @@ mod inner {
                 false,
                 true,
                 GdnStateTrafficScope::Decode,
+                None,
             );
 
             // SAFETY: GPU completed (wait_until_completed called in forward_step_inner).
@@ -9513,6 +9561,260 @@ mod inner {
             } else {
                 decode_tokens(tokenizer, &generated_ids)
             };
+            Ok(GenerateOutput {
+                text,
+                token_ids: generated_ids.clone(),
+                prompt_tokens: prompt_len,
+                generated_tokens: generated_ids.len(),
+                stopped,
+                stop_reason: Some(stop_reason),
+                token_logprobs: vec![],
+            })
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal S5, MP2): Metal port of the residual-stream
+        /// REPLACE injection half of `cpu_f16::generate_multimodal_f16` — the CPU
+        /// function is the numeric oracle (ADR-069 Amendment 1: divergence from it
+        /// is a bug by definition), so this mirrors its request type, validation
+        /// order, and per-token embedding contract exactly: real residual-stream
+        /// REPLACE injection of merged patch embeddings at `<|image_pad|>` slots
+        /// (mirrors `forward_step_f16`'s `injected_embedding`). Position handling
+        /// (3-axis M-RoPE at the six GQA layers, mirroring
+        /// `full_attention_step_f16`'s `mrope_cos_sin`) is a separate, later port
+        /// stage — this stage runs every position through the model's existing
+        /// 1-D `engine.rope_cos`/`rope_sin` table, same as plain text decode.
+        ///
+        /// Deliberately a new entry point rather than a change to [`Self::generate_multimodal`]:
+        /// that function's [`crate::vision::MultimodalInput`] represents visual tokens as a
+        /// flat prefix and carries no per-image `(T, H, W)` grid shape, so it cannot supply
+        /// `Qwen35VisionRequest`'s validation/checkpoint-binding inputs this port reuses.
+        /// `generate_multimodal` is unchanged by this PR.
+        pub fn generate_multimodal_vision(
+            &mut self,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+        ) -> Result<GenerateOutput, crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            super::multimodal_generate_preflight(gen_cfg)?;
+
+            request.validate().map_err(|e| {
+                InferenceError::InvalidInput(format!("multimodal request failed validation: {e}"))
+            })?;
+
+            let cfg = self.engine.config.clone();
+
+            // Caller-supplied `input_ids` must be bounded against the checkpoint
+            // vocabulary before any GPU work begins — mirrors the CPU oracle's guard
+            // ahead of `forward_step_f16`'s embedding-table slice.
+            if let Some(&bad_id) = request
+                .input_ids
+                .iter()
+                .find(|&&id| id as usize >= cfg.vocab_size)
+            {
+                return Err(InferenceError::InvalidInput(format!(
+                    "input_ids contains out-of-vocabulary token id {bad_id} (vocab_size={})",
+                    cfg.vocab_size
+                )));
+            }
+
+            let has_image = !request.image_grids.is_empty();
+
+            // Bind the request to the loaded checkpoint's vision metadata before
+            // selecting image slots (mirrors the CPU oracle's checkpoint-binding
+            // guard) — an internally consistent request targeting the wrong
+            // checkpoint must not silently inject at the wrong slots.
+            if has_image {
+                let cfg_image_token_id = cfg.image_token_id.ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "multimodal request supplied but checkpoint has no image_token_id"
+                            .to_string(),
+                    )
+                })?;
+                if cfg_image_token_id != request.image_token_id {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "request image_token_id {} does not match checkpoint image_token_id {cfg_image_token_id}",
+                        request.image_token_id
+                    )));
+                }
+                let vision_cfg = cfg.vision_config.as_ref().ok_or_else(|| {
+                    InferenceError::InvalidInput(
+                        "multimodal request supplied but checkpoint has no vision_config"
+                            .to_string(),
+                    )
+                })?;
+                if vision_cfg.spatial_merge_size != request.spatial_merge_size {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "request spatial_merge_size {} does not match checkpoint \
+                         vision_config.spatial_merge_size {}",
+                        request.spatial_merge_size, vision_cfg.spatial_merge_size
+                    )));
+                }
+                if request.decoder_hidden_size != cfg.hidden_size {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "request decoder_hidden_size {} does not match checkpoint hidden_size {}",
+                        request.decoder_hidden_size, cfg.hidden_size
+                    )));
+                }
+                if vision_cfg.out_hidden_size != cfg.hidden_size {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "checkpoint vision_config.out_hidden_size {} does not match decoder \
+                         hidden_size {}",
+                        vision_cfg.out_hidden_size, cfg.hidden_size
+                    )));
+                }
+            }
+
+            let prompt_ids = &request.input_ids;
+            let prompt_len = prompt_ids.len();
+            crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+
+            if gen_cfg.max_new_tokens == 0 {
+                return Ok(GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
+                });
+            }
+
+            crate::model::qwen35::check_context_budget(
+                prompt_len,
+                gen_cfg.reasoning_budget,
+                gen_cfg.max_new_tokens,
+                self.max_context(),
+            )?;
+
+            // Reset recurrent state for a clean generation.
+            self.reset_state();
+
+            let mut rng_state = match gen_cfg.seed {
+                Some(s) => {
+                    if s == 0 {
+                        1
+                    } else {
+                        s
+                    }
+                }
+                None => {
+                    use std::time::SystemTime;
+                    let t = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0x12345678_9abcdef0_u64);
+                    if t == 0 { 1 } else { t }
+                }
+            };
+
+            // Prefill: inject a post-merger visual row at each `<|image_pad|>` slot, in the
+            // same sequential image-token order the request already concatenated
+            // `post_merger_rows` in (HF's masked_scatter contract), text tokens (including
+            // vision delimiters) keep their normal embedding lookup.
+            let mut visual_row = 0usize;
+            let mut last_logits = Vec::new();
+            for (pos, &token_id) in prompt_ids.iter().enumerate() {
+                if has_image && token_id == request.image_token_id {
+                    let start = visual_row * request.decoder_hidden_size;
+                    let end = start + request.decoder_hidden_size;
+                    let row = &request.post_merger_rows[start..end];
+                    // Mirrors `forward_step_f16`'s injected_embedding guard: reject a
+                    // non-finite visual row before it reaches the residual stream. (Length
+                    // is already guaranteed by `request.validate()` above.)
+                    if let Some(bad) = row.iter().find(|v| !v.is_finite()) {
+                        return Err(InferenceError::InvalidInput(format!(
+                            "injected_embedding contains a non-finite value: {bad}"
+                        )));
+                    }
+                    visual_row += 1;
+                    last_logits = self.forward_step_injected(row, pos);
+                } else {
+                    last_logits = self.forward_step(token_id, pos);
+                }
+            }
+
+            let mut all_ids = prompt_ids.clone();
+            let is_stop = |id: u32| id == cfg.eos_token_id || gen_cfg.stop_token_ids.contains(&id);
+            let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
+            let mut stopped = false;
+            let mut stop_reason = StopReason::Length;
+
+            // String-stop path: mirrors the CPU stop-string matcher exactly, same as
+            // `generate_multimodal`.
+            let mut stop_text_state = if gen_cfg.stop_strings.is_empty() {
+                None
+            } else {
+                Some((
+                    IncrementalDetokenizer::new(),
+                    StopStringMatcher::new(&gen_cfg.stop_strings),
+                ))
+            };
+
+            let first_id = sample_token(&last_logits, gen_cfg, &all_ids, &mut rng_state);
+            if is_stop(first_id) {
+                stopped = true;
+                stop_reason = StopReason::Eos;
+            } else {
+                generated_ids.push(first_id);
+                all_ids.push(first_id);
+                if let Some((detok, matcher)) = stop_text_state.as_mut() {
+                    let delta = detok.push(tokenizer, first_id);
+                    if matcher.push(&delta, &mut |_| {}) {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                    }
+                }
+            }
+
+            // Autoregressive decode: identical to the plain `generate`/`generate_streaming`
+            // loop. Position handling for image content (M-RoPE) is a separate, later port
+            // stage — this stage only makes the visual embeddings themselves reach the
+            // residual stream correctly.
+            while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
+                if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
+                    stop_reason = StopReason::KvFull;
+                    break;
+                }
+                let physical_pos = self.session.kv_cache.seq_len;
+                let last_token = *all_ids.last().unwrap_or(&cfg.eos_token_id);
+                if is_stop(last_token) {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
+                    break;
+                }
+
+                let step_logits = self.forward_step(last_token, physical_pos);
+                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
+                if is_stop(next_id) {
+                    stopped = true;
+                    stop_reason = StopReason::Eos;
+                    break;
+                }
+                generated_ids.push(next_id);
+                all_ids.push(next_id);
+
+                if let Some((detok, matcher)) = stop_text_state.as_mut() {
+                    let delta = detok.push(tokenizer, next_id);
+                    if matcher.push(&delta, &mut |_| {}) {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                        break;
+                    }
+                }
+            }
+
+            let text = if let Some((mut detok, mut matcher)) = stop_text_state {
+                if !matcher.stopped() {
+                    matcher.finish(&detok.finish(), &mut |_| {});
+                }
+                matcher.into_text()
+            } else {
+                decode_tokens(tokenizer, &generated_ids)
+            };
+
             Ok(GenerateOutput {
                 text,
                 token_ids: generated_ids.clone(),
@@ -24684,6 +24986,226 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 out.stop_reason,
                 Some(StopReason::Length),
                 "max_new_tokens=0 must report StopReason::Length"
+            );
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal S5): shared test fixture for the MP2/MP3
+        /// `generate_multimodal_vision` gates below. One image run, grid
+        /// `(1, 2*merge, 2*merge)` so it always expands to exactly 4 post-merger
+        /// rows regardless of the checkpoint's `spatial_merge_size` (mirrors
+        /// `multimodal.rs`'s `base_request()` CPU unit fixture shape). Real
+        /// checkpoint config (`image_token_id`, `vision_config`, `hidden_size`) so
+        /// `generate_multimodal_vision`'s checkpoint-binding guards pass.
+        #[cfg(test)]
+        fn vision_gate_fixture(
+            cfg: &Qwen35Config,
+            seed: f32,
+        ) -> crate::vision::multimodal::Qwen35VisionRequest {
+            let vision_cfg = cfg
+                .vision_config
+                .as_ref()
+                .expect("real 0.8b checkpoint carries vision_config");
+            let image_token_id = cfg
+                .image_token_id
+                .expect("real 0.8b checkpoint carries image_token_id");
+            let merge = vision_cfg.spatial_merge_size;
+            let grid = crate::vision::qwen35_vit::GridThw {
+                t: 1,
+                h: 2 * merge,
+                w: 2 * merge,
+            };
+            let num_rows = (grid.t * grid.h * grid.w) / (merge * merge);
+
+            let mut input_ids = vec![10u32, 11];
+            input_ids.extend(std::iter::repeat_n(image_token_id, num_rows));
+            input_ids.push(12);
+
+            // Non-constant per-lane content: a per-visual-row constant vector is
+            // invariant under Qwen3.5's `(1+gamma) * x / rms(x)` RMSNorm (a
+            // positive constant vector normalizes to the same direction
+            // regardless of its magnitude), which would make an additive
+            // mutation invisible one layer in. Vary by lane index instead.
+            let mut post_merger_rows = vec![0.0f32; num_rows * cfg.hidden_size];
+            for (i, v) in post_merger_rows.iter_mut().enumerate() {
+                *v = seed + 0.01 * ((i % 97) as f32 - 48.0);
+            }
+
+            Qwen35VisionRequest {
+                input_ids,
+                image_grids: vec![grid],
+                post_merger_rows,
+                image_token_id,
+                spatial_merge_size: merge,
+                decoder_hidden_size: cfg.hidden_size,
+            }
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): isolates `forward_step_injected`
+        /// from the KV-cache history / decode-loop / sampling machinery entirely by
+        /// calling it once at position 0 on a freshly reset state, so any
+        /// insensitivity to row content can only come from the injection write
+        /// itself or the single-step layer pass — not from attention weighting
+        /// across later positions (which
+        /// `generate_multimodal_vision_injection_is_mutation_sensitive` below is
+        /// exposed to, with a synthetic 7-token prompt and only 2 greedy decode
+        /// steps).
+        #[test]
+        fn forward_step_injected_logits_differ_by_row_content() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let Some(model) = load_real_qwen35_0_8b_or_skip() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let hidden = cfg.hidden_size;
+
+            let mut row_a = vec![0.0f32; hidden];
+            for (i, v) in row_a.iter_mut().enumerate() {
+                *v = 0.01 + 0.01 * ((i % 97) as f32 - 48.0);
+            }
+            let row_b: Vec<f32> = row_a.iter().map(|v| -v).collect();
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            state.reset_state();
+            let logits_a = state.forward_step_injected(&row_a, 0);
+            state.reset_state();
+            let logits_b = state.forward_step_injected(&row_b, 0);
+
+            let diff: f32 = logits_a
+                .iter()
+                .zip(&logits_b)
+                .map(|(a, b)| (a - b).abs())
+                .sum();
+            assert!(
+                diff > 1e-3,
+                "forward_step_injected output insensitive to row content: diff={diff}"
+            );
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): mutation-sensitive test for
+        /// the residual-stream REPLACE injection at `<|image_pad|>` slots, mirroring
+        /// the CPU injection test's shape (cpu_f16.rs's `forward_step_f16`
+        /// `injected_embedding` coverage).
+        ///
+        /// Mutating the supplied visual rows changes Metal's greedy output — the
+        /// rows are genuinely consumed, not discarded like the pre-MP2 stub
+        /// (`forward_step(0, vt)`, which fed every visual position the same fixed
+        /// embedding regardless of `patch_embeddings`). All four image-pad rows
+        /// are negated together (rather than just the first) — with only one
+        /// 7-token synthetic prompt and 2 greedy decode steps, a single mutated
+        /// row's effect on the final argmax token can be diluted by attention over
+        /// the later, unmutated image-pad positions;
+        /// `forward_step_injected_logits_differ_by_row_content` above already
+        /// isolates and proves per-row sensitivity at the logit level without that
+        /// dilution.
+        ///
+        /// REPLACE semantics (the injected row replaces rather than falls back to
+        /// a token-id embedding lookup) is proved separately, structurally, by
+        /// `injected_embedding_never_falls_back_to_token_lookup` below — this
+        /// checkpoint ties `embed_tokens` to the lm_head weight matrix
+        /// (`tie_word_embeddings=true`), so *any* row mutation shifts that row's
+        /// logit component through the tied GEMV regardless of whether it was
+        /// ever used for input embedding lookup; a behavioral "mutate an unrelated
+        /// row, expect no output change" test is unsound on a tied-embeddings
+        /// checkpoint; (confirmed directly: mutating `embed_tokens[0]` collapsed
+        /// greedy output to token 0 on every step purely through the lm_head GEMV
+        /// component, with no injection-path involvement at all).
+        ///
+        /// Mutation-sensitivity verified locally per repo convention: reverting
+        /// `forward_step_inner_impl`'s injection branch (falling through to the
+        /// plain `embed_tokens[token_id]` lookup unconditionally, matching the old
+        /// stub's behavior) was confirmed to make this assertion fail before the
+        /// fix was restored.
+        #[test]
+        fn generate_multimodal_vision_injection_is_mutation_sensitive() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let Some(model) = load_real_qwen35_0_8b_or_skip() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+
+            let request_a = vision_gate_fixture(&cfg, 0.01);
+            let out_a = state
+                .generate_multimodal_vision(&request_a, &tokenizer, &gen_cfg)
+                .expect("baseline multimodal generate succeeds");
+
+            // Negate every supplied visual row (a sign flip that survives RMSNorm,
+            // unlike a uniform additive shift on an otherwise-constant row; see
+            // `vision_gate_fixture`'s doc comment). All four image-pad rows are
+            // mutated together so the perturbation isn't diluted by attention over
+            // the unmutated later image-pad positions.
+            let mut request_b = vision_gate_fixture(&cfg, 0.01);
+            for v in &mut request_b.post_merger_rows {
+                *v = -*v;
+            }
+            let out_b = state
+                .generate_multimodal_vision(&request_b, &tokenizer, &gen_cfg)
+                .expect("mutated-visual-row multimodal generate succeeds");
+            assert_ne!(
+                out_a.token_ids, out_b.token_ids,
+                "mutating the supplied visual rows must change Metal's greedy output \
+                 (visual rows are not being consumed)"
+            );
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): REPLACE-semantics
+        /// structural check, complementing the behavioral mutation-sensitivity
+        /// test above. `forward_step_inner_impl`'s `Some(row) => { ... }`
+        /// embedding-lookup arm (taken whenever `injected_embedding` is set at an
+        /// `<|image_pad|>` slot) must never reference `token_id` or read from
+        /// `embed_tokens` — proving by construction that an injected row can never
+        /// fall back to the token-id embedding lookup the pre-MP2 stub used, no
+        /// matter what runtime token id happens to occupy the slot. A behavioral
+        /// equivalent (mutate `embed_tokens` at some row, expect no output change)
+        /// is unsound on this checkpoint: `tie_word_embeddings=true` means
+        /// `embed_tokens` also serves as the lm_head weight matrix
+        /// (`encode_final_head`'s `QuantFormat::Q8_0` GEMV binds it directly), so
+        /// mutating any row shifts that row's logit component regardless of
+        /// whether the row was ever read for input embedding.
+        ///
+        /// Mutation-sensitivity verified locally: temporarily adding a fallback
+        /// read of `embed_tokens[token_id]` inside the `Some(row) =>` arm (mirroring
+        /// the pre-MP2 stub) made this test fail immediately; removing it restored
+        /// the pass.
+        #[test]
+        fn injected_embedding_never_falls_back_to_token_lookup() {
+            const RUST_SOURCE: &str = include_str!("metal_qwen35.rs");
+            let match_start = RUST_SOURCE
+                .find("match injected_embedding {")
+                .expect("forward_step_inner_impl's injected_embedding match must exist");
+            let some_start = match_start
+                + RUST_SOURCE[match_start..]
+                    .find("Some(row) => {")
+                    .expect("Some(row) arm must exist");
+            let none_start = some_start
+                + RUST_SOURCE[some_start..]
+                    .find("None => {")
+                    .expect("None arm must follow Some(row) arm");
+            let some_arm_body = &RUST_SOURCE[some_start..none_start];
+            assert!(
+                !some_arm_body.contains("embed_tokens") && !some_arm_body.contains("token_id"),
+                "the injected_embedding Some(row) arm must never reference embed_tokens \
+                 or token_id — it must REPLACE the embedding lookup, not fall back to it"
             );
         }
 
