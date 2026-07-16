@@ -101,7 +101,7 @@ requested model matches its configured model:
 | ----------------------------------------------------------------------------------------------------------- | -------------------------- |
 | Batch must contain at least one text                                                                        | `EmbedError::InvalidInput` |
 | Batch may contain at most `DEFAULT_MAX_BATCH_SIZE` (1,000) texts                                            | `EmbedError::InvalidInput` |
-| Each text must be at most `MAX_TEXT_CHARS` (32,768) according to the implementation's `String::len()` check | `EmbedError::TextTooLong`  |
+| Each text must be at most `MAX_TEXT_BYTES` (32,768) according to the implementation's `String::len()` check | `EmbedError::TextTooLong`  |
 | Native request model must equal that service's configured model                                             | `EmbedError::InvalidInput` |
 
 `String::len()` measures UTF-8 bytes, so the present implementation can reject fewer than

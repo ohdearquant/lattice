@@ -9,8 +9,14 @@ fn test_max_batch_size_constant() {
 }
 
 #[test]
-fn test_max_text_chars_constant() {
-    assert_eq!(MAX_TEXT_CHARS, 32768);
+fn test_max_text_bytes_constant() {
+    assert_eq!(MAX_TEXT_BYTES, 32768);
+}
+
+#[test]
+#[allow(deprecated)]
+fn test_max_text_chars_deprecated_alias_matches() {
+    assert_eq!(MAX_TEXT_CHARS, MAX_TEXT_BYTES);
 }
 
 #[cfg(feature = "native")]
@@ -198,6 +204,74 @@ mod native_tests {
             err.contains("BgeBaseEnV15") || err.contains("requested model"),
             "error should mention the model mismatch, got: {err}"
         );
+    }
+
+    /// #1010 repro shape 1: an all-ASCII text where char count == byte count.
+    /// Rejected under either a byte or a char guard, so this alone would not
+    /// have caught the bug — kept alongside the multibyte case for coverage.
+    #[tokio::test]
+    async fn test_native_service_ascii_text_too_long_reports_bytes() {
+        let text = "a".repeat(36_556);
+        assert_eq!(text.len(), 36_556);
+        assert_eq!(text.chars().count(), 36_556);
+
+        let service = NativeEmbeddingService::default();
+        let texts = vec![text];
+        let err = service
+            .embed(&texts, EmbeddingModel::BgeSmallEnV15)
+            .await
+            .expect_err("text over MAX_TEXT_BYTES must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("36556"), "got: {msg}");
+        assert!(msg.contains("bytes"), "got: {msg}");
+    }
+
+    /// #1010 repro shape 2 (discriminating case): 32,768 chars / 32,846 bytes —
+    /// under char count, this is exactly at the limit and would be ADMITTED;
+    /// under byte count (the guard's actual behavior), it exceeds the limit
+    /// and must be REJECTED. If the guard is ever switched to `chars().count()`,
+    /// this test fails.
+    #[tokio::test]
+    async fn test_native_service_multibyte_text_too_long_uses_byte_count() {
+        // 78 two-byte chars + 32,690 one-byte chars = 32,768 chars / 32,846 bytes.
+        let text = format!("{}{}", "é".repeat(78), "a".repeat(32_690));
+        assert_eq!(text.chars().count(), 32_768);
+        assert_eq!(text.len(), 32_846);
+
+        let service = NativeEmbeddingService::default();
+        let texts = vec![text];
+        let err = service
+            .embed(&texts, EmbeddingModel::BgeSmallEnV15)
+            .await
+            .expect_err("32846-byte text must be rejected under byte semantics");
+        let msg = err.to_string();
+        assert!(msg.contains("32846"), "got: {msg}");
+        assert!(
+            !msg.contains("32768 bytes exceeds") && !msg.contains("32768 chars exceeds"),
+            "reported length must be the byte count (32846), not the char count: {msg}"
+        );
+    }
+
+    /// Same discriminating shape, through the `CachedEmbeddingService` wrapper —
+    /// a sibling invocation path with its own copy of the length guard.
+    #[tokio::test]
+    async fn test_cached_service_multibyte_text_too_long_uses_byte_count() {
+        use crate::service::CachedEmbeddingService;
+        use std::sync::Arc;
+
+        let text = format!("{}{}", "é".repeat(78), "a".repeat(32_690));
+        assert_eq!(text.chars().count(), 32_768);
+        assert_eq!(text.len(), 32_846);
+
+        let service =
+            CachedEmbeddingService::with_default_cache(Arc::new(NativeEmbeddingService::default()));
+        let texts = vec![text];
+        let err = service
+            .embed(&texts, EmbeddingModel::BgeSmallEnV15)
+            .await
+            .expect_err("32846-byte text must be rejected under byte semantics");
+        let msg = err.to_string();
+        assert!(msg.contains("32846"), "got: {msg}");
     }
 }
 
