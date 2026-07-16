@@ -24793,7 +24793,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists()
+            // Mirror `Qwen35Model::from_safetensors`: weights are present in
+            // EITHER the single-file layout (`model.safetensors`) or the
+            // sharded layout (`model.safetensors.index.json`) — an HF
+            // `snapshot_download` of this model ships only the sharded form.
+            let weights_present = model_dir.join("model.safetensors").exists()
+                || model_dir.join("model.safetensors.index.json").exists();
+            if !weights_present
                 || !model_dir.join("config.json").exists()
                 || !model_dir.join("tokenizer.json").exists()
             {
