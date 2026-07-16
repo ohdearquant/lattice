@@ -8,6 +8,13 @@ use crate::attention::gdn_fused::gated_delta_net_step_fused;
 use crate::error::InferenceError;
 use crate::forward::cpu::matmul_bt;
 
+#[cfg(test)]
+pub(crate) struct ForwardTrace {
+    pub(crate) mixer_residuals: Vec<Vec<f32>>,
+    pub(crate) block_residuals: Vec<Vec<f32>>,
+    pub(crate) logits: Vec<f32>,
+}
+
 impl Qwen35Model {
     /// **Unstable**: debug single-token forward pass returning raw logits.
     pub fn forward_single_token_debug(&self, token_id: u32) -> Vec<f32> {
@@ -181,6 +188,115 @@ impl Qwen35Model {
             }
         }
         Ok(scratch.logits[..cfg.vocab_size].to_vec())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_prompt_residual_trace_debug(
+        &self,
+        prompt_ids: &[u32],
+    ) -> Result<ForwardTrace, InferenceError> {
+        if prompt_ids.is_empty() {
+            return Err(InferenceError::Inference(
+                "forward_prompt_residual_trace_debug: prompt_ids must not be empty".into(),
+            ));
+        }
+
+        let cfg = &self.config;
+        if prompt_ids.len() > self.max_context() {
+            return Err(InferenceError::Inference(format!(
+                "forward_prompt_residual_trace_debug: prompt_ids.len() ({}) exceeds RoPE table capacity ({})",
+                prompt_ids.len(),
+                self.max_context()
+            )));
+        }
+
+        let hidden = cfg.hidden_size;
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::new(cfg))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
+        let mut scratch = ForwardScratch::new();
+        let mut mixer_trace = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut block_trace = Vec::with_capacity(cfg.num_hidden_layers);
+
+        for (position, &token_id) in prompt_ids.iter().enumerate() {
+            scratch.ensure_capacity(cfg, kv_cache.seq_len + 1);
+            let embed_start = token_id as usize * hidden;
+            scratch.hidden[..hidden]
+                .copy_from_slice(&self.weights.embed_tokens[embed_start..embed_start + hidden]);
+
+            let mut linear_idx = 0usize;
+            let mut full_idx = 0usize;
+            for layer_i in 0..cfg.num_hidden_layers {
+                let (attn_weights, common) = &self.weights.layers[layer_i];
+                scratch.residual[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+                qwen35_rms_norm(
+                    &mut scratch.hidden[..hidden],
+                    &common.input_layernorm,
+                    hidden,
+                    cfg.rms_norm_eps,
+                );
+                self.run_attention_layer(
+                    layer_i,
+                    attn_weights,
+                    &mut linear_idx,
+                    &mut full_idx,
+                    position,
+                    &mut gdn_states,
+                    &mut kv_cache,
+                    &mut scratch,
+                    hidden,
+                );
+                for i in 0..hidden {
+                    scratch.hidden[i] = scratch.residual[i] + scratch.attn_out[i];
+                }
+                if position + 1 == prompt_ids.len() {
+                    mixer_trace.push(scratch.hidden[..hidden].to_vec());
+                }
+
+                scratch.residual[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+                qwen35_rms_norm(
+                    &mut scratch.hidden[..hidden],
+                    &common.post_attention_layernorm,
+                    hidden,
+                    cfg.rms_norm_eps,
+                );
+                scratch.ffn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+                self.run_ffn_layer(layer_i, common, &mut scratch, hidden);
+                for i in 0..hidden {
+                    scratch.hidden[i] = scratch.residual[i] + scratch.ffn_out[i];
+                }
+
+                if position + 1 == prompt_ids.len() {
+                    block_trace.push(scratch.hidden[..hidden].to_vec());
+                }
+            }
+
+            qwen35_rms_norm(
+                &mut scratch.hidden[..hidden],
+                &self.weights.final_norm,
+                hidden,
+                cfg.rms_norm_eps,
+            );
+            let logits_weight = self.weights.logits_weight();
+            matmul_bt(
+                &scratch.hidden[..hidden],
+                logits_weight,
+                &mut scratch.logits[..cfg.vocab_size],
+                1,
+                hidden,
+                cfg.vocab_size,
+            );
+            if position + 1 < prompt_ids.len() {
+                kv_cache.seq_len += 1;
+            }
+        }
+
+        Ok(ForwardTrace {
+            mixer_residuals: mixer_trace,
+            block_residuals: block_trace,
+            logits: scratch.logits[..cfg.vocab_size].to_vec(),
+        })
     }
 }
 

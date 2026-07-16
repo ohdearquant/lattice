@@ -723,7 +723,12 @@ fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, I
 mod tests {
     use super::*;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
+    use crate::tokenizer::bpe::BpeTokenizer;
+    use crate::tokenizer::common::Tokenizer;
     use serde_json::Value;
+    use std::collections::{BTreeMap, HashMap};
+    use std::env;
+    use std::io::BufWriter;
     use std::path::PathBuf;
 
     // ------------------------------------------------------------------
@@ -2437,5 +2442,263 @@ mod tests {
             err.contains("too large"),
             "error must name the size-cap failure; got: {err}"
         );
+    }
+
+    fn write_f16_safetensors_for_cpu_gate(
+        path: &Path,
+        tensors: &HashMap<String, TensorEntry>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut names: Vec<_> = tensors.keys().collect();
+        names.sort();
+        let mut offset = 0_u64;
+        let mut header = BTreeMap::new();
+        for name in &names {
+            let tensor = tensors
+                .get(*name)
+                .ok_or("tensor disappeared while writing")?;
+            let byte_len = u64::try_from(tensor.data.len())?
+                .checked_mul(2)
+                .ok_or("f16 byte length overflow")?;
+            let next = offset
+                .checked_add(byte_len)
+                .ok_or("safetensors offset overflow")?;
+            header.insert(
+                (*name).clone(),
+                serde_json::json!({
+                    "dtype": "F16",
+                    "shape": tensor.shape,
+                    "data_offsets": [offset, next],
+                }),
+            );
+            offset = next;
+        }
+        let header = serde_json::to_vec(&header)?;
+        let file = fs::File::create(path)?;
+        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+        writer.write_all(&u64::try_from(header.len())?.to_le_bytes())?;
+        writer.write_all(&header)?;
+        for name in names {
+            let tensor = tensors
+                .get(name)
+                .ok_or("tensor disappeared while streaming")?;
+            for values in tensor.data.chunks(1 << 20) {
+                let mut bytes = Vec::with_capacity(values.len() * 2);
+                for &value in values {
+                    bytes.extend_from_slice(&q4_f32_to_f16(value as f32).to_le_bytes());
+                }
+                writer.write_all(&bytes)?;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_cpu_f16_gate_artifact(
+        output_dir: &Path,
+        config_json: &str,
+        tokenizer_path: &Path,
+        tensors: &HashMap<String, TensorEntry>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::create_dir(output_dir)?;
+        fs::write(output_dir.join("config.json"), config_json)?;
+        fs::copy(tokenizer_path, output_dir.join("tokenizer.json"))?;
+        write_f16_safetensors_for_cpu_gate(&output_dir.join("model.safetensors"), tensors)
+    }
+
+    fn nll(logits: &[f32], target: u32) -> f64 {
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum_exp: f64 = logits
+            .iter()
+            .map(|&value| f64::from((value - max).exp()))
+            .sum();
+        f64::from(max) + sum_exp.ln() - f64::from(logits[target as usize])
+    }
+
+    fn rel_l2(reference: &[f32], candidate: &[f32]) -> f64 {
+        let (squared_error, squared_reference) =
+            reference
+                .iter()
+                .zip(candidate)
+                .fold((0.0_f64, 0.0_f64), |(error, norm), (&a, &b)| {
+                    let delta = f64::from(a - b);
+                    (error + delta * delta, norm + f64::from(a) * f64::from(a))
+                });
+        squared_error.sqrt() / squared_reference.sqrt().max(f64::MIN_POSITIVE)
+    }
+
+    #[test]
+    #[ignore = "requires LATTICE_QUAROT_REAL_MODEL_DIR and writes two temporary F16 0.8B artifacts"]
+    fn real_qwen35_fp16_rotation_gate() -> Result<(), Box<dyn std::error::Error>> {
+        let input_dir = PathBuf::from(env::var("LATTICE_QUAROT_REAL_MODEL_DIR")?);
+        let output_root = PathBuf::from(env::var("LATTICE_QUAROT_FP16_GATE_DIR")?);
+
+        const SEED: u64 = 0x00C0_FFEE;
+        const PROMPT: &str = "The capital of France is Paris, and the capital of Japan is Tokyo.";
+        let config_json = fs::read_to_string(input_dir.join("config.json"))?;
+        let config = Qwen35Config::from_config_json_str(&config_json)?;
+        let reader = QuarotTensorReader::open(&input_dir)?;
+        let required_names = qwen_required_tensor_names(&config);
+        let mut original = load_tensors_f64(&reader, &required_names)?;
+        materialize_lm_head_for_qwen35(&mut original, &config)?;
+        let mut rotated = original.clone();
+        let mut fusion_plan = qwen35_per_layer_fusion_plan(&config)?;
+        fusion_plan.push(qwen35_final_norm_fusion_target());
+        let rotation = RandomizedHadamard::new(SEED, config.hidden_size)?;
+        fuse_rmsnorms(&mut rotated, &fusion_plan)?;
+        absorb_rotations(
+            &mut rotated,
+            &RotationPlan::qwen35_residual_stream_linear_layers(),
+            &rotation,
+        )?;
+
+        let gate_config = untie_word_embeddings_in_config_json(&config_json)?;
+        if !output_root.exists() {
+            fs::create_dir(&output_root)?;
+            write_cpu_f16_gate_artifact(
+                &output_root.join("baseline"),
+                &gate_config,
+                &input_dir.join("tokenizer.json"),
+                &original,
+            )?;
+            write_cpu_f16_gate_artifact(
+                &output_root.join("rotated"),
+                &gate_config,
+                &input_dir.join("tokenizer.json"),
+                &rotated,
+            )?;
+        } else {
+            assert!(
+                output_root.join("baseline/model.safetensors").is_file()
+                    && output_root.join("rotated/model.safetensors").is_file(),
+                "FP16 gate output root is incomplete: {}",
+                output_root.display()
+            );
+        }
+
+        let baseline =
+            crate::model::qwen35::Qwen35Model::from_safetensors(&output_root.join("baseline"))?;
+        let candidate =
+            crate::model::qwen35::Qwen35Model::from_safetensors(&output_root.join("rotated"))?;
+        let tokenizer = BpeTokenizer::from_tokenizer_json(&input_dir.join("tokenizer.json"))?;
+        let tokenized = tokenizer.tokenize(PROMPT);
+        let tokens = tokenized.input_ids[..tokenized.real_length.min(8)].to_vec();
+        assert!(tokens.len() >= 2, "FP16 gate prompt tokenized too short");
+        let mut base_nll = Vec::new();
+        let mut rotated_nll = Vec::new();
+        let mut logit_reference = Vec::new();
+        let mut logit_candidate = Vec::new();
+        let mut final_trace = None;
+
+        for prefix_len in 1..tokens.len() {
+            let base_trace = baseline.forward_prompt_residual_trace_debug(&tokens[..prefix_len])?;
+            let candidate_trace =
+                candidate.forward_prompt_residual_trace_debug(&tokens[..prefix_len])?;
+            let base_logits = &base_trace.logits;
+            let candidate_logits = &candidate_trace.logits;
+            assert_eq!(base_logits.len(), candidate_logits.len());
+            base_nll.push(nll(base_logits, tokens[prefix_len]));
+            rotated_nll.push(nll(candidate_logits, tokens[prefix_len]));
+            logit_reference.extend_from_slice(base_logits);
+            logit_candidate.extend_from_slice(candidate_logits);
+            if prefix_len + 1 == tokens.len() {
+                final_trace = Some((base_trace, candidate_trace));
+            }
+        }
+
+        let (base_trace, rotated_trace) = final_trace.ok_or("missing final residual trace")?;
+        assert_eq!(base_trace.mixer_residuals.len(), config.num_hidden_layers);
+        assert_eq!(
+            rotated_trace.mixer_residuals.len(),
+            config.num_hidden_layers
+        );
+        assert_eq!(base_trace.block_residuals.len(), config.num_hidden_layers);
+        assert_eq!(
+            rotated_trace.block_residuals.len(),
+            config.num_hidden_layers
+        );
+        let mut aligned_mixer_trace = Vec::with_capacity(rotated_trace.mixer_residuals.len());
+        for mut residual in rotated_trace.mixer_residuals {
+            rotation.apply_inverse(&mut residual)?;
+            aligned_mixer_trace.push(residual);
+        }
+        let mut aligned_block_trace = Vec::with_capacity(rotated_trace.block_residuals.len());
+        for mut residual in rotated_trace.block_residuals {
+            rotation.apply_inverse(&mut residual)?;
+            aligned_block_trace.push(residual);
+        }
+
+        let mean_base_nll = base_nll.iter().sum::<f64>() / base_nll.len() as f64;
+        let mean_rotated_nll = rotated_nll.iter().sum::<f64>() / rotated_nll.len() as f64;
+        let nll_delta = mean_rotated_nll - mean_base_nll;
+        let ppl_delta = mean_rotated_nll.exp() - mean_base_nll.exp();
+        let logits_rel_l2 = rel_l2(&logit_reference, &logit_candidate);
+        let logits_max_abs = logit_reference
+            .iter()
+            .zip(&logit_candidate)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let first_mixer_residual_rel_l2 =
+            rel_l2(&base_trace.mixer_residuals[0], &aligned_mixer_trace[0]);
+        let first_block_residual_rel_l2 =
+            rel_l2(&base_trace.block_residuals[0], &aligned_block_trace[0]);
+        let later_residual_max_rel_l2 = base_trace
+            .mixer_residuals
+            .iter()
+            .zip(&aligned_mixer_trace)
+            .skip(1)
+            .map(|(base, aligned)| rel_l2(base, aligned))
+            .chain(
+                base_trace
+                    .block_residuals
+                    .iter()
+                    .zip(&aligned_block_trace)
+                    .skip(1)
+                    .map(|(base, aligned)| rel_l2(base, aligned)),
+            )
+            .fold(0.0_f64, f64::max);
+        let replay_logits = baseline
+            .forward_prompt_residual_trace_debug(&tokens[..tokens.len() - 1])?
+            .logits;
+        let replay_max_abs = replay_logits
+            .iter()
+            .zip(logit_reference.iter().rev().take(replay_logits.len()).rev())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+
+        println!(
+            "FP16_GATE seed=0x{SEED:08x} prompt={PROMPT:?} tokens={tokens:?} scored_tokens={}",
+            base_nll.len()
+        );
+        println!(
+            "FP16_GATE mean_nll_base={mean_base_nll:.9} mean_nll_rotated={mean_rotated_nll:.9} nll_delta={nll_delta:.9}"
+        );
+        println!(
+            "FP16_GATE ppl_delta={ppl_delta:.9} logits_rel_l2={logits_rel_l2:.9e} logits_max_abs={logits_max_abs:.9e}"
+        );
+        println!(
+            "FP16_GATE first_mixer_residual_rel_l2={first_mixer_residual_rel_l2:.9e} first_block_residual_rel_l2={first_block_residual_rel_l2:.9e} later_residual_max_rel_l2={later_residual_max_rel_l2:.9e} replay_max_abs={replay_max_abs:.9e}"
+        );
+        println!("FP16_GATE artifacts={}", output_root.display());
+
+        assert!(nll_delta.abs() <= 1e-3, "FP16 NLL gate failed: {nll_delta}");
+        assert!(ppl_delta.abs() <= 1e-2, "FP16 PPL gate failed: {ppl_delta}");
+        assert!(
+            logits_rel_l2 <= 5e-4,
+            "FP16 logit relative-L2 gate failed: {logits_rel_l2}"
+        );
+        assert!(
+            logits_max_abs <= 5e-3,
+            "FP16 max-logit gate failed: {logits_max_abs}"
+        );
+        assert!(
+            first_mixer_residual_rel_l2 <= 1e-4,
+            "FP16 first-residual gate failed: {first_mixer_residual_rel_l2}"
+        );
+        assert!(
+            later_residual_max_rel_l2 <= 5e-4,
+            "FP16 later-residual gate failed: {later_residual_max_rel_l2}"
+        );
+        assert_eq!(replay_max_abs, 0.0, "baseline repeatability gate failed");
+        Ok(())
     }
 }

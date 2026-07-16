@@ -125,7 +125,7 @@ impl Qwen35Model {
         );
     }
 
-    fn run_attention_layer(
+    pub(super) fn run_attention_layer(
         &self,
         layer_i: usize,
         attn_weights: &AttentionWeights,
@@ -161,7 +161,7 @@ impl Qwen35Model {
         }
     }
 
-    fn run_ffn_layer(
+    pub(super) fn run_ffn_layer(
         &self,
         layer_i: usize,
         common: &CommonLayerWeights,
