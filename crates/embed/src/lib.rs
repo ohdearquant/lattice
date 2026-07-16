@@ -23,6 +23,8 @@ mod model;
 pub mod service;
 pub mod simd;
 pub mod types;
+#[cfg(feature = "native")]
+pub mod vision;
 // Keep this gate aligned with wasm-bindgen's wasm32-only dependency — see docs/design.md.
 #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
 pub mod wasm;
