@@ -78,6 +78,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod merger;
 pub mod multimodal;
+pub mod pooled_embed;
 pub mod preprocess;
 pub mod qwen35_merger;
 pub mod qwen35_mrope;
@@ -87,6 +88,7 @@ pub mod vit;
 
 pub use config::VisionConfig;
 pub use multimodal::MultimodalInput;
+pub use pooled_embed::embed_image_from_bytes_f16;
 
 use merger::{MlpMerger, MlpMergerWeights};
 use preprocess::PreprocessConfig;

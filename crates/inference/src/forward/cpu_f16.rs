@@ -22,6 +22,7 @@ use crate::rope::RopeTable;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
+use crate::vision::multimodal::Qwen35VisionRequest;
 use crate::weights::f16_weights::{
     F16AttentionWeights, F16FeedForwardWeights, F16FullAttentionLayerWeights,
     F16GatedDeltaNetWeights, F16ModelWeights, F16MoeLayerWeights, f16_to_f32_slice, matmul_bt_f16,
@@ -1399,6 +1400,359 @@ pub fn generate_multimodal_f16(
         stop_reason: Some(stop_reason),
         token_logprobs: vec![],
     })
+}
+
+// ---------------------------------------------------------------------------
+// Pooled embedding extraction (vision-embed-pooling): image + text, same
+// decoder + same pooling, so both land in the same vector space (GME-style).
+// ---------------------------------------------------------------------------
+
+/// How to collapse a prefill's per-position hidden states into one
+/// fixed-size embedding vector.
+///
+/// **Retrieval quality with the base Qwen3.5-0.8B *instruct* checkpoint is
+/// unvalidated.** GME-style pooled embeddings normally come from a
+/// checkpoint that has been contrastively fine-tuned for retrieval
+/// (image-text matching, hard-negative mining); the base instruct checkpoint
+/// was never trained for that objective. What this module provides — and
+/// what is tested — is the extraction *machinery*: pooling over the
+/// verifiably correct positions, deterministically, into a unit-norm
+/// vector. Picking (or fine-tuning) a checkpoint for retrieval quality is a
+/// separate, later decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolingStrategy {
+    /// Mean over the hidden states at the request's `<|image_pad|>`
+    /// positions (the visual tokens). For a text-only request — no image
+    /// runs, so no pad tokens are present — this degrades to a mean over
+    /// every position, i.e. an ordinary mean-pooled text embedding rather
+    /// than an error.
+    MeanVisualTokens,
+    /// The hidden state at the last physical position — GME's
+    /// text-embedding convention. Well-defined for both image and
+    /// text-only requests.
+    LastToken,
+}
+
+/// Run prefill ONLY (no sampling, no decode loop) over `request.input_ids`,
+/// injecting each post-merger visual row at its `<|image_pad|>` slot exactly
+/// as [`generate_multimodal_f16`] does, and return every position's final
+/// hidden state (post-final-norm, pre-lm_head projection) as a flat
+/// row-major `[seq_len * cfg.hidden_size]` buffer.
+///
+/// Shares `generate_multimodal_f16`'s request validation, checkpoint-binding
+/// checks, and M-RoPE/injection wiring; the only behavioral difference is
+/// that this never samples a token, so it takes no [`GenerateConfig`].
+///
+/// # Errors
+///
+/// See [`generate_multimodal_f16`]'s error conditions — the same
+/// `request.validate()`, out-of-vocabulary, checkpoint-binding, and M-RoPE
+/// table checks apply here, minus the generation-only checks (grammar,
+/// logprobs, stop strings, reasoning budget) that do not apply to a
+/// prefill-only call.
+pub fn prefill_hidden_states_f16(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    request: &Qwen35VisionRequest,
+) -> Result<Vec<f32>, crate::error::InferenceError> {
+    request.validate().map_err(|e| {
+        crate::error::InferenceError::InvalidInput(format!(
+            "multimodal request failed validation: {e}"
+        ))
+    })?;
+
+    if let Some(&bad_id) = request
+        .input_ids
+        .iter()
+        .find(|&&id| id as usize >= cfg.vocab_size)
+    {
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "input_ids contains out-of-vocabulary token id {bad_id} (vocab_size={})",
+            cfg.vocab_size
+        )));
+    }
+
+    let has_image = !request.image_grids.is_empty();
+
+    // Mirrors generate_multimodal_f16's checkpoint-binding guard: an
+    // internally consistent request can still target the wrong checkpoint.
+    if has_image {
+        let cfg_image_token_id = cfg.image_token_id.ok_or_else(|| {
+            crate::error::InferenceError::InvalidInput(
+                "multimodal request supplied but checkpoint has no image_token_id".to_string(),
+            )
+        })?;
+        if cfg_image_token_id != request.image_token_id {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "request image_token_id {} does not match checkpoint image_token_id {cfg_image_token_id}",
+                request.image_token_id
+            )));
+        }
+        let vision_cfg = cfg.vision_config.as_ref().ok_or_else(|| {
+            crate::error::InferenceError::InvalidInput(
+                "multimodal request supplied but checkpoint has no vision_config".to_string(),
+            )
+        })?;
+        if vision_cfg.spatial_merge_size != request.spatial_merge_size {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "request spatial_merge_size {} does not match checkpoint \
+                 vision_config.spatial_merge_size {}",
+                request.spatial_merge_size, vision_cfg.spatial_merge_size
+            )));
+        }
+        if request.decoder_hidden_size != cfg.hidden_size {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "request decoder_hidden_size {} does not match checkpoint hidden_size {}",
+                request.decoder_hidden_size, cfg.hidden_size
+            )));
+        }
+        if vision_cfg.out_hidden_size != cfg.hidden_size {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "checkpoint vision_config.out_hidden_size {} does not match decoder \
+                 hidden_size {}",
+                vision_cfg.out_hidden_size, cfg.hidden_size
+            )));
+        }
+    }
+
+    // Reject empty and over-context prompts before build_mrope_tables, which
+    // otherwise materializes a position entry plus cos/sin rows per supplied
+    // token — unbounded input must fail cheaply, not after that allocation.
+    let prompt_len = request.input_ids.len();
+    crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+    let max_context = cfg.max_position_embeddings;
+    if prompt_len > max_context {
+        return Err(crate::error::InferenceError::Inference(format!(
+            "prompt ({prompt_len} tokens) exceeds model context window ({max_context})"
+        )));
+    }
+
+    let (_positions, tables) = request.build_mrope_tables(cfg)?;
+
+    let expected_rope_half = cfg.rope_dim() / 2;
+    if tables.cos.iter().any(|row| row.len() != expected_rope_half)
+        || tables.sin.iter().any(|row| row.len() != expected_rope_half)
+    {
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "M-RoPE table row width does not match decoder rotary half-width: expected \
+             {expected_rope_half}"
+        )));
+    }
+
+    let prompt_ids = &request.input_ids;
+
+    let num_linear = cfg.num_linear_attention_layers();
+    let num_full = cfg.num_full_attention_layers();
+    let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+        .map(|_| GatedDeltaNetState::new(cfg))
+        .collect();
+    let mut kv_cache = KvCache::new(num_full);
+    let mut scratch = ForwardScratch::new();
+
+    // Text-only requests route through the plain 1-D RopeTable (cos_sin =
+    // None below), bit-identical to generate_f16/generate_multimodal_f16;
+    // only image-bearing requests use the M-RoPE table.
+    let rope = RopeTable::new(cfg.rope_dim(), max_context, cfg.rope_theta);
+
+    let hidden = cfg.hidden_size;
+    let mut hidden_states: Vec<f32> = Vec::with_capacity(prompt_len * hidden);
+
+    let mut visual_row = 0usize;
+    for (pos, &token_id) in prompt_ids.iter().enumerate() {
+        let injected = if token_id == request.image_token_id {
+            let start = visual_row * request.decoder_hidden_size;
+            let end = start + request.decoder_hidden_size;
+            visual_row += 1;
+            Some(&request.post_merger_rows[start..end])
+        } else {
+            None
+        };
+        let cos_sin = if has_image {
+            Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()))
+        } else {
+            None
+        };
+
+        forward_step_f16(
+            weights,
+            cfg,
+            &rope,
+            token_id,
+            pos,
+            &mut gdn_states,
+            &mut kv_cache,
+            &mut scratch,
+            injected,
+            cos_sin,
+        )?;
+
+        hidden_states.extend_from_slice(&scratch.hidden[..hidden]);
+
+        if pos < prompt_len - 1 {
+            kv_cache.seq_len += 1;
+        }
+    }
+    kv_cache.seq_len = prompt_len;
+
+    Ok(hidden_states)
+}
+
+/// Mean-pool `hidden_states` (flat row-major `[seq_len, hidden_size]`) over
+/// `positions`. Panics only on internal misuse (empty `positions` or an
+/// out-of-range index), never on caller input — callers of this private
+/// helper always derive `positions` from a validated request.
+fn mean_pool_rows(hidden_states: &[f32], hidden_size: usize, positions: &[usize]) -> Vec<f32> {
+    debug_assert!(!positions.is_empty());
+    let mut out = vec![0.0f32; hidden_size];
+    for &p in positions {
+        let row = &hidden_states[p * hidden_size..(p + 1) * hidden_size];
+        for (o, &v) in out.iter_mut().zip(row) {
+            *o += v;
+        }
+    }
+    let n = positions.len() as f32;
+    for o in &mut out {
+        *o /= n;
+    }
+    out
+}
+
+/// L2-normalize `v` in place; a zero or non-finite norm leaves `v`
+/// unchanged rather than dividing by zero/NaN.
+fn l2_normalize_owned(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 && norm.is_finite() {
+        for x in &mut v {
+            *x /= norm;
+        }
+    }
+    v
+}
+
+/// Collapse `hidden_states` into one `[hidden_size]` vector per
+/// [`PoolingStrategy`]. `image_pad_positions` is the (possibly empty) list
+/// of physical positions holding an `<|image_pad|>` token, in ascending
+/// order.
+fn pool_hidden_states(
+    hidden_states: &[f32],
+    hidden_size: usize,
+    seq_len: usize,
+    image_pad_positions: &[usize],
+    pooling: PoolingStrategy,
+) -> Vec<f32> {
+    match pooling {
+        PoolingStrategy::LastToken => {
+            hidden_states[(seq_len - 1) * hidden_size..seq_len * hidden_size].to_vec()
+        }
+        PoolingStrategy::MeanVisualTokens => {
+            if image_pad_positions.is_empty() {
+                let all: Vec<usize> = (0..seq_len).collect();
+                mean_pool_rows(hidden_states, hidden_size, &all)
+            } else {
+                mean_pool_rows(hidden_states, hidden_size, image_pad_positions)
+            }
+        }
+    }
+}
+
+/// Run prefill over an image + text [`Qwen35VisionRequest`] and return a
+/// pooled, L2-normalized embedding of length `cfg.hidden_size` (2048 for the
+/// Qwen3.5-0.8B checkpoint).
+///
+/// See [`PoolingStrategy`] for the honesty note on retrieval quality: this
+/// function is the extraction machinery (correct positions, deterministic,
+/// unit-norm output), not a claim about embedding quality.
+///
+/// # Errors
+///
+/// See [`prefill_hidden_states_f16`].
+pub fn embed_image_f16(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    request: &Qwen35VisionRequest,
+    pooling: PoolingStrategy,
+) -> Result<Vec<f32>, crate::error::InferenceError> {
+    let hidden_states = prefill_hidden_states_f16(weights, cfg, request)?;
+    let seq_len = request.input_ids.len();
+    let image_pad_positions: Vec<usize> = request
+        .input_ids
+        .iter()
+        .enumerate()
+        .filter(|&(_, &id)| id == request.image_token_id)
+        .map(|(i, _)| i)
+        .collect();
+    let pooled = pool_hidden_states(
+        &hidden_states,
+        cfg.hidden_size,
+        seq_len,
+        &image_pad_positions,
+        pooling,
+    );
+    Ok(l2_normalize_owned(pooled))
+}
+
+/// Tokenize `prompt` and run it through the same decoder + pooling path as
+/// [`embed_image_f16`] (as a text-only [`Qwen35VisionRequest`] with no image
+/// runs), so text and image embeddings from the same checkpoint land in the
+/// same vector space. Returns a pooled, L2-normalized embedding of length
+/// `cfg.hidden_size`.
+///
+/// Requires a vision-language checkpoint: `cfg.rope_parameters` must carry
+/// an `mrope_section` (only vision-language configs set one) even though no
+/// image is present, because this routes through the same
+/// [`Qwen35VisionRequest`]-shaped prefill as the image path rather than a
+/// separate code path — that shared path is the whole point (same decoder,
+/// same pooling, same space).
+///
+/// # Errors
+///
+/// Returns [`crate::error::InferenceError::InvalidInput`] if the tokenized
+/// prompt is empty or contains an out-of-vocabulary or (surprisingly) an
+/// `image_token_id` token. See [`prefill_hidden_states_f16`] for the
+/// remaining error conditions.
+pub fn embed_text_vlm_f16(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    tokenizer: &BpeTokenizer,
+    prompt: &str,
+    pooling: PoolingStrategy,
+) -> Result<Vec<f32>, crate::error::InferenceError> {
+    let input = tokenizer.tokenize(prompt);
+    let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+    crate::model::qwen35::check_prompt_not_empty(prompt_ids.len())?;
+
+    if let Some(&bad_id) = prompt_ids.iter().find(|&&id| id as usize >= cfg.vocab_size) {
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "prompt contains out-of-vocabulary token id {bad_id} (vocab_size={})",
+            cfg.vocab_size
+        )));
+    }
+
+    // image_token_id is only needed here to shape a well-formed (imageless)
+    // Qwen35VisionRequest; u32::MAX is an unreachable sentinel when the
+    // checkpoint has no vision config at all (in which case the request
+    // below will simply never see that id).
+    let image_token_id = cfg.image_token_id.unwrap_or(u32::MAX);
+    if prompt_ids.contains(&image_token_id) {
+        return Err(crate::error::InferenceError::InvalidInput(
+            "tokenized prompt unexpectedly contains the checkpoint's image_token_id".to_string(),
+        ));
+    }
+
+    let request = Qwen35VisionRequest {
+        input_ids: prompt_ids,
+        image_grids: vec![],
+        post_merger_rows: vec![],
+        image_token_id,
+        spatial_merge_size: cfg
+            .vision_config
+            .as_ref()
+            .map(|v| v.spatial_merge_size)
+            .unwrap_or(2),
+        decoder_hidden_size: cfg.hidden_size,
+    };
+
+    embed_image_f16(weights, cfg, &request, pooling)
 }
 
 // ---------------------------------------------------------------------------
@@ -3203,6 +3557,371 @@ mod tests {
         assert!(
             matches!(err, crate::error::InferenceError::InvalidInput(_)),
             "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Pooled embedding extraction (vision-embed-pooling)
+    // -----------------------------------------------------------------
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            return 0.0;
+        }
+        dot / (na * nb)
+    }
+
+    /// A one-image request over [`tiny_vision_splice_model_with_vision_cfg`]:
+    /// grid (1,4,4), merge_size=2 -> 4 post-merger rows, embedded in a short
+    /// text scaffold `[0, <pad>x4, 1]`. `visual_rows` lets callers vary the
+    /// "image content" while keeping every shape/id fixed.
+    fn one_image_request(visual_rows: Vec<f32>) -> Qwen35VisionRequest {
+        let mut input_ids = vec![0u32];
+        input_ids.extend(std::iter::repeat_n(3u32, 4));
+        input_ids.push(1);
+        Qwen35VisionRequest {
+            input_ids,
+            image_grids: vec![crate::vision::qwen35_vit::GridThw { t: 1, h: 4, w: 4 }],
+            post_merger_rows: visual_rows,
+            image_token_id: 3,
+            spatial_merge_size: 2,
+            decoder_hidden_size: 8,
+        }
+    }
+
+    #[test]
+    fn embed_image_f16_is_deterministic() {
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        let request = one_image_request(vec![0.3f32; 4 * cfg.hidden_size]);
+
+        let v1 = embed_image_f16(&weights, &cfg, &request, PoolingStrategy::MeanVisualTokens)
+            .expect("embed_image_f16 succeeds");
+        let v2 = embed_image_f16(&weights, &cfg, &request, PoolingStrategy::MeanVisualTokens)
+            .expect("embed_image_f16 succeeds");
+        assert_eq!(v1, v2, "same input must produce an identical vector");
+
+        let v3 = embed_image_f16(&weights, &cfg, &request, PoolingStrategy::LastToken)
+            .expect("embed_image_f16 succeeds");
+        let v4 = embed_image_f16(&weights, &cfg, &request, PoolingStrategy::LastToken)
+            .expect("embed_image_f16 succeeds");
+        assert_eq!(
+            v3, v4,
+            "same input must produce an identical vector (LastToken)"
+        );
+    }
+
+    #[test]
+    fn embed_image_f16_is_finite_and_unit_norm() {
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        for pooling in [
+            PoolingStrategy::MeanVisualTokens,
+            PoolingStrategy::LastToken,
+        ] {
+            let request = one_image_request(vec![0.4f32; 4 * cfg.hidden_size]);
+            let v = embed_image_f16(&weights, &cfg, &request, pooling)
+                .expect("embed_image_f16 succeeds");
+            assert_eq!(v.len(), cfg.hidden_size);
+            assert!(
+                v.iter().all(|x| x.is_finite()),
+                "{pooling:?}: non-finite output"
+            );
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "{pooling:?}: expected unit norm, got {norm}"
+            );
+        }
+    }
+
+    #[test]
+    fn embed_image_f16_discriminates_different_images_but_matches_itself() {
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+
+        let request_a = one_image_request(
+            (0..4 * cfg.hidden_size)
+                .map(|i| (i as f32) * 0.05 - 0.8)
+                .collect(),
+        );
+        let request_b = one_image_request(
+            (0..4 * cfg.hidden_size)
+                .map(|i| -(i as f32) * 0.03 + 0.5)
+                .collect(),
+        );
+
+        let emb_a = embed_image_f16(
+            &weights,
+            &cfg,
+            &request_a,
+            PoolingStrategy::MeanVisualTokens,
+        )
+        .expect("embed_image_f16 succeeds");
+        let emb_a_again = embed_image_f16(
+            &weights,
+            &cfg,
+            &request_a,
+            PoolingStrategy::MeanVisualTokens,
+        )
+        .expect("embed_image_f16 succeeds");
+        let emb_b = embed_image_f16(
+            &weights,
+            &cfg,
+            &request_b,
+            PoolingStrategy::MeanVisualTokens,
+        )
+        .expect("embed_image_f16 succeeds");
+
+        let self_cos = cosine(&emb_a, &emb_a_again);
+        assert!(
+            (self_cos - 1.0).abs() < 1e-5,
+            "an image embedded against itself must have cosine ~1.0, got {self_cos}"
+        );
+
+        let cross_cos = cosine(&emb_a, &emb_b);
+        assert!(
+            cross_cos < 0.999,
+            "two different images must not collapse to near-identical embeddings, got cosine {cross_cos}"
+        );
+    }
+
+    /// Direct unit test on the pooling primitive: pooling over the correct
+    /// image-pad window vs. an off-by-one-shifted window over the SAME
+    /// hidden-state matrix must produce different vectors. This is the
+    /// mutation-sensitivity gate for the position-selection logic
+    /// `embed_image_f16` relies on — an off-by-one bug in
+    /// `image_pad_positions` (or a copy-pasted sibling that reintroduces
+    /// one) changes the output instead of silently passing.
+    #[test]
+    fn pool_hidden_states_wrong_positions_change_the_output() {
+        let hidden_size = 4;
+        let seq_len = 6;
+        // Row i is a constant-i vector, so shifting the pooled window by one
+        // position is guaranteed to change the mean.
+        let hidden_states: Vec<f32> = (0..seq_len)
+            .flat_map(|i| std::iter::repeat_n(i as f32, hidden_size))
+            .collect();
+
+        let correct_positions = [1usize, 2, 3, 4];
+        let off_by_one_positions = [2usize, 3, 4, 5];
+
+        let correct = pool_hidden_states(
+            &hidden_states,
+            hidden_size,
+            seq_len,
+            &correct_positions,
+            PoolingStrategy::MeanVisualTokens,
+        );
+        let wrong = pool_hidden_states(
+            &hidden_states,
+            hidden_size,
+            seq_len,
+            &off_by_one_positions,
+            PoolingStrategy::MeanVisualTokens,
+        );
+
+        assert_ne!(
+            correct, wrong,
+            "pooling over an off-by-one-shifted position window must change the output"
+        );
+    }
+
+    #[test]
+    fn embed_image_f16_wrong_pad_run_placement_changes_embedding() {
+        // Same checkpoint, same post-merger rows, but the image-pad run sits
+        // at a different physical offset in input_ids (shifted by one text
+        // token) -- the practical shape of a real "wrong positions" bug
+        // (e.g. an off-by-one in scaffold assembly). The resulting pooled
+        // embedding must differ: different M-RoPE coordinates and different
+        // neighboring context both feed into it.
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        let visual_rows = vec![0.25f32; 4 * cfg.hidden_size];
+
+        let correct = one_image_request(visual_rows.clone());
+        let mut shifted_ids = vec![0u32, 2]; // extra leading text token
+        shifted_ids.extend(std::iter::repeat_n(3u32, 4));
+        shifted_ids.push(1);
+        let shifted = Qwen35VisionRequest {
+            input_ids: shifted_ids,
+            ..one_image_request(visual_rows)
+        };
+
+        let emb_correct =
+            embed_image_f16(&weights, &cfg, &correct, PoolingStrategy::MeanVisualTokens)
+                .expect("embed_image_f16 succeeds");
+        let emb_shifted =
+            embed_image_f16(&weights, &cfg, &shifted, PoolingStrategy::MeanVisualTokens)
+                .expect("embed_image_f16 succeeds");
+
+        assert_ne!(
+            emb_correct, emb_shifted,
+            "shifting the image-pad run's position in input_ids must change the pooled embedding"
+        );
+    }
+
+    #[test]
+    fn embed_text_vlm_f16_is_deterministic_and_unit_norm() {
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        let mut vocab_map = std::collections::HashMap::new();
+        for (i, c) in ["a", "b", "c"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        let tokenizer =
+            BpeTokenizer::from_vocab_and_merges(vocab_map, vec![]).expect("tokenizer constructs");
+
+        for pooling in [
+            PoolingStrategy::MeanVisualTokens,
+            PoolingStrategy::LastToken,
+        ] {
+            let v1 = embed_text_vlm_f16(&weights, &cfg, &tokenizer, "abc", pooling)
+                .expect("embed_text_vlm_f16 succeeds");
+            let v2 = embed_text_vlm_f16(&weights, &cfg, &tokenizer, "abc", pooling)
+                .expect("embed_text_vlm_f16 succeeds");
+            assert_eq!(
+                v1, v2,
+                "{pooling:?}: same prompt must produce an identical vector"
+            );
+            assert_eq!(v1.len(), cfg.hidden_size);
+            let norm: f32 = v1.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "{pooling:?}: expected unit norm, got {norm}"
+            );
+        }
+    }
+
+    #[test]
+    fn embed_text_vlm_f16_and_embed_image_f16_share_the_same_space() {
+        // Not a quality claim (see PoolingStrategy's doc comment) -- just
+        // proves both entry points route through the same decoder + pooling
+        // call so their outputs are directly comparable vectors of the same
+        // dimension, which is the structural property retrieval depends on.
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        let mut vocab_map = std::collections::HashMap::new();
+        vocab_map.insert("a".to_string(), 0u32);
+        let tokenizer =
+            BpeTokenizer::from_vocab_and_merges(vocab_map, vec![]).expect("tokenizer constructs");
+
+        let text_emb =
+            embed_text_vlm_f16(&weights, &cfg, &tokenizer, "a", PoolingStrategy::LastToken)
+                .expect("embed_text_vlm_f16 succeeds");
+        let image_emb = embed_image_f16(
+            &weights,
+            &cfg,
+            &one_image_request(vec![0.1f32; 4 * cfg.hidden_size]),
+            PoolingStrategy::LastToken,
+        )
+        .expect("embed_image_f16 succeeds");
+
+        assert_eq!(text_emb.len(), image_emb.len());
+        let cos = cosine(&text_emb, &image_emb);
+        assert!(cos.is_finite());
+    }
+
+    #[test]
+    fn embed_text_vlm_f16_rejects_prompt_colliding_with_image_token_id() {
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        assert_eq!(cfg.image_token_id, Some(3));
+        // Vocab entry "z" is deliberately assigned id 3, the checkpoint's
+        // image_token_id -- a tokenized prompt must never silently contain it.
+        let mut vocab_map = std::collections::HashMap::new();
+        vocab_map.insert("z".to_string(), 3u32);
+        let tokenizer =
+            BpeTokenizer::from_vocab_and_merges(vocab_map, vec![]).expect("tokenizer constructs");
+
+        let err = embed_text_vlm_f16(&weights, &cfg, &tokenizer, "z", PoolingStrategy::LastToken)
+            .expect_err("a prompt colliding with image_token_id must be rejected");
+        assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn embed_image_f16_rejects_invalid_request() {
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        let mut request = one_image_request(vec![0.1f32; 4 * cfg.hidden_size]);
+        request.post_merger_rows.pop(); // now the wrong length
+        assert!(
+            embed_image_f16(&weights, &cfg, &request, PoolingStrategy::MeanVisualTokens).is_err()
+        );
+    }
+
+    /// The context-window limit must be evaluated BEFORE `build_mrope_tables`
+    /// materializes per-token position/cos/sin rows: an over-context request
+    /// must fail cheaply, not after unbounded allocation work. The request
+    /// here passes `Qwen35VisionRequest::validate` (run count, TOTAL pad
+    /// count, and row-buffer length all line up) but carries per-run lengths
+    /// [1, 3] against grids expecting [2, 2] — a mismatch only the M-RoPE
+    /// builder detects — so getting the context-window error (not the
+    /// builder's run-length error) proves the ordering.
+    #[test]
+    fn prefill_rejects_over_context_before_mrope_table_construction() {
+        let (mut cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        let base = one_image_request(vec![0.1f32; 4 * cfg.hidden_size]);
+        let request = Qwen35VisionRequest {
+            // Two pad runs of lengths 1 and 3 (total 4, matching the grids'
+            // total merged rows), while each grid below expects a run of 2.
+            input_ids: vec![0u32, 3, 1, 3, 3, 3, 1],
+            image_grids: vec![
+                crate::vision::qwen35_vit::GridThw { t: 1, h: 2, w: 4 },
+                crate::vision::qwen35_vit::GridThw { t: 1, h: 2, w: 4 },
+            ],
+            ..base
+        };
+        request
+            .validate()
+            .expect("request must pass validation so only the builder would catch it");
+        cfg.max_position_embeddings = request.input_ids.len() - 1;
+
+        let err = prefill_hidden_states_f16(&weights, &cfg, &request)
+            .expect_err("over-context request must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("context window"),
+            "must fail on the context-window check, before M-RoPE table \
+             construction; got: {msg}"
+        );
+    }
+
+    /// Golden-reference check for `embed_image_f16`'s own image-pad
+    /// position-selection wiring (not just the generic `pool_hidden_states`
+    /// primitive, which `pool_hidden_states_wrong_positions_change_the_output`
+    /// already covers in isolation): `one_image_request`'s fixed layout
+    /// `[0, <pad>x4, 1]` puts the pad run at physical positions `[1,2,3,4]`
+    /// by construction. This test independently derives the expected
+    /// pooled/normalized vector from `prefill_hidden_states_f16` using that
+    /// hand-known-correct window and asserts `embed_image_f16` matches it
+    /// exactly.
+    ///
+    /// Mutation-sensitive: an off-by-one in `embed_image_f16`'s
+    /// `image_pad_positions` computation (e.g. `.map(|(i, _)| i + 1)`) still
+    /// passes `embed_image_f16_is_deterministic`,
+    /// `_discriminates_different_images_but_matches_itself`, and
+    /// `_wrong_pad_run_placement_changes_embedding` (all of them assert only
+    /// relative properties -- determinism, discrimination, "differs from a
+    /// differently-shaped request" -- that remain true under a consistently
+    /// applied shift), but fails this golden check because the reference
+    /// value is computed independently of that internal computation.
+    #[test]
+    fn embed_image_f16_matches_independently_computed_golden_pool() {
+        let (cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        let request = one_image_request(vec![0.37f32; 4 * cfg.hidden_size]);
+
+        let hidden_states = prefill_hidden_states_f16(&weights, &cfg, &request)
+            .expect("prefill_hidden_states_f16 succeeds");
+        let known_correct_pad_positions = [1usize, 2, 3, 4]; // by construction of one_image_request
+        let golden = l2_normalize_owned(mean_pool_rows(
+            &hidden_states,
+            cfg.hidden_size,
+            &known_correct_pad_positions,
+        ));
+
+        let got = embed_image_f16(&weights, &cfg, &request, PoolingStrategy::MeanVisualTokens)
+            .expect("embed_image_f16 succeeds");
+
+        assert_eq!(
+            got, golden,
+            "embed_image_f16 must pool over exactly the known-correct image-pad positions"
         );
     }
 }
