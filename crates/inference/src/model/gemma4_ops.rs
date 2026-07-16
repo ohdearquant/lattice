@@ -65,6 +65,18 @@ fn gelu_tanh_exact(x: f32) -> f32 {
     0.5 * x * (1.0 + inner.tanh())
 }
 
+/// In-place exact tanh-approximate GELU (`gelu_pytorch_tanh`) over a whole
+/// slice -- the same [`gelu_tanh_exact`] scalar op [`gemma4_geglu_mlp`] uses
+/// internally, exposed for the per-layer-embedding gate activation
+/// (`Gemma4TextDecoderLayer.forward`'s `self.act_fn(per_layer_input_gate(x))`,
+/// `modeling_gemma4.py:1451`), which is a plain activation with no MLP
+/// wiring around it.
+pub fn gemma4_gelu_tanh(x: &mut [f32]) {
+    for v in x.iter_mut() {
+        *v = gelu_tanh_exact(*v);
+    }
+}
+
 /// GeGLU MLP: `down(gelu_tanh(gate(x)) * up(x))`
 /// (`Gemma4TextMLP.forward`, `modeling_gemma4.py:1079-1081`).
 ///
@@ -72,6 +84,13 @@ fn gelu_tanh_exact(x: f32) -> f32 {
 /// `[hidden, intermediate]` (`nn.Linear` weight layout, `[out, in]`) --
 /// exactly the layout `crate::forward::cpu::matmul_bt` expects as its `B`
 /// argument.
+///
+/// `gate_scratch`/`up_scratch` are caller-provided `tokens*intermediate`
+/// buffers (their contents on entry are irrelevant -- both are fully
+/// overwritten by the first `matmul_bt` before being read) so that a
+/// per-layer caller can reuse one allocation across every layer of a
+/// forward pass instead of allocating two fresh vectors per call.
+#[allow(clippy::too_many_arguments)]
 pub fn gemma4_geglu_mlp(
     x: &[f32],
     gate_w: &[f32],
@@ -80,6 +99,8 @@ pub fn gemma4_geglu_mlp(
     tokens: usize,
     hidden: usize,
     intermediate: usize,
+    gate_scratch: &mut [f32],
+    up_scratch: &mut [f32],
     out: &mut [f32],
 ) {
     assert_eq!(x.len(), tokens * hidden, "x must be tokens*hidden");
@@ -99,16 +120,24 @@ pub fn gemma4_geglu_mlp(
         "down_w must be hidden*intermediate"
     );
     assert_eq!(out.len(), tokens * hidden, "out must be tokens*hidden");
+    assert_eq!(
+        gate_scratch.len(),
+        tokens * intermediate,
+        "gate_scratch must be tokens*intermediate"
+    );
+    assert_eq!(
+        up_scratch.len(),
+        tokens * intermediate,
+        "up_scratch must be tokens*intermediate"
+    );
 
-    let mut gate = vec![0f32; tokens * intermediate];
-    let mut up = vec![0f32; tokens * intermediate];
-    matmul_bt(x, gate_w, &mut gate, tokens, hidden, intermediate);
-    matmul_bt(x, up_w, &mut up, tokens, hidden, intermediate);
-    for v in gate.iter_mut() {
+    matmul_bt(x, gate_w, gate_scratch, tokens, hidden, intermediate);
+    matmul_bt(x, up_w, up_scratch, tokens, hidden, intermediate);
+    for v in gate_scratch.iter_mut() {
         *v = gelu_tanh_exact(*v);
     }
-    elementwise_mul(&mut gate, &up);
-    matmul_bt(&gate, down_w, out, tokens, intermediate, hidden);
+    elementwise_mul(gate_scratch, up_scratch);
+    matmul_bt(gate_scratch, down_w, out, tokens, intermediate, hidden);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,20 +330,33 @@ pub fn gemma4_apply_rope(
         seq_len * head_dim,
         "sin must be seq_len*head_dim"
     );
+    // Stride-half pairing requires an even head_dim; an odd width would
+    // leave the last lane outside every (i, half+i) pair and silently
+    // diverge from the rotate-half reference.
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "head_dim must be even and > 0 for stride-half RoPE, got {head_dim}"
+    );
     let half = head_dim / 2;
-    let mut rotated = vec![0f32; head_dim];
     for t in 0..seq_len {
         let cos_row = &cos[t * head_dim..(t + 1) * head_dim];
         let sin_row = &sin[t * head_dim..(t + 1) * head_dim];
         for h in 0..heads {
             let base = (t * heads + h) * head_dim;
             let row = &mut x[base..base + head_dim];
+            // Same arithmetic as materializing `rotate_half(row)` into a
+            // temporary buffer then computing `row * cos + rotated * sin`
+            // element-wise, just without the heap allocation: each pair
+            // `(i, half+i)` only reads its own pre-update values (`x1`,
+            // `x2`), so writing both outputs of a pair before moving to the
+            // next pair is order-independent and bit-identical to the
+            // original two-pass form (even head_dim enforced above; pairs
+            // are disjoint only in that domain).
             for i in 0..half {
-                rotated[i] = -row[half + i];
-                rotated[half + i] = row[i];
-            }
-            for i in 0..head_dim {
-                row[i] = row[i] * cos_row[i] + rotated[i] * sin_row[i];
+                let x1 = row[i];
+                let x2 = row[half + i];
+                row[i] = x1 * cos_row[i] - x2 * sin_row[i];
+                row[half + i] = x2 * cos_row[half + i] + x1 * sin_row[half + i];
             }
         }
     }
@@ -503,6 +545,8 @@ mod tests {
         let expected = load_bin(&fx, "output");
 
         let mut out = vec![0f32; tokens * hidden];
+        let mut gate_scratch = vec![0f32; tokens * intermediate];
+        let mut up_scratch = vec![0f32; tokens * intermediate];
         gemma4_geglu_mlp(
             &x,
             &gate_w,
@@ -511,6 +555,8 @@ mod tests {
             tokens,
             hidden,
             intermediate,
+            &mut gate_scratch,
+            &mut up_scratch,
             &mut out,
         );
 
@@ -754,6 +800,64 @@ mod tests {
             "global RoPE fed the local theta must diverge by at least the predeclared \
              mutation-separation floor (diff {diff_global}, floor {floor})"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "head_dim must be even")]
+    fn apply_rope_rejects_odd_head_dim() {
+        // The in-place stride-half loop pairs (i, half+i); an odd width has
+        // an unpaired last lane the loop would silently leave un-rotated
+        // (the removed two-pass form scaled it by cos). Reject, don't drift.
+        let head_dim = 5;
+        let mut x = vec![1.0_f32; head_dim];
+        let cos = vec![1.0_f32; head_dim];
+        let sin = vec![0.0_f32; head_dim];
+        gemma4_apply_rope(&mut x, &cos, &sin, 1, 1, head_dim);
+    }
+
+    #[test]
+    fn apply_rope_bit_identical_to_two_pass_reference() {
+        // Even-width exact-bit regression: the in-place pair loop must match
+        // the removed materialize-rotate-half-then-elementwise form to the
+        // bit on finite values (the claim the hot-path rewrite rests on).
+        let (seq_len, heads, head_dim) = (3, 2, 8);
+        let half = head_dim / 2;
+        let n = seq_len * heads * head_dim;
+        // Deterministic, sign-varied, non-round values.
+        let val = |i: usize| ((i as f32) * 0.7311 - 3.1).sin() * 2.3;
+        let x_orig: Vec<f32> = (0..n).map(val).collect();
+        let cos: Vec<f32> = (0..seq_len * head_dim).map(|i| val(i + 17)).collect();
+        let sin: Vec<f32> = (0..seq_len * head_dim).map(|i| val(i + 41)).collect();
+
+        // Reference: the old two-pass form.
+        let mut expected = x_orig.clone();
+        for t in 0..seq_len {
+            let cos_row = &cos[t * head_dim..(t + 1) * head_dim];
+            let sin_row = &sin[t * head_dim..(t + 1) * head_dim];
+            for h in 0..heads {
+                let base = (t * heads + h) * head_dim;
+                let row = &mut expected[base..base + head_dim];
+                let mut rotated = vec![0.0_f32; head_dim];
+                for i in 0..half {
+                    rotated[i] = -row[half + i];
+                    rotated[half + i] = row[i];
+                }
+                for i in 0..head_dim {
+                    row[i] = row[i] * cos_row[i] + rotated[i] * sin_row[i];
+                }
+            }
+        }
+
+        let mut actual = x_orig;
+        gemma4_apply_rope(&mut actual, &cos, &sin, seq_len, heads, head_dim);
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "lane {i}: in-place RoPE not bit-identical to two-pass reference \
+                 ({a} vs {e})"
+            );
+        }
     }
 
     #[test]

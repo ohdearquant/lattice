@@ -374,15 +374,19 @@ impl Gemma4Config {
                 self.num_attention_heads, self.num_key_value_heads
             )));
         }
-        if self.head_dim == 0 {
-            return Err(InferenceError::Inference(
-                "invalid Gemma 4 config.json: head_dim must be > 0".to_string(),
-            ));
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(2) {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: head_dim ({}) must be even and > 0 \
+                 (stride-half RoPE pairs (i, head_dim/2 + i))",
+                self.head_dim
+            )));
         }
-        if self.global_head_dim == 0 {
-            return Err(InferenceError::Inference(
-                "invalid Gemma 4 config.json: global_head_dim must be > 0".to_string(),
-            ));
+        if self.global_head_dim == 0 || !self.global_head_dim.is_multiple_of(2) {
+            return Err(InferenceError::Inference(format!(
+                "invalid Gemma 4 config.json: global_head_dim ({}) must be even and > 0 \
+                 (stride-half RoPE pairs (i, head_dim/2 + i))",
+                self.global_head_dim
+            )));
         }
         if self.sliding_window == 0 {
             return Err(InferenceError::Inference(
@@ -463,6 +467,20 @@ impl Gemma4Config {
             return Err(InferenceError::Inference(
                 "invalid Gemma 4 config.json: attention_bias=true is unsupported -- the \
                  Gemma 4 E2B checkpoint this loader targets has attention_bias=false"
+                    .to_string(),
+            ));
+        }
+        // The forward pass always projects logits through `embed_tokens`
+        // (the tied convention) and the loader never requests a distinct
+        // `lm_head.weight`. tie_word_embeddings=false on an otherwise
+        // E2B-shaped config would load successfully and silently produce
+        // wrong logits by using the input embedding table as the output
+        // head. Reject it here rather than load-then-diverge.
+        if !self.tie_word_embeddings {
+            return Err(InferenceError::Inference(
+                "invalid Gemma 4 config.json: tie_word_embeddings=false is unsupported -- this \
+                 loader only implements the tied embed_tokens/lm_head projection the pinned \
+                 Gemma 4 E2B checkpoint uses; an untied lm_head.weight is never read"
                     .to_string(),
             ));
         }
@@ -790,6 +808,35 @@ mod tests {
     }
 
     #[test]
+    fn odd_head_dim_errors_naming_field() {
+        // gemma4_apply_rope's stride-half pairing requires even widths; an
+        // odd head_dim must die here with a typed error, not deep in the
+        // forward pass at the op-level assert.
+        let mut json = pinned_config_value();
+        json["text_config"]["head_dim"] = serde_json::json!(255);
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("an odd head_dim must yield an InferenceError");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("head_dim (255)") && msg.contains("even"),
+            "error must name head_dim and evenness: {msg}"
+        );
+    }
+
+    #[test]
+    fn odd_global_head_dim_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["global_head_dim"] = serde_json::json!(511);
+        let err = Gemma4Config::from_config_json_str(&json.to_string())
+            .expect_err("an odd global_head_dim must yield an InferenceError");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("global_head_dim (511)") && msg.contains("even"),
+            "error must name global_head_dim and evenness: {msg}"
+        );
+    }
+
+    #[test]
     fn wrong_hidden_activation_errors_naming_field() {
         let mut json = pinned_config_value();
         json["text_config"]["hidden_activation"] = serde_json::json!("gelu");
@@ -810,6 +857,20 @@ mod tests {
         assert!(
             err.to_string().contains("final_logit_softcapping"),
             "error must name final_logit_softcapping: {err}"
+        );
+    }
+
+    #[test]
+    fn tie_word_embeddings_false_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["tie_word_embeddings"] = serde_json::json!(false);
+        let err = Gemma4Config::from_config_json_str(&json.to_string()).expect_err(
+            "tie_word_embeddings=false must yield an InferenceError: this loader never reads \
+             a distinct lm_head.weight",
+        );
+        assert!(
+            err.to_string().contains("tie_word_embeddings"),
+            "error must name tie_word_embeddings: {err}"
         );
     }
 
