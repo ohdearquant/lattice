@@ -1515,6 +1515,18 @@ pub fn prefill_hidden_states_f16(
         }
     }
 
+    // Reject empty and over-context prompts before build_mrope_tables, which
+    // otherwise materializes a position entry plus cos/sin rows per supplied
+    // token — unbounded input must fail cheaply, not after that allocation.
+    let prompt_len = request.input_ids.len();
+    crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+    let max_context = cfg.max_position_embeddings;
+    if prompt_len > max_context {
+        return Err(crate::error::InferenceError::Inference(format!(
+            "prompt ({prompt_len} tokens) exceeds model context window ({max_context})"
+        )));
+    }
+
     let (_positions, tables) = request.build_mrope_tables(cfg)?;
 
     let expected_rope_half = cfg.rope_dim() / 2;
@@ -1528,15 +1540,6 @@ pub fn prefill_hidden_states_f16(
     }
 
     let prompt_ids = &request.input_ids;
-    let prompt_len = prompt_ids.len();
-    crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
-
-    let max_context = cfg.max_position_embeddings;
-    if prompt_len > max_context {
-        return Err(crate::error::InferenceError::Inference(format!(
-            "prompt ({prompt_len} tokens) exceeds model context window ({max_context})"
-        )));
-    }
 
     let num_linear = cfg.num_linear_attention_layers();
     let num_full = cfg.num_full_attention_layers();
@@ -3840,6 +3843,43 @@ mod tests {
         request.post_merger_rows.pop(); // now the wrong length
         assert!(
             embed_image_f16(&weights, &cfg, &request, PoolingStrategy::MeanVisualTokens).is_err()
+        );
+    }
+
+    /// The context-window limit must be evaluated BEFORE `build_mrope_tables`
+    /// materializes per-token position/cos/sin rows: an over-context request
+    /// must fail cheaply, not after unbounded allocation work. The request
+    /// here passes `Qwen35VisionRequest::validate` (run count, TOTAL pad
+    /// count, and row-buffer length all line up) but carries per-run lengths
+    /// [1, 3] against grids expecting [2, 2] — a mismatch only the M-RoPE
+    /// builder detects — so getting the context-window error (not the
+    /// builder's run-length error) proves the ordering.
+    #[test]
+    fn prefill_rejects_over_context_before_mrope_table_construction() {
+        let (mut cfg, weights) = tiny_vision_splice_model_with_vision_cfg();
+        let base = one_image_request(vec![0.1f32; 4 * cfg.hidden_size]);
+        let request = Qwen35VisionRequest {
+            // Two pad runs of lengths 1 and 3 (total 4, matching the grids'
+            // total merged rows), while each grid below expects a run of 2.
+            input_ids: vec![0u32, 3, 1, 3, 3, 3, 1],
+            image_grids: vec![
+                crate::vision::qwen35_vit::GridThw { t: 1, h: 2, w: 4 },
+                crate::vision::qwen35_vit::GridThw { t: 1, h: 2, w: 4 },
+            ],
+            ..base
+        };
+        request
+            .validate()
+            .expect("request must pass validation so only the builder would catch it");
+        cfg.max_position_embeddings = request.input_ids.len() - 1;
+
+        let err = prefill_hidden_states_f16(&weights, &cfg, &request)
+            .expect_err("over-context request must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("context window"),
+            "must fail on the context-window check, before M-RoPE table \
+             construction; got: {msg}"
         );
     }
 
