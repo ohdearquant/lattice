@@ -34,7 +34,7 @@
 // truth for what "too large" means -- both are `pub` and re-exported
 // unconditionally at the `lattice_embed` crate root (not gated behind the
 // `native` feature), so this crate can depend on them directly.
-use lattice_embed::{DEFAULT_MAX_BATCH_SIZE, EmbeddingModel as ModelFamily, MAX_TEXT_CHARS};
+use lattice_embed::{DEFAULT_MAX_BATCH_SIZE, EmbeddingModel as ModelFamily, MAX_TEXT_BYTES};
 use lattice_inference::BertModel;
 use napi::bindgen_prelude::{AsyncTask, Float32Array, Task};
 use napi::{Env, Error, Result, Status};
@@ -378,18 +378,16 @@ fn validate_text(text: &str, index: usize) -> Result<()> {
     ));
   }
 
-  // `MAX_TEXT_CHARS`'s own doc comment says "characters", but the
-  // production enforcement point this binding mirrors
-  // (`crates/embed/src/service/native.rs`, `if text.len() > MAX_TEXT_CHARS`)
-  // actually measures `str::len()`, i.e. UTF-8 BYTE length, not
-  // `chars().count()`. Match that exactly -- not the doc comment -- so a
+  // Mirrors the production enforcement point
+  // (`crates/embed/src/service/native.rs`, `if text.len() > MAX_TEXT_BYTES`):
+  // `str::len()` is UTF-8 BYTE length, not `chars().count()`, so a
   // multi-byte string near the boundary is accepted/rejected identically
   // by this binding and by `NativeEmbeddingService`/`CachedEmbeddingService`.
-  if text.len() > MAX_TEXT_CHARS {
+  if text.len() > MAX_TEXT_BYTES {
     return Err(invalid_arg(
       "FL_EMBED_INPUT_TOO_LARGE",
       format!(
-        "text at index {index} is {} bytes, exceeding the maximum of {MAX_TEXT_CHARS} bytes",
+        "text at index {index} is {} bytes, exceeding the maximum of {MAX_TEXT_BYTES} bytes",
         text.len()
       ),
     ));
