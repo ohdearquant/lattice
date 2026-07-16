@@ -269,10 +269,16 @@ jobs:
             fi
           }
 
-          cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu,test-utils > lattice_serve_test.log 2>&1
-          lattice_serve_status=$?
-          cat lattice_serve_test.log
-          if [ "$lattice_serve_status" -ne 0 ]; then
+          # if/else (not `cmd; status=$?`): this step runs under the default
+          # `bash -e {0}` shell, so a failing bare `cargo test` terminates the
+          # script BEFORE the `cat` — the log with the actual failure is never
+          # printed (this hid the failing test on a 2026-07-16 main-push run).
+          # A command inside an `if` condition is exempt from `-e`.
+          if cargo test -p lattice-inference --bin lattice_serve --features f16,metal-gpu,test-utils > lattice_serve_test.log 2>&1; then
+            cat lattice_serve_test.log
+          else
+            lattice_serve_status=$?
+            cat lattice_serve_test.log
             echo "::error::cargo test --bin lattice_serve failed (exit $lattice_serve_status)"
             exit "$lattice_serve_status"
           fi
@@ -284,10 +290,12 @@ jobs:
           # exercise the real chat_completions -> body_stream cancel_guard
           # -> generate_streaming_with_cancel composition; without it here
           # that test would silently not compile/run under this job.
-          cargo test -p lattice-inference --bin lattice --features f16,metal-gpu,test-utils > lattice_test.log 2>&1
-          lattice_status=$?
-          cat lattice_test.log
-          if [ "$lattice_status" -ne 0 ]; then
+          # Same if/else form as lattice_serve above, same `-e` reasoning.
+          if cargo test -p lattice-inference --bin lattice --features f16,metal-gpu,test-utils > lattice_test.log 2>&1; then
+            cat lattice_test.log
+          else
+            lattice_status=$?
+            cat lattice_test.log
             echo "::error::cargo test --bin lattice failed (exit $lattice_status)"
             exit "$lattice_status"
           fi
