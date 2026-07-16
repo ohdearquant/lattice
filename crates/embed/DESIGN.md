@@ -40,7 +40,7 @@
 **INV-4.** Model loads exactly once per `NativeEmbeddingService` lifetime (`OnceLock` at `native.rs:63-64`). If broken: double model load wastes memory, or concurrent load attempts race.
 **INV-5.** Cache key includes `model_config.to_embedding_key().canonical_bytes()` (`cache.rs:194-198`). If broken: same text with different model/dimension shares cache entry, returning wrong-dimension embeddings.
 **INV-6.** `CachedEmbeddingService` validates `embeddings.len() == texts_to_embed.len()` (FP-035, `cached.rs:153-159`). If broken: cache merge produces misaligned results (embedding N assigned to text M).
-**INV-7.** Batch size <= 1000, text length <= 32768 chars. If broken: OOM on large batches or excessive tokenization time. Validated at both `native.rs` and `cached.rs` entry points.
+**INV-7.** Batch size <= 1000, text length <= `MAX_TEXT_BYTES` (32768 UTF-8 bytes, `str::len()`). If broken: OOM on large batches or excessive tokenization time. Validated at both `native.rs` and `cached.rs` entry points.
 **INV-8.** Requested model must equal loaded model (`native.rs:327-332`). If broken: model produces embeddings in wrong dimension/space.
 
 ## Known Concerns Acknowledged
