@@ -36,6 +36,74 @@ use std::path::Path;
 /// in the order layers were visited.
 type LayerProbeTrace = Vec<(usize, Vec<f32>)>;
 
+/// Reusable per-token forward-pass buffers (mirrors
+/// `qwen35::cache::ForwardScratch`): every `Vec` [`Gemma4Model::forward_step`]
+/// previously allocated fresh inside its 35-layer loop (or once per call for
+/// the vocab-sized logits buffer) now lives here, sized once at
+/// [`Self::new`] and reused across every token of a generation. Callers own
+/// one instance per generation (or per test) and pass it `&mut` into every
+/// `forward_step` call.
+pub(crate) struct Gemma4Scratch {
+    hidden: Vec<f32>,
+    residual: Vec<f32>,
+    normed: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    scores: Vec<f32>,
+    context: Vec<f32>,
+    attn_out: Vec<f32>,
+    residual2: Vec<f32>,
+    normed2: Vec<f32>,
+    ffn_out: Vec<f32>,
+    residual3: Vec<f32>,
+    gate: Vec<f32>,
+    proj: Vec<f32>,
+    /// Post-softcap logits, `[vocab_size]`. `forward_step` writes here
+    /// instead of returning an owned vector; callers that need an owned
+    /// copy across the generation boundary clone out of this once, not on
+    /// every token.
+    pub(crate) logits: Vec<f32>,
+}
+
+impl Gemma4Scratch {
+    /// Allocate every buffer at its call-independent maximum size (head
+    /// width varies sliding-vs-global, so `q`/`k`/`v`/`context` are sized to
+    /// the wider of the two head dims). `scores` is grown lazily in
+    /// [`Gemma4Model::forward_step`] since its length tracks the live KV
+    /// sequence length, not a config constant.
+    pub(crate) fn new(cfg: &Gemma4Config) -> Self {
+        let hidden_size = cfg.hidden_size;
+        let widest_head = cfg.head_dim.max(cfg.global_head_dim);
+        let q_dim_max = cfg.num_attention_heads * widest_head;
+        let kv_dim_max = cfg.num_key_value_heads * widest_head;
+        Self {
+            hidden: vec![0f32; hidden_size],
+            residual: vec![0f32; hidden_size],
+            normed: vec![0f32; hidden_size],
+            q: vec![0f32; q_dim_max],
+            k: vec![0f32; kv_dim_max],
+            v: vec![0f32; kv_dim_max],
+            scores: Vec::new(),
+            context: vec![0f32; q_dim_max],
+            attn_out: vec![0f32; hidden_size],
+            residual2: vec![0f32; hidden_size],
+            normed2: vec![0f32; hidden_size],
+            ffn_out: vec![0f32; hidden_size],
+            residual3: vec![0f32; hidden_size],
+            gate: vec![0f32; cfg.hidden_size_per_layer_input],
+            proj: vec![0f32; hidden_size],
+            logits: vec![0f32; cfg.vocab_size],
+        }
+    }
+
+    fn ensure_scores_capacity(&mut self, n: usize) {
+        if self.scores.len() < n {
+            self.scores.resize(n, 0.0);
+        }
+    }
+}
+
 /// **Unstable**: Gemma 4 E2B text-only generation model.
 pub struct Gemma4Model {
     pub(crate) config: Gemma4Config,
@@ -101,8 +169,11 @@ impl Gemma4Model {
         Gemma4KvCache::new(&self.config, max_seq_len)
     }
 
-    /// **Unstable**: single-token forward pass. Returns post-softcap logits
-    /// (`[vocab_size]`). `capture_layers` names zero-based layer indices
+    /// **Unstable**: single-token forward pass. Writes post-softcap logits
+    /// into `scratch.logits` (`[vocab_size]`) rather than returning an owned
+    /// vector -- callers that need an owned copy across a generation
+    /// boundary clone out of `scratch.logits` once, not on every token (see
+    /// [`Gemma4Scratch`]). `capture_layers` names zero-based layer indices
     /// whose post-layer hidden state (after that layer's PLE residual and
     /// `layer_scalar` multiply, before the final norm) should be recorded
     /// into the returned trace, in the order layers are visited --
@@ -118,8 +189,9 @@ impl Gemma4Model {
         token_id: u32,
         position: usize,
         cache: &mut Gemma4KvCache,
+        scratch: &mut Gemma4Scratch,
         capture_layers: &[usize],
-    ) -> Result<(Vec<f32>, LayerProbeTrace), InferenceError> {
+    ) -> Result<LayerProbeTrace, InferenceError> {
         let cfg = &self.config;
         let hidden_size = cfg.hidden_size;
         if token_id as usize >= cfg.vocab_size {
@@ -133,17 +205,24 @@ impl Gemma4Model {
         let ple_packed_dim = cfg.num_hidden_layers * per_layer_dim;
 
         // -- Scaled token embedding (G10a). --
-        let mut hidden = vec![0f32; hidden_size];
         gemma4_scaled_embedding(
             &[token_id],
             &self.weights.embed_tokens,
             hidden_size,
-            &mut hidden,
+            &mut scratch.hidden[..hidden_size],
         );
 
         // -- Per-Layer Embeddings (PLE, G9): token-identity + context. --
-        let per_layer_inputs =
-            self.compute_per_layer_inputs(&hidden, token_id, per_layer_dim, ple_packed_dim);
+        // Computed once per token (not per layer), so left as an owned
+        // return value rather than threaded through `Gemma4Scratch` -- the
+        // hot-path cost this buffer-reuse pass targets is the 35x-per-layer
+        // repetition below, not this once-per-token allocation.
+        let per_layer_inputs = self.compute_per_layer_inputs(
+            &scratch.hidden[..hidden_size],
+            token_id,
+            per_layer_dim,
+            ple_packed_dim,
+        );
 
         // -- Dual RoPE cos/sin, computed once per token (position-only). --
         let (cos_local, sin_local) = gemma4_rope_cos_sin(&self.local_inv_freq, &[position as u32]);
@@ -168,27 +247,33 @@ impl Gemma4Model {
             };
 
             // -- Attention block. --
-            let residual = hidden.clone();
-            let mut normed = hidden.clone();
+            scratch.residual[..hidden_size].copy_from_slice(&scratch.hidden[..hidden_size]);
+            scratch.normed[..hidden_size].copy_from_slice(&scratch.hidden[..hidden_size]);
             gemma4_rms_norm(
-                &mut normed,
+                &mut scratch.normed[..hidden_size],
                 &lw.input_layernorm,
                 hidden_size,
                 cfg.rms_norm_eps,
             );
 
-            let mut q = vec![0f32; q_dim];
-            matmul_bt(&normed, &lw.q_proj, &mut q, 1, hidden_size, q_dim);
+            matmul_bt(
+                &scratch.normed[..hidden_size],
+                &lw.q_proj,
+                &mut scratch.q[..q_dim],
+                1,
+                hidden_size,
+                q_dim,
+            );
             for h in 0..num_q_heads {
                 let start = h * head_w;
                 gemma4_rms_norm(
-                    &mut q[start..start + head_w],
+                    &mut scratch.q[start..start + head_w],
                     &lw.q_norm,
                     head_w,
                     cfg.rms_norm_eps,
                 );
             }
-            gemma4_apply_rope(&mut q, cos, sin, 1, num_q_heads, head_w);
+            gemma4_apply_rope(&mut scratch.q[..q_dim], cos, sin, 1, num_q_heads, head_w);
 
             if !is_shared {
                 let k_proj = lw.k_proj.as_ref().ok_or_else(|| {
@@ -207,33 +292,45 @@ impl Gemma4Model {
                     ))
                 })?;
 
-                let mut k = vec![0f32; kv_dim];
-                matmul_bt(&normed, k_proj, &mut k, 1, hidden_size, kv_dim);
-                let mut v = vec![0f32; kv_dim];
-                matmul_bt(&normed, v_proj, &mut v, 1, hidden_size, kv_dim);
+                matmul_bt(
+                    &scratch.normed[..hidden_size],
+                    k_proj,
+                    &mut scratch.k[..kv_dim],
+                    1,
+                    hidden_size,
+                    kv_dim,
+                );
+                matmul_bt(
+                    &scratch.normed[..hidden_size],
+                    v_proj,
+                    &mut scratch.v[..kv_dim],
+                    1,
+                    hidden_size,
+                    kv_dim,
+                );
 
                 for h in 0..num_kv_heads {
                     let start = h * head_w;
                     gemma4_rms_norm(
-                        &mut k[start..start + head_w],
+                        &mut scratch.k[start..start + head_w],
                         k_norm,
                         head_w,
                         cfg.rms_norm_eps,
                     );
                 }
-                gemma4_apply_rope(&mut k, cos, sin, 1, num_kv_heads, head_w);
+                gemma4_apply_rope(&mut scratch.k[..kv_dim], cos, sin, 1, num_kv_heads, head_w);
                 for h in 0..num_kv_heads {
                     let start = h * head_w;
                     let ones = vec![1.0f32; head_w];
                     rms_norm(
-                        &mut v[start..start + head_w],
+                        &mut scratch.v[start..start + head_w],
                         &ones,
                         head_w,
                         cfg.rms_norm_eps,
                     );
                 }
 
-                cache.append_kv(layer_idx, &k, &v)?;
+                cache.append_kv(layer_idx, &scratch.k[..kv_dim], &scratch.v[..kv_dim])?;
             }
 
             let seq_len = cache.seq_len(layer_idx)?;
@@ -241,11 +338,11 @@ impl Gemma4Model {
             let v_view = cache.v_view(layer_idx)?;
 
             let groups = num_q_heads / num_kv_heads;
-            let mut context = vec![0f32; q_dim];
-            let mut scores = vec![0f32; seq_len];
+            scratch.ensure_scores_capacity(seq_len);
             for qh in 0..num_q_heads {
                 let kvh = qh / groups;
-                let q_head = &q[qh * head_w..(qh + 1) * head_w];
+                let q_head = &scratch.q[qh * head_w..(qh + 1) * head_w];
+                let scores = &mut scratch.scores[..seq_len];
                 for t in 0..seq_len {
                     let k_off = t * kv_dim + kvh * head_w;
                     let mut dot = 0.0f32;
@@ -257,123 +354,128 @@ impl Gemma4Model {
                     // 1/sqrt(head_dim) convention) -- no scale applied here.
                     scores[t] = dot;
                 }
-                softmax_row_fail_closed(&mut scores);
+                softmax_row_fail_closed(scores);
                 let ctx_off = qh * head_w;
                 for d in 0..head_w {
                     let mut sum = 0.0f32;
                     for t in 0..seq_len {
                         let v_off = t * kv_dim + kvh * head_w;
-                        sum += scores[t] * v_view[v_off + d];
+                        sum += scratch.scores[t] * v_view[v_off + d];
                     }
-                    context[ctx_off + d] = sum;
+                    scratch.context[ctx_off + d] = sum;
                 }
             }
 
-            let mut attn_out = vec![0f32; hidden_size];
-            matmul_bt(&context, &lw.o_proj, &mut attn_out, 1, q_dim, hidden_size);
+            matmul_bt(
+                &scratch.context[..q_dim],
+                &lw.o_proj,
+                &mut scratch.attn_out[..hidden_size],
+                1,
+                q_dim,
+                hidden_size,
+            );
             gemma4_rms_norm(
-                &mut attn_out,
+                &mut scratch.attn_out[..hidden_size],
                 &lw.post_attention_layernorm,
                 hidden_size,
                 cfg.rms_norm_eps,
             );
             for i in 0..hidden_size {
-                hidden[i] = residual[i] + attn_out[i];
+                scratch.hidden[i] = scratch.residual[i] + scratch.attn_out[i];
             }
 
             // -- FFN block. --
-            let residual2 = hidden.clone();
-            let mut normed2 = hidden.clone();
+            scratch.residual2[..hidden_size].copy_from_slice(&scratch.hidden[..hidden_size]);
+            scratch.normed2[..hidden_size].copy_from_slice(&scratch.hidden[..hidden_size]);
             gemma4_rms_norm(
-                &mut normed2,
+                &mut scratch.normed2[..hidden_size],
                 &lw.pre_feedforward_layernorm,
                 hidden_size,
                 cfg.rms_norm_eps,
             );
             let mlp_dim = cfg.mlp_intermediate_size(layer_idx);
-            let mut ffn_out = vec![0f32; hidden_size];
             gemma4_geglu_mlp(
-                &normed2,
+                &scratch.normed2[..hidden_size],
                 &lw.gate_proj,
                 &lw.up_proj,
                 &lw.down_proj,
                 1,
                 hidden_size,
                 mlp_dim,
-                &mut ffn_out,
+                &mut scratch.ffn_out[..hidden_size],
             );
             gemma4_rms_norm(
-                &mut ffn_out,
+                &mut scratch.ffn_out[..hidden_size],
                 &lw.post_feedforward_layernorm,
                 hidden_size,
                 cfg.rms_norm_eps,
             );
             for i in 0..hidden_size {
-                hidden[i] = residual2[i] + ffn_out[i];
+                scratch.hidden[i] = scratch.residual2[i] + scratch.ffn_out[i];
             }
 
             // -- Per-layer-embedding residual gate (G9). --
-            let residual3 = hidden.clone();
-            let mut gate = vec![0f32; per_layer_dim];
+            scratch.residual3[..hidden_size].copy_from_slice(&scratch.hidden[..hidden_size]);
             matmul_bt(
-                &hidden,
+                &scratch.hidden[..hidden_size],
                 &lw.per_layer_input_gate,
-                &mut gate,
+                &mut scratch.gate[..per_layer_dim],
                 1,
                 hidden_size,
                 per_layer_dim,
             );
-            gemma4_gelu_tanh(&mut gate);
+            gemma4_gelu_tanh(&mut scratch.gate[..per_layer_dim]);
             let this_layer_input =
                 &per_layer_inputs[layer_idx * per_layer_dim..(layer_idx + 1) * per_layer_dim];
-            elementwise_mul(&mut gate, this_layer_input);
-            let mut proj = vec![0f32; hidden_size];
+            elementwise_mul(&mut scratch.gate[..per_layer_dim], this_layer_input);
             matmul_bt(
-                &gate,
+                &scratch.gate[..per_layer_dim],
                 &lw.per_layer_projection,
-                &mut proj,
+                &mut scratch.proj[..hidden_size],
                 1,
                 per_layer_dim,
                 hidden_size,
             );
             gemma4_rms_norm(
-                &mut proj,
+                &mut scratch.proj[..hidden_size],
                 &lw.post_per_layer_input_norm,
                 hidden_size,
                 cfg.rms_norm_eps,
             );
             for i in 0..hidden_size {
-                hidden[i] = residual3[i] + proj[i];
+                scratch.hidden[i] = scratch.residual3[i] + scratch.proj[i];
             }
 
-            for v in hidden.iter_mut() {
+            for v in scratch.hidden[..hidden_size].iter_mut() {
                 *v *= lw.layer_scalar;
             }
 
             if capture_layers.contains(&layer_idx) {
-                captured.push((layer_idx, hidden.clone()));
+                captured.push((layer_idx, scratch.hidden[..hidden_size].to_vec()));
             }
         }
 
         gemma4_rms_norm(
-            &mut hidden,
+            &mut scratch.hidden[..hidden_size],
             &self.weights.norm,
             hidden_size,
             cfg.rms_norm_eps,
         );
 
-        let mut logits = vec![0f32; cfg.vocab_size];
         matmul_bt(
-            &hidden,
+            &scratch.hidden[..hidden_size],
             &self.weights.embed_tokens,
-            &mut logits,
+            &mut scratch.logits[..cfg.vocab_size],
             1,
             hidden_size,
             cfg.vocab_size,
         );
-        gemma4_logit_softcap(&mut logits, cfg.final_logit_softcapping);
+        gemma4_logit_softcap(
+            &mut scratch.logits[..cfg.vocab_size],
+            cfg.final_logit_softcapping,
+        );
 
-        Ok((logits, captured))
+        Ok(captured)
     }
 
     /// PLE token-identity (`embed_tokens_per_layer`, scaled by
@@ -445,21 +547,19 @@ impl Gemma4Model {
         max_seq_len: usize,
     ) -> Result<Vec<u32>, InferenceError> {
         let mut cache = self.new_cache(max_seq_len)?;
+        let mut scratch = Gemma4Scratch::new(&self.config);
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut position = 0usize;
-        let mut logits = Vec::new();
 
         for &tok in prompt_ids {
-            let (l, _) = self.forward_step(tok, position, &mut cache, &[])?;
-            logits = l;
+            self.forward_step(tok, position, &mut cache, &mut scratch, &[])?;
             position += 1;
         }
 
         for _ in 0..max_new_tokens {
-            let next = argmax(&logits);
+            let next = argmax(&scratch.logits[..self.config.vocab_size]);
             generated.push(next);
-            let (l, _) = self.forward_step(next, position, &mut cache, &[])?;
-            logits = l;
+            self.forward_step(next, position, &mut cache, &mut scratch, &[])?;
             position += 1;
         }
 
@@ -487,31 +587,37 @@ impl Gemma4Model {
         probe_layers: &[usize],
     ) -> Result<(Vec<u32>, Vec<f32>, LayerProbeTrace), InferenceError> {
         let mut cache = self.new_cache(max_seq_len)?;
+        let mut scratch = Gemma4Scratch::new(&self.config);
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut position = 0usize;
-        let mut logits = Vec::new();
         let mut probe = Vec::new();
 
         for (i, &tok) in prompt_ids.iter().enumerate() {
             let is_last = i + 1 == prompt_ids.len();
             let layers: &[usize] = if is_last { probe_layers } else { &[] };
-            let (l, captured) = self.forward_step(tok, position, &mut cache, layers)?;
-            logits = l;
+            let captured = self.forward_step(tok, position, &mut cache, &mut scratch, layers)?;
             if is_last {
                 probe = captured;
             }
             position += 1;
         }
 
+        // Snapshot the prompt's-last-position logits right after prefill,
+        // before any generated token's forward pass overwrites
+        // `scratch.logits` -- this is what the HF golden's
+        // `final_logits_last_pos_top8` records (logits used to pick the
+        // *first* greedy token), not whatever `scratch.logits` holds after
+        // the last generated token.
+        let final_logits = scratch.logits[..self.config.vocab_size].to_vec();
+
         for _ in 0..max_new_tokens {
-            let next = argmax(&logits);
+            let next = argmax(&scratch.logits[..self.config.vocab_size]);
             generated.push(next);
-            let (l, _) = self.forward_step(next, position, &mut cache, &[])?;
-            logits = l;
+            self.forward_step(next, position, &mut cache, &mut scratch, &[])?;
             position += 1;
         }
 
-        Ok((generated, logits, probe))
+        Ok((generated, final_logits, probe))
     }
 }
 
@@ -590,30 +696,28 @@ mod donor_mutation_tests {
         cache: &mut Gemma4KvCache,
         probe_layers: &[usize],
     ) -> (Vec<u32>, LayerProbeTrace) {
+        let mut scratch = Gemma4Scratch::new(&model.config);
         let mut generated = Vec::with_capacity(max_new_tokens);
         let mut position = 0usize;
-        let mut logits = Vec::new();
         let mut probe = Vec::new();
 
         for (i, &tok) in input_ids.iter().enumerate() {
             let is_last = i + 1 == input_ids.len();
             let layers: &[usize] = if is_last { probe_layers } else { &[] };
-            let (l, captured) = model
-                .forward_step(tok, position, cache, layers)
+            let captured = model
+                .forward_step(tok, position, cache, &mut scratch, layers)
                 .expect("forward_step");
-            logits = l;
             if is_last {
                 probe = captured;
             }
             position += 1;
         }
         for _ in 0..max_new_tokens {
-            let next = argmax(&logits);
+            let next = argmax(&scratch.logits[..model.config.vocab_size]);
             generated.push(next);
-            let (l, _) = model
-                .forward_step(next, position, cache, &[])
+            model
+                .forward_step(next, position, cache, &mut scratch, &[])
                 .expect("forward_step");
-            logits = l;
             position += 1;
         }
         (generated, probe)

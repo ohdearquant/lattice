@@ -466,6 +466,20 @@ impl Gemma4Config {
                     .to_string(),
             ));
         }
+        // The forward pass always projects logits through `embed_tokens`
+        // (the tied convention) and the loader never requests a distinct
+        // `lm_head.weight`. tie_word_embeddings=false on an otherwise
+        // E2B-shaped config would load successfully and silently produce
+        // wrong logits by using the input embedding table as the output
+        // head. Reject it here rather than load-then-diverge.
+        if !self.tie_word_embeddings {
+            return Err(InferenceError::Inference(
+                "invalid Gemma 4 config.json: tie_word_embeddings=false is unsupported -- this \
+                 loader only implements the tied embed_tokens/lm_head projection the pinned \
+                 Gemma 4 E2B checkpoint uses; an untied lm_head.weight is never read"
+                    .to_string(),
+            ));
+        }
         if !(self.rope_theta.is_finite() && self.rope_theta > 0.0) {
             return Err(InferenceError::Inference(format!(
                 "invalid Gemma 4 config.json: rope_theta ({}) must be finite and > 0",
@@ -810,6 +824,20 @@ mod tests {
         assert!(
             err.to_string().contains("final_logit_softcapping"),
             "error must name final_logit_softcapping: {err}"
+        );
+    }
+
+    #[test]
+    fn tie_word_embeddings_false_errors_naming_field() {
+        let mut json = pinned_config_value();
+        json["text_config"]["tie_word_embeddings"] = serde_json::json!(false);
+        let err = Gemma4Config::from_config_json_str(&json.to_string()).expect_err(
+            "tie_word_embeddings=false must yield an InferenceError: this loader never reads \
+             a distinct lm_head.weight",
+        );
+        assert!(
+            err.to_string().contains("tie_word_embeddings"),
+            "error must name tie_word_embeddings: {err}"
         );
     }
 

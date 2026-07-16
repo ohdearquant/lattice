@@ -18,7 +18,12 @@ else
 fi
 
 echo "=== Tests ==="
-cargo test --workspace
+# gemma4_e2e_forward_test.rs fails closed by default on a missing checkpoint
+# (deliberately -- see the test file's module docs): this general-purpose
+# workspace test run is not the checkpoint-gated job, so it opts into the
+# explicit, loudly-logged skip rather than failing every runner that lacks
+# the multi-GB gemma-4-e2b-it checkpoint.
+LATTICE_GEMMA4_GATE_SKIP=1 cargo test --workspace
 
 echo "=== Tokenizer Parity Gate ==="
 tmp_tokenizer_log="$(mktemp)"

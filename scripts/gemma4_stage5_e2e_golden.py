@@ -46,6 +46,19 @@ PROBE_LAYERS = [0, 4, 15, 34]
 PROMPT = "The capital of France is"
 OUT_PATH = "crates/inference/tests/fixtures/gemma4/stage5/e2e_golden.json"
 
+# Sliding-window boundary coverage (ADR-082 stage 5 review finding 3):
+# sliding_window=512 means a token at position p attends to keys
+# [max(0, p - (window - 1)), p]. A prompt of BOUNDARY_LENGTHS tokens puts the
+# LAST position at index (length - 1):
+#   length=511 -> last position 510, window [0, 510]   (full history, window not yet binding)
+#   length=512 -> last position 511, window [0, 511]   (exactly window-sized, boundary edge)
+#   length=513 -> last position 512, window [1, 512]   (token 0 must be evicted)
+# Reusing PROMPT's own token ids (cycled) keeps every id a real, previously
+# tokenizer-verified id -- no need to hand-pick synthetic ids that might
+# collide with reserved/special ranges.
+BOUNDARY_LENGTHS = [511, 512, 513]
+BOUNDARY_OUT_PATH = "crates/inference/tests/fixtures/gemma4/stage5/boundary_golden.json"
+
 
 def main() -> None:
     torch.manual_seed(0)
@@ -135,6 +148,52 @@ def main() -> None:
         json.dump(fixture, f, indent=2)
     print(f"wrote {OUT_PATH}", file=sys.stderr)
     print(json.dumps({k: v for k, v in fixture.items() if k != "hidden_state_last_pos"}, indent=2))
+
+    cap = cfg.text_config.final_logit_softcapping
+    boundary_cases = []
+    with torch.no_grad():
+        for length in BOUNDARY_LENGTHS:
+            ids = [bos_id]
+            i = 0
+            while len(ids) < length:
+                ids.append(prompt_ids[i % len(prompt_ids)])
+                i += 1
+            assert len(ids) == length
+            ids_t = torch.tensor([ids], dtype=torch.long)
+
+            out = model.model.language_model(
+                input_ids=ids_t, output_hidden_states=False, use_cache=False
+            )
+            logits = model.lm_head(out.last_hidden_state)
+            logits = torch.tanh(logits / cap) * cap
+            last_logits = logits[0, -1, :]
+            top = torch.topk(last_logits, 8)
+
+            gen = model.generate(
+                input_ids=ids_t, max_new_tokens=2, do_sample=False, use_cache=True
+            )
+            greedy_tokens = gen[0, ids_t.shape[1] :].tolist()
+
+            boundary_cases.append(
+                {
+                    "length": length,
+                    "input_ids": ids,
+                    "final_logits_last_pos_top8": {
+                        "indices": top.indices.tolist(),
+                        "values": top.values.tolist(),
+                    },
+                    "greedy_tokens": greedy_tokens,
+                }
+            )
+            print(f"boundary length={length} done", file=sys.stderr)
+
+    boundary_fixture = {
+        "metadata": fixture["metadata"],
+        "cases": boundary_cases,
+    }
+    with open(BOUNDARY_OUT_PATH, "w") as f:
+        json.dump(boundary_fixture, f, indent=2)
+    print(f"wrote {BOUNDARY_OUT_PATH}", file=sys.stderr)
 
 
 if __name__ == "__main__":

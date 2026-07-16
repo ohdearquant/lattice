@@ -412,6 +412,15 @@ impl SafetensorsFile {
         self.tensors.contains_key(name)
     }
 
+    /// **Unstable**: header-declared dtype name (`"F32"`, `"F16"`, `"BF16"`,
+    /// or another safetensors dtype label) for a named tensor, `None` if
+    /// absent. Lets a loader enforce a checkpoint's declared dtype contract
+    /// (e.g. Gemma 4's BF16-only language-model tensors) at runtime, not
+    /// just in an offline header-manifest preflight.
+    pub fn tensor_dtype(&self, name: &str) -> Option<&'static str> {
+        self.tensors.get(name).map(|m| m.dtype.name())
+    }
+
     /// **Unstable**: load a named tensor as f32 slice; dtype conversion strategy may change.
     ///
     /// Get a tensor by name as f32 slice.
@@ -1031,6 +1040,14 @@ pub trait TensorSource {
         &mut self,
         name: &str,
     ) -> Result<(Vec<f32>, Vec<usize>), InferenceError>;
+    /// Header-declared dtype name for a named tensor, `None` if the source
+    /// cannot report it. Default `None` keeps every existing implementor
+    /// (mocks, sharded sources that haven't wired this through yet) source
+    /// compatible; a loader that needs a dtype contract enforced treats
+    /// `None` as "unknown, cannot check" rather than a failure.
+    fn tensor_dtype(&mut self, _name: &str) -> Result<Option<String>, InferenceError> {
+        Ok(None)
+    }
 }
 
 impl TensorSource for SafetensorsFile {
@@ -1040,6 +1057,10 @@ impl TensorSource for SafetensorsFile {
 
     fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
         Ok(SafetensorsFile::tensor_shape(self, name).map(<[usize]>::to_vec))
+    }
+
+    fn tensor_dtype(&mut self, name: &str) -> Result<Option<String>, InferenceError> {
+        Ok(SafetensorsFile::tensor_dtype(self, name).map(str::to_string))
     }
 
     fn get_f32_tensor_owned(
