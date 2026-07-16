@@ -9,13 +9,17 @@
 //! here — only checkpoint loading (mirroring the directory-loading pattern
 //! `service::native` uses for the BERT/Qwen text models) and error mapping.
 //!
-//! [`VisionEmbeddingModel::from_directory`] supports only checkpoints whose
-//! decoder weights resolve to a single safetensors shard (matches the
-//! Qwen3.5-0.8B checkpoint shape). Callers with pre-loaded components, or a
-//! multi-shard checkpoint, can assemble their own weights and call
-//! [`VisionEmbeddingModel::new`] directly.
+//! [`VisionEmbeddingModel::from_directory`] supports only checkpoints that
+//! carry a `model.safetensors.index.json` (or `quantize_index.json`)
+//! manifest naming exactly one decoder shard (matches the Qwen3.5-0.8B
+//! checkpoint shape) — the vision-tensor loader requires that manifest and
+//! runs before decoder-shard resolution, so a directory with only a plain
+//! `model.safetensors` and no manifest is rejected. Callers with pre-loaded
+//! components, or a multi-shard checkpoint, can assemble their own weights
+//! and call [`VisionEmbeddingModel::new`] directly.
 
 use crate::error::{EmbedError, Result};
+use lattice_inference::InferenceError;
 use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_inference::vision::checkpoint::{Qwen35VisionWeights, load_qwen35_vision_weights};
@@ -60,15 +64,20 @@ impl VisionEmbeddingModel {
 
     /// Load a Qwen3.5 vision-language checkpoint directory: `config.json`,
     /// `tokenizer.json`, the `model.visual.*` vision-encoder tensors, and a
-    /// single-shard decoder checkpoint (`model.safetensors`, or
-    /// `model.safetensors.index.json` naming exactly one shard file).
+    /// single-shard decoder checkpoint. The directory must carry a
+    /// `model.safetensors.index.json` (or `quantize_index.json`) manifest
+    /// naming exactly one decoder shard file — the vision-tensor loader
+    /// requires one of those manifests and runs before decoder-shard
+    /// resolution, so a plain `model.safetensors` alone (with no manifest)
+    /// is not sufficient. The canonical Qwen3.5-0.8B HF layout (a one-shard
+    /// index) satisfies this.
     ///
     /// # Errors
     ///
     /// Returns [`EmbedError::ModelInitialization`] if `config.json` is
-    /// missing or invalid, if the checkpoint has no `vision_config`, if the
-    /// decoder weights are sharded across more than one file, or if any
-    /// component tensor fails to load.
+    /// missing or invalid, if the checkpoint has no `vision_config`, if
+    /// neither manifest is present, if the decoder weights are sharded
+    /// across more than one file, or if any component tensor fails to load.
     pub fn from_directory(dir: &Path) -> Result<Self> {
         let config = Qwen35Config::from_model_dir(dir)
             .map_err(|e| EmbedError::ModelInitialization(format!("config.json: {e}")))?;
@@ -109,7 +118,10 @@ impl VisionEmbeddingModel {
     /// Returns [`EmbedError::InvalidInput`] if `image_bytes` cannot be
     /// decoded, its dimensions are not compatible with the checkpoint's
     /// patch/merge geometry, or the assembled request otherwise fails
-    /// validation. The error message names the offending field.
+    /// validation (the error message names the offending field). Returns
+    /// [`EmbedError::InferenceFailed`] for every other underlying failure —
+    /// e.g. the prompt plus image tokens exceeding the checkpoint's context
+    /// window.
     pub fn embed_image(
         &self,
         image_bytes: &[u8],
@@ -125,7 +137,7 @@ impl VisionEmbeddingModel {
             prompt,
             pooling,
         )
-        .map_err(|e| EmbedError::InvalidInput(e.to_string()))
+        .map_err(map_inference_error)
     }
 
     /// Pool a text-only prompt through the same decoder + pooling path as
@@ -134,7 +146,9 @@ impl VisionEmbeddingModel {
     /// # Errors
     ///
     /// Returns [`EmbedError::InvalidInput`] if the prompt is empty or
-    /// tokenizes to an out-of-vocabulary id.
+    /// tokenizes to an out-of-vocabulary id. Returns
+    /// [`EmbedError::InferenceFailed`] for every other underlying failure —
+    /// e.g. the prompt exceeding the checkpoint's context window.
     pub fn embed_text(&self, prompt: &str, pooling: PoolingStrategy) -> Result<Vec<f32>> {
         lattice_inference::forward::cpu_f16::embed_text_vlm_f16(
             &self.weights,
@@ -143,7 +157,7 @@ impl VisionEmbeddingModel {
             prompt,
             pooling,
         )
-        .map_err(|e| EmbedError::InvalidInput(e.to_string()))
+        .map_err(map_inference_error)
     }
 
     /// Output embedding dimension (the checkpoint's decoder hidden size).
@@ -152,10 +166,24 @@ impl VisionEmbeddingModel {
     }
 }
 
-/// Resolve the single safetensors shard `load_f16_weights` needs. A local
-/// checkout may expose a convenience `model.safetensors` (often a symlink);
-/// a raw HuggingFace snapshot has only the sharded file(s) named in
-/// `model.safetensors.index.json`. Mirrors
+/// Map an inference-layer error to the embed crate's two-variant contract:
+/// caller-supplied-input problems stay distinguishable from every other
+/// (model/runtime) failure, so callers can tell "fix your request" apart
+/// from "retry or report a bug" (see `embed_image`/`embed_text` docs).
+fn map_inference_error(e: InferenceError) -> EmbedError {
+    match e {
+        InferenceError::InvalidInput(msg) => EmbedError::InvalidInput(msg),
+        other => EmbedError::InferenceFailed(other.to_string()),
+    }
+}
+
+/// Resolve the single safetensors shard `load_f16_weights` needs. By the time
+/// this runs, [`load_qwen35_vision_weights`] has already required a
+/// `model.safetensors.index.json` or `quantize_index.json` manifest to exist
+/// in `model_dir` (see module docs) — so a convenience `model.safetensors`
+/// file (often a symlink some local checkouts add alongside the manifest) is
+/// checked first as a cheap shortcut when present, then falls back to
+/// resolving the shard named by the index. This mirrors
 /// `Qwen35Model::from_safetensors`'s plain-then-index precedence, but
 /// resolves the concrete shard path a single-`SafetensorsFile` loader needs
 /// (multi-shard checkpoints are out of scope here — see module docs).
@@ -546,6 +574,31 @@ mod tests {
         assert_eq!(via_wrapper, via_raw);
     }
 
+    /// A runtime (non-input) failure -- the prompt exceeding the checkpoint's
+    /// context window, surfaced as `InferenceError::Inference` from the
+    /// shared prefill path (cpu_f16.rs) -- must map to
+    /// `EmbedError::InferenceFailed`, not `EmbedError::InvalidInput`: the
+    /// prompt itself is well-formed, the checkpoint just can't fit it.
+    #[test]
+    fn embed_text_maps_context_overflow_to_inference_failed() {
+        let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
+        cfg.max_position_embeddings = 1;
+        let tokenizer = single_char_tokenizer();
+        let model = VisionEmbeddingModel::new(weights, cfg, vision_weights, tokenizer);
+
+        let err = model
+            .embed_text("abc", PoolingStrategy::LastToken)
+            .expect_err("a prompt longer than max_position_embeddings must fail");
+        assert!(
+            matches!(err, EmbedError::InferenceFailed(_)),
+            "context-window overflow is a runtime failure, not caller-input validation, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("context window"),
+            "error should retain the underlying context-window detail, got: {err}"
+        );
+    }
+
     #[test]
     fn resolve_single_shard_rejects_multi_shard_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -566,5 +619,32 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let err = resolve_single_shard(tmp.path()).expect_err("missing manifest must be rejected");
         assert!(matches!(err, EmbedError::ModelInitialization(_)));
+    }
+
+    /// `from_directory`'s documented contract requires an index/quantize
+    /// manifest (the vision-tensor loader runs before decoder-shard
+    /// resolution and has no plain-file fallback). A directory with a valid
+    /// config.json (including `vision_config`) but no manifest at all must
+    /// fail with an actionable, named error -- not merely `expect_err` on
+    /// some opaque error -- pinning the real (manifest-required) behavior
+    /// rather than the previously-documented (plain-file-sufficient) one.
+    #[test]
+    fn from_directory_without_manifest_reports_actionable_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_json = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../inference/tests/fixtures/qwen35_0_8b_config.json"
+        ));
+        std::fs::write(tmp.path().join("config.json"), config_json).expect("write config.json");
+
+        let Err(err) = VisionEmbeddingModel::from_directory(tmp.path()) else {
+            panic!("a directory with no index/quantize manifest must be rejected")
+        };
+        assert!(matches!(err, EmbedError::ModelInitialization(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("model.safetensors.index.json") && msg.contains("quantize_index.json"),
+            "error must name the missing manifest(s), got: {msg}"
+        );
     }
 }
