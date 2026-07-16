@@ -24809,6 +24809,39 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             )
         }
 
+        /// Qwen3.5 vision (ADR-069 Metal S5, MP2) capability gate: a Metal
+        /// device and a real checkpoint are both required to exercise the
+        /// injection path. Fails closed (`LATTICE_METAL_TEST_ENFORCE=1`)
+        /// instead of returning `None` when either is missing, matching the
+        /// `forward::metal::metal_test_device` / `f16_kv_metal_path_executes_and_reports_capability`
+        /// convention — otherwise a runner without a Metal device or
+        /// checkpoint would report these tests as passing without ever
+        /// exercising the injection path.
+        fn require_metal_and_real_checkpoint_or_skip(
+            context: &str,
+        ) -> Option<crate::model::qwen35::Qwen35Model> {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            if Device::system_default().is_none() {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present ({context})"
+                );
+                eprintln!("[METAL_TEST_SKIP] context={context} reason=no_metal_device");
+                return None;
+            }
+            match load_real_qwen35_0_8b_or_skip() {
+                Some(model) => Some(model),
+                None => {
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but qwen3.5-0.8b checkpoint missing ({context})"
+                    );
+                    eprintln!("[METAL_TEST_SKIP] context={context} reason=no_checkpoint");
+                    None
+                }
+            }
+        }
+
         /// Acceptance test #1 (task order item 7 / design_spec.md Test Plan
         /// §4): greedy token agreement 100% vs. the full-logit path on
         /// \>=10,000 positions using the real Qwen3.5-0.8B checkpoint.
@@ -25051,10 +25084,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// steps).
         #[test]
         fn forward_step_injected_logits_differ_by_row_content() {
-            let Some(_) = Device::system_default() else {
-                return;
-            };
-            let Some(model) = load_real_qwen35_0_8b_or_skip() else {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "forward_step_injected_logits_differ_by_row_content",
+            ) else {
                 return;
             };
             let _guard = gpu_test_lock();
@@ -25122,10 +25154,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// fix was restored.
         #[test]
         fn generate_multimodal_vision_injection_is_mutation_sensitive() {
-            let Some(_) = Device::system_default() else {
-                return;
-            };
-            let Some(model) = load_real_qwen35_0_8b_or_skip() else {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_injection_is_mutation_sensitive",
+            ) else {
                 return;
             };
             let _guard = gpu_test_lock();
@@ -25206,6 +25237,89 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 !some_arm_body.contains("embed_tokens") && !some_arm_body.contains("token_id"),
                 "the injected_embedding Some(row) arm must never reference embed_tokens \
                  or token_id — it must REPLACE the embedding lookup, not fall back to it"
+            );
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): behavioral REPLACE
+        /// isolation test, complementing the structural spelling check above.
+        /// A source-scan test can be defeated by helper indirection (e.g. a
+        /// token-id-derived alias computed before the match and consumed by
+        /// a helper the `Some(row)` arm calls); this test instead proves the
+        /// REPLACE contract by calling `forward_step_inner_impl` directly
+        /// with the SAME injected row but DIFFERENT `token_id` values at the
+        /// same position and asserting byte-identical logits. Under REPLACE
+        /// semantics the token id occupying an injected slot can never
+        /// influence the step, regardless of buffer layout or aliasing — so
+        /// this is sound even on this tie_word_embeddings checkpoint where
+        /// the `embed_tokens`-mutation design (mentioned in the structural
+        /// test's doc comment above) is not: mutating `embed_tokens` here
+        /// would also perturb the lm_head GEMV, which reads the *same*
+        /// buffer for `QuantFormat::Q8_0`, and would falsely look like a
+        /// REPLACE violation. Varying only `token_id` (never touching
+        /// `embed_tokens`) sidesteps that confound entirely.
+        ///
+        /// Mutation-sensitivity verified locally: temporarily adding a
+        /// fallback read of `embed_tokens[token_id]` inside the `Some(row) =>`
+        /// arm (mirroring the pre-MP2 stub) made this test fail immediately
+        /// (different token ids produced different logits); removing it
+        /// restored the pass.
+        #[test]
+        fn injected_embedding_logits_are_independent_of_token_id() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "injected_embedding_logits_are_independent_of_token_id",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let hidden = cfg.hidden_size;
+            let vocab = cfg.vocab_size;
+
+            let mut row = vec![0.0f32; hidden];
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = 0.02 + 0.01 * ((i % 89) as f32 - 44.0);
+            }
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+
+            state.reset_state();
+            let logits_id0 = state
+                .forward_step_inner_impl(
+                    0,
+                    0,
+                    false,
+                    false,
+                    GdnStateTrafficScope::Decode,
+                    Some(&row),
+                )
+                .logits;
+
+            state.reset_state();
+            let other_token_id = vocab.saturating_sub(1) as u32;
+            let logits_id_other = state
+                .forward_step_inner_impl(
+                    other_token_id,
+                    0,
+                    false,
+                    false,
+                    GdnStateTrafficScope::Decode,
+                    Some(&row),
+                )
+                .logits;
+
+            assert_eq!(logits_id0.len(), logits_id_other.len());
+            let max_abs_diff = logits_id0
+                .iter()
+                .zip(&logits_id_other)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs_diff < 1e-6,
+                "an injected row's logits must be independent of the token_id occupying the \
+                 slot — the injected_embedding arm must REPLACE the embedding lookup, never \
+                 blend or fall back to it (max_abs_diff={max_abs_diff})"
             );
         }
 
