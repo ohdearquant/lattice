@@ -920,7 +920,7 @@ pub fn generate_f16(
     // `check_prompt_not_empty` (model::qwen35::generation).
     crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
 
-    // codex r1 blocker 1 (sibling of `generate_multimodal_f16`'s guard): tokenizer
+    // Sibling of `generate_multimodal_f16`'s input-id guard: tokenizer
     // output is bounded by the tokenizer's own vocabulary, but this driver accepts
     // `cfg` and `tokenizer` as independent parameters, so a mismatched pair can still
     // produce a prompt id at or past `cfg.vocab_size` and panic in `forward_step_f16`'s
@@ -1116,7 +1116,7 @@ pub fn generate_multimodal_f16(
         ))
     })?;
 
-    // codex r1 blocker 1: caller-supplied `input_ids` must be bounded against the
+    // Caller-supplied `input_ids` must be bounded against the
     // checkpoint vocabulary before any decoder allocation/work begins — an
     // out-of-range id would otherwise panic in `forward_step_f16`'s embedding-table
     // slice (`token_id * hidden`) instead of failing closed.
@@ -1133,7 +1133,7 @@ pub fn generate_multimodal_f16(
 
     let has_image = !request.image_grids.is_empty();
 
-    // codex r1 major 3: `request.validate()` proves only internal consistency —
+    // `request.validate()` proves only internal consistency —
     // bind the request to the *loaded checkpoint's* vision metadata before
     // selecting image slots or building M-RoPE tables, otherwise an internally
     // consistent request targeting the wrong checkpoint silently injects rows at
@@ -1179,7 +1179,7 @@ pub fn generate_multimodal_f16(
 
     let (positions, tables) = request.build_mrope_tables(cfg)?;
 
-    // codex r1 major 4: the M-RoPE table builder resolves `partial_rotary_factor`
+    // The M-RoPE table builder resolves `partial_rotary_factor`
     // from `cfg.rope_parameters`, while the attention loop derives its rotary
     // half-width from the separately public `cfg.rope_dim()`
     // (`cfg.partial_rotary_factor`). A constructible config where these diverge
@@ -1342,7 +1342,7 @@ pub fn generate_multimodal_f16(
             let decode_axis =
                 crate::vision::qwen35_mrope::decode_position(physical_pos, positions.rope_delta)?;
             decode_cos_sin = request.build_decode_cos_sin(cfg, decode_axis)?;
-            // codex r1 major 4 (decode-time sibling): the prefill table's row-width
+            // Decode-time sibling of the prefill row-width guard: the prefill table's row-width
             // guard has no effect on this independently-built single-row decode
             // table — check it here too, before it reaches the attention loop's
             // `cos_row[i]`/`sin_row[i]` indexing.
@@ -2939,7 +2939,7 @@ mod tests {
         );
     }
 
-    /// codex r1 blocker 1: a caller-supplied `input_ids` entry at or past
+    /// A caller-supplied `input_ids` entry at or past
     /// `cfg.vocab_size` must be rejected with `InvalidInput` before any decoder
     /// allocation/work, not panic in `forward_step_f16`'s embedding-table slice.
     /// Mutation check: removing the guard lets the request reach the None-branch
@@ -2971,7 +2971,7 @@ mod tests {
         );
     }
 
-    /// codex r1 blocker 1, sibling path: `generate_f16` accepts `cfg` and
+    /// Sibling path of the input-id guard: `generate_f16` accepts `cfg` and
     /// `tokenizer` as independent parameters, so a mismatched pair can still
     /// tokenize a prompt into an id at or past `cfg.vocab_size`. Simulates that
     /// mismatch directly (a tokenizer vocab entry the fixture's 8-row embedding
@@ -3011,7 +3011,7 @@ mod tests {
 
     /// Build the [`tiny_vision_splice_model`] fixture plus a populated
     /// `vision_config` (spatial_merge_size=2, out_hidden_size == decoder
-    /// hidden_size) so checkpoint-binding mismatches (codex r1 major 3) are
+    /// hidden_size) so checkpoint-binding mismatches are
     /// testable against a checkpoint that genuinely carries vision metadata.
     fn tiny_vision_splice_model_with_vision_cfg() -> (Qwen35Config, F16ModelWeights) {
         use crate::model::qwen35_config::VisionModelConfig;
@@ -3032,7 +3032,7 @@ mod tests {
         (cfg, weights)
     }
 
-    /// codex r1 major 3: an internally-consistent multimodal request whose
+    /// An internally-consistent multimodal request whose
     /// `image_token_id` does not match the loaded checkpoint's must be rejected
     /// up front, before image slots are selected -- otherwise it silently
     /// injects/rotates at the wrong slots against a real checkpoint.
@@ -3072,7 +3072,7 @@ mod tests {
         );
     }
 
-    /// codex r1 major 3: a request whose `spatial_merge_size` does not match the
+    /// A request whose `spatial_merge_size` does not match the
     /// checkpoint's `vision_config.spatial_merge_size` must be rejected up front.
     /// Mutation check: removing just this guard branch lets an internally
     /// consistent (but checkpoint-mismatched) request run to completion (`Ok`),
@@ -3111,7 +3111,7 @@ mod tests {
         );
     }
 
-    /// codex r1 major 3: a request whose `decoder_hidden_size` does not match
+    /// A request whose `decoder_hidden_size` does not match
     /// the checkpoint's `hidden_size` must be rejected up front by name, before
     /// image slots are selected -- not only by the unrelated, later
     /// `forward_step_f16` injected-row-length guard that happens to catch this
@@ -3154,7 +3154,7 @@ mod tests {
         );
     }
 
-    /// codex r1 major 4: the M-RoPE table builder resolves
+    /// The M-RoPE table builder resolves
     /// `partial_rotary_factor` from `cfg.rope_parameters`, while the attention
     /// loop derives its rotary half-width from the separately public
     /// `cfg.rope_dim()` (`cfg.partial_rotary_factor`). A constructible config
