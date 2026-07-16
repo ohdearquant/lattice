@@ -9693,6 +9693,26 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
+            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None)
+        }
+
+        /// Body of [`Self::generate_multimodal_vision`] with an optional
+        /// decode-step logits probe (each decode iteration's full logits row,
+        /// in order). The probe exists because greedy token output is not a
+        /// usable observable for the decode-time M-RoPE coordinate: 18 of 24
+        /// decoder layers are GDN (no RoPE at all), and on the real #989
+        /// fixture a `None`-decode mutation reproduced the correct arm's
+        /// greedy tokens exactly over a 32-step horizon. Logit-level
+        /// assertions through this seam are what make the decode wiring
+        /// mutation-detectable (same pattern as `gemma4`'s
+        /// `generate_greedy_with_probe`).
+        fn generate_multimodal_vision_impl(
+            &mut self,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            mut decode_logits_probe: Option<&mut Vec<Vec<f32>>>,
+        ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
 
             super::multimodal_generate_preflight(gen_cfg)?;
@@ -9936,6 +9956,9 @@ mod inner {
                 };
 
                 let step_logits = self.forward_step_mrope(last_token, physical_pos, mrope_cos_sin);
+                if let Some(probe) = decode_logits_probe.as_deref_mut() {
+                    probe.push(step_logits.clone());
+                }
                 let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
@@ -25772,6 +25795,268 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "text-only generate_multimodal_vision must be bit-identical to the plain \
                  forward_step decode loop"
             );
+
+            // Equal greedy tokens can survive a non-bit-identical logit
+            // regression, so token equality alone does not substantiate the
+            // bit-identity contract. Drive the two entry points step-by-step
+            // on fresh states and assert exact bit equality of every logit at
+            // every prefill and decode step: `forward_step_mrope(.., None)` is
+            // the exact call `generate_multimodal_vision` makes for text-only
+            // requests, `forward_step` is the plain path.
+            let mut state_mrope_none = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let mut state_plain_bits = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            state_mrope_none.reset_state();
+            state_plain_bits.reset_state();
+
+            let assert_bits_equal = |a: &[f32], b: &[f32], step: usize| {
+                assert_eq!(a.len(), b.len(), "logit width diverged at step {step}");
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "step {step} logit {i}: text-only mrope-None path must be \
+                         bit-identical to the plain path ({x} vs {y})"
+                    );
+                }
+            };
+
+            let mut bits_last = Vec::new();
+            for (pos, &token_id) in input_ids.iter().enumerate() {
+                let a = state_mrope_none.forward_step_mrope(token_id, pos, None);
+                let b = state_plain_bits.forward_step(token_id, pos);
+                assert_bits_equal(&a, &b, pos);
+                bits_last = a;
+            }
+            let mut bits_ids = input_ids.clone();
+            let mut bits_rng = 1u64;
+            for step in 0..gen_cfg.max_new_tokens {
+                let next_id = sample_token(&bits_last, &gen_cfg, &bits_ids, &mut bits_rng);
+                bits_ids.push(next_id);
+                let physical_pos = state_mrope_none.session.kv_cache.seq_len;
+                assert_eq!(
+                    physical_pos, state_plain_bits.session.kv_cache.seq_len,
+                    "physical KV positions diverged before decode step {step}"
+                );
+                let a = state_mrope_none.forward_step_mrope(next_id, physical_pos, None);
+                let b = state_plain_bits.forward_step(next_id, physical_pos);
+                assert_bits_equal(&a, &b, input_ids.len() + step);
+                bits_last = a;
+            }
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal MP3 gate, decode-coordinate
+        /// discrimination): every prefill-oriented gate above still passes if
+        /// only the DECODE-time M-RoPE wiring regresses (dropping
+        /// `decode_cos_sin` and rotating decode steps by raw physical
+        /// position) — verified empirically: mutating
+        /// `generate_multimodal_vision`'s decode call to pass `None` left the
+        /// oracle-parity test green. Greedy TOKENS are not a usable
+        /// observable for this wiring at all: 18 of 24 layers are GDN (no
+        /// RoPE), and both a synthetic merged 8x8 grid (`rope_delta` -56,
+        /// 4-step horizon) and the real #989 fixture (32-step horizon)
+        /// produced token-identical trajectories on the correct and
+        /// `None`-decode arms. So this test pins the function at LOGIT level
+        /// through the `generate_multimodal_vision_impl` decode probe:
+        ///
+        /// - A manual replication of the function's exact prefill+first
+        ///   decode step is run twice: once with the correct decode
+        ///   coordinate (`decode_position(physical_pos, rope_delta)` +
+        ///   `build_decode_cos_sin`) and once simulating the regression
+        ///   (`None`, 1-D table keyed by physical position). The vacuity
+        ///   guard requires their decode-step logits to differ by a
+        ///   margin-safe amount — proving the fixture discriminates the two
+        ///   behaviors at the observable this test actually asserts on.
+        /// - The function's own probed decode-step logits must be
+        ///   bit-identical to the correct arm (Metal execution is
+        ///   deterministic across freshly built states; the text-only
+        ///   bit-identity test above establishes that). Mutation-verified:
+        ///   forcing the function's decode call to `None` makes exactly this
+        ///   assertion fail; restoring it passes.
+        #[test]
+        fn generate_multimodal_vision_decode_step_uses_rope_delta_coordinate() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_decode_step_uses_rope_delta_coordinate",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let tokenizer = minimal_bpe_tokenizer();
+
+            let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("tests")
+                .join("fixtures")
+                .join("vision");
+            if !fixture_dir.join("manifest.json").exists() {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=generate_multimodal_vision_decode_step_uses_rope_delta_coordinate \
+                     reason=no_vision_fixture path={}",
+                    fixture_dir.display()
+                );
+                let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but the #989 vision fixture is missing at {}",
+                    fixture_dir.display()
+                );
+                return;
+            }
+
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(fixture_dir.join("manifest.json")).expect("read manifest.json"),
+            )
+            .expect("parse manifest.json");
+            let input_ids: Vec<u32> = serde_json::from_slice::<Vec<i64>>(
+                &std::fs::read(fixture_dir.join("input_ids.json")).expect("read input_ids.json"),
+            )
+            .expect("parse input_ids.json")
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+            let post_merger_bytes = std::fs::read(fixture_dir.join("vit_post_merger_f32.bin"))
+                .expect("read vit_post_merger_f32.bin");
+            let post_merger: Vec<f32> = post_merger_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let grid_thw = manifest["image_grid_thw"]
+                .as_array()
+                .expect("image_grid_thw array")
+                .first()
+                .expect("at least one image grid")
+                .as_array()
+                .expect("grid triple");
+            let grid = crate::vision::qwen35_vit::GridThw {
+                t: grid_thw[0].as_u64().unwrap() as usize,
+                h: grid_thw[1].as_u64().unwrap() as usize,
+                w: grid_thw[2].as_u64().unwrap() as usize,
+            };
+            let vision_cfg = cfg
+                .vision_config
+                .as_ref()
+                .expect("real 0.8b checkpoint carries vision_config");
+            let image_token_id = cfg
+                .image_token_id
+                .expect("real 0.8b checkpoint carries image_token_id");
+            let request = Qwen35VisionRequest {
+                input_ids,
+                image_grids: vec![grid],
+                post_merger_rows: post_merger,
+                image_token_id,
+                spatial_merge_size: vision_cfg.spatial_merge_size,
+                decoder_hidden_size: cfg.hidden_size,
+            };
+            request
+                .validate()
+                .expect("fixture-derived request is valid");
+
+            let (positions, tables) = request
+                .build_mrope_tables(&cfg)
+                .expect("fixture request builds M-RoPE tables");
+            assert_ne!(
+                positions.rope_delta, 0,
+                "fixture must have a nonzero rope_delta or this test cannot \
+                 discriminate the decode coordinate from the physical position"
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            // Manual replication of `generate_multimodal_vision`'s exact
+            // prefill + first greedy decode step, with the decode-time M-RoPE
+            // coordinate either wired correctly or dropped to `None`. Returns
+            // that decode step's full logits row.
+            let manual_decode_logits = |use_decode_coordinate: bool| -> Vec<f32> {
+                let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                    .expect("real-checkpoint state");
+                state.reset_state();
+                let mut visual_row = 0usize;
+                let mut last_logits = Vec::new();
+                for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                    let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
+                    if token_id == request.image_token_id {
+                        let start = visual_row * request.decoder_hidden_size;
+                        let end = start + request.decoder_hidden_size;
+                        let row = &request.post_merger_rows[start..end];
+                        visual_row += 1;
+                        last_logits = state.forward_step_injected_mrope(row, pos, cos_sin);
+                    } else {
+                        last_logits = state.forward_step_mrope(token_id, pos, cos_sin);
+                    }
+                }
+                let mut all_ids = request.input_ids.clone();
+                let mut rng_state = 1u64;
+                let first_id = sample_token(&last_logits, &gen_cfg, &all_ids, &mut rng_state);
+                assert_ne!(
+                    first_id, cfg.eos_token_id,
+                    "fixture's first greedy token must not be EOS or no decode step runs"
+                );
+                all_ids.push(first_id);
+                let physical_pos = state.session.kv_cache.seq_len;
+                let decode_row_owned;
+                let cos_sin = if use_decode_coordinate {
+                    let decode_axis = crate::vision::qwen35_mrope::decode_position(
+                        physical_pos,
+                        positions.rope_delta,
+                    )
+                    .expect("fixture decode coordinate is valid");
+                    decode_row_owned = request
+                        .build_decode_cos_sin(&cfg, decode_axis)
+                        .expect("fixture decode row builds");
+                    Some((decode_row_owned.0.as_slice(), decode_row_owned.1.as_slice()))
+                } else {
+                    None
+                };
+                state.forward_step_mrope(first_id, physical_pos, cos_sin)
+            };
+
+            let logits_correct = manual_decode_logits(true);
+            let logits_regressed = manual_decode_logits(false);
+            let max_abs_diff = logits_correct
+                .iter()
+                .zip(&logits_regressed)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs_diff > 1e-3,
+                "vacuity guard: the fixture's first decode-step logits must \
+                 discriminate the rope_delta-shifted coordinate from the raw \
+                 physical position by a margin-safe amount (max_abs_diff = \
+                 {max_abs_diff:e}) — without this, the bit-equality assert \
+                 below could pass vacuously"
+            );
+
+            let mut state_fn = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let mut probed: Vec<Vec<f32>> = Vec::new();
+            let out = state_fn
+                .generate_multimodal_vision_impl(&request, &tokenizer, &gen_cfg, Some(&mut probed))
+                .expect("fixture multimodal generate succeeds");
+            assert_eq!(
+                out.generated_tokens, 2,
+                "expected prefill-sampled token + one decode step"
+            );
+            assert_eq!(probed.len(), 1, "one decode step probes one logits row");
+            assert_eq!(probed[0].len(), logits_correct.len());
+            for (lane, (&got, &want)) in probed[0].iter().zip(&logits_correct).enumerate() {
+                assert!(
+                    got.to_bits() == want.to_bits(),
+                    "generate_multimodal_vision's decode step must use the \
+                     rope_delta-shifted M-RoPE coordinate: probed logits diverge \
+                     from the correct arm at lane {lane} ({got} vs {want})"
+                );
+            }
         }
 
         /// Qwen3.5 vision (ADR-069 Metal MP3 gate, test 4/4 — CPU-vs-Metal
