@@ -42,6 +42,129 @@ use crate::grammar::spec::GrammarSpec;
 use crate::grammar::vocab_partition::VocabPartition;
 use std::fmt;
 
+// ---------------------------------------------------------------------------
+// Profiling instrumentation (issue #734 diagnostics)
+// ---------------------------------------------------------------------------
+//
+// Thread-local, opt-in counters used by `gramperf_profile` (crates/inference/
+// src/bin/gramperf_profile.rs) to break decode-step cost down into the
+// precomputed-bitmask path, the context-dependent recheck loop, and the
+// `mask_by_simulation` fallback, without touching any call site outside this
+// file. Disabled by default (`mask_profiling_enabled()` short-circuits on a
+// single `Cell<bool>` read), so production decode pays no cost beyond that
+// one branch when profiling is off.
+
+thread_local! {
+    static MASK_PROFILING_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MASK_PROFILE: std::cell::RefCell<MaskProfile> =
+        const { std::cell::RefCell::new(MaskProfile::new()) };
+    static BUILD_PROFILE: std::cell::RefCell<BuildProfile> =
+        const { std::cell::RefCell::new(BuildProfile::new()) };
+}
+
+/// Aggregated per-decode-step grammar-masking cost, accumulated across every
+/// `mask_logits`/`advance` call since the last [`enable_mask_profiling`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MaskProfile {
+    /// Precomputed-bitmask path: `find_state_id` (hit) + `VocabPartition::apply_mask`.
+    pub precomputed_calls: u64,
+    pub precomputed_ns: u64,
+    /// Context-dependent token recheck loop (runs only on the precomputed-hit path).
+    pub context_recheck_calls: u64,
+    pub context_recheck_ns: u64,
+    /// `mask_by_simulation` fallback: `find_state_id` (miss) + full-vocab simulation.
+    pub fallback_calls: u64,
+    pub fallback_ns: u64,
+    /// `GrammarEngine::advance` (PDA byte-stepping), tracked separately so it
+    /// is not misattributed to either masking path in the report.
+    pub advance_calls: u64,
+    pub advance_ns: u64,
+}
+
+impl MaskProfile {
+    const fn new() -> Self {
+        Self {
+            precomputed_calls: 0,
+            precomputed_ns: 0,
+            context_recheck_calls: 0,
+            context_recheck_ns: 0,
+            fallback_calls: 0,
+            fallback_ns: 0,
+            advance_calls: 0,
+            advance_ns: 0,
+        }
+    }
+}
+
+/// One-time `GrammarEngine::new` cost breakdown, overwritten on every call
+/// (unconditional — construction is a once-per-schema event, so the two
+/// extra `Instant::now()` calls are immaterial next to the multi-second
+/// build itself).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildProfile {
+    pub bfs_ns: u64,
+    pub partition_build_ns: u64,
+    /// `enumerate_grammar_states`'s returned state count, which is *itself*
+    /// capped at the `max_states` argument passed to it — see
+    /// `probe_reachable_states` for the uncapped count.
+    pub reachable_states: usize,
+    pub capped_states: usize,
+}
+
+impl BuildProfile {
+    const fn new() -> Self {
+        Self {
+            bfs_ns: 0,
+            partition_build_ns: 0,
+            reachable_states: 0,
+            capped_states: 0,
+        }
+    }
+}
+
+/// Enable per-decode-step mask profiling on the current thread and reset the
+/// accumulator. Call [`take_mask_profile`] after the measured run(s).
+pub fn enable_mask_profiling() {
+    MASK_PROFILING_ENABLED.with(|e| e.set(true));
+    MASK_PROFILE.with(|p| *p.borrow_mut() = MaskProfile::new());
+}
+
+/// Disable mask profiling and return the accumulated [`MaskProfile`].
+pub fn take_mask_profile() -> MaskProfile {
+    MASK_PROFILING_ENABLED.with(|e| e.set(false));
+    MASK_PROFILE.with(|p| *p.borrow())
+}
+
+fn mask_profiling_enabled() -> bool {
+    MASK_PROFILING_ENABLED.with(std::cell::Cell::get)
+}
+
+/// Return the [`BuildProfile`] captured by the most recent `GrammarEngine::new`
+/// call on this thread.
+pub fn last_build_profile() -> BuildProfile {
+    BUILD_PROFILE.with(|p| *p.borrow())
+}
+
+/// Profiling-only probe: run `enumerate_grammar_states` with an arbitrary
+/// `max_states` ceiling (independent of `MAX_GRAMMAR_STATES`) and return how
+/// many states it found. Because `enumerate_grammar_states` stops growing
+/// `visited` once it reaches `max_states`, `GrammarEngine::new`'s own BFS
+/// output is *already* capped when a grammar exceeds the production limit —
+/// this is the only way to see the true reachable-state count past the cap.
+/// Never called from production code paths; used solely by
+/// `gramperf_profile` (issue #734).
+pub fn probe_reachable_states(
+    spec: &GrammarSpec,
+    vocab_bytes: &[Vec<u8>],
+    max_states: usize,
+) -> Result<usize, GrammarError> {
+    let grammar = match spec {
+        GrammarSpec::JsonSchema(schema) => compile(schema)?,
+        GrammarSpec::Gbnf(gbnf) => parse_gbnf(gbnf)?,
+    };
+    Ok(enumerate_grammar_states(&grammar, vocab_bytes, max_states).len())
+}
+
 /// Error from `GrammarEngine::new`.
 #[derive(Debug, Clone)]
 pub struct GrammarError(pub String);
@@ -165,11 +288,13 @@ impl GrammarEngine {
 
         // Enumerate grammar states reachable from the initial state.
         // We limit to MAX_GRAMMAR_STATES to bound memory usage.
+        let bfs_t0 = std::time::Instant::now();
         let states = enumerate_grammar_states(
             &grammar,
             &vocab_bytes,
             crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
         );
+        let bfs_ns = bfs_t0.elapsed().as_nanos() as u64;
 
         let state_limit_exceeded =
             states.len() >= crate::grammar::vocab_partition::MAX_GRAMMAR_STATES;
@@ -179,9 +304,21 @@ impl GrammarEngine {
                 crate::grammar::vocab_partition::MAX_GRAMMAR_STATES
             );
         }
+        let reachable_states = states.len();
 
         // Build the vocabulary partition.
+        let partition_t0 = std::time::Instant::now();
         let partition = VocabPartition::build(&grammar, states, &vocab_bytes);
+        let partition_build_ns = partition_t0.elapsed().as_nanos() as u64;
+
+        BUILD_PROFILE.with(|p| {
+            *p.borrow_mut() = BuildProfile {
+                bfs_ns,
+                partition_build_ns,
+                reachable_states,
+                capped_states: crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
+            }
+        });
 
         Ok(Self {
             grammar,
@@ -231,13 +368,28 @@ impl GrammarEngine {
             self.vocab_size
         );
 
+        let profiling = mask_profiling_enabled();
+        let find_t0 = profiling.then(std::time::Instant::now);
+        let found = self.find_state_id(state);
+        let find_ns = find_t0.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+
         // Find the state id in the partition.
-        match self.find_state_id(state) {
+        match found {
             Some(state_id) => {
                 // Apply the precomputed bitmask.
+                let t0 = profiling.then(std::time::Instant::now);
                 self.partition.apply_mask(state_id, logits);
+                if let Some(t0) = t0 {
+                    let ns = find_ns + t0.elapsed().as_nanos() as u64;
+                    MASK_PROFILE.with(|p| {
+                        let mut p = p.borrow_mut();
+                        p.precomputed_calls += 1;
+                        p.precomputed_ns += ns;
+                    });
+                }
 
                 // Re-check context-dependent tokens at runtime.
+                let t1 = profiling.then(std::time::Instant::now);
                 for &token_id in self.partition.context_dependent_ids() {
                     if token_id >= self.vocab_size {
                         continue;
@@ -264,6 +416,14 @@ impl GrammarEngine {
                         SimResult::Accept => {}
                     }
                 }
+                if let Some(t1) = t1 {
+                    let ns = t1.elapsed().as_nanos() as u64;
+                    MASK_PROFILE.with(|p| {
+                        let mut p = p.borrow_mut();
+                        p.context_recheck_calls += 1;
+                        p.context_recheck_ns += ns;
+                    });
+                }
             }
             None => {
                 // The grammar exceeded `MAX_GRAMMAR_STATES`, so the BFS state
@@ -277,7 +437,16 @@ impl GrammarEngine {
                 // algorithm the precomputed table caches; it is sound and live
                 // (a fully fail-closed "block everything" fallback would be sound
                 // but would stall generation by leaving no legal token).
+                let t0 = profiling.then(std::time::Instant::now);
                 self.mask_by_simulation(state, logits);
+                if let Some(t0) = t0 {
+                    let ns = find_ns + t0.elapsed().as_nanos() as u64;
+                    MASK_PROFILE.with(|p| {
+                        let mut p = p.borrow_mut();
+                        p.fallback_calls += 1;
+                        p.fallback_ns += ns;
+                    });
+                }
             }
         }
     }
@@ -313,6 +482,21 @@ impl GrammarEngine {
     /// the grammar rejected it (caller should treat this as an error and stop
     /// generation).
     pub fn advance(&self, state: &mut GrammarState, token_id: u32) -> bool {
+        let profiling = mask_profiling_enabled();
+        let t0 = profiling.then(std::time::Instant::now);
+        let result = self.advance_inner(state, token_id);
+        if let Some(t0) = t0 {
+            let ns = t0.elapsed().as_nanos() as u64;
+            MASK_PROFILE.with(|p| {
+                let mut p = p.borrow_mut();
+                p.advance_calls += 1;
+                p.advance_ns += ns;
+            });
+        }
+        result
+    }
+
+    fn advance_inner(&self, state: &mut GrammarState, token_id: u32) -> bool {
         let token_id = token_id as usize;
         if token_id >= self.vocab_size {
             return false;
