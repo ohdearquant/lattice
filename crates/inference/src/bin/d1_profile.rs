@@ -26,7 +26,7 @@
 //!                       T_target definition — the binary refuses to run below that floor)
 //!   D1_WARMUP_STEPS    warmup steps discarded before measurement starts (default 20; this
 //!                       is the "exact warmup count pinned in the run script before first
-//!                       run" GATES.md requires — the seat script pins it explicitly via
+//!                       run" GATES.md requires — the run script pins it explicitly via
 //!                       this env var rather than leaving a library default implicit)
 //!   D1_SEED            recorded for provenance only (default 42; decode here is greedy —
 //!                       deterministic given a fixed prompt — so this does not change any
