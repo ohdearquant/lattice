@@ -44,8 +44,31 @@
 //! but the last; the last child reuses the caller's owned state by move),
 //! so straight-line chains — the common case for byte-level BPE tokens
 //! after the first few branching bytes — advance in place with zero clones.
+//!
+//! That O(stack depth) bound depends on the walk starting from a state
+//! whose `partial_token_bytes` is empty, not a clone of the live decode
+//! state's. `advance_byte` unconditionally appends to that field, and the
+//! live state passed into `mask` has one entry per byte generated so far
+//! in the whole decode — cloning it as the walk root would make every
+//! DFS clone O(stack depth + bytes generated so far) instead. See
+//! [`walk_root_state`] for the fix.
 
 use crate::grammar::pda::{CompiledGrammar, GrammarState, StepResult, advance_byte};
+
+// Reused across every `ByteTrie::mask` call on this thread so the hot
+// over-cap path doesn't heap-allocate a fresh `vocab_size / 64`-word bitvec
+// every time (issue #734 follow-up: this buffer was previously a
+// `vec![0u64; stride]` per call, ~31KB of allocator traffic at 248K-token
+// vocab). `ByteTrie::mask` takes `&self`, so a `RefCell` field can't hand
+// out a mutably-borrowed buffer across calls without risking a
+// double-borrow if `mask` were ever re-entered on the same thread; it
+// isn't (the DFS never calls back into `mask`), so a plain thread-local
+// scratch buffer is sound and avoids that hazard entirely — concurrent
+// callers on other threads each get their own buffer, so there's no data
+// race to reason about either.
+thread_local! {
+    static MASK_SCRATCH: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// One node in the byte trie. Children are kept as a small sorted-free
 /// association list rather than a fixed 256-entry table: vocab tries are
@@ -121,9 +144,40 @@ impl ByteTrie {
         logits: &mut [f32],
     ) {
         let mask_stride = vocab_size.div_ceil(64);
-        let mut allowed = vec![0u64; mask_stride];
-        mark_allowed(&self.nodes, 0, state.clone(), grammar, &mut allowed);
-        apply_allowed_mask(&allowed, vocab_size, logits);
+        MASK_SCRATCH.with(|scratch| {
+            let mut allowed = scratch.borrow_mut();
+            allowed.clear();
+            allowed.resize(mask_stride, 0u64);
+            mark_allowed(
+                &self.nodes,
+                0,
+                walk_root_state(state),
+                grammar,
+                &mut allowed,
+            );
+            apply_allowed_mask(&allowed, vocab_size, logits);
+        });
+    }
+}
+
+/// Build the DFS walk's root state from the live decode-step `state`.
+///
+/// Carries a clone of `stack` and `complete` (the only fields `advance_byte`
+/// and `is_accepting` ever read) but starts `partial_token_bytes` empty
+/// instead of cloning the live state's history. `advance_byte` (pda.rs)
+/// unconditionally *appends* to `partial_token_bytes` and nothing in PDA
+/// matching ever reads it — it exists only for external context-dependent
+/// inspection of a state returned to a caller, which the trie walk's
+/// throwaway internal states are not. Cloning the live field here would
+/// make every non-last-child DFS clone (`mark_allowed`) pay for the entire
+/// generated-so-far byte history instead of O(stack depth), since
+/// `partial_token_bytes` grows once per accepted byte for the whole
+/// decode, not just within one trie walk.
+fn walk_root_state(state: &GrammarState) -> GrammarState {
+    GrammarState {
+        stack: state.stack.clone(),
+        partial_token_bytes: Vec::new(),
+        complete: state.complete,
     }
 }
 
@@ -245,5 +299,70 @@ mod tests {
         trie.mask(&state, &grammar, vocab.len(), &mut logits);
         assert!(logits[0] > f32::NEG_INFINITY);
         assert_eq!(logits[1], f32::NEG_INFINITY, "empty token always blocked");
+    }
+
+    /// Regression test for the over-cap trie-mask hot path (issue #734
+    /// follow-up): `mark_allowed`'s DFS clones must never carry the live
+    /// decode state's `partial_token_bytes` history. `advance_byte`
+    /// (pda.rs) appends to that field on every accepted byte for the
+    /// *whole* decode, and nothing in PDA matching (`try_advance_stack`,
+    /// `is_accepting`) ever reads it back. If the walk root cloned it,
+    /// every non-last-child DFS clone in `mark_allowed` would copy the
+    /// entire generated-so-far history instead of paying only for the
+    /// stack.
+    ///
+    /// Mutation-sensitive: reverting `walk_root_state` to `state.clone()`
+    /// makes this fail immediately, since `root.partial_token_bytes` would
+    /// equal the 64KB history instead of being empty. Verified by hand:
+    /// temporarily replacing the body with `state.clone()` and re-running
+    /// this test fails on the `is_empty()` assertion; restoring the fix
+    /// makes it pass again.
+    #[test]
+    fn trie_walk_root_state_drops_partial_token_bytes() {
+        let mut state = GrammarState::initial();
+        // Representative of a long-running decode: `partial_token_bytes`
+        // grows by one entry per accepted byte across the whole
+        // generation, not just within one trie walk.
+        state.partial_token_bytes = vec![b'x'; 64 * 1024];
+
+        let root = walk_root_state(&state);
+
+        assert!(
+            root.partial_token_bytes.is_empty(),
+            "walk root must start with empty partial_token_bytes regardless \
+             of the live state's history length (got {} bytes) — a full \
+             state.clone() here reintroduces O(generation-so-far) DFS clones",
+            root.partial_token_bytes.len()
+        );
+        assert_eq!(root.stack, state.stack, "walk root must preserve stack");
+        assert_eq!(
+            root.complete, state.complete,
+            "walk root must preserve the complete flag"
+        );
+    }
+
+    /// End-to-end companion to the unit test above: the mask output must
+    /// not depend on how much byte history the live state carries in
+    /// `partial_token_bytes`, since the trie walk never reads that field
+    /// through a cloned live state.
+    #[test]
+    fn trie_mask_byte_identical_regardless_of_partial_token_bytes_history() {
+        let vocab = vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+        let grammar = or_grammar();
+        let trie = ByteTrie::build(&vocab);
+
+        let clean_state = GrammarState::initial();
+        let mut clean_logits = vec![1.0f32, 2.0f32, 3.0f32];
+        trie.mask(&clean_state, &grammar, vocab.len(), &mut clean_logits);
+
+        let mut heavy_state = GrammarState::initial();
+        heavy_state.partial_token_bytes = vec![b'x'; 64 * 1024];
+        let mut heavy_logits = vec![1.0f32, 2.0f32, 3.0f32];
+        trie.mask(&heavy_state, &grammar, vocab.len(), &mut heavy_logits);
+
+        assert_eq!(
+            clean_logits, heavy_logits,
+            "mask output must be independent of partial_token_bytes history"
+        );
     }
 }
