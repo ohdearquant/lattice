@@ -866,6 +866,216 @@ pub(crate) fn forward_step_f16(
     Ok(())
 }
 
+/// Test-only operation boundaries for one final-token full-attention layer.
+///
+/// This deliberately follows [`forward_step_f16`] rather than adding a trace
+/// branch to the production path. It lets Metal differential tests distinguish
+/// a local layer discontinuity from smooth accumulated drift without changing
+/// the release forward kernel.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct F16FullAttentionOpTrace {
+    pub(crate) q: Vec<f32>,
+    pub(crate) k: Vec<f32>,
+    pub(crate) v: Vec<f32>,
+    pub(crate) gated_context: Vec<f32>,
+    pub(crate) o_projection: Vec<f32>,
+    pub(crate) output: Vec<f32>,
+}
+
+#[cfg(test)]
+#[allow(dead_code, clippy::type_complexity)]
+fn forward_prompt_f16_trace_inner(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    rope: &RopeTable,
+    token_ids: &[u32],
+    capture_full_layer: Option<usize>,
+) -> Result<(Vec<f32>, Vec<Vec<f32>>, Option<F16FullAttentionOpTrace>), crate::error::InferenceError>
+{
+    if token_ids.is_empty() {
+        return Err(crate::error::InferenceError::InvalidInput(
+            "forward_prompt_f16_layer_trace requires at least one token".to_string(),
+        ));
+    }
+
+    let hidden = cfg.hidden_size;
+    let num_linear = cfg.num_linear_attention_layers();
+    let num_full = cfg.num_full_attention_layers();
+    let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
+        .map(|_| GatedDeltaNetState::new(cfg))
+        .collect();
+    let mut kv_cache = KvCache::new(num_full);
+    let mut scratch = ForwardScratch::new();
+    let mut last_layer_outputs = Vec::with_capacity(cfg.num_hidden_layers);
+    let mut captured = None;
+
+    for (position, &token_id) in token_ids.iter().enumerate() {
+        if token_id as usize >= cfg.vocab_size {
+            return Err(crate::error::InferenceError::InvalidInput(format!(
+                "token {token_id} at position {position} exceeds vocab_size {}",
+                cfg.vocab_size
+            )));
+        }
+        scratch.ensure_capacity(cfg, kv_cache.seq_len + 1);
+        let embed_start = token_id as usize * hidden;
+        f16_to_f32_slice(
+            &weights.embed_tokens[embed_start..embed_start + hidden],
+            &mut scratch.hidden[..hidden],
+        );
+
+        let mut linear_idx = 0usize;
+        let mut full_idx = 0usize;
+        for layer_i in 0..cfg.num_hidden_layers {
+            let (attn_weights, common) = &weights.layers[layer_i];
+            scratch.residual[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+            qwen35_rms_norm(
+                &mut scratch.hidden[..hidden],
+                &common.input_layernorm,
+                hidden,
+                cfg.rms_norm_eps,
+            );
+
+            let capture_this_layer =
+                position + 1 == token_ids.len() && capture_full_layer == Some(layer_i);
+
+            match attn_weights {
+                F16AttentionWeights::Linear(gdn_w) => {
+                    gated_delta_net_step_fused_f16(
+                        &scratch.hidden[..hidden],
+                        &mut gdn_states[linear_idx],
+                        gdn_w,
+                        cfg,
+                        &mut scratch.gdn_scratch,
+                        &mut scratch.attn_out[..hidden],
+                    );
+                    linear_idx += 1;
+                }
+                F16AttentionWeights::Full(full_w) => {
+                    scratch.attn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+                    full_attention_step_f16(
+                        full_w,
+                        cache_idx_of(full_idx),
+                        position,
+                        &mut kv_cache,
+                        &mut scratch,
+                        cfg,
+                        rope,
+                        hidden,
+                        None,
+                    );
+                    if capture_this_layer {
+                        captured = Some(F16FullAttentionOpTrace {
+                            q: scratch.q_buf[..cfg.full_q_dim()].to_vec(),
+                            k: scratch.k_buf[..cfg.full_kv_dim()].to_vec(),
+                            v: scratch.v_buf[..cfg.full_kv_dim()].to_vec(),
+                            gated_context: scratch.context[..cfg.full_q_dim()].to_vec(),
+                            o_projection: scratch.attn_out[..hidden].to_vec(),
+                            output: Vec::new(),
+                        });
+                    }
+                    full_idx += 1;
+                }
+            }
+
+            for i in 0..hidden {
+                scratch.hidden[i] = scratch.residual[i] + scratch.attn_out[i];
+            }
+            scratch.residual[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+            qwen35_rms_norm(
+                &mut scratch.hidden[..hidden],
+                &common.post_attention_layernorm,
+                hidden,
+                cfg.rms_norm_eps,
+            );
+            scratch.ffn_out[..hidden].copy_from_slice(&scratch.hidden[..hidden]);
+            match &common.ffn {
+                F16FeedForwardWeights::Dense {
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                } => ffn_step_f16(
+                    gate_proj,
+                    up_proj,
+                    down_proj,
+                    &mut scratch,
+                    cfg.intermediate_size,
+                    hidden,
+                ),
+                F16FeedForwardWeights::Moe(moe) => moe_ffn_step_f16(moe, &mut scratch, hidden),
+            }
+            for i in 0..hidden {
+                scratch.hidden[i] = scratch.residual[i] + scratch.ffn_out[i];
+            }
+            if let Some(trace) = captured.as_mut().filter(|_| capture_this_layer) {
+                trace.output = scratch.hidden[..hidden].to_vec();
+            }
+
+            if position + 1 == token_ids.len() {
+                last_layer_outputs.push(scratch.hidden[..hidden].to_vec());
+            }
+        }
+
+        if position + 1 < token_ids.len() {
+            kv_cache.seq_len += 1;
+        }
+    }
+    kv_cache.seq_len = token_ids.len();
+
+    qwen35_rms_norm(
+        &mut scratch.hidden[..hidden],
+        &weights.final_norm,
+        hidden,
+        cfg.rms_norm_eps,
+    );
+    resize(&mut scratch.logits, cfg.vocab_size);
+    matmul_bt_f16(
+        &scratch.hidden[..hidden],
+        &weights.embed_tokens,
+        &mut scratch.logits[..cfg.vocab_size],
+        1,
+        hidden,
+        cfg.vocab_size,
+    );
+    Ok((
+        scratch.logits[..cfg.vocab_size].to_vec(),
+        last_layer_outputs,
+        captured,
+    ))
+}
+
+/// Test-only final-token residual snapshots after every transformer layer.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn forward_prompt_f16_layer_trace(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    rope: &RopeTable,
+    token_ids: &[u32],
+) -> Result<(Vec<f32>, Vec<Vec<f32>>), crate::error::InferenceError> {
+    let (logits, layers, _) = forward_prompt_f16_trace_inner(weights, cfg, rope, token_ids, None)?;
+    Ok((logits, layers))
+}
+
+/// Test-only f16 capture of a final-token full-attention layer's operation boundaries.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn forward_prompt_f16_full_attention_op_trace(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    rope: &RopeTable,
+    token_ids: &[u32],
+    layer: usize,
+) -> Result<F16FullAttentionOpTrace, crate::error::InferenceError> {
+    let (_, _, capture) =
+        forward_prompt_f16_trace_inner(weights, cfg, rope, token_ids, Some(layer))?;
+    capture.ok_or_else(|| {
+        crate::error::InferenceError::InvalidInput(format!(
+            "layer {layer} was not a full-attention layer in f16 trace"
+        ))
+    })
+}
+
 /// Identity function for cache index -- full_idx IS the cache index.
 #[inline(always)]
 fn cache_idx_of(full_idx: usize) -> usize {

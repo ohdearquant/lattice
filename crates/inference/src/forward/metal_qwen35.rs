@@ -1073,7 +1073,12 @@ mod inner {
     use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
     use metal::*;
+    #[cfg(test)]
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(test)]
+    static ISSUE_535_CAPTURE_LAST_O_PROJECTION: AtomicBool = AtomicBool::new(false);
 
     // ---------------------------------------------------------------------------
     // MSL Compute Shaders
@@ -7202,6 +7207,18 @@ mod inner {
                             m,
                             hidden as u32,
                             q_dim as u32,
+                        );
+                    }
+
+                    #[cfg(test)]
+                    if ISSUE_535_CAPTURE_LAST_O_PROJECTION.load(Ordering::Relaxed)
+                        && layer_i + 1 == cfg.num_hidden_layers
+                    {
+                        self.dispatch_copy(
+                            enc,
+                            &self.session.activations.ffn_out,
+                            &self.session.activations.attn_out,
+                            m * hidden as u32,
                         );
                     }
 
@@ -28248,6 +28265,360 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 }
             }
             best
+        }
+
+        // -----------------------------------------------------------------------
+        // #535 long-prefill CPU-f16 vs Metal diagnostic
+        // -----------------------------------------------------------------------
+
+        #[derive(Clone, Copy)]
+        struct Issue535Diff {
+            max_abs: f32,
+            rel_l2: f32,
+        }
+
+        fn issue_535_diff(reference: &[f32], actual: &[f32]) -> Issue535Diff {
+            assert_eq!(reference.len(), actual.len(), "#535 diff shape mismatch");
+            let mut max_abs = 0.0f32;
+            let mut squared_error = 0.0f64;
+            let mut squared_reference = 0.0f64;
+            for (&r, &a) in reference.iter().zip(actual) {
+                max_abs = max_abs.max((r - a).abs());
+                squared_error += f64::from(r - a).powi(2);
+                squared_reference += f64::from(r).powi(2);
+            }
+            Issue535Diff {
+                max_abs,
+                rel_l2: (squared_error.sqrt() / squared_reference.sqrt().max(f64::EPSILON)) as f32,
+            }
+        }
+
+        fn issue_535_topk(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
+            let mut ids: Vec<usize> = (0..logits.len()).collect();
+            ids.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then_with(|| a.cmp(&b)));
+            ids.into_iter().take(k).map(|id| (id, logits[id])).collect()
+        }
+
+        /// Read the exact content-anchored #535 prompt from the e2e fixture.
+        ///
+        /// The Python module only imports its HF dependencies inside the reference runner,
+        /// so loading its `LONG_PREFILL_PROMPT` binding here is cheap. Keeping the fixture
+        /// as the authority prevents this local probe from silently drifting from the CI case.
+        fn issue_535_prompt() -> String {
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../scripts/e2e_parity_check.py"
+            );
+            let output = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    "import runpy, sys; print(runpy.run_path(sys.argv[1])['LONG_PREFILL_PROMPT'], end='')",
+                    fixture,
+                ])
+                .output()
+                .expect("run Python e2e prompt fixture");
+            assert!(
+                output.status.success(),
+                "load #535 prompt fixture: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).expect("#535 prompt fixture must be UTF-8")
+        }
+
+        fn issue_535_model_dir() -> std::path::PathBuf {
+            std::path::PathBuf::from("/Users/lion/.lattice/models/qwen3.5-0.8b")
+        }
+
+        struct Issue535CpuF16 {
+            cfg: crate::model::qwen35_config::Qwen35Config,
+            weights: crate::weights::f16_weights::F16ModelWeights,
+            rope: crate::rope::RopeTable,
+        }
+
+        fn load_issue_535_cpu_f16(model_dir: &std::path::Path) -> Issue535CpuF16 {
+            use crate::model::qwen35_config::Qwen35Config;
+            use crate::rope::RopeTable;
+            use crate::weights::SafetensorsFile;
+            use crate::weights::f16_weights::load_f16_weights;
+
+            let cfg = Qwen35Config::from_model_dir(model_dir).expect("load #535 config");
+            let weights_file = SafetensorsFile::open(&model_dir.join("model.safetensors"))
+                .expect("open #535 safetensors");
+            let weights = load_f16_weights(&weights_file, &cfg).expect("load #535 f16 weights");
+            let rope = RopeTable::new(
+                cfg.rope_dim(),
+                cfg.max_position_embeddings.min(8192),
+                cfg.rope_theta,
+            );
+            Issue535CpuF16 { cfg, weights, rope }
+        }
+
+        fn issue_535_cpu_f16(state: &Issue535CpuF16, tokens: &[u32]) -> (Vec<f32>, Vec<Vec<f32>>) {
+            use crate::forward::cpu_f16::forward_prompt_f16_layer_trace;
+            forward_prompt_f16_layer_trace(&state.weights, &state.cfg, &state.rope, tokens)
+                .expect("CPU f16 #535 prefill")
+        }
+
+        /// Run the production batched-pre-fill kernels but stop after each layer prefix.
+        ///
+        /// The final chunk is intentionally emitted with `emit_logits=false`: that leaves
+        /// `activations.hidden` as the post-layer residual rather than overwriting it with
+        /// the terminal RMS norm. Each prefix starts from clean KV/GDN state, so the final
+        /// row is the same layer boundary used by the CPU f16 trace.
+        fn issue_535_metal_layer_trace(
+            state: &mut MetalQwen35State,
+            tokens: &[u32],
+        ) -> Vec<Vec<f32>> {
+            let original_cfg = state.engine.config.clone();
+            let active: Vec<usize> = (0..original_cfg.num_hidden_layers)
+                .filter(|&layer| original_cfg.is_layer_active(layer))
+                .collect();
+            let hidden = original_cfg.hidden_size;
+            let mut traces = Vec::with_capacity(active.len());
+
+            for prefix_len in 1..=active.len() {
+                let mut mask = vec![false; original_cfg.num_hidden_layers];
+                for &layer in &active[..prefix_len] {
+                    mask[layer] = true;
+                }
+                state.engine.config.layer_mask = mask;
+                state.reset_state();
+
+                let mut start_pos = 0usize;
+                for chunk in tokens.chunks(state.session.max_prefill) {
+                    let _ = state.forward_prefill_batched_chunk(chunk, start_pos, false, false);
+                    start_pos += chunk.len();
+                }
+                let last_row_offset = (tokens.len() - 1) % state.session.max_prefill * hidden;
+                // SAFETY: the final batched chunk waited for completion; hidden is shared,
+                // and the calculated final-row range is within the max-prefill allocation.
+                let row = unsafe {
+                    let ptr = state.session.activations.hidden.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr.add(last_row_offset), hidden).to_vec()
+                };
+                traces.push(row);
+            }
+
+            state.engine.config.layer_mask = original_cfg.layer_mask;
+            state.reset_state();
+            traces
+        }
+
+        struct Issue535MetalFullAttentionOpTrace {
+            q: Vec<f32>,
+            k: Vec<f32>,
+            v: Vec<f32>,
+            gated_context: Vec<f32>,
+            o_projection: Vec<f32>,
+            output: Vec<f32>,
+        }
+
+        /// Capture the terminal full-attention layer's production prefill buffers.
+        ///
+        /// Two production-prefill passes preserve distinct terminal GQA boundaries:
+        /// attention context first, then O projection. The second test-only pass copies
+        /// O output into `attn_out`, which is dead after terminal GQA's O projection.
+        fn issue_535_metal_final_full_attention_op_trace(
+            state: &mut MetalQwen35State,
+            tokens: &[u32],
+        ) -> Issue535MetalFullAttentionOpTrace {
+            let cfg = state.engine.config.clone();
+            let hidden = cfg.hidden_size;
+            let q_dim = cfg.full_q_dim();
+            let kv_dim = cfg.full_kv_dim();
+            state.reset_state();
+
+            let mut start_pos = 0usize;
+            for chunk in tokens.chunks(state.session.max_prefill) {
+                let _ = state.forward_prefill_batched_chunk(chunk, start_pos, false, false);
+                start_pos += chunk.len();
+            }
+            let row = (tokens.len() - 1) % state.session.max_prefill;
+            // SAFETY: the final batched chunk waited for completion. All buffers are shared and
+            // `row` is in the final chunk's [0, max_prefill) allocation.
+            let read_row = |buf: &Buffer, stride: usize| unsafe {
+                let ptr = buf.contents() as *const f32;
+                std::slice::from_raw_parts(ptr.add(row * stride), stride).to_vec()
+            };
+            let q = read_row(&state.session.activations.q_separated, q_dim);
+            let k = read_row(&state.session.activations.k, kv_dim);
+            let v = read_row(&state.session.activations.v, kv_dim);
+            let gated_context = read_row(&state.session.activations.attn_out, q_dim);
+
+            state.reset_state();
+            ISSUE_535_CAPTURE_LAST_O_PROJECTION.store(true, Ordering::Relaxed);
+            start_pos = 0;
+            for chunk in tokens.chunks(state.session.max_prefill) {
+                let _ = state.forward_prefill_batched_chunk(chunk, start_pos, false, false);
+                start_pos += chunk.len();
+            }
+            ISSUE_535_CAPTURE_LAST_O_PROJECTION.store(false, Ordering::Relaxed);
+            Issue535MetalFullAttentionOpTrace {
+                q,
+                k,
+                v,
+                gated_context,
+                o_projection: read_row(&state.session.activations.attn_out, hidden),
+                output: read_row(&state.session.activations.hidden, hidden),
+            }
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        #[ignore = "manual #535 differential probe; needs the local 0.8B checkpoint and exclusive GPU"]
+        fn issue_535_long_prefill_cpu_f16_vs_metal_diagnostic() {
+            let model_dir = issue_535_model_dir();
+            for name in ["model.safetensors", "config.json", "tokenizer.json"] {
+                assert!(
+                    model_dir.join(name).exists(),
+                    "#535 diagnostic requires {}",
+                    model_dir.join(name).display()
+                );
+            }
+
+            let _gpu = gpu_test_lock();
+            let Some(_device) = Device::system_default() else {
+                eprintln!("#535 diagnostic skipped: no Metal device");
+                return;
+            };
+
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load #535 Metal model");
+            let prompt = issue_535_prompt();
+            let input = model.tokenizer().tokenize(&prompt);
+            let tokens = input.input_ids[..input.real_length].to_vec();
+            assert!(
+                (800..=830).contains(&tokens.len()),
+                "#535 fixture token count drifted: expected about 816, got {}",
+                tokens.len()
+            );
+            let mut metal = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct #535 Metal state");
+            assert_eq!(metal.session.max_prefill, 512, "#535 chunk invariant");
+            let cpu_f16 = load_issue_535_cpu_f16(&model_dir);
+
+            let sweep = [64usize, 128, 256, 384, 512, 640, 768, tokens.len()];
+            eprintln!(
+                "ISSUE535 lengths: token_count={} max_prefill={}",
+                tokens.len(),
+                metal.session.max_prefill
+            );
+            eprintln!("ISSUE535 sweep: len,max_abs,rel_l2,cpu_argmax,metal_argmax");
+
+            let mut full_cpu_logits = Vec::new();
+            let mut full_cpu_layers = Vec::new();
+            let mut full_metal_logits = Vec::new();
+            for &length in &sweep {
+                let (cpu_logits, cpu_layers) = issue_535_cpu_f16(&cpu_f16, &tokens[..length]);
+                metal.reset_state();
+                let metal_logits = metal.forward_prefill(&tokens[..length]);
+                let diff = issue_535_diff(&cpu_logits, &metal_logits);
+                eprintln!(
+                    "ISSUE535 sweep_row: {length},{:.7e},{:.7e},{},{}",
+                    diff.max_abs,
+                    diff.rel_l2,
+                    argmax_f32(&cpu_logits),
+                    argmax_f32(&metal_logits),
+                );
+                if length == tokens.len() {
+                    full_cpu_logits = cpu_logits;
+                    full_cpu_layers = cpu_layers;
+                    full_metal_logits = metal_logits;
+                }
+            }
+
+            let cpu_top5 = issue_535_topk(&full_cpu_logits, 5);
+            let metal_top5 = issue_535_topk(&full_metal_logits, 5);
+            let cpu_id = argmax_f32(&full_cpu_logits);
+            let metal_id = argmax_f32(&full_metal_logits);
+            eprintln!("ISSUE535 CPU top5={cpu_top5:?}");
+            eprintln!("ISSUE535 METAL top5={metal_top5:?}");
+            eprintln!(
+                "ISSUE535 candidate_margins: cpu(token {cpu_id} - token {metal_id})={:.7e}, metal(token {cpu_id} - token {metal_id})={:.7e}",
+                full_cpu_logits[cpu_id] - full_cpu_logits[metal_id],
+                full_metal_logits[cpu_id] - full_metal_logits[metal_id],
+            );
+
+            let metal_layers = issue_535_metal_layer_trace(&mut metal, &tokens);
+            assert_eq!(
+                full_cpu_layers.len(),
+                metal_layers.len(),
+                "#535 layer trace shape"
+            );
+            eprintln!("ISSUE535 layers: layer,type,max_abs,rel_l2");
+            for (layer, (cpu, metal_row)) in full_cpu_layers.iter().zip(&metal_layers).enumerate() {
+                let diff = issue_535_diff(cpu, metal_row);
+                let kind = if model.config().is_full_attention(layer) {
+                    "GQA"
+                } else {
+                    "GDN"
+                };
+                eprintln!(
+                    "ISSUE535 layer_row: {layer},{kind},{:.7e},{:.7e}",
+                    diff.max_abs, diff.rel_l2
+                );
+            }
+        }
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        #[ignore = "manual #535 last-GQA operation probe; needs the local 0.8B checkpoint and exclusive GPU"]
+        fn issue_535_last_gqa_operation_diagnostic() {
+            use crate::forward::cpu_f16::forward_prompt_f16_full_attention_op_trace;
+
+            let model_dir = issue_535_model_dir();
+            let _gpu = gpu_test_lock();
+            let Some(_device) = Device::system_default() else {
+                eprintln!("#535 GQA op diagnostic skipped: no Metal device");
+                return;
+            };
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load #535 Metal model");
+            let prompt = issue_535_prompt();
+            let input = model.tokenizer().tokenize(&prompt);
+            let tokens = input.input_ids[..input.real_length].to_vec();
+            let target_layer = model.config().num_hidden_layers - 1;
+            assert!(
+                model.config().is_full_attention(target_layer),
+                "#535 op probe assumes the terminal layer is GQA"
+            );
+
+            let cpu = load_issue_535_cpu_f16(&model_dir);
+            let cpu_ops = forward_prompt_f16_full_attention_op_trace(
+                &cpu.weights,
+                &cpu.cfg,
+                &cpu.rope,
+                &tokens,
+                target_layer,
+            )
+            .expect("CPU f16 final-GQA operation trace");
+            let mut metal = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct #535 Metal state");
+            let metal_ops = issue_535_metal_final_full_attention_op_trace(&mut metal, &tokens);
+
+            eprintln!("ISSUE535 op_rows: op,max_abs,rel_l2");
+            for (name, cpu, metal) in [
+                ("q_norm_rope", &cpu_ops.q, &metal_ops.q),
+                ("k_norm_rope", &cpu_ops.k, &metal_ops.k),
+                ("v_projection", &cpu_ops.v, &metal_ops.v),
+                (
+                    "gated_attention_context",
+                    &cpu_ops.gated_context,
+                    &metal_ops.gated_context,
+                ),
+                (
+                    "o_projection",
+                    &cpu_ops.o_projection,
+                    &metal_ops.o_projection,
+                ),
+                ("post_ffn", &cpu_ops.output, &metal_ops.output),
+            ] {
+                let diff = issue_535_diff(cpu, metal);
+                eprintln!(
+                    "ISSUE535 op_row: {name},{:.7e},{:.7e}",
+                    diff.max_abs, diff.rel_l2
+                );
+            }
         }
 
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
