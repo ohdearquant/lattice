@@ -78,6 +78,13 @@ pub enum ApiError {
     PayloadTooLarge { message: String },
     /// Server-side failure — HTTP 500.
     Internal { message: String },
+    /// Server-side failure with a specific machine-readable code beyond the
+    /// generic `internal_error` — HTTP 500. Used by strict structured-output
+    /// requests (`blocked_constraint`, `validation_failed`, `length_limit`):
+    /// the request itself was not the caller's fault, but returning partial
+    /// or unvalidated JSON as a 200 is prohibited, so this is still a 500,
+    /// just with a code the caller can branch on instead of a generic one.
+    ServerError { message: String, code: &'static str },
     /// Admission rejected: the shared Metal worker's outstanding-job cap
     /// (queued + in-flight) is already full — HTTP 503 (issue #932). This is
     /// the ONE place `MetalWorkerClient::submit` is allowed to fail
@@ -97,6 +104,7 @@ impl ApiError {
             ApiError::BadRequest { message, .. } => message,
             ApiError::PayloadTooLarge { message } => message,
             ApiError::Internal { message } => message,
+            ApiError::ServerError { message, .. } => message,
             ApiError::ServiceUnavailable { message } => message,
         }
     }
@@ -111,6 +119,7 @@ impl ApiError {
             ApiError::BadRequest { code, .. } => code,
             ApiError::PayloadTooLarge { .. } => "request_body_too_large",
             ApiError::Internal { .. } => "internal_error",
+            ApiError::ServerError { code, .. } => code,
             ApiError::ServiceUnavailable { .. } => "server_busy",
         }
     }
@@ -175,6 +184,17 @@ impl IntoResponse for ApiError {
                     },
                 });
                 (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+            }
+            ApiError::ServerError { message, code } => {
+                let body = Json(ErrorBody {
+                    error: ErrorDetail {
+                        message,
+                        r#type: "server_error",
+                        code: code.to_string(),
+                        param: None,
+                    },
+                });
+                (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
             }
         }
     }

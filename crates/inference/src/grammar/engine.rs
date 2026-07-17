@@ -137,6 +137,11 @@ pub struct GrammarEngine {
     vocab_size: usize,
     /// Raw vocabulary byte sequences (used for context-dependent token checks).
     vocab_bytes: Vec<Vec<u8>>,
+    /// Set when state enumeration in `new` hit `MAX_GRAMMAR_STATES` before
+    /// exhausting the reachable state graph: some runtime states then have
+    /// no precomputed mask and fall back to `mask_by_simulation` (a
+    /// full-vocab scan per token). See `exceeds_state_budget`.
+    state_limit_exceeded: bool,
 }
 
 impl GrammarEngine {
@@ -166,7 +171,9 @@ impl GrammarEngine {
             crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
         );
 
-        if states.len() >= crate::grammar::vocab_partition::MAX_GRAMMAR_STATES {
+        let state_limit_exceeded =
+            states.len() >= crate::grammar::vocab_partition::MAX_GRAMMAR_STATES;
+        if state_limit_exceeded {
             tracing::warn!(
                 "grammar state count hit limit ({}); some states may fall back to context-dependent checks",
                 crate::grammar::vocab_partition::MAX_GRAMMAR_STATES
@@ -181,7 +188,20 @@ impl GrammarEngine {
             partition,
             vocab_size,
             vocab_bytes,
+            state_limit_exceeded,
         })
+    }
+
+    /// True when state enumeration hit `MAX_GRAMMAR_STATES` (256) before
+    /// covering the whole reachable state graph. Once true, some runtime
+    /// states have no precomputed mask and every step in that state pays
+    /// `mask_by_simulation`'s full-vocab scan instead of a bitmask lookup --
+    /// an unbounded-latency mode unacceptable for an unrestricted serve API.
+    /// Callers that need a bounded-latency guarantee (e.g. HTTP strict
+    /// structured-output admission) should reject the schema instead of
+    /// using an engine that reports `true` here.
+    pub fn exceeds_state_budget(&self) -> bool {
+        self.state_limit_exceeded
     }
 
     /// Create the initial `GrammarState` for a new decode sequence.
