@@ -636,8 +636,43 @@ mod imp {
                         b'u' => {
                             let hex = s.get(*pos + 1..*pos + 5)?;
                             let code = u32::from_str_radix(hex, 16).ok()?;
+                            *pos += 5; // consume 'u' + 4 hex digits
+                            if (0xD800..=0xDBFF).contains(&code) {
+                                // High surrogate: the compiled grammar
+                                // (json_schema.rs escape_id) admits any
+                                // four-hex `\uXXXX` independently of
+                                // pairing, so a lone half must still
+                                // validate here (validator ⊇ grammar
+                                // language). Combine with an immediately
+                                // following low-surrogate escape when
+                                // present; a lone half is represented as
+                                // U+FFFD since `char`/`String` cannot hold
+                                // an unpaired surrogate scalar.
+                                if s.as_bytes().get(*pos) == Some(&b'\\')
+                                    && s.as_bytes().get(*pos + 1) == Some(&b'u')
+                                    && let Some(low) = s
+                                        .get(*pos + 2..*pos + 6)
+                                        .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                        .filter(|low| (0xDC00..=0xDFFF).contains(low))
+                                {
+                                    let combined =
+                                        0x10000 + (code - 0xD800) * 0x400 + (low - 0xDC00);
+                                    out.push(char::from_u32(combined)?);
+                                    *pos += 6;
+                                    continue;
+                                }
+                                out.push('\u{FFFD}');
+                                continue;
+                            }
+                            if (0xDC00..=0xDFFF).contains(&code) {
+                                // Lone low surrogate: same grammar-parity
+                                // rationale as the high-surrogate case
+                                // above.
+                                out.push('\u{FFFD}');
+                                continue;
+                            }
                             out.push(char::from_u32(code)?);
-                            *pos += 4;
+                            continue;
                         }
                         _ => return None,
                     }
@@ -647,7 +682,15 @@ mod imp {
                     // Not a quote or a backslash: copy one UTF-8 scalar
                     // verbatim, O(1) since `s[*pos..]` is a valid-UTF-8
                     // slice already and `chars().next()` decodes lazily.
+                    // RFC 8259 §7 requires U+0000-U+001F to be escaped;
+                    // the compiled grammar's string-body alternatives
+                    // (json_schema.rs, unescaped-ASCII range starts at
+                    // 0x20) reject them unescaped too, so an unescaped
+                    // raw control scalar here must fail the same way.
                     let ch = s[*pos..].chars().next()?;
+                    if (ch as u32) < 0x20 {
+                        return None;
+                    }
                     out.push(ch);
                     *pos += ch.len_utf8();
                 }
@@ -4284,6 +4327,76 @@ mod imp {
             }
         }
 
+        /// Round-2 review medium finding 1: the `catch_unwind` single-flight
+        /// recovery path (`get_or_compile`'s `Action::Compile` arm) had no
+        /// test exercising an actual owner-closure panic. `compile` is an
+        /// injectable `FnOnce` argument to `get_or_compile` already -- no
+        /// extra test-only seam is needed, since single-flight semantics
+        /// mean only the one thread that wins `Action::Compile` ever
+        /// invokes its closure, so every concurrent caller can safely be
+        /// handed the same panicking closure. Every caller's result is
+        /// collected over a channel with a bounded `recv_timeout` rather
+        /// than a plain `.join()`, so a regression that reintroduces a
+        /// missed `notify_all` fails this test deterministically instead of
+        /// hanging the suite.
+        #[test]
+        fn grammar_cache_panic_in_compile_notifies_waiters_with_internal_error() {
+            let cache = Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY));
+            let key = canonical_schema_key(
+                &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
+            );
+            const N: usize = 8;
+            let barrier = Arc::new(std::sync::Barrier::new(N));
+            let prev_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {})); // silence the expected injected panic
+            let (tx, rx) = std::sync::mpsc::channel();
+            for _ in 0..N {
+                let cache = Arc::clone(&cache);
+                let key = key.clone();
+                let barrier = Arc::clone(&barrier);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = cache.get_or_compile(key, || {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        panic!("injected compile panic for single-flight regression test");
+                    });
+                    let _ = tx.send(result);
+                });
+            }
+            drop(tx);
+            for _ in 0..N {
+                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(Err(CacheError::Internal(_))) => {}
+                    Ok(Err(other)) => panic!("expected CacheError::Internal, got Err({other:?})"),
+                    Ok(Ok(_)) => panic!("expected CacheError::Internal, got Ok(engine)"),
+                    Err(_) => panic!(
+                        "caller did not return within timeout -- single-flight panic recovery hung"
+                    ),
+                }
+            }
+            std::panic::set_hook(prev_hook);
+            assert_eq!(
+                cache.compile_count(),
+                1,
+                "panic-injected compile must run exactly once across all waiters"
+            );
+
+            // Poison-recovery: retrying the same key with a working compile
+            // must succeed, proving the slot was removed (not left poisoned
+            // or permanently occupied) after the panic.
+            cache
+                .get_or_compile(key, || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
+                })
+                .expect("retry after a panicked compile must succeed");
+            assert_eq!(
+                cache.compile_count(),
+                2,
+                "retry after panic recovery must actually recompile, not replay a poisoned entry"
+            );
+        }
+
         #[test]
         fn grammar_cache_key_is_invariant_to_object_property_order() {
             let v1: Value = serde_json::from_str(
@@ -4640,6 +4753,57 @@ mod imp {
                 "additionalProperties": false,
             });
             assert!(v0_validate_json(r#"{"n": 18446744073709551616}"#, &schema));
+        }
+
+        /// Round-2 review major finding 1: a valid UTF-16 surrogate pair
+        /// (the G-clef character, U+1D11E) spelled as its two `\uXXXX`
+        /// escape halves must validate under a string schema -- it is a
+        /// grammar-conforming strict completion, and rejecting it turned
+        /// into a false `validation_failed` 500 before this fix.
+        #[test]
+        fn v0_validate_json_accepts_surrogate_pair_under_string_schema() {
+            let schema = serde_json::json!({"type": "string"});
+            assert!(v0_validate_json(r#""\uD834\uDD1E""#, &schema));
+        }
+
+        /// Same surrogate pair, but as an object property value -- proves
+        /// the fix applies through `v0_validate_object`'s recursive
+        /// `v0_validate_at` call, not just the top-level string schema.
+        #[test]
+        fn v0_validate_json_accepts_surrogate_pair_as_object_property_value() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {"s": {"type": "string"}},
+                "required": ["s"],
+                "additionalProperties": false,
+            });
+            assert!(v0_validate_json(r#"{"s": "\uD834\uDD1E"}"#, &schema));
+        }
+
+        /// Grammar-parity: the compiled grammar admits any four-hex
+        /// `\uXXXX` escape independently of pairing (json_schema.rs
+        /// `escape_id` alternatives at ~1564), and its own
+        /// `string_accepts_legal_escapes` test (json_schema.rs ~2762)
+        /// explicitly accepts lone surrogate halves `\uD800` / `\uDC00`.
+        /// The validator must not be narrower than the grammar it guards,
+        /// so a lone (unpaired) surrogate escape must also validate here.
+        #[test]
+        fn v0_validate_json_accepts_lone_surrogate_escape_grammar_parity() {
+            let schema = serde_json::json!({"type": "string"});
+            assert!(v0_validate_json(r#""\uD834""#, &schema));
+            assert!(v0_validate_json(r#""\uDD1E""#, &schema));
+        }
+
+        /// Round-2 review major finding 1, second half: RFC 8259 §7
+        /// requires U+0000-U+001F to be escaped, and the compiled grammar
+        /// rejects them raw too (json_schema.rs
+        /// `string_rejects_raw_control_byte`). A literal BEL (0x07) byte
+        /// embedded unescaped in a string must fail validation.
+        #[test]
+        fn v0_validate_json_rejects_raw_control_char() {
+            let schema = serde_json::json!({"type": "string"});
+            let content = format!("\"{}\"", '\u{7}');
+            assert!(!v0_validate_json(&content, &schema));
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
