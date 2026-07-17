@@ -20434,10 +20434,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // Shape B: M=72,N=48,K=64 non-multiple of BM/BN — exercises the
             //   `gm<M`/`gn<N` boundary zero-pad guards in the tiled kernel.
             // Shape C: M=5,N=9,K=96 small odd M/N with a 3-block K depth.
-            // Shape D: M=16,N=32,K=1024 — representative production MLP
-            //   intermediate-dim depth (Qwen3.5's `hidden_size`/`intermediate_size`
-            //   K-depths are multiples of 1024), so the envelope below is not
-            //   just extrapolated from tiny shapes.
+            // Shape D: M=16,N=32,K=1024 — Qwen3.5-0.8B's dense gate/up
+            //   projection input depth (`hidden_size=1024`, dispatch uses
+            //   `K=hidden` — metal_qwen35.rs:5086), a production K-depth but
+            //   not the deepest Q3-eligible one.
+            // Shape E: M=16,N=1024,K=3584 — Qwen3.5-0.8B's down-projection
+            //   depth (`intermediate_size=3584`, dispatch uses
+            //   `K=intermediate` — metal_qwen35.rs:5112), 112 `BK=32`
+            //   iterations — the deepest Q3-eligible production MLP shape,
+            //   round-2 review finding 2.
             //
             // `max_abs_diff` is the same NaN-honest helper used by the Q4 twin
             // below (`gemm_q4_tiled_vs_naive_numeric_differential`) — a
@@ -20455,6 +20460,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 (72usize, 48usize, 64usize, 0xBBBB_u64),
                 (5usize, 9usize, 96usize, 0xCCCC_u64),
                 (16usize, 32usize, 1024usize, 0xEEEE_u64),
+                (16usize, 1024usize, 3584usize, 0xFEED_u64),
             ] {
                 let (qw_buf, packed) = make_q3_weight_ref(&device, seed, n, k);
                 let x = q3_test_activation(seed ^ 0xDEAD, m * k);
@@ -20505,15 +20511,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
 
             // Bound derived from the measured envelope above (see
-            // w3_fix_r1_report.md for the full table), not a hand-waved
-            // constant: the largest observed shape (M=16 N=32 K=1024,
-            // production intermediate-dim depth) measured max|gpu-ref| ~=
-            // 1.055e-2; 0.02 is ~1.9x that, absorbing run-to-run
-            // f16-staging/reduction-order jitter while still catching a real
-            // regression (e.g. the NaN and packed-high-plane mutation tests
-            // below, which corrupt the GPU-visible bytes and must fail this
-            // same bound).
-            const MEASURED_ENVELOPE_TOL: f32 = 0.02;
+            // w3_fix_r2_report.md for the full table), not a hand-waved
+            // constant: the largest observed shape (M=16 N=1024 K=3584, the
+            // Qwen3.5-0.8B down-projection depth — 112 `BK=32` iterations,
+            // round-2 review finding 2) measured max|gpu-ref| ~= 1.946e-2;
+            // 0.037 is ~1.9x that. The headroom covers cross-device variation
+            // (different Apple Silicon generations accumulate the f16
+            // X/W-staging + f32-reduction residual slightly differently) and
+            // future kernel-scheduling changes (e.g. a different tile
+            // traversal order), not run-to-run jitter — the seeds and
+            // dispatch are deterministic, so a rerun on the same host
+            // reproduces the same value, and this bound is not measuring
+            // that. It must still catch a real regression (e.g. the NaN and
+            // packed-high-plane mutation tests below, which corrupt the
+            // GPU-visible bytes and must fail this same bound).
+            const MEASURED_ENVELOPE_TOL: f32 = 0.037;
             for &(m, n, k, d) in &envelope {
                 assert!(
                     d < MEASURED_ENVELOPE_TOL,
@@ -20532,19 +20544,42 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// above: it proves the comparison mechanism itself is
         /// mutation-sensitive, the same way the pack/unpack mutation tests
         /// prove the kernel is.
+        ///
+        /// Round-2 review finding 1: `#[should_panic(expected = "is not
+        /// finite")]` could not distinguish "the Apple7 dispatch ran and the
+        /// NaN-honest comparison caught it" from "no Apple7 device, so this
+        /// branch panicked with an unrelated message that happened to also
+        /// contain the substring" — both read as green under
+        /// `should_panic(expected = ...)`. This test instead dispatches
+        /// unconditionally past the device gate, then wraps only the
+        /// comparison in `catch_unwind` and asserts on the caught panic's
+        /// message, so a panic from the wrong place (or no panic at all)
+        /// fails the test instead of silently passing it.
+        ///
+        /// Consequence: on a host with a Metal device but no Apple7 GPU
+        /// (e.g. GitHub's `macos-latest` paravirtual runner), this test
+        /// still returns early rather than failing — mirroring
+        /// `gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries` and
+        /// `gemm_q4_tiled_enabled_on_apple7_plus` above, and the reasoning
+        /// `e2e-parity.yml`'s MP2 injection gate documents: Apple7's
+        /// `simdgroup_matrix` requirement is real hardware, not something
+        /// `LATTICE_METAL_TEST_ENFORCE` can force on a paravirtual GPU. No CI
+        /// workflow currently selects this test by name (its module path
+        /// does not match any existing `--lib` filter), so
+        /// `LATTICE_METAL_TEST_ENFORCE` below only covers the device-absent
+        /// branch, consistent with every other Apple7-gated test in this file.
         #[test]
-        #[should_panic(expected = "is not finite")]
         fn gemm_q3_tiled_differential_fails_closed_on_nan_scale() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(device) = Device::system_default() else {
-                // No GPU available: nothing to corrupt or dispatch, so the
-                // `should_panic` expectation cannot be exercised. Panic with
-                // the same expected substring so this test is still honest
-                // about not having proven anything on this host, rather than
-                // vacuously "passing" via `return` under `should_panic`.
-                panic!("is not finite: no Metal device available to run this test");
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
             };
             if !device.supports_family(MTLGPUFamily::Apple7) {
-                panic!("is not finite: host GPU is not Apple7+, gemm_q3_tiled is unavailable");
+                return;
             }
             let _guard = gpu_test_lock();
             let (cfg, weights) = tiny_metal_qwen35_fixture();
@@ -20615,11 +20650,31 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // NaN also present on the reference side.
             let y_ref = gemm_q3_reference(&x, &packed, m, n, k);
 
-            let max_diff = max_abs_diff(y_gpu, &y_ref);
+            // Wrapped in `catch_unwind` (round-2 fix) rather than
+            // `#[should_panic]` on the whole test: everything above this
+            // point (the device/Apple7 gate, the real dispatch) has already
+            // run unconditionally, so a caught "is not finite" panic here
+            // proves the dispatch executed and the comparison caught the
+            // corruption — not that the test skipped before doing anything.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let max_diff = max_abs_diff(y_gpu, &y_ref);
+                assert!(
+                    max_diff.is_finite(),
+                    "max|gpu-ref| is not finite (max_diff={max_diff}) — NaN-scale mutation \
+                     correctly detected by the comparison"
+                );
+            }));
+            let payload = result.expect_err(
+                "expected the NaN-scale mutation to make the differential comparison panic",
+            );
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>");
             assert!(
-                max_diff.is_finite(),
-                "max|gpu-ref| is not finite (max_diff={max_diff}) — NaN-scale mutation \
-                 correctly detected by the comparison"
+                msg.contains("is not finite"),
+                "expected the caught panic message to contain \"is not finite\", got: {msg}"
             );
         }
 
