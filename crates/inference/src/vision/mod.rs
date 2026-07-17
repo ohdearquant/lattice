@@ -107,6 +107,12 @@ pub enum VisionError {
     },
     /// A configuration value is invalid (zero dimension, indivisible sizes, etc.).
     InvalidConfig(String),
+    /// The image's decoded pixel dimensions exceed the serving-side limit enforced before full
+    /// decode (ADR-069 S6 review round 1 blocker): compressed-byte clamps at the HTTP boundary
+    /// bound the encoded stream, not the pixels a small, highly-compressible image can decode
+    /// to. Distinct from `InvalidConfig` so callers (the serve layer) can map it to a dedicated
+    /// HTTP error code instead of the generic image-rejection one.
+    DimensionsExceeded(String),
     /// I/O error during weight loading.
     Io(std::io::Error),
 }
@@ -124,6 +130,7 @@ impl std::fmt::Display for VisionError {
                 "Vision shape mismatch ({context}): expected {expected}, got {actual}"
             ),
             Self::InvalidConfig(msg) => write!(f, "Vision invalid config: {msg}"),
+            Self::DimensionsExceeded(msg) => write!(f, "Vision image dimensions exceeded: {msg}"),
             Self::Io(e) => write!(f, "Vision I/O error: {e}"),
         }
     }

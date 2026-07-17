@@ -40,6 +40,22 @@ use std::io::Cursor;
 const QWEN35_IMAGE_MEAN: f32 = 0.5;
 const QWEN35_IMAGE_STD: f32 = 0.5;
 
+/// Maximum accepted image width/height in pixels, enforced by
+/// [`preprocess_qwen35_image`] before any pixel data is decoded (ADR-069 S6 review round 1
+/// blocker). Nothing in `VisionModelConfig` bounds this naturally: `num_position_embeddings`
+/// only sizes the learned position-embedding table, which [`build_pos_embed_and_rope_tables`]
+/// bilinearly *interpolates* to whatever patch grid the input image produces, so it places no
+/// ceiling on `GridThw::num_patches()`. Left unbounded, the serve layer's compressed-byte
+/// clamps (which bound the encoded stream, not decoded pixels) let a small, highly-compressible
+/// image decode to an arbitrarily large pixel grid, driving an unbounded `num_patches *
+/// patch_len` allocation below and unbounded O(n^2) full-attention work in
+/// `multihead_attention_full`. Chosen as a conservative serving ceiling rather than derived from
+/// the checkpoint: 2048x2048 is exactly `64 * (patch_size=16 * spatial_merge_size=2)` for the
+/// real 0.8B checkpoint's factor, i.e. a 128x128 = 16,384-patch grid pre-merge -- generous for
+/// real chat-image use, far below what would let one request monopolize the single serialized
+/// Metal worker.
+const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
+
 /// The temporal/height/width patch-grid shape for one image (`grid_thw` in
 /// the HF reference). `t` is always 1 for a still image (video is out of
 /// scope — ADR-069 Deferred list).
@@ -77,12 +93,49 @@ pub fn preprocess_qwen35_image(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
-    let reader = ImageReader::new(Cursor::new(image_bytes))
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION_PIXELS);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION_PIXELS);
+
+    // Cheap header-only dimension probe -- `into_dimensions()` parses just enough of the
+    // container (e.g. the PNG IHDR chunk) to report width/height, and with `limits` set both
+    // the PNG and JPEG decoders (the only formats this crate enables) enforce
+    // `max_image_width`/`max_image_height` at that same header-parse step, before any pixel
+    // data is read. Rejects an oversized image (ADR-069 S6 review round 1 blocker) without
+    // paying for full decode or the pixel-tensor allocation below.
+    let mut dim_reader = ImageReader::new(Cursor::new(image_bytes))
         .with_guessed_format()
         .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
-    let img: DynamicImage = reader
-        .decode()
-        .map_err(|e| VisionError::ImageDecode(format!("decode failed: {e}")))?;
+    dim_reader.limits(limits.clone());
+    match dim_reader.into_dimensions() {
+        Ok(_) => {}
+        Err(image::ImageError::Limits(e)) => {
+            return Err(VisionError::DimensionsExceeded(format!(
+                "image exceeds the {MAX_IMAGE_DIMENSION_PIXELS}x{MAX_IMAGE_DIMENSION_PIXELS}-pixel \
+                 serving limit: {e}"
+            )));
+        }
+        Err(e) => {
+            return Err(VisionError::ImageDecode(format!(
+                "header/dimension read failed: {e}"
+            )));
+        }
+    }
+
+    // Independent defense-in-depth: re-apply the same strict limits on the actual decode call
+    // (not just the header probe above), in case a future format-specific quirk lets dimensions
+    // slip past `into_dimensions()`'s check without also being caught here.
+    let mut reader = ImageReader::new(Cursor::new(image_bytes))
+        .with_guessed_format()
+        .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
+    reader.limits(limits);
+    let img: DynamicImage = reader.decode().map_err(|e| match e {
+        image::ImageError::Limits(e) => VisionError::DimensionsExceeded(format!(
+            "image exceeds the {MAX_IMAGE_DIMENSION_PIXELS}x{MAX_IMAGE_DIMENSION_PIXELS}-pixel \
+             serving limit: {e}"
+        )),
+        e => VisionError::ImageDecode(format!("decode failed: {e}")),
+    })?;
     let rgb = img.into_rgb8();
     let (width, height) = (rgb.width() as usize, rgb.height() as usize);
 
@@ -113,7 +166,16 @@ pub fn preprocess_qwen35_image(
     let temporal = cfg.temporal_patch_size;
     let patch_len = in_channels * temporal * patch_size * patch_size;
     let num_patches = grid.num_patches();
-    let mut out = vec![0.0f32; num_patches * patch_len];
+    // Defense in depth alongside the dimension guard above: checked arithmetic on the
+    // pixel-tensor allocation size itself, so a config/grid combination that somehow slips past
+    // the width/height limit still cannot drive an unchecked, attacker-influenced allocation.
+    let alloc_len = num_patches.checked_mul(patch_len).ok_or_else(|| {
+        VisionError::InvalidConfig(format!(
+            "image patch grid {grid:?} with patch_len={patch_len} overflows the pixel-tensor \
+             allocation size"
+        ))
+    })?;
+    let mut out = vec![0.0f32; alloc_len];
 
     let blocks_h = grid_h / merge;
     let blocks_w = grid_w / merge;
@@ -527,6 +589,61 @@ mod tests {
         img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
             .unwrap();
         buf
+    }
+
+    /// Builds an all-black RGB PNG at `w`x`h` -- highly compressible (a real-world encoder
+    /// collapses uniform rows to a few bytes each), so this fixture stays tiny on disk/wire
+    /// while still decoding to the full `w * h` pixel grid. Mirrors the external review's
+    /// concrete construction: a small, standards-conformant PNG whose *decoded* dimensions are
+    /// the actual attack surface, distinct from `make_test_png`'s gradient fill (which this
+    /// guard test does not need).
+    fn make_black_test_png(w: u32, h: u32) -> Vec<u8> {
+        use image::RgbImage;
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+        let img = RgbImage::new(w, h); // zero-initialized == solid black
+        let mut buf = Vec::new();
+        // Default compression leaves an all-black 4064x4064 fixture at ~245 KiB;
+        // Best gets it under the 64 KiB content-part clamp, which is the point
+        // of the construction (small wire size, huge decoded dimensions).
+        let encoder = PngEncoder::new_with_quality(
+            std::io::Cursor::new(&mut buf),
+            CompressionType::Best,
+            FilterType::Adaptive,
+        );
+        img.write_with_encoder(encoder).unwrap();
+        buf
+    }
+
+    /// ADR-069 S6 review round 1 blocker: a compressed-byte clamp at the HTTP boundary does not
+    /// bound decoded pixel dimensions. This reproduces the reviewer's concrete construction (an
+    /// all-black 4064x4064 RGB PNG, well under every byte clamp, 32-divisible so it would
+    /// otherwise pass the patch-alignment check too) and asserts `preprocess_qwen35_image`
+    /// rejects it with the dedicated `DimensionsExceeded` variant *before* ever reaching the
+    /// `num_patches * patch_len` pixel-tensor allocation or the ViT forward pass -- proven by
+    /// the fact that this test completes near-instantly rather than allocating/processing a
+    /// ~396 MB tensor for a 4064x4064 grid.
+    ///
+    /// Mutation-sensitive: temporarily commenting out the dimension-limit block in
+    /// `preprocess_qwen35_image` turns this from an instant `DimensionsExceeded` rejection into
+    /// either an `Ok` (full decode + huge allocation succeeds) or, at minimum, a decode that no
+    /// longer returns this error variant -- verified locally by reverting the guard and watching
+    /// this assertion fail, then restoring it (not committed).
+    #[test]
+    fn preprocess_rejects_oversized_decoded_dimensions_before_allocation() {
+        let cfg = tiny_cfg(); // factor = patch_size(2) * merge(2) = 4; 4064 % 4 == 0
+        let png = make_black_test_png(4064, 4064);
+        assert!(
+            png.len() < 65_536,
+            "fixture must itself be a realistic small-upload size (got {} bytes) -- the whole \
+             point is that byte-size clamps alone cannot catch this",
+            png.len()
+        );
+
+        let err = preprocess_qwen35_image(&png, &cfg).unwrap_err();
+        assert!(
+            matches!(err, VisionError::DimensionsExceeded(_)),
+            "expected DimensionsExceeded, got {err:?}"
+        );
     }
 
     #[test]

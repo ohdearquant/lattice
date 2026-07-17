@@ -55,6 +55,7 @@ use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
+use crate::vision::VisionError;
 use crate::vision::checkpoint::Qwen35VisionWeights;
 use crate::vision::multimodal::Qwen35VisionRequest;
 use crate::vision::qwen35_merger::qwen35_merger_forward;
@@ -430,15 +431,37 @@ fn build_vision_prompt_ids(
     ids
 }
 
+/// Non-[`WorkerFailure`] outcome of [`build_vision_request`]: cancellation observed between its
+/// expensive phases (decode/preprocess, ViT, merger) must not surface as an ordinary failure.
+/// [`run_worker_loop`]'s shared cancellation contract classifies mid-flight cancellation (after
+/// a job has already been dequeued and started) as an `Ok(GenerateOutput)` carrying
+/// `stop_reason: Some(StopReason::Interrupt)` -- exactly how the pre-existing text-generation
+/// path already reports a should-cancel observed mid-prefill/mid-decode -- never a
+/// `WorkerEvent::Failed`. Keeping this distinct from [`WorkerFailure`] at the type level means
+/// the call site cannot accidentally collapse the two the way the pre-fix code did (returning
+/// `WorkerFailure::Failed("cancelled before vision generation started")`, which classified a
+/// disconnected client the same as a genuine internal error).
+enum VisionBuildStop {
+    /// `should_cancel` observed `true` between two of `build_vision_request`'s phases; the
+    /// caller must synthesize an interrupted [`GenerateOutput`] instead of propagating this.
+    Cancelled,
+    Failure(WorkerFailure),
+}
+
 /// Build a [`Qwen35VisionRequest`] for `messages` (exactly one of which
 /// carries an image, at `image_message_index`) against `vision_weights`
 /// (ADR-069 S6): preprocess -> Metal ViT forward (S3b, transparently
 /// CPU-fallback per-GEMM when the Metal dispatch threshold isn't cleared --
 /// see `qwen35_vit_metal`'s module docs) -> merger -> the expanded token-id
-/// stream from [`build_vision_prompt_ids`]. Returns [`WorkerFailure::Rejected`]
-/// for a caller-fixable problem (bad image bytes, misaligned dimensions,
-/// missing checkpoint vision metadata) and [`WorkerFailure::Failed`] for an
-/// internal forward-pass error.
+/// stream from [`build_vision_prompt_ids`]. Returns [`VisionBuildStop::Failure`] wrapping
+/// [`WorkerFailure::Rejected`] for a caller-fixable problem (bad image bytes, oversized decoded
+/// dimensions, misaligned dimensions, missing checkpoint vision metadata),
+/// [`WorkerFailure::Failed`] for an internal forward-pass error, and
+/// [`VisionBuildStop::Cancelled`] (issue found in PR #1021 review round 1) if `should_cancel`
+/// observes the caller is gone at any point between decode/preprocess, ViT, and merger -- so a
+/// disconnected client stops paying for vision work at the earliest checkpoint instead of only
+/// after the full pass completes.
+#[allow(clippy::too_many_arguments)]
 fn build_vision_request(
     vision_weights: &Qwen35VisionWeights,
     cfg: &crate::model::qwen35_config::Qwen35Config,
@@ -446,19 +469,20 @@ fn build_vision_request(
     messages: &[ChatMessage],
     image_message_index: usize,
     image_bytes: &[u8],
-) -> Result<Qwen35VisionRequest, WorkerFailure> {
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Result<Qwen35VisionRequest, VisionBuildStop> {
     let bad_request = |message: String| {
-        WorkerFailure::Rejected(ApiError::BadRequest {
+        VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
             message,
             code: "invalid_image",
-        })
+        }))
     };
 
     let vision_cfg = cfg.vision_config.as_ref().ok_or_else(|| {
-        WorkerFailure::Rejected(ApiError::BadRequest {
+        VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
             message: "this checkpoint has no vision_config; image input is unsupported".into(),
             code: "vision_unsupported",
-        })
+        }))
     })?;
     let image_token_id = cfg
         .image_token_id
@@ -470,13 +494,46 @@ fn build_vision_request(
         .vision_end_token_id
         .ok_or_else(|| bad_request("checkpoint has no vision_end_token_id".into()))?;
 
-    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg)
-        .map_err(|e| bad_request(format!("image preprocessing failed: {e}")))?;
+    // Checked before any decode/preprocess work: a client that disconnected between dequeue and
+    // here must not pay for the (potentially large) image decode below (PR #1021 review round 1
+    // major finding).
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
+    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg).map_err(|e| {
+        // The dimension guard (ADR-069 S6 review round 1 blocker) gets its own HTTP code,
+        // distinct from ordinary image-rejection reasons, so a caller can tell "this image is
+        // fundamentally too large to serve" apart from "this image/data URI was malformed".
+        let code = if matches!(e, VisionError::DimensionsExceeded(_)) {
+            "image_dimensions_exceeded"
+        } else {
+            "invalid_image"
+        };
+        VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: format!("image preprocessing failed: {e}"),
+            code,
+        }))
+    })?;
 
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
     let pre_merger = qwen35_vit_forward_metal(vision_weights, vision_cfg, &pixel_values, grid)
-        .map_err(|e| WorkerFailure::Failed(format!("ViT forward failed: {e}")))?;
+        .map_err(|e| {
+            VisionBuildStop::Failure(WorkerFailure::Failed(format!("ViT forward failed: {e}")))
+        })?;
+
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
     let post_merger = qwen35_merger_forward(&vision_weights.merger, vision_cfg, &pre_merger)
-        .map_err(|e| WorkerFailure::Failed(format!("merger forward failed: {e}")))?;
+        .map_err(|e| {
+            VisionBuildStop::Failure(WorkerFailure::Failed(format!("merger forward failed: {e}")))
+        })?;
+
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
 
     let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
     if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
@@ -505,6 +562,26 @@ fn build_vision_request(
         spatial_merge_size: vision_cfg.spatial_merge_size,
         decoder_hidden_size: cfg.hidden_size,
     })
+}
+
+/// The `GenerateOutput` [`run_worker_loop`]'s shared cancellation contract requires for a job
+/// that started (was dequeued) but whose client disconnected before any tokens were produced --
+/// mirrors the identically-shaped literal the text-generation path returns from inside
+/// `MetalQwen35State::generate_streaming_with_prefix_cache_and_cancel` when `should_cancel` is
+/// observed `true` before prefill. `prompt_tokens: 0` here (unlike that text-path literal, which
+/// already knows the tokenized prompt length at that point) because the vision path can be
+/// interrupted before `build_vision_request` ever tokenizes anything; this is a best-effort
+/// terminal event, not a usage-accounting one.
+fn vision_cancelled_output() -> GenerateOutput {
+    GenerateOutput {
+        text: String::new(),
+        token_ids: vec![],
+        prompt_tokens: 0,
+        generated_tokens: 0,
+        stopped: false,
+        stop_reason: Some(crate::stop_reason::StopReason::Interrupt),
+        token_logprobs: vec![],
+    }
 }
 
 /// Dequeue -> cancel-check -> generate -> reply, serialized on whatever
@@ -672,19 +749,34 @@ impl MetalWorker {
                                 code: "vision_unsupported",
                             }));
                         };
+                        // Checked before entering `build_vision_request` at all (PR #1021
+                        // review round 1 major finding): the prior code only checked
+                        // `should_cancel` after the full decode/preprocess/ViT/merger pass
+                        // had already run, so a disconnected client still paid for the
+                        // entire vision prefill.
+                        if should_cancel() {
+                            return Ok(vision_cancelled_output());
+                        }
                         let image_bytes = &messages[image_message_index]
                             .image
                             .as_ref()
                             .expect("image_message_index selected only messages with Some(image)")
                             .bytes;
-                        let request = build_vision_request(
+                        let request = match build_vision_request(
                             vision_weights,
                             &state.engine.config,
                             &tokenizer,
                             messages,
                             image_message_index,
                             image_bytes,
-                        )?;
+                            &mut *should_cancel,
+                        ) {
+                            Ok(request) => request,
+                            Err(VisionBuildStop::Cancelled) => {
+                                return Ok(vision_cancelled_output());
+                            }
+                            Err(VisionBuildStop::Failure(failure)) => return Err(failure),
+                        };
                         check_prompt_fits_window(
                             meta.context_window_policy,
                             meta.model_max_context,
@@ -693,9 +785,7 @@ impl MetalWorker {
                         )
                         .map_err(WorkerFailure::Rejected)?;
                         if should_cancel() {
-                            return Err(WorkerFailure::Failed(
-                                "cancelled before vision generation started".into(),
-                            ));
+                            return Ok(vision_cancelled_output());
                         }
                         // `generate_multimodal_vision` is a single blocking
                         // call (no incremental `on_token` hook exists on
@@ -1054,6 +1144,163 @@ mod tests {
                 token_logprobs: vec![],
             })
         }
+    }
+
+    // ── PR #1021 review round 1 major finding: `build_vision_request`
+    //    cancellation ordering ─────────────────────────────────────────────
+
+    fn tiny_vision_cfg() -> crate::model::qwen35_config::VisionModelConfig {
+        crate::model::qwen35_config::VisionModelConfig {
+            depth: 1,
+            hidden_size: 8,
+            num_heads: 2,
+            patch_size: 2,
+            spatial_merge_size: 2,
+            out_hidden_size: 8,
+            temporal_patch_size: 1,
+            num_position_embeddings: 16,
+            in_channels: 1,
+            deepstack_visual_indexes: vec![],
+        }
+    }
+
+    /// Deliberately empty/zero-length weight vectors: both cancellation tests below must never
+    /// touch these (the whole point is that `should_cancel` short-circuits before the ViT/merger
+    /// forward passes that would read them), so their contents don't matter.
+    fn empty_vision_weights() -> Qwen35VisionWeights {
+        use crate::vision::checkpoint::VisualMergerWeights;
+        Qwen35VisionWeights {
+            patch_embed_weight: vec![],
+            patch_embed_weight_shape: vec![],
+            patch_embed_bias: vec![],
+            pos_embed: vec![],
+            blocks: vec![],
+            merger: VisualMergerWeights {
+                fc1_weight: vec![],
+                fc1_bias: vec![],
+                fc2_weight: vec![],
+                fc2_bias: vec![],
+                norm_weight: vec![],
+                norm_bias: vec![],
+            },
+        }
+    }
+
+    fn vision_test_qwen35_config() -> crate::model::qwen35_config::Qwen35Config {
+        crate::model::qwen35_config::Qwen35Config {
+            vision_config: Some(tiny_vision_cfg()),
+            image_token_id: Some(100),
+            vision_start_token_id: Some(101),
+            vision_end_token_id: Some(102),
+            hidden_size: 8,
+            ..Default::default()
+        }
+    }
+
+    fn minimal_tokenizer() -> BpeTokenizer {
+        // The constructor requires a dense id range, so a single-entry vocab is
+        // the smallest valid tokenizer. These tests cancel before any
+        // tokenization happens; the tokenizer is never actually exercised.
+        let vocab = std::collections::HashMap::from([("a".to_string(), 0u32)]);
+        BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("single-entry vocab must construct a tokenizer")
+    }
+
+    fn make_black_test_png(w: u32, h: u32) -> Vec<u8> {
+        use image::RgbImage;
+        let img = RgbImage::new(w, h);
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    /// PR #1021 review round 1 major finding: the pre-fix code only checked `should_cancel`
+    /// *after* `build_vision_request` had already run the full decode/preprocess/ViT/merger
+    /// pass, so a disconnected client still paid for the entire vision prefill. Proves the fix:
+    /// with `should_cancel` already `true`, `build_vision_request` must stop before touching the
+    /// (deliberately invalid) image bytes at all -- if it decoded first, this would fail with an
+    /// image-decode error instead of `Cancelled`, and `should_cancel` would be observed more than
+    /// once.
+    ///
+    /// Mutation-sensitive: commenting out the first `if should_cancel() { return
+    /// Err(VisionBuildStop::Cancelled); }` in `build_vision_request` turns this from an
+    /// instant `Cancelled` into an `invalid_image` rejection from the garbage bytes reaching
+    /// `preprocess_qwen35_image` -- verified locally by reverting the check and watching this
+    /// assertion fail, then restoring it (not committed).
+    #[test]
+    fn build_vision_request_stops_before_any_work_when_already_cancelled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let mut should_cancel = move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        let vision_weights = empty_vision_weights();
+        let cfg = vision_test_qwen35_config();
+        let tokenizer = minimal_tokenizer();
+        let messages = vec![ChatMessage::user("hi")];
+        let garbage_bytes = b"not an image";
+
+        let result = build_vision_request(
+            &vision_weights,
+            &cfg,
+            &tokenizer,
+            &messages,
+            0,
+            garbage_bytes,
+            &mut should_cancel,
+        );
+
+        assert!(
+            matches!(result, Err(VisionBuildStop::Cancelled)),
+            "expected Cancelled before any decode/preprocess work"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should_cancel must be checked exactly once, before any other work"
+        );
+    }
+
+    /// Defense-in-depth checkpoint: cancellation observed right after decode/preprocess
+    /// completes must stop `build_vision_request` before it ever calls the Metal-only
+    /// `qwen35_vit_forward_metal` (unreachable in this non-GPU gate) -- proven by the exact
+    /// `should_cancel` call count (one before preprocess, one immediately after) rather than by
+    /// exercising the GPU path itself.
+    #[test]
+    fn build_vision_request_stops_after_preprocess_before_vit_when_cancelled_mid_flight() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let mut should_cancel = move || calls2.fetch_add(1, Ordering::SeqCst) >= 1;
+
+        let vision_weights = empty_vision_weights();
+        let cfg = vision_test_qwen35_config();
+        let tokenizer = minimal_tokenizer();
+        let messages = vec![ChatMessage::user("hi")];
+        let png = make_black_test_png(8, 8); // 8x8, aligned to tiny_vision_cfg's factor=4
+
+        let result = build_vision_request(
+            &vision_weights,
+            &cfg,
+            &tokenizer,
+            &messages,
+            0,
+            &png,
+            &mut should_cancel,
+        );
+
+        assert!(
+            matches!(result, Err(VisionBuildStop::Cancelled)),
+            "expected Cancelled between preprocess and the ViT forward pass"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "should_cancel must be checked once before preprocess and once after -- proving the \
+             Metal ViT forward was never entered"
+        );
     }
 
     /// Builds a `WorkerJob` plus the receiver its worker replies on and the
