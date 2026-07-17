@@ -69,6 +69,7 @@ pub mod gbnf;
 pub mod json_schema;
 pub mod pda;
 pub mod spec;
+pub mod trie;
 pub mod vocab_partition;
 
 // Re-exports for the primary public API.
