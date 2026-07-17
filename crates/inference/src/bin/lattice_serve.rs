@@ -93,7 +93,8 @@ mod imp {
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use serde::Deserialize;
     use serde_json::{Value, json};
-    use std::sync::Arc;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     /// Only used by the test module's raw job-channel helpers
     /// (`mpsc::UnboundedReceiver<WorkerJob>` etc. -- see
@@ -176,6 +177,11 @@ mod imp {
         /// clone per compile (no cross-request grammar cache in v0; see the
         /// structured-output v0 design note's stage split).
         vocab_bytes: Arc<Vec<Vec<u8>>>,
+        /// Bounded (32-entry, LRU) single-flight cache of compiled
+        /// `GrammarEngine`s, keyed by canonicalized admitted schema JSON
+        /// (structured-output v0 design note, stage 2). `Arc`-shared so
+        /// every clone of `AppState` (one per request) hits the same cache.
+        grammar_cache: Arc<GrammarCache>,
     }
 
     // ─── OpenAI request shapes ───────────────────────────────────────────────
@@ -558,6 +564,195 @@ mod imp {
         }
     }
 
+    /// Serializes `schema` (already admitted by `admit_v0_schema`) into a
+    /// key that is identical for two schemas differing only in object
+    /// property order. Deliberately does NOT rely on `serde_json::Value`'s
+    /// own `Map` ordering: whether that `Map` is `BTreeMap`-backed (sorted)
+    /// or insertion-order-backed depends on whether the `preserve_order`
+    /// Cargo feature is unified into the build anywhere in the dependency
+    /// graph -- verified empirically for the current lockfile (no crate
+    /// enables it, so `serde_json::to_string` already sorts keys), but that
+    /// is a whole-workspace build property that a future unrelated
+    /// dependency bump could silently flip. This walks the value itself and
+    /// sorts object keys explicitly, so the cache key's determinism does not
+    /// depend on that build-wide feature-unification detail.
+    fn canonical_schema_key(schema: &Value) -> String {
+        fn write_canonical(v: &Value, out: &mut String) {
+            match v {
+                Value::Null => out.push_str("null"),
+                Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                Value::Number(n) => out.push_str(&n.to_string()),
+                Value::String(s) => {
+                    out.push_str(&serde_json::to_string(s).unwrap_or_default());
+                }
+                Value::Array(items) => {
+                    out.push('[');
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        write_canonical(item, out);
+                    }
+                    out.push(']');
+                }
+                Value::Object(map) => {
+                    let mut keys: Vec<&String> = map.keys().collect();
+                    keys.sort();
+                    out.push('{');
+                    for (i, k) in keys.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                        out.push(':');
+                        write_canonical(&map[*k], out);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        let mut out = String::new();
+        write_canonical(schema, &mut out);
+        out
+    }
+
+    /// Stage 2 design note: shipped default capacity for the LRU compiled-
+    /// grammar cache.
+    const GRAMMAR_CACHE_CAPACITY: usize = 32;
+
+    /// The state shared by a single in-flight compile: waiters block on
+    /// `cv` until `result` is populated by the one thread that actually
+    /// calls the compile closure (structured-output v0 design note,
+    /// stage-2 single-flight requirement).
+    struct CompileSlot {
+        result: Mutex<Option<Result<Arc<GrammarEngine>, String>>>,
+        cv: Condvar,
+    }
+
+    struct GrammarCacheInner {
+        capacity: usize,
+        /// Compiled, ready-to-serve entries. Recency order tracked in
+        /// `order` (front = least-recently-used, back = most-recently-used);
+        /// `ready` itself has no ordering, so eviction always consults
+        /// `order`, never `ready`'s iteration order.
+        ready: HashMap<String, Arc<GrammarEngine>>,
+        order: VecDeque<String>,
+        /// Keys currently being compiled by exactly one thread; every other
+        /// concurrent request for the same key waits on the listed slot
+        /// instead of starting a second, redundant compile.
+        compiling: HashMap<String, Arc<CompileSlot>>,
+    }
+
+    /// Bounded LRU cache of compiled `GrammarEngine`s keyed by
+    /// `canonical_schema_key`, with single-flight compilation (structured-
+    /// output v0 design note §"Schema-to-grammar compilation and cache
+    /// placement"). Only successfully admitted-and-compiled schemas are
+    /// cached -- a rejected or over-budget schema is never inserted, so a
+    /// later, corrected request for the same key compiles fresh rather than
+    /// replaying a cached failure.
+    struct GrammarCache {
+        inner: Mutex<GrammarCacheInner>,
+        /// Count of compile closures actually executed (as opposed to
+        /// served from cache or a single-flight wait). Test-only signal for
+        /// asserting single-flight collapses N concurrent identical
+        /// requests into exactly 1 compile; harmless to keep in production
+        /// as a cheap counter.
+        compile_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GrammarCache {
+        fn new(capacity: usize) -> Self {
+            Self {
+                inner: Mutex::new(GrammarCacheInner {
+                    capacity,
+                    ready: HashMap::new(),
+                    order: VecDeque::new(),
+                    compiling: HashMap::new(),
+                }),
+                compile_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        #[cfg(test)]
+        fn compile_count(&self) -> usize {
+            self.compile_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Returns the cached engine for `key`, compiling it via `compile`
+        /// if absent. Concurrent callers with the same `key` share one
+        /// compile: all but the first block on that first call's result.
+        fn get_or_compile(
+            &self,
+            key: String,
+            compile: impl FnOnce() -> Result<GrammarEngine, String>,
+        ) -> Result<Arc<GrammarEngine>, String> {
+            enum Action {
+                Hit(Arc<GrammarEngine>),
+                Wait(Arc<CompileSlot>),
+                Compile,
+            }
+            let action = {
+                let mut inner = self.inner.lock().expect("grammar cache mutex poisoned");
+                if let Some(engine) = inner.ready.get(&key).cloned() {
+                    if let Some(pos) = inner.order.iter().position(|k| k == &key) {
+                        inner.order.remove(pos);
+                    }
+                    inner.order.push_back(key.clone());
+                    Action::Hit(engine)
+                } else if let Some(slot) = inner.compiling.get(&key).cloned() {
+                    Action::Wait(slot)
+                } else {
+                    let slot = Arc::new(CompileSlot {
+                        result: Mutex::new(None),
+                        cv: Condvar::new(),
+                    });
+                    inner.compiling.insert(key.clone(), slot);
+                    Action::Compile
+                }
+            };
+            match action {
+                Action::Hit(engine) => Ok(engine),
+                Action::Wait(slot) => {
+                    let guard = slot.result.lock().expect("compile slot mutex poisoned");
+                    let guard = slot
+                        .cv
+                        .wait_while(guard, |r| r.is_none())
+                        .expect("compile slot mutex poisoned");
+                    guard.clone().expect("compile slot signaled with no result")
+                }
+                Action::Compile => {
+                    self.compile_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let result = compile().map(Arc::new);
+                    {
+                        let mut inner = self.inner.lock().expect("grammar cache mutex poisoned");
+                        let slot = inner
+                            .compiling
+                            .remove(&key)
+                            .expect("this thread inserted its own compiling slot");
+                        if let Ok(engine) = &result {
+                            inner.ready.insert(key.clone(), Arc::clone(engine));
+                            inner.order.push_back(key.clone());
+                            while inner.ready.len() > inner.capacity {
+                                if let Some(lru_key) = inner.order.pop_front() {
+                                    inner.ready.remove(&lru_key);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        drop(inner);
+                        let mut slot_result =
+                            slot.result.lock().expect("compile slot mutex poisoned");
+                        *slot_result = Some(result.clone());
+                        slot.cv.notify_all();
+                    }
+                    result
+                }
+            }
+        }
+    }
+
     /// A structured (`response_format.json_schema`, `strict: true`) request,
     /// admitted and compiled before any worker job is submitted.
     struct StructuredRequest {
@@ -574,6 +769,7 @@ mod imp {
     fn admit_structured_request(
         req: &ChatReq,
         vocab_bytes: &Arc<Vec<Vec<u8>>>,
+        grammar_cache: &Arc<GrammarCache>,
     ) -> Result<Option<StructuredRequest>, RequestError> {
         let Some(fmt) = &req.response_format else {
             return Ok(None);
@@ -631,26 +827,33 @@ mod imp {
             ));
         }
         // Compile before enqueueing (design note §"Schema-to-grammar
-        // compilation and cache placement"): no cross-request cache in v0
-        // (stage 2+), so this clones the vocabulary once per request --
-        // acceptable for the admission+wiring slice, not for throughput.
-        let spec = GrammarSpec::JsonSchema(schema.clone());
-        let engine = GrammarEngine::new(&spec, (**vocab_bytes).clone()).map_err(|e| {
-            RequestError::bad_request(
-                format!("schema failed to compile: {e}"),
-                "unsupported_strict_schema",
-            )
-        })?;
-        if engine.exceeds_state_budget() {
-            return Err(RequestError::bad_request(
-                "schema exceeds the strict-output complexity budget (256 precomputed grammar \
-                 states); v0 never falls back to the full-vocabulary simulation path",
-                "unsupported_strict_schema",
-            ));
-        }
+        // compilation and cache placement"), via the bounded single-flight
+        // cache (stage 2): a schema already compiled by an earlier request
+        // is served without touching the vocabulary clone or the compiler
+        // at all; a schema currently being compiled by a concurrent request
+        // is waited on instead of independently recompiled.
+        let key = canonical_schema_key(schema);
+        let schema_for_compile = schema.clone();
+        let vocab_bytes = Arc::clone(vocab_bytes);
+        let engine = grammar_cache
+            .get_or_compile(key, move || {
+                let spec = GrammarSpec::JsonSchema(schema_for_compile);
+                let engine = GrammarEngine::new(&spec, (*vocab_bytes).clone())
+                    .map_err(|e| format!("schema failed to compile: {e}"))?;
+                if engine.exceeds_state_budget() {
+                    return Err(
+                        "schema exceeds the strict-output complexity budget (256 precomputed \
+                         grammar states); v0 never falls back to the full-vocabulary simulation \
+                         path"
+                            .to_string(),
+                    );
+                }
+                Ok(engine)
+            })
+            .map_err(|message| RequestError::bad_request(message, "unsupported_strict_schema"))?;
         Ok(Some(StructuredRequest {
             schema: schema.clone(),
-            engine: Arc::new(engine),
+            engine,
         }))
     }
 
@@ -1577,7 +1780,7 @@ mod imp {
         // `Ok(None)` for an ordinary text request; a schema/streaming
         // problem here always surfaces as a 4xx, never a best-effort
         // fallback to unconstrained generation.
-        let structured = match admit_structured_request(&req, &s.vocab_bytes) {
+        let structured = match admit_structured_request(&req, &s.vocab_bytes, &s.grammar_cache) {
             Ok(structured) => structured,
             Err(err) => {
                 emit_serve_event(
@@ -2494,9 +2697,14 @@ mod imp {
         // Reloads the tokenizer and `config.json` a second time -- the
         // worker thread's `load_model` (above) already loaded both once,
         // inside a closure this async-setup code cannot reach across the
-        // thread boundary. Accepted, documented duplication for the v0
-        // admission+wiring slice; sharing a single load is stage-2 cache-
-        // placement work, out of this stage's scope.
+        // thread boundary. Stage 2 (the `GrammarCache` below) does NOT
+        // remove this duplication: the underlying obstacle is the `!Send`
+        // worker closure boundary, not the lack of a compile cache -- the
+        // cache only avoids re-cloning `vocab_bytes` into `GrammarEngine`
+        // on a cache HIT, it does not change where the first, authoritative
+        // tokenizer/config load happens. Removing the second load would
+        // require restructuring `load_model`'s ownership across that
+        // thread boundary, out of stage 2's cache-placement scope.
         let vocab_bytes: Arc<Vec<Vec<u8>>> = {
             let tokenizer_for_vocab = BpeTokenizer::from_tokenizer_json(&tokenizer_path_for_vocab)
                 .map_err(|e| {
@@ -2523,6 +2731,7 @@ mod imp {
             max_pending,
             metrics: Arc::new(ServeMetrics::default()),
             vocab_bytes,
+            grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2613,6 +2822,7 @@ mod imp {
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 }
             }
             let (jobs, _rx) = test_client_and_jobs();
@@ -2890,6 +3100,7 @@ mod imp {
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: Arc::new(vec![]),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             }
         }
 
@@ -3224,6 +3435,7 @@ mod imp {
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), body).await;
@@ -3276,6 +3488,7 @@ mod imp {
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), body).await;
@@ -3324,6 +3537,7 @@ mod imp {
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), body).await;
@@ -3377,12 +3591,201 @@ mod imp {
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(code, "validation_failed");
+        }
+
+        // ── GrammarCache (stage 2: LRU + single-flight) ─────────────────────
+
+        const SCHEMA_CACHE_TEST_BOOL: &str = r#"{"type":"boolean"}"#;
+        const SCHEMA_CACHE_TEST_NULL: &str = r#"{"type":"null"}"#;
+        const SCHEMA_CACHE_TEST_EMPTY_OBJECT: &str =
+            r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#;
+
+        /// A vocabulary sized only for the tiny literal schemas above --
+        /// same rationale as `route_test_vocab`: a wide vocabulary combined
+        /// with these schemas' few reachable states is irrelevant work, not
+        /// a more faithful test.
+        fn cache_test_vocab() -> Arc<Vec<Vec<u8>>> {
+            Arc::new(
+                ["true", "false", "null", "{", "}"]
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect(),
+            )
+        }
+
+        fn compile_schema_for_cache_test(schema_json: &str) -> Result<GrammarEngine, String> {
+            let schema: Value = serde_json::from_str(schema_json).expect("test schema must parse");
+            let spec = GrammarSpec::JsonSchema(schema);
+            GrammarEngine::new(&spec, (*cache_test_vocab()).clone())
+                .map_err(|e| format!("test schema failed to compile: {e}"))
+        }
+
+        #[test]
+        fn grammar_cache_hit_returns_same_engine_without_recompiling() {
+            let cache = GrammarCache::new(GRAMMAR_CACHE_CAPACITY);
+            let key = canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap());
+            let first = cache
+                .get_or_compile(key.clone(), || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_BOOL)
+                })
+                .expect("first compile must succeed");
+            let second = cache
+                .get_or_compile(key, || {
+                    panic!("cache hit must not invoke the compile closure again")
+                })
+                .expect("cache hit must succeed");
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "cache hit must return the exact same Arc"
+            );
+            assert_eq!(cache.compile_count(), 1);
+        }
+
+        #[test]
+        fn grammar_cache_evicts_least_recently_used_at_capacity() {
+            let cache = GrammarCache::new(2);
+            let key_a =
+                canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap());
+            let key_b =
+                canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_NULL).unwrap());
+            let key_c = canonical_schema_key(
+                &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
+            );
+
+            cache
+                .get_or_compile(key_a.clone(), || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_BOOL)
+                })
+                .unwrap();
+            cache
+                .get_or_compile(key_b.clone(), || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_NULL)
+                })
+                .unwrap();
+            cache
+                .get_or_compile(key_c, || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
+                })
+                .unwrap();
+            assert_eq!(
+                cache.compile_count(),
+                3,
+                "three distinct schemas must each compile exactly once"
+            );
+
+            // `a` was the least-recently-used entry when `c` was inserted
+            // into a capacity-2 cache, so `b` must still be cached.
+            cache
+                .get_or_compile(key_b, || {
+                    panic!("b must still be cached: a, not b, was the LRU entry evicted by c")
+                })
+                .unwrap();
+            assert_eq!(cache.compile_count(), 3);
+
+            // `a` was evicted, so requesting it again must recompile.
+            cache
+                .get_or_compile(key_a, || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_BOOL)
+                })
+                .unwrap();
+            assert_eq!(
+                cache.compile_count(),
+                4,
+                "evicted key must recompile on next request"
+            );
+        }
+
+        #[test]
+        fn grammar_cache_single_flight_collapses_concurrent_identical_requests() {
+            let cache = Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY));
+            let key = canonical_schema_key(
+                &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
+            );
+            const N: usize = 8;
+            let barrier = Arc::new(std::sync::Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let cache = Arc::clone(&cache);
+                    let key = key.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        cache
+                            .get_or_compile(key, || {
+                                std::thread::sleep(std::time::Duration::from_millis(30));
+                                compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
+                            })
+                            .expect("compile must succeed")
+                    })
+                })
+                .collect();
+            let engines: Vec<Arc<GrammarEngine>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                cache.compile_count(),
+                1,
+                "{N} concurrent identical requests must collapse into exactly 1 compile"
+            );
+            for engine in &engines[1..] {
+                assert!(
+                    Arc::ptr_eq(&engines[0], engine),
+                    "every waiter must observe the same compiled engine"
+                );
+            }
+        }
+
+        #[test]
+        fn grammar_cache_key_is_invariant_to_object_property_order() {
+            let v1: Value = serde_json::from_str(
+                r#"{"type":"object","properties":{"a":{"type":"boolean"},"b":{"type":"null"}},"required":["a","b"],"additionalProperties":false}"#,
+            )
+            .unwrap();
+            let v2: Value = serde_json::from_str(
+                r#"{"additionalProperties":false,"required":["a","b"],"properties":{"b":{"type":"null"},"a":{"type":"boolean"}},"type":"object"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                canonical_schema_key(&v1),
+                canonical_schema_key(&v2),
+                "reordering object keys (including nested 'properties') must not change the cache key"
+            );
+
+            let different: Value = serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap();
+            assert_ne!(
+                canonical_schema_key(&v1),
+                canonical_schema_key(&different),
+                "structurally different schemas must have different cache keys"
+            );
+        }
+
+        #[test]
+        fn grammar_cache_hits_across_reordered_but_equivalent_top_level_keys() {
+            let cache = GrammarCache::new(GRAMMAR_CACHE_CAPACITY);
+            const EMPTY_OBJ_REORDERED: &str =
+                r#"{"additionalProperties":false,"required":[],"properties":{},"type":"object"}"#;
+            let v1: Value = serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap();
+            let v2: Value = serde_json::from_str(EMPTY_OBJ_REORDERED).unwrap();
+            assert_eq!(canonical_schema_key(&v1), canonical_schema_key(&v2));
+
+            let first = cache
+                .get_or_compile(canonical_schema_key(&v1), || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
+                })
+                .expect("v1 must compile");
+            let second = cache
+                .get_or_compile(canonical_schema_key(&v2), || {
+                    panic!("v2's canonical key must hit the entry compiled for v1")
+                })
+                .expect("v2 must hit cache");
+            assert!(Arc::ptr_eq(&first, &second));
+            assert_eq!(cache.compile_count(), 1);
         }
 
         // ── admit_v0_schema: golden accept per construct ────────────────────
@@ -3701,6 +4104,7 @@ mod imp {
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: Arc::new(vec![]),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             (state, jobs_rx)
         }
@@ -4137,6 +4541,7 @@ mod imp {
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 }
             }
 
@@ -4242,6 +4647,7 @@ mod imp {
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 };
                 (state, unblock_tx, started_rx)
             }
@@ -4478,6 +4884,7 @@ mod imp {
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 }
             }
 
@@ -4671,6 +5078,7 @@ mod imp {
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 };
                 let body = Body::from(
                     r#"{"messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#
