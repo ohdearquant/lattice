@@ -3752,6 +3752,7 @@ mod imp {
         /// even for a schema this small -- a real tokenizer's vocabulary is
         /// large but mostly irrelevant to any one schema's few reachable
         /// states, which a literal-token synthetic vocab does not model.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn route_test_vocab() -> Arc<Vec<Vec<u8>>> {
             Arc::new(
                 ["{", "}", "\"", ":", "ok", "true", "false", ","]
@@ -3768,8 +3769,10 @@ mod imp {
         /// to `V0_OBJECT_SCHEMA`, which is used by tests that stop at pure
         /// schema-shape validation (`admit_v0_schema`) or reject before
         /// compilation is ever attempted.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         const V0_ROUTE_SCHEMA: &str = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
 
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn structured_body(schema: &str, strict: Option<&str>, stream: Option<bool>) -> String {
             let strict_field = match strict {
                 Some(raw) => format!(r#","strict":{raw}"#),
