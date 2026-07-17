@@ -501,10 +501,23 @@ pub fn save_q3_file(path: &std::path::Path, tensor: &Q3Tensor) -> std::io::Resul
 /// Returns [`InferenceError::InvalidInput`] if `tensor_name` does not name an
 /// MLP `gate_proj` / `up_proj` / `down_proj` / fused `gate_up_proj` tensor.
 pub fn validate_q3_mlp_role(tensor_name: &str) -> Result<(), InferenceError> {
-    let is_mlp_proj = tensor_name.contains(".mlp.gate_proj")
-        || tensor_name.contains(".mlp.up_proj")
-        || tensor_name.contains(".mlp.down_proj")
-        || tensor_name.contains(".mlp.gate_up_proj");
+    const MLP_PROJ_SUFFIXES: [&str; 4] = [
+        ".mlp.gate_proj",
+        ".mlp.up_proj",
+        ".mlp.down_proj",
+        ".mlp.gate_up_proj",
+    ];
+    // Real checkpoints (safetensors index + the Q4 loader's call sites, e.g.
+    // `{prefix}.mlp.gate_proj.weight`) always carry a terminal `.weight`; a
+    // name without it — a LoRA adapter (`...gate_proj.lora_A.weight`), a
+    // renamed backup (`...up_proj_backup`), or a trailing-suffix typo
+    // (`...down_proj.weight.extra`) — must fail closed rather than match on
+    // substring alone.
+    let is_mlp_proj = tensor_name.strip_suffix(".weight").is_some_and(|stem| {
+        MLP_PROJ_SUFFIXES
+            .iter()
+            .any(|suffix| stem.ends_with(suffix))
+    });
     if is_mlp_proj {
         Ok(())
     } else {
@@ -1065,6 +1078,44 @@ mod tests {
             assert!(
                 validate_q3_mlp_role(name).is_err(),
                 "expected '{name}' to be rejected as outside the Q3 MLP role set"
+            );
+        }
+    }
+
+    #[test]
+    fn mlp_role_rejects_near_miss_suffixes() {
+        // Exact-suffix contract: `.contains()` on the role substring would
+        // wrongly accept these — a LoRA adapter branch, a renamed sibling
+        // tensor, and a trailing extra suffix after `.weight`. Table-driven
+        // per the round-1 review (codex_1014_r1_verdict.md finding 1).
+        for name in [
+            "model.layers.3.mlp.gate_proj.lora_A.weight",
+            "model.layers.3.mlp.up_proj_backup.weight",
+            "model.layers.3.mlp.up_proj_backup",
+            "model.layers.3.mlp.down_proj.weight.extra",
+        ] {
+            assert!(
+                validate_q3_mlp_role(name).is_err(),
+                "expected near-miss '{name}' to be rejected by the exact-suffix gate"
+            );
+        }
+    }
+
+    #[test]
+    fn mlp_role_requires_terminal_weight_suffix() {
+        // Real checkpoints always name dense MLP projections with a terminal
+        // `.weight` (see the Q4 loader's `{prefix}.mlp.gate_proj.weight` call
+        // sites in metal_qwen35.rs); a role-correct name missing it is not a
+        // real tensor name and must fail closed.
+        for name in [
+            "model.layers.3.mlp.gate_proj",
+            "model.layers.3.mlp.up_proj",
+            "model.layers.3.mlp.down_proj",
+            "model.layers.3.mlp.gate_up_proj",
+        ] {
+            assert!(
+                validate_q3_mlp_role(name).is_err(),
+                "expected '{name}' (missing '.weight') to be rejected"
             );
         }
     }

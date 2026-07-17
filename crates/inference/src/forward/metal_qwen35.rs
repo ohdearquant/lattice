@@ -1289,6 +1289,11 @@ mod inner {
             .len();
         crate::weights::q3_weights::validate_q3_header_payload_bounds(&header, file_len, path)
             .map_err(|e| format!("failed to validate Q3 payload {}: {e}", path.display()))?;
+        // SAFETY: `mmap`'s read-only-mmap invariant is documented above
+        // (`# Safety invariant`): the file is opened read-only and mapped
+        // `MAP_PRIVATE`, and the caller must not mutate the on-disk file
+        // while this process runs — the same invariant `mmap_q4_weight`
+        // relies on for its no-copy Metal buffer.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
             .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
 
@@ -12111,9 +12116,16 @@ mod inner {
         /// with M>1. Callers that need to support non-Apple7 prefill would need
         /// a naive `gemm_q3` kernel, out of Stage 2 scope.
         ///
+        /// # Errors
+        /// Returns `Err` if `m > 1` and `gemm_q3_tiled` is unavailable (device
+        /// is not Apple7+, or the tiled kernel failed to compile) — Stage 2
+        /// has no naive Q3 GEMM fallback to fall back to (mirrors how
+        /// `mmap_q3_weight` propagates its fail-closed checks as `Result`
+        /// rather than panicking).
+        ///
         /// # Panics
-        /// Panics if `k` is zero or not a multiple of 32, or if `m > 1` and
-        /// `gemm_q3_tiled` is unavailable (device is not Apple7+).
+        /// Panics if `k` is zero or not a multiple of 32 (a caller
+        /// programming error, not a runtime/capability condition).
         #[allow(dead_code)] // wired to real MLP dispatch is deferred past Stage 2 — see w3_stage2_report.md
         fn dispatch_gemm_q3(
             &self,
@@ -12126,9 +12138,9 @@ mod inner {
             m: u32,
             n: u32,
             k: u32,
-        ) {
+        ) -> Result<(), String> {
             if m == 0 || n == 0 {
-                return;
+                return Ok(());
             }
             assert!(
                 k > 0 && k.is_multiple_of(32),
@@ -12147,11 +12159,17 @@ mod inner {
                     MTLSize::new(32, 4, 1),
                 );
             } else {
-                let tiled = self.engine.pipelines.gemm_q3_tiled.as_ref().expect(
-                    "dispatch_gemm_q3 called with M>1 but gemm_q3_tiled is unavailable \
+                let tiled = self
+                    .engine
+                    .pipelines
+                    .gemm_q3_tiled
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "dispatch_gemm_q3 called with M>1 but gemm_q3_tiled is unavailable \
                      (device is not Apple7+, or the tiled kernel failed to compile); \
-                     Stage 2 has no naive Q3 GEMM fallback",
-                );
+                     Stage 2 has no naive Q3 GEMM fallback"
+                            .to_string()
+                    })?;
                 enc.set_compute_pipeline_state(tiled);
                 enc.set_buffer(0, Some(&qw.buffer), qw.payload_offset);
                 enc.set_buffer(1, Some(x), x_offset);
@@ -12164,6 +12182,7 @@ mod inner {
                     MTLSize::new(32, 4, 1),
                 );
             }
+            Ok(())
         }
 
         // -----------------------------------------------------------------------
@@ -20368,6 +20387,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 cmd.commit();
                 cmd.wait_until_completed();
 
+                // SAFETY: `cmd.wait_until_completed()` above blocks until the
+                // GPU has finished writing `y_buf`, and `y_buf` is a
+                // `StorageModeShared` buffer sized `n * 4` bytes — the CPU
+                // read of `n` f32s below is in-bounds and happens-after the
+                // GPU write.
                 let y_gpu: &[f32] =
                     unsafe { std::slice::from_raw_parts(y_buf.contents().cast::<f32>(), n) };
                 let y_ref = gemv_q3_reference(&x, &packed, n, k);
@@ -20410,10 +20434,27 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // Shape B: M=72,N=48,K=64 non-multiple of BM/BN — exercises the
             //   `gm<M`/`gn<N` boundary zero-pad guards in the tiled kernel.
             // Shape C: M=5,N=9,K=96 small odd M/N with a 3-block K depth.
+            // Shape D: M=16,N=32,K=1024 — representative production MLP
+            //   intermediate-dim depth (Qwen3.5's `hidden_size`/`intermediate_size`
+            //   K-depths are multiples of 1024), so the envelope below is not
+            //   just extrapolated from tiny shapes.
+            //
+            // `max_abs_diff` is the same NaN-honest helper used by the Q4 twin
+            // below (`gemm_q4_tiled_vs_naive_numeric_differential`) — a
+            // `.fold(0.0, f32::max)`-style comparison silently drops a NaN/Inf
+            // operand (IEEE maxNum semantics keep the non-NaN side), so a
+            // corrupted GPU tile that produces NaN would read as a perfect
+            // match. Both operands here read the *same* already-quantized Q3
+            // bytes, so source quantization error cancels between GPU and CPU
+            // reference; the residual is f16 X/W staging plus f32 reduction
+            // order, not quant step size — see the measured envelope below,
+            // which replaces the prior hand-waved 0.05 bound.
+            let mut envelope: Vec<(usize, usize, usize, f32)> = Vec::new();
             for &(m, n, k, seed) in &[
                 (64usize, 64usize, 64usize, 0xAAAA_u64),
                 (72usize, 48usize, 64usize, 0xBBBB_u64),
                 (5usize, 9usize, 96usize, 0xCCCC_u64),
+                (16usize, 32usize, 1024usize, 0xEEEE_u64),
             ] {
                 let (qw_buf, packed) = make_q3_weight_ref(&device, seed, n, k);
                 let x = q3_test_activation(seed ^ 0xDEAD, m * k);
@@ -20442,27 +20483,144 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 cmd.commit();
                 cmd.wait_until_completed();
 
+                // SAFETY: completed GPU work (`wait_until_completed` above)
+                // makes this `StorageModeShared` buffer's `m * n` f32s visible
+                // to the CPU; the slice length matches the buffer's
+                // allocated size (`m * n * 4` bytes) from its construction
+                // above.
                 let y_gpu: &[f32] =
                     unsafe { std::slice::from_raw_parts(y_buf.contents().cast::<f32>(), m * n) };
                 let y_ref = gemm_q3_reference(&x, &packed, m, n, k);
 
-                let mut max_diff = 0.0f32;
-                for i in 0..m * n {
-                    let d = (y_gpu[i] - y_ref[i]).abs();
-                    if d > max_diff {
-                        max_diff = d;
-                    }
-                }
-                // Tiled kernel stages X/W in half precision, same as
-                // gemm_q4_tiled (documented ~2.9e-3 half-staging error on top
-                // of quant error there); bound generously at ~15x that headroom
-                // since Q3's coarser 8-level quantization widens the per-weight
-                // step size relative to Q4's 16 levels.
+                let max_diff = max_abs_diff(y_gpu, &y_ref);
                 assert!(
-                    max_diff < 0.05,
-                    "shape M={m} N={n} K={k}: max|gpu-ref| = {max_diff} exceeds bound"
+                    max_diff.is_finite(),
+                    "shape M={m} N={n} K={k}: max|gpu-ref| is not finite (max_diff={max_diff}) \
+                     — the GPU tiled kernel produced a NaN/Inf output that a \
+                     `.fold(0.0, f32::max)`-style comparison would have silently \
+                     dropped as a false match"
+                );
+                println!("gemm_q3_tiled envelope: M={m} N={n} K={k} max|gpu-ref|={max_diff:.3e}");
+                envelope.push((m, n, k, max_diff));
+            }
+
+            // Bound derived from the measured envelope above (see
+            // w3_fix_r1_report.md for the full table), not a hand-waved
+            // constant: the largest observed shape (M=16 N=32 K=1024,
+            // production intermediate-dim depth) measured max|gpu-ref| ~=
+            // 1.055e-2; 0.02 is ~1.9x that, absorbing run-to-run
+            // f16-staging/reduction-order jitter while still catching a real
+            // regression (e.g. the NaN and packed-high-plane mutation tests
+            // below, which corrupt the GPU-visible bytes and must fail this
+            // same bound).
+            const MEASURED_ENVELOPE_TOL: f32 = 0.02;
+            for &(m, n, k, d) in &envelope {
+                assert!(
+                    d < MEASURED_ENVELOPE_TOL,
+                    "shape M={m} N={n} K={k}: max|gpu-ref| = {d} exceeds the \
+                     measured-envelope bound {MEASURED_ENVELOPE_TOL}"
                 );
             }
+        }
+
+        /// Mutation-sensitivity test for the differential comparison itself
+        /// (round-1 review finding 2): corrupt a packed block's `scale` field
+        /// to an IEEE-754 f16 NaN bit pattern so the GPU kernel's dequantized
+        /// weight — and therefore its GEMM output — is NaN, then prove the
+        /// NaN-honest comparison fails loudly instead of silently reading as
+        /// a perfect match. This is deliberately the inverse of the test
+        /// above: it proves the comparison mechanism itself is
+        /// mutation-sensitive, the same way the pack/unpack mutation tests
+        /// prove the kernel is.
+        #[test]
+        #[should_panic(expected = "is not finite")]
+        fn gemm_q3_tiled_differential_fails_closed_on_nan_scale() {
+            let Some(device) = Device::system_default() else {
+                // No GPU available: nothing to corrupt or dispatch, so the
+                // `should_panic` expectation cannot be exercised. Panic with
+                // the same expected substring so this test is still honest
+                // about not having proven anything on this host, rather than
+                // vacuously "passing" via `return` under `should_panic`.
+                panic!("is not finite: no Metal device available to run this test");
+            };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                panic!("is not finite: host GPU is not Apple7+, gemm_q3_tiled is unavailable");
+            }
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            let tiled_pipeline = state
+                .engine
+                .pipelines
+                .gemm_q3_tiled
+                .as_ref()
+                .expect("gemm_q3_tiled must be present on Apple7+");
+            let queue = &state.engine.queue;
+
+            use crate::weights::q3_weights::gemm_q3_reference;
+
+            let (m, n, k) = (5usize, 9usize, 96usize);
+            let (_qw_buf, packed) = make_q3_weight_ref(&device, 0xF00D_u64, n, k);
+
+            // Corrupt row 0's first block: `scale` occupies packed[0..2] as an
+            // IEEE-754 f16 bit pattern (little-endian). 0x7C01 is a quiet-ish
+            // NaN encoding (exponent all-ones, nonzero mantissa) — every
+            // weight in that block dequantizes to NaN, and the GEMM row that
+            // reads it becomes NaN in the GPU output.
+            let mut corrupted = packed.clone();
+            corrupted[0] = 0x01;
+            corrupted[1] = 0x7C;
+            let qw_buf = device.new_buffer_with_data(
+                corrupted.as_ptr() as *const _,
+                corrupted.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+
+            let x = q3_test_activation(0xF00D_u64 ^ 0xDEAD, m * k);
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let y_buf =
+                device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+            let cmd = queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(tiled_pipeline);
+            enc.set_buffer(0, Some(&qw_buf), 0);
+            enc.set_buffer(1, Some(&x_buf), 0);
+            enc.set_buffer(2, Some(&y_buf), 0);
+            enc.set_bytes(3, 4, &(m as u32) as *const u32 as *const _);
+            enc.set_bytes(4, 4, &(n as u32) as *const u32 as *const _);
+            enc.set_bytes(5, 4, &(k as u32) as *const u32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new((n as u64).div_ceil(32), (m as u64).div_ceil(64), 1),
+                MTLSize::new(32, 4, 1),
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            // SAFETY: completed GPU work (`wait_until_completed` above) makes
+            // this `StorageModeShared` buffer's `m * n` f32s visible to the
+            // CPU; the slice length matches the buffer's allocated size
+            // (`m * n * 4` bytes) from its construction above.
+            let y_gpu: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf.contents().cast::<f32>(), m * n) };
+            // Reference computed from the ORIGINAL, uncorrupted bytes: the
+            // GPU side alone is corrupted, so any NaN in `y_gpu` is a genuine
+            // divergence the comparison must surface, not an artifact of a
+            // NaN also present on the reference side.
+            let y_ref = gemm_q3_reference(&x, &packed, m, n, k);
+
+            let max_diff = max_abs_diff(y_gpu, &y_ref);
+            assert!(
+                max_diff.is_finite(),
+                "max|gpu-ref| is not finite (max_diff={max_diff}) — NaN-scale mutation \
+                 correctly detected by the comparison"
+            );
         }
 
         #[test]
@@ -20523,6 +20681,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 enc.end_encoding();
                 cmd.commit();
                 cmd.wait_until_completed();
+                // SAFETY: completed GPU work (`wait_until_completed` above)
+                // makes this `StorageModeShared` buffer's `n` f32s visible to
+                // the CPU; the slice length matches the buffer's allocated
+                // size (`n * 4` bytes) from its construction above.
                 unsafe { std::slice::from_raw_parts(y_buf.contents().cast::<f32>(), n) }.to_vec()
             };
 
