@@ -979,13 +979,22 @@ pub enum ChatRole {
 }
 
 impl ChatRole {
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             ChatRole::System => "system",
             ChatRole::User => "user",
             ChatRole::Assistant => "assistant",
         }
     }
+}
+
+/// **Unstable**: an image attached to a [`ChatMessage`] (ADR-069 S6).
+/// Carries the raw, still-encoded (e.g. PNG/JPEG) image bytes as decoded
+/// from the caller's request -- preprocessing (resize/patchify/normalize)
+/// happens downstream in the vision pipeline, not here.
+#[derive(Debug, Clone)]
+pub struct ChatImage {
+    pub bytes: Vec<u8>,
 }
 
 /// **Unstable**: single chat message; fields may expand with tool call support.
@@ -995,6 +1004,9 @@ impl ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// At most one image per message (ADR-069 S6 v0: single-image requests
+    /// only). `None` for every plain-text message -- the pre-vision shape.
+    pub image: Option<ChatImage>,
 }
 
 impl ChatMessage {
@@ -1003,6 +1015,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content: content.into(),
+            image: None,
         }
     }
     /// **Unstable**: construct a user message.
@@ -1010,6 +1023,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: content.into(),
+            image: None,
         }
     }
     /// **Unstable**: construct an assistant message.
@@ -1017,6 +1031,15 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content: content.into(),
+            image: None,
+        }
+    }
+    /// **Unstable**: construct a message carrying an image (ADR-069 S6).
+    pub fn with_image(role: ChatRole, content: impl Into<String>, image_bytes: Vec<u8>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            image: Some(ChatImage { bytes: image_bytes }),
         }
     }
 }

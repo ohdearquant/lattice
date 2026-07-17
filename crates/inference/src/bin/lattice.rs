@@ -2873,6 +2873,12 @@ mod serve {
                             model_max_context: max_context,
                             context_window_policy: ContextWindowPolicy::PromptAndMaxTokens,
                         },
+                        // `lattice.rs`'s chat surface still rejects
+                        // `image_url` content parts outright (see
+                        // `message_text`); ADR-069 S6 wires vision into
+                        // `lattice_serve.rs` only, so this binary never
+                        // loads vision weights.
+                        None,
                     ))
                 },
                 max_pending,

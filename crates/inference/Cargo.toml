@@ -224,6 +224,11 @@ http-body-util = { workspace = true }
 # kept at this use site (the version itself moved
 # to `[workspace.dependencies]`, feature selection stays local).
 tower = { workspace = true, features = ["util"] }
+# Real HTTP client for the ADR-069 S6 serve vision e2e smoke test (posts a
+# small image + question to a real `lattice_serve` subprocess over
+# loopback). Already resolved in Cargo.lock as a transitive `download`
+# feature dependency; this just makes it a direct dev-dependency.
+ureq = "2"
 
 [[bench]]
 name = "attention_bench"

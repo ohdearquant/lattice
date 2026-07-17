@@ -18,6 +18,23 @@
 //!   -d '{"model":"lattice","messages":[{"role":"user","content":"hi"}],"stream":true}'
 //! ```
 //!
+//! On a vision-capable checkpoint (e.g. `qwen3.5-0.8b`, ADR-069), a `user`
+//! message's `content` may be an OpenAI-shape array mixing a `text` part
+//! with one `image_url` part carrying a `data:` URI (base64-encoded PNG/JPEG;
+//! remote URLs are rejected -- this server never fetches on the caller's
+//! behalf):
+//!
+//! ```text
+//! curl http://127.0.0.1:11435/v1/chat/completions -H 'content-type: application/json' -d '{
+//!   "model": "lattice",
+//!   "messages": [{"role": "user", "content": [
+//!     {"type": "text", "text": "Describe this image."},
+//!     {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+//!   ]}],
+//!   "max_tokens": 64
+//! }'
+//! ```
+//!
 //! # Endpoints
 //!
 //! - `POST /v1/chat/completions` — streaming (SSE) and non-streaming, OpenAI shape
@@ -73,7 +90,7 @@ mod imp {
         },
         routing::{get, post},
     };
-    use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
+    use lattice_inference::forward::metal_qwen35::{ChatMessage, ChatRole, MetalQwen35State};
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{
@@ -200,10 +217,15 @@ mod imp {
     /// #551 fallback when the loaded model's config has no derivable context.
     const FALLBACK_MODEL_MAX_CONTEXT: usize = 4096;
 
-    /// #649: image input is accepted in the OpenAI wire shape but this server
-    /// has no vision tower, so it must fail closed with a clear message
-    /// rather than silently dropping the part or coercing it to text.
-    const IMAGE_REQUIRES_VISION_MESSAGE: &str = "image input requires a vision-capable model";
+    /// Maximum decoded (post-base64) byte length accepted from a `data:`
+    /// `image_url` content part (ADR-069 S6). Checked immediately after
+    /// decoding, before the bytes reach the vision preprocessor -- serve
+    /// DoS-hardening rule: clamp before the allocation the `image` crate's
+    /// decoder would size off attacker-controlled dimensions. In practice
+    /// `MAX_CONTENT_PART_BYTES` (64 KiB of base64 text, ~48 KiB decoded)
+    /// already bounds this tighter; this is defense in depth if that
+    /// constant is ever widened independently.
+    const MAX_DECODED_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
     /// A request-validation failure that must surface as HTTP 400 (#641,
     /// #649). Fail-closed: unknown roles and unsupported content parts are
@@ -341,7 +363,7 @@ mod imp {
 
     /// #656: reject known-but-unsupported OpenAI request fields with HTTP
     /// 400 instead of silently ignoring them -- the same fail-closed
-    /// philosophy `MessageRole::parse`/`content_text` already apply to
+    /// philosophy `MessageRole::parse`/`content_parts` already apply to
     /// roles and content parts. Mirrors `lattice.rs`'s `reject_unsupported`,
     /// scoped to this minimal server's narrower surface: unlike
     /// `lattice.rs`, this server has no `logprobs`/`stop` implementation at
@@ -1219,8 +1241,8 @@ mod imp {
     /// OpenAI message content: either a plain string or an array of typed
     /// parts (`[{"type":"text","text":"..."}]`). Both forms deserialize
     /// successfully here; rejection of unsupported part types happens in
-    /// `content_text` so the exact offending part is available for the error
-    /// message.
+    /// `content_parts` so the exact offending part is available for the
+    /// error message.
     #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
     #[serde(untagged)]
     enum MessageContent {
@@ -1817,48 +1839,203 @@ mod imp {
         })
     }
 
-    /// Flatten message content to plain text (#641, #649). Fails closed:
-    /// an `image_url` part returns the vision-model message, any other
-    /// unsupported part type names itself in the error rather than being
-    /// silently dropped.
-    fn content_text(content: &MessageContent) -> Result<String, RequestError> {
+    /// Flattened message content: concatenated text plus at most one
+    /// decoded image (ADR-069 S6, extending #641/#649's text-only shape).
+    #[derive(Debug, PartialEq, Eq)]
+    struct FlattenedContent {
+        text: String,
+        image: Option<Vec<u8>>,
+    }
+
+    /// Decode an OpenAI-shape `image_url.url` (ADR-069 S6). Accepts `data:`
+    /// URIs (base64-encoded image bytes) only -- a remote URL would require
+    /// this server to make an outbound fetch on the caller's behalf, out of
+    /// scope for v0 -- and fails closed (never panics) on every malformed
+    /// form: wrong scheme, missing `,` separator, missing `;base64`, a
+    /// non-image media type, invalid base64, an empty payload, or a decoded
+    /// payload over [`MAX_DECODED_IMAGE_BYTES`].
+    fn decode_data_uri_image(
+        url: &str,
+        message_index: usize,
+        part_index: usize,
+    ) -> Result<Vec<u8>, RequestError> {
+        let bad = |msg: String| RequestError::bad_request(msg, "invalid_image_data_uri");
+
+        let rest = url.strip_prefix("data:").ok_or_else(|| {
+            RequestError::bad_request(
+                format!(
+                    "messages[{message_index}].content[{part_index}].image_url.url must be a \
+                     data: URI (base64-encoded image); remote URLs are not supported"
+                ),
+                "unsupported_image_url_scheme",
+            )
+        })?;
+        let (meta, data) = rest.split_once(',').ok_or_else(|| {
+            bad(format!(
+                "messages[{message_index}].content[{part_index}].image_url.url is not a valid \
+                 data URI (missing ',' separator)"
+            ))
+        })?;
+        let mut segments = meta.split(';');
+        let mime = segments.next().unwrap_or("");
+        if !mime.starts_with("image/") {
+            return Err(bad(format!(
+                "messages[{message_index}].content[{part_index}].image_url.url media type \
+                 '{mime}' is not an image/* type"
+            )));
+        }
+        if !segments.any(|seg| seg.eq_ignore_ascii_case("base64")) {
+            return Err(bad(format!(
+                "messages[{message_index}].content[{part_index}].image_url.url is not \
+                 base64-encoded (only ';base64' data URIs are supported)"
+            )));
+        }
+        let bytes = base64_decode_standard(data).map_err(|e| {
+            bad(format!(
+                "messages[{message_index}].content[{part_index}].image_url.url has invalid \
+                 base64: {e}"
+            ))
+        })?;
+        if bytes.is_empty() {
+            return Err(bad(format!(
+                "messages[{message_index}].content[{part_index}].image_url.url decodes to an \
+                 empty image"
+            )));
+        }
+        if bytes.len() > MAX_DECODED_IMAGE_BYTES {
+            return Err(RequestError::bad_request(
+                format!(
+                    "messages[{message_index}].content[{part_index}].image_url.url decodes to \
+                     {} bytes, exceeding the {MAX_DECODED_IMAGE_BYTES}-byte limit",
+                    bytes.len()
+                ),
+                "image_too_large",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// Standard-alphabet (RFC 4648 §4) base64 decoder, no external crate:
+    /// this server already clamps the input string to
+    /// [`MAX_CONTENT_PART_BYTES`] before this ever runs, so an image-sized
+    /// hand-rolled decoder is simpler than pulling in a dependency for one
+    /// call site. Fails closed on every malformed input (non-multiple-of-4
+    /// length, invalid alphabet character, misplaced `=` padding) rather
+    /// than panicking or silently truncating.
+    fn base64_decode_standard(s: &str) -> Result<Vec<u8>, String> {
+        fn value(b: u8) -> Result<u32, String> {
+            match b {
+                b'A'..=b'Z' => Ok((b - b'A') as u32),
+                b'a'..=b'z' => Ok((b - b'a' + 26) as u32),
+                b'0'..=b'9' => Ok((b - b'0' + 52) as u32),
+                b'+' => Ok(62),
+                b'/' => Ok(63),
+                other => Err(format!("invalid base64 character {:?}", other as char)),
+            }
+        }
+        let bytes = s.as_bytes();
+        if bytes.is_empty() {
+            return Err("empty base64 payload".to_string());
+        }
+        if !bytes.len().is_multiple_of(4) {
+            return Err("base64 length must be a multiple of 4".to_string());
+        }
+        let n_chunks = bytes.len() / 4;
+        let mut out = Vec::with_capacity(n_chunks * 3);
+        for (chunk_index, chunk) in bytes.chunks_exact(4).enumerate() {
+            let is_last = chunk_index + 1 == n_chunks;
+            let pad = chunk.iter().rev().take_while(|&&b| b == b'=').count();
+            if pad > 0 && !is_last {
+                return Err("'=' padding is only allowed in the final base64 block".to_string());
+            }
+            if pad > 2 {
+                return Err("too much '=' padding in base64 data".to_string());
+            }
+            if chunk[..4 - pad].contains(&b'=') {
+                return Err("'=' padding character in the middle of a base64 block".to_string());
+            }
+            let mut v = [0u32; 4];
+            for (j, &b) in chunk.iter().enumerate() {
+                v[j] = if b == b'=' { 0 } else { value(b)? };
+            }
+            let n = (v[0] << 18) | (v[1] << 12) | (v[2] << 6) | v[3];
+            out.push((n >> 16) as u8);
+            if pad < 2 {
+                out.push((n >> 8) as u8);
+            }
+            if pad < 1 {
+                out.push(n as u8);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Flatten one message's content into text plus at most one image
+    /// (ADR-069 S6, extending #641/#649). Fails closed: more than one
+    /// `image_url` part in a single message, or any other unsupported part
+    /// type, names itself in the error rather than being silently dropped.
+    fn content_parts(
+        content: &MessageContent,
+        message_index: usize,
+    ) -> Result<FlattenedContent, RequestError> {
         match content {
-            MessageContent::Text(text) => Ok(text.clone()),
+            MessageContent::Text(text) => Ok(FlattenedContent {
+                text: text.clone(),
+                image: None,
+            }),
             MessageContent::Parts(parts) => {
-                let mut out = String::new();
-                for part in parts {
+                let mut text = String::new();
+                let mut image: Option<Vec<u8>> = None;
+                for (part_index, part) in parts.iter().enumerate() {
                     match part {
-                        Part::Text { text } => out.push_str(text),
-                        Part::ImageUrl { .. } => {
-                            // Matches lattice.rs's `message_text` image
-                            // rejection code (ADR-080 C2).
-                            return Err(RequestError::bad_request(
-                                IMAGE_REQUIRES_VISION_MESSAGE,
-                                "unsupported_feature",
-                            ));
+                        Part::Text { text: t } => text.push_str(t),
+                        Part::ImageUrl { image_url } => {
+                            if image.is_some() {
+                                return Err(RequestError::bad_request(
+                                    format!(
+                                        "messages[{message_index}].content carries more than \
+                                         one image_url part; only a single image is supported"
+                                    ),
+                                    "unsupported_feature",
+                                ));
+                            }
+                            image = Some(decode_data_uri_image(
+                                &image_url.url,
+                                message_index,
+                                part_index,
+                            )?);
                         }
                         Part::Unsupported { kind } => {
                             return Err(RequestError::bad_request(
                                 format!(
-                                    "unsupported content part type '{kind}'; only 'text' parts are accepted"
+                                    "unsupported content part type '{kind}'; only 'text' and \
+                                     'image_url' parts are accepted"
                                 ),
                                 "unsupported_feature",
                             ));
                         }
                     }
                 }
-                Ok(out)
+                Ok(FlattenedContent { text, image })
             }
         }
     }
 
-    fn to_chat_message(m: &InMsg) -> Result<ChatMessage, RequestError> {
+    fn to_chat_message(m: &InMsg, message_index: usize) -> Result<ChatMessage, RequestError> {
         let role = MessageRole::parse(&m.role)?;
-        let content = content_text(&m.content)?;
-        Ok(match role {
-            MessageRole::System => ChatMessage::system(content),
-            MessageRole::User => ChatMessage::user(content),
-            MessageRole::Assistant => ChatMessage::assistant(content),
+        let FlattenedContent { text, image } = content_parts(&m.content, message_index)?;
+        let engine_role = match role {
+            MessageRole::System => ChatRole::System,
+            MessageRole::User => ChatRole::User,
+            MessageRole::Assistant => ChatRole::Assistant,
+        };
+        Ok(match image {
+            Some(bytes) => ChatMessage::with_image(engine_role, text, bytes),
+            None => match role {
+                MessageRole::System => ChatMessage::system(text),
+                MessageRole::User => ChatMessage::user(text),
+                MessageRole::Assistant => ChatMessage::assistant(text),
+            },
         })
     }
 
@@ -2204,7 +2381,13 @@ mod imp {
             );
         }
 
-        let messages: Vec<ChatMessage> = match req.messages.iter().map(to_chat_message).collect() {
+        let messages: Vec<ChatMessage> = match req
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| to_chat_message(m, i))
+            .collect()
+        {
             Ok(messages) => messages,
             Err(err) => {
                 emit_serve_event(
@@ -2221,6 +2404,28 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
+        // ADR-069 S6 v0: at most one image across the whole conversation --
+        // `content_parts` already rejects more than one `image_url` part
+        // *within* a single message; this catches the same request shape
+        // spread across two different messages instead.
+        if messages.iter().filter(|m| m.image.is_some()).count() > 1 {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                "/v1/chat/completions",
+                400,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some("unsupported_feature"),
+            );
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                "only a single image is supported per request",
+                "unsupported_feature",
+            );
+        }
         // Structured-output v0 (design note): admit + compile
         // `response_format.json_schema` BEFORE any worker job is submitted.
         // `Ok(None)` for an ordinary text request; a schema/streaming
@@ -3121,6 +3326,34 @@ mod imp {
                     format,
                     model_max_context,
                 } = load_model(&model_dir_for_loader, &tokenizer_path, format)?;
+                // ADR-069 S6: load the real `model.visual.*` tensors
+                // alongside the decoder when this checkpoint's config.json
+                // carries a `vision_config` -- re-parsed here rather than
+                // threading it out of `load_model`'s two format-specific
+                // branches, which keeps `LoadedModel` unchanged for every
+                // existing text-only caller/test. A vision-capable
+                // checkpoint whose weight files are missing/corrupt still
+                // serves text-only rather than failing startup outright
+                // (loud warning, not a silent skip).
+                let vision_weights = Qwen35Config::from_model_dir(&model_dir_for_loader)
+                    .ok()
+                    .and_then(|cfg| cfg.vision_config)
+                    .and_then(|vision_cfg| {
+                        match lattice_inference::vision::checkpoint::load_qwen35_vision_weights(
+                            &model_dir_for_loader,
+                            &vision_cfg,
+                        ) {
+                            Ok(w) => Some(w),
+                            Err(e) => {
+                                eprintln!(
+                                    "[lattice_serve] WARNING: checkpoint advertises \
+                                     vision_config but failed to load model.visual.* weights \
+                                     ({e}); serving text-only"
+                                );
+                                None
+                            }
+                        }
+                    });
                 Ok((
                     metal,
                     tokenizer,
@@ -3129,6 +3362,7 @@ mod imp {
                         model_max_context,
                         context_window_policy: ContextWindowPolicy::PromptAndDecodeWithDelimiter,
                     },
+                    vision_weights,
                 ))
             },
             max_pending,
@@ -3310,12 +3544,13 @@ mod imp {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
             };
-            let chat_message = to_chat_message(&msg).expect("plain string content must parse");
+            let chat_message = to_chat_message(&msg, 0).expect("plain string content must parse");
             assert_eq!(
                 chat_message.role,
                 lattice_inference::forward::metal_qwen35::ChatRole::User
             );
             assert_eq!(chat_message.content, "hi");
+            assert!(chat_message.image.is_none());
         }
 
         #[test]
@@ -3328,19 +3563,190 @@ mod imp {
                     text: "b".to_string(),
                 },
             ]);
-            assert_eq!(content_text(&content).unwrap(), "ab");
+            let flattened = content_parts(&content, 0).unwrap();
+            assert_eq!(flattened.text, "ab");
+            assert!(flattened.image.is_none());
+        }
+
+        /// A 1x1 white PNG, small enough to inline as a literal.
+        const TINY_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+        #[test]
+        fn message_content_data_uri_image_decodes() {
+            let content = MessageContent::Parts(vec![Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: format!("data:image/png;base64,{TINY_PNG_BASE64}"),
+                    detail: None,
+                },
+            }]);
+            let flattened = content_parts(&content, 0).expect("valid data URI must decode");
+            let bytes = flattened.image.expect("image must be present");
+            assert!(
+                bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+                "must decode a real PNG header"
+            );
         }
 
         #[test]
-        fn message_content_image_url_rejected() {
+        fn message_content_remote_image_url_rejected() {
             let content = MessageContent::Parts(vec![Part::ImageUrl {
                 image_url: ImageUrl {
                     url: "https://example.com/cat.png".to_string(),
                     detail: None,
                 },
             }]);
-            let err = content_text(&content).unwrap_err();
-            assert_eq!(err.message(), IMAGE_REQUIRES_VISION_MESSAGE);
+            let err = content_parts(&content, 0).unwrap_err();
+            assert_eq!(err.code(), "unsupported_image_url_scheme");
+        }
+
+        #[test]
+        fn message_content_malformed_base64_rejected() {
+            let content = MessageContent::Parts(vec![Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,not-valid-base64!!".to_string(),
+                    detail: None,
+                },
+            }]);
+            let err = content_parts(&content, 0).unwrap_err();
+            assert_eq!(err.code(), "invalid_image_data_uri");
+        }
+
+        #[test]
+        fn message_content_non_multiple_of_four_base64_rejected() {
+            let content = MessageContent::Parts(vec![Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,abcde".to_string(),
+                    detail: None,
+                },
+            }]);
+            let err = content_parts(&content, 0).unwrap_err();
+            assert_eq!(err.code(), "invalid_image_data_uri");
+        }
+
+        #[test]
+        fn message_content_non_image_mime_rejected() {
+            let content = MessageContent::Parts(vec![Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:text/plain;base64,aGVsbG8=".to_string(),
+                    detail: None,
+                },
+            }]);
+            let err = content_parts(&content, 0).unwrap_err();
+            assert_eq!(err.code(), "invalid_image_data_uri");
+        }
+
+        #[test]
+        fn message_content_oversized_decoded_image_rejected() {
+            // Encodes MAX_DECODED_IMAGE_BYTES + 1 zero bytes as base64 --
+            // exercises the post-decode size clamp, not the pre-decode
+            // MAX_CONTENT_PART_BYTES text clamp (a real oversized image
+            // would already be caught by `validate_content_part_limits`
+            // before reaching this function; this test isolates the
+            // second, independent clamp).
+            let raw = vec![0u8; MAX_DECODED_IMAGE_BYTES + 1];
+            let b64 = base64_encode_standard_for_test(&raw);
+            let content = MessageContent::Parts(vec![Part::ImageUrl {
+                image_url: ImageUrl {
+                    url: format!("data:image/png;base64,{b64}"),
+                    detail: None,
+                },
+            }]);
+            let err = content_parts(&content, 0).unwrap_err();
+            assert_eq!(err.code(), "image_too_large");
+        }
+
+        /// Test-only encoder (the reverse of `base64_decode_standard`) so
+        /// the oversized-image test above can construct an input without a
+        /// base64 crate dependency.
+        fn base64_encode_standard_for_test(bytes: &[u8]) -> String {
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+            for chunk in bytes.chunks(3) {
+                let b0 = chunk[0] as u32;
+                let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+                let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+                let n = (b0 << 16) | (b1 << 8) | b2;
+                out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
+                out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
+                out.push(if chunk.len() > 1 {
+                    ALPHABET[(n >> 6) as usize & 0x3f] as char
+                } else {
+                    '='
+                });
+                out.push(if chunk.len() > 2 {
+                    ALPHABET[n as usize & 0x3f] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        }
+
+        #[test]
+        fn message_content_second_image_in_same_message_rejected() {
+            let content = MessageContent::Parts(vec![
+                Part::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{TINY_PNG_BASE64}"),
+                        detail: None,
+                    },
+                },
+                Part::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{TINY_PNG_BASE64}"),
+                        detail: None,
+                    },
+                },
+            ]);
+            let err = content_parts(&content, 0).unwrap_err();
+            assert_eq!(err.code(), "unsupported_feature");
+        }
+
+        #[test]
+        fn message_content_mixed_text_and_image_ordering_preserved() {
+            let content = MessageContent::Parts(vec![
+                Part::Text {
+                    text: "before ".to_string(),
+                },
+                Part::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{TINY_PNG_BASE64}"),
+                        detail: None,
+                    },
+                },
+                Part::Text {
+                    text: "after".to_string(),
+                },
+            ]);
+            let flattened = content_parts(&content, 0).expect("mixed content must parse");
+            // Text parts concatenate in their original order regardless of
+            // where the image part sits between them; the image is carried
+            // out-of-band in `flattened.image`, not spliced into the text.
+            assert_eq!(flattened.text, "before after");
+            assert!(flattened.image.is_some());
+        }
+
+        #[test]
+        fn to_chat_message_with_image_carries_bytes() {
+            let msg = InMsg {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![
+                    Part::Text {
+                        text: "describe this".to_string(),
+                    },
+                    Part::ImageUrl {
+                        image_url: ImageUrl {
+                            url: format!("data:image/png;base64,{TINY_PNG_BASE64}"),
+                            detail: None,
+                        },
+                    },
+                ]),
+            };
+            let chat_message = to_chat_message(&msg, 0).expect("image message must parse");
+            assert_eq!(chat_message.content, "describe this");
+            let image = chat_message.image.expect("image must be attached");
+            assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         }
 
         #[test]
@@ -3348,10 +3754,11 @@ mod imp {
             let content = MessageContent::Parts(vec![Part::Unsupported {
                 kind: "file".to_string(),
             }]);
-            let err = content_text(&content).unwrap_err();
+            let err = content_parts(&content, 0).unwrap_err();
             assert_eq!(
                 err.message(),
-                "unsupported content part type 'file'; only 'text' parts are accepted"
+                "unsupported content part type 'file'; only 'text' and 'image_url' parts are \
+                 accepted"
             );
         }
 
@@ -3653,7 +4060,10 @@ mod imp {
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
-        async fn chat_completions_image_url_400() {
+        async fn chat_completions_remote_image_url_400() {
+            // ADR-069 S6: `data:` image URIs are now accepted (routed to the
+            // vision path), but a remote URL still fails closed -- this
+            // server never makes an outbound fetch on the caller's behalf.
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":[
                     {"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}
@@ -3663,7 +4073,10 @@ mod imp {
             let response = chat_completions(State(test_app_state()), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(message, IMAGE_REQUIRES_VISION_MESSAGE);
+            assert!(
+                message.contains("data: URI"),
+                "expected a data-URI-scheme rejection message, got: {message}"
+            );
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

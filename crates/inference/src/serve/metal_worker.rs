@@ -55,6 +55,11 @@ use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
+use crate::vision::checkpoint::Qwen35VisionWeights;
+use crate::vision::multimodal::Qwen35VisionRequest;
+use crate::vision::qwen35_merger::qwen35_merger_forward;
+use crate::vision::qwen35_vit::preprocess_qwen35_image;
+use crate::vision::qwen35_vit_metal::qwen35_vit_forward_metal;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
@@ -365,6 +370,143 @@ fn check_prompt_fits_window(
     Ok(())
 }
 
+/// Render `messages` into the physical token id stream a [`Qwen35VisionRequest`]
+/// needs (ADR-069 S6): every turn is ChatML-rendered exactly like
+/// [`format_chat_template`], except the turn at `image_message_index` splices
+/// `vision_start_token_id`, `num_pads` copies of `image_token_id`, then
+/// `vision_end_token_id` immediately after that turn's role header and ahead
+/// of its own text -- the same "vision block precedes text" layout
+/// `vision::pooled_embed::embed_image_from_bytes_f16` uses, and the layout
+/// the committed `#989` HF differential golden encodes (see
+/// `tests/fixtures/vision/README.md`). Tokenizes in exactly two calls (the
+/// text before the spliced ids, then the text after) rather than one call
+/// per ChatML segment, so only the one unavoidable seam next to the
+/// numeric image-pad ids is exposed to cross-call BPE boundary effects --
+/// every other turn boundary stays inside a single `tokenizer.tokenize`
+/// call, identical to the plain-text path.
+fn build_vision_prompt_ids(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    tokenizer: &BpeTokenizer,
+    vision_start_token_id: u32,
+    vision_end_token_id: u32,
+    image_token_id: u32,
+    num_pads: usize,
+) -> Vec<u32> {
+    let tokenize = |text: &str| -> Vec<u32> {
+        let out = tokenizer.tokenize(text);
+        out.input_ids[..out.real_length].to_vec()
+    };
+
+    let render_turn = |out: &mut String, m: &ChatMessage| {
+        out.push_str("<|im_start|>");
+        out.push_str(m.role.as_str());
+        out.push('\n');
+        out.push_str(&m.content);
+        out.push_str("<|im_end|>\n");
+    };
+
+    let mut before = String::new();
+    for m in &messages[..image_message_index] {
+        render_turn(&mut before, m);
+    }
+    before.push_str("<|im_start|>");
+    before.push_str(messages[image_message_index].role.as_str());
+    before.push('\n');
+
+    let mut after = String::new();
+    after.push_str(&messages[image_message_index].content);
+    after.push_str("<|im_end|>\n");
+    for m in &messages[image_message_index + 1..] {
+        render_turn(&mut after, m);
+    }
+    after.push_str("<|im_start|>assistant\n");
+
+    let mut ids = tokenize(&before);
+    ids.push(vision_start_token_id);
+    ids.extend(std::iter::repeat_n(image_token_id, num_pads));
+    ids.push(vision_end_token_id);
+    ids.extend(tokenize(&after));
+    ids
+}
+
+/// Build a [`Qwen35VisionRequest`] for `messages` (exactly one of which
+/// carries an image, at `image_message_index`) against `vision_weights`
+/// (ADR-069 S6): preprocess -> Metal ViT forward (S3b, transparently
+/// CPU-fallback per-GEMM when the Metal dispatch threshold isn't cleared --
+/// see `qwen35_vit_metal`'s module docs) -> merger -> the expanded token-id
+/// stream from [`build_vision_prompt_ids`]. Returns [`WorkerFailure::Rejected`]
+/// for a caller-fixable problem (bad image bytes, misaligned dimensions,
+/// missing checkpoint vision metadata) and [`WorkerFailure::Failed`] for an
+/// internal forward-pass error.
+fn build_vision_request(
+    vision_weights: &Qwen35VisionWeights,
+    cfg: &crate::model::qwen35_config::Qwen35Config,
+    tokenizer: &BpeTokenizer,
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    image_bytes: &[u8],
+) -> Result<Qwen35VisionRequest, WorkerFailure> {
+    let bad_request = |message: String| {
+        WorkerFailure::Rejected(ApiError::BadRequest {
+            message,
+            code: "invalid_image",
+        })
+    };
+
+    let vision_cfg = cfg.vision_config.as_ref().ok_or_else(|| {
+        WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "this checkpoint has no vision_config; image input is unsupported".into(),
+            code: "vision_unsupported",
+        })
+    })?;
+    let image_token_id = cfg
+        .image_token_id
+        .ok_or_else(|| bad_request("checkpoint has no image_token_id".into()))?;
+    let vision_start = cfg
+        .vision_start_token_id
+        .ok_or_else(|| bad_request("checkpoint has no vision_start_token_id".into()))?;
+    let vision_end = cfg
+        .vision_end_token_id
+        .ok_or_else(|| bad_request("checkpoint has no vision_end_token_id".into()))?;
+
+    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg)
+        .map_err(|e| bad_request(format!("image preprocessing failed: {e}")))?;
+
+    let pre_merger = qwen35_vit_forward_metal(vision_weights, vision_cfg, &pixel_values, grid)
+        .map_err(|e| WorkerFailure::Failed(format!("ViT forward failed: {e}")))?;
+    let post_merger = qwen35_merger_forward(&vision_weights.merger, vision_cfg, &pre_merger)
+        .map_err(|e| WorkerFailure::Failed(format!("merger forward failed: {e}")))?;
+
+    let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
+    if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
+        return Err(bad_request(format!(
+            "image dimensions produce a patch grid {grid:?} not divisible by \
+             spatial_merge_size^2 ({merge_sq})"
+        )));
+    }
+    let num_pads = grid.num_patches() / merge_sq;
+
+    let input_ids = build_vision_prompt_ids(
+        messages,
+        image_message_index,
+        tokenizer,
+        vision_start,
+        vision_end,
+        image_token_id,
+        num_pads,
+    );
+
+    Ok(Qwen35VisionRequest {
+        input_ids,
+        image_grids: vec![grid],
+        post_merger_rows: post_merger,
+        image_token_id,
+        spatial_merge_size: vision_cfg.spatial_merge_size,
+        decoder_hidden_size: cfg.hidden_size,
+    })
+}
+
 /// Dequeue -> cancel-check -> generate -> reply, serialized on whatever
 /// thread calls this (the dedicated Metal worker thread in production; a
 /// plain `std::thread::spawn` in this module's own tests).
@@ -474,8 +616,15 @@ impl MetalWorker {
     /// [`DEFAULT_MAX_PENDING_JOBS`]); this function applies no default of
     /// its own.
     pub fn spawn(
-        loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
-        + Send
+        loader: impl FnOnce() -> Result<
+            (
+                MetalQwen35State,
+                BpeTokenizer,
+                WorkerMetadata,
+                Option<Qwen35VisionWeights>,
+            ),
+            String,
+        > + Send
         + 'static,
         max_pending: usize,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
@@ -490,9 +639,78 @@ impl MetalWorker {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WorkerMetadata, String>>();
 
         let join_handle = std::thread::spawn(move || match loader() {
-            Ok((mut state, tokenizer, meta)) => {
+            Ok((mut state, tokenizer, meta, vision_weights)) => {
                 let _ = ready_tx.send(Ok(meta.clone()));
                 run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
+                    // ADR-069 S6: a job carrying an image takes a separate
+                    // path -- one Metal ViT+merger pass to build a
+                    // `Qwen35VisionRequest`, then the vision-aware decode
+                    // entry point -- instead of the plain ChatML render +
+                    // text `generate_streaming_with_prefix_cache_and_cancel`
+                    // below. `image_message_index` is `None` for every
+                    // plain-text request, which is the overwhelming
+                    // majority, so that request shape is completely
+                    // unaffected by this branch.
+                    let mut image_positions = messages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| m.image.is_some());
+                    let image_message_index = image_positions.next().map(|(i, _)| i);
+                    if image_positions.next().is_some() {
+                        return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                            message: "only a single image is supported per request".into(),
+                            code: "vision_unsupported",
+                        }));
+                    }
+
+                    if let Some(image_message_index) = image_message_index {
+                        let Some(vision_weights) = vision_weights.as_ref() else {
+                            return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                                message: "image input requires a vision-capable model; this \
+                                          checkpoint has no vision weights loaded"
+                                    .into(),
+                                code: "vision_unsupported",
+                            }));
+                        };
+                        let image_bytes = &messages[image_message_index]
+                            .image
+                            .as_ref()
+                            .expect("image_message_index selected only messages with Some(image)")
+                            .bytes;
+                        let request = build_vision_request(
+                            vision_weights,
+                            &state.engine.config,
+                            &tokenizer,
+                            messages,
+                            image_message_index,
+                            image_bytes,
+                        )?;
+                        check_prompt_fits_window(
+                            meta.context_window_policy,
+                            meta.model_max_context,
+                            request.input_ids.len(),
+                            cfg,
+                        )
+                        .map_err(WorkerFailure::Rejected)?;
+                        if should_cancel() {
+                            return Err(WorkerFailure::Failed(
+                                "cancelled before vision generation started".into(),
+                            ));
+                        }
+                        // `generate_multimodal_vision` is a single blocking
+                        // call (no incremental `on_token` hook exists on
+                        // this entry point yet) -- the full answer arrives
+                        // as one delta rather than a token-by-token stream
+                        // (known ADR-069 S6 v0 limitation).
+                        let output = state
+                            .generate_multimodal_vision(&request, &tokenizer, cfg)
+                            .map_err(WorkerFailure::from)?;
+                        if !output.text.is_empty() {
+                            on_token(&output.text, 0);
+                        }
+                        return Ok(output);
+                    }
+
                     // Render the ChatML prompt exactly once (#828/#832: the
                     // prior `lattice_serve.rs` path rendered it a second
                     // time inside its own window preflight); reused for
@@ -1268,7 +1486,7 @@ mod tests {
     #[test]
     fn max_pending_zero_is_rejected_before_semaphore_new() {
         let result = MetalWorker::spawn(
-            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> {
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata, Option<Qwen35VisionWeights>), String> {
                 panic!("loader must not run: max_pending=0 must be rejected first")
             },
             0,
@@ -1283,7 +1501,7 @@ mod tests {
     fn max_pending_above_max_permits_is_rejected_before_semaphore_new() {
         let too_big = Semaphore::MAX_PERMITS + 1;
         let result = MetalWorker::spawn(
-            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> {
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata, Option<Qwen35VisionWeights>), String> {
                 panic!("loader must not run: max_pending above MAX_PERMITS must be rejected first")
             },
             too_big,
