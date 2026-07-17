@@ -22,7 +22,9 @@ This process caught a 15% decode throughput regression (157 → 130 tok/s) that 
 
 A bench window means no concurrent builds AND no git checkouts, worktree adds, large file copies, or downloads. Filesystem indexing churn (Spotlight `mdworker`, `fseventsd`) from a repository checkout lands asymmetrically in whichever measurement phase it overlaps, and base-then-head runs make that asymmetry read as a code regression. Two consecutive A/B runs were corrupted this way — worktree checkouts overlapping the head phase produced swings up to +250% in groups the diff could not reach.
 
-Before re-running a corrupted A/B, check structural reachability first: is the changed code even compiled into the bench binaries? A diff confined to a `cfg`-gated module (e.g. `#[cfg(all(target_os = "macos", feature = "metal-gpu"))]`) is compiled out of a default-feature bench build entirely — base and head binaries are then built from identical effective source, no rerun can attribute any delta to the diff, and stating that proof in the PR beats a ritual rerun.
+Before re-running a corrupted A/B, check structural reachability first: is the changed code even compiled into the bench binaries? A diff confined to a `cfg`-gated module (e.g. `#[cfg(all(target_os = "macos", feature = "metal-gpu"))]`) is compiled out of a default-feature bench build entirely — base and head binaries are then built from identical effective source, and no rerun can attribute any delta to the diff.
+
+To be precise about how this interacts with the "no exceptions" rule above: the bench-compare disposition section of the PR is still mandatory for every `crates/inference/` or `crates/embed/` PR. The compiled-out proof is the one narrow case where that section may contain the structural argument (name the `cfg` gate, name the bench build's feature set, state that base and head bench binaries have identical effective source) instead of an A/B table. If any changed line is compiled into the bench binaries — even an additive field or a cold-path function — the proof does not apply and you run the A/B, in a quiet window, like always.
 
 ### Bench by Group, Not All at Once
 
