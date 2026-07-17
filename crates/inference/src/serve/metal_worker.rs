@@ -107,10 +107,19 @@ pub enum WorkerEvent {
     /// [`ApiError`] (`BadRequest`, code `context_length_exceeded`) instead
     /// of a raw string, so every caller maps it identically.
     Rejected(ApiError),
-    /// Generation failed closed instead of completing (#611: e.g. a grammar
-    /// mask that blocks every candidate token). Carries the underlying
-    /// error message for server-side logging.
+    /// Generation failed closed instead of completing for a reason other
+    /// than a grammar-blocked mask -- an ordinary internal failure. Carries
+    /// the underlying error message for server-side logging.
     Failed(String),
+    /// Generation failed closed because a grammar mask blocked every
+    /// candidate token (#611), distinct from [`WorkerEvent::Failed`] at the
+    /// type level so a caller offering structured-output admission can
+    /// report its dedicated `blocked_constraint` HTTP machine code without
+    /// pattern-matching the message text (round-1 structured-output-v0
+    /// review, medium finding 2: a backend wording change must not be able
+    /// to silently degrade that code to `internal_error`). Carries the
+    /// underlying error message for server-side logging only.
+    ConstraintBlocked(String),
     /// The job was skipped before any prompt work started because the
     /// client was already gone: `cancel`'s watch flag was `true`, or this
     /// event receiver was already closed, at dequeue time. The single
@@ -128,6 +137,27 @@ pub enum WorkerEvent {
 enum WorkerFailure {
     Rejected(ApiError),
     Failed(String),
+    /// Mirrors [`WorkerEvent::ConstraintBlocked`] -- see that variant's doc
+    /// comment. Kept distinct from `Failed` from the moment the generation
+    /// call returns, all the way to the `WorkerEvent` sent back to the
+    /// caller, so no stage in between has to sniff the message text.
+    ConstraintBlocked(String),
+}
+
+impl From<crate::error::InferenceError> for WorkerFailure {
+    /// Classifies a generation-time [`InferenceError`](crate::error::InferenceError)
+    /// into the worker's own failure shape. `GrammarConstraintBlocked` is
+    /// the one variant with a dedicated `WorkerEvent`; every other variant
+    /// (including `InvalidInput`'s many unrelated uses) stays a generic
+    /// `Failed` exactly as before this change.
+    fn from(err: crate::error::InferenceError) -> Self {
+        match err {
+            crate::error::InferenceError::GrammarConstraintBlocked(message) => {
+                WorkerFailure::ConstraintBlocked(message)
+            }
+            other => WorkerFailure::Failed(other.to_string()),
+        }
+    }
 }
 
 /// Worker startup failure: either the `loader` itself returned `Err`
@@ -407,6 +437,10 @@ fn run_worker_loop(
                 eprintln!("[metal-worker] generation error: {message}");
                 let _ = job.tx.send(WorkerEvent::Failed(message));
             }
+            Err(WorkerFailure::ConstraintBlocked(message)) => {
+                eprintln!("[metal-worker] generation error: {message}");
+                let _ = job.tx.send(WorkerEvent::ConstraintBlocked(message));
+            }
         }
     }
 }
@@ -504,9 +538,7 @@ impl MetalWorker {
                             c.cache.prompt_tokens,
                         );
                     }
-                    cached
-                        .map(|c| c.output)
-                        .map_err(|e| WorkerFailure::Failed(e.to_string()))
+                    cached.map(|c| c.output).map_err(WorkerFailure::from)
                 });
             }
             Err(e) => {
@@ -1000,6 +1032,12 @@ mod tests {
                 Some(WorkerEvent::Failed(message)) => {
                     panic!("fake_generate never fails; unexpected Failed: {message}")
                 }
+                Some(WorkerEvent::ConstraintBlocked(message)) => {
+                    panic!(
+                        "fake_generate never blocks on a grammar constraint; unexpected \
+                         ConstraintBlocked: {message}"
+                    )
+                }
                 Some(WorkerEvent::Rejected(err)) => {
                     panic!("fake_generate never rejects; unexpected Rejected: {err:?}")
                 }
@@ -1059,6 +1097,12 @@ mod tests {
             }
             Some(WorkerEvent::Failed(message)) => {
                 panic!("fake_generate_with_prefill_gap never fails; unexpected Failed: {message}")
+            }
+            Some(WorkerEvent::ConstraintBlocked(message)) => {
+                panic!(
+                    "fake_generate_with_prefill_gap never blocks on a grammar constraint; \
+                     unexpected ConstraintBlocked: {message}"
+                )
             }
             Some(WorkerEvent::Rejected(err)) => {
                 panic!("fake_generate_with_prefill_gap never rejects; unexpected Rejected: {err:?}")
