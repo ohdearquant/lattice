@@ -217,3 +217,32 @@ quality mechanism justifies a 3-bit tier. No Metal kernels, quantizer emit, or l
 it are to be built while #420 is closed. Amendment 1's format definition remains authoritative
 for the dormant module; its Stage-2 build plan and binding validation gates are suspended with
 the lane rather than repealed, so they re-arm as-written if the reopen conditions are ever met.
+
+## Amendment 3 (2026-07-17): Stage-2 Metal kernels landed post-closure; dormant status recorded
+
+**What happened.** PR #1014 (merged 2026-07-17T03:40Z) implemented the Stage-2 Metal kernels for
+the `Q3Block` format — `gemv_q3_decode`, `gemm_q3_tiled`, the `Q3WeightBuf`/`mmap_q3_weight`
+loader building blocks, and the CPU parity oracle — three days after Amendment 2 closed #420 and
+stated that no Metal kernels, quantizer emit, or loader support were to be built while the issue
+stays closed. The PR was driven from pre-Amendment-2 lane state: its body cites the original P1
+ranking and Stage-1/Stage-2 plan with no mention of the closure.
+
+**Disposition: retained, not reverted.** Every symbol #1014 added is `#[allow(dead_code)]` or
+test-only and is reachable from no live engine path (`MetalFfnWeights::Dense` still carries only
+`Q4WeightBuf` for MLP tensors); the kernels are differentially tested against the CPU oracle on
+real GPU hardware, with mutation-sensitive coverage on both sides. Reverting correct, tested,
+unwired code costs more than recording the truth. Stage 2 therefore joins Stage 1 (#978) under
+the same status: **dormant format infrastructure**, correct and tested, wired to nothing.
+
+**Prohibition reaffirmed, narrowed to the remaining surface.** With both format and kernels now
+existing as dormant artifacts, the binding line moves to activation: no checkpoint-level routing,
+no quantizer emit, and no live loader wiring of any Q3 path while #420 is closed. Amendment 2's
+reopen conditions are unchanged — a quality mechanism that changes the error distribution (a
+proven online rotation via #703, GPTQ/AWQ-class calibration, or finer groups) — and Amendment 1's
+suspended Stage-2 validation gates re-arm as-written if a reopen ever occurs, now covering the
+activation step rather than the already-built kernels.
+
+**Process note.** Two same-day instances of stale lane state driving work (a queued Stage-1
+assignment dispatched against the closed lane, and #1014 itself) establish this as a pattern:
+build lanes must verify the governing issue state and the ADR's amendments at launch time, not
+the queue entry that scheduled them.
