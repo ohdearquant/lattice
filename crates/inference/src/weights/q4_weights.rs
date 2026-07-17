@@ -399,6 +399,173 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Result<Q4Tensor, Inf
     })
 }
 
+// ---------------------------------------------------------------------------
+// GPTQ-style error-compensation quantization (v0 — identity Hessian, no
+// rotation, no activation statistics)
+// ---------------------------------------------------------------------------
+
+/// Selects whether [`quantize_f32_to_q4_compensated`] applies GPTQ-style
+/// error-feedback compensation on top of plain round-to-nearest (RTN).
+///
+/// `None` (the default) performs no cross-column correction —
+/// [`quantize_f32_to_q4_compensated`] delegates straight to
+/// [`quantize_f32_to_q4`] in that case, so the shipping (uncompensated) Q4
+/// output stays byte-identical regardless of this type's existence.
+///
+/// `ErrorFeedback` quantizes each row's columns left to right and, once a
+/// column is quantized, propagates its rounding error into the
+/// not-yet-quantized columns of the same row via a [`ColumnErrorWeighting`].
+/// v0 always uses [`UniformFeedback`] — an identity-Hessian stand-in, since
+/// no calibration-activation statistics are collected to weight columns by
+/// importance (unlike real GPTQ's inverse-Hessian weighting). A future
+/// Hessian-proxy (e.g. weights derived from activation covariance) can plug
+/// in by implementing [`ColumnErrorWeighting`] and adding a variant here —
+/// the quantization loop in [`quantize_f32_to_q4_compensated`] does not need
+/// to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Q4Compensation {
+    #[default]
+    None,
+    ErrorFeedback,
+}
+
+/// Plug-in point for how a just-quantized column's rounding error is spread
+/// across the not-yet-quantized columns of its row — the seam a future
+/// Hessian-proxy weighting replaces. See [`Q4Compensation::ErrorFeedback`]
+/// for why v0 ships only [`UniformFeedback`].
+pub trait ColumnErrorWeighting {
+    /// Adds `error`'s share into each not-yet-quantized column of
+    /// `working` (indices `col + 1 .. working.len()`), in place.
+    fn propagate(&self, error: f32, col: usize, working: &mut [f32]);
+}
+
+/// Identity-Hessian error distribution: every not-yet-quantized column in
+/// the row receives an equal share of the rounding error.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UniformFeedback;
+
+impl ColumnErrorWeighting for UniformFeedback {
+    fn propagate(&self, error: f32, col: usize, working: &mut [f32]) {
+        let tail = &mut working[col + 1..];
+        if tail.is_empty() {
+            return;
+        }
+        let share = error / tail.len() as f32;
+        for w in tail {
+            *w += share;
+        }
+    }
+}
+
+/// Quantize a 2-D `[rows, cols]` `f32` weight matrix into a [`Q4Tensor`],
+/// optionally applying GPTQ-style error-feedback compensation (v0 —
+/// identity Hessian, no rotation; see [`Q4Compensation`]).
+///
+/// Column-sequential compensation is only meaningful for an explicit 2-D
+/// weight matrix (row = one output unit, column = one input feature), so
+/// `shape` must have exactly 2 dimensions whenever `compensation !=
+/// Q4Compensation::None`. With `compensation = Q4Compensation::None` this
+/// delegates directly to [`quantize_f32_to_q4`] (any `shape` that function
+/// accepts works here too), so the output is byte-identical to calling it
+/// directly — this function adds no new code path in the default case.
+///
+/// With `Q4Compensation::ErrorFeedback`, each row's 32-wide blocks are
+/// processed left to right. A block's scale/bias is derived from the row's
+/// working values as they stand at the start of that block — i.e. after any
+/// error already fed forward from earlier blocks — then each column in the
+/// block is quantized in order, and its own rounding error is immediately
+/// propagated into every later not-yet-quantized column of the row (both
+/// the rest of the current block and all later blocks) before the next
+/// column is quantized. This is O(cols²) per row, the same asymptotic cost
+/// as reference GPTQ implementations; it is an opt-in, offline-conversion
+/// cost only.
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if `compensation !=
+/// Q4Compensation::None` and `shape.len() != 2`, if `shape` does not match
+/// `data.len()`, or if any value in `data` is non-finite.
+pub fn quantize_f32_to_q4_compensated(
+    data: &[f32],
+    shape: &[usize],
+    compensation: Q4Compensation,
+) -> Result<Q4Tensor, InferenceError> {
+    if compensation == Q4Compensation::None {
+        return quantize_f32_to_q4(data, shape);
+    }
+    if shape.len() != 2 {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q4 error-feedback compensation requires a 2-D [rows, cols] weight \
+             matrix shape, got {shape:?}"
+        )));
+    }
+    assert_shape_matches_data_len(shape, data.len());
+    let (rows, cols) = (shape[0], shape[1]);
+    let weighting = UniformFeedback;
+    let blocks_per_row = cols.div_ceil(32);
+    let mut blocks = Vec::with_capacity(rows * blocks_per_row);
+
+    for row_idx in 0..rows {
+        let row = &data[row_idx * cols..(row_idx + 1) * cols];
+        let mut working = Vec::with_capacity(cols);
+        for (i, &v) in row.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(InferenceError::InvalidInput(format!(
+                    "Q4 weight matrix row {row_idx} column {i} contains a \
+                     non-finite value ({v}); source weights must be finite"
+                )));
+            }
+            working.push(v);
+        }
+
+        for block_idx in 0..blocks_per_row {
+            let start = block_idx * 32;
+            let end = (start + 32).min(cols);
+            let valid_len = end - start;
+
+            let min_val = working[start..end]
+                .iter()
+                .copied()
+                .fold(f32::INFINITY, f32::min);
+            let max_val = working[start..end]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let range = max_val - min_val;
+            let scale = if range == 0.0 { 1.0f32 } else { range / 15.0 };
+            let inv_scale = 1.0 / scale;
+
+            let mut nibbles = [0u8; 32];
+            for j in 0..valid_len {
+                let col = start + j;
+                let q = ((working[col] - min_val) * inv_scale)
+                    .round()
+                    .clamp(0.0, 15.0) as u8;
+                nibbles[j] = q;
+                let dequant = q as f32 * scale + min_val;
+                let error = working[col] - dequant;
+                weighting.propagate(error, col, &mut working);
+            }
+
+            let mut packed = [0u8; 16];
+            for b in 0..16 {
+                packed[b] = (nibbles[2 * b + 1] << 4) | (nibbles[2 * b] & 0x0f);
+            }
+            blocks.push(Q4Block {
+                scale: q4_f32_to_f16(scale),
+                bias: q4_f32_to_f16(min_val),
+                packed,
+            });
+        }
+    }
+
+    Ok(Q4Tensor {
+        blocks,
+        shape: shape.to_vec(),
+        original_len: data.len(),
+    })
+}
+
 /// Quantize an `f64` tensor into a [`Q4Tensor`] via f32 downcast.
 ///
 /// Delegated wrapper around [`quantize_f32_to_q4`] for the QuaRot pipeline,
@@ -2731,5 +2898,206 @@ mod tests {
         );
 
         std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // GPTQ-style error-compensation quantization (Q4Compensation)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quantize_f32_to_q4_compensated_none_is_byte_identical_to_rtn() {
+        // Mutation-sensitive: if the `compensation == Q4Compensation::None`
+        // early return in `quantize_f32_to_q4_compensated` is removed (or
+        // bypassed), this test starts comparing RTN output against
+        // ErrorFeedback output instead, which the SSE-reduction test below
+        // proves differs on correlated data — so this test would fail.
+        let src = synthetic_f32_uniform(256, 41);
+        let shape = [8usize, 32usize];
+
+        let oracle = quantize_f32_to_q4(&src, &shape).unwrap();
+        let none = quantize_f32_to_q4_compensated(&src, &shape, Q4Compensation::None).unwrap();
+
+        assert_eq!(none.shape, oracle.shape);
+        assert_eq!(none.original_len, oracle.original_len);
+        assert_eq!(none.blocks.len(), oracle.blocks.len());
+        for (i, (a, b)) in none.blocks.iter().zip(oracle.blocks.iter()).enumerate() {
+            assert_eq!(a.scale, b.scale, "block {i} scale mismatch");
+            assert_eq!(a.bias, b.bias, "block {i} bias mismatch");
+            assert_eq!(a.packed, b.packed, "block {i} packed mismatch");
+        }
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_compensated_none_rejects_non_finite_like_rtn() {
+        // Non-finite guard must still be reachable through the compensated
+        // entry point when compensation is off (it just delegates).
+        let src = [1.0f32, f32::NAN, 3.0, 4.0];
+        let err = quantize_f32_to_q4_compensated(&src, &[4], Q4Compensation::None).unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    /// A single Q4 block's worth of values engineered so plain RTN
+    /// quantization has a large, *consistent* rounding bias: a low anchor
+    /// (0.0) and a high anchor (100.0) force a coarse per-block scale, and
+    /// the 5 "cluster" values sit consistently on one side of their
+    /// nearest grid point, all rounding the same way under RTN.
+    fn biased_cluster_block(cluster_val: f32) -> Vec<f32> {
+        let mut block = Vec::with_capacity(32);
+        // 30 exact-grid-point zeros first: RTN and compensated agree here
+        // (zero rounding error either way — a working value that already
+        // equals its block's bias always quantizes exactly), so they never
+        // propagate any error and don't perturb the single off-grid
+        // column that follows.
+        block.extend(std::iter::repeat_n(0.0f32, 30));
+        // Exactly one off-grid "cluster" column: with only one lossy
+        // element per block, there is no intra-block cascading to reason
+        // about — block 0's element gets RTN's own nibble (nothing
+        // upstream to shift it yet), and block 1's element receives
+        // exactly the uniform shift block 0 propagated forward, with
+        // nothing else in either block to perturb it further.
+        block.push(cluster_val);
+        block.push(100.0f32);
+        block
+    }
+
+    fn sse(original: &[f32], reconstructed: &[f32]) -> f64 {
+        original
+            .iter()
+            .zip(reconstructed.iter())
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_compensated_error_feedback_reduces_sse_on_correlated_matrix() {
+        // Two identical 32-wide blocks in one row, each with exactly one
+        // off-grid ("cluster") column plus a 0/100 anchor pair that forces
+        // a coarse block scale. Block 0's cluster column has nothing
+        // upstream of it, so it quantizes exactly as RTN would (same
+        // nibble) and propagates its rounding error forward as a shift
+        // that lands *uniformly* on every column of block 1 (all of block
+        // 1 is still un-quantized while block 0 runs, so each of block 0's
+        // propagate() calls adds the same amount to every one of block 1's
+        // columns). A uniform shift does not change block 1's own min/max
+        // range (hence not its scale), only its bias — so block 1's
+        // cluster column resolves to the *same* nibble RTN would have
+        // picked, but its dequantized value is offset by that shift. This
+        // is provably a strict SSE win as long as the shift has the same
+        // sign as block 1's own (would-be) RTN error and is smaller than
+        // twice its magnitude — i.e. mean-centering: block 1's total
+        // squared error becomes `(rtn_error - shift)^2 < rtn_error^2` for
+        // any `0 < shift < 2*rtn_error` of matching sign, which is exactly
+        // the near-zero (~-0.05) shift this construction produces relative
+        // to block 1's own ~-1.64 baseline error. Only one off-grid column
+        // per block (the rest are exact-zero anchors) means neither block
+        // has any intra-block cascading to reason about — block 0's own
+        // total error is therefore unchanged from RTN, so the net effect
+        // on the whole row is exactly block 1's (small, strictly negative)
+        // SSE change.
+        let mut row = biased_cluster_block(5.03);
+        row.extend(biased_cluster_block(5.03));
+        assert_eq!(row.len(), 64);
+
+        let shape = [1usize, 64usize];
+        let rtn = quantize_f32_to_q4(&row, &shape).unwrap();
+        let compensated =
+            quantize_f32_to_q4_compensated(&row, &shape, Q4Compensation::ErrorFeedback).unwrap();
+
+        let rtn_recon = dequantize_q4_to_f32(&rtn);
+        let comp_recon = dequantize_q4_to_f32(&compensated);
+        assert_eq!(rtn_recon.len(), row.len());
+        assert_eq!(comp_recon.len(), row.len());
+
+        let sse_rtn = sse(&row, &rtn_recon);
+        let sse_compensated = sse(&row, &comp_recon);
+
+        assert!(
+            sse_compensated < sse_rtn,
+            "error-feedback compensation must strictly reduce total squared \
+             reconstruction error on this correlated matrix: rtn={sse_rtn}, \
+             compensated={sse_compensated}"
+        );
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_compensated_error_feedback_rejects_non_2d_shape() {
+        let src = synthetic_f32_uniform(64, 7);
+        let err =
+            quantize_f32_to_q4_compensated(&src, &[64], Q4Compensation::ErrorFeedback).unwrap_err();
+        assert!(
+            matches!(err, InferenceError::InvalidInput(_)),
+            "1-D shape must be rejected under ErrorFeedback (column-sequential \
+             compensation needs an explicit [rows, cols] matrix)"
+        );
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_compensated_error_feedback_rejects_non_finite() {
+        // Mirrors the non-finite guard in `quantize_block_with_mode_len` /
+        // `quantize_f32_to_q4` (quantizer non-finite-guard class, #452):
+        // NaN/Inf must fail closed on the compensated path too, not just
+        // the RTN path it wraps.
+        let mut row = biased_cluster_block(5.03);
+        row.extend(biased_cluster_block(5.03));
+        row[40] = f32::NAN;
+        let shape = [1usize, 64usize];
+        let err = quantize_f32_to_q4_compensated(&row, &shape, Q4Compensation::ErrorFeedback)
+            .unwrap_err();
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+
+        let mut row_inf = biased_cluster_block(5.03);
+        row_inf.extend(biased_cluster_block(5.03));
+        row_inf[10] = f32::INFINITY;
+        let err_inf =
+            quantize_f32_to_q4_compensated(&row_inf, &shape, Q4Compensation::ErrorFeedback)
+                .unwrap_err();
+        assert!(matches!(err_inf, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_compensated_error_feedback_rejects_shape_data_mismatch() {
+        let src = synthetic_f32_uniform(64, 11);
+        let result = std::panic::catch_unwind(|| {
+            quantize_f32_to_q4_compensated(&src, &[2, 40], Q4Compensation::ErrorFeedback)
+        });
+        assert!(
+            result.is_err(),
+            "shape/data length mismatch must panic via assert_shape_matches_data_len, \
+             matching quantize_f32_to_q4's contract"
+        );
+    }
+
+    #[test]
+    fn uniform_feedback_propagates_full_error_evenly_across_remaining_columns() {
+        // Direct unit test of the ColumnErrorWeighting seam, independent of
+        // the full quantization loop.
+        let weighting = UniformFeedback;
+        let mut working = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        weighting.propagate(4.0, 1, &mut working);
+        // col=1 -> remaining = working[2..] = 3 columns, share = 4.0/3.
+        assert_eq!(
+            working[0], 1.0,
+            "already-quantized columns must be untouched"
+        );
+        assert_eq!(
+            working[1], 2.0,
+            "the just-quantized column itself is untouched"
+        );
+        let share = 4.0f32 / 3.0;
+        assert!((working[2] - (3.0 + share)).abs() < 1e-6);
+        assert!((working[3] - (4.0 + share)).abs() < 1e-6);
+        assert!((working[4] - (5.0 + share)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn uniform_feedback_propagate_on_last_column_is_a_noop() {
+        let weighting = UniformFeedback;
+        let mut working = vec![1.0f32, 2.0, 3.0];
+        weighting.propagate(9.0, 2, &mut working);
+        assert_eq!(
+            working,
+            vec![1.0, 2.0, 3.0],
+            "no remaining columns to receive the error"
+        );
     }
 }
