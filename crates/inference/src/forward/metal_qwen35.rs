@@ -28250,6 +28250,25 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             best
         }
 
+        /// Mirror `Qwen35Model::from_safetensors`: weights are present in
+        /// EITHER the single-file layout (`model.safetensors`) or the
+        /// sharded layout (`model.safetensors.index.json`) — an HF
+        /// `snapshot_download` of this model ships only the sharded form.
+        fn qwen35_checkpoint_weights_present(model_dir: &std::path::Path) -> bool {
+            model_dir.join("model.safetensors").exists()
+                || model_dir.join("model.safetensors.index.json").exists()
+        }
+
+        #[test]
+        fn qwen35_checkpoint_weights_present_accepts_sharded_layout() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            assert!(!qwen35_checkpoint_weights_present(dir.path()));
+
+            std::fs::write(dir.path().join("model.safetensors.index.json"), "{}")
+                .expect("write index");
+            assert!(qwen35_checkpoint_weights_present(dir.path()));
+        }
+
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn metal_qwen35_chunked_prefill_long_prompt_matches_step_loop() {
@@ -28260,7 +28279,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists()
+            if !qwen35_checkpoint_weights_present(&model_dir)
                 || !model_dir.join("config.json").exists()
                 || !model_dir.join("tokenizer.json").exists()
             {
@@ -28367,7 +28386,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists()
+            if !qwen35_checkpoint_weights_present(&model_dir)
                 || !model_dir.join("config.json").exists()
                 || !model_dir.join("tokenizer.json").exists()
             {
@@ -28469,7 +28488,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists()
+            if !qwen35_checkpoint_weights_present(&model_dir)
                 || !model_dir.join("config.json").exists()
                 || !model_dir.join("tokenizer.json").exists()
             {
@@ -28554,7 +28573,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists()
+            if !qwen35_checkpoint_weights_present(&model_dir)
                 || !model_dir.join("config.json").exists()
                 || !model_dir.join("tokenizer.json").exists()
             {
@@ -28797,7 +28816,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists() {
+            if !qwen35_checkpoint_weights_present(&model_dir) {
                 eprintln!("skipping: model missing");
                 return;
             }
@@ -28850,7 +28869,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists() {
+            if !qwen35_checkpoint_weights_present(&model_dir) {
                 eprintln!("skipping: model missing");
                 return;
             }
@@ -28979,7 +28998,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists() {
+            if !qwen35_checkpoint_weights_present(&model_dir) {
                 eprintln!(
                     "skipping gdn_chunked_prefill_vs_serial_prefill_logit_parity: model missing"
                 );
@@ -29169,7 +29188,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists() {
+            if !qwen35_checkpoint_weights_present(&model_dir) {
                 eprintln!("skipping gdn175_s1b_chunkwise_oracle_real_activations: model missing");
                 return;
             }
@@ -29472,7 +29491,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let model_dir =
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
                     .join(".lattice/models/qwen3.5-0.8b");
-            if !model_dir.join("model.safetensors").exists() {
+            if !qwen35_checkpoint_weights_present(&model_dir) {
                 eprintln!("skipping: model missing");
                 return;
             }
