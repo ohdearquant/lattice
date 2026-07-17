@@ -39,8 +39,11 @@ use crate::grammar::pda::{
     CompiledGrammar, GrammarState, SimResult, StepResult, advance_byte, simulate_token,
 };
 use crate::grammar::spec::GrammarSpec;
+use crate::grammar::trie::ByteTrie;
 use crate::grammar::vocab_partition::VocabPartition;
 use std::fmt;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Profiling instrumentation (issue #734 diagnostics)
@@ -262,9 +265,18 @@ pub struct GrammarEngine {
     vocab_bytes: Vec<Vec<u8>>,
     /// Set when state enumeration in `new` hit `MAX_GRAMMAR_STATES` before
     /// exhausting the reachable state graph: some runtime states then have
-    /// no precomputed mask and fall back to `mask_by_simulation` (a
-    /// full-vocab scan per token). See `exceeds_state_budget`.
+    /// no precomputed mask and fall back to `mask_by_trie`. See
+    /// `exceeds_state_budget`.
     state_limit_exceeded: bool,
+    /// Byte trie over `vocab_bytes`, used by `mask_by_trie` for states with
+    /// no precomputed mask. Built lazily on first use (`OnceLock`) so
+    /// grammars that never exceed `MAX_GRAMMAR_STATES` — the common case —
+    /// never pay the build cost.
+    trie: OnceLock<ByteTrie>,
+    /// Nanoseconds spent building `trie`, captured the one time
+    /// `trie.get_or_init` actually runs the builder. Zero until the trie
+    /// has been built at least once.
+    trie_build_ns: AtomicU64,
 }
 
 impl GrammarEngine {
@@ -326,7 +338,17 @@ impl GrammarEngine {
             vocab_size,
             vocab_bytes,
             state_limit_exceeded,
+            trie: OnceLock::new(),
+            trie_build_ns: AtomicU64::new(0),
         })
+    }
+
+    /// Nanoseconds spent building the byte trie used by `mask_by_trie`, or 0
+    /// if the trie has not been built yet (grammar never hit an over-cap
+    /// state, or none has been masked yet). Diagnostic accessor for
+    /// self-measurement harnesses.
+    pub fn trie_build_ns(&self) -> u64 {
+        self.trie_build_ns.load(Ordering::Relaxed)
     }
 
     /// True when state enumeration hit `MAX_GRAMMAR_STATES` (256) before
@@ -432,13 +454,14 @@ impl GrammarEngine {
                 // be unsound: tokens valid only at position 0 (e.g. an opening
                 // quote) would be left allowed at a deep state, and single-byte
                 // tokens are not in the context-dependent recheck set, so nothing
-                // would correct them. Compute the exact mask by simulating every
-                // token against the actual state instead. This is the universal
-                // algorithm the precomputed table caches; it is sound and live
-                // (a fully fail-closed "block everything" fallback would be sound
-                // but would stall generation by leaving no legal token).
+                // would correct them. Compute the exact mask via the byte trie
+                // instead — same contract as `mask_by_simulation` (only cheaper:
+                // a rejected byte prunes every token sharing that prefix in one
+                // step instead of re-walking each one independently).
+                // `mask_by_simulation` stays available as the oracle for the
+                // differential tests below and as a manual fallback.
                 let t0 = profiling.then(std::time::Instant::now);
-                self.mask_by_simulation(state, logits);
+                self.mask_by_trie(state, logits);
                 if let Some(t0) = t0 {
                     let ns = find_ns + t0.elapsed().as_nanos() as u64;
                     MASK_PROFILE.with(|p| {
@@ -453,12 +476,14 @@ impl GrammarEngine {
 
     /// Compute the grammar mask for `state` directly by simulating every token.
     ///
-    /// Used as the exact fallback for runtime states that are not present in the
-    /// precomputed partition (grammars exceeding `MAX_GRAMMAR_STATES`). Blocks
-    /// every token whose byte sequence does not fully advance the PDA from
-    /// `state`. Cost: O(vocab_size × token_len); only invoked on the unknown-state
-    /// path, never for grammars within the state cap.
-    fn mask_by_simulation(&self, state: &GrammarState, logits: &mut [f32]) {
+    /// This was the over-cap fallback in `mask_logits` before the byte-trie
+    /// path (`mask_by_trie`) replaced it on the hot path (issue #734: this
+    /// full-vocab independent simulation is O(vocab_size × token_len) and
+    /// dominates decode-step wall time for schemas that exceed
+    /// `MAX_GRAMMAR_STATES`). It defines the mask contract `mask_by_trie`
+    /// must reproduce exactly and stays public as the oracle for the
+    /// differential tests below and as a slow-path manual escape hatch.
+    pub fn mask_by_simulation(&self, state: &GrammarState, logits: &mut [f32]) {
         for token_id in 0..self.vocab_size {
             if logits[token_id] == f32::NEG_INFINITY {
                 continue;
@@ -473,6 +498,23 @@ impl GrammarEngine {
                 logits[token_id] = f32::NEG_INFINITY;
             }
         }
+    }
+
+    /// Compute the grammar mask for `state` via the byte trie.
+    ///
+    /// Same contract as `mask_by_simulation` (see [`crate::grammar::trie`]),
+    /// used as the over-cap fallback in `mask_logits` in place of the
+    /// full-vocab independent simulation. Builds the trie on first use and
+    /// reuses it for every subsequent call against this engine.
+    fn mask_by_trie(&self, state: &GrammarState, logits: &mut [f32]) {
+        let trie = self.trie.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let built = ByteTrie::build(&self.vocab_bytes);
+            self.trie_build_ns
+                .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            built
+        });
+        trie.mask(state, &self.grammar, self.vocab_size, logits);
     }
 
     /// Advance the grammar state by one token.
@@ -931,5 +973,293 @@ mod tests {
         for i in 2..130 {
             assert_eq!(logits[i], f32::NEG_INFINITY, "token {i} should be blocked");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Trie-mask differential tests (issue #734 fix)
+    //
+    // `mask_by_trie` must reproduce `mask_by_simulation`'s mask bit for
+    // bit. These tests harvest a corpus of real grammar states from a
+    // generation trajectory against the exact schema shape
+    // `gramperf_profile` profiles (crates/inference/src/bin/
+    // gramperf_profile.rs), then compare the two algorithms directly.
+    // -----------------------------------------------------------------
+
+    /// The #734-shape schema from `gramperf_profile`: 4 nested object
+    /// levels, 3 array fields, 6 six-member string enums. Reused verbatim
+    /// (not approximated) so this corpus exercises the same structural
+    /// over-cap behavior the profiling report measured.
+    fn trie_diff_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "level1": {
+                    "type": "object",
+                    "properties": {
+                        "level2": {
+                            "type": "object",
+                            "properties": {
+                                "level3": {
+                                    "type": "object",
+                                    "properties": {
+                                        "level4": {
+                                            "type": "object",
+                                            "properties": {
+                                                "status": {"type": "string", "enum": ["active", "inactive", "pending", "archived", "deleted", "draft"]},
+                                                "value": {"type": "integer"}
+                                            },
+                                            "required": ["status", "value"]
+                                        }
+                                    },
+                                    "required": ["level4"]
+                                },
+                                "category": {"type": "string", "enum": ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]}
+                            },
+                            "required": ["level3", "category"]
+                        },
+                        "tags": {"type": "array", "items": {"type": "string"}}
+                    },
+                    "required": ["level2", "tags"]
+                },
+                "items": {"type": "array", "items": {"type": "integer"}},
+                "flags": {"type": "array", "items": {"type": "boolean"}},
+                "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent", "critical", "none"]},
+                "region": {"type": "string", "enum": ["us", "eu", "apac", "latam", "mea", "other"]},
+                "mode": {"type": "string", "enum": ["sync", "async", "batch", "stream", "manual", "auto"]},
+                "role": {"type": "string", "enum": ["admin", "user", "guest", "owner", "viewer", "editor"]}
+            },
+            "required": ["level1", "items", "flags", "priority", "region", "mode", "role"]
+        })
+    }
+
+    /// Synthetic vocabulary sized for fast unit tests (not the real 248K
+    /// tokenizer vocab): every single byte (so the trie branches fully at
+    /// every depth, matching the real vocab's near-total root fan-out)
+    /// plus multi-byte literal fragments drawn from the schema's property
+    /// names, enum members, and JSON keywords, so the trie also exercises
+    /// prefix-shared, straight-line multi-byte runs.
+    fn trie_diff_vocab() -> Vec<Vec<u8>> {
+        let mut vocab: Vec<Vec<u8>> = (0u16..256).map(|b| vec![b as u8]).collect();
+        let fragments: &[&str] = &[
+            "\"level1\"",
+            "\"level2\"",
+            "\"level3\"",
+            "\"level4\"",
+            "\"status\"",
+            "\"value\"",
+            "\"category\"",
+            "\"tags\"",
+            "\"items\"",
+            "\"flags\"",
+            "\"priority\"",
+            "\"region\"",
+            "\"mode\"",
+            "\"role\"",
+            "\"active\"",
+            "\"inactive\"",
+            "\"pending\"",
+            "\"archived\"",
+            "\"deleted\"",
+            "\"draft\"",
+            "\"alpha\"",
+            "\"beta\"",
+            "\"gamma\"",
+            "\"delta\"",
+            "\"epsilon\"",
+            "\"zeta\"",
+            "\"low\"",
+            "\"medium\"",
+            "\"high\"",
+            "\"urgent\"",
+            "\"critical\"",
+            "\"none\"",
+            "\"us\"",
+            "\"eu\"",
+            "\"apac\"",
+            "\"latam\"",
+            "\"mea\"",
+            "\"other\"",
+            "\"sync\"",
+            "\"async\"",
+            "\"batch\"",
+            "\"stream\"",
+            "\"manual\"",
+            "\"auto\"",
+            "\"admin\"",
+            "\"user\"",
+            "\"guest\"",
+            "\"owner\"",
+            "\"viewer\"",
+            "\"editor\"",
+            "true",
+            "false",
+            "null",
+        ];
+        for f in fragments {
+            vocab.push(f.as_bytes().to_vec());
+        }
+        vocab
+    }
+
+    /// A minified, schema-valid JSON instance. `serde_json::Value::Object`
+    /// is a `BTreeMap` in this workspace (no `preserve_order` feature), so
+    /// `compile_object`'s property order — and therefore the required-key
+    /// order the PDA enforces — is alphabetical-by-key, not `properties`
+    /// declaration order or `required`-array order; this instance's key
+    /// order at every nesting level is alphabetical to match (top:
+    /// flags, items, level1, mode, priority, region, role; level2:
+    /// category, level3 — note `category` sorts before `level3`). Walking
+    /// this byte-by-byte through the PDA is the "generation trajectory"
+    /// the corpus is harvested from: its byte positions span the initial
+    /// state (byte 0), deep nesting (into level1/level2/level3/level4),
+    /// inside-string (mid `"active`), inside-enum-literal (mid `"alpha`,
+    /// `"low`, `"sync`, ...), post-number (right after `42`, `1`, `2`,
+    /// `3`), and near-complete (the last few closing-brace bytes) — the
+    /// edge-state categories the correctness bar requires, without needing
+    /// a separate hand-built state per category.
+    const TRIE_DIFF_INSTANCE: &str = r#"{"flags":[true,false],"items":[1,2,3],"level1":{"level2":{"category":"alpha","level3":{"level4":{"status":"active","value":42}}},"tags":["x","y"]},"mode":"sync","priority":"low","region":"us","role":"admin"}"#;
+
+    /// Harvest a corpus of distinct grammar states by advancing `engine`
+    /// byte-by-byte through [`TRIE_DIFF_INSTANCE`], deduping by PDA
+    /// identity (`states_equal`, same identity `find_state_id` uses).
+    /// Panics with the failing byte position if the instance is rejected —
+    /// a silent partial trajectory would silently shrink the corpus
+    /// instead of failing the test that depends on its size.
+    fn harvest_trajectory_states(engine: &GrammarEngine) -> Vec<GrammarState> {
+        let mut state = engine.initial_state();
+        let mut corpus = vec![state.clone()];
+        for (i, &b) in TRIE_DIFF_INSTANCE.as_bytes().iter().enumerate() {
+            let step = advance_byte(&mut state, &engine.grammar, b);
+            assert_eq!(
+                step,
+                StepResult::Accepted,
+                "trajectory instance rejected at byte {i} ({:?}); fixture is out of \
+                 sync with the schema",
+                b as char
+            );
+            if !corpus.iter().any(|s| states_equal(s, &state)) {
+                corpus.push(state.clone());
+            }
+        }
+        assert!(
+            state.is_complete(),
+            "trajectory instance must fully complete the grammar"
+        );
+        corpus
+    }
+
+    #[test]
+    fn trie_mask_byte_identical_to_oracle_over_corpus() {
+        let vocab = trie_diff_vocab();
+        let spec = GrammarSpec::JsonSchema(trie_diff_schema());
+        let engine = GrammarEngine::new(&spec, vocab.clone()).unwrap();
+        assert!(
+            engine.exceeds_state_budget(),
+            "fixture must exceed the state cap for this differential to exercise \
+             the fallback path (the point of this test)"
+        );
+
+        let corpus = harvest_trajectory_states(&engine);
+        assert!(
+            corpus.len() >= 20,
+            "need at least 20 distinct harvested states, got {}",
+            corpus.len()
+        );
+
+        let mut over_cap_states = 0usize;
+        for (i, state) in corpus.iter().enumerate() {
+            let mut oracle_logits = vec![0.0f32; vocab.len()];
+            let mut trie_logits = vec![0.0f32; vocab.len()];
+            engine.mask_by_simulation(state, &mut oracle_logits);
+            engine.mask_by_trie(state, &mut trie_logits);
+            if engine.find_state_id(state).is_none() {
+                over_cap_states += 1;
+            }
+            for tok in 0..vocab.len() {
+                assert_eq!(
+                    trie_logits[tok],
+                    oracle_logits[tok],
+                    "state #{i}: token {tok} ({:?}) mismatch — trie={} oracle={}",
+                    String::from_utf8_lossy(&vocab[tok]),
+                    trie_logits[tok],
+                    oracle_logits[tok]
+                );
+            }
+        }
+        assert!(
+            over_cap_states >= 15,
+            "corpus should mostly cover the over-cap fallback path (the profiling \
+             report measured a 98% fallback rate on this schema shape); got \
+             {over_cap_states}/{}",
+            corpus.len()
+        );
+    }
+
+    #[test]
+    fn trie_mask_never_over_accepts_vs_oracle() {
+        // P0, reported separately from the byte-identical test above: this
+        // isolates the over-accept direction (trie allows a token the
+        // oracle rejects) so a prune-logic regression that only
+        // over-accepts is caught and reported distinctly from an
+        // under-accept regression.
+        let vocab = trie_diff_vocab();
+        let spec = GrammarSpec::JsonSchema(trie_diff_schema());
+        let engine = GrammarEngine::new(&spec, vocab.clone()).unwrap();
+        let corpus = harvest_trajectory_states(&engine);
+
+        let mut over_accepts: Vec<(usize, Vec<u8>)> = Vec::new();
+        for state in &corpus {
+            let mut oracle_logits = vec![0.0f32; vocab.len()];
+            let mut trie_logits = vec![0.0f32; vocab.len()];
+            engine.mask_by_simulation(state, &mut oracle_logits);
+            engine.mask_by_trie(state, &mut trie_logits);
+            for tok in 0..vocab.len() {
+                let oracle_blocked = oracle_logits[tok] == f32::NEG_INFINITY;
+                let trie_allowed = trie_logits[tok] != f32::NEG_INFINITY;
+                if oracle_blocked && trie_allowed {
+                    over_accepts.push((tok, vocab[tok].clone()));
+                }
+            }
+        }
+        assert!(
+            over_accepts.is_empty(),
+            "trie over-accepted {} token(s) the oracle rejects (P0 soundness \
+             violation): {:?}",
+            over_accepts.len(),
+            over_accepts
+                .iter()
+                .take(5)
+                .map(|(id, bytes)| (id, String::from_utf8_lossy(bytes).to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trie_routes_over_cap_states_through_mask_logits() {
+        // End-to-end wiring check: the public `mask_logits` entry point
+        // (not the private helpers) must actually route over-cap states
+        // through the trie and produce the same result as calling the
+        // oracle directly — guards against the routing edit in
+        // `mask_logits` silently going stale if the fallback call site
+        // changes again.
+        let vocab = trie_diff_vocab();
+        let spec = GrammarSpec::JsonSchema(trie_diff_schema());
+        let engine = GrammarEngine::new(&spec, vocab.clone()).unwrap();
+        let corpus = harvest_trajectory_states(&engine);
+        let deep_state = corpus
+            .iter()
+            .find(|s| engine.find_state_id(s).is_none())
+            .expect("corpus must contain at least one over-cap state");
+
+        let mut via_mask_logits = vec![0.0f32; vocab.len()];
+        let mut oracle_logits = vec![0.0f32; vocab.len()];
+        let mut state_for_public_call = deep_state.clone();
+        engine.mask_logits(&mut state_for_public_call, &mut via_mask_logits);
+        engine.mask_by_simulation(deep_state, &mut oracle_logits);
+
+        assert_eq!(
+            via_mask_logits, oracle_logits,
+            "mask_logits on an over-cap state must match the oracle mask exactly"
+        );
     }
 }

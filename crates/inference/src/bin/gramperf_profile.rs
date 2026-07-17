@@ -203,7 +203,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
              precomputed_ns_per_step={} context_recheck_calls={} context_recheck_ns={} \
              context_recheck_ns_per_step={} fallback_calls={} fallback_ns={} \
              fallback_ns_per_step={} advance_calls={} advance_ns={} advance_ns_per_step={} \
-             residual_ns_per_step={} stop_reason={:?}",
+             residual_ns_per_step={} stop_reason={:?} trie_build_ns={}",
             output.generated_tokens,
             wall_ns / steps,
             mp.precomputed_calls,
@@ -226,6 +226,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mp.advance_ns / steps,
             residual_ns / steps,
             output.stop_reason,
+            engine.trie_build_ns(),
         );
         if i == 0 {
             grammar_token_ids = output.token_ids.clone();
@@ -260,6 +261,101 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
              wall_ns_per_step={}",
             output.generated_tokens,
             wall_ns / steps,
+        );
+    }
+
+    // (e) Multi-request cross-request state-revisit measurement. Gates the
+    // GrammarEngine-lifetime memoized-mask decision from the profiling
+    // report's ranked fix #2 (measurement only — no memo is implemented
+    // here). M=5 sequential generations share the SAME `engine` Arc (the
+    // production caching unit: one compiled schema reused across many
+    // requests), each with different prompt wording so content-dependent
+    // states (which enum member, which digits) can plausibly diverge
+    // across requests while schema-literal scaffold states (JSON
+    // punctuation, property-name keys) should still recur. A
+    // `(stack, complete)` visit map persists across all M runs — a hit
+    // means a later request landed on a state some earlier request already
+    // visited, which a per-engine (not per-request) memoized mask cache
+    // could have served from cache.
+    {
+        let multi_prompts = [
+            "Generate a JSON object describing a record with a deeply \
+             nested configuration, some tags and numeric items, and a \
+             handful of categorical flags.",
+            "Produce a JSON object for a different record with its own \
+             nested configuration, different tags, different numeric \
+             items, and different categorical flags.",
+            "Emit a JSON object representing yet another record: nested \
+             configuration, a fresh set of tags, fresh numeric items, and \
+             fresh categorical flags.",
+            "Return a JSON object for a new record instance with a \
+             distinct nested configuration, distinct tags, distinct \
+             numeric items, and distinct categorical flags.",
+            "Write a JSON object capturing one more record: its own \
+             nested configuration, its own tags, its own numeric items, \
+             and its own categorical flags.",
+        ];
+        let m = multi_prompts.len();
+        let mut cross_request_visits: HashMap<(Vec<StackFrame>, bool), u32> = HashMap::new();
+        let mut total_steps = 0u64;
+        let mut cross_request_hits = 0u64;
+
+        for (run_idx, p) in multi_prompts.iter().enumerate() {
+            metal.reset_state();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: max_tokens,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: None,
+                grammar: Some(Arc::clone(&engine)),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+            let output = metal.generate(p, &tokenizer, &gen_cfg)?;
+
+            // Replay this run's token sequence through the SAME engine
+            // (fresh GrammarState per run — one request = one decode
+            // sequence — but `cross_request_visits` persists across runs)
+            // to count revisits against states seen in EARLIER runs.
+            let mut state = engine.initial_state();
+            let mut new_states_this_run = 0u64;
+            for &token_id in &output.token_ids {
+                let key: (Vec<StackFrame>, bool) = (state.stack.clone(), state.complete);
+                if cross_request_visits.contains_key(&key) {
+                    cross_request_hits += 1;
+                } else {
+                    new_states_this_run += 1;
+                }
+                *cross_request_visits.entry(key).or_insert(0) += 1;
+                total_steps += 1;
+                if !engine.advance(&mut state, token_id) {
+                    break;
+                }
+            }
+            println!(
+                "RESULT kind=multi_request_run run={run_idx} generated_tokens={} \
+                 new_states={new_states_this_run}",
+                output.generated_tokens,
+            );
+        }
+
+        let hit_rate = if total_steps > 0 {
+            cross_request_hits as f64 / total_steps as f64
+        } else {
+            0.0
+        };
+        println!(
+            "RESULT kind=multi_request_summary requests={m} total_steps={total_steps} \
+             cross_request_hits={cross_request_hits} cross_request_hit_rate={hit_rate:.4} \
+             distinct_states_total={} trie_build_ns={}",
+            cross_request_visits.len(),
+            engine.trie_build_ns(),
         );
     }
 
