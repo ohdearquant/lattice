@@ -35596,6 +35596,56 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false);
         }
     }
+
+    /// D_1 measurement harness (`bin/d1_profile.rs`, GATES.md pre-registration
+    /// 20260717): exposes the real MTP draft/verify forwards so the harness can
+    /// time each call directly from outside with a plain CPU `Instant`, the same
+    /// no-internal-instrumentation approach `bench_support`'s
+    /// `forward_prefill_production_chunk` uses above. Gated on `bench-internals`
+    /// like the rest of this file's bench-only surface, so production decode is
+    /// untouched (these are thin pass-throughs to the existing private methods,
+    /// not new timing code).
+    #[cfg(feature = "bench-internals")]
+    impl MetalQwen35State {
+        /// One MTP draft forward at `position`, predicting from `pending_token`.
+        /// Identical to the call `generate_greedy_mtp` makes in its draft phase
+        /// (see the `t_mtp` timing block above in this file).
+        pub fn d1_mtp_draft_step(&mut self, pending_token: u32, position: usize) -> u32 {
+            self.mtp_forward_one(pending_token, position).token_id
+        }
+
+        /// One K=1 verify batch validating `draft_token` at `position`, identical
+        /// to `generate_greedy_mtp`'s verify phase (non-batch-GEMM path — the
+        /// default when `LATTICE_MTP_BATCH` is unset). Returns the argmax of the
+        /// bonus-position logits (the target's own next-token prediction),
+        /// mirroring the full-accept happy path so the harness's decode loop
+        /// advances with real per-position content instead of a synthetic
+        /// token. Accept/reject bookkeeping is intentionally not reproduced
+        /// here: D_1 is a draft/verify *cost* anchor (GATES.md), not an
+        /// acceptance-rate measurement, and always-accept is what
+        /// `verify_tokens_batched` itself already advances the KV cache and GDN
+        /// state for.
+        pub fn d1_mtp_verify_step(
+            &mut self,
+            pending_token: u32,
+            draft_token: u32,
+            position: usize,
+        ) -> Result<u32, String> {
+            let out = self
+                .verify_tokens_batched(&[pending_token, draft_token], position)
+                .map_err(|e| e.to_string())?;
+            let bonus_logits = &out.logits[1];
+            let mut best_id = 0u32;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, &v) in bonus_logits.iter().enumerate() {
+                if v > best_val {
+                    best_val = v;
+                    best_id = i as u32;
+                }
+            }
+            Ok(best_id)
+        }
+    }
 }
 
 // Stage-1 block-top-k and the full-logit lm_head both accumulate ~1K f32

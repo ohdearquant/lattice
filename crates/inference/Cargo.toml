@@ -112,6 +112,11 @@ path = "src/bin/bench_gdn_prefill_ab.rs"
 required-features = ["f16", "metal-gpu", "bench-internals"]
 
 [[bin]]
+name = "d1_profile"
+path = "src/bin/d1_profile.rs"
+required-features = ["f16", "metal-gpu", "bench-internals"]
+
+[[bin]]
 name = "bench_lora_mixture"
 path = "src/bin/bench_lora_mixture.rs"
 required-features = ["f16", "metal-gpu"]
