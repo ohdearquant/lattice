@@ -2713,6 +2713,13 @@ mod tests {
         metrics.logits_max_abs <= 5e-3 && metrics.first_mixer_residual_rel_l2 <= 1e-4
     }
 
+    fn fp16_gate4_contract_passes(metrics: &Fp16GateMetrics) -> bool {
+        metrics.logits_max_abs <= 5e-3
+            && metrics.first_mixer_residual_rel_l2 <= 1e-4
+            && metrics.later_residual_max_rel_l2 <= 5e-4
+            && metrics.replay_max_abs == 0.0
+    }
+
     fn write_gate_artifact_if_missing(
         output_dir: &Path,
         config_json: &str,
@@ -2788,6 +2795,25 @@ mod tests {
                 "linear_attn.conv1d.weight",
                 "linear_attn.norm.weight",
                 "linear_attn.out_proj.weight",
+            ] {
+                restore_original_tensor(target, original, format!("{prefix}.{suffix}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_original_dense_mlp_tensors(
+        target: &mut HashMap<String, TensorEntry>,
+        original: &HashMap<String, TensorEntry>,
+        config: &Qwen35Config,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for layer_i in 0..config.num_hidden_layers {
+            let prefix = format!("model.language_model.layers.{layer_i}");
+            for suffix in [
+                "post_attention_layernorm.weight",
+                "mlp.gate_proj.weight",
+                "mlp.up_proj.weight",
+                "mlp.down_proj.weight",
             ] {
                 restore_original_tensor(target, original, format!("{prefix}.{suffix}"))?;
             }
@@ -3065,6 +3091,93 @@ mod tests {
         } else {
             println!("FP16_LADDER_DECISION no_mechanism_found online_rotation_or_trace_remains");
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires LATTICE_QUAROT_REAL_MODEL_DIR and writes a test-only F16 0.8B MLP-boundary artifact"]
+    fn real_qwen35_fp16_rotation_mlp_only_gate() -> Result<(), Box<dyn std::error::Error>> {
+        let input_dir = PathBuf::from(env::var("LATTICE_QUAROT_REAL_MODEL_DIR")?);
+        let output_root = PathBuf::from(env::var("LATTICE_QUAROT_FP16_GATE_DIR")?);
+
+        const SEED: u64 = 0x00C0_FFEE;
+        const PROMPT: &str = "The capital of France is Paris, and the capital of Japan is Tokyo.";
+        let config_json = fs::read_to_string(input_dir.join("config.json"))?;
+        let config = Qwen35Config::from_config_json_str(&config_json)?;
+        let reader = QuarotTensorReader::open(&input_dir)?;
+        let required_names = qwen_required_tensor_names(&config);
+        let mut original = load_tensors_f64(&reader, &required_names)?;
+        materialize_lm_head_for_qwen35(&mut original, &config)?;
+        let mut rotated = original.clone();
+        let mut full_fusion_plan = qwen35_per_layer_fusion_plan(&config)?;
+        full_fusion_plan.push(qwen35_final_norm_fusion_target());
+        let rotation = RandomizedHadamard::new(SEED, config.hidden_size)?;
+        fuse_rmsnorms(&mut rotated, &full_fusion_plan)?;
+        absorb_rotations(
+            &mut rotated,
+            &RotationPlan::qwen35_residual_stream_linear_layers(),
+            &rotation,
+        )?;
+
+        let gate_config = untie_word_embeddings_in_config_json(&config_json)?;
+        let baseline_dir = output_root.join("baseline");
+        let rotated_dir = output_root.join("rotated");
+        assert!(
+            baseline_dir.join("model.safetensors").is_file()
+                && rotated_dir.join("model.safetensors").is_file(),
+            "FP16 Gate 4 requires the reusable baseline and rotated artifacts under {}",
+            output_root.display()
+        );
+
+        let mlp_only_dir = output_root.join("gate4-mlp-only-boundary");
+        restore_original_dense_mlp_tensors(&mut rotated, &original, &config)?;
+        write_gate_artifact_if_missing(
+            &mlp_only_dir,
+            &gate_config,
+            &input_dir.join("tokenizer.json"),
+            &rotated,
+        )?;
+        drop(rotated);
+
+        let baseline = crate::model::qwen35::Qwen35Model::from_safetensors(&baseline_dir)?;
+        let candidate = crate::model::qwen35::Qwen35Model::from_safetensors(&mlp_only_dir)?;
+        let tokenizer = BpeTokenizer::from_tokenizer_json(&input_dir.join("tokenizer.json"))?;
+        let tokenized = tokenizer.tokenize(PROMPT);
+        let tokens = tokenized.input_ids[..tokenized.real_length.min(8)].to_vec();
+        assert!(tokens.len() >= 2, "FP16 Gate 4 prompt tokenized too short");
+
+        let metrics = fp16_gate_metrics(
+            &baseline,
+            &candidate,
+            &tokens,
+            &rotation,
+            ResidualBoundaryControl {
+                original_mlp_boundaries: true,
+                ..ResidualBoundaryControl::default()
+            },
+            true,
+        )?;
+
+        println!(
+            "FP16_GATE4 seed=0x{SEED:08x} prompt={PROMPT:?} tokens={tokens:?} scored_tokens={}",
+            tokens.len() - 1
+        );
+        print_fp16_gate_metrics("FP16_GATE4 family=mlp_only_boundary", &metrics);
+        println!("FP16_GATE4 artifacts={}", mlp_only_dir.display());
+        if fp16_gate4_contract_passes(&metrics) {
+            println!("FP16_GATE4_DECISION CONFIRMED");
+        } else {
+            println!("FP16_GATE4_DECISION NOT_CONFIRMED");
+        }
+
+        assert!(
+            fp16_gate4_contract_passes(&metrics),
+            "FP16 Gate 4 MLP-only contract failed: max_logit={} first_mixer={} later_residual={} replay={}",
+            metrics.logits_max_abs,
+            metrics.first_mixer_residual_rel_l2,
+            metrics.later_residual_max_rel_l2,
+            metrics.replay_max_abs,
+        );
         Ok(())
     }
 
