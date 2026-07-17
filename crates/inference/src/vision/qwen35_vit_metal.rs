@@ -431,7 +431,7 @@ mod tests {
         let cfg = tiny_cfg();
         let weights = make_test_weights(&cfg);
         let png = make_test_png(8, 8);
-        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg).expect("preprocess");
+        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg, None).expect("preprocess");
 
         let cpu_out = qwen35_vit_forward(&weights, &cfg, &pixel_values, grid).expect("cpu forward");
         let metal_out =

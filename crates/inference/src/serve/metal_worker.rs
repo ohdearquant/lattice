@@ -51,7 +51,10 @@
 
 #[cfg(test)]
 use crate::forward::metal_qwen35::{ChatImage, ChatRole};
-use crate::forward::metal_qwen35::{ChatMessage, MetalQwen35State, format_chat_template};
+use crate::forward::metal_qwen35::{
+    ChatMessage, MetalQwen35State, format_chat_template, push_chat_turn_close, push_chat_turn_open,
+    render_chat_turn,
+};
 use crate::kv_cache::CrossTurnSlotId;
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
 use crate::serve::ApiError;
@@ -374,21 +377,24 @@ fn check_prompt_fits_window(
 }
 
 /// Render `messages` into the physical token id stream a [`Qwen35VisionRequest`]
-/// needs (ADR-069 S6): every turn is ChatML-rendered exactly like
-/// [`format_chat_template`], except the turn at `image_message_index` splices
-/// `vision_start_token_id`, `num_pads` copies of `image_token_id`, then
-/// `vision_end_token_id` between that turn's own `text_before` (`content`)
-/// and `text_after` (`image.text_after`) -- preserving the caller's
-/// original content-part order (PR #1021 review round 3: a prior version
-/// unconditionally inserted the vision span ahead of the turn's entire
+/// needs (ADR-069 S6): every turn is ChatML-rendered through the exact same shared
+/// turn primitives [`format_chat_template`] uses ([`render_chat_turn`] for a whole
+/// turn, [`push_chat_turn_open`]/[`push_chat_turn_close`] for the turn at
+/// `image_message_index`, which splices `vision_start_token_id`, `num_pads` copies
+/// of `image_token_id`, then `vision_end_token_id` between that turn's own
+/// `text_before` (`content`) and `text_after` (`image.text_after`) -- preserving
+/// the caller's original content-part order (PR #1021 review round 3: a prior
+/// version unconditionally inserted the vision span ahead of the turn's entire
 /// text, so `[text("before"), image, text("after")]` decoded as
-/// image -> "beforeafter" instead of "before" -> image -> "after"). Tokenizes
-/// in exactly two calls (the text before the spliced ids, then the text
-/// after) rather than one call per ChatML segment, so only the one
-/// unavoidable seam next to the numeric image-pad ids is exposed to
-/// cross-call BPE boundary effects -- every other turn boundary stays
-/// inside a single `tokenizer.tokenize` call, identical to the plain-text
-/// path.
+/// image -> "beforeafter" instead of "before" -> image -> "after"). Sharing the
+/// turn primitives with [`format_chat_template`] (PR #1021 review round 5) means
+/// there is exactly one definition of the ChatML layout (`<|im_start|>{role}\n` /
+/// `<|im_end|>\n`); editing it here automatically keeps the text-only path in
+/// sync, and vice versa. Tokenizes in exactly two calls (the text before the
+/// spliced ids, then the text after) rather than one call per ChatML segment, so
+/// only the one unavoidable seam next to the numeric image-pad ids is exposed to
+/// cross-call BPE boundary effects -- every other turn boundary stays inside a
+/// single `tokenizer.tokenize` call, identical to the plain-text path.
 fn build_vision_prompt_ids(
     messages: &[ChatMessage],
     image_message_index: usize,
@@ -403,21 +409,11 @@ fn build_vision_prompt_ids(
         out.input_ids[..out.real_length].to_vec()
     };
 
-    let render_turn = |out: &mut String, m: &ChatMessage| {
-        out.push_str("<|im_start|>");
-        out.push_str(m.role.as_str());
-        out.push('\n');
-        out.push_str(&m.content);
-        out.push_str("<|im_end|>\n");
-    };
-
     let mut before = String::new();
     for m in &messages[..image_message_index] {
-        render_turn(&mut before, m);
+        render_chat_turn(&mut before, m);
     }
-    before.push_str("<|im_start|>");
-    before.push_str(messages[image_message_index].role.as_str());
-    before.push('\n');
+    push_chat_turn_open(&mut before, messages[image_message_index].role.as_str());
     // The image message's own text that preceded the image part in the
     // caller's original content-part order (PR #1021 review round 3):
     // without this, a `[text("before"), image, ...]` message loses "before"
@@ -442,9 +438,9 @@ fn build_vision_prompt_ids(
             .text_after
             .as_str(),
     );
-    after.push_str("<|im_end|>\n");
+    push_chat_turn_close(&mut after);
     for m in &messages[image_message_index + 1..] {
-        render_turn(&mut after, m);
+        render_chat_turn(&mut after, m);
     }
     after.push_str("<|im_start|>assistant\n");
 
@@ -531,7 +527,15 @@ fn build_vision_request(
     if should_cancel() {
         return Err(VisionBuildStop::Cancelled);
     }
-    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg).map_err(|e| {
+    // Only the serve path opts into the serving-latency patch budget (PR #1021 review round 5):
+    // the shared preprocessor no longer applies it by default, so the public embedding API keeps
+    // accepting whatever it accepted before that budget existed.
+    let (pixel_values, grid) = preprocess_qwen35_image(
+        image_bytes,
+        vision_cfg,
+        Some(crate::vision::qwen35_vit::serve_max_vision_patches()),
+    )
+    .map_err(|e| {
         // The dimension guard (ADR-069 S6 review round 1 blocker) gets its own HTTP code,
         // distinct from ordinary image-rejection reasons, so a caller can tell "this image is
         // fundamentally too large to serve" apart from "this image/data URI was malformed".

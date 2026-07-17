@@ -94,7 +94,7 @@ mod imp {
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{
-        GenerateConfig, GenerateOutput, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
+        GenerateConfig, GenerateOutput, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config, VisionModelConfig,
     };
     use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::serve::metal_worker::{
@@ -1896,7 +1896,7 @@ mod imp {
                  base64-encoded (only ';base64' data URIs are supported)"
             )));
         }
-        let bytes = base64_decode_standard(data).map_err(|e| {
+        let bytes = lattice_inference::serve::base64_codec::decode_standard(data).map_err(|e| {
             bad(format!(
                 "messages[{message_index}].content[{part_index}].image_url.url has invalid \
                  base64: {e}"
@@ -1919,61 +1919,6 @@ mod imp {
             ));
         }
         Ok(bytes)
-    }
-
-    /// Standard-alphabet (RFC 4648 §4) base64 decoder, no external crate:
-    /// this server already clamps the input string to
-    /// [`MAX_CONTENT_PART_BYTES`] before this ever runs, so an image-sized
-    /// hand-rolled decoder is simpler than pulling in a dependency for one
-    /// call site. Fails closed on every malformed input (non-multiple-of-4
-    /// length, invalid alphabet character, misplaced `=` padding) rather
-    /// than panicking or silently truncating.
-    fn base64_decode_standard(s: &str) -> Result<Vec<u8>, String> {
-        fn value(b: u8) -> Result<u32, String> {
-            match b {
-                b'A'..=b'Z' => Ok((b - b'A') as u32),
-                b'a'..=b'z' => Ok((b - b'a' + 26) as u32),
-                b'0'..=b'9' => Ok((b - b'0' + 52) as u32),
-                b'+' => Ok(62),
-                b'/' => Ok(63),
-                other => Err(format!("invalid base64 character {:?}", other as char)),
-            }
-        }
-        let bytes = s.as_bytes();
-        if bytes.is_empty() {
-            return Err("empty base64 payload".to_string());
-        }
-        if !bytes.len().is_multiple_of(4) {
-            return Err("base64 length must be a multiple of 4".to_string());
-        }
-        let n_chunks = bytes.len() / 4;
-        let mut out = Vec::with_capacity(n_chunks * 3);
-        for (chunk_index, chunk) in bytes.chunks_exact(4).enumerate() {
-            let is_last = chunk_index + 1 == n_chunks;
-            let pad = chunk.iter().rev().take_while(|&&b| b == b'=').count();
-            if pad > 0 && !is_last {
-                return Err("'=' padding is only allowed in the final base64 block".to_string());
-            }
-            if pad > 2 {
-                return Err("too much '=' padding in base64 data".to_string());
-            }
-            if chunk[..4 - pad].contains(&b'=') {
-                return Err("'=' padding character in the middle of a base64 block".to_string());
-            }
-            let mut v = [0u32; 4];
-            for (j, &b) in chunk.iter().enumerate() {
-                v[j] = if b == b'=' { 0 } else { value(b)? };
-            }
-            let n = (v[0] << 18) | (v[1] << 12) | (v[2] << 6) | v[3];
-            out.push((n >> 16) as u8);
-            if pad < 2 {
-                out.push((n >> 8) as u8);
-            }
-            if pad < 1 {
-                out.push(n as u8);
-            }
-        }
-        Ok(out)
     }
 
     /// Flatten one message's content into text plus at most one image
@@ -2154,6 +2099,14 @@ mod imp {
         tokenizer: BpeTokenizer,
         format: String,
         model_max_context: usize,
+        /// The checkpoint's `vision_config`, if any, straight from the one `Qwen35Config` parse
+        /// each branch below already performs (PR #1021 review round 5: the loader closure
+        /// previously re-parsed `config.json` a second time, via `Qwen35Config::from_model_dir`,
+        /// solely to recover this field, and silently downgraded a second-parse failure to
+        /// text-only serving via `.ok()`. Threading it out of the single parse here removes both
+        /// the duplicate I/O and that silent-fallback path -- a config load failure is now always
+        /// the loud `Err` this function already returns for every other config problem).
+        vision_config: Option<VisionModelConfig>,
     }
 
     fn load_model(
@@ -2168,6 +2121,7 @@ mod imp {
             ModelFormat::Q4 => {
                 let cfg = Qwen35Config::from_model_dir(model_dir)
                     .map_err(|e| format!("config.json load failed: {e}"))?;
+                let vision_config = cfg.vision_config.clone();
                 let requested_context = model_context_from_config(Some(&cfg));
                 let metal = MetalQwen35State::from_q4_dir(
                     model_dir,
@@ -2182,12 +2136,14 @@ mod imp {
                     tokenizer,
                     format: "q4".to_string(),
                     model_max_context,
+                    vision_config,
                 })
             }
             ModelFormat::Safetensors => {
                 let model = Qwen35Model::from_safetensors(model_dir)
                     .map_err(|e| format!("safetensors load failed: {e}"))?;
                 let cfg = model.config().clone();
+                let vision_config = cfg.vision_config.clone();
                 let requested_context = model_context_from_config(Some(&cfg));
                 let metal = MetalQwen35State::new(model.weights(), &cfg, requested_context)
                     .map_err(|e| format!("Metal init failed: {e}"))?;
@@ -2197,6 +2153,7 @@ mod imp {
                     tokenizer,
                     format: "bf16".to_string(),
                     model_max_context,
+                    vision_config,
                 })
             }
             ModelFormat::Unknown => Err(model_format::unrecognized_format_message(model_dir)),
@@ -3385,35 +3342,32 @@ mod imp {
                     tokenizer,
                     format,
                     model_max_context,
+                    vision_config,
                 } = load_model(&model_dir_for_loader, &tokenizer_path, format)?;
-                // ADR-069 S6: load the real `model.visual.*` tensors
-                // alongside the decoder when this checkpoint's config.json
-                // carries a `vision_config` -- re-parsed here rather than
-                // threading it out of `load_model`'s two format-specific
-                // branches, which keeps `LoadedModel` unchanged for every
-                // existing text-only caller/test. A vision-capable
-                // checkpoint whose weight files are missing/corrupt still
-                // serves text-only rather than failing startup outright
-                // (loud warning, not a silent skip).
-                let vision_weights = Qwen35Config::from_model_dir(&model_dir_for_loader)
-                    .ok()
-                    .and_then(|cfg| cfg.vision_config)
-                    .and_then(|vision_cfg| {
-                        match lattice_inference::vision::checkpoint::load_qwen35_vision_weights(
-                            &model_dir_for_loader,
-                            &vision_cfg,
-                        ) {
-                            Ok(w) => Some(w),
-                            Err(e) => {
-                                eprintln!(
-                                    "[lattice_serve] WARNING: checkpoint advertises \
-                                     vision_config but failed to load model.visual.* weights \
-                                     ({e}); serving text-only"
-                                );
-                                None
-                            }
+                // ADR-069 S6: load the real `model.visual.*` tensors alongside the decoder when
+                // this checkpoint's config.json carries a `vision_config` -- reuses the
+                // `vision_config` `load_model` above already parsed (PR #1021 review round 5:
+                // this used to re-parse config.json a second time here). A vision-capable
+                // checkpoint whose weight files are missing/corrupt still serves text-only rather
+                // than failing startup outright (loud warning, not a silent skip); a genuine
+                // config-load failure is no longer possible to hit silently at this point, since
+                // it would already have surfaced as `load_model`'s own loud `Err` above.
+                let vision_weights = vision_config.and_then(|vision_cfg| {
+                    match lattice_inference::vision::checkpoint::load_qwen35_vision_weights(
+                        &model_dir_for_loader,
+                        &vision_cfg,
+                    ) {
+                        Ok(w) => Some(w),
+                        Err(e) => {
+                            eprintln!(
+                                "[lattice_serve] WARNING: checkpoint advertises \
+                                 vision_config but failed to load model.visual.* weights \
+                                 ({e}); serving text-only"
+                            );
+                            None
                         }
-                    });
+                    }
+                });
                 Ok((
                     metal,
                     tokenizer,
@@ -3704,7 +3658,7 @@ mod imp {
             // before reaching this function; this test isolates the
             // second, independent clamp).
             let raw = vec![0u8; MAX_DECODED_IMAGE_BYTES + 1];
-            let b64 = base64_encode_standard_for_test(&raw);
+            let b64 = lattice_inference::serve::base64_codec::encode_standard(&raw);
             let content = MessageContent::Parts(vec![Part::ImageUrl {
                 image_url: ImageUrl {
                     url: format!("data:image/png;base64,{b64}"),
@@ -3713,34 +3667,6 @@ mod imp {
             }]);
             let err = content_parts(&content, 0).unwrap_err();
             assert_eq!(err.code(), "image_too_large");
-        }
-
-        /// Test-only encoder (the reverse of `base64_decode_standard`) so
-        /// the oversized-image test above can construct an input without a
-        /// base64 crate dependency.
-        fn base64_encode_standard_for_test(bytes: &[u8]) -> String {
-            const ALPHABET: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-            for chunk in bytes.chunks(3) {
-                let b0 = chunk[0] as u32;
-                let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-                let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-                let n = (b0 << 16) | (b1 << 8) | b2;
-                out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
-                out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
-                out.push(if chunk.len() > 1 {
-                    ALPHABET[(n >> 6) as usize & 0x3f] as char
-                } else {
-                    '='
-                });
-                out.push(if chunk.len() > 2 {
-                    ALPHABET[n as usize & 0x3f] as char
-                } else {
-                    '='
-                });
-            }
-            out
         }
 
         #[test]

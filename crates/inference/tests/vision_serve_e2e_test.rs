@@ -166,33 +166,6 @@ fn wait_for_health(port: u16, deadline: Instant) -> bool {
     false
 }
 
-/// Standard-alphabet base64 encoder (no external crate; mirrors the decoder
-/// `lattice_serve.rs` ships for the request-parsing side of this same
-/// stage).
-fn base64_encode_standard(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 0x3f] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 0x3f] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 #[test]
 fn serve_chat_completions_answers_a_grounded_question_about_an_image() {
     let Some(model_dir) = require_model_dir() else {
@@ -208,7 +181,7 @@ fn serve_chat_completions_answers_a_grounded_question_about_an_image() {
         .join("golden_image.png");
     let image_bytes = std::fs::read(&image_path)
         .unwrap_or_else(|e| panic!("reading {}: {e}", image_path.display()));
-    let image_b64 = base64_encode_standard(&image_bytes);
+    let image_b64 = lattice_inference::serve::base64_codec::encode_standard(&image_bytes);
 
     let bin = env!("CARGO_BIN_EXE_lattice_serve");
     let port = free_loopback_port();

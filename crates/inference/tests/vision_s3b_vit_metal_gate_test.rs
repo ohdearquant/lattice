@@ -279,7 +279,7 @@ mod gated {
         let weights = make_weights(&cfg, 0x1234_5678);
         let image_bytes = load_golden_image();
         let (pixel_values, grid) =
-            preprocess_qwen35_image(&image_bytes, &cfg).expect("preprocess golden image");
+            preprocess_qwen35_image(&image_bytes, &cfg, None).expect("preprocess golden image");
         assert_eq!(grid.num_patches(), 256);
 
         let expected_dispatches = expected_dispatch_count(&cfg);

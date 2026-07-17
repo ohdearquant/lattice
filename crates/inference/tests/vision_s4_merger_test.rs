@@ -270,7 +270,7 @@ fn run_s4_e2e_gate(model_dir: &Path) {
     let image_bytes =
         std::fs::read(dir.join("golden_image.png")).expect("reading golden_image.png");
     let (pixel_values, grid) =
-        preprocess_qwen35_image(&image_bytes, &vision_cfg).expect("preprocess golden image");
+        preprocess_qwen35_image(&image_bytes, &vision_cfg, None).expect("preprocess golden image");
     assert_eq!(grid.num_patches(), 256);
 
     let pre_merger = qwen35_vit_forward(&vit_weights, &vision_cfg, &pixel_values, grid)

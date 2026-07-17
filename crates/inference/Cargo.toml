@@ -60,7 +60,7 @@ clap = { workspace = true }
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
-ureq = { version = "2", features = ["tls"], optional = true }
+ureq = { workspace = true, optional = true }
 sha2.workspace = true
 rusqlite = { workspace = true, optional = true }
 metal = { version = "0.33", optional = true }
@@ -203,6 +203,13 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_gdn_state"
 required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 
+# Uses `serve::base64_codec::encode_standard` (PR #1021 review round 5), which is gated
+# `cfg(any(test, feature = "test-utils"))` -- this integration test is a separate compilation
+# unit from the lib crate, so it only sees that function through the `test-utils` feature arm.
+[[test]]
+name = "vision_serve_e2e_test"
+required-features = ["test-utils"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
@@ -227,8 +234,10 @@ tower = { workspace = true, features = ["util"] }
 # Real HTTP client for the ADR-069 S6 serve vision e2e smoke test (posts a
 # small image + question to a real `lattice_serve` subprocess over
 # loopback). Already resolved in Cargo.lock as a transitive `download`
-# feature dependency; this just makes it a direct dev-dependency.
-ureq = "2"
+# feature dependency; this just makes it a direct dev-dependency. Single
+# version declaration shared with the optional `[dependencies]` entry above
+# via `[workspace.dependencies]` (same convention as `tokio` in this file).
+ureq = { workspace = true }
 
 [[bench]]
 name = "attention_bench"

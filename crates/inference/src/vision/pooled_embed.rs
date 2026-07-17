@@ -69,7 +69,9 @@ pub fn embed_image_from_bytes_f16(
         InferenceError::InvalidInput("checkpoint has no vision_end_token_id".into())
     })?;
 
-    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg)
+    // Public embedding API: no serving-latency budget applies here (PR #1021 review round 5) --
+    // only the serve path (`serve/metal_worker.rs`) opts into `serve_max_vision_patches()`.
+    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg, None)
         .map_err(|e| InferenceError::InvalidInput(format!("image preprocessing failed: {e}")))?;
     let pre_merger = qwen35_vit_forward(vision_weights, vision_cfg, &pixel_values, grid)
         .map_err(|e| InferenceError::InvalidInput(format!("ViT forward failed: {e}")))?;

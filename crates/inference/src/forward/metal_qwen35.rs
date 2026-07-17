@@ -1063,6 +1063,33 @@ impl ChatMessage {
     }
 }
 
+/// Renders a ChatML turn header -- `<|im_start|>{role}\n` -- the one place this layout is
+/// defined (PR #1021 review round 5: previously reimplemented independently in
+/// `serve::metal_worker::build_vision_prompt_ids`, which risked silently drifting from this
+/// renderer if only one side was ever edited). [`format_chat_template`] uses this for a whole
+/// turn; the vision path's segmented renderer (`serve::metal_worker::build_vision_prompt_ids`)
+/// uses it to open the turn that its image span interrupts mid-content.
+pub(crate) fn push_chat_turn_open(out: &mut String, role: &str) {
+    out.push_str("<|im_start|>");
+    out.push_str(role);
+    out.push('\n');
+}
+
+/// Renders a ChatML turn terminator -- `<|im_end|>\n` -- the closing half of
+/// [`push_chat_turn_open`], shared for the same reason.
+pub(crate) fn push_chat_turn_close(out: &mut String) {
+    out.push_str("<|im_end|>\n");
+}
+
+/// Renders one complete ChatML turn (open + content + close) for `msg`. Shared by
+/// [`format_chat_template`] and the vision path's segmented renderer for every turn that is
+/// *not* interrupted by an image span.
+pub(crate) fn render_chat_turn(out: &mut String, msg: &ChatMessage) {
+    push_chat_turn_open(out, msg.role.as_str());
+    out.push_str(&msg.content);
+    push_chat_turn_close(out);
+}
+
 /// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
 ///
 /// Format messages into Qwen3.5 chat template.
@@ -1071,11 +1098,7 @@ impl ChatMessage {
 pub fn format_chat_template(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
-        prompt.push_str("<|im_start|>");
-        prompt.push_str(msg.role.as_str());
-        prompt.push('\n');
-        prompt.push_str(&msg.content);
-        prompt.push_str("<|im_end|>\n");
+        render_chat_turn(&mut prompt, msg);
     }
     // Open assistant turn for generation
     prompt.push_str("<|im_start|>assistant\n");
@@ -10058,6 +10081,25 @@ mod inner {
             let mut visual_row = 0usize;
             let mut last_logits = Vec::new();
             for (pos, &token_id) in prompt_ids.iter().enumerate() {
+                // Checked before each prefill step's GPU work (PR #1021 review round 5 major
+                // finding): unlike the text-only path's single batched `forward_prefill` dispatch
+                // (which can only be checked before/after the whole call), multimodal prefill is
+                // already a per-token loop, so it is polled at the same per-step granularity as
+                // the decode loop below -- a disconnected client stops paying for further prefill
+                // steps at the next token boundary instead of running the full image+text prompt
+                // through the serialized Metal worker. Mirrors the decode loop's contract exactly
+                // (`stopped` stays `false`, `stop_reason` becomes `Interrupt`, no tokens emitted).
+                if should_cancel() {
+                    return Ok(GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: false,
+                        stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs: vec![],
+                    });
+                }
                 let cos_sin = if has_image {
                     Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()))
                 } else {
@@ -26345,6 +26387,95 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "decode loop must stop within one step of should_cancel going true \
                  (cancel_after={cancel_after}), got {} generated tokens",
                 out.generated_tokens
+            );
+        }
+
+        /// PR #1021 review round 5 major finding: the multimodal *prefill* loop (every prompt
+        /// token, image-pad or text, injected via `forward_step_injected_mrope`/
+        /// `forward_step_mrope`) ran to completion with no cancellation check at all -- the first
+        /// `should_cancel` poll in `generate_multimodal_vision_impl` was in the decode loop, well
+        /// after the entire image+text prompt had already been forced through the serialized
+        /// Metal worker. Forces `should_cancel` `true` after two prefill steps (well short of
+        /// `vision_gate_fixture`'s 7-token prompt) and asserts the loop stops there with
+        /// `stop_reason: Some(StopReason::Interrupt)` and zero generated tokens -- proving
+        /// cancellation is observed *during* prefill, not merely before it starts or after it
+        /// finishes.
+        ///
+        /// Mutation-sensitive: reverting the prefill loop's `if should_cancel() { return Ok(...);
+        /// }` check makes `should_cancel_calls` reach the full prompt length (7) instead of
+        /// stopping at `cancel_after + 1` -- verified locally by reverting the check and watching
+        /// the assertion below fail (`should_cancel` still gets called 7+ times, `stop_reason`
+        /// comes back `Length`/`Eos` instead of `Interrupt`), then restoring it (not committed).
+        #[test]
+        fn generate_multimodal_vision_with_cancel_stops_prefill_loop_early() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_with_cancel_stops_prefill_loop_early",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 50,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let request = vision_gate_fixture(&cfg, 0.01);
+            assert!(
+                request.input_ids.len() > 4,
+                "fixture prompt must be long enough that cancel_after=2 fires mid-prefill, \
+                 got {} tokens",
+                request.input_ids.len()
+            );
+
+            let should_cancel_calls = std::cell::Cell::new(0usize);
+            let cancel_after = 2usize;
+            let should_cancel = || {
+                let n = should_cancel_calls.get();
+                should_cancel_calls.set(n + 1);
+                n >= cancel_after
+            };
+
+            let out = state
+                .generate_multimodal_vision_with_cancel(
+                    &request,
+                    &tokenizer,
+                    &gen_cfg,
+                    should_cancel,
+                )
+                .expect("cancelled multimodal generate still returns Ok, not Err");
+
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Interrupt),
+                "mid-prefill cancellation must surface as StopReason::Interrupt, got {:?}",
+                out.stop_reason
+            );
+            assert_eq!(
+                out.generated_tokens, 0,
+                "prefill cancellation must happen before any token is sampled, got {} \
+                 generated tokens",
+                out.generated_tokens
+            );
+            assert!(
+                !out.stopped,
+                "prefill cancellation is an interruption, not a stop condition"
+            );
+            assert!(
+                should_cancel_calls.get() <= cancel_after + 1,
+                "prefill loop must stop within one step of should_cancel going true \
+                 (cancel_after={cancel_after}), got {} should_cancel calls -- the full \
+                 {}-token prompt must not be processed",
+                should_cancel_calls.get(),
+                request.input_ids.len()
             );
         }
 
