@@ -1262,4 +1262,136 @@ mod tests {
             "mask_logits on an over-cap state must match the oracle mask exactly"
         );
     }
+
+    /// Same differential as `trie_mask_byte_identical_to_oracle_over_corpus` /
+    /// `trie_mask_never_over_accepts_vs_oracle`, but over the REAL model
+    /// tokenizer vocabulary instead of the synthetic `trie_diff_vocab`. The
+    /// synthetic vocab (256 single bytes + ~50 fragments) is a stand-in that
+    /// exercises trie branching and prefix sharing but is roughly three
+    /// orders of magnitude smaller than a real ~248K-token vocab, so it
+    /// cannot rule out a size- or content-dependent trie bug that only
+    /// surfaces at production scale. `#[ignore]`d because it loads a real
+    /// tokenizer and simulates the oracle over the full vocab (slow, and
+    /// requires a model checkout on disk); run explicitly with a `real_vocab`
+    /// test filter.
+    #[test]
+    #[ignore = "loads a real tokenizer + full vocab oracle simulation; run with `real_vocab` filter"]
+    fn trie_mask_byte_identical_to_oracle_real_vocab() {
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let tokenizer_dir_str = std::env::var("LATTICE_TOKENIZER_DIR")
+            .unwrap_or_else(|_| format!("{home}/.lattice/models/qwen3.5-0.8b"));
+        let tokenizer_dir = std::path::Path::new(&tokenizer_dir_str);
+        let config_path = tokenizer_dir.join("config.json");
+        let tokenizer_path = tokenizer_dir.join("tokenizer.json");
+        if !config_path.exists() || !tokenizer_path.exists() {
+            panic!(
+                "real-vocab differential test skipped: no model checkout at \
+                 {tokenizer_dir_str} (expected config.json + tokenizer.json); \
+                 set LATTICE_TOKENIZER_DIR to point at one"
+            );
+        }
+
+        let cfg = crate::model::qwen35_config::Qwen35Config::from_model_dir(tokenizer_dir)
+            .expect("config.json load");
+        let tokenizer = crate::tokenizer::BpeTokenizer::from_tokenizer_json(&tokenizer_path)
+            .expect("tokenizer.json load");
+        let vocab = tokenizer
+            .vocab_bytes(cfg.vocab_size)
+            .expect("vocab_bytes over real tokenizer");
+        assert!(
+            vocab.len() > 100_000,
+            "expected a production-scale vocab (~248K tokens for Qwen3.5), got {}",
+            vocab.len()
+        );
+
+        let spec = GrammarSpec::JsonSchema(trie_diff_schema());
+        let engine = GrammarEngine::new(&spec, vocab.clone()).unwrap();
+        assert!(
+            engine.exceeds_state_budget(),
+            "fixture must exceed the state cap for this differential to exercise \
+             the fallback path (the point of this test) — got a real vocab of {} \
+             tokens",
+            vocab.len()
+        );
+
+        let corpus = harvest_trajectory_states(&engine);
+        assert!(
+            corpus.len() >= 20,
+            "need at least 20 distinct harvested states, got {}",
+            corpus.len()
+        );
+
+        let mut over_cap_states = 0usize;
+        let mut mismatches: Vec<(usize, usize)> = Vec::new();
+        let mut over_accepts: Vec<(usize, usize)> = Vec::new();
+        for (i, state) in corpus.iter().enumerate() {
+            let mut oracle_logits = vec![0.0f32; vocab.len()];
+            let mut trie_logits = vec![0.0f32; vocab.len()];
+            engine.mask_by_simulation(state, &mut oracle_logits);
+            engine.mask_by_trie(state, &mut trie_logits);
+            if engine.find_state_id(state).is_none() {
+                over_cap_states += 1;
+            }
+            for tok in 0..vocab.len() {
+                if trie_logits[tok] != oracle_logits[tok] {
+                    mismatches.push((i, tok));
+                }
+                let oracle_blocked = oracle_logits[tok] == f32::NEG_INFINITY;
+                let trie_allowed = trie_logits[tok] != f32::NEG_INFINITY;
+                if oracle_blocked && trie_allowed {
+                    over_accepts.push((i, tok));
+                }
+            }
+        }
+
+        assert!(
+            over_cap_states >= 10,
+            "corpus should mostly cover the over-cap fallback path; got \
+             {over_cap_states}/{}",
+            corpus.len()
+        );
+
+        // Reported separately from the byte-identical check below so a
+        // prune-logic regression that only over-accepts (P0 soundness) is
+        // distinguishable from a broader mismatch (which could also include
+        // under-accepts).
+        assert!(
+            over_accepts.is_empty(),
+            "trie over-accepted {} token(s) the oracle rejects on the real \
+             vocab (P0 soundness violation): {:?}",
+            over_accepts.len(),
+            over_accepts
+                .iter()
+                .take(5)
+                .map(|(state_idx, tok)| (
+                    state_idx,
+                    tok,
+                    String::from_utf8_lossy(&vocab[*tok]).to_string()
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        assert!(
+            mismatches.is_empty(),
+            "trie mask diverged from oracle mask on {} (state, token) pair(s) \
+             over the real vocab: {:?}",
+            mismatches.len(),
+            mismatches
+                .iter()
+                .take(5)
+                .map(|(state_idx, tok)| (
+                    state_idx,
+                    tok,
+                    String::from_utf8_lossy(&vocab[*tok]).to_string()
+                ))
+                .collect::<Vec<_>>()
+        );
+
+        eprintln!(
+            "real_vocab differential: vocab_size={} corpus_states={} \
+             over_cap_states={over_cap_states} over_accepts=0 mismatches=0",
+            vocab.len(),
+            corpus.len(),
+        );
+    }
 }
