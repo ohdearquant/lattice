@@ -49,6 +49,8 @@
 //! on `metal_qwen35.rs`'s own exhaustive Device-gated tests for the
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
+#[cfg(test)]
+use crate::forward::metal_qwen35::{ChatImage, ChatRole};
 use crate::forward::metal_qwen35::{ChatMessage, MetalQwen35State, format_chat_template};
 use crate::kv_cache::CrossTurnSlotId;
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
@@ -375,16 +377,18 @@ fn check_prompt_fits_window(
 /// needs (ADR-069 S6): every turn is ChatML-rendered exactly like
 /// [`format_chat_template`], except the turn at `image_message_index` splices
 /// `vision_start_token_id`, `num_pads` copies of `image_token_id`, then
-/// `vision_end_token_id` immediately after that turn's role header and ahead
-/// of its own text -- the same "vision block precedes text" layout
-/// `vision::pooled_embed::embed_image_from_bytes_f16` uses, and the layout
-/// the committed `#989` HF differential golden encodes (see
-/// `tests/fixtures/vision/README.md`). Tokenizes in exactly two calls (the
-/// text before the spliced ids, then the text after) rather than one call
-/// per ChatML segment, so only the one unavoidable seam next to the
-/// numeric image-pad ids is exposed to cross-call BPE boundary effects --
-/// every other turn boundary stays inside a single `tokenizer.tokenize`
-/// call, identical to the plain-text path.
+/// `vision_end_token_id` between that turn's own `text_before` (`content`)
+/// and `text_after` (`image.text_after`) -- preserving the caller's
+/// original content-part order (PR #1021 review round 3: a prior version
+/// unconditionally inserted the vision span ahead of the turn's entire
+/// text, so `[text("before"), image, text("after")]` decoded as
+/// image -> "beforeafter" instead of "before" -> image -> "after"). Tokenizes
+/// in exactly two calls (the text before the spliced ids, then the text
+/// after) rather than one call per ChatML segment, so only the one
+/// unavoidable seam next to the numeric image-pad ids is exposed to
+/// cross-call BPE boundary effects -- every other turn boundary stays
+/// inside a single `tokenizer.tokenize` call, identical to the plain-text
+/// path.
 fn build_vision_prompt_ids(
     messages: &[ChatMessage],
     image_message_index: usize,
@@ -414,9 +418,30 @@ fn build_vision_prompt_ids(
     before.push_str("<|im_start|>");
     before.push_str(messages[image_message_index].role.as_str());
     before.push('\n');
+    // The image message's own text that preceded the image part in the
+    // caller's original content-part order (PR #1021 review round 3):
+    // without this, a `[text("before"), image, ...]` message loses "before"
+    // entirely -- the vision span spliced right after the role header with
+    // no text ahead of it at all.
+    before.push_str(&messages[image_message_index].content);
 
     let mut after = String::new();
-    after.push_str(&messages[image_message_index].content);
+    // The image message's text that followed the image part in the
+    // caller's original content-part order (PR #1021 review round 3):
+    // `messages[image_message_index].content` is that message's
+    // *before*-image text (already rendered into `before` above), so the
+    // vision span must be followed by `image.text_after`, not `content`
+    // again -- reusing `content` here is exactly the bug that decoded
+    // `[text("before"), image, text("after")]` as image -> "beforeafter"
+    // instead of "before" -> image -> "after".
+    after.push_str(
+        messages[image_message_index]
+            .image
+            .as_ref()
+            .expect("image_message_index selected only messages with Some(image)")
+            .text_after
+            .as_str(),
+    );
     after.push_str("<|im_end|>\n");
     for m in &messages[image_message_index + 1..] {
         render_turn(&mut after, m);
@@ -808,13 +833,20 @@ impl MetalWorker {
                         if should_cancel() {
                             return Ok(vision_cancelled_output());
                         }
-                        // `generate_multimodal_vision` is a single blocking
-                        // call (no incremental `on_token` hook exists on
-                        // this entry point yet) -- the full answer arrives
-                        // as one delta rather than a token-by-token stream
-                        // (known ADR-069 S6 v0 limitation).
+                        // `generate_multimodal_vision_with_cancel` is a single blocking call (no
+                        // incremental `on_token` hook exists on this entry point yet) -- the full
+                        // answer arrives as one delta rather than a token-by-token stream (known
+                        // ADR-069 S6 v0 limitation) -- but it does poll `should_cancel` once per
+                        // decode step internally (PR #1021 review round 3 major finding), so a
+                        // disconnected client still stops the decode loop early instead of
+                        // running to `max_new_tokens`/context-full.
                         let output = state
-                            .generate_multimodal_vision(&request, &tokenizer, cfg)
+                            .generate_multimodal_vision_with_cancel(
+                                &request,
+                                &tokenizer,
+                                cfg,
+                                &mut *should_cancel,
+                            )
                             .map_err(WorkerFailure::from)?;
                         if !output.text.is_empty() {
                             on_token(&output.text, 0);
@@ -1239,6 +1271,45 @@ mod tests {
         buf
     }
 
+    /// PR #1021 review round 3 major finding: `build_vision_prompt_ids` unconditionally
+    /// inserted the vision span ahead of a message's *entire* text, so a message shaped
+    /// `[text("before"), image, text("after")]` decoded as image -> "beforeafter" instead of
+    /// "before" -> image -> "after". Drives `build_vision_prompt_ids` directly with a
+    /// single-char vocab so both text tokens are individually addressable, then asserts their
+    /// token ids appear on the correct side of the spliced vision span.
+    ///
+    /// Mutation-sensitive: reverting `before.push_str(&messages[image_message_index].content)`
+    /// (dropping the pre-image text) or reverting `after`'s source back to
+    /// `messages[image_message_index].content` (the old bug, re-inserting the full text again
+    /// instead of `image.text_after`) both change this exact token sequence -- verified locally
+    /// by reverting each hunk in turn and watching this assertion fail, then restoring the fix.
+    #[test]
+    fn build_vision_prompt_ids_preserves_before_and_after_text_order() {
+        let vocab =
+            std::collections::HashMap::from([("A".to_string(), 10u32), ("B".to_string(), 11u32)]);
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("two-entry vocab must construct a tokenizer");
+
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "A".to_string(),
+            image: Some(ChatImage {
+                bytes: vec![],
+                text_after: "B".to_string(),
+            }),
+        }];
+
+        let ids = build_vision_prompt_ids(
+            &messages, 0, &tokenizer, /* vision_start */ 101, /* vision_end */ 102,
+            /* image_token */ 100, /* num_pads */ 2,
+        );
+
+        // "A" (before) -> vision span (start, 2 image pads, end) -> "B" (after); every
+        // template/role/newline character around them is unknown to this vocab and dropped, so
+        // the surviving ids are exactly this ordered sequence.
+        assert_eq!(ids, vec![10, 101, 100, 100, 102, 11]);
+    }
+
     /// PR #1021 review round 1 major finding: the pre-fix code only checked `should_cancel`
     /// *after* `build_vision_request` had already run the full decode/preprocess/ViT/merger
     /// pass, so a disconnected client still paid for the entire vision prefill. Proves the fix:
@@ -1303,7 +1374,19 @@ mod tests {
         let vision_weights = empty_vision_weights();
         let cfg = vision_test_qwen35_config();
         let tokenizer = minimal_tokenizer();
-        let messages = vec![ChatMessage::user("hi")];
+        // Must actually carry `image: Some(..)` at `image_message_index` (PR #1021 review round
+        // 3): `build_vision_prompt_ids` now reads `image.text_after` for the post-image text
+        // instead of reusing `content`, matching the real invariant every production caller
+        // already holds (`image_message_index` is only ever the index of a message
+        // `image_positions` filtered to `Some(image)`).
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hi".to_string(),
+            image: Some(ChatImage {
+                bytes: vec![],
+                text_after: String::new(),
+            }),
+        }];
         let png = make_black_test_png(8, 8); // 8x8, aligned to tiny_vision_cfg's factor=4
 
         let result = build_vision_request(

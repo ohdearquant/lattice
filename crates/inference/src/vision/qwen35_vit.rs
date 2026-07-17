@@ -52,24 +52,56 @@ const QWEN35_IMAGE_STD: f32 = 0.5;
 /// `multihead_attention_full`. Chosen as a conservative serving ceiling rather than derived from
 /// the checkpoint: 2048x2048 is exactly `64 * (patch_size=16 * spatial_merge_size=2)` for the
 /// real 0.8B checkpoint's factor, i.e. a 128x128 = 16,384-patch grid pre-merge. This cap alone
-/// is NOT the resource bound -- the O(n^2) full-attention cost bound is [`MAX_VISION_PATCHES`]
-/// below (round-2 review); this dimension cap remains as the outer decoder-level limit the
+/// is NOT the resource bound -- the O(n^2) full-attention cost bound is
+/// [`DEFAULT_MAX_VISION_PATCHES`] below (round-2 review); this dimension cap remains as the
+/// outer decoder-level limit the
 /// `image` crate can enforce during header parsing.
 const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
 
-/// Maximum accepted pre-merge patch count for one image, enforced from the
-/// header-reported dimensions before any pixel data is decoded (ADR-069 S6
-/// review round 2 blocker). The dimension cap above is not sufficient on its
-/// own because the ViT's full attention materializes a per-head
-/// `scores[n, n]` f32 matrix (`multihead_attention_full` via `gemm_bt`): at
-/// the 2048x2048 dimension boundary with the real checkpoint's
-/// `patch_size=16`, `n = 128^2 = 16,384` and that single allocation is
-/// `16,384^2 * 4 = 1 GiB`, before compute. The budget is therefore chosen
-/// from the attention-score allocation, not decoded RGB bytes: `n = 4,096`
-/// (a 1024x1024 image at patch 16) caps the per-head score matrix at
-/// `4,096^2 * 4 = 64 MiB` and the O(n^2) work correspondingly, while staying
-/// generous for real chat-image use.
-const MAX_VISION_PATCHES: usize = 4096;
+/// Default maximum accepted pre-merge patch count for one image, enforced from the
+/// header-reported dimensions before any pixel data is decoded (ADR-069 S6 review round 2
+/// blocker). The dimension cap above is not sufficient on its own because the ViT's full
+/// attention materializes a per-head `scores[n, n]` f32 matrix (`multihead_attention_full` via
+/// `gemm_bt`): at the 2048x2048 dimension boundary with the real checkpoint's `patch_size=16`,
+/// `n = 128^2 = 16,384` and that single allocation is `16,384^2 * 4 = 1 GiB`, before compute.
+///
+/// PR #1021 review round 3 major finding: the score-allocation bound above (originally
+/// `n = 4,096`, a 1024x1024 image) does not bound *wall-clock serving time* on the single
+/// serialized Metal worker -- a real, end-to-end timed `qwen35_vit_forward_metal` pass at
+/// `n = 4,096` on this development machine (Apple M2 Max) measured **78.8 s**, monopolizing the
+/// worker for the whole request. Re-derived from a direct measurement of the same real
+/// checkpoint's ViT forward at several patch counts (`cargo test -p lattice-inference --features
+/// f16,metal-gpu,test-utils --lib -- <ad hoc timing harness>`, GPU-flock-serialized): `n=64` ->
+/// 330.7 ms, `n=256` -> 1,431.0 ms, `n=576` -> 4,811.6 ms, `n=4,096` -> 78,882.7 ms (cost grows
+/// worse than linearly but sub-quadratically across this range -- consistent with a
+/// dispatch-count-bound linear component plus an O(n^2) full-attention component). `n = 256`
+/// (a 256x256 image, patch_size=16 -- the same natural grid boundary the module's committed
+/// golden fixture already uses) is the largest measured grid whose wall time (1.43 s) stays
+/// under the ~2 s worst-case serving budget, rounded down from the next larger measured point
+/// (576 patches, 4.81 s, well over budget). Overridable per-machine via
+/// [`LATTICE_VISION_MAX_PATCHES_ENV`] without a rebuild.
+const DEFAULT_MAX_VISION_PATCHES: usize = 256;
+
+/// Environment variable overriding [`DEFAULT_MAX_VISION_PATCHES`] (PR #1021 review round 3): the
+/// measured default above is specific to the development machine it was measured on, so an
+/// operator serving on different hardware (or accepting a different latency/image-size
+/// tradeoff) can retune the cap without a rebuild. A missing, unparseable, or zero value falls
+/// back to the default.
+const LATTICE_VISION_MAX_PATCHES_ENV: &str = "LATTICE_VISION_MAX_PATCHES";
+
+/// Current serving-budget patch cap: [`LATTICE_VISION_MAX_PATCHES_ENV`] if set to a valid
+/// positive integer, otherwise [`DEFAULT_MAX_VISION_PATCHES`]. Read fresh on every call
+/// (cheap -- this guard runs once per image request, not per patch) so a changed environment
+/// takes effect without restarting the process mid-test; production callers only ever observe
+/// the value fixed at process start, since nothing in this codebase mutates its own environment
+/// after startup.
+fn max_vision_patches() -> usize {
+    std::env::var(LATTICE_VISION_MAX_PATCHES_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_VISION_PATCHES)
+}
 
 /// The temporal/height/width patch-grid shape for one image (`grid_thw` in
 /// the HF reference). `t` is always 1 for a still image (video is out of
@@ -139,17 +171,18 @@ pub fn preprocess_qwen35_image(
 
     // Attention-budget guard, still header-only (ADR-069 S6 review round 2 blocker): the
     // dimension cap alone admits grids whose per-head `scores[n, n]` full-attention allocation
-    // reaches 1 GiB (see MAX_VISION_PATCHES docs). Conservative ceil-division so unaligned
+    // reaches 1 GiB (see DEFAULT_MAX_VISION_PATCHES docs). Conservative ceil-division so unaligned
     // dimensions (rejected later anyway) cannot round the estimate below the true patch count.
     // A zero patch_size falls through to the InvalidConfig rejection below.
     if cfg.patch_size > 0 {
         let est_patches = (header_w as usize)
             .div_ceil(cfg.patch_size)
             .saturating_mul((header_h as usize).div_ceil(cfg.patch_size));
-        if est_patches > MAX_VISION_PATCHES {
+        let max_patches = max_vision_patches();
+        if est_patches > max_patches {
             return Err(VisionError::DimensionsExceeded(format!(
                 "image {header_w}x{header_h} yields {est_patches} patches at \
-                 patch_size={}, exceeding the {MAX_VISION_PATCHES}-patch serving \
+                 patch_size={}, exceeding the {max_patches}-patch serving \
                  budget (full-attention cost is quadratic in patch count)",
                 cfg.patch_size
             )));
@@ -694,38 +727,126 @@ mod tests {
 
     #[test]
     fn preprocess_rejects_attention_budget_at_admitted_dimension_boundary() {
-        // 2048x2048 passes the MAX_IMAGE_DIMENSION_PIXELS cap exactly, but at the
-        // real patch_size=16 it is a 128x128 = 16,384-patch grid whose per-head
-        // full-attention scores allocation is 16,384^2 * 4 = 1 GiB. The patch
-        // budget must reject it from the header alone (round-2 review blocker).
-        let cfg = real_geometry_cfg();
-        let png = make_black_test_png(2048, 2048);
-        assert!(
-            png.len() < 65_536,
-            "fixture must stay a realistic small-upload size (got {} bytes)",
-            png.len()
-        );
-        let err = preprocess_qwen35_image(&png, &cfg).unwrap_err();
-        assert!(
-            matches!(err, VisionError::DimensionsExceeded(_)),
-            "expected DimensionsExceeded from the patch budget, got {err:?}"
-        );
+        // Pinned to the unset-env default (see `with_max_patches_env` docs): this test's
+        // boundary numbers are quoted against DEFAULT_MAX_VISION_PATCHES specifically, so it
+        // must not observe a concurrently-running env-override test's temporary value.
+        with_max_patches_env(None, || {
+            // 2048x2048 passes the MAX_IMAGE_DIMENSION_PIXELS cap exactly, but at the
+            // real patch_size=16 it is a 128x128 = 16,384-patch grid whose per-head
+            // full-attention scores allocation is 16,384^2 * 4 = 1 GiB. The patch
+            // budget must reject it from the header alone (round-2 review blocker).
+            let cfg = real_geometry_cfg();
+            let png = make_black_test_png(2048, 2048);
+            assert!(
+                png.len() < 65_536,
+                "fixture must stay a realistic small-upload size (got {} bytes)",
+                png.len()
+            );
+            let err = preprocess_qwen35_image(&png, &cfg).unwrap_err();
+            assert!(
+                matches!(err, VisionError::DimensionsExceeded(_)),
+                "expected DimensionsExceeded from the patch budget, got {err:?}"
+            );
+        });
     }
 
     #[test]
     fn preprocess_accepts_largest_grid_within_attention_budget() {
-        // 1024x1024 at patch_size=16 is exactly MAX_VISION_PATCHES = 4,096
-        // pre-merge patches -- the largest square grid the budget admits. Its
-        // per-head scores allocation is 4,096^2 * 4 = 64 MiB, the documented
-        // ceiling. Must preprocess successfully (not be rejected by either
-        // guard), proving the budget boundary sits where the docs say.
-        let cfg = real_geometry_cfg();
-        let png = make_black_test_png(1024, 1024);
-        let (patches, grid) = preprocess_qwen35_image(&png, &cfg).expect("boundary grid accepted");
-        assert_eq!(grid, GridThw { t: 1, h: 64, w: 64 });
-        assert_eq!(grid.num_patches(), MAX_VISION_PATCHES);
-        let patch_len = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
-        assert_eq!(patches.len(), MAX_VISION_PATCHES * patch_len);
+        // Pinned to the unset-env default -- see the sibling test above for why.
+        with_max_patches_env(None, || {
+            // 256x256 at patch_size=16 is exactly DEFAULT_MAX_VISION_PATCHES = 256 pre-merge
+            // patches (PR #1021 review round 3: re-measured from a real, end-to-end timed Metal
+            // ViT forward on this development machine -- see DEFAULT_MAX_VISION_PATCHES's doc
+            // comment for the measured numbers) -- the largest square grid the default budget
+            // admits. Must preprocess successfully (not be rejected by either guard), proving
+            // the budget boundary sits where the docs say.
+            let cfg = real_geometry_cfg();
+            let png = make_black_test_png(256, 256);
+            let (patches, grid) =
+                preprocess_qwen35_image(&png, &cfg).expect("boundary grid accepted");
+            assert_eq!(grid, GridThw { t: 1, h: 16, w: 16 });
+            assert_eq!(grid.num_patches(), DEFAULT_MAX_VISION_PATCHES);
+            let patch_len =
+                cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+            assert_eq!(patches.len(), DEFAULT_MAX_VISION_PATCHES * patch_len);
+        });
+    }
+
+    /// Serializes every test below that mutates the real process environment
+    /// (`LATTICE_VISION_MAX_PATCHES` is process-global -- `cargo test` runs this file's tests on
+    /// multiple threads within one process, so unguarded concurrent `set_var`/`remove_var` calls
+    /// would race and flake). Same pattern as `moe_expert_cache.rs`'s `ENV_TEST_LOCK`.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets (or clears) `LATTICE_VISION_MAX_PATCHES` for the duration of `f`, holding
+    /// `ENV_TEST_LOCK` and restoring the prior value (including "was unset") on the way out,
+    /// even if `f` panics.
+    fn with_max_patches_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var(LATTICE_VISION_MAX_PATCHES_ENV).ok();
+        // SAFETY: serialized by `ENV_TEST_LOCK` above -- no concurrent reader/writer of this
+        // process-global variable.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(LATTICE_VISION_MAX_PATCHES_ENV, v),
+                None => std::env::remove_var(LATTICE_VISION_MAX_PATCHES_ENV),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: see above.
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var(LATTICE_VISION_MAX_PATCHES_ENV, v),
+                None => std::env::remove_var(LATTICE_VISION_MAX_PATCHES_ENV),
+            }
+        }
+        match result {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn max_vision_patches_unset_env_falls_back_to_default() {
+        with_max_patches_env(None, || {
+            assert_eq!(max_vision_patches(), DEFAULT_MAX_VISION_PATCHES);
+        });
+    }
+
+    /// PR #1021 review round 3 major finding: the patch cap must be configurable per-machine
+    /// without a rebuild. Setting the env var below the default must make a request that the
+    /// default would admit get rejected instead -- proving the override actually reaches the
+    /// admission guard, not just the standalone `max_vision_patches()` accessor.
+    #[test]
+    fn preprocess_honors_lower_env_override_below_default() {
+        with_max_patches_env(Some("64"), || {
+            assert_eq!(max_vision_patches(), 64);
+            let cfg = real_geometry_cfg();
+            // 256x256 = 256 patches, which the DEFAULT_MAX_VISION_PATCHES=256 budget admits
+            // (proved above) but a 64-patch override must reject.
+            let png = make_black_test_png(256, 256);
+            let err = preprocess_qwen35_image(&png, &cfg).unwrap_err();
+            assert!(
+                matches!(err, VisionError::DimensionsExceeded(_)),
+                "expected the lowered env override to reject a default-admitted grid, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn max_vision_patches_malformed_or_zero_env_falls_back_to_default() {
+        for bad in ["not-a-number", "0", ""] {
+            with_max_patches_env(Some(bad), || {
+                assert_eq!(
+                    max_vision_patches(),
+                    DEFAULT_MAX_VISION_PATCHES,
+                    "env value {bad:?} must fall back to the default, not panic or admit \
+                     unbounded patches"
+                );
+            });
+        }
     }
 
     #[test]

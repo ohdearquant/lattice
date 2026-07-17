@@ -995,6 +995,14 @@ impl ChatRole {
 #[derive(Debug, Clone)]
 pub struct ChatImage {
     pub bytes: Vec<u8>,
+    /// Text that followed the image part within the same message, in the
+    /// caller's original content-part order (PR #1021 review round 3: the
+    /// image's own message can carry text both before AND after it, e.g.
+    /// `[text("before"), image, text("after")]` -- `ChatMessage::content`
+    /// carries the "before" text, this field carries "after" so the vision
+    /// span is spliced at its true position instead of always ahead of the
+    /// message's full text).
+    pub text_after: String,
 }
 
 /// **Unstable**: single chat message; fields may expand with tool call support.
@@ -1035,11 +1043,22 @@ impl ChatMessage {
         }
     }
     /// **Unstable**: construct a message carrying an image (ADR-069 S6).
-    pub fn with_image(role: ChatRole, content: impl Into<String>, image_bytes: Vec<u8>) -> Self {
+    /// `text_before`/`text_after` are the message's text parts that sat
+    /// before/after the single `image_url` part in the caller's original
+    /// content-part order (PR #1021 review round 3 ordering fix).
+    pub fn with_image(
+        role: ChatRole,
+        text_before: impl Into<String>,
+        image_bytes: Vec<u8>,
+        text_after: impl Into<String>,
+    ) -> Self {
         Self {
             role,
-            content: content.into(),
-            image: Some(ChatImage { bytes: image_bytes }),
+            content: text_before.into(),
+            image: Some(ChatImage {
+                bytes: image_bytes,
+                text_after: text_after.into(),
+            }),
         }
     }
 }
@@ -9846,7 +9865,33 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
-            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None)
+            // Thin `should_cancel = || false` wrapper over the cancel-aware entry point below --
+            // same pattern as `generate_streaming`/`generate_streaming_with_cancel` (PR #1021
+            // review round 3 major finding: this path previously had no cancel-aware variant at
+            // all, so a disconnected client's job ran the vision decode loop to completion --
+            // up to the full remaining context window -- on the single serialized worker).
+            self.generate_multimodal_vision_with_cancel(request, tokenizer, gen_cfg, || false)
+        }
+
+        /// Cancel-aware [`Self::generate_multimodal_vision`] (PR #1021 review round 3): mirrors
+        /// [`Self::generate_streaming_with_prefix_cache_and_cancel`]'s contract on this entry
+        /// point -- `should_cancel` is polled once per decode-loop iteration, before that
+        /// iteration's GPU work, so a disconnected client stops paying for further decode steps
+        /// at the next step boundary instead of running to `max_new_tokens`/context-full. ViT
+        /// preprocessing/forward/merger cancellation is out of scope here (already covered,
+        /// separately, by `build_vision_request`'s own `should_cancel` checks in
+        /// `serve/metal_worker.rs` before this function is ever called).
+        pub fn generate_multimodal_vision_with_cancel<C>(
+            &mut self,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            should_cancel: C,
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
+        where
+            C: FnMut() -> bool,
+        {
+            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None, should_cancel)
         }
 
         /// Body of [`Self::generate_multimodal_vision`] with an optional
@@ -9859,13 +9904,17 @@ mod inner {
         /// assertions through this seam are what make the decode wiring
         /// mutation-detectable (same pattern as `gemma4`'s
         /// `generate_greedy_with_probe`).
-        fn generate_multimodal_vision_impl(
+        fn generate_multimodal_vision_impl<C>(
             &mut self,
             request: &Qwen35VisionRequest,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut decode_logits_probe: Option<&mut Vec<Vec<f32>>>,
-        ) -> Result<GenerateOutput, crate::error::InferenceError> {
+            mut should_cancel: C,
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
+        where
+            C: FnMut() -> bool,
+        {
             use crate::error::InferenceError;
 
             super::multimodal_generate_preflight(gen_cfg)?;
@@ -10073,6 +10122,15 @@ mod inner {
             // `decode_axis = physical_pos + rope_delta`, recomputed into a single
             // cos/sin row via the same `build_decode_cos_sin` the CPU oracle uses.
             while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
+                // Checked before this iteration's GPU work, independent of whether it ends up
+                // producing a token -- mirrors `generate_streaming_with_prefix_cache_and_cancel`'s
+                // decode-loop check (PR #1021 review round 3 major finding: this loop previously
+                // had no cancellation check at all, so a disconnected client's job ran to
+                // `max_new_tokens`/context-full on the single serialized worker).
+                if should_cancel() {
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -26217,6 +26275,79 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// PR #1021 review round 3 major finding: the multimodal decode loop did not honor
+        /// cancellation once generation started, so a disconnected client's job ran to
+        /// `max_new_tokens`/context-full on the single serialized worker. Forces `should_cancel`
+        /// `true` after two decode steps and asserts the loop stops there (well short of the
+        /// generous `max_new_tokens` requested) with `stop_reason: Some(StopReason::Interrupt)`
+        /// -- the same contract `generate_streaming_with_prefix_cache_and_cancel` already
+        /// guarantees on the text path.
+        ///
+        /// Mutation-sensitive: reverting the decode loop's `if should_cancel() { ... break; }`
+        /// check makes this run to the full `max_new_tokens` regardless of `should_cancel`,
+        /// which fails the `generated_tokens` bound below -- verified locally by reverting the
+        /// check and watching this assertion fail, then restoring it (not committed).
+        #[test]
+        fn generate_multimodal_vision_with_cancel_stops_decode_loop_early() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_with_cancel_stops_decode_loop_early",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 50,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let request = vision_gate_fixture(&cfg, 0.01);
+
+            let decode_calls = std::cell::Cell::new(0usize);
+            let cancel_after = 2usize;
+            let should_cancel = || {
+                let n = decode_calls.get();
+                decode_calls.set(n + 1);
+                n >= cancel_after
+            };
+
+            let out = state
+                .generate_multimodal_vision_with_cancel(
+                    &request,
+                    &tokenizer,
+                    &gen_cfg,
+                    should_cancel,
+                )
+                .expect("cancelled multimodal generate still returns Ok, not Err");
+
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Interrupt),
+                "mid-decode cancellation must surface as StopReason::Interrupt, got {:?}",
+                out.stop_reason
+            );
+            assert!(
+                out.generated_tokens < gen_cfg.max_new_tokens,
+                "cancellation must bound the decode loop well below max_new_tokens={}, got {}",
+                gen_cfg.max_new_tokens,
+                out.generated_tokens
+            );
+            assert!(
+                out.generated_tokens <= cancel_after + 1,
+                "decode loop must stop within one step of should_cancel going true \
+                 (cancel_after={cancel_after}), got {} generated tokens",
+                out.generated_tokens
+            );
+        }
+
         /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): REPLACE-semantics
         /// structural check, complementing the behavioral mutation-sensitivity
         /// test above. `forward_step_inner_impl`'s `Some(row) => { ... }`
@@ -26862,7 +26993,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("real-checkpoint state");
             let mut probed: Vec<Vec<f32>> = Vec::new();
             let out = state_fn
-                .generate_multimodal_vision_impl(&request, &tokenizer, &gen_cfg, Some(&mut probed))
+                .generate_multimodal_vision_impl(
+                    &request,
+                    &tokenizer,
+                    &gen_cfg,
+                    Some(&mut probed),
+                    || false,
+                )
                 .expect("fixture multimodal generate succeeds");
             assert_eq!(
                 out.generated_tokens, 2,

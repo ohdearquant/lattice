@@ -1839,12 +1839,18 @@ mod imp {
         })
     }
 
-    /// Flattened message content: concatenated text plus at most one
-    /// decoded image (ADR-069 S6, extending #641/#649's text-only shape).
+    /// Flattened message content: text plus at most one decoded image
+    /// (ADR-069 S6, extending #641/#649's text-only shape). `text_before`/
+    /// `text_after` preserve the caller's original content-part ordering
+    /// around the (at most one) image part -- PR #1021 review round 3: a
+    /// message with no image concatenates everything into `text_before`
+    /// (`text_after` stays empty); a message with an image splits at the
+    /// image part instead of collapsing all text into one blob ahead of it.
     #[derive(Debug, PartialEq, Eq)]
     struct FlattenedContent {
-        text: String,
+        text_before: String,
         image: Option<Vec<u8>>,
+        text_after: String,
     }
 
     /// Decode an OpenAI-shape `image_url.url` (ADR-069 S6). Accepts `data:`
@@ -1980,15 +1986,27 @@ mod imp {
     ) -> Result<FlattenedContent, RequestError> {
         match content {
             MessageContent::Text(text) => Ok(FlattenedContent {
-                text: text.clone(),
+                text_before: text.clone(),
                 image: None,
+                text_after: String::new(),
             }),
             MessageContent::Parts(parts) => {
-                let mut text = String::new();
+                let mut text_before = String::new();
+                let mut text_after = String::new();
                 let mut image: Option<Vec<u8>> = None;
                 for (part_index, part) in parts.iter().enumerate() {
                     match part {
-                        Part::Text { text: t } => text.push_str(t),
+                        // Text before the (at most one) image part accumulates in
+                        // `text_before`; text after it accumulates in `text_after`
+                        // (PR #1021 review round 3) -- preserving original order
+                        // instead of collapsing every text part into one string.
+                        Part::Text { text: t } => {
+                            if image.is_some() {
+                                text_after.push_str(t);
+                            } else {
+                                text_before.push_str(t);
+                            }
+                        }
                         Part::ImageUrl { image_url } => {
                             if image.is_some() {
                                 return Err(RequestError::bad_request(
@@ -2016,25 +2034,33 @@ mod imp {
                         }
                     }
                 }
-                Ok(FlattenedContent { text, image })
+                Ok(FlattenedContent {
+                    text_before,
+                    image,
+                    text_after,
+                })
             }
         }
     }
 
     fn to_chat_message(m: &InMsg, message_index: usize) -> Result<ChatMessage, RequestError> {
         let role = MessageRole::parse(&m.role)?;
-        let FlattenedContent { text, image } = content_parts(&m.content, message_index)?;
+        let FlattenedContent {
+            text_before,
+            image,
+            text_after,
+        } = content_parts(&m.content, message_index)?;
         let engine_role = match role {
             MessageRole::System => ChatRole::System,
             MessageRole::User => ChatRole::User,
             MessageRole::Assistant => ChatRole::Assistant,
         };
         Ok(match image {
-            Some(bytes) => ChatMessage::with_image(engine_role, text, bytes),
+            Some(bytes) => ChatMessage::with_image(engine_role, text_before, bytes, text_after),
             None => match role {
-                MessageRole::System => ChatMessage::system(text),
-                MessageRole::User => ChatMessage::user(text),
-                MessageRole::Assistant => ChatMessage::assistant(text),
+                MessageRole::System => ChatMessage::system(text_before),
+                MessageRole::User => ChatMessage::user(text_before),
+                MessageRole::Assistant => ChatMessage::assistant(text_before),
             },
         })
     }
@@ -2483,6 +2509,40 @@ mod imp {
             cfg.enable_thinking = false;
         }
         let cfg = cfg;
+        // PR #1021 review round 3 major finding: reject an image-bearing request combined with
+        // an admitted `response_format.json_schema` or a nonzero `reasoning_budget` HERE, at
+        // admission, before any worker dispatch. The vision decode path's preflight
+        // (`multimodal_generate_preflight`) rejects both unconditionally, and the worker maps
+        // that `InvalidInput` to a 500 `Failed` outcome rather than a request rejection --
+        // supporting the combination is out of scope for this PR (tracked separately).
+        if messages.iter().any(|m| m.image.is_some()) {
+            let reasoning_budget = cfg.reasoning_budget.unwrap_or(0);
+            if structured.is_some() || reasoning_budget != 0 {
+                let message = if structured.is_some() {
+                    "image content parts cannot be combined with response_format.json_schema; \
+                     submit the request without a structured response_format"
+                } else {
+                    "image content parts cannot be combined with a nonzero reasoning_budget; \
+                     submit the request without reasoning_budget"
+                };
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    "/v1/chat/completions",
+                    400,
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some("image_unsupported_combination"),
+                );
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    message,
+                    "image_unsupported_combination",
+                );
+            }
+        }
         let model_id = s.model_id.to_string();
         let streaming = req.stream.unwrap_or(false);
         let id = format!("chatcmpl-{}", unix_nanos());
@@ -3564,7 +3624,7 @@ mod imp {
                 },
             ]);
             let flattened = content_parts(&content, 0).unwrap();
-            assert_eq!(flattened.text, "ab");
+            assert_eq!(flattened.text_before, "ab");
             assert!(flattened.image.is_none());
         }
 
@@ -3720,10 +3780,12 @@ mod imp {
                 },
             ]);
             let flattened = content_parts(&content, 0).expect("mixed content must parse");
-            // Text parts concatenate in their original order regardless of
-            // where the image part sits between them; the image is carried
-            // out-of-band in `flattened.image`, not spliced into the text.
-            assert_eq!(flattened.text, "before after");
+            // Text before the image part and text after it are kept
+            // separate (PR #1021 review round 3) so a downstream renderer
+            // can splice the vision span at its true position instead of
+            // collapsing both into one blob ahead of the image.
+            assert_eq!(flattened.text_before, "before ");
+            assert_eq!(flattened.text_after, "after");
             assert!(flattened.image.is_some());
         }
 
@@ -3747,6 +3809,7 @@ mod imp {
             assert_eq!(chat_message.content, "describe this");
             let image = chat_message.image.expect("image must be attached");
             assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+            assert_eq!(image.text_after, "");
         }
 
         #[test]
@@ -4077,6 +4140,50 @@ mod imp {
                 message.contains("data: URI"),
                 "expected a data-URI-scheme rejection message, got: {message}"
             );
+        }
+
+        /// PR #1021 review round 3 major finding: an image content part combined with an
+        /// admitted strict `response_format.json_schema` must be rejected at admission with a
+        /// 400, not dispatched to the vision decode path (whose preflight rejects grammar
+        /// unconditionally, and whose worker previously mapped that rejection to a 500).
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_image_with_grammar_400() {
+            let state = AppState {
+                vocab_bytes: route_test_vocab(),
+                ..test_app_state()
+            };
+            let body = Body::from(format!(
+                r#"{{"messages":[{{"role":"user","content":[
+                    {{"type":"text","text":"describe this"}},
+                    {{"type":"image_url","image_url":{{"url":"data:image/png;base64,{TINY_PNG_BASE64}"}}}}
+                ]}}],
+                "response_format":{{"type":"json_schema","json_schema":{{
+                    "name":"result","strict":true,"schema":{V0_ROUTE_SCHEMA}}}}}}}"#
+            ));
+            let response = chat_completions(State(state), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "image_unsupported_combination");
+        }
+
+        /// PR #1021 review round 3 major finding: an image content part combined with a
+        /// nonzero `reasoning_budget` must be rejected at admission with a 400 for the same
+        /// reason as the grammar case above.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_image_with_reasoning_budget_400() {
+            let body = Body::from(format!(
+                r#"{{"messages":[{{"role":"user","content":[
+                    {{"type":"text","text":"describe this"}},
+                    {{"type":"image_url","image_url":{{"url":"data:image/png;base64,{TINY_PNG_BASE64}"}}}}
+                ]}}],
+                "reasoning_budget":50}}"#
+            ));
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "image_unsupported_combination");
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
