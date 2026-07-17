@@ -876,6 +876,85 @@ kernel void gemv_q4_decode(
     }
 }
 
+// ===== Q3 GEMV Decode: 3-bit plane-split (2+1) x float32 with simd_sum reduction =====
+// Q3 block: [f16 scale (2B)][f16 bias/min (2B)][12 bytes packed 2+1 plane-split] = 16 bytes per 32 weights.
+// Plane-split layout (see weights/q3_weights.rs module docs):
+//   packed[0..8]  low-2-bit plane, 4 values/byte; packed[8..12] high-1-bit plane, 8 values/byte.
+//   dequant: q[i] = low2(i) | (hi(i) << 2); real_value = q * scale + bias.
+// NR=2 output rows per threadgroup, 4 simdgroups of 32 = 128 threads — same dispatch
+// geometry as gemv_q4_decode (mirrored, not reinvented): TG count = ceil(N/2).
+// Dispatch: threadgroups=(ceil(N/2), 1, 1), threads=(32, 4, 1)
+kernel void gemv_q3_decode(
+    device const float* x        [[buffer(0)]],
+    device const char*  qweight  [[buffer(1)]],
+    device float*       y        [[buffer(2)]],
+    constant uint& N             [[buffer(3)]],
+    constant uint& K             [[buffer(4)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint  tiisg [[thread_index_in_simdgroup]],
+    uint  sgitg [[simdgroup_index_in_threadgroup]])
+{
+    const uint NR = 2;
+    const uint NSG = 4;
+    const uint nb = K / 32;           // number of Q3 blocks per row
+    const uint row_bytes = nb * 16;   // 16 bytes per block (2 scale + 2 bias + 12 plane-split packed)
+    const uint first_row = tgpig.x * NR;
+    const uint ix = tiisg / 4;        // block sub-index (0..7)
+    const uint il = tiisg % 4;        // lane within block (0..3); each lane owns 8 of the 32 weights
+
+    float sumf[NR] = {0.0f};
+    const uint ib_start = sgitg * 8 + ix;
+    const uint ib_stride = NSG * 8;
+
+    // Each lane handles the 8 weights at global indices [il*8, il*8+8) within
+    // the block — the high-plane byte for that range is a single aligned byte
+    // (packed[8+il]), the low-plane spans two aligned bytes (packed[2*il..2*il+2]).
+    device const float* yb = x + ib_start * 32 + il * 8;
+
+    for (uint ib = ib_start; ib < nb; ib += ib_stride) {
+        float yl[8];
+        float yl_sum = 0.0f;
+        for (uint i = 0; i < 8; i++) { yl[i] = yb[i]; yl_sum += yb[i]; }
+        yb += ib_stride * 32;
+
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r >= N) continue;
+            device const uchar* base = (device const uchar*)(qweight + r * row_bytes + ib * 16);
+            float d = float(*((device const half*)base));         // scale
+            float b = float(*((device const half*)(base + 2)));   // bias (min)
+            device const uchar* low2_bytes = base + 4 + il * 2;   // 2 bytes: low-2-bit plane for this lane's 8 values
+            uchar hi_byte = *(base + 4 + 8 + il);                  // 1 byte: high-1-bit plane for this lane's 8 values
+
+            // Asymmetric dequant: w = q * d + b, q = low2 | (hi << 2).
+            float sumq_dot = 0.0f;
+            for (uint k = 0; k < 8; k++) {
+                uchar low2 = (low2_bytes[k / 4] >> ((k % 4) * 2)) & 0x3;
+                uchar hi = (hi_byte >> k) & 0x1;
+                uchar q = low2 | (hi << 2);
+                sumq_dot += float(q) * yl[k];
+            }
+            sumf[row] += sumq_dot * d + b * yl_sum;
+        }
+    }
+
+    for (uint row = 0; row < NR; row++) sumf[row] = simd_sum(sumf[row]);
+
+    threadgroup float shared[NR][4];
+    if (tiisg == 0) {
+        for (uint row = 0; row < NR; row++) shared[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0 && tiisg == 0) {
+        for (uint row = 0; row < NR; row++) {
+            uint r = first_row + row;
+            if (r < N) {
+                y[r] = shared[row][0] + shared[row][1] + shared[row][2] + shared[row][3];
+            }
+        }
+    }
+}
+
 // ===== GDN: Depthwise conv1d + SiLU =====
 // conv_buf: [conv_dim * buf_len] persistent shift register (buf_len = kernel_size - 1)
 // One thread per channel.
