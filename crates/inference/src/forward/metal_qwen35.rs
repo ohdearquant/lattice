@@ -1621,6 +1621,14 @@ mod inner {
     struct MetalStepOutput {
         logits: Vec<f32>,
         pre_final_hidden: Vec<f32>,
+        // Kept alive by binding the returned struct (not discarding it),
+        // rather than dropping at the end of `forward_step_inner_impl`'s
+        // body — the zero-copy greedy path needs `decode.step` to span
+        // through its post-return logits scan (see
+        // `forward_step_greedy_argmax`); every other caller either drops
+        // this immediately (`.logits`, same timing as before) or holds a
+        // `Scope::NotDecode` no-op guard, which is a no-op to drop late.
+        _signpost_step: crate::forward::signpost::Interval,
     }
 
     struct MetalMtpForwardOutput {
@@ -4714,7 +4722,12 @@ mod inner {
                     GdnStateTrafficScope::MtpVerify,
                 );
                 #[cfg(not(feature = "gdn-state-counters"))]
-                let repair_out = self.forward_step_inner(repair_token, repair_pos, true);
+                let repair_out = self.forward_step_inner(
+                    repair_token,
+                    repair_pos,
+                    true,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 self.session.last_pre_final_hidden = repair_out.pre_final_hidden;
                 self.session.kv_cache.seq_len = seq_len;
             } else {
@@ -4763,7 +4776,12 @@ mod inner {
                     GdnStateTrafficScope::MtpVerify,
                 );
                 #[cfg(not(feature = "gdn-state-counters"))]
-                let out = self.forward_step_inner(token, start_pos + i, true);
+                let out = self.forward_step_inner(
+                    token,
+                    start_pos + i,
+                    true,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 self.checkpoint_gdn_to_slot(i + 1, GdnStateTrafficScope::MtpVerify)?;
                 all_logits.push(out.logits);
                 final_hidden = out.pre_final_hidden;
@@ -5977,6 +5995,7 @@ mod inner {
             token_id: u32,
             position: usize,
             capture_hidden: bool,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> MetalStepOutput {
             self.forward_step_inner_impl(
                 token_id,
@@ -5986,6 +6005,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 None,
+                signpost_scope,
             )
         }
 
@@ -6001,6 +6021,8 @@ mod inner {
             capture_hidden: bool,
             scope: GdnStateTrafficScope,
         ) -> MetalStepOutput {
+            // Both callers (repair replay, batched verifier) are MTP-verify
+            // work, never autoregressive decode — always `NotDecode`.
             self.forward_step_inner_impl(
                 token_id,
                 position,
@@ -6009,6 +6031,7 @@ mod inner {
                 scope,
                 None,
                 None,
+                crate::forward::signpost::Scope::NotDecode,
             )
         }
 
@@ -6031,6 +6054,7 @@ mod inner {
         #[allow(dead_code)] // exercised by injection-only unit tests, see doc comment
         fn forward_step_injected(&mut self, embedding: &[f32], position: usize) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
+            // Never reached on a production path (see doc comment) — always `NotDecode`.
             self.forward_step_inner_impl(
                 0,
                 position,
@@ -6039,6 +6063,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 None,
+                crate::forward::signpost::Scope::NotDecode,
             )
             .logits
         }
@@ -6054,6 +6079,7 @@ mod inner {
             embedding: &[f32],
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl(
@@ -6064,6 +6090,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 mrope_cos_sin,
+                signpost_scope,
             )
             .logits
         }
@@ -6079,6 +6106,7 @@ mod inner {
             token_id: u32,
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl(
@@ -6089,6 +6117,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 mrope_cos_sin,
+                signpost_scope,
             )
             .logits
         }
@@ -6109,9 +6138,12 @@ mod inner {
             _traffic_scope: GdnStateTrafficScope,
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> MetalStepOutput {
-            let _signpost_step =
-                crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeStep);
+            let _signpost_step = crate::forward::signpost::interval_in(
+                signpost_scope,
+                crate::forward::signpost::Label::DecodeStep,
+            );
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
 
@@ -6234,8 +6266,20 @@ mod inner {
                         linear_idx += 1;
                         layer_enc.end_encoding();
                         let t_mixer = std::time::Instant::now();
-                        layer_cmd.commit();
-                        layer_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            layer_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            layer_cmd.wait_until_completed();
+                        }
                         prof.gpu_gdn_mixer_us += t_mixer.elapsed().as_micros();
                         // MLP-only command buffer for this GDN layer.
                         let mlp_cmd = unsafe {
@@ -6254,8 +6298,20 @@ mod inner {
                         );
                         mlp_enc.end_encoding();
                         let t_mlp = std::time::Instant::now();
-                        mlp_cmd.commit();
-                        mlp_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            mlp_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            mlp_cmd.wait_until_completed();
+                        }
                         prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                     } else {
                         // Attn-only (no MLP): measures pure GQA attention cost.
@@ -6275,8 +6331,20 @@ mod inner {
                         full_idx += 1;
                         layer_enc.end_encoding();
                         let t_attn = std::time::Instant::now();
-                        layer_cmd.commit();
-                        layer_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            layer_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            layer_cmd.wait_until_completed();
+                        }
                         prof.gpu_gqa_attn_us += t_attn.elapsed().as_micros();
                         // MLP-only command buffer for this GQA layer.
                         let mlp_cmd = unsafe {
@@ -6295,8 +6363,20 @@ mod inner {
                         );
                         mlp_enc.end_encoding();
                         let t_mlp = std::time::Instant::now();
-                        mlp_cmd.commit();
-                        mlp_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            mlp_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            mlp_cmd.wait_until_completed();
+                        }
                         prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                     }
                     // Keep legacy aggregates for backward compat with existing tooling.
@@ -6312,8 +6392,20 @@ mod inner {
                     self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling);
                 head_enc.end_encoding();
                 let t_gpu = std::time::Instant::now();
-                head_cmd.commit();
-                head_cmd.wait_until_completed();
+                {
+                    let _signpost_commit = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeCbCommit,
+                    );
+                    head_cmd.commit();
+                }
+                {
+                    let _signpost_wait = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeCbWait,
+                    );
+                    head_cmd.wait_until_completed();
+                }
                 prof.gpu_lm_head_us += t_gpu.elapsed().as_micros();
 
                 let total_gpu_us = prof.gpu_gdn_mixer_us
@@ -6386,6 +6478,10 @@ mod inner {
 
                 // SAFETY: GPU completed (wait_until_completed called above for head_cmd).
                 let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     let h =
                         unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                     self.session.last_pre_final_hidden = h.clone();
@@ -6397,11 +6493,19 @@ mod inner {
                 let logits = if skip_logits_readback {
                     vec![]
                 } else if let Some(which) = topk_which_inner {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     let k = self.session.compact_topk;
                     let candidates = unsafe { self.read_topk_candidates(which, k) };
                     self.session.compact_result = candidates;
                     vec![]
                 } else {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
                 };
                 self.session.kv_cache.seq_len += 1;
@@ -6409,6 +6513,7 @@ mod inner {
                 return MetalStepOutput {
                     logits,
                     pre_final_hidden,
+                    _signpost_step,
                 };
             }
 
@@ -6472,13 +6577,15 @@ mod inner {
             // Single submit for entire forward pass + optional top-k.
             enc.end_encoding();
             {
-                let _signpost_commit = crate::forward::signpost::interval(
+                let _signpost_commit = crate::forward::signpost::interval_in(
+                    signpost_scope,
                     crate::forward::signpost::Label::DecodeCbCommit,
                 );
                 cmd.commit();
             }
             {
-                let _signpost_wait = crate::forward::signpost::interval(
+                let _signpost_wait = crate::forward::signpost::interval_in(
+                    signpost_scope,
                     crate::forward::signpost::Label::DecodeCbWait,
                 );
                 cmd.wait_until_completed();
@@ -6539,7 +6646,8 @@ mod inner {
             // Read back pre-final hidden when requested (for MTP input).
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
             let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
-                let _signpost_host_read = crate::forward::signpost::interval(
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
                 );
                 let h = unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
@@ -6554,7 +6662,8 @@ mod inner {
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
                 // SAFETY: GPU completed, buffers are StorageModeShared.
-                let _signpost_host_read = crate::forward::signpost::interval(
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
                 );
                 let k = self.session.compact_topk;
@@ -6564,7 +6673,8 @@ mod inner {
             } else {
                 // Full path: read vocab_size f32 logits back to host.
                 // SAFETY: GPU completed, buffer is StorageModeShared.
-                let _signpost_host_read = crate::forward::signpost::interval(
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
                 );
                 unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
@@ -6574,6 +6684,7 @@ mod inner {
             MetalStepOutput {
                 logits,
                 pre_final_hidden,
+                _signpost_step,
             }
         }
 
@@ -6603,14 +6714,49 @@ mod inner {
         /// live entry saved while it is still generating.
         pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
-            self.forward_step_inner(token_id, position, false).logits
+            // General-purpose raw entry point: reused for prompt prefill (a
+            // token-at-a-time loop, e.g. `forward_prefill_impl`,
+            // `forward_prefill_from`, multimodal prefill) as well as by
+            // external library consumers calling it directly, so it cannot
+            // assume decode scope. The production autoregressive decode
+            // loops call `forward_step_decode` instead (below), which is
+            // `Scope::Decode`.
+            self.forward_step_inner(
+                token_id,
+                position,
+                false,
+                crate::forward::signpost::Scope::NotDecode,
+            )
+            .logits
+        }
+
+        /// Same contract as [`Self::forward_step`], for the production
+        /// autoregressive decode loops (`generate`, `generate_streaming*`,
+        /// `generate_streaming_with_prefix_cache*`) only — marks the
+        /// `decode.*` signpost interval `Scope::Decode` so it is not silent.
+        /// Not `pub`: external consumers get the general-purpose
+        /// `forward_step`, which stays `Scope::NotDecode` since it cannot
+        /// know whether the caller is decoding or prefilling.
+        fn forward_step_decode(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner(
+                token_id,
+                position,
+                false,
+                crate::forward::signpost::Scope::Decode,
+            )
+            .logits
         }
 
         /// Zero-copy greedy argmax: run forward pass then scan GPU shared buffer
         /// directly for the argmax token ID, avoiding 993KB allocation+copy.
         fn forward_step_greedy_argmax(&mut self, token_id: u32, position: usize) -> u32 {
             let cfg = self.engine.config.clone();
-            self.forward_step_inner_impl(
+            // Binding (not discarding) the returned guard keeps `decode.step`
+            // alive through the host-read/argmax scan below, matching its
+            // documented span (through logits/top-k readback) — the scan is
+            // logically part of this step, not a separate one.
+            let _step_guard = self.forward_step_inner_impl(
                 token_id,
                 position,
                 false,
@@ -6618,6 +6764,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 None,
+                crate::forward::signpost::Scope::Decode,
             );
 
             // Fused host read + greedy sample: this scan both reads the
@@ -8910,7 +9057,14 @@ mod inner {
                 }
                 if self.session.gdn_checkpoints.is_none() {
                     // Checkpoint pool not allocated — fall through to single-token decode.
-                    let logits = self.forward_step_inner(pending_token, pos, false).logits;
+                    let logits = self
+                        .forward_step_inner(
+                            pending_token,
+                            pos,
+                            false,
+                            crate::forward::signpost::Scope::Decode,
+                        )
+                        .logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
                     // Stop-token contract (#613): `next` is never appended when it is
@@ -8939,7 +9093,14 @@ mod inner {
                     .checkpoint_gdn_to_slot(0, GdnStateTrafficScope::Decode)
                     .is_err()
                 {
-                    let logits = self.forward_step_inner(pending_token, pos, false).logits;
+                    let logits = self
+                        .forward_step_inner(
+                            pending_token,
+                            pos,
+                            false,
+                            crate::forward::signpost::Scope::Decode,
+                        )
+                        .logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
                     // Stop-token contract (#613): `next` is never appended when it is
@@ -9428,7 +9589,7 @@ mod inner {
                 let next_id = if greedy_fast {
                     self.forward_step_greedy_argmax(last_token, pos)
                 } else {
-                    let mut step_logits = self.forward_step(last_token, pos);
+                    let mut step_logits = self.forward_step_decode(last_token, pos);
 
                     // Apply grammar masking before sampling (ADR-046).
                     if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
@@ -9793,7 +9954,7 @@ mod inner {
                     stop_reason = StopReason::Eos;
                     break;
                 }
-                let step_logits = self.forward_step(last_token, pos);
+                let step_logits = self.forward_step_decode(last_token, pos);
                 pos += 1;
                 let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
@@ -10040,9 +10201,19 @@ mod inner {
                         )));
                     }
                     visual_row += 1;
-                    last_logits = self.forward_step_injected_mrope(row, pos, cos_sin);
+                    last_logits = self.forward_step_injected_mrope(
+                        row,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 } else {
-                    last_logits = self.forward_step_mrope(token_id, pos, cos_sin);
+                    last_logits = self.forward_step_mrope(
+                        token_id,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
             }
 
@@ -10121,7 +10292,12 @@ mod inner {
                     None
                 };
 
-                let step_logits = self.forward_step_mrope(last_token, physical_pos, mrope_cos_sin);
+                let step_logits = self.forward_step_mrope(
+                    last_token,
+                    physical_pos,
+                    mrope_cos_sin,
+                    crate::forward::signpost::Scope::Decode,
+                );
                 if let Some(probe) = decode_logits_probe.as_deref_mut() {
                     probe.push(step_logits.clone());
                 }
@@ -13744,7 +13920,12 @@ mod inner {
                 // Process all tokens; capture pre-final hidden for the last one.
                 for (pos, &id) in token_ids.iter().enumerate() {
                     let is_last = pos == n - 1;
-                    let _ = self.forward_step_inner(id, pos, is_last);
+                    let _ = self.forward_step_inner(
+                        id,
+                        pos,
+                        is_last,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
 
                 // last_pre_final_hidden = post-last-active-layer hidden for the last token.
@@ -14380,7 +14561,7 @@ mod inner {
                 let last_token = *all_ids
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
-                let mut step_logits = self.forward_step(last_token, pos);
+                let mut step_logits = self.forward_step_decode(last_token, pos);
 
                 // Apply grammar masking before sampling (ADR-046).
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
@@ -17327,7 +17508,7 @@ mod inner {
                 let last_token = *all_ids
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
-                let mut step_logits = self.forward_step(last_token, pos);
+                let mut step_logits = self.forward_step_decode(last_token, pos);
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     let _signpost_grammar = crate::forward::signpost::interval(
@@ -17474,7 +17655,7 @@ mod inner {
                 if !generated_ids.is_empty() && !stopped && !stopped_by_caller {
                     let seq_len = self.session.kv_cache.seq_len;
                     if seq_len < self.session.kv_cache.max_cache_len {
-                        let _ = self.forward_step(last_pushed_id, seq_len);
+                        let _ = self.forward_step_decode(last_pushed_id, seq_len);
                     }
                     // else: KV is already full; the cache boundary stays one
                     // token short of `generated_ids` — still consistent, since
@@ -26341,6 +26522,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     GdnStateTrafficScope::Decode,
                     Some(&row),
                     None,
+                    crate::forward::signpost::Scope::NotDecode,
                 )
                 .logits;
 
@@ -26355,6 +26537,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     GdnStateTrafficScope::Decode,
                     Some(&row),
                     None,
+                    crate::forward::signpost::Scope::NotDecode,
                 )
                 .logits;
 
@@ -26463,9 +26646,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             prime(&mut state);
-            let logits_a = state.forward_step_injected_mrope(&row, 2, Some((&cos_a, &sin_a)));
+            let logits_a = state.forward_step_injected_mrope(
+                &row,
+                2,
+                Some((&cos_a, &sin_a)),
+                crate::forward::signpost::Scope::NotDecode,
+            );
             prime(&mut state);
-            let logits_b = state.forward_step_injected_mrope(&row, 2, Some((&cos_b, &sin_b)));
+            let logits_b = state.forward_step_injected_mrope(
+                &row,
+                2,
+                Some((&cos_b, &sin_b)),
+                crate::forward::signpost::Scope::NotDecode,
+            );
 
             let max_abs_diff = logits_a
                 .iter()
@@ -26527,9 +26720,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     let end = start + request.decoder_hidden_size;
                     let row = &request.post_merger_rows[start..end];
                     visual_row += 1;
-                    last_logits_real = state_real.forward_step_injected_mrope(row, pos, cos_sin);
+                    last_logits_real = state_real.forward_step_injected_mrope(
+                        row,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 } else {
-                    last_logits_real = state_real.forward_step_mrope(token_id, pos, cos_sin);
+                    last_logits_real = state_real.forward_step_mrope(
+                        token_id,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
             }
 
@@ -26674,7 +26877,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let mut bits_last = Vec::new();
             for (pos, &token_id) in input_ids.iter().enumerate() {
-                let a = state_mrope_none.forward_step_mrope(token_id, pos, None);
+                let a = state_mrope_none.forward_step_mrope(
+                    token_id,
+                    pos,
+                    None,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 let b = state_plain_bits.forward_step(token_id, pos);
                 assert_bits_equal(&a, &b, pos);
                 bits_last = a;
@@ -26689,7 +26897,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     physical_pos, state_plain_bits.session.kv_cache.seq_len,
                     "physical KV positions diverged before decode step {step}"
                 );
-                let a = state_mrope_none.forward_step_mrope(next_id, physical_pos, None);
+                let a = state_mrope_none.forward_step_mrope(
+                    next_id,
+                    physical_pos,
+                    None,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 let b = state_plain_bits.forward_step(next_id, physical_pos);
                 assert_bits_equal(&a, &b, input_ids.len() + step);
                 bits_last = a;
@@ -26840,9 +27053,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                         let end = start + request.decoder_hidden_size;
                         let row = &request.post_merger_rows[start..end];
                         visual_row += 1;
-                        last_logits = state.forward_step_injected_mrope(row, pos, cos_sin);
+                        last_logits = state.forward_step_injected_mrope(
+                            row,
+                            pos,
+                            cos_sin,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
                     } else {
-                        last_logits = state.forward_step_mrope(token_id, pos, cos_sin);
+                        last_logits = state.forward_step_mrope(
+                            token_id,
+                            pos,
+                            cos_sin,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
                     }
                 }
                 let mut all_ids = request.input_ids.clone();
@@ -26868,7 +27091,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 } else {
                     None
                 };
-                state.forward_step_mrope(first_id, physical_pos, cos_sin)
+                state.forward_step_mrope(
+                    first_id,
+                    physical_pos,
+                    cos_sin,
+                    crate::forward::signpost::Scope::NotDecode,
+                )
             };
 
             let logits_correct = manual_decode_logits(true);

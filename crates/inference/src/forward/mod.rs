@@ -16,11 +16,11 @@ pub mod metal_qwen35;
 pub mod moe_expert_cache;
 pub mod neon;
 pub mod neon_forward;
-// Every call site lives inside `metal_qwen35`'s `metal-gpu`-gated Metal
-// decode implementation; with that feature off, nothing in this crate
-// constructs a `Label`/`Interval`, which is otherwise flagged as dead code
-// now that the module is `pub(crate)` rather than a public API surface.
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+// Every call site lives inside `metal_qwen35::inner`, gated the same way
+// (`target_os = "macos"` + `metal-gpu`) — mirror that gate here instead of
+// compiling the module everywhere and suppressing the resulting dead-code
+// lint. Smaller surface, nothing to keep in sync with `mod inner`'s own gate.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) mod signpost;
 
 // Re-export from cpu for backward compat (was `layers`)

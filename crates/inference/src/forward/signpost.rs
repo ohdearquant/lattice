@@ -127,11 +127,33 @@ mod imp {
         }
     }
 
+    /// The category string is `<os/signpost.h>`'s `OS_LOG_CATEGORY_DYNAMIC_TRACING`:
+    /// ```c
+    /// #define OS_LOG_CATEGORY_DYNAMIC_TRACING "DynamicTracing"
+    /// ```
+    /// (`/Library/Developer/CommandLineTools/SDKs/MacOSX26.2.sdk/usr/include/os/signpost.h:332`,
+    /// under the header's own `@const OS_LOG_CATEGORY_DYNAMIC_TRACING` doc comment:
+    /// "signposts emitted to the resulting log handle should be disabled by
+    /// default, reducing the runtime overhead. os_signpost_enabled calls on the
+    /// resulting log handle will only return 'true' when a performance tool
+    /// like Instruments.app is recording.") A plain `"decode"` category (the
+    /// prior value) has no such contract — `os_signpost_enabled` on it can be
+    /// `true` with no tool attached, so every decode interval paid ID
+    /// generation plus begin/end FFI even in an idle signpost-enabled build.
+    /// This category name is not one of `Label`'s `__TEXT,__oslogstring`
+    /// statics: it is passed to `os_log_create`, not to
+    /// `_os_signpost_emit_with_name_impl`'s `name`/`format` parameters, so it
+    /// does not need compiler-string-table placement — only those two
+    /// parameters are read from `__TEXT,__oslogstring` by the trace decoder.
+    /// A heap `CString`, one-time-allocated and `OnceLock`-cached below (not
+    /// a per-interval cost), is the same category-string mechanism the
+    /// subsystem string already used before this fix.
     fn decode_log() -> os_log_t {
         static LOG: OnceLock<usize> = OnceLock::new();
         let ptr = *LOG.get_or_init(|| {
             let subsystem = CString::new("ai.lattice.inference").expect("static subsystem string");
-            let category = CString::new("decode").expect("static category string");
+            let category =
+                CString::new("DynamicTracing").expect("static dynamic-tracing category string");
             // SAFETY: both CStrings outlive this call; os_log_create copies
             // what it needs internally per Apple's os_log contract. This is a
             // one-time (OnceLock-cached) allocation, not a per-interval cost;
@@ -196,6 +218,15 @@ mod imp {
                 state: Some((log, spid, label)),
             }
         }
+
+        /// Same zero-FFI-cost `state: None` guard `begin` returns when
+        /// `os_signpost_enabled` observed false — used for a label that is
+        /// suppressed for the current [`super::Scope`] rather than for the
+        /// tracing-off case. No `decode_log()`/FFI call at all: the caller
+        /// already knows this scope must stay silent.
+        pub fn not_recording() -> Self {
+            Interval { state: None }
+        }
     }
 
     impl Drop for Interval {
@@ -220,10 +251,27 @@ mod imp {
         pub fn begin(_label: Label) -> Self {
             Interval
         }
+
+        #[inline(always)]
+        pub fn not_recording() -> Self {
+            Interval
+        }
     }
 }
 
 pub(crate) use imp::Interval;
+
+/// Discriminates which decode-path invocations of the shared per-token
+/// forward helper are in the documented autoregressive-decode scope. Only
+/// `Scope::Decode` call sites emit `decode.*` signposts; MTP verification,
+/// prompt-prefill (multimodal or plain), and diagnostic replays pass
+/// `Scope::NotDecode` and stay silent — the same shared helper otherwise
+/// reports their work as decode, contradicting the label glossary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    Decode,
+    NotDecode,
+}
 
 /// Begin a signpost interval for `label`, ending it when the returned guard
 /// drops. No-op (zero-sized, inlined away) unless built with `--features
@@ -233,12 +281,23 @@ pub(crate) fn interval(label: Label) -> Interval {
     Interval::begin(label)
 }
 
+/// Same as [`interval`], but only for `Scope::Decode`; `Scope::NotDecode`
+/// returns the same zero-FFI-cost guard a disabled/not-recording build
+/// returns, without touching `decode_log()` or any FFI call.
+#[inline(always)]
+pub(crate) fn interval_in(scope: Scope, label: Label) -> Interval {
+    match scope {
+        Scope::Decode => Interval::begin(label),
+        Scope::NotDecode => Interval::not_recording(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod recorder {
     //! Emission-recording seam for tests: records begin/end pairing without
     //! touching the real macOS FFI path, so pairing can be asserted on every
     //! platform/feature combination `cargo test` runs under.
-    use super::Label;
+    use super::{Label, Scope};
     use std::cell::RefCell;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,18 +318,30 @@ pub(crate) mod recorder {
         LOG.with(|log| log.borrow().clone())
     }
 
-    pub(crate) struct RecordingInterval(Label);
+    pub(crate) struct RecordingInterval(Option<Label>);
 
     impl RecordingInterval {
         pub(crate) fn begin(label: Label) -> Self {
             LOG.with(|log| log.borrow_mut().push(Event::Begin(label)));
-            RecordingInterval(label)
+            RecordingInterval(Some(label))
+        }
+
+        /// Mirrors [`super::interval_in`]'s scope gating: `Scope::NotDecode`
+        /// records nothing at begin or drop, exactly like the real FFI path's
+        /// `Interval::not_recording()`.
+        pub(crate) fn begin_in(scope: Scope, label: Label) -> Self {
+            match scope {
+                Scope::Decode => Self::begin(label),
+                Scope::NotDecode => RecordingInterval(None),
+            }
         }
     }
 
     impl Drop for RecordingInterval {
         fn drop(&mut self) {
-            LOG.with(|log| log.borrow_mut().push(Event::End(self.0)));
+            if let Some(label) = self.0 {
+                LOG.with(|log| log.borrow_mut().push(Event::End(label)));
+            }
         }
     }
 }
@@ -278,6 +349,7 @@ pub(crate) mod recorder {
 #[cfg(test)]
 mod tests {
     use super::Label;
+    use super::Scope;
     use super::interval;
     use super::recorder::{Event, RecordingInterval};
 
@@ -314,6 +386,39 @@ mod tests {
                 Event::End(Label::DecodeCbCommit),
                 Event::End(Label::DecodeStep),
             ]
+        );
+    }
+
+    // Mutation-sensitive: drives the `Scope` discriminator both ways through
+    // the exact `RecordingInterval::begin_in` seam `interval_in` mirrors.
+    // `Scope::NotDecode` (MTP verify / prefill / diagnostic call sites) must
+    // record zero events; `Scope::Decode` must record the full begin/end
+    // pair. Reverting the discriminator (emitting unconditionally, as the
+    // shared helper did before this fix) makes the `NotDecode` assertion
+    // fail — see fix-round-3 report for the mutation run.
+    #[test]
+    fn scope_discriminator_silences_non_decode_and_records_decode() {
+        super::recorder::clear();
+        {
+            let _not_decode = RecordingInterval::begin_in(Scope::NotDecode, Label::DecodeStep);
+        }
+        assert_eq!(
+            super::recorder::events(),
+            vec![],
+            "Scope::NotDecode must record nothing"
+        );
+
+        super::recorder::clear();
+        {
+            let _decode = RecordingInterval::begin_in(Scope::Decode, Label::DecodeStep);
+        }
+        assert_eq!(
+            super::recorder::events(),
+            vec![
+                Event::Begin(Label::DecodeStep),
+                Event::End(Label::DecodeStep)
+            ],
+            "Scope::Decode must record the begin/end pair"
         );
     }
 }
