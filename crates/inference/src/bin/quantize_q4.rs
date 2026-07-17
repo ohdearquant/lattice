@@ -14,7 +14,10 @@
 //! alongside its `f32` downcast and Q4 output.
 
 use lattice_inference::quant::quarot::QuarotTensorReader;
-use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, quantize_f32_to_q4, save_q4_file};
+use lattice_inference::weights::q4_weights::{
+    Q4_BLOCK_BYTES, Q4Compensation, quantize_f32_to_q4, quantize_f32_to_q4_compensated,
+    save_q4_file,
+};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -188,11 +191,17 @@ struct IndexEntry {
 // ---------------------------------------------------------------------------
 
 fn print_usage_and_exit() -> ! {
-    eprintln!("Usage: quantize_q4 --model-dir <DIR> --output-dir <DIR> [--dry-run]");
+    eprintln!(
+        "Usage: quantize_q4 --model-dir <DIR> --output-dir <DIR> [--dry-run] [--compensation error-feedback]"
+    );
     eprintln!();
     eprintln!("  --model-dir   directory containing model.safetensors[.index.json]");
     eprintln!("  --output-dir  directory to write .q4 and index files");
     eprintln!("  --dry-run     read tensors but skip writing output");
+    eprintln!(
+        "  --compensation error-feedback  opt-in GPTQ-style error feedback for 2-D weight \
+         matrices (non-2-D tensors fall back to plain RTN with a notice)"
+    );
     std::process::exit(1);
 }
 
@@ -208,6 +217,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut model_dir: Option<PathBuf> = None;
     let mut output_dir: Option<PathBuf> = None;
     let mut dry_run = false;
+    let mut compensation = Q4Compensation::None;
 
     let mut i = 1;
     while i < args.len() {
@@ -227,6 +237,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 })));
             }
             "--dry-run" => dry_run = true,
+            "--compensation" => {
+                i += 1;
+                match args.get(i).map(String::as_str) {
+                    Some("error-feedback") => compensation = Q4Compensation::ErrorFeedback,
+                    other => {
+                        eprintln!(
+                            "--compensation requires the value `error-feedback`, got {other:?}"
+                        );
+                        print_usage_and_exit();
+                    }
+                }
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 print_usage_and_exit();
@@ -315,7 +337,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         if should_quantize(tensor_name) {
-            let q4 = quantize_f32_to_q4(&data_f32, &shape)?;
+            // Error-feedback compensation is defined only for explicit 2-D
+            // weight matrices; anything else (fused MoE expert arrays, 1-D
+            // tensors that slip through should_quantize) keeps plain RTN.
+            let q4 = if compensation == Q4Compensation::ErrorFeedback && shape.len() == 2 {
+                quantize_f32_to_q4_compensated(&data_f32, &shape, compensation)?
+            } else {
+                if compensation != Q4Compensation::None && shape.len() != 2 {
+                    eprintln!("  note: {tensor_name} shape {shape:?} is not 2-D; plain RTN used");
+                }
+                quantize_f32_to_q4(&data_f32, &shape)?
+            };
             let bytes_out = (q4.blocks.len() * Q4_BLOCK_BYTES) as u64;
             total_bytes_out += bytes_out;
 
