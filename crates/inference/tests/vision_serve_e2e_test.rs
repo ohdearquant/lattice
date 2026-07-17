@@ -23,7 +23,7 @@
 //! Run:
 //! ```bash
 //! cargo test --release -p lattice-inference --features f16,metal-gpu \
-//!     --test vision_serve_e2e_test -- --nocapture --ignored
+//!     --test vision_serve_e2e_test -- --nocapture
 //! ```
 
 use std::io::Read;

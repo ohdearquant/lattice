@@ -51,10 +51,25 @@ const QWEN35_IMAGE_STD: f32 = 0.5;
 /// patch_len` allocation below and unbounded O(n^2) full-attention work in
 /// `multihead_attention_full`. Chosen as a conservative serving ceiling rather than derived from
 /// the checkpoint: 2048x2048 is exactly `64 * (patch_size=16 * spatial_merge_size=2)` for the
-/// real 0.8B checkpoint's factor, i.e. a 128x128 = 16,384-patch grid pre-merge -- generous for
-/// real chat-image use, far below what would let one request monopolize the single serialized
-/// Metal worker.
+/// real 0.8B checkpoint's factor, i.e. a 128x128 = 16,384-patch grid pre-merge. This cap alone
+/// is NOT the resource bound -- the O(n^2) full-attention cost bound is [`MAX_VISION_PATCHES`]
+/// below (round-2 review); this dimension cap remains as the outer decoder-level limit the
+/// `image` crate can enforce during header parsing.
 const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
+
+/// Maximum accepted pre-merge patch count for one image, enforced from the
+/// header-reported dimensions before any pixel data is decoded (ADR-069 S6
+/// review round 2 blocker). The dimension cap above is not sufficient on its
+/// own because the ViT's full attention materializes a per-head
+/// `scores[n, n]` f32 matrix (`multihead_attention_full` via `gemm_bt`): at
+/// the 2048x2048 dimension boundary with the real checkpoint's
+/// `patch_size=16`, `n = 128^2 = 16,384` and that single allocation is
+/// `16,384^2 * 4 = 1 GiB`, before compute. The budget is therefore chosen
+/// from the attention-score allocation, not decoded RGB bytes: `n = 4,096`
+/// (a 1024x1024 image at patch 16) caps the per-head score matrix at
+/// `4,096^2 * 4 = 64 MiB` and the O(n^2) work correspondingly, while staying
+/// generous for real chat-image use.
+const MAX_VISION_PATCHES: usize = 4096;
 
 /// The temporal/height/width patch-grid shape for one image (`grid_thw` in
 /// the HF reference). `t` is always 1 for a still image (video is out of
@@ -107,8 +122,8 @@ pub fn preprocess_qwen35_image(
         .with_guessed_format()
         .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
     dim_reader.limits(limits.clone());
-    match dim_reader.into_dimensions() {
-        Ok(_) => {}
+    let (header_w, header_h) = match dim_reader.into_dimensions() {
+        Ok(dims) => dims,
         Err(image::ImageError::Limits(e)) => {
             return Err(VisionError::DimensionsExceeded(format!(
                 "image exceeds the {MAX_IMAGE_DIMENSION_PIXELS}x{MAX_IMAGE_DIMENSION_PIXELS}-pixel \
@@ -118,6 +133,25 @@ pub fn preprocess_qwen35_image(
         Err(e) => {
             return Err(VisionError::ImageDecode(format!(
                 "header/dimension read failed: {e}"
+            )));
+        }
+    };
+
+    // Attention-budget guard, still header-only (ADR-069 S6 review round 2 blocker): the
+    // dimension cap alone admits grids whose per-head `scores[n, n]` full-attention allocation
+    // reaches 1 GiB (see MAX_VISION_PATCHES docs). Conservative ceil-division so unaligned
+    // dimensions (rejected later anyway) cannot round the estimate below the true patch count.
+    // A zero patch_size falls through to the InvalidConfig rejection below.
+    if cfg.patch_size > 0 {
+        let est_patches = (header_w as usize)
+            .div_ceil(cfg.patch_size)
+            .saturating_mul((header_h as usize).div_ceil(cfg.patch_size));
+        if est_patches > MAX_VISION_PATCHES {
+            return Err(VisionError::DimensionsExceeded(format!(
+                "image {header_w}x{header_h} yields {est_patches} patches at \
+                 patch_size={}, exceeding the {MAX_VISION_PATCHES}-patch serving \
+                 budget (full-attention cost is quadratic in patch count)",
+                cfg.patch_size
             )));
         }
     }
@@ -644,6 +678,54 @@ mod tests {
             matches!(err, VisionError::DimensionsExceeded(_)),
             "expected DimensionsExceeded, got {err:?}"
         );
+    }
+
+    /// The real 0.8B checkpoint's patch geometry, which the patch-budget
+    /// guard's boundary numbers are quoted in (round-2 review blocker).
+    fn real_geometry_cfg() -> VisionModelConfig {
+        VisionModelConfig {
+            patch_size: 16,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            in_channels: 3,
+            ..tiny_cfg()
+        }
+    }
+
+    #[test]
+    fn preprocess_rejects_attention_budget_at_admitted_dimension_boundary() {
+        // 2048x2048 passes the MAX_IMAGE_DIMENSION_PIXELS cap exactly, but at the
+        // real patch_size=16 it is a 128x128 = 16,384-patch grid whose per-head
+        // full-attention scores allocation is 16,384^2 * 4 = 1 GiB. The patch
+        // budget must reject it from the header alone (round-2 review blocker).
+        let cfg = real_geometry_cfg();
+        let png = make_black_test_png(2048, 2048);
+        assert!(
+            png.len() < 65_536,
+            "fixture must stay a realistic small-upload size (got {} bytes)",
+            png.len()
+        );
+        let err = preprocess_qwen35_image(&png, &cfg).unwrap_err();
+        assert!(
+            matches!(err, VisionError::DimensionsExceeded(_)),
+            "expected DimensionsExceeded from the patch budget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn preprocess_accepts_largest_grid_within_attention_budget() {
+        // 1024x1024 at patch_size=16 is exactly MAX_VISION_PATCHES = 4,096
+        // pre-merge patches -- the largest square grid the budget admits. Its
+        // per-head scores allocation is 4,096^2 * 4 = 64 MiB, the documented
+        // ceiling. Must preprocess successfully (not be rejected by either
+        // guard), proving the budget boundary sits where the docs say.
+        let cfg = real_geometry_cfg();
+        let png = make_black_test_png(1024, 1024);
+        let (patches, grid) = preprocess_qwen35_image(&png, &cfg).expect("boundary grid accepted");
+        assert_eq!(grid, GridThw { t: 1, h: 64, w: 64 });
+        assert_eq!(grid.num_patches(), MAX_VISION_PATCHES);
+        let patch_len = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+        assert_eq!(patches.len(), MAX_VISION_PATCHES * patch_len);
     }
 
     #[test]

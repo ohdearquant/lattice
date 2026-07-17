@@ -450,13 +450,18 @@ enum VisionBuildStop {
 
 /// Build a [`Qwen35VisionRequest`] for `messages` (exactly one of which
 /// carries an image, at `image_message_index`) against `vision_weights`
-/// (ADR-069 S6): preprocess -> Metal ViT forward (S3b, transparently
-/// CPU-fallback per-GEMM when the Metal dispatch threshold isn't cleared --
-/// see `qwen35_vit_metal`'s module docs) -> merger -> the expanded token-id
-/// stream from [`build_vision_prompt_ids`]. Returns [`VisionBuildStop::Failure`] wrapping
+/// (ADR-069 S6): preprocess -> expanded token-id stream from
+/// [`build_vision_prompt_ids`] + `window_preflight` on its length -> Metal
+/// ViT forward (S3b, transparently CPU-fallback per-GEMM when the Metal
+/// dispatch threshold isn't cleared -- see `qwen35_vit_metal`'s module docs)
+/// -> merger. The prompt ids are built (and the context window checked)
+/// BEFORE the ViT because the expanded length is fully determined by the
+/// tokenizer and the patch grid: an over-context request must cost only
+/// decode/preprocess, never a full vision forward pass (PR #1021 review
+/// round 2 blocker). Returns [`VisionBuildStop::Failure`] wrapping
 /// [`WorkerFailure::Rejected`] for a caller-fixable problem (bad image bytes, oversized decoded
-/// dimensions, misaligned dimensions, missing checkpoint vision metadata),
-/// [`WorkerFailure::Failed`] for an internal forward-pass error, and
+/// dimensions, misaligned dimensions, over-context expanded prompt, missing checkpoint vision
+/// metadata), [`WorkerFailure::Failed`] for an internal forward-pass error, and
 /// [`VisionBuildStop::Cancelled`] (issue found in PR #1021 review round 1) if `should_cancel`
 /// observes the caller is gone at any point between decode/preprocess, ViT, and merger -- so a
 /// disconnected client stops paying for vision work at the earliest checkpoint instead of only
@@ -470,6 +475,7 @@ fn build_vision_request(
     image_message_index: usize,
     image_bytes: &[u8],
     should_cancel: &mut dyn FnMut() -> bool,
+    window_preflight: &dyn Fn(usize) -> Result<(), ApiError>,
 ) -> Result<Qwen35VisionRequest, VisionBuildStop> {
     let bad_request = |message: String| {
         VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
@@ -515,6 +521,33 @@ fn build_vision_request(
         }))
     })?;
 
+    // Grid -> expanded prompt ids BEFORE any ViT/merger work (daemon review
+    // blocker on round 2's head): the expanded prompt length is fully
+    // determined by the tokenizer and the patch grid, so a request that is
+    // guaranteed to be rejected as over-context must be rejected HERE --
+    // paying only decode/preprocess cost -- not after the full vision
+    // forward pass has run.
+    let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
+    if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
+        return Err(bad_request(format!(
+            "image dimensions produce a patch grid {grid:?} not divisible by \
+             spatial_merge_size^2 ({merge_sq})"
+        )));
+    }
+    let num_pads = grid.num_patches() / merge_sq;
+
+    let input_ids = build_vision_prompt_ids(
+        messages,
+        image_message_index,
+        tokenizer,
+        vision_start,
+        vision_end,
+        image_token_id,
+        num_pads,
+    );
+    window_preflight(input_ids.len())
+        .map_err(|e| VisionBuildStop::Failure(WorkerFailure::Rejected(e)))?;
+
     if should_cancel() {
         return Err(VisionBuildStop::Cancelled);
     }
@@ -534,25 +567,6 @@ fn build_vision_request(
     if should_cancel() {
         return Err(VisionBuildStop::Cancelled);
     }
-
-    let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
-    if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
-        return Err(bad_request(format!(
-            "image dimensions produce a patch grid {grid:?} not divisible by \
-             spatial_merge_size^2 ({merge_sq})"
-        )));
-    }
-    let num_pads = grid.num_patches() / merge_sq;
-
-    let input_ids = build_vision_prompt_ids(
-        messages,
-        image_message_index,
-        tokenizer,
-        vision_start,
-        vision_end,
-        image_token_id,
-        num_pads,
-    );
 
     Ok(Qwen35VisionRequest {
         input_ids,
@@ -762,6 +776,19 @@ impl MetalWorker {
                             .as_ref()
                             .expect("image_message_index selected only messages with Some(image)")
                             .bytes;
+                        // Window preflight is threaded INTO the builder so it runs as soon
+                        // as the expanded prompt length is known (right after preprocess),
+                        // before the ViT/merger cost -- not after it (daemon review
+                        // blocker: over-context requests previously consumed the entire
+                        // vision prefill first).
+                        let window_preflight = |expanded_len: usize| {
+                            check_prompt_fits_window(
+                                meta.context_window_policy,
+                                meta.model_max_context,
+                                expanded_len,
+                                cfg,
+                            )
+                        };
                         let request = match build_vision_request(
                             vision_weights,
                             &state.engine.config,
@@ -770,6 +797,7 @@ impl MetalWorker {
                             image_message_index,
                             image_bytes,
                             &mut *should_cancel,
+                            &window_preflight,
                         ) {
                             Ok(request) => request,
                             Err(VisionBuildStop::Cancelled) => {
@@ -777,13 +805,6 @@ impl MetalWorker {
                             }
                             Err(VisionBuildStop::Failure(failure)) => return Err(failure),
                         };
-                        check_prompt_fits_window(
-                            meta.context_window_policy,
-                            meta.model_max_context,
-                            request.input_ids.len(),
-                            cfg,
-                        )
-                        .map_err(WorkerFailure::Rejected)?;
                         if should_cancel() {
                             return Ok(vision_cancelled_output());
                         }
@@ -1199,8 +1220,11 @@ mod tests {
 
     fn minimal_tokenizer() -> BpeTokenizer {
         // The constructor requires a dense id range, so a single-entry vocab is
-        // the smallest valid tokenizer. These tests cancel before any
-        // tokenization happens; the tokenizer is never actually exercised.
+        // the smallest valid tokenizer. The already-cancelled test stops before
+        // any tokenization; the mid-flight test does reach
+        // `build_vision_prompt_ids` (prompt ids now precede the ViT), where
+        // unknown characters fail soft (dropped, no unk_id configured) -- these
+        // tests assert cancellation ordering, never token content.
         let vocab = std::collections::HashMap::from([("a".to_string(), 0u32)]);
         BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
             .expect("single-entry vocab must construct a tokenizer")
@@ -1251,6 +1275,7 @@ mod tests {
             0,
             garbage_bytes,
             &mut should_cancel,
+            &|_| Ok(()),
         );
 
         assert!(
@@ -1289,6 +1314,7 @@ mod tests {
             0,
             &png,
             &mut should_cancel,
+            &|_| Ok(()),
         );
 
         assert!(
