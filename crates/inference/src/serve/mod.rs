@@ -45,6 +45,12 @@ pub mod metrics;
 /// so every caller shares one RFC-4648 implementation.
 pub mod base64_codec;
 
+/// Machine-wide Metal GPU test-serialization lock, exposed for separate-compilation-unit
+/// integration tests (PR #1021 review round 6, issue 6). Test-only: gated the same way
+/// `metal_worker`'s cross-binary test seams are (`cfg(any(test, feature = "test-utils"))`).
+#[cfg(any(test, feature = "test-utils"))]
+pub mod gpu_test_lock;
+
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries
 /// already enforced this exact limit independently (`lattice.rs` via
 /// `DefaultBodyLimit::max`, `lattice_serve.rs` via `to_bytes(body, LIMIT)`);

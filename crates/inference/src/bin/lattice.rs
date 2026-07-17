@@ -2878,7 +2878,7 @@ mod serve {
                         // `message_text`); ADR-069 S6 wires vision into
                         // `lattice_serve.rs` only, so this binary never
                         // loads vision weights.
-                        None,
+                        lattice_inference::serve::metal_worker::LazyVision::Unsupported,
                     ))
                 },
                 max_pending,
@@ -3634,7 +3634,17 @@ mod serve {
         // Render the full conversation into a ChatML prompt through the
         // shared `format_chat_template` (#668).  Returns 400 for any
         // unsupported role or content-part type encountered.
-        let prompt = format_chat_template(&to_chat_messages(&req.messages)?);
+        // `to_chat_messages` never builds an image-bearing `ChatMessage` (this binary's chat
+        // surface rejects `image_url` content parts outright in `message_text`), so
+        // `format_chat_template`'s new image rejection cannot actually trigger here today --
+        // still mapped to a 400 rather than unwrapped, since that invariant lives in a
+        // different function and must not silently panic if it's ever relaxed.
+        let prompt = format_chat_template(&to_chat_messages(&req.messages)?).map_err(|e| {
+            ApiError::BadRequest {
+                message: e.to_string(),
+                code: "unsupported_feature",
+            }
+        })?;
 
         Ok(ValidatedChatRequest {
             max_tokens,
@@ -4574,7 +4584,7 @@ mod serve {
                     content: MessageContent::Text("Hello".to_string()),
                 },
             ];
-            let prompt = format_chat_template(&to_chat_messages(&messages).unwrap());
+            let prompt = format_chat_template(&to_chat_messages(&messages).unwrap()).unwrap();
             assert!(prompt.contains("<|im_start|>system\nBe helpful.<|im_end|>"));
             assert!(prompt.contains("<|im_start|>user\nHello<|im_end|>"));
             assert!(prompt.ends_with("<|im_start|>assistant\n"));
@@ -5085,7 +5095,7 @@ mod serve {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
             }];
-            let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap());
+            let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap()).unwrap();
             assert_eq!(
                 prompt,
                 "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
@@ -5108,7 +5118,7 @@ mod serve {
                     content: MessageContent::Text("q2".to_string()),
                 },
             ];
-            let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap());
+            let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap()).unwrap();
             assert!(prompt.contains("<|im_start|>user\nq1<|im_end|>"));
             assert!(prompt.contains("<|im_start|>assistant\na1<|im_end|>"));
             assert!(prompt.contains("<|im_start|>user\nq2<|im_end|>"));
@@ -5130,7 +5140,7 @@ mod serve {
                     },
                 ]),
             }];
-            let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap());
+            let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap()).unwrap();
             assert!(prompt.contains("<|im_start|>user\nhello world<|im_end|>"));
         }
 

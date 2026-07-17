@@ -1095,14 +1095,90 @@ pub(crate) fn render_chat_turn(out: &mut String, msg: &ChatMessage) {
 /// Format messages into Qwen3.5 chat template.
 /// Template: <|im_start|>{role}\n{content}<|im_end|>\n
 /// Final assistant turn left open for generation.
-pub fn format_chat_template(messages: &[ChatMessage]) -> String {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any message carries an image
+/// (PR #1021 review round 6, issues 1+10): this renderer only ever emits
+/// `msg.content` for each turn, so a `ChatMessage::with_image` value silently
+/// lost its image bytes and `image.text_after` here before this fix, with no
+/// error at all -- a text-only entry point that happened to receive a valid,
+/// image-bearing `ChatMessage` produced a plausible-looking text-only
+/// completion instead of failing loudly. Rather than splitting `ChatMessage`
+/// into two types (API churn disproportionate to the fix), every public
+/// entry point that renders through this function now rejects image-bearing
+/// messages instead of dropping their images; callers that need image
+/// support use the dedicated multimodal path
+/// (`serve::metal_worker::build_vision_prompt_ids` /
+/// `generate_multimodal_vision_with_cancel`), which still renders
+/// image-bearing messages correctly.
+pub fn format_chat_template(
+    messages: &[ChatMessage],
+) -> Result<String, crate::error::InferenceError> {
+    if let Some(image_msg) = messages.iter().find(|m| m.image.is_some()) {
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "message with role '{}' carries an image, but this is a text-only chat-completion \
+             entry point that cannot render it; use the multimodal serve path instead",
+            image_msg.role.as_str()
+        )));
+    }
     let mut prompt = String::new();
     for msg in messages {
         render_chat_turn(&mut prompt, msg);
     }
     // Open assistant turn for generation
     prompt.push_str("<|im_start|>assistant\n");
-    prompt
+    Ok(prompt)
+}
+
+#[cfg(test)]
+mod format_chat_template_image_rejection_tests {
+    // CPU-available (no `metal-gpu` feature needed): `ChatMessage`/`format_chat_template`
+    // live at module top level for exactly this reason (#668).
+    use super::{ChatMessage, ChatRole, format_chat_template};
+
+    /// PR #1021 review round 6, issues 1+10: a text-only entry point must reject an
+    /// image-bearing message instead of silently rendering only its text and dropping the
+    /// image bytes + `image.text_after`.
+    #[test]
+    fn text_only_renderer_rejects_image_bearing_message() {
+        let messages = vec![ChatMessage::with_image(
+            ChatRole::User,
+            "before",
+            vec![0xFFu8, 0xD8, 0xFF],
+            "after",
+        )];
+        let err = format_chat_template(&messages)
+            .expect_err("format_chat_template must reject an image-bearing message");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multimodal"),
+            "error must direct the caller to the multimodal path: {msg}"
+        );
+        assert!(
+            msg.contains("user"),
+            "error must name the offending role: {msg}"
+        );
+    }
+
+    /// Sibling positive case: ordinary text-only messages are completely unaffected.
+    #[test]
+    fn text_only_renderer_still_accepts_plain_messages() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+        ];
+        let prompt =
+            format_chat_template(&messages).expect("plain text messages must still render");
+        assert_eq!(
+            prompt,
+            "<|im_start|>system\nsys<|im_end|>\n\
+             <|im_start|>user\nhello<|im_end|>\n\
+             <|im_start|>assistant\nhi<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -14059,7 +14135,7 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<ChatCompletionOutput, crate::error::InferenceError> {
-            let prompt = format_chat_template(messages);
+            let prompt = format_chat_template(messages)?;
             // Add <|im_end|> as stop token
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -16131,7 +16207,7 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
-            let prompt = format_chat_template(messages);
+            let prompt = format_chat_template(messages)?;
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
                 && !cfg.stop_token_ids.contains(&im_end_id)
@@ -17624,7 +17700,7 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
-            let prompt = format_chat_template(messages);
+            let prompt = format_chat_template(messages)?;
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
                 && !cfg.stop_token_ids.contains(&im_end_id)

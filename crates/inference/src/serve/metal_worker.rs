@@ -56,16 +56,17 @@ use crate::forward::metal_qwen35::{
     render_chat_turn,
 };
 use crate::kv_cache::CrossTurnSlotId;
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
+use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, VisionModelConfig};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::vision::VisionError;
-use crate::vision::checkpoint::Qwen35VisionWeights;
+use crate::vision::checkpoint::{Qwen35VisionWeights, load_qwen35_vision_weights};
 use crate::vision::multimodal::Qwen35VisionRequest;
 use crate::vision::qwen35_merger::qwen35_merger_forward;
 use crate::vision::qwen35_vit::preprocess_qwen35_image;
 use crate::vision::qwen35_vit_metal::qwen35_vit_forward_metal;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
@@ -707,6 +708,70 @@ fn run_worker_loop(
     }
 }
 
+/// A vision-capable checkpoint's `model.visual.*` tensors, loaded either eagerly at startup
+/// or lazily on the worker's first image request (PR #1021 review round 6, issue 7): eagerly
+/// reading and (for Q4 checkpoints) dequantizing all ~153 visual tensors -- about 384 MiB f32
+/// for Qwen3.5-0.8B -- taxed every text-only server's startup and steady-state memory, even
+/// though the overwhelming majority of requests never touch an image.
+///
+/// This type's `get_or_load` takes `&mut self` and is only ever called from inside
+/// [`run_worker_loop`]'s single-threaded, one-job-at-a-time loop, which is what makes the
+/// lazy path race-free without needing a real `OnceCell`/mutex: there is exactly one caller,
+/// on exactly one thread, one job at a time, so "first request wins" cannot race the way it
+/// could across real concurrent threads.
+pub enum LazyVision {
+    /// This checkpoint's `config.json` carries no `vision_config` at all -- never attempt a
+    /// load, no matter how many image requests arrive.
+    Unsupported,
+    /// Vision-capable checkpoint; weights not read from disk yet (the common case: startup
+    /// does zero vision tensor reads unless `--preload-vision` was passed).
+    Pending {
+        model_dir: PathBuf,
+        vision_cfg: VisionModelConfig,
+    },
+    /// Weights are resident -- either loaded eagerly at startup (`--preload-vision`) or lazily
+    /// by a prior image request. Stays resident for the rest of the process lifetime.
+    Loaded(Qwen35VisionWeights),
+}
+
+impl LazyVision {
+    /// Returns the loaded weights, loading them first if this is the first image request this
+    /// checkpoint has seen. Returns `Ok(None)` only for [`LazyVision::Unsupported`] (checkpoint
+    /// has no vision weights at all -- not a failure, just "this model can't do vision").
+    /// Returns `Err` on a load failure; the failure is loud (caller surfaces it as a request
+    /// error, not a silent text-only fallback) and this stays [`LazyVision::Pending`] so the
+    /// NEXT image request retries the load rather than being permanently wedged by one
+    /// transient failure.
+    fn get_or_load(&mut self) -> Result<Option<&Qwen35VisionWeights>, String> {
+        if let LazyVision::Pending {
+            model_dir,
+            vision_cfg,
+        } = self
+        {
+            eprintln!(
+                "[metal-worker] loading vision weights on first image request \
+                 (model_dir={}) ...",
+                model_dir.display()
+            );
+            match load_qwen35_vision_weights(model_dir, vision_cfg) {
+                Ok(weights) => *self = LazyVision::Loaded(weights),
+                Err(e) => {
+                    let message = format!("vision weights failed to load: {e}");
+                    eprintln!("[metal-worker] {message}");
+                    return Err(message);
+                }
+            }
+        }
+        Ok(match self {
+            LazyVision::Unsupported => None,
+            LazyVision::Loaded(weights) => Some(weights),
+            LazyVision::Pending { .. } => {
+                unreachable!("just transitioned to Loaded above, or returned Err")
+            }
+        })
+    }
+}
+
 /// Namespace for [`MetalWorker::spawn`] -- a zero-sized marker type (never
 /// constructed) so the shared worker's entry point reads as
 /// `MetalWorker::spawn(..)` at every call site, matching the association
@@ -737,12 +802,7 @@ impl MetalWorker {
     /// its own.
     pub fn spawn(
         loader: impl FnOnce() -> Result<
-            (
-                MetalQwen35State,
-                BpeTokenizer,
-                WorkerMetadata,
-                Option<Qwen35VisionWeights>,
-            ),
+            (MetalQwen35State, BpeTokenizer, WorkerMetadata, LazyVision),
             String,
         > + Send
         + 'static,
@@ -759,7 +819,7 @@ impl MetalWorker {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WorkerMetadata, String>>();
 
         let join_handle = std::thread::spawn(move || match loader() {
-            Ok((mut state, tokenizer, meta, vision_weights)) => {
+            Ok((mut state, tokenizer, meta, mut vision_state)) => {
                 let _ = ready_tx.send(Ok(meta.clone()));
                 run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
                     // ADR-069 S6: a job carrying an image takes a separate
@@ -784,13 +844,34 @@ impl MetalWorker {
                     }
 
                     if let Some(image_message_index) = image_message_index {
-                        let Some(vision_weights) = vision_weights.as_ref() else {
-                            return Err(WorkerFailure::Rejected(ApiError::BadRequest {
-                                message: "image input requires a vision-capable model; this \
-                                          checkpoint has no vision weights loaded"
-                                    .into(),
-                                code: "vision_unsupported",
-                            }));
+                        // Structured, single-line dispatch marker (PR #1021 review round 6,
+                        // issue 3): the one stable, greppable observable that a request took
+                        // the vision path rather than the text path -- distinct from any HTTP
+                        // response shape, so a regression that silently drops the image and
+                        // falls back to a plausible-looking text-only answer is still caught
+                        // by asserting this line's presence/absence, not just a 200 status.
+                        eprintln!("[metal-worker] route=vision dispatch=multimodal");
+                        let vision_weights = match vision_state.get_or_load() {
+                            Ok(Some(weights)) => weights,
+                            Ok(None) => {
+                                return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                                    message: "image input requires a vision-capable model; \
+                                              this checkpoint has no vision weights loaded"
+                                        .into(),
+                                    code: "vision_unsupported",
+                                }));
+                            }
+                            Err(message) => {
+                                // Loud request error, not a silent text-only fallback (issue 7
+                                // ruling): the caller sees exactly why its image request
+                                // failed, and `vision_state` is still `Pending` here (see
+                                // `LazyVision::get_or_load`'s doc comment), so the NEXT image
+                                // request retries the load instead of being permanently wedged.
+                                return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                                    message,
+                                    code: "vision_load_failed",
+                                }));
+                            }
                         };
                         // Checked before entering `build_vision_request` at all (PR #1021
                         // review round 1 major finding): the prior code only checked
@@ -862,7 +943,7 @@ impl MetalWorker {
                     // prior `lattice_serve.rs` path rendered it a second
                     // time inside its own window preflight); reused for
                     // both the window check and the generation call below.
-                    let prompt = format_chat_template(messages);
+                    let prompt = format_chat_template(messages)?;
                     let prompt_len = tokenizer.tokenize(&prompt).real_length;
                     check_prompt_fits_window(
                         meta.context_window_policy,
@@ -1065,7 +1146,7 @@ pub fn spawn_fake_with_cap(
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
     std::thread::spawn(move || {
         run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
-            let prompt = format_chat_template(messages);
+            let prompt = format_chat_template(messages)?;
             let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
             check_prompt_fits_window(context_window_policy, model_max_context, prompt_tokens, cfg)
                 .map_err(WorkerFailure::Rejected)?;
@@ -1846,7 +1927,7 @@ mod tests {
     #[test]
     fn max_pending_zero_is_rejected_before_semaphore_new() {
         let result = MetalWorker::spawn(
-            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata, Option<Qwen35VisionWeights>), String> {
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata, LazyVision), String> {
                 panic!("loader must not run: max_pending=0 must be rejected first")
             },
             0,
@@ -1861,7 +1942,7 @@ mod tests {
     fn max_pending_above_max_permits_is_rejected_before_semaphore_new() {
         let too_big = Semaphore::MAX_PERMITS + 1;
         let result = MetalWorker::spawn(
-            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata, Option<Qwen35VisionWeights>), String> {
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata, LazyVision), String> {
                 panic!("loader must not run: max_pending above MAX_PERMITS must be rejected first")
             },
             too_big,
@@ -2243,5 +2324,129 @@ mod tests {
         drop(rx1);
         drop(client);
         handle.join().expect("worker thread must not panic");
+    }
+
+    // ── Issue 7 (PR #1021 review round 6): LazyVision lazy-load contract ──
+
+    /// Resolves a real Qwen3.5-0.8B checkpoint directory the same way
+    /// `vision_serve_e2e_test.rs` does (`LATTICE_VISION_S3_MODEL_DIR`, falling back to the
+    /// default model cache path), so these tests run out of the box on a machine that
+    /// already has the checkpoint and skip loudly otherwise.
+    fn real_vision_checkpoint_dir() -> Option<std::path::PathBuf> {
+        if let Ok(value) = std::env::var("LATTICE_VISION_S3_MODEL_DIR") {
+            let path = std::path::PathBuf::from(value);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        let home = std::env::var("HOME").ok()?;
+        let default = std::path::PathBuf::from(home)
+            .join(".lattice")
+            .join("models")
+            .join("qwen3.5-0.8b");
+        default.exists().then_some(default)
+    }
+
+    #[test]
+    fn lazy_vision_loads_on_first_image_request_then_never_touches_disk_again() {
+        let Some(real_dir) = real_vision_checkpoint_dir() else {
+            eprintln!(
+                "LAZY_VISION_TEST_SKIPPED reason=no_checkpoint -- set \
+                 LATTICE_VISION_S3_MODEL_DIR or place the checkpoint at \
+                 ~/.lattice/models/qwen3.5-0.8b"
+            );
+            return;
+        };
+        let cfg = crate::model::qwen35_config::Qwen35Config::from_model_dir(&real_dir)
+            .expect("real checkpoint's config.json must parse");
+        let vision_cfg = cfg
+            .vision_config
+            .clone()
+            .expect("real checkpoint carries vision_config");
+
+        // Symlink (not copy -- the shard is ~1.6 GiB) the files `load_qwen35_vision_weights`
+        // actually reads into an isolated tempdir, so this test can sever access to the
+        // weight shard afterward without touching the real checkpoint on disk -- the probe
+        // for "second call performs no disk read" is that a re-read would now fail.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        for name in ["config.json", "model.safetensors.index.json"] {
+            std::os::unix::fs::symlink(real_dir.join(name), tempdir.path().join(name))
+                .unwrap_or_else(|e| panic!("symlink {name}: {e}"));
+        }
+        let shard_name = "model.safetensors-00001-of-00001.safetensors";
+        let shard_link = tempdir.path().join(shard_name);
+        std::os::unix::fs::symlink(real_dir.join(shard_name), &shard_link)
+            .unwrap_or_else(|e| panic!("symlink {shard_name}: {e}"));
+
+        let mut state = LazyVision::Pending {
+            model_dir: tempdir.path().to_path_buf(),
+            vision_cfg,
+        };
+
+        let first = state
+            .get_or_load()
+            .expect("first image request must successfully load vision weights");
+        assert!(first.is_some(), "loaded weights must be Some on success");
+        assert!(
+            matches!(state, LazyVision::Loaded(_)),
+            "state must transition to Loaded after the first successful load"
+        );
+
+        // Sever disk access to the weight shard: if a second call re-read from disk, it would
+        // now fail (ModelNotFound/MissingTensor). It must not -- the weights stay resident.
+        std::fs::remove_file(&shard_link).expect("remove symlink (not the real file)");
+
+        let second = state
+            .get_or_load()
+            .expect("second call must reuse the already-loaded weights, not re-read from disk");
+        assert!(second.is_some());
+    }
+
+    #[test]
+    fn lazy_vision_unsupported_never_attempts_a_load() {
+        let mut state = LazyVision::Unsupported;
+        let result = state
+            .get_or_load()
+            .expect("Unsupported must not error -- it just means no vision weights exist");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lazy_vision_pending_load_failure_leaves_state_pending_for_retry() {
+        let Some(real_dir) = real_vision_checkpoint_dir() else {
+            eprintln!("LAZY_VISION_TEST_SKIPPED reason=no_checkpoint");
+            return;
+        };
+        let cfg = crate::model::qwen35_config::Qwen35Config::from_model_dir(&real_dir)
+            .expect("real checkpoint's config.json must parse");
+        let vision_cfg = cfg
+            .vision_config
+            .clone()
+            .expect("real checkpoint carries vision_config");
+
+        // A directory with no manifest at all -- every load attempt fails, proving a failed
+        // load leaves `state` retryable rather than permanently wedged (issue 7 ruling:
+        // "subsequent image requests may retry the load").
+        let empty_dir = tempfile::tempdir().expect("tempdir");
+        let mut state = LazyVision::Pending {
+            model_dir: empty_dir.path().to_path_buf(),
+            vision_cfg,
+        };
+
+        let first_err = state
+            .get_or_load()
+            .expect_err("no manifest present in an empty dir -- must fail");
+        assert!(
+            matches!(state, LazyVision::Pending { .. }),
+            "a failed load must leave state Pending so the next image request retries"
+        );
+
+        let second_err = state
+            .get_or_load()
+            .expect_err("retry must also attempt the load and fail the same way");
+        assert_eq!(
+            first_err, second_err,
+            "both attempts hit the same missing-manifest condition"
+        );
     }
 }

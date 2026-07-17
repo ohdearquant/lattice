@@ -257,6 +257,17 @@ pub fn preprocess_qwen35_image(
     };
 
     let in_channels = cfg.in_channels;
+    // Locally visible invariant (PR #1021 review round 6, issue 8): the loop below decodes
+    // every image to a fixed 3-channel `RgbImage` and indexes `pixel[c]` for `c in
+    // 0..in_channels`, so `in_channels` must never exceed 3 here. `VisionModelConfig::validate`
+    // is the real fail-closed gate (rejects `in_channels != 3` at config/load time, before this
+    // function can ever be reached with a bad config) -- this assert is defense in depth only,
+    // catching a config constructed directly without going through `validate`.
+    debug_assert!(
+        in_channels <= 3,
+        "in_channels={in_channels} would index past a 3-channel RgbImage; \
+         VisionModelConfig::validate should have rejected this"
+    );
     let temporal = cfg.temporal_patch_size;
     let patch_len = in_channels * temporal * patch_size * patch_size;
     let num_patches = grid.num_patches();

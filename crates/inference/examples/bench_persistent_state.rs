@@ -81,7 +81,8 @@ fn run() {
         let mut history: Vec<ChatMessage> = vec![system_msg.clone()];
         for &user_msg in &user_prompts {
             history.push(ChatMessage::user(user_msg));
-            let full_prompt = format_chat_template(&history);
+            let full_prompt =
+                format_chat_template(&history).expect("plain-text history must render");
             let result = state
                 .generate(&full_prompt, &tokenizer, &gen_cfg)
                 .expect("generation failed");
@@ -110,7 +111,8 @@ fn run() {
 
             // Full chat history formatted into a single prompt string.
             let t_fmt = Instant::now();
-            let full_prompt = format_chat_template(&history);
+            let full_prompt =
+                format_chat_template(&history).expect("plain-text history must render");
             let fmt_ms = t_fmt.elapsed().as_secs_f64() * 1000.0;
 
             // Current behavior: generate() tokenizes, resets state, prefills from pos 0, decodes.

@@ -2001,7 +2001,25 @@ mod imp {
             MessageRole::Assistant => ChatRole::Assistant,
         };
         Ok(match image {
-            Some(bytes) => ChatMessage::with_image(engine_role, text_before, bytes, text_after),
+            Some(bytes) => {
+                // PR #1021 review round 6, issue 9: the Qwen3.5 chat template only splices
+                // image content into the 'user' turn -- 'system' and 'assistant' turns render
+                // as plain-text content regardless of what the caller sends, so an image on
+                // either of those roles would silently reach `ChatMessage::with_image` and
+                // then produce unsupported model input instead of a clear rejection. Reject
+                // here, at request validation, naming the offending role.
+                if role != MessageRole::User {
+                    return Err(RequestError::bad_request(
+                        format!(
+                            "messages[{message_index}]: role '{}' cannot carry an image_url \
+                             part; the chat template only supports images on 'user' messages",
+                            m.role
+                        ),
+                        "unsupported_feature",
+                    ));
+                }
+                ChatMessage::with_image(engine_role, text_before, bytes, text_after)
+            }
             None => match role {
                 MessageRole::System => ChatMessage::system(text_before),
                 MessageRole::User => ChatMessage::user(text_before),
@@ -3310,6 +3328,15 @@ mod imp {
         // runs one generation at a time.
         let max_pending: usize = parse_max_pending(&args)?;
 
+        // `--preload-vision` (PR #1021 review round 6, issue 7): by default, a vision-capable
+        // checkpoint's `model.visual.*` tensors (~153 tensors, ~384 MiB f32 for Qwen3.5-0.8B,
+        // more after Q4 dequantization) are NOT read from disk at startup -- they load lazily
+        // on the worker's first image request, so text-only serving pays zero extra startup
+        // cost or persistent memory. Passing this flag restores the old eager-load-at-startup
+        // behavior for operators who want predictable first-image latency and are willing to
+        // pay that memory/startup cost on every boot, image traffic or not.
+        let preload_vision = args.iter().any(|a| a == "--preload-vision");
+
         eprintln!(
             "[lattice_serve] loading model from {} ({}) ...",
             model_dir.display(),
@@ -3344,30 +3371,51 @@ mod imp {
                     model_max_context,
                     vision_config,
                 } = load_model(&model_dir_for_loader, &tokenizer_path, format)?;
-                // ADR-069 S6: load the real `model.visual.*` tensors alongside the decoder when
-                // this checkpoint's config.json carries a `vision_config` -- reuses the
-                // `vision_config` `load_model` above already parsed (PR #1021 review round 5:
-                // this used to re-parse config.json a second time here). A vision-capable
-                // checkpoint whose weight files are missing/corrupt still serves text-only rather
-                // than failing startup outright (loud warning, not a silent skip); a genuine
-                // config-load failure is no longer possible to hit silently at this point, since
-                // it would already have surfaced as `load_model`'s own loud `Err` above.
-                let vision_weights = vision_config.and_then(|vision_cfg| {
-                    match lattice_inference::vision::checkpoint::load_qwen35_vision_weights(
-                        &model_dir_for_loader,
-                        &vision_cfg,
-                    ) {
-                        Ok(w) => Some(w),
-                        Err(e) => {
-                            eprintln!(
-                                "[lattice_serve] WARNING: checkpoint advertises \
-                                 vision_config but failed to load model.visual.* weights \
-                                 ({e}); serving text-only"
-                            );
-                            None
+                // ADR-069 S6 / PR #1021 review round 6, issue 7: a vision-capable checkpoint's
+                // `model.visual.*` tensors load lazily on the worker's first image request by
+                // default (`LazyVision::Pending`) -- reuses the `vision_config` `load_model`
+                // above already parsed (round 5: this used to re-parse config.json a second
+                // time here). `--preload-vision` restores eager startup residency for operators
+                // who want predictable first-image latency; a preload failure warns and falls
+                // back to the lazy path (a later image request still gets a chance to load
+                // it), rather than failing startup outright for a checkpoint that otherwise
+                // serves text perfectly well.
+                let vision_state = match vision_config {
+                    None => lattice_inference::serve::metal_worker::LazyVision::Unsupported,
+                    Some(vision_cfg) if preload_vision => {
+                        eprintln!(
+                            "[lattice_serve] --preload-vision: loading model.visual.* weights \
+                             at startup ..."
+                        );
+                        match lattice_inference::vision::checkpoint::load_qwen35_vision_weights(
+                            &model_dir_for_loader,
+                            &vision_cfg,
+                        ) {
+                            Ok(w) => lattice_inference::serve::metal_worker::LazyVision::Loaded(w),
+                            Err(e) => {
+                                eprintln!(
+                                    "[lattice_serve] WARNING: --preload-vision failed to load \
+                                     model.visual.* weights ({e}); will retry lazily on first \
+                                     image request"
+                                );
+                                lattice_inference::serve::metal_worker::LazyVision::Pending {
+                                    model_dir: model_dir_for_loader.clone(),
+                                    vision_cfg,
+                                }
+                            }
                         }
                     }
-                });
+                    Some(vision_cfg) => {
+                        eprintln!(
+                            "[lattice_serve] vision available (deferred): model.visual.* \
+                             weights load on first image request"
+                        );
+                        lattice_inference::serve::metal_worker::LazyVision::Pending {
+                            model_dir: model_dir_for_loader.clone(),
+                            vision_cfg,
+                        }
+                    }
+                };
                 Ok((
                     metal,
                     tokenizer,
@@ -3376,7 +3424,7 @@ mod imp {
                         model_max_context,
                         context_window_policy: ContextWindowPolicy::PromptAndDecodeWithDelimiter,
                     },
-                    vision_weights,
+                    vision_state,
                 ))
             },
             max_pending,
@@ -3736,6 +3784,35 @@ mod imp {
             let image = chat_message.image.expect("image must be attached");
             assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
             assert_eq!(image.text_after, "");
+        }
+
+        /// PR #1021 review round 6, issue 9: the Qwen3.5 chat template only splices image
+        /// content into 'user' turns; 'system' and 'assistant' turns render as plain text
+        /// regardless of what the caller sends, so an image on either role must be rejected
+        /// at request validation with a 400 naming the offending role, not silently reach the
+        /// vision prompt.
+        #[test]
+        fn to_chat_message_rejects_image_on_system_and_assistant_roles() {
+            for role in ["system", "assistant"] {
+                let msg = InMsg {
+                    role: role.to_string(),
+                    content: MessageContent::Parts(vec![Part::ImageUrl {
+                        image_url: ImageUrl {
+                            url: format!("data:image/png;base64,{TINY_PNG_BASE64}"),
+                            detail: None,
+                        },
+                    }]),
+                };
+                let err = to_chat_message(&msg, 0).expect_err(&format!(
+                    "role '{role}' must not be allowed to carry an image"
+                ));
+                assert_eq!(err.code(), "unsupported_feature");
+                assert!(
+                    err.message().contains(role),
+                    "error must name the offending role '{role}': {}",
+                    err.message()
+                );
+            }
         }
 
         #[test]
