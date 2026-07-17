@@ -85,6 +85,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 simsimd = "6"
 proptest = "1"
+tempfile = { workspace = true }
+# Test-only: encodes small procedural PNGs for the vision-embedding wrapper's
+# unit tests. PNG-only is intentional here (these tests only ever encode
+# PNGs); lattice-inference's own (non-dev) dependency additionally enables
+# jpeg for its broader image-loading surface, which this crate's tests don't
+# exercise.
+image = { version = "0.25", default-features = false, features = ["png"] }
 lattice-transport = { path = "../transport" }
 serde_json = { workspace = true }
 
