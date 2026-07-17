@@ -6110,6 +6110,7 @@ mod inner {
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
         ) -> MetalStepOutput {
+            let _signpost_step = crate::forward::signpost::interval("decode.step");
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
 
@@ -6469,8 +6470,14 @@ mod inner {
 
             // Single submit for entire forward pass + optional top-k.
             enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
+            {
+                let _signpost_commit = crate::forward::signpost::interval("decode.cb_commit");
+                cmd.commit();
+            }
+            {
+                let _signpost_wait = crate::forward::signpost::interval("decode.cb_wait");
+                cmd.wait_until_completed();
+            }
 
             // Diagnostic: dump post-final-norm hidden state magnitudes for
             // divergence analysis vs MLX. Set LATTICE_HIDDEN_DUMP=path to enable.
@@ -6527,6 +6534,8 @@ mod inner {
             // Read back pre-final hidden when requested (for MTP input).
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
             let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                let _signpost_host_read =
+                    crate::forward::signpost::interval("decode.host_scalar_read");
                 let h = unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                 self.session.last_pre_final_hidden = h.clone();
                 h
@@ -6539,6 +6548,8 @@ mod inner {
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
                 // SAFETY: GPU completed, buffers are StorageModeShared.
+                let _signpost_host_read =
+                    crate::forward::signpost::interval("decode.host_scalar_read");
                 let k = self.session.compact_topk;
                 let candidates = unsafe { self.read_topk_candidates(which, k) };
                 self.session.compact_result = candidates;
@@ -6546,6 +6557,8 @@ mod inner {
             } else {
                 // Full path: read vocab_size f32 logits back to host.
                 // SAFETY: GPU completed, buffer is StorageModeShared.
+                let _signpost_host_read =
+                    crate::forward::signpost::interval("decode.host_scalar_read");
                 unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
             };
             self.session.kv_cache.seq_len += 1;
@@ -9402,6 +9415,8 @@ mod inner {
 
                     // Apply grammar masking before sampling (ADR-046).
                     if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                        let _signpost_grammar =
+                            crate::forward::signpost::interval("decode.grammar_mask");
                         engine.mask_logits(gs, &mut step_logits);
                         // Fail closed if the grammar blocked every continuation,
                         // matching the CPU contract (#611).
@@ -9414,6 +9429,7 @@ mod inner {
                         }
                     }
 
+                    let _signpost_sample = crate::forward::signpost::interval("decode.sample");
                     if use_compact {
                         sample_from_candidates(
                             &self.session.compact_result,
@@ -17286,6 +17302,8 @@ mod inner {
                 let mut step_logits = self.forward_step(last_token, pos);
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    let _signpost_grammar =
+                        crate::forward::signpost::interval("decode.grammar_mask");
                     engine.mask_logits(gs, &mut step_logits);
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
@@ -17298,15 +17316,18 @@ mod inner {
                     }
                 }
 
-                let sampled_id = if use_compact {
-                    sample_from_candidates(
-                        &self.session.compact_result,
-                        gen_cfg,
-                        &all_ids,
-                        &mut rng_state,
-                    )
-                } else {
-                    sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                let sampled_id = {
+                    let _signpost_sample = crate::forward::signpost::interval("decode.sample");
+                    if use_compact {
+                        sample_from_candidates(
+                            &self.session.compact_result,
+                            gen_cfg,
+                            &all_ids,
+                            &mut rng_state,
+                        )
+                    } else {
+                        sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                    }
                 };
 
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` or

@@ -38,6 +38,11 @@ mixture = ["dep:lattice-fann"]
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.
 gdn-state-counters = []
+# os_signpost instrumentation of the Metal decode path (W1.0), for capturing
+# a Metal System Trace of command-buffer/dispatch/wait structure in
+# Instruments. Opt-in only: every call site is a zero-sized no-op guard when
+# this is off, so the default decode path stays byte-identical.
+signpost = []
 # Exposes test-only fixture constructors (currently: a tiny all-zero-weight
 # Qwen35Model, ADR-080 C2) as `pub` library API, gated so they never
 # ship in a normal build. Needed because bin targets (lattice.rs,

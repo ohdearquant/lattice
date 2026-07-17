@@ -16,6 +16,7 @@ pub mod metal_qwen35;
 pub mod moe_expert_cache;
 pub mod neon;
 pub mod neon_forward;
+pub mod signpost;
 
 // Re-export from cpu for backward compat (was `layers`)
 pub use self::cpu::*;
