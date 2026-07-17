@@ -18,6 +18,12 @@ Paste the output in the PR description. If nothing changed, say "bench-compare s
 
 This process caught a 15% decode throughput regression (157 → 130 tok/s) that had been attributed to "GPU contention noise" for days. The f32 dot_product unrolling that caused it was identified in under 2 minutes via A/B comparison.
 
+### Keep the Machine Quiet During A/B Runs — Quiet Means Zero Disk Activity, Not Just Zero Builds
+
+A bench window means no concurrent builds AND no git checkouts, worktree adds, large file copies, or downloads. Filesystem indexing churn (Spotlight `mdworker`, `fseventsd`) from a repository checkout lands asymmetrically in whichever measurement phase it overlaps, and base-then-head runs make that asymmetry read as a code regression. Two consecutive A/B runs were corrupted this way — worktree checkouts overlapping the head phase produced swings up to +250% in groups the diff could not reach.
+
+Before re-running a corrupted A/B, check structural reachability first: is the changed code even compiled into the bench binaries? A diff confined to a `cfg`-gated module (e.g. `#[cfg(all(target_os = "macos", feature = "metal-gpu"))]`) is compiled out of a default-feature bench build entirely — base and head binaries are then built from identical effective source, no rerun can attribute any delta to the diff, and stating that proof in the PR beats a ritual rerun.
+
 ### Bench by Group, Not All at Once
 
 The full Criterion suite takes 15-30 min. Never run it all. Filter to the groups your PR touches:
