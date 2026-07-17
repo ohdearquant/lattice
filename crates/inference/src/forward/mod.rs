@@ -16,7 +16,12 @@ pub mod metal_qwen35;
 pub mod moe_expert_cache;
 pub mod neon;
 pub mod neon_forward;
-pub mod signpost;
+// Every call site lives inside `metal_qwen35`'s `metal-gpu`-gated Metal
+// decode implementation; with that feature off, nothing in this crate
+// constructs a `Label`/`Interval`, which is otherwise flagged as dead code
+// now that the module is `pub(crate)` rather than a public API surface.
+#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+pub(crate) mod signpost;
 
 // Re-export from cpu for backward compat (was `layers`)
 pub use self::cpu::*;

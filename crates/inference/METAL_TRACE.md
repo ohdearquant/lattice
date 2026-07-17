@@ -2,6 +2,8 @@
 
 `os_signpost` instrumentation of the Metal decode path, gated behind the `signpost` cargo feature (default OFF). It exists so a Metal System Trace captured in Instruments can show the per-decode-step launch and synchronization structure — command-buffer commits, interior `waitUntilCompleted` waits, host-side reads of GPU results — instead of a single opaque GPU busy span.
 
+Source: `crates/inference/src/forward/signpost.rs` (interval guard + label statics) and its call sites in `crates/inference/src/forward/metal_qwen35.rs`.
+
 ## Capturing a trace
 
 1. Build a decode binary (e.g. `chat_metal` or `lattice_serve`) with the feature on:

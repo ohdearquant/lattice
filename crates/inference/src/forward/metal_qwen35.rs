@@ -6110,7 +6110,8 @@ mod inner {
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
         ) -> MetalStepOutput {
-            let _signpost_step = crate::forward::signpost::interval("decode.step");
+            let _signpost_step =
+                crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeStep);
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
 
@@ -6471,11 +6472,15 @@ mod inner {
             // Single submit for entire forward pass + optional top-k.
             enc.end_encoding();
             {
-                let _signpost_commit = crate::forward::signpost::interval("decode.cb_commit");
+                let _signpost_commit = crate::forward::signpost::interval(
+                    crate::forward::signpost::Label::DecodeCbCommit,
+                );
                 cmd.commit();
             }
             {
-                let _signpost_wait = crate::forward::signpost::interval("decode.cb_wait");
+                let _signpost_wait = crate::forward::signpost::interval(
+                    crate::forward::signpost::Label::DecodeCbWait,
+                );
                 cmd.wait_until_completed();
             }
 
@@ -6534,8 +6539,9 @@ mod inner {
             // Read back pre-final hidden when requested (for MTP input).
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
             let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
-                let _signpost_host_read =
-                    crate::forward::signpost::interval("decode.host_scalar_read");
+                let _signpost_host_read = crate::forward::signpost::interval(
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 let h = unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                 self.session.last_pre_final_hidden = h.clone();
                 h
@@ -6548,8 +6554,9 @@ mod inner {
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
                 // SAFETY: GPU completed, buffers are StorageModeShared.
-                let _signpost_host_read =
-                    crate::forward::signpost::interval("decode.host_scalar_read");
+                let _signpost_host_read = crate::forward::signpost::interval(
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 let k = self.session.compact_topk;
                 let candidates = unsafe { self.read_topk_candidates(which, k) };
                 self.session.compact_result = candidates;
@@ -6557,8 +6564,9 @@ mod inner {
             } else {
                 // Full path: read vocab_size f32 logits back to host.
                 // SAFETY: GPU completed, buffer is StorageModeShared.
-                let _signpost_host_read =
-                    crate::forward::signpost::interval("decode.host_scalar_read");
+                let _signpost_host_read = crate::forward::signpost::interval(
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
             };
             self.session.kv_cache.seq_len += 1;
@@ -6612,6 +6620,15 @@ mod inner {
                 None,
             );
 
+            // Fused host read + greedy sample: this scan both reads the
+            // shared logits buffer off the GPU and picks the argmax token in
+            // the same pass (the whole point of the zero-copy path), so it
+            // carries both signpost labels for the span it covers.
+            let _signpost_host_read = crate::forward::signpost::interval(
+                crate::forward::signpost::Label::DecodeHostScalarRead,
+            );
+            let _signpost_sample =
+                crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample);
             // SAFETY: GPU completed (wait_until_completed called in forward_step_inner).
             // logits buffer is StorageModeShared — CPU can read it directly.
             unsafe {
@@ -9415,8 +9432,9 @@ mod inner {
 
                     // Apply grammar masking before sampling (ADR-046).
                     if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                        let _signpost_grammar =
-                            crate::forward::signpost::interval("decode.grammar_mask");
+                        let _signpost_grammar = crate::forward::signpost::interval(
+                            crate::forward::signpost::Label::DecodeGrammarMask,
+                        );
                         engine.mask_logits(gs, &mut step_logits);
                         // Fail closed if the grammar blocked every continuation,
                         // matching the CPU contract (#611).
@@ -9429,7 +9447,9 @@ mod inner {
                         }
                     }
 
-                    let _signpost_sample = crate::forward::signpost::interval("decode.sample");
+                    let _signpost_sample = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeSample,
+                    );
                     if use_compact {
                         sample_from_candidates(
                             &self.session.compact_result,
@@ -14364,6 +14384,9 @@ mod inner {
 
                 // Apply grammar masking before sampling (ADR-046).
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    let _signpost_grammar = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeGrammarMask,
+                    );
                     engine.mask_logits(gs, &mut step_logits);
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
@@ -14376,15 +14399,20 @@ mod inner {
                     }
                 }
 
-                let sampled_id = if use_compact {
-                    sample_from_candidates(
-                        &self.session.compact_result,
-                        gen_cfg,
-                        &all_ids,
-                        &mut rng_state,
-                    )
-                } else {
-                    sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                let sampled_id = {
+                    let _signpost_sample = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeSample,
+                    );
+                    if use_compact {
+                        sample_from_candidates(
+                            &self.session.compact_result,
+                            gen_cfg,
+                            &all_ids,
+                            &mut rng_state,
+                        )
+                    } else {
+                        sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
+                    }
                 };
 
                 // One atomic per-step transition (ADR-080 C3, PR #787) --
@@ -17302,8 +17330,9 @@ mod inner {
                 let mut step_logits = self.forward_step(last_token, pos);
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    let _signpost_grammar =
-                        crate::forward::signpost::interval("decode.grammar_mask");
+                    let _signpost_grammar = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeGrammarMask,
+                    );
                     engine.mask_logits(gs, &mut step_logits);
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
@@ -17317,7 +17346,9 @@ mod inner {
                 }
 
                 let sampled_id = {
-                    let _signpost_sample = crate::forward::signpost::interval("decode.sample");
+                    let _signpost_sample = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeSample,
+                    );
                     if use_compact {
                         sample_from_candidates(
                             &self.session.compact_result,
