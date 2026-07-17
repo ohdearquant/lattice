@@ -5632,7 +5632,8 @@ mod inner {
                     cfg.rms_norm_eps,
                 );
 
-                // Partial RoPE.
+                // Partial RoPE. MTP speculative decoding is text-only in this
+                // stage (ADR-069 RECON §5 open question); no M-RoPE override.
                 self.dispatch_partial_rope(
                     enc,
                     &*buf_q_sep,
@@ -5640,6 +5641,7 @@ mod inner {
                     hd,
                     half_rope_dim,
                     position as u32,
+                    None,
                 );
                 self.dispatch_partial_rope(
                     enc,
@@ -5648,6 +5650,7 @@ mod inner {
                     hd,
                     half_rope_dim,
                     position as u32,
+                    None,
                 );
 
                 // Append K,V to MTP KV cache.
@@ -5852,6 +5855,7 @@ mod inner {
                 false,
                 GdnStateTrafficScope::Decode,
                 None,
+                None,
             )
         }
 
@@ -5867,7 +5871,15 @@ mod inner {
             capture_hidden: bool,
             scope: GdnStateTrafficScope,
         ) -> MetalStepOutput {
-            self.forward_step_inner_impl(token_id, position, capture_hidden, false, scope, None)
+            self.forward_step_inner_impl(
+                token_id,
+                position,
+                capture_hidden,
+                false,
+                scope,
+                None,
+                None,
+            )
         }
 
         /// Qwen3.5 vision (ADR-069 Metal S5 / MP2): run a single decoder step with the
@@ -5880,6 +5892,13 @@ mod inner {
         /// The caller (`generate_multimodal_vision`) has already validated `embedding`'s
         /// length and finiteness before this is reached — this is a private, non-`pub`
         /// entry point, so that validation is not repeated per call.
+        ///
+        /// `generate_multimodal_vision` itself now calls
+        /// [`Self::forward_step_injected_mrope`] (ADR-069 MP3 needs a per-token
+        /// cos/sin row at every call site); this plain-injection entry point is
+        /// retained because unit tests exercise the MP2 injection contract in
+        /// isolation, without the M-RoPE table machinery.
+        #[allow(dead_code)] // exercised by injection-only unit tests, see doc comment
         fn forward_step_injected(&mut self, embedding: &[f32], position: usize) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl(
@@ -5889,10 +5908,68 @@ mod inner {
                 false,
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
+                None,
             )
             .logits
         }
 
+        /// Qwen3.5 vision (ADR-069 Metal MP3): same REPLACE-injection contract as
+        /// [`Self::forward_step_injected`], plus a per-token interleaved-axis
+        /// M-RoPE cos/sin row for the six GQA layers (see
+        /// `forward_step_inner_impl`'s `mrope_cos_sin` doc). Used for image-pad
+        /// prefill positions, where `injected_embedding` and `mrope_cos_sin` are
+        /// both `Some`.
+        fn forward_step_injected_mrope(
+            &mut self,
+            embedding: &[f32],
+            position: usize,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+        ) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner_impl(
+                0,
+                position,
+                false,
+                false,
+                GdnStateTrafficScope::Decode,
+                Some(embedding),
+                mrope_cos_sin,
+            )
+            .logits
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal MP3): ordinary token-id embedding lookup
+        /// (no injection), plus a per-token M-RoPE cos/sin row — used for
+        /// non-image-pad positions in a multimodal request (text tokens and
+        /// vision delimiters keep the normal embedding lookup, but still rotate
+        /// with the 3-axis table once an image has shifted the position
+        /// coordinate) and for every decode step after a multimodal prefill.
+        fn forward_step_mrope(
+            &mut self,
+            token_id: u32,
+            position: usize,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+        ) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner_impl(
+                token_id,
+                position,
+                false,
+                false,
+                GdnStateTrafficScope::Decode,
+                None,
+                mrope_cos_sin,
+            )
+            .logits
+        }
+
+        /// `mrope_cos_sin`, when supplied (Qwen3.5 vision M-RoPE, ADR-069 MP3),
+        /// replaces the six GQA layers' 1-D `engine.rope_cos`/`rope_sin` table
+        /// lookup (keyed by `position`) with this caller-supplied interleaved-axis
+        /// row for every full-attention layer in this step — mirrors
+        /// `cpu_f16::full_attention_step_f16`'s `mrope_cos_sin` parameter. GDN
+        /// layers never consume RoPE and are unaffected either way.
+        #[allow(clippy::too_many_arguments)]
         fn forward_step_inner_impl(
             &mut self,
             token_id: u32,
@@ -5901,9 +5978,24 @@ mod inner {
             skip_logits_readback: bool,
             _traffic_scope: GdnStateTrafficScope,
             injected_embedding: Option<&[f32]>,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
         ) -> MetalStepOutput {
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
+
+            // Build the single-token M-RoPE cos/sin buffers once for this step (all
+            // six GQA layers rotate with the same per-token row); `None` keeps every
+            // `dispatch_partial_rope` call on the unchanged 1-D `engine.rope_cos`/
+            // `rope_sin` path, so text-only decode is structurally untouched.
+            let mrope_row_bufs: Option<(Buffer, Buffer)> =
+                mrope_cos_sin.map(|(cos_row, sin_row)| {
+                    (
+                        make_buffer(&self.engine.device, cos_row, "mrope_cos_row"),
+                        make_buffer(&self.engine.device, sin_row, "mrope_sin_row"),
+                    )
+                });
+            let mrope_override: Option<(&Buffer, &Buffer)> =
+                mrope_row_bufs.as_ref().map(|(c, s)| (c, s));
 
             // --- Per-phase timing (enabled by env LATTICE_PROFILE=1) ---
             let profiling = std::env::var_os("LATTICE_PROFILE").is_some();
@@ -6046,6 +6138,7 @@ mod inner {
                             &mut prof,
                             profiling,
                             false,
+                            mrope_override,
                         );
                         full_idx += 1;
                         layer_enc.end_encoding();
@@ -6235,6 +6328,7 @@ mod inner {
                         &mut prof,
                         profiling,
                         true,
+                        mrope_override,
                     );
                     full_idx += 1;
                 }
@@ -6371,6 +6465,7 @@ mod inner {
                 false,
                 true,
                 GdnStateTrafficScope::Decode,
+                None,
                 None,
             );
 
@@ -9572,17 +9667,20 @@ mod inner {
             })
         }
 
-        /// Qwen3.5 vision (ADR-069 Metal S5, MP2): Metal port of the residual-stream
-        /// REPLACE injection half of `cpu_f16::generate_multimodal_f16` — the CPU
-        /// function is the numeric oracle (ADR-069 Amendment 1: divergence from it
-        /// is a bug by definition), so this mirrors its request type, validation
-        /// order, and per-token embedding contract exactly: real residual-stream
+        /// Qwen3.5 vision (ADR-069 Metal S5, MP2+MP3): Metal port of
+        /// `cpu_f16::generate_multimodal_f16` — the CPU function is the numeric
+        /// oracle (ADR-069 Amendment 1: divergence from it is a bug by
+        /// definition), so this mirrors its request type, validation order, and
+        /// per-token embedding + M-RoPE contract exactly: real residual-stream
         /// REPLACE injection of merged patch embeddings at `<|image_pad|>` slots
-        /// (mirrors `forward_step_f16`'s `injected_embedding`). Position handling
-        /// (3-axis M-RoPE at the six GQA layers, mirroring
-        /// `full_attention_step_f16`'s `mrope_cos_sin`) is a separate, later port
-        /// stage — this stage runs every position through the model's existing
-        /// 1-D `engine.rope_cos`/`rope_sin` table, same as plain text decode.
+        /// (mirrors `forward_step_f16`'s `injected_embedding`), and per-token
+        /// 3-axis interleaved M-RoPE cos/sin rows at the six GQA layers (mirrors
+        /// `full_attention_step_f16`'s `mrope_cos_sin`) built from
+        /// `Qwen35VisionRequest::build_mrope_tables`/`build_decode_cos_sin`. A
+        /// text-only request (`image_grids` empty) passes `None` throughout,
+        /// which keeps every position on the model's unchanged 1-D
+        /// `engine.rope_cos`/`rope_sin` table — structurally identical to plain
+        /// text decode.
         ///
         /// Deliberately a new entry point rather than a change to [`Self::generate_multimodal`]:
         /// that function's [`crate::vision::MultimodalInput`] represents visual tokens as a
@@ -9594,6 +9692,26 @@ mod inner {
             request: &Qwen35VisionRequest,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
+        ) -> Result<GenerateOutput, crate::error::InferenceError> {
+            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None)
+        }
+
+        /// Body of [`Self::generate_multimodal_vision`] with an optional
+        /// decode-step logits probe (each decode iteration's full logits row,
+        /// in order). The probe exists because greedy token output is not a
+        /// usable observable for the decode-time M-RoPE coordinate: 18 of 24
+        /// decoder layers are GDN (no RoPE at all), and on the real #989
+        /// fixture a `None`-decode mutation reproduced the correct arm's
+        /// greedy tokens exactly over a 32-step horizon. Logit-level
+        /// assertions through this seam are what make the decode wiring
+        /// mutation-detectable (same pattern as `gemma4`'s
+        /// `generate_greedy_with_probe`).
+        fn generate_multimodal_vision_impl(
+            &mut self,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            mut decode_logits_probe: Option<&mut Vec<Vec<f32>>>,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
 
@@ -9666,6 +9784,21 @@ mod inner {
                 }
             }
 
+            // Build the per-physical-token M-RoPE position ids and interleaved
+            // cos/sin tables (ADR-069 MP3). Mirrors `generate_multimodal_f16`'s
+            // ordering: built right after the checkpoint-binding checks above,
+            // before the prompt-empty/context-budget checks below.
+            let (positions, tables) = request.build_mrope_tables(&cfg)?;
+            let expected_rope_half = cfg.rope_dim() / 2;
+            if tables.cos.iter().any(|row| row.len() != expected_rope_half)
+                || tables.sin.iter().any(|row| row.len() != expected_rope_half)
+            {
+                return Err(InferenceError::InvalidInput(format!(
+                    "M-RoPE table row width does not match decoder rotary half-width: expected \
+                     {expected_rope_half}"
+                )));
+            }
+
             let prompt_ids = &request.input_ids;
             let prompt_len = prompt_ids.len();
             crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
@@ -9713,10 +9846,21 @@ mod inner {
             // Prefill: inject a post-merger visual row at each `<|image_pad|>` slot, in the
             // same sequential image-token order the request already concatenated
             // `post_merger_rows` in (HF's masked_scatter contract), text tokens (including
-            // vision delimiters) keep their normal embedding lookup.
+            // vision delimiters) keep their normal embedding lookup. Every physical
+            // position — image-pad or text — rotates the six GQA layers with its
+            // `tables.cos[pos]`/`tables.sin[pos]` row when the request carries an
+            // image (ADR-069 MP3); `has_image=false` passes `None` throughout, which
+            // keeps `forward_step_mrope`/`forward_step_injected_mrope` on the
+            // unchanged 1-D `engine.rope_cos`/`rope_sin` path — structurally
+            // identical to the pre-MP3 text-only route.
             let mut visual_row = 0usize;
             let mut last_logits = Vec::new();
             for (pos, &token_id) in prompt_ids.iter().enumerate() {
+                let cos_sin = if has_image {
+                    Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()))
+                } else {
+                    None
+                };
                 if has_image && token_id == request.image_token_id {
                     let start = visual_row * request.decoder_hidden_size;
                     let end = start + request.decoder_hidden_size;
@@ -9730,9 +9874,9 @@ mod inner {
                         )));
                     }
                     visual_row += 1;
-                    last_logits = self.forward_step_injected(row, pos);
+                    last_logits = self.forward_step_injected_mrope(row, pos, cos_sin);
                 } else {
-                    last_logits = self.forward_step(token_id, pos);
+                    last_logits = self.forward_step_mrope(token_id, pos, cos_sin);
                 }
             }
 
@@ -9770,9 +9914,11 @@ mod inner {
             }
 
             // Autoregressive decode: identical to the plain `generate`/`generate_streaming`
-            // loop. Position handling for image content (M-RoPE) is a separate, later port
-            // stage — this stage only makes the visual embeddings themselves reach the
-            // residual stream correctly.
+            // loop, except that once the prompt contained an image the physical
+            // KV-cache index (`physical_pos`) and the M-RoPE coordinate diverge —
+            // mirrors `generate_multimodal_f16`'s decode loop (ADR-069 RECON §3):
+            // `decode_axis = physical_pos + rope_delta`, recomputed into a single
+            // cos/sin row via the same `build_decode_cos_sin` the CPU oracle uses.
             while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
@@ -9786,7 +9932,33 @@ mod inner {
                     break;
                 }
 
-                let step_logits = self.forward_step(last_token, physical_pos);
+                let decode_cos_sin_owned;
+                let mrope_cos_sin = if has_image {
+                    let decode_axis = crate::vision::qwen35_mrope::decode_position(
+                        physical_pos,
+                        positions.rope_delta,
+                    )?;
+                    decode_cos_sin_owned = request.build_decode_cos_sin(&cfg, decode_axis)?;
+                    if decode_cos_sin_owned.0.len() != expected_rope_half
+                        || decode_cos_sin_owned.1.len() != expected_rope_half
+                    {
+                        return Err(InferenceError::InvalidInput(format!(
+                            "decode-time M-RoPE row width does not match decoder rotary \
+                             half-width: expected {expected_rope_half}"
+                        )));
+                    }
+                    Some((
+                        decode_cos_sin_owned.0.as_slice(),
+                        decode_cos_sin_owned.1.as_slice(),
+                    ))
+                } else {
+                    None
+                };
+
+                let step_logits = self.forward_step_mrope(last_token, physical_pos, mrope_cos_sin);
+                if let Some(probe) = decode_logits_probe.as_deref_mut() {
+                    probe.push(step_logits.clone());
+                }
                 let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
@@ -10414,6 +10586,7 @@ mod inner {
                     head_dim as u32,
                     half_rope_dim,
                     position as u32,
+                    None,
                 );
                 self.dispatch_partial_rope(
                     enc,
@@ -10422,6 +10595,7 @@ mod inner {
                     head_dim as u32,
                     half_rope_dim,
                     position as u32,
+                    None,
                 );
 
                 enc.end_encoding();
@@ -10906,6 +11080,7 @@ mod inner {
         /// All commands are appended to the already-open encoder `enc`; no new
         /// command buffer is created here.
         #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
         fn encode_gqa_layer(
             &mut self,
             enc: &ComputeCommandEncoderRef,
@@ -10918,6 +11093,7 @@ mod inner {
             prof: &mut StepProfile,
             profiling: bool,
             with_mlp: bool,
+            mrope_override: Option<(&Buffer, &Buffer)>,
         ) {
             let hidden = cfg.hidden_size;
             // GQA: SINGLE command buffer — pre-norm + projections + KV copy + attention + MLP
@@ -11054,6 +11230,7 @@ mod inner {
                 head_dim as u32,
                 half_rope_dim,
                 position as u32,
+                mrope_override,
             );
             self.dispatch_partial_rope(
                 enc,
@@ -11062,6 +11239,7 @@ mod inner {
                 head_dim as u32,
                 half_rope_dim,
                 position as u32,
+                mrope_override,
             );
 
             // GPU KV cache copy
@@ -12249,6 +12427,14 @@ mod inner {
             );
         }
 
+        /// `mrope_override`, when supplied (Qwen3.5 vision M-RoPE, ADR-069 MP3),
+        /// replaces the 1-D `engine.rope_cos`/`rope_sin` table indexed by
+        /// `position` with a caller-supplied single-token cos/sin row (indexed
+        /// at offset 0) — the interleaved-axis row built by
+        /// `Qwen35VisionRequest::build_mrope_tables`/`build_decode_cos_sin`.
+        /// The rotation kernel and its stride-half arithmetic are unchanged
+        /// either way; only the cos/sin row source differs, mirroring
+        /// `cpu_f16::full_attention_step_f16`'s `mrope_cos_sin` parameter.
         fn dispatch_partial_rope(
             &self,
             enc: &ComputeCommandEncoderRef,
@@ -12257,15 +12443,20 @@ mod inner {
             head_dim: u32,
             half_rope_dim: u32,
             position: u32,
+            mrope_override: Option<(&Buffer, &Buffer)>,
         ) {
+            let (cos_buf, sin_buf, pos_offset) = match mrope_override {
+                Some((cos_buf, sin_buf)) => (cos_buf, sin_buf, 0u32),
+                None => (&self.engine.rope_cos, &self.engine.rope_sin, position),
+            };
             enc.set_compute_pipeline_state(&self.engine.pipelines.partial_rope);
             enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(&self.engine.rope_cos), 0);
-            enc.set_buffer(2, Some(&self.engine.rope_sin), 0);
+            enc.set_buffer(1, Some(cos_buf), 0);
+            enc.set_buffer(2, Some(sin_buf), 0);
             enc.set_bytes(3, 4, &num_heads as *const u32 as *const _);
             enc.set_bytes(4, 4, &head_dim as *const u32 as *const _);
             enc.set_bytes(5, 4, &half_rope_dim as *const u32 as *const _);
-            enc.set_bytes(6, 4, &position as *const u32 as *const _);
+            enc.set_bytes(6, 4, &pos_offset as *const u32 as *const _);
             let total_pairs = num_heads * half_rope_dim;
             let wg = 256u64;
             enc.dispatch_threads(
@@ -25299,6 +25490,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     false,
                     GdnStateTrafficScope::Decode,
                     Some(&row),
+                    None,
                 )
                 .logits;
 
@@ -25312,6 +25504,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     false,
                     GdnStateTrafficScope::Decode,
                     Some(&row),
+                    None,
                 )
                 .logits;
 
@@ -25326,6 +25519,716 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "an injected row's logits must be independent of the token_id occupying the \
                  slot — the injected_embedding arm must REPLACE the embedding lookup, never \
                  blend or fall back to it (max_abs_diff={max_abs_diff})"
+            );
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal MP3 gate, test 1/4 — position
+        /// sensitivity): the SAME injected embedding row at two different
+        /// M-RoPE `(t, h, w)` positions must yield DIFFERENT logits.
+        ///
+        /// `injected_embedding_logits_are_independent_of_token_id` above proves
+        /// the injected row is consumed regardless of which token id occupies
+        /// the slot, but it always ran at physical position 0 with no M-RoPE
+        /// table — it cannot catch a regression where MP3's wiring silently
+        /// ignores the supplied per-token cos/sin row (e.g. always dispatching
+        /// `pos_offset=0` into the override buffer, or falling back to
+        /// `engine.rope_cos`/`rope_sin`). This test drives two DIFFERENT
+        /// `(t, h, w)` triples (built the same way `build_mrope_tables` would
+        /// for an image spanning two rows) through `forward_step_injected_mrope`
+        /// at the SAME physical position, so only the M-RoPE row differs
+        /// between the two calls; the two logit vectors must differ.
+        ///
+        /// Mutation-sensitivity verified locally: forcing `dispatch_partial_rope`
+        /// to ignore `mrope_override` and always take the `None` branch (the
+        /// pre-MP3 1-D fallback) collapsed both calls to identical logits
+        /// (`max_abs_diff` fell under `1e-6`), failing this assertion; restoring
+        /// the override branch made it pass again.
+        ///
+        /// Both calls run after two identical priming tokens (not at a bare
+        /// reset). With an empty KV cache the injected token is the only
+        /// cached key, and softmax over a single score is always exactly
+        /// `1.0` regardless of the Q/K dot product — so a single-token
+        /// attention step is invariant to ANY Q/K rotation and cannot
+        /// discriminate this bug. Priming the cache to length 2 first makes
+        /// softmax weigh 3 distinct scores, where a rotation genuinely shifts
+        /// the attention distribution.
+        #[test]
+        fn forward_step_injected_mrope_logits_differ_by_position() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "forward_step_injected_mrope_logits_differ_by_position",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let hidden = cfg.hidden_size;
+
+            let mut row = vec![0.0f32; hidden];
+            for (i, v) in row.iter_mut().enumerate() {
+                *v = 0.02 + 0.01 * ((i % 89) as f32 - 44.0);
+            }
+
+            let mrope_section = cfg
+                .rope_parameters
+                .as_ref()
+                .and_then(|p| p.mrope_section.clone())
+                .expect("real 0.8b checkpoint carries mrope_section");
+            let theta = cfg
+                .rope_parameters
+                .as_ref()
+                .map(|p| p.rope_theta as f32)
+                .expect("real 0.8b checkpoint carries rope_theta");
+            let partial_rotary_factor = cfg
+                .rope_parameters
+                .as_ref()
+                .and_then(|p| p.partial_rotary_factor)
+                .unwrap_or(0.25);
+
+            let row_for = |t: u32, h: u32, w: u32| -> (Vec<f32>, Vec<f32>) {
+                let positions = crate::vision::qwen35_mrope::MRopePositions {
+                    positions: vec![(t, h, w)],
+                    rope_delta: 0,
+                };
+                let tables = crate::vision::qwen35_mrope::build_cos_sin(
+                    &positions,
+                    cfg.head_dim,
+                    partial_rotary_factor,
+                    theta,
+                    &mrope_section,
+                )
+                .expect("valid checkpoint M-RoPE config builds a table");
+                (tables.cos[0].clone(), tables.sin[0].clone())
+            };
+            let (cos_a, sin_a) = row_for(4, 4, 4);
+            let (cos_b, sin_b) = row_for(4, 11, 11);
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+
+            let prime = |s: &mut MetalQwen35State| {
+                s.reset_state();
+                s.forward_step(20, 0);
+                s.forward_step(21, 1);
+            };
+
+            prime(&mut state);
+            let logits_a = state.forward_step_injected_mrope(&row, 2, Some((&cos_a, &sin_a)));
+            prime(&mut state);
+            let logits_b = state.forward_step_injected_mrope(&row, 2, Some((&cos_b, &sin_b)));
+
+            let max_abs_diff = logits_a
+                .iter()
+                .zip(&logits_b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs_diff > 1e-3,
+                "the same injected row at two different M-RoPE (t,h,w) positions must \
+                 yield different logits — M-RoPE is not being applied (max_abs_diff={max_abs_diff})"
+            );
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal MP3 gate, test 2/4 — routing): proves
+        /// image-token positions actually go through the 3-axis M-RoPE table
+        /// built by `build_mrope_tables`, not the 1-D `engine.rope_cos`/
+        /// `rope_sin` fallback keyed by physical position.
+        ///
+        /// The synthetic fixture's image spans physical positions where the
+        /// M-RoPE `(t, h, w)` triple diverges from the physical index (H/W
+        /// sweep within the merged grid), so the correct per-position cos/sin
+        /// row differs from what the 1-D table would produce at that same
+        /// physical position. Compares the FINAL PREFILL STEP's raw logits
+        /// (not a downstream sampled/greedy token after further decode steps —
+        /// argmax over a real 24-layer/151936-vocab model can be robust to a
+        /// small per-position logit shift, which would make a token-level
+        /// comparison an insensitive gate) between a real run (using
+        /// `tables.cos[pos]`/`tables.sin[pos]`, the exact per-position rows
+        /// `generate_multimodal_vision` builds) and a forced-1-D run (`None`
+        /// throughout, i.e. `engine.rope_cos`/`rope_sin` keyed by physical
+        /// position — what `generate_multimodal_vision` would silently do if
+        /// it discarded `tables` and never wired the override through).
+        #[test]
+        fn generate_multimodal_vision_routes_image_tokens_through_mrope_table() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_routes_image_tokens_through_mrope_table",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let request = vision_gate_fixture(&cfg, 0.01);
+            let (_positions, tables) = request
+                .build_mrope_tables(&cfg)
+                .expect("fixture request builds M-RoPE tables");
+
+            // Real path: every position rotates with its genuine `tables.cos[pos]`/
+            // `tables.sin[pos]` row, exactly as `generate_multimodal_vision` does.
+            let mut state_real = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            state_real.reset_state();
+            let mut visual_row = 0usize;
+            let mut last_logits_real = Vec::new();
+            for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
+                if token_id == request.image_token_id {
+                    let start = visual_row * request.decoder_hidden_size;
+                    let end = start + request.decoder_hidden_size;
+                    let row = &request.post_merger_rows[start..end];
+                    visual_row += 1;
+                    last_logits_real = state_real.forward_step_injected_mrope(row, pos, cos_sin);
+                } else {
+                    last_logits_real = state_real.forward_step_mrope(token_id, pos, cos_sin);
+                }
+            }
+
+            // Forced-1-D path: identical injection sequence, but every call passes
+            // `None` for `mrope_cos_sin`.
+            let mut state_forced = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            state_forced.reset_state();
+            let mut visual_row = 0usize;
+            let mut last_logits_forced = Vec::new();
+            for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                if token_id == request.image_token_id {
+                    let start = visual_row * request.decoder_hidden_size;
+                    let end = start + request.decoder_hidden_size;
+                    let row = &request.post_merger_rows[start..end];
+                    visual_row += 1;
+                    last_logits_forced = state_forced.forward_step_injected(row, pos);
+                } else {
+                    last_logits_forced = state_forced.forward_step(token_id, pos);
+                }
+            }
+
+            let max_abs_diff = last_logits_real
+                .iter()
+                .zip(&last_logits_forced)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs_diff > 1e-3,
+                "generate_multimodal_vision's prefill must route image-token positions \
+                 through the 3-axis M-RoPE table, not the 1-D engine.rope_cos/rope_sin \
+                 fallback — forcing the 1-D path produced indistinguishable final-prefill \
+                 logits (max_abs_diff={max_abs_diff})"
+            );
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal MP3 gate, test 3/4 — text-only
+        /// bit-identity): a text-only request through `generate_multimodal_vision`
+        /// (no image runs) must produce bit-identical logits/tokens to the plain
+        /// `generate_streaming`/`forward_step` path, following the pattern of
+        /// `generate_multimodal_text_only_matches_plain_forward_bit_identical`
+        /// in `cpu_f16.rs`. `has_image=false` passes `None` for `mrope_cos_sin`
+        /// throughout, which keeps every `dispatch_partial_rope` call on the
+        /// unchanged `engine.rope_cos`/`rope_sin` 1-D table — this proves that
+        /// structural claim behaviorally.
+        #[test]
+        fn generate_multimodal_vision_text_only_matches_plain_forward_bit_identical() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_text_only_matches_plain_forward_bit_identical",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let tokenizer = minimal_bpe_tokenizer();
+            let input_ids: Vec<u32> = vec![10, 11, 12, 13, 14, 15, 16];
+
+            let request = crate::vision::multimodal::Qwen35VisionRequest {
+                input_ids: input_ids.clone(),
+                image_grids: vec![],
+                post_merger_rows: vec![],
+                image_token_id: cfg
+                    .image_token_id
+                    .expect("real 0.8b checkpoint carries image_token_id"),
+                spatial_merge_size: cfg
+                    .vision_config
+                    .as_ref()
+                    .expect("real 0.8b checkpoint carries vision_config")
+                    .spatial_merge_size,
+                decoder_hidden_size: cfg.hidden_size,
+            };
+            request.validate().expect("text-only request is valid");
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 3,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            let mut state_vision = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let out_vision = state_vision
+                .generate_multimodal_vision(&request, &tokenizer, &gen_cfg)
+                .expect("text-only multimodal generate succeeds");
+
+            let mut state_plain = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            state_plain.reset_state();
+            let mut all_ids = input_ids.clone();
+            let mut last_logits = Vec::new();
+            for (pos, &token_id) in input_ids.iter().enumerate() {
+                last_logits = state_plain.forward_step(token_id, pos);
+            }
+            let mut rng_state = 1u64;
+            let first_id = sample_token(&last_logits, &gen_cfg, &all_ids, &mut rng_state);
+            all_ids.push(first_id);
+            let mut plain_tokens = vec![first_id];
+            for _ in 1..gen_cfg.max_new_tokens {
+                let physical_pos = state_plain.session.kv_cache.seq_len;
+                let last_token = *all_ids.last().expect("prompt or sample populated all_ids");
+                let step_logits = state_plain.forward_step(last_token, physical_pos);
+                let next_id = sample_token(&step_logits, &gen_cfg, &all_ids, &mut rng_state);
+                plain_tokens.push(next_id);
+                all_ids.push(next_id);
+            }
+
+            assert_eq!(
+                out_vision.token_ids, plain_tokens,
+                "text-only generate_multimodal_vision must be bit-identical to the plain \
+                 forward_step decode loop"
+            );
+
+            // Equal greedy tokens can survive a non-bit-identical logit
+            // regression, so token equality alone does not substantiate the
+            // bit-identity contract. Drive the two entry points step-by-step
+            // on fresh states and assert exact bit equality of every logit at
+            // every prefill and decode step: `forward_step_mrope(.., None)` is
+            // the exact call `generate_multimodal_vision` makes for text-only
+            // requests, `forward_step` is the plain path.
+            let mut state_mrope_none = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let mut state_plain_bits = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            state_mrope_none.reset_state();
+            state_plain_bits.reset_state();
+
+            let assert_bits_equal = |a: &[f32], b: &[f32], step: usize| {
+                assert_eq!(a.len(), b.len(), "logit width diverged at step {step}");
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    assert_eq!(
+                        x.to_bits(),
+                        y.to_bits(),
+                        "step {step} logit {i}: text-only mrope-None path must be \
+                         bit-identical to the plain path ({x} vs {y})"
+                    );
+                }
+            };
+
+            let mut bits_last = Vec::new();
+            for (pos, &token_id) in input_ids.iter().enumerate() {
+                let a = state_mrope_none.forward_step_mrope(token_id, pos, None);
+                let b = state_plain_bits.forward_step(token_id, pos);
+                assert_bits_equal(&a, &b, pos);
+                bits_last = a;
+            }
+            let mut bits_ids = input_ids.clone();
+            let mut bits_rng = 1u64;
+            for step in 0..gen_cfg.max_new_tokens {
+                let next_id = sample_token(&bits_last, &gen_cfg, &bits_ids, &mut bits_rng);
+                bits_ids.push(next_id);
+                let physical_pos = state_mrope_none.session.kv_cache.seq_len;
+                assert_eq!(
+                    physical_pos, state_plain_bits.session.kv_cache.seq_len,
+                    "physical KV positions diverged before decode step {step}"
+                );
+                let a = state_mrope_none.forward_step_mrope(next_id, physical_pos, None);
+                let b = state_plain_bits.forward_step(next_id, physical_pos);
+                assert_bits_equal(&a, &b, input_ids.len() + step);
+                bits_last = a;
+            }
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal MP3 gate, decode-coordinate
+        /// discrimination): every prefill-oriented gate above still passes if
+        /// only the DECODE-time M-RoPE wiring regresses (dropping
+        /// `decode_cos_sin` and rotating decode steps by raw physical
+        /// position) — verified empirically: mutating
+        /// `generate_multimodal_vision`'s decode call to pass `None` left the
+        /// oracle-parity test green. Greedy TOKENS are not a usable
+        /// observable for this wiring at all: 18 of 24 layers are GDN (no
+        /// RoPE), and both a synthetic merged 8x8 grid (`rope_delta` -56,
+        /// 4-step horizon) and the real #989 fixture (32-step horizon)
+        /// produced token-identical trajectories on the correct and
+        /// `None`-decode arms. So this test pins the function at LOGIT level
+        /// through the `generate_multimodal_vision_impl` decode probe:
+        ///
+        /// - A manual replication of the function's exact prefill+first
+        ///   decode step is run twice: once with the correct decode
+        ///   coordinate (`decode_position(physical_pos, rope_delta)` +
+        ///   `build_decode_cos_sin`) and once simulating the regression
+        ///   (`None`, 1-D table keyed by physical position). The vacuity
+        ///   guard requires their decode-step logits to differ by a
+        ///   margin-safe amount — proving the fixture discriminates the two
+        ///   behaviors at the observable this test actually asserts on.
+        /// - The function's own probed decode-step logits must be
+        ///   bit-identical to the correct arm (Metal execution is
+        ///   deterministic across freshly built states; the text-only
+        ///   bit-identity test above establishes that). Mutation-verified:
+        ///   forcing the function's decode call to `None` makes exactly this
+        ///   assertion fail; restoring it passes.
+        #[test]
+        fn generate_multimodal_vision_decode_step_uses_rope_delta_coordinate() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_decode_step_uses_rope_delta_coordinate",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let tokenizer = minimal_bpe_tokenizer();
+
+            let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("tests")
+                .join("fixtures")
+                .join("vision");
+            if !fixture_dir.join("manifest.json").exists() {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=generate_multimodal_vision_decode_step_uses_rope_delta_coordinate \
+                     reason=no_vision_fixture path={}",
+                    fixture_dir.display()
+                );
+                let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but the #989 vision fixture is missing at {}",
+                    fixture_dir.display()
+                );
+                return;
+            }
+
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(fixture_dir.join("manifest.json")).expect("read manifest.json"),
+            )
+            .expect("parse manifest.json");
+            let input_ids: Vec<u32> = serde_json::from_slice::<Vec<i64>>(
+                &std::fs::read(fixture_dir.join("input_ids.json")).expect("read input_ids.json"),
+            )
+            .expect("parse input_ids.json")
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+            let post_merger_bytes = std::fs::read(fixture_dir.join("vit_post_merger_f32.bin"))
+                .expect("read vit_post_merger_f32.bin");
+            let post_merger: Vec<f32> = post_merger_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let grid_thw = manifest["image_grid_thw"]
+                .as_array()
+                .expect("image_grid_thw array")
+                .first()
+                .expect("at least one image grid")
+                .as_array()
+                .expect("grid triple");
+            let grid = crate::vision::qwen35_vit::GridThw {
+                t: grid_thw[0].as_u64().unwrap() as usize,
+                h: grid_thw[1].as_u64().unwrap() as usize,
+                w: grid_thw[2].as_u64().unwrap() as usize,
+            };
+            let vision_cfg = cfg
+                .vision_config
+                .as_ref()
+                .expect("real 0.8b checkpoint carries vision_config");
+            let image_token_id = cfg
+                .image_token_id
+                .expect("real 0.8b checkpoint carries image_token_id");
+            let request = Qwen35VisionRequest {
+                input_ids,
+                image_grids: vec![grid],
+                post_merger_rows: post_merger,
+                image_token_id,
+                spatial_merge_size: vision_cfg.spatial_merge_size,
+                decoder_hidden_size: cfg.hidden_size,
+            };
+            request
+                .validate()
+                .expect("fixture-derived request is valid");
+
+            let (positions, tables) = request
+                .build_mrope_tables(&cfg)
+                .expect("fixture request builds M-RoPE tables");
+            assert_ne!(
+                positions.rope_delta, 0,
+                "fixture must have a nonzero rope_delta or this test cannot \
+                 discriminate the decode coordinate from the physical position"
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            // Manual replication of `generate_multimodal_vision`'s exact
+            // prefill + first greedy decode step, with the decode-time M-RoPE
+            // coordinate either wired correctly or dropped to `None`. Returns
+            // that decode step's full logits row.
+            let manual_decode_logits = |use_decode_coordinate: bool| -> Vec<f32> {
+                let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                    .expect("real-checkpoint state");
+                state.reset_state();
+                let mut visual_row = 0usize;
+                let mut last_logits = Vec::new();
+                for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                    let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
+                    if token_id == request.image_token_id {
+                        let start = visual_row * request.decoder_hidden_size;
+                        let end = start + request.decoder_hidden_size;
+                        let row = &request.post_merger_rows[start..end];
+                        visual_row += 1;
+                        last_logits = state.forward_step_injected_mrope(row, pos, cos_sin);
+                    } else {
+                        last_logits = state.forward_step_mrope(token_id, pos, cos_sin);
+                    }
+                }
+                let mut all_ids = request.input_ids.clone();
+                let mut rng_state = 1u64;
+                let first_id = sample_token(&last_logits, &gen_cfg, &all_ids, &mut rng_state);
+                assert_ne!(
+                    first_id, cfg.eos_token_id,
+                    "fixture's first greedy token must not be EOS or no decode step runs"
+                );
+                all_ids.push(first_id);
+                let physical_pos = state.session.kv_cache.seq_len;
+                let decode_row_owned;
+                let cos_sin = if use_decode_coordinate {
+                    let decode_axis = crate::vision::qwen35_mrope::decode_position(
+                        physical_pos,
+                        positions.rope_delta,
+                    )
+                    .expect("fixture decode coordinate is valid");
+                    decode_row_owned = request
+                        .build_decode_cos_sin(&cfg, decode_axis)
+                        .expect("fixture decode row builds");
+                    Some((decode_row_owned.0.as_slice(), decode_row_owned.1.as_slice()))
+                } else {
+                    None
+                };
+                state.forward_step_mrope(first_id, physical_pos, cos_sin)
+            };
+
+            let logits_correct = manual_decode_logits(true);
+            let logits_regressed = manual_decode_logits(false);
+            let max_abs_diff = logits_correct
+                .iter()
+                .zip(&logits_regressed)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs_diff > 1e-3,
+                "vacuity guard: the fixture's first decode-step logits must \
+                 discriminate the rope_delta-shifted coordinate from the raw \
+                 physical position by a margin-safe amount (max_abs_diff = \
+                 {max_abs_diff:e}) — without this, the bit-equality assert \
+                 below could pass vacuously"
+            );
+
+            let mut state_fn = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let mut probed: Vec<Vec<f32>> = Vec::new();
+            let out = state_fn
+                .generate_multimodal_vision_impl(&request, &tokenizer, &gen_cfg, Some(&mut probed))
+                .expect("fixture multimodal generate succeeds");
+            assert_eq!(
+                out.generated_tokens, 2,
+                "expected prefill-sampled token + one decode step"
+            );
+            assert_eq!(probed.len(), 1, "one decode step probes one logits row");
+            assert_eq!(probed[0].len(), logits_correct.len());
+            for (lane, (&got, &want)) in probed[0].iter().zip(&logits_correct).enumerate() {
+                assert!(
+                    got.to_bits() == want.to_bits(),
+                    "generate_multimodal_vision's decode step must use the \
+                     rope_delta-shifted M-RoPE coordinate: probed logits diverge \
+                     from the correct arm at lane {lane} ({got} vs {want})"
+                );
+            }
+        }
+
+        /// Qwen3.5 vision (ADR-069 Metal MP3 gate, test 4/4 — CPU-vs-Metal
+        /// parity vs the oracle): loads the committed #989 differential
+        /// fixture (`tests/fixtures/vision/`, the same one
+        /// `vision_s5b_e2e_gate_test.rs` uses for the CPU-only S5b gate) and
+        /// runs the identical `Qwen35VisionRequest` through both
+        /// `cpu_f16::generate_multimodal_f16` (the numeric oracle, ADR-069
+        /// Amendment 1) and `generate_multimodal_vision` (this port), on the
+        /// real 82-token image+text prompt. Asserts the first greedy token
+        /// (the highest-margin, decode-independent position — see
+        /// `vision_s5b_e2e_gate_test.rs`'s `check_greedy_parity` doc comment)
+        /// matches the committed HF golden on BOTH paths, and that the two
+        /// paths agree with each other on all `max_new_tokens` tokens.
+        #[test]
+        fn generate_multimodal_vision_matches_cpu_oracle_on_real_fixture() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_matches_cpu_oracle_on_real_fixture",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("tests")
+                .join("fixtures")
+                .join("vision");
+            if !fixture_dir.join("manifest.json").exists() {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=generate_multimodal_vision_matches_cpu_oracle_on_real_fixture \
+                     reason=no_vision_fixture path={}",
+                    fixture_dir.display()
+                );
+                let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but the #989 vision fixture is missing at {}",
+                    fixture_dir.display()
+                );
+                return;
+            }
+
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(fixture_dir.join("manifest.json")).expect("read manifest.json"),
+            )
+            .expect("parse manifest.json");
+
+            let input_ids: Vec<u32> = serde_json::from_slice::<Vec<i64>>(
+                &std::fs::read(fixture_dir.join("input_ids.json")).expect("read input_ids.json"),
+            )
+            .expect("parse input_ids.json")
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+            assert_eq!(
+                input_ids.len(),
+                82,
+                "fixture prompt drifted from the reviewed anchor"
+            );
+
+            let post_merger_bytes = std::fs::read(fixture_dir.join("vit_post_merger_f32.bin"))
+                .expect("read vit_post_merger_f32.bin");
+            let post_merger: Vec<f32> = post_merger_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+
+            let grid_thw = manifest["image_grid_thw"]
+                .as_array()
+                .expect("image_grid_thw array")
+                .first()
+                .expect("at least one image grid")
+                .as_array()
+                .expect("grid triple");
+            let grid = crate::vision::qwen35_vit::GridThw {
+                t: grid_thw[0].as_u64().unwrap() as usize,
+                h: grid_thw[1].as_u64().unwrap() as usize,
+                w: grid_thw[2].as_u64().unwrap() as usize,
+            };
+
+            let greedy: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(fixture_dir.join("greedy_tokens.json"))
+                    .expect("read greedy_tokens.json"),
+            )
+            .expect("parse greedy_tokens.json");
+            let golden_first_token = greedy["token_ids"]
+                .as_array()
+                .expect("greedy_tokens.token_ids")
+                .first()
+                .and_then(serde_json::Value::as_i64)
+                .expect("first golden token") as u32;
+
+            let cfg = model.config().clone();
+            let vision_cfg = cfg
+                .vision_config
+                .as_ref()
+                .expect("0.8b checkpoint carries vision_config");
+            let image_token_id = cfg
+                .image_token_id
+                .expect("0.8b checkpoint carries image_token_id");
+
+            let request = crate::vision::multimodal::Qwen35VisionRequest {
+                input_ids,
+                image_grids: vec![grid],
+                post_merger_rows: post_merger,
+                image_token_id,
+                spatial_merge_size: vision_cfg.spatial_merge_size,
+                decoder_hidden_size: cfg.hidden_size,
+            };
+            request
+                .validate()
+                .expect("fixture-derived request is valid");
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 3,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            // The CPU oracle (`generate_multimodal_f16`) needs `F16ModelWeights`,
+            // a different weight representation than `Qwen35Model::weights()`
+            // (used by the Metal path below) — load it directly from the same
+            // checkpoint directory `require_metal_and_real_checkpoint_or_skip`
+            // resolved, mirroring `vision_s5b_e2e_gate_test.rs`'s loader.
+            let model_dir =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                    .join(".lattice/models/qwen3.5-0.8b");
+            let safetensors_path = model_dir.join("model.safetensors");
+            let sf = crate::weights::f32_weights::SafetensorsFile::open(&safetensors_path)
+                .expect("opening the checkpoint's safetensors file");
+            let f16_weights = crate::weights::f16_weights::load_f16_weights(&sf, &cfg)
+                .expect("real f16 decoder weights must load");
+
+            let cpu_out = crate::forward::cpu_f16::generate_multimodal_f16(
+                &f16_weights,
+                &cfg,
+                &request,
+                &gen_cfg,
+            )
+            .expect("CPU oracle multimodal generate succeeds");
+
+            let tokenizer = minimal_bpe_tokenizer();
+            let mut metal_state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let metal_out = metal_state
+                .generate_multimodal_vision(&request, &tokenizer, &gen_cfg)
+                .expect("Metal multimodal generate succeeds");
+
+            eprintln!(
+                "LATTICE_MP3_PARITY cpu={:?} metal={:?} golden_first={golden_first_token}",
+                cpu_out.token_ids, metal_out.token_ids
+            );
+
+            assert_eq!(
+                cpu_out.token_ids.first().copied(),
+                Some(golden_first_token),
+                "CPU oracle's first greedy token drifted from the committed HF golden"
+            );
+            assert_eq!(
+                metal_out.token_ids.first().copied(),
+                Some(golden_first_token),
+                "Metal's first greedy token drifted from the committed HF golden"
+            );
+            assert_eq!(
+                cpu_out.token_ids, metal_out.token_ids,
+                "Metal generate_multimodal_vision must match the CPU oracle \
+                 (generate_multimodal_f16) on the real vision fixture"
             );
         }
 
