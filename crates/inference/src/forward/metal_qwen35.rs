@@ -1080,6 +1080,17 @@ mod inner {
     #[cfg(test)]
     static ISSUE_535_CAPTURE_LAST_O_PROJECTION: AtomicBool = AtomicBool::new(false);
 
+    /// #535 control 2: at weight-load time, also upload an f16 shadow buffer alongside
+    /// each Q8_0-quantized weight buffer (see [`Q4WeightBuf::f16_shadow`]).
+    #[cfg(test)]
+    static ISSUE_535_SHADOW_F16_WEIGHTS: AtomicBool = AtomicBool::new(false);
+
+    /// #535 control 2: dispatch the tiled GEMM against the f16 shadow buffer instead of
+    /// the Q8_0 buffer, when a shadow is present. Same tile/stage/MMA order as
+    /// `gemm_q8_tiled`; only the weight representation differs.
+    #[cfg(test)]
+    static ISSUE_535_FORCE_F16_TILED_GEMM: AtomicBool = AtomicBool::new(false);
+
     // ---------------------------------------------------------------------------
     // MSL Compute Shaders
     // ---------------------------------------------------------------------------
@@ -1112,6 +1123,13 @@ mod inner {
     ///   Total              = 10048 bytes < 32 KB → 2× occupancy on M1
     const MSL_Q8_TILED_SOURCE: &str = include_str!("shaders/gemm_q8_tiled.metal");
 
+    /// #535 control 2 diagnostic only: identical tiling/staging/MMA order as
+    /// `gemm_q8_tiled`, but the weight buffer is a flat row-major f16 `[N,K]` array
+    /// instead of Q8_0 blocks — no dequantization step. Isolates tiled-GEMM
+    /// accumulation order from Q8 quantization.
+    #[cfg(test)]
+    const MSL_F16_TILED_SOURCE: &str = include_str!("shaders/gemm_f16_tiled_diag.metal");
+
     // ---------------------------------------------------------------------------
     // GPU Buffer Structures
     // ---------------------------------------------------------------------------
@@ -1131,6 +1149,11 @@ mod inner {
         payload_offset: u64,
         // Keeps the mmap alive as long as the Metal buffer needs the memory.
         _mmap: Option<memmap2::Mmap>,
+        /// #535 control 2 only: flat row-major f16 `[N,K]` mirror of this Q8_0 buffer's
+        /// source weights, populated when `ISSUE_535_SHADOW_F16_WEIGHTS` is set at load
+        /// time. `None` in all normal (non-diagnostic) builds and runs.
+        #[cfg(test)]
+        f16_shadow: Option<Buffer>,
     }
 
     impl Q4WeightBuf {
@@ -1140,6 +1163,8 @@ mod inner {
                 buffer,
                 payload_offset: 0,
                 _mmap: None,
+                #[cfg(test)]
+                f16_shadow: None,
             }
         }
 
@@ -1149,6 +1174,8 @@ mod inner {
                 buffer,
                 payload_offset,
                 _mmap: Some(mmap),
+                #[cfg(test)]
+                f16_shadow: None,
             }
         }
     }
@@ -1631,6 +1658,9 @@ mod inner {
         fused_residual_add_norm_batch: ComputePipelineState,
         gemm_q8: ComputePipelineState,
         gemm_q8_tiled: Option<ComputePipelineState>,
+        /// #535 control 2 diagnostic only; see [`MSL_F16_TILED_SOURCE`].
+        #[cfg(test)]
+        gemm_f16_tiled: Option<ComputePipelineState>,
         topk_merge_pass: ComputePipelineState,
         argmax_first: ComputePipelineState,
         argmax_merge: ComputePipelineState,
@@ -3100,6 +3130,21 @@ mod inner {
                 device.new_compute_pipeline_state_with_function(&func).ok()
             };
 
+            #[cfg(test)]
+            let make_optional_gemm_f16_tiled = || -> Option<ComputePipelineState> {
+                // #535 control 2 diagnostic only: same Apple7 gate as gemm_q8_tiled.
+                if !device.supports_family(MTLGPUFamily::Apple7) {
+                    return None;
+                }
+                let tiled_opts = CompileOptions::new();
+                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+                let lib = device
+                    .new_library_with_source(MSL_F16_TILED_SOURCE, &tiled_opts)
+                    .ok()?;
+                let func = lib.get_function("gemm_f16_tiled_diag", None).ok()?;
+                device.new_compute_pipeline_state_with_function(&func).ok()
+            };
+
             let pipelines = MetalQwen35Pipelines {
                 gemv_decode: make_pipeline("gemv_decode_m1")?,
                 gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
@@ -3149,6 +3194,8 @@ mod inner {
                 fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
                 gemm_q8_tiled: make_optional_gemm_q8_tiled(),
+                #[cfg(test)]
+                gemm_f16_tiled: make_optional_gemm_f16_tiled(),
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
                 argmax_first: make_pipeline("logits_argmax_first")?,
                 argmax_merge: make_pipeline("logits_argmax_merge")?,
@@ -3241,6 +3288,21 @@ mod inner {
                         QuantFormat::Q4_0 => make_buffer_q4_0(device, data, label),
                     }
                 };
+            // #535 control 2 diagnostic only: same quantized buffer as make_buffer_quant,
+            // plus an f16 shadow of the same source `data` when
+            // ISSUE_535_SHADOW_F16_WEIGHTS is set. No-op wrapper in every normal build/run.
+            let make_quant_weight =
+                |device: &Device, data: &[f32], label: &str| -> Result<Q4WeightBuf, String> {
+                    let buf = make_buffer_quant(device, data, label)?;
+                    #[allow(unused_mut)]
+                    let mut qwb = Q4WeightBuf::from_buffer(buf);
+                    #[cfg(test)]
+                    if ISSUE_535_SHADOW_F16_WEIGHTS.load(Ordering::Relaxed) {
+                        qwb.f16_shadow =
+                            Some(make_buffer_f16(device, data, &format!("{label}.f16shadow")));
+                    }
+                    Ok(qwb)
+                };
 
             let mut layer_weights = Vec::with_capacity(cfg.num_hidden_layers);
             for (i, (attn_w, common_w)) in weights.layers.iter().enumerate() {
@@ -3266,11 +3328,11 @@ mod inner {
                                 &up_bytes,
                                 &format!("L{i}.gate_up.{quant_tag}"),
                             )),
-                            down_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            down_proj: make_quant_weight(
                                 &device,
                                 &d.down_proj,
                                 &format!("L{i}.down.{quant_tag}"),
-                            )?),
+                            )?,
                         }
                     }
                     crate::model::qwen35::FeedForwardWeights::Moe(m) => {
@@ -3389,24 +3451,24 @@ mod inner {
                     AttentionWeights::Linear(gdn_w) => {
                         MetalLayerAttnWeights::Linear(MetalGdnLayerWeights {
                             // Large projections to f16
-                            in_proj_qkv: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            in_proj_qkv: make_quant_weight(
                                 &device,
                                 &gdn_w.in_proj_qkv,
                                 &format!("L{i}.gdn.qkv.{quant_tag}"),
-                            )?),
-                            in_proj_z: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            )?,
+                            in_proj_z: make_quant_weight(
                                 &device,
                                 &gdn_w.in_proj_z,
                                 &format!("L{i}.gdn.z.{quant_tag}"),
-                            )?),
+                            )?,
                             in_proj_qkvz: {
                                 let mut combined = gdn_w.in_proj_qkv.clone();
                                 combined.extend_from_slice(&gdn_w.in_proj_z);
-                                Q4WeightBuf::from_buffer(make_buffer_quant(
+                                make_quant_weight(
                                     &device,
                                     &combined,
                                     &format!("L{i}.gdn.qkvz.{quant_tag}"),
-                                )?)
+                                )?
                             },
                             // in_proj_b/a: keep f16 — CPU reads these for GDN recurrence
                             in_proj_b: make_buffer_f16(
@@ -3438,36 +3500,36 @@ mod inner {
                                 &format!("L{i}.gdn.norm"),
                             ),
                             // Output projection: f16 (large)
-                            out_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            out_proj: make_quant_weight(
                                 &device,
                                 &gdn_w.out_proj,
                                 &format!("L{i}.gdn.out.{quant_tag}"),
-                            )?),
+                            )?,
                         })
                     }
                     AttentionWeights::Full(full_w) => {
                         MetalLayerAttnWeights::Full(MetalFullLayerWeights {
                             // Large projections to f16
-                            q_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            q_proj: make_quant_weight(
                                 &device,
                                 &full_w.q_proj,
                                 &format!("L{i}.full.q.{quant_tag}"),
-                            )?),
-                            k_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            )?,
+                            k_proj: make_quant_weight(
                                 &device,
                                 &full_w.k_proj,
                                 &format!("L{i}.full.k.{quant_tag}"),
-                            )?),
-                            v_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            )?,
+                            v_proj: make_quant_weight(
                                 &device,
                                 &full_w.v_proj,
                                 &format!("L{i}.full.v.{quant_tag}"),
-                            )?),
-                            o_proj: Q4WeightBuf::from_buffer(make_buffer_quant(
+                            )?,
+                            o_proj: make_quant_weight(
                                 &device,
                                 &full_w.o_proj,
                                 &format!("L{i}.full.o.{quant_tag}"),
-                            )?),
+                            )?,
                             // Norm weights stay f32 (small, precision-sensitive)
                             q_norm: make_buffer(
                                 &device,
@@ -11867,6 +11929,30 @@ mod inner {
                     MTLSize::new(32, 4, 1),
                 );
             } else if let Some(tiled) = self.engine.pipelines.gemm_q8_tiled.as_ref() {
+                // #535 control 2 diagnostic only: dispatch the f16-shadow tiled kernel
+                // instead, when armed and a shadow buffer is present for this weight.
+                // Same BM/BN/BK tiling and buffer binding order as the Q8 branch below;
+                // only the weight representation and pipeline differ.
+                #[cfg(test)]
+                if ISSUE_535_FORCE_F16_TILED_GEMM.load(Ordering::Relaxed)
+                    && let (Some(f16_tiled), Some(shadow)) = (
+                        self.engine.pipelines.gemm_f16_tiled.as_ref(),
+                        qw.f16_shadow.as_ref(),
+                    )
+                {
+                    enc.set_compute_pipeline_state(f16_tiled);
+                    enc.set_buffer(0, Some(shadow), 0);
+                    enc.set_buffer(1, Some(x), x_offset);
+                    enc.set_buffer(2, Some(y), y_offset);
+                    enc.set_bytes(3, 4, &m as *const u32 as *const _);
+                    enc.set_bytes(4, 4, &n as *const u32 as *const _);
+                    enc.set_bytes(5, 4, &k as *const u32 as *const _);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                        MTLSize::new(32, 4, 1),
+                    );
+                    return;
+                }
                 // Tiled simdgroup-matrix GEMM (Apple7+, BM=64 × BN=32).
                 // Buffer bindings: buf(0)=QW, buf(1)=X, buf(2)=Y.
                 enc.set_compute_pipeline_state(tiled);
@@ -14872,6 +14958,10 @@ mod inner {
                 fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
                 gemm_q8: make_pipeline("gemm_q8")?,
                 gemm_q8_tiled: make_optional_gemm_q8_tiled(),
+                // #535 control 2 is only exercised via MetalQwen35Engine::new
+                // (safetensors load path); from_q4_dir never gets a shadow.
+                #[cfg(test)]
+                gemm_f16_tiled: None,
                 topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
                 argmax_first: make_pipeline("logits_argmax_first")?,
                 argmax_merge: make_pipeline("logits_argmax_merge")?,
@@ -28619,6 +28709,134 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     diff.max_abs, diff.rel_l2
                 );
             }
+        }
+
+        /// Load the #535 fixture prompt and Metal model, common to both controls.
+        fn issue_535_control_setup() -> (crate::model::qwen35::Qwen35Model, Vec<u32>, Issue535CpuF16)
+        {
+            let model_dir = issue_535_model_dir();
+            for name in ["model.safetensors", "config.json", "tokenizer.json"] {
+                assert!(
+                    model_dir.join(name).exists(),
+                    "#535 control requires {}",
+                    model_dir.join(name).display()
+                );
+            }
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&model_dir)
+                .expect("load #535 Metal model");
+            let prompt = issue_535_prompt();
+            let input = model.tokenizer().tokenize(&prompt);
+            let tokens = input.input_ids[..input.real_length].to_vec();
+            assert!(
+                (800..=830).contains(&tokens.len()),
+                "#535 fixture token count drifted: expected about 816, got {}",
+                tokens.len()
+            );
+            let cpu_f16 = load_issue_535_cpu_f16(&model_dir);
+            (model, tokens, cpu_f16)
+        }
+
+        /// Print the same margin/top5/full-row table the base #535 diagnostic reports,
+        /// tagged with `label` so a control's output is distinguishable in logs.
+        fn issue_535_report_control(label: &str, cpu_logits: &[f32], metal_logits: &[f32]) {
+            let diff = issue_535_diff(cpu_logits, metal_logits);
+            let cpu_top5 = issue_535_topk(cpu_logits, 5);
+            let metal_top5 = issue_535_topk(metal_logits, 5);
+            let cpu_id = argmax_f32(cpu_logits);
+            let metal_id = argmax_f32(metal_logits);
+            eprintln!("ISSUE535_{label} CPU top5={cpu_top5:?}");
+            eprintln!("ISSUE535_{label} METAL top5={metal_top5:?}");
+            eprintln!(
+                "ISSUE535_{label} candidate_margins: cpu(token {cpu_id} - token {metal_id})={:.7e}, metal(token {cpu_id} - token {metal_id})={:.7e}",
+                cpu_logits[cpu_id] - cpu_logits[metal_id],
+                metal_logits[cpu_id] - metal_logits[metal_id],
+            );
+            eprintln!(
+                "ISSUE535_{label} full_row: max_abs={:.7e} rel_l2={:.7e} cpu_argmax={} metal_argmax={}",
+                diff.max_abs, diff.rel_l2, cpu_id, metal_id
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // #535 discriminating controls (pre-registered in the diagnostic report)
+        // -----------------------------------------------------------------------
+
+        /// Control 1: force the existing naive (non-tiled) Q8 GEMM fallback, retaining
+        /// Q8 weights and leaving every other dispatch unchanged. If tiled-GEMM
+        /// staging/accumulation order is the cause of the #535 argmax reversal, this
+        /// control alone should move the `merge - main` margin back to the CPU side.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        #[ignore = "manual #535 control 1: forced non-tiled Q8 GEMM; needs the local 0.8B checkpoint and exclusive GPU"]
+        fn issue_535_control1_non_tiled_q8_diagnostic() {
+            let _gpu = gpu_test_lock();
+            let Some(_device) = Device::system_default() else {
+                eprintln!("#535 control 1 skipped: no Metal device");
+                return;
+            };
+            let (model, tokens, cpu_f16) = issue_535_control_setup();
+
+            let mut metal = MetalQwen35State::new(model.weights(), model.config(), 1024)
+                .expect("construct #535 Metal state");
+            assert!(
+                metal.engine.pipelines.gemm_q8_tiled.is_some(),
+                "#535 control 1 requires the tiled Q8 GEMM to be active by default on this \
+                 device, else forcing it off is a no-op rather than a control"
+            );
+            metal.engine.pipelines.gemm_q8_tiled = None;
+
+            let (cpu_logits, _) = issue_535_cpu_f16(&cpu_f16, &tokens);
+            metal.reset_state();
+            let metal_logits = metal.forward_prefill(&tokens);
+
+            issue_535_report_control("C1", &cpu_logits, &metal_logits);
+        }
+
+        /// Control 2: run the same tiled GEMM kernel machinery, but with an f16 weight
+        /// shadow buffer (no Q8 quantization) for the Q/K/V/O and GDN in/out
+        /// projections. The fused MLP gate_up_proj (dispatched via
+        /// `dispatch_gemm_q8_at`) is NOT covered — it stays Q8-tiled in both arms,
+        /// a disclosed scope limitation. If the reversal disappears only here, Q8
+        /// quantization dominates; if it persists across both controls, it is
+        /// accumulation/order inherent to batched prefill.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        #[ignore = "manual #535 control 2: f16-shadow tiled GEMM; needs the local 0.8B checkpoint and exclusive GPU"]
+        fn issue_535_control2_f16_tiled_diagnostic() {
+            let _gpu = gpu_test_lock();
+            let Some(_device) = Device::system_default() else {
+                eprintln!("#535 control 2 skipped: no Metal device");
+                return;
+            };
+            let (model, tokens, cpu_f16) = issue_535_control_setup();
+
+            ISSUE_535_SHADOW_F16_WEIGHTS.store(true, Ordering::Relaxed);
+            let build_result = MetalQwen35State::new(model.weights(), model.config(), 1024);
+            ISSUE_535_SHADOW_F16_WEIGHTS.store(false, Ordering::Relaxed);
+            let mut metal =
+                build_result.expect("construct #535 Metal state with f16 shadow weights");
+
+            assert!(
+                metal.engine.pipelines.gemm_f16_tiled.is_some(),
+                "#535 control 2 requires the f16-tiled diagnostic kernel to compile on this device"
+            );
+            let terminal_layer = metal.engine.config.num_hidden_layers - 1;
+            match &metal.engine.layer_weights[terminal_layer].0 {
+                MetalLayerAttnWeights::Full(w) => assert!(
+                    w.o_proj.f16_shadow.is_some(),
+                    "#535 control 2 requires the terminal GQA layer's O-projection to have \
+                     an f16 shadow buffer attached (shadow build silently skipped?)"
+                ),
+                MetalLayerAttnWeights::Linear(_) => panic!("#535 op probe assumes terminal GQA"),
+            }
+
+            ISSUE_535_FORCE_F16_TILED_GEMM.store(true, Ordering::Relaxed);
+            let (cpu_logits, _) = issue_535_cpu_f16(&cpu_f16, &tokens);
+            metal.reset_state();
+            let metal_logits = metal.forward_prefill(&tokens);
+            ISSUE_535_FORCE_F16_TILED_GEMM.store(false, Ordering::Relaxed);
+
+            issue_535_report_control("C2", &cpu_logits, &metal_logits);
         }
 
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
