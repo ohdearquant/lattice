@@ -2714,7 +2714,7 @@ mod serve {
                     }
                     WorkerEvent::Complete(output) => return Ok(output),
                     WorkerEvent::Rejected(api_err) => return Err(api_err),
-                    WorkerEvent::Failed(message) => {
+                    WorkerEvent::Failed(message) | WorkerEvent::ConstraintBlocked(message) => {
                         return Err(ApiError::Internal {
                             message: format!("generation failed: {message}"),
                         });

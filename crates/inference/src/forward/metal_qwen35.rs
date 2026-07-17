@@ -9245,7 +9245,7 @@ mod inner {
                 // short-circuit would silently return the first candidate's token
                 // id. Fail closed instead, matching the CPU contract (#611).
                 if !super::has_finite_logit(&prefill_logits) {
-                    return Err(InferenceError::InvalidInput(
+                    return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
                             .into(),
@@ -9406,7 +9406,7 @@ mod inner {
                         // Fail closed if the grammar blocked every continuation,
                         // matching the CPU contract (#611).
                         if !super::has_finite_logit(&step_logits) {
-                            return Err(InferenceError::InvalidInput(
+                            return Err(InferenceError::GrammarConstraintBlocked(
                                 "grammar constraint blocked every token; \
                                  no legal continuation exists in the current grammar state"
                                     .into(),
@@ -14181,7 +14181,7 @@ mod inner {
                 // short-circuit would silently return the first candidate's token
                 // id. Fail closed instead, matching the CPU contract (#611).
                 if !super::has_finite_logit(&prefill_logits) {
-                    return Err(InferenceError::InvalidInput(
+                    return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
                             .into(),
@@ -14352,7 +14352,7 @@ mod inner {
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
                     if !super::has_finite_logit(&step_logits) {
-                        return Err(InferenceError::InvalidInput(
+                        return Err(InferenceError::GrammarConstraintBlocked(
                             "grammar constraint blocked every token; \
                              no legal continuation exists in the current grammar state"
                                 .into(),
@@ -17079,7 +17079,7 @@ mod inner {
                 // short-circuit would silently return the first candidate's token
                 // id. Fail closed instead, matching the CPU contract (#611).
                 if !super::has_finite_logit(&prefill_logits) {
-                    return Err(InferenceError::InvalidInput(
+                    return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
                             .into(),
@@ -17290,7 +17290,7 @@ mod inner {
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
                     if !super::has_finite_logit(&step_logits) {
-                        return Err(InferenceError::InvalidInput(
+                        return Err(InferenceError::GrammarConstraintBlocked(
                             "grammar constraint blocked every token; \
                              no legal continuation exists in the current grammar state"
                                 .into(),
@@ -33988,7 +33988,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
             assert!(
-                matches!(result, Err(InferenceError::InvalidInput(_))),
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
                 "grammar blocking every token must fail closed via generate(); got {result:?}"
             );
         }
@@ -34050,7 +34050,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             });
 
             assert!(
-                matches!(result, Err(InferenceError::InvalidInput(_))),
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
                 "grammar blocking every token must fail closed via generate_streaming(); \
                  got {result:?}"
             );
@@ -34123,7 +34123,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             assert!(
-                matches!(result, Err(InferenceError::InvalidInput(_))),
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
                 "grammar blocking every token must fail closed via \
                  generate_streaming_with_prefix_cache(); got {result:?}"
             );
@@ -34897,7 +34897,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
             assert!(
-                matches!(result, Err(InferenceError::InvalidInput(_))),
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
                 "a grammar allowing exactly one token must fail closed at the \
                  decode-loop guard once the second step's mask blocks every \
                  continuation; got {result:?}"
@@ -34959,7 +34959,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             });
 
             assert!(
-                matches!(result, Err(InferenceError::InvalidInput(_))),
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
                 "a grammar allowing exactly one token must fail closed at the \
                  decode-loop guard via generate_streaming(); got {result:?}"
             );
@@ -35029,7 +35029,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
 
             assert!(
-                matches!(result, Err(InferenceError::InvalidInput(_))),
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
                 "a grammar allowing exactly one token must fail closed at the \
                  decode-loop guard via generate_streaming_with_prefix_cache(); \
                  got {result:?}"
@@ -36080,8 +36080,8 @@ mod multimodal_preflight_tests {
 // `GrammarEngine::mask_logits`, which sets every disallowed logit position to
 // `f32::NEG_INFINITY`. `crate::model::qwen35::generation` and `crate::generate`
 // (the CPU paths) each guard every `mask_logits` call with a `has_finite_logit`
-// check and fail closed with `InferenceError::InvalidInput` when the grammar
-// blocks every token — otherwise the sampler's non-finite-max short-circuit
+// check and fail closed with `InferenceError::GrammarConstraintBlocked` when
+// the grammar blocks every token — otherwise the sampler's non-finite-max short-circuit
 // would silently return the first candidate's token id (numerically safe, but
 // a silent violation of the grammar contract). This is that same guard,
 // mirrored for the Metal paths.

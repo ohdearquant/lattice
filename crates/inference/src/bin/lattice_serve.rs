@@ -74,6 +74,7 @@ mod imp {
         routing::{get, post},
     };
     use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
+    use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{
         GenerateConfig, GenerateOutput, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
@@ -92,7 +93,8 @@ mod imp {
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use serde::Deserialize;
     use serde_json::{Value, json};
-    use std::sync::Arc;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     /// Only used by the test module's raw job-channel helpers
     /// (`mpsc::UnboundedReceiver<WorkerJob>` etc. -- see
@@ -166,6 +168,20 @@ mod imp {
         /// every clone of `AppState` (one per request) records into the same
         /// counters.
         metrics: Arc<ServeMetrics>,
+        /// The loaded model's tokenizer vocabulary, byte-decoded once at
+        /// startup (structured-output v0 design note): `GrammarEngine::new`
+        /// needs `vocab_bytes[i]` for every token id to compile a schema
+        /// into a PDA + vocabulary partition. `Arc`-shared so every request
+        /// clones a pointer, not the ~vocab_size-entry `Vec<Vec<u8>>` --
+        /// `GrammarEngine::new` itself still takes ownership of a fresh
+        /// clone per compile (no cross-request grammar cache in v0; see the
+        /// structured-output v0 design note's stage split).
+        vocab_bytes: Arc<Vec<Vec<u8>>>,
+        /// Bounded (32-entry, LRU) single-flight cache of compiled
+        /// `GrammarEngine`s, keyed by canonicalized admitted schema JSON
+        /// (structured-output v0 design note, stage 2). `Arc`-shared so
+        /// every clone of `AppState` (one per request) hits the same cache.
+        grammar_cache: Arc<GrammarCache>,
     }
 
     // ─── OpenAI request shapes ───────────────────────────────────────────────
@@ -207,7 +223,18 @@ mod imp {
     /// false match.
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RequestError {
-        BadRequest { message: String, code: &'static str },
+        BadRequest {
+            message: String,
+            code: &'static str,
+        },
+        /// A server-side malfunction discovered during admission (round-1
+        /// review medium finding 4a: e.g. the grammar cache's own lock/slot
+        /// invariants broke) -- never the caller's fault, so it must not be
+        /// reported as the 400 every other `RequestError` is.
+        ServerError {
+            message: String,
+            code: &'static str,
+        },
     }
 
     impl RequestError {
@@ -218,15 +245,29 @@ mod imp {
             }
         }
 
+        fn server_error(message: impl Into<String>, code: &'static str) -> Self {
+            Self::ServerError {
+                message: message.into(),
+                code,
+            }
+        }
+
         fn message(&self) -> &str {
             match self {
-                Self::BadRequest { message, .. } => message,
+                Self::BadRequest { message, .. } | Self::ServerError { message, .. } => message,
             }
         }
 
         fn code(&self) -> &'static str {
             match self {
-                Self::BadRequest { code, .. } => code,
+                Self::BadRequest { code, .. } | Self::ServerError { code, .. } => code,
+            }
+        }
+
+        fn status(&self) -> StatusCode {
+            match self {
+                Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
+                Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             }
         }
     }
@@ -280,6 +321,22 @@ mod imp {
     #[derive(Debug, Deserialize)]
     struct ResponseFormat {
         r#type: String,
+        #[serde(default)]
+        json_schema: Option<JsonSchemaFormat>,
+    }
+
+    /// `response_format.json_schema` (structured-output v0 design note).
+    /// Fields are all `Option` at the wire boundary so `admit_structured_request`
+    /// can name exactly which one is missing/wrong rather than serde
+    /// rejecting the whole request with a generic parse error.
+    #[derive(Debug, Deserialize)]
+    struct JsonSchemaFormat {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        strict: Option<bool>,
+        #[serde(default)]
+        schema: Option<Value>,
     }
 
     /// #656: reject known-but-unsupported OpenAI request fields with HTTP
@@ -304,6 +361,7 @@ mod imp {
         }
         if let Some(fmt) = &req.response_format
             && fmt.r#type != "text"
+            && fmt.r#type != "json_schema"
         {
             return Err(RequestError::bad_request(
                 format!(
@@ -338,6 +396,784 @@ mod imp {
             ));
         }
         Ok(())
+    }
+
+    // ─── structured-output v0 (design note: strict JSON Schema, non-streaming only) ──
+
+    /// Keywords the v0 structured-output schema subset does not admit.
+    /// Checked before the narrower per-type validation in
+    /// `admit_v0_schema_at` so every rejection names the exact offending
+    /// keyword instead of falling through to a generic message.
+    /// `enum`/`const` are deferred per the design note's sign-off ruling
+    /// (Q2): admitted only once an independent evaluator and fuzz corpus
+    /// prove their type/escaping semantics, which this patch does not add.
+    const V0_REJECTED_KEYWORDS: &[&str] = &[
+        "enum",
+        "const",
+        "pattern",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "$ref",
+        "$defs",
+        "definitions",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "format",
+        "prefixItems",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "contains",
+    ];
+
+    /// A successful admission: the caller's schema, admitted into the v0
+    /// subset (closed objects, uniform arrays, primitive types, arbitrary
+    /// nesting of the above -- see the structured-output v0 design note).
+    /// Rejection is a `RequestError` with code `unsupported_strict_schema`,
+    /// naming the offending keyword/structural problem, and happens before
+    /// any worker job is submitted.
+    fn admit_v0_schema(schema: &Value) -> Result<(), String> {
+        admit_v0_schema_at(schema, "schema")
+    }
+
+    fn admit_v0_schema_at(node: &Value, path: &str) -> Result<(), String> {
+        let Some(obj) = node.as_object() else {
+            return Err(format!("{path}: schema must be a JSON object"));
+        };
+
+        for kw in V0_REJECTED_KEYWORDS {
+            if obj.contains_key(*kw) {
+                return Err(format!(
+                    "{path}: keyword '{kw}' is not supported by the v0 structured-output schema subset"
+                ));
+            }
+        }
+
+        let Some(type_value) = obj.get("type") else {
+            return Err(format!("{path}: 'type' is required"));
+        };
+        let Some(ty) = type_value.as_str() else {
+            return Err(format!(
+                "{path}: 'type' must be a single string, not a union or other value"
+            ));
+        };
+
+        match ty {
+            "object" => {
+                const ALLOWED: &[&str] =
+                    &["type", "properties", "required", "additionalProperties"];
+                if let Some(unknown) = obj.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+                    return Err(format!(
+                        "{path}: unknown keyword '{unknown}' is not supported for an object schema"
+                    ));
+                }
+                if !matches!(obj.get("additionalProperties"), Some(Value::Bool(false))) {
+                    return Err(format!(
+                        "{path}: 'additionalProperties' must be present and set to exactly 'false'"
+                    ));
+                }
+                let Some(props) = obj.get("properties").and_then(Value::as_object) else {
+                    return Err(format!(
+                        "{path}: 'properties' is required and must be an object"
+                    ));
+                };
+                let Some(required) = obj.get("required").and_then(Value::as_array) else {
+                    return Err(format!(
+                        "{path}: 'required' is required and must be an array"
+                    ));
+                };
+                let mut required_names = std::collections::BTreeSet::new();
+                for entry in required {
+                    let Some(name) = entry.as_str() else {
+                        return Err(format!("{path}: 'required' entries must be strings"));
+                    };
+                    required_names.insert(name);
+                }
+                let prop_names: std::collections::BTreeSet<&str> =
+                    props.keys().map(String::as_str).collect();
+                if required_names != prop_names {
+                    return Err(format!(
+                        "{path}: 'required' must list every property exactly once (closed strict object)"
+                    ));
+                }
+                for (name, prop_schema) in props {
+                    admit_v0_schema_at(prop_schema, &format!("{path}.{name}"))?;
+                }
+                Ok(())
+            }
+            "array" => {
+                const ALLOWED: &[&str] = &["type", "items"];
+                if let Some(unknown) = obj.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+                    return Err(format!(
+                        "{path}: unknown keyword '{unknown}' is not supported for an array schema"
+                    ));
+                }
+                let Some(items) = obj.get("items") else {
+                    return Err(format!("{path}: 'items' is required for an array schema"));
+                };
+                admit_v0_schema_at(items, &format!("{path}[]"))
+            }
+            "string" | "number" | "integer" | "boolean" | "null" => {
+                const ALLOWED: &[&str] = &["type"];
+                if let Some(unknown) = obj.keys().find(|k| !ALLOWED.contains(&k.as_str())) {
+                    return Err(format!(
+                        "{path}: unknown keyword '{unknown}' is not supported for type '{ty}'"
+                    ));
+                }
+                Ok(())
+            }
+            other => Err(format!("{path}: unsupported type '{other}'")),
+        }
+    }
+
+    /// Independent post-generation conformance check (structured-output v0
+    /// design note's "independent validation" requirement): validates the
+    /// raw generated JSON text against an admitted v0 schema by walking
+    /// `content`'s bytes directly, in lockstep with the schema, WITHOUT
+    /// reusing any of `lattice_inference::grammar::json_schema`'s compiler
+    /// code AND without ever going through `serde_json::Value` -- so a bug
+    /// shared between admission-time compilation and this check cannot
+    /// silently agree on a wrong answer.
+    ///
+    /// Round-1 review major finding: `serde_json::Value` (without the
+    /// `arbitrary_precision` feature, which the workspace does not enable)
+    /// parses any JSON number into `u64`/`i64`/`f64` before this function
+    /// would ever see it, so a grammar-conforming integer literal outside
+    /// `u64`/`i64` range (e.g. `18446744073709551616`) got silently rounded
+    /// to the nearest representable `f64`, and `is_i64()`/`is_u64()` then
+    /// rejected it -- a false `validation_failed` 500 for output the
+    /// compiler itself admitted. Preferred this raw-text walker over
+    /// turning on `arbitrary_precision`: that feature changes every
+    /// `Value` built anywhere in this binary, not just here, and isn't
+    /// already enabled anywhere in the workspace.
+    ///
+    /// Assumes `schema` already passed `admit_v0_schema` -- only the v0
+    /// subset's shapes are handled.
+    fn v0_validate_json(content: &str, schema: &Value) -> bool {
+        let mut pos = 0usize;
+        if !v0_validate_at(content, &mut pos, schema) {
+            return false;
+        }
+        v0_skip_ws(content, &mut pos);
+        pos == content.len()
+    }
+
+    fn v0_skip_ws(s: &str, pos: &mut usize) {
+        let b = s.as_bytes();
+        while matches!(b.get(*pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            *pos += 1;
+        }
+    }
+
+    fn v0_validate_at(s: &str, pos: &mut usize, schema: &Value) -> bool {
+        v0_skip_ws(s, pos);
+        let Some(obj) = schema.as_object() else {
+            return false;
+        };
+        let Some(ty) = obj.get("type").and_then(Value::as_str) else {
+            return false;
+        };
+        match ty {
+            "object" => v0_validate_object(s, pos, obj),
+            "array" => v0_validate_array(s, pos, obj),
+            "string" => v0_parse_string(s, pos).is_some(),
+            "boolean" => v0_parse_literal(s, pos, "true") || v0_parse_literal(s, pos, "false"),
+            "null" => v0_parse_literal(s, pos, "null"),
+            "number" => v0_parse_number_lexeme(s, pos).is_some(),
+            "integer" => {
+                v0_parse_number_lexeme(s, pos).is_some_and(|lexeme| v0_is_integer_lexeme(&lexeme))
+            }
+            _ => false,
+        }
+    }
+
+    fn v0_parse_literal(s: &str, pos: &mut usize, lit: &str) -> bool {
+        if s.as_bytes().get(*pos..*pos + lit.len()) == Some(lit.as_bytes()) {
+            *pos += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Parses a JSON string starting at `s[*pos]` (which must be `"`),
+    /// returning its unescaped content and advancing `*pos` past the
+    /// closing quote.
+    fn v0_parse_string(s: &str, pos: &mut usize) -> Option<String> {
+        let b = s.as_bytes();
+        if b.get(*pos) != Some(&b'"') {
+            return None;
+        }
+        *pos += 1;
+        let mut out = String::new();
+        loop {
+            match b.get(*pos)? {
+                b'"' => {
+                    *pos += 1;
+                    return Some(out);
+                }
+                b'\\' => {
+                    *pos += 1;
+                    match *b.get(*pos)? {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{8}'),
+                        b'f' => out.push('\u{c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let hex = s.get(*pos + 1..*pos + 5)?;
+                            let code = u32::from_str_radix(hex, 16).ok()?;
+                            *pos += 5; // consume 'u' + 4 hex digits
+                            if (0xD800..=0xDBFF).contains(&code) {
+                                // High surrogate: the compiled grammar
+                                // (json_schema.rs escape_id) admits any
+                                // four-hex `\uXXXX` independently of
+                                // pairing, so a lone half must still
+                                // validate here (validator ⊇ grammar
+                                // language). Combine with an immediately
+                                // following low-surrogate escape when
+                                // present; a lone half is represented as
+                                // U+FFFD since `char`/`String` cannot hold
+                                // an unpaired surrogate scalar.
+                                if s.as_bytes().get(*pos) == Some(&b'\\')
+                                    && s.as_bytes().get(*pos + 1) == Some(&b'u')
+                                    && let Some(low) = s
+                                        .get(*pos + 2..*pos + 6)
+                                        .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                        .filter(|low| (0xDC00..=0xDFFF).contains(low))
+                                {
+                                    let combined =
+                                        0x10000 + (code - 0xD800) * 0x400 + (low - 0xDC00);
+                                    out.push(char::from_u32(combined)?);
+                                    *pos += 6;
+                                    continue;
+                                }
+                                out.push('\u{FFFD}');
+                                continue;
+                            }
+                            if (0xDC00..=0xDFFF).contains(&code) {
+                                // Lone low surrogate: same grammar-parity
+                                // rationale as the high-surrogate case
+                                // above.
+                                out.push('\u{FFFD}');
+                                continue;
+                            }
+                            out.push(char::from_u32(code)?);
+                            continue;
+                        }
+                        _ => return None,
+                    }
+                    *pos += 1;
+                }
+                _ => {
+                    // Not a quote or a backslash: copy one UTF-8 scalar
+                    // verbatim, O(1) since `s[*pos..]` is a valid-UTF-8
+                    // slice already and `chars().next()` decodes lazily.
+                    // RFC 8259 §7 requires U+0000-U+001F to be escaped;
+                    // the compiled grammar's string-body alternatives
+                    // (json_schema.rs, unescaped-ASCII range starts at
+                    // 0x20) reject them unescaped too, so an unescaped
+                    // raw control scalar here must fail the same way.
+                    let ch = s[*pos..].chars().next()?;
+                    if (ch as u32) < 0x20 {
+                        return None;
+                    }
+                    out.push(ch);
+                    *pos += ch.len_utf8();
+                }
+            }
+        }
+    }
+
+    /// Consumes one JSON number token starting at `s[*pos]` per the
+    /// standard JSON number grammar (`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`)
+    /// and returns its exact source lexeme, unconverted -- the whole point
+    /// of this function existing instead of `serde_json::Value::as_f64`.
+    fn v0_parse_number_lexeme(s: &str, pos: &mut usize) -> Option<String> {
+        let b = s.as_bytes();
+        let start = *pos;
+        if b.get(*pos) == Some(&b'-') {
+            *pos += 1;
+        }
+        match b.get(*pos) {
+            Some(b'0') => *pos += 1,
+            Some(c) if c.is_ascii_digit() => {
+                while matches!(b.get(*pos), Some(c) if c.is_ascii_digit()) {
+                    *pos += 1;
+                }
+            }
+            _ => {
+                *pos = start;
+                return None;
+            }
+        }
+        if b.get(*pos) == Some(&b'.') {
+            let frac_start = *pos + 1;
+            let mut probe = frac_start;
+            while matches!(b.get(probe), Some(c) if c.is_ascii_digit()) {
+                probe += 1;
+            }
+            if probe > frac_start {
+                *pos = probe;
+            }
+        }
+        if matches!(b.get(*pos), Some(b'e' | b'E')) {
+            let mut probe = *pos + 1;
+            if matches!(b.get(probe), Some(b'+' | b'-')) {
+                probe += 1;
+            }
+            let exp_digits_start = probe;
+            while matches!(b.get(probe), Some(c) if c.is_ascii_digit()) {
+                probe += 1;
+            }
+            if probe > exp_digits_start {
+                *pos = probe;
+            }
+        }
+        Some(s[start..*pos].to_string())
+    }
+
+    /// JSON Schema's `integer` is any number with a zero fractional part
+    /// (2020-12 §6.1.1) -- `1.0` is a valid integer, `1.5` is not. The v0
+    /// compiler's own `json_integer` grammar production never emits a
+    /// fraction or exponent at all, so this is stricter than necessary for
+    /// grammar-conformant output and exists to independently reject a
+    /// non-conformant generation on its own terms, not the compiler's.
+    fn v0_is_integer_lexeme(lexeme: &str) -> bool {
+        if lexeme.contains(['e', 'E']) {
+            return false;
+        }
+        match lexeme.split_once('.') {
+            None => true,
+            Some((_, frac)) => !frac.is_empty() && frac.bytes().all(|c| c == b'0'),
+        }
+    }
+
+    fn v0_validate_object(s: &str, pos: &mut usize, obj: &serde_json::Map<String, Value>) -> bool {
+        let Some(props) = obj.get("properties").and_then(Value::as_object) else {
+            return false;
+        };
+        if s.as_bytes().get(*pos) != Some(&b'{') {
+            return false;
+        }
+        *pos += 1;
+        v0_skip_ws(s, pos);
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        if s.as_bytes().get(*pos) == Some(&b'}') {
+            *pos += 1;
+            return props.is_empty();
+        }
+        loop {
+            v0_skip_ws(s, pos);
+            let Some(key) = v0_parse_string(s, pos) else {
+                return false;
+            };
+            v0_skip_ws(s, pos);
+            if s.as_bytes().get(*pos) != Some(&b':') {
+                return false;
+            }
+            *pos += 1;
+            let Some(prop_schema) = props.get(&key) else {
+                return false;
+            };
+            if !seen.insert(key) {
+                return false;
+            }
+            if !v0_validate_at(s, pos, prop_schema) {
+                return false;
+            }
+            v0_skip_ws(s, pos);
+            match s.as_bytes().get(*pos) {
+                Some(b',') => *pos += 1,
+                Some(b'}') => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return false,
+            }
+        }
+        seen.len() == props.len()
+    }
+
+    fn v0_validate_array(s: &str, pos: &mut usize, obj: &serde_json::Map<String, Value>) -> bool {
+        let Some(items_schema) = obj.get("items") else {
+            return false;
+        };
+        if s.as_bytes().get(*pos) != Some(&b'[') {
+            return false;
+        }
+        *pos += 1;
+        v0_skip_ws(s, pos);
+        if s.as_bytes().get(*pos) == Some(&b']') {
+            *pos += 1;
+            return true;
+        }
+        loop {
+            if !v0_validate_at(s, pos, items_schema) {
+                return false;
+            }
+            v0_skip_ws(s, pos);
+            match s.as_bytes().get(*pos) {
+                Some(b',') => *pos += 1,
+                Some(b']') => {
+                    *pos += 1;
+                    break;
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Serializes `schema` (already admitted by `admit_v0_schema`) into a
+    /// key that is identical for two schemas differing only in object
+    /// property order. Deliberately does NOT rely on `serde_json::Value`'s
+    /// own `Map` ordering: whether that `Map` is `BTreeMap`-backed (sorted)
+    /// or insertion-order-backed depends on whether the `preserve_order`
+    /// Cargo feature is unified into the build anywhere in the dependency
+    /// graph -- verified empirically for the current lockfile (no crate
+    /// enables it, so `serde_json::to_string` already sorts keys), but that
+    /// is a whole-workspace build property that a future unrelated
+    /// dependency bump could silently flip. This walks the value itself and
+    /// sorts object keys explicitly, so the cache key's determinism does not
+    /// depend on that build-wide feature-unification detail.
+    fn canonical_schema_key(schema: &Value) -> String {
+        fn write_canonical(v: &Value, out: &mut String) {
+            match v {
+                Value::Null => out.push_str("null"),
+                Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                Value::Number(n) => out.push_str(&n.to_string()),
+                Value::String(s) => {
+                    out.push_str(&serde_json::to_string(s).unwrap_or_default());
+                }
+                Value::Array(items) => {
+                    out.push('[');
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        write_canonical(item, out);
+                    }
+                    out.push(']');
+                }
+                Value::Object(map) => {
+                    let mut keys: Vec<&String> = map.keys().collect();
+                    keys.sort();
+                    out.push('{');
+                    for (i, k) in keys.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                        out.push(':');
+                        write_canonical(&map[*k], out);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        let mut out = String::new();
+        write_canonical(schema, &mut out);
+        out
+    }
+
+    /// Stage 2 design note: shipped default capacity for the LRU compiled-
+    /// grammar cache.
+    const GRAMMAR_CACHE_CAPACITY: usize = 32;
+
+    /// [`GrammarCache::get_or_compile`]'s error shape (round-1 review
+    /// medium finding 4a). Distinguishes a legitimate schema-compile
+    /// failure -- the caller's fault, an ordinary 400
+    /// `unsupported_strict_schema`, exactly the behavior before this change
+    /// -- from the cache's own internal machinery breaking (a poisoned
+    /// lock, a vanished compiling-slot entry, or the compile closure
+    /// panicking instead of returning `Err`), which is never the caller's
+    /// fault and must surface as a bounded 500 instead of a panic that
+    /// tears down the request or a condvar nobody ever notifies again.
+    #[derive(Debug, Clone)]
+    enum CacheError {
+        Compile(String),
+        Internal(String),
+    }
+
+    /// The state shared by a single in-flight compile: waiters block on
+    /// `cv` until `result` is populated by the one thread that actually
+    /// calls the compile closure (structured-output v0 design note,
+    /// stage-2 single-flight requirement).
+    struct CompileSlot {
+        result: Mutex<Option<Result<Arc<GrammarEngine>, CacheError>>>,
+        cv: Condvar,
+    }
+
+    struct GrammarCacheInner {
+        capacity: usize,
+        /// Compiled, ready-to-serve entries. Recency order tracked in
+        /// `order` (front = least-recently-used, back = most-recently-used);
+        /// `ready` itself has no ordering, so eviction always consults
+        /// `order`, never `ready`'s iteration order.
+        ready: HashMap<String, Arc<GrammarEngine>>,
+        order: VecDeque<String>,
+        /// Keys currently being compiled by exactly one thread; every other
+        /// concurrent request for the same key waits on the listed slot
+        /// instead of starting a second, redundant compile.
+        compiling: HashMap<String, Arc<CompileSlot>>,
+    }
+
+    /// Bounded LRU cache of compiled `GrammarEngine`s keyed by
+    /// `canonical_schema_key`, with single-flight compilation (structured-
+    /// output v0 design note §"Schema-to-grammar compilation and cache
+    /// placement"). Only successfully admitted-and-compiled schemas are
+    /// cached -- a rejected or over-budget schema is never inserted, so a
+    /// later, corrected request for the same key compiles fresh rather than
+    /// replaying a cached failure.
+    struct GrammarCache {
+        inner: Mutex<GrammarCacheInner>,
+        /// Count of compile closures actually executed (as opposed to
+        /// served from cache or a single-flight wait). Test-only signal for
+        /// asserting single-flight collapses N concurrent identical
+        /// requests into exactly 1 compile; harmless to keep in production
+        /// as a cheap counter.
+        compile_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GrammarCache {
+        fn new(capacity: usize) -> Self {
+            Self {
+                inner: Mutex::new(GrammarCacheInner {
+                    capacity,
+                    ready: HashMap::new(),
+                    order: VecDeque::new(),
+                    compiling: HashMap::new(),
+                }),
+                compile_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        #[cfg(test)]
+        fn compile_count(&self) -> usize {
+            self.compile_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Returns the cached engine for `key`, compiling it via `compile`
+        /// if absent. Concurrent callers with the same `key` share one
+        /// compile: all but the first block on that first call's result.
+        ///
+        /// Never panics on a poisoned lock or a broken internal invariant
+        /// (round-1 review medium finding 4a): every lock is recovered via
+        /// `unwrap_or_else(PoisonError::into_inner)` instead of `expect`,
+        /// and `compile` runs under `catch_unwind` so a panicking compile
+        /// still frees its slot and wakes every waiter with
+        /// `CacheError::Internal` instead of leaving them blocked on a
+        /// condvar nobody will ever notify again.
+        fn get_or_compile(
+            &self,
+            key: String,
+            compile: impl FnOnce() -> Result<GrammarEngine, String> + std::panic::UnwindSafe,
+        ) -> Result<Arc<GrammarEngine>, CacheError> {
+            use std::sync::PoisonError;
+
+            enum Action {
+                Hit(Arc<GrammarEngine>),
+                Wait(Arc<CompileSlot>),
+                Compile,
+            }
+            let action = {
+                let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(engine) = inner.ready.get(&key).cloned() {
+                    if let Some(pos) = inner.order.iter().position(|k| k == &key) {
+                        inner.order.remove(pos);
+                    }
+                    inner.order.push_back(key.clone());
+                    Action::Hit(engine)
+                } else if let Some(slot) = inner.compiling.get(&key).cloned() {
+                    Action::Wait(slot)
+                } else {
+                    let slot = Arc::new(CompileSlot {
+                        result: Mutex::new(None),
+                        cv: Condvar::new(),
+                    });
+                    inner.compiling.insert(key.clone(), slot);
+                    Action::Compile
+                }
+            };
+            match action {
+                Action::Hit(engine) => Ok(engine),
+                Action::Wait(slot) => {
+                    let guard = slot.result.lock().unwrap_or_else(PoisonError::into_inner);
+                    let guard = slot
+                        .cv
+                        .wait_while(guard, |r| r.is_none())
+                        .unwrap_or_else(PoisonError::into_inner);
+                    guard.clone().unwrap_or_else(|| {
+                        Err(CacheError::Internal(
+                            "compile slot signaled with no result".to_string(),
+                        ))
+                    })
+                }
+                Action::Compile => {
+                    self.compile_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let result = match std::panic::catch_unwind(compile) {
+                        Ok(Ok(engine)) => Ok(Arc::new(engine)),
+                        Ok(Err(message)) => Err(CacheError::Compile(message)),
+                        Err(_) => Err(CacheError::Internal(
+                            "grammar compilation panicked".to_string(),
+                        )),
+                    };
+                    let slot = {
+                        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+                        let slot = inner.compiling.remove(&key);
+                        if let Ok(engine) = &result {
+                            inner.ready.insert(key.clone(), Arc::clone(engine));
+                            inner.order.push_back(key.clone());
+                            while inner.ready.len() > inner.capacity {
+                                if let Some(lru_key) = inner.order.pop_front() {
+                                    inner.ready.remove(&lru_key);
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        slot
+                    };
+                    // `slot` is only ever absent if this thread's own
+                    // `Action::Compile` insert (above) never happened --
+                    // structurally unreachable, but not worth an `expect`:
+                    // there is simply no waiter to notify in that case.
+                    if let Some(slot) = slot {
+                        let mut slot_result =
+                            slot.result.lock().unwrap_or_else(PoisonError::into_inner);
+                        *slot_result = Some(result.clone());
+                        slot.cv.notify_all();
+                    }
+                    result
+                }
+            }
+        }
+    }
+
+    /// A structured (`response_format.json_schema`, `strict: true`) request,
+    /// admitted and compiled before any worker job is submitted.
+    struct StructuredRequest {
+        schema: Value,
+        engine: Arc<GrammarEngine>,
+    }
+
+    /// Parses and admits `req.response_format` (structured-output v0 design
+    /// note, §"Accepted request profile"). Returns `Ok(None)` for an
+    /// ordinary text request, `Ok(Some(..))` for an admitted+compiled
+    /// strict structured request, or `Err` for any request-shape or schema
+    /// problem -- always before a worker job is submitted, matching the
+    /// design note's fail-closed admission contract.
+    fn admit_structured_request(
+        req: &ChatReq,
+        vocab_bytes: &Arc<Vec<Vec<u8>>>,
+        grammar_cache: &Arc<GrammarCache>,
+    ) -> Result<Option<StructuredRequest>, RequestError> {
+        let Some(fmt) = &req.response_format else {
+            return Ok(None);
+        };
+        if fmt.r#type != "json_schema" {
+            return Ok(None);
+        }
+        // Non-streaming only (design note §"Terminal and streaming
+        // behavior"): an SSE consumer could observe syntactically
+        // incomplete JSON at every intermediate token, so v0 rejects the
+        // combination outright rather than hiding partial bytes.
+        if req.stream.unwrap_or(false) {
+            return Err(RequestError::bad_request(
+                "response_format.json_schema requires a non-streaming request \
+                 (stream must be false or omitted)",
+                "unsupported_feature",
+            ));
+        }
+        let Some(json_schema) = &fmt.json_schema else {
+            return Err(RequestError::bad_request(
+                "response_format.json_schema is required when response_format.type is 'json_schema'",
+                "invalid_request",
+            ));
+        };
+        let name_ok = json_schema
+            .name
+            .as_deref()
+            .is_some_and(|n| !n.trim().is_empty());
+        if !name_ok {
+            return Err(RequestError::bad_request(
+                "response_format.json_schema.name must be a nonempty string",
+                "invalid_request",
+            ));
+        }
+        // Missing or false `strict` is rejected rather than silently
+        // treated as best-effort JSON (design note §"Accepted request
+        // profile", item 3).
+        if json_schema.strict != Some(true) {
+            return Err(RequestError::bad_request(
+                "response_format.json_schema.strict must be true; \
+                 best-effort JSON mode is not supported",
+                "unsupported_feature",
+            ));
+        }
+        let Some(schema) = &json_schema.schema else {
+            return Err(RequestError::bad_request(
+                "response_format.json_schema.schema is required",
+                "invalid_request",
+            ));
+        };
+        if let Err(message) = admit_v0_schema(schema) {
+            return Err(RequestError::bad_request(
+                message,
+                "unsupported_strict_schema",
+            ));
+        }
+        // Compile before enqueueing (design note §"Schema-to-grammar
+        // compilation and cache placement"), via the bounded single-flight
+        // cache (stage 2): a schema already compiled by an earlier request
+        // is served without touching the vocabulary clone or the compiler
+        // at all; a schema currently being compiled by a concurrent request
+        // is waited on instead of independently recompiled.
+        let key = canonical_schema_key(schema);
+        let schema_for_compile = schema.clone();
+        let vocab_bytes = Arc::clone(vocab_bytes);
+        let engine = grammar_cache
+            .get_or_compile(key, move || {
+                let spec = GrammarSpec::JsonSchema(schema_for_compile);
+                let engine = GrammarEngine::new(&spec, (*vocab_bytes).clone())
+                    .map_err(|e| format!("schema failed to compile: {e}"))?;
+                if engine.exceeds_state_budget() {
+                    return Err(
+                        "schema exceeds the strict-output complexity budget (256 precomputed \
+                         grammar states); v0 never falls back to the full-vocabulary simulation \
+                         path"
+                            .to_string(),
+                    );
+                }
+                Ok(engine)
+            })
+            .map_err(|err| match err {
+                CacheError::Compile(message) => {
+                    RequestError::bad_request(message, "unsupported_strict_schema")
+                }
+                CacheError::Internal(message) => {
+                    RequestError::server_error(message, "internal_error")
+                }
+            })?;
+        Ok(Some(StructuredRequest {
+            schema: schema.clone(),
+            engine,
+        }))
     }
 
     #[derive(Debug, Deserialize)]
@@ -838,11 +1674,138 @@ mod imp {
         }
     }
 
+    /// Raw-JSON duplicate-member scan (round-1 review blocker, finding 1):
+    /// rejects a request body containing an object with a repeated member
+    /// name, at any nesting depth, ANYWHERE in the body -- not scoped to
+    /// just `response_format.json_schema.schema`. Deliberate choice: a
+    /// schema-only scope would still let a duplicate elsewhere in the body
+    /// (e.g. a duplicated top-level `messages`) pass through the same
+    /// receiver-ambiguity RFC 8259 §4 warns about, and scanning the whole
+    /// body is no more expensive than the existing raw preflight pass
+    /// `validate_content_part_limits` already does below.
+    ///
+    /// Runs on the raw bytes BEFORE any deserialization into `Value` or
+    /// `ChatReq` -- both materialize objects as maps, so by the time
+    /// `admit_v0_schema` walks the parsed `Value` a duplicate key has
+    /// already silently collapsed to whichever pair `serde_json` kept.
+    /// A genuine JSON syntax error is deliberately NOT reported here (this
+    /// function returns `Ok(())` for any error other than a captured
+    /// duplicate name); the typed `ChatReq` parse below remains the single
+    /// authoritative source for "this body is not valid JSON at all",
+    /// exactly like `validate_content_part_limits`'s own established
+    /// pattern in this file.
+    fn reject_duplicate_json_members(body: &[u8]) -> Result<(), RequestError> {
+        use serde::Deserializer as _;
+        use serde::de::{DeserializeSeed, Error as DeError, MapAccess, SeqAccess, Visitor};
+        use std::cell::RefCell;
+        use std::fmt;
+
+        let duplicate: RefCell<Option<String>> = RefCell::new(None);
+
+        struct AnySeed<'v> {
+            duplicate: &'v RefCell<Option<String>>,
+        }
+        impl<'de, 'v> DeserializeSeed<'de> for AnySeed<'v> {
+            type Value = ();
+            fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(AnyVisitor {
+                    duplicate: self.duplicate,
+                })
+            }
+        }
+
+        struct AnyVisitor<'v> {
+            duplicate: &'v RefCell<Option<String>>,
+        }
+        impl<'de, 'v> Visitor<'de> for AnyVisitor<'v> {
+            type Value = ();
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E: DeError>(self, _v: bool) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_i64<E: DeError>(self, _v: i64) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_u64<E: DeError>(self, _v: u64) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_f64<E: DeError>(self, _v: f64) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_str<E: DeError>(self, _v: &str) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_string<E: DeError>(self, _v: String) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_unit<E: DeError>(self) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_none<E: DeError>(self) -> Result<(), E> {
+                Ok(())
+            }
+            fn visit_some<D>(self, deserializer: D) -> Result<(), D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(AnyVisitor {
+                    duplicate: self.duplicate,
+                })
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while seq
+                    .next_element_seed(AnySeed {
+                        duplicate: self.duplicate,
+                    })?
+                    .is_some()
+                {}
+                Ok(())
+            }
+            fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
+                        *self.duplicate.borrow_mut() = Some(key.clone());
+                        return Err(A::Error::custom(format!("duplicate object member '{key}'")));
+                    }
+                    map.next_value_seed(AnySeed {
+                        duplicate: self.duplicate,
+                    })?;
+                }
+                Ok(())
+            }
+        }
+
+        let mut de = serde_json::Deserializer::from_slice(body);
+        let _ = de.deserialize_any(AnyVisitor {
+            duplicate: &duplicate,
+        });
+        match duplicate.into_inner() {
+            Some(key) => Err(RequestError::bad_request(
+                format!("request body contains a duplicate JSON object member name '{key}'"),
+                "invalid_request_body",
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Clamp-then-parse entry point (#649 DoS hardening): validates part
     /// counts/sizes against the raw bytes first, then deserializes the typed
     /// request. Never allocates the request's strings/arrays before the
     /// clamp has run.
     fn parse_chat_req(body: &[u8]) -> Result<ChatReq, RequestError> {
+        reject_duplicate_json_members(body)?;
         validate_content_part_limits(body)?;
         serde_json::from_slice::<ChatReq>(body).map_err(|_| {
             RequestError::bad_request(
@@ -1258,7 +2221,29 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
-        let cfg = match build_cfg(&req, &s.defaults, s.model_max_context) {
+        // Structured-output v0 (design note): admit + compile
+        // `response_format.json_schema` BEFORE any worker job is submitted.
+        // `Ok(None)` for an ordinary text request; a schema/streaming
+        // problem here always surfaces as a 4xx, never a best-effort
+        // fallback to unconstrained generation.
+        let structured = match admit_structured_request(&req, &s.vocab_bytes, &s.grammar_cache) {
+            Ok(structured) => structured,
+            Err(err) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    "/v1/chat/completions",
+                    err.status().as_u16(),
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some(err.code()),
+                );
+                return err_response(err.status(), err.message(), err.code());
+            }
+        };
+        let mut cfg = match build_cfg(&req, &s.defaults, s.model_max_context) {
             Ok(cfg) => cfg,
             Err(err) => {
                 emit_serve_event(
@@ -1282,6 +2267,17 @@ mod imp {
                 return err.into_response();
             }
         };
+        // Wire the compiled grammar into the worker config (design note
+        // §"End-to-end execution", step 4) and force `enable_thinking` off
+        // for strict requests regardless of server defaults (sign-off Q5):
+        // the grammar masks from the first decode token, so thinking
+        // tokens are unsampleable under it and a think-then-constrain flow
+        // is out of scope for v0.
+        if let Some(structured) = &structured {
+            cfg.grammar = Some(Arc::clone(&structured.engine));
+            cfg.enable_thinking = false;
+        }
+        let cfg = cfg;
         let model_id = s.model_id.to_string();
         let streaming = req.stream.unwrap_or(false);
         let id = format!("chatcmpl-{}", unix_nanos());
@@ -1368,7 +2364,13 @@ mod imp {
                     );
                     return api_err.into_response();
                 }
-                WorkerEvent::Failed(message) => {
+                // `response_format.json_schema` is rejected outright for a
+                // streaming request (see `admit_structured_request`), so a
+                // `ConstraintBlocked` event can only ever mean the same
+                // generic internal failure `Failed` does here -- neither
+                // variant gets the `blocked_constraint` machine code on this
+                // path.
+                WorkerEvent::Failed(message) | WorkerEvent::ConstraintBlocked(message) => {
                     eprintln!("generation error (streaming): {message}");
                     emit_serve_event(
                         &s.metrics,
@@ -1465,7 +2467,10 @@ mod imp {
                                         ),
                                     ))
                                 }
-                                Some(WorkerEvent::Failed(message)) => {
+                                Some(
+                                    WorkerEvent::Failed(message)
+                                    | WorkerEvent::ConstraintBlocked(message),
+                                ) => {
                                     // The HTTP response was already committed as
                                     // 200 + text/event-stream when this SSE stream
                                     // started, so an error mid-stream cannot change
@@ -1641,6 +2646,7 @@ mod imp {
             let mut prompt_tokens = 0usize;
             let mut completion_tokens = 0usize;
             let mut stopped = false;
+            let mut stop_reason: Option<lattice_inference::StopReason> = None;
             let mut pending = Some(first_ev);
             while let Some(ev) = match pending.take() {
                 Some(ev) => Some(ev),
@@ -1652,6 +2658,7 @@ mod imp {
                         prompt_tokens = output.prompt_tokens;
                         completion_tokens = output.generated_tokens;
                         stopped = output.stopped;
+                        stop_reason = output.stop_reason;
                     }
                     WorkerEvent::Failed(message) => {
                         // Unlike streaming, the response has not been committed
@@ -1672,11 +2679,58 @@ mod imp {
                             false,
                             Some("internal_error"),
                         );
-                        return err_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "inference failed",
-                            "internal_error",
+                        return lattice_inference::serve::ApiError::ServerError {
+                            message: "inference failed".to_string(),
+                            code: "internal_error",
+                        }
+                        .into_response();
+                    }
+                    WorkerEvent::ConstraintBlocked(message) => {
+                        // Structured-output v0 (design note, sign-off Q4): a
+                        // strict request's generation failure is reported
+                        // with the `blocked_constraint` machine code instead
+                        // of the generic `internal_error`. Round-1 review
+                        // medium finding 2: this used to be decided by
+                        // sniffing `message` for the engine's known
+                        // grammar-exhausted-mask wording
+                        // (`metal_qwen35.rs`'s `has_finite_logit` fail-closed
+                        // check); `WorkerEvent::ConstraintBlocked` is now a
+                        // distinct type from `WorkerEvent::Failed` all the
+                        // way from `InferenceError::GrammarConstraintBlocked`
+                        // through `WorkerFailure`, so a backend wording
+                        // change can no longer degrade this to
+                        // `internal_error`. `message` is logged only, never
+                        // inspected for classification. KNOWN GAP
+                        // (documented in the stage-1 report): the
+                        // prefix-cache generation path does not call
+                        // `is_complete_without_continuation` before raising
+                        // this error the way the canonical CPU generation
+                        // loop does, so a schema that legitimately finished
+                        // (no further byte is valid after a closed
+                        // top-level value) currently produces the exact same
+                        // typed error and also lands here as
+                        // `blocked_constraint`, not a 200. Closing that gap
+                        // is prefix-cache generation-loop work, out of this
+                        // stage's admission+wiring scope.
+                        eprintln!("generation error: {message}");
+                        emit_serve_event(
+                            &s.metrics,
+                            "POST",
+                            "/v1/chat/completions",
+                            500,
+                            None,
+                            None,
+                            timer.elapsed().as_secs_f64() * 1000.0,
+                            false,
+                            Some("blocked_constraint"),
                         );
+                        return lattice_inference::serve::ApiError::ServerError {
+                            message: "structured output generation was blocked: no legal \
+                                      token continues the schema from this state"
+                                .to_string(),
+                            code: "blocked_constraint",
+                        }
+                        .into_response();
                     }
                     WorkerEvent::Rejected(api_err) => {
                         // #656: client-caused request-contract violation (the
@@ -1706,11 +2760,68 @@ mod imp {
                     }
                 }
             }
+            // Structured-output v0 (design note §"End-to-end execution",
+            // steps 5-6): a strict request never returns partial JSON as a
+            // 200. `stopped == false` covers length-limit and KV-window
+            // exhaustion identically (the engine's `GenerateOutput` does not
+            // separate them at this call site any more finely than the
+            // `finish_reason` mapping below already does); an interrupted
+            // request never reaches this line at all (the client is gone).
+            if let Some(structured) = &structured {
+                if !stopped {
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        "/v1/chat/completions",
+                        500,
+                        Some(prompt_tokens),
+                        Some(completion_tokens),
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        false,
+                        Some("length_limit"),
+                    );
+                    return lattice_inference::serve::ApiError::ServerError {
+                        message: format!(
+                            "structured output did not complete within max_tokens \
+                             (stop_reason={stop_reason:?}); refusing to return partial JSON"
+                        ),
+                        code: "length_limit",
+                    }
+                    .into_response();
+                }
+                // Independent validation (design note's "independent
+                // validation" requirement): a raw-text walk
+                // (`v0_validate_json`) that shares no code with the grammar
+                // compiler AND never goes through `serde_json::Value`, so a
+                // shared compiler bug -- or `Value`'s own numeric-precision
+                // limits -- cannot make this check silently agree with a
+                // wrong generation.
+                let conforms = v0_validate_json(&content, &structured.schema);
+                if !conforms {
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        "/v1/chat/completions",
+                        500,
+                        Some(prompt_tokens),
+                        Some(completion_tokens),
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        false,
+                        Some("validation_failed"),
+                    );
+                    return lattice_inference::serve::ApiError::ServerError {
+                        message: "generated text failed independent JSON Schema validation"
+                            .to_string(),
+                        code: "validation_failed",
+                    }
+                    .into_response();
+                }
+            }
             // ADR-080 C2, #746: the engine's actual stop cause, not a
             // hardcoded "stop" -- matches the streaming path and
             // `lattice.rs`'s non-streaming contract.
             let finish_reason = lattice_inference::serve::finish_reason(stopped);
-            let body = json!({
+            let mut body = json!({
                 "id": id, "object": "chat.completion",
                 "created": created, "model": model_id,
                 "choices": [{
@@ -1724,6 +2835,15 @@ mod imp {
                     "total_tokens": prompt_tokens + completion_tokens,
                 },
             });
+            // Structured-output v0 route-test marker (design note §"Serve
+            // and backend integration", item 1): a route that returns
+            // schema-shaped JSON WITHOUT actually having gone through
+            // grammar-constrained decoding must fail its route test, so
+            // this is set only on the code path above that attached
+            // `cfg.grammar` from an admitted `StructuredRequest`.
+            if structured.is_some() {
+                body["constraint_applied"] = Value::Bool(true);
+            }
             emit_serve_event(
                 &s.metrics,
                 "POST",
@@ -1984,6 +3104,7 @@ mod imp {
         // like this binary's prior `spawn_worker` + separate `ready` channel
         // did.
         let model_dir_for_loader = model_dir.clone();
+        let tokenizer_path_for_vocab = tokenizer_path.clone();
         let (
             owner,
             jobs,
@@ -2043,6 +3164,38 @@ mod imp {
             .into();
         eprintln!("[lattice_serve] model '{model_id}' ({fmt}) ready (context={model_max_context})");
 
+        // Structured-output v0 (design note): the tokenizer vocabulary,
+        // byte-decoded once here so `admit_structured_request` can compile
+        // `GrammarEngine`s without touching the `!Send` worker thread.
+        // Reloads the tokenizer and `config.json` a second time -- the
+        // worker thread's `load_model` (above) already loaded both once,
+        // inside a closure this async-setup code cannot reach across the
+        // thread boundary. Stage 2 (the `GrammarCache` below) does NOT
+        // remove this duplication: the underlying obstacle is the `!Send`
+        // worker closure boundary, not the lack of a compile cache -- the
+        // cache only avoids re-cloning `vocab_bytes` into `GrammarEngine`
+        // on a cache HIT, it does not change where the first, authoritative
+        // tokenizer/config load happens. Removing the second load would
+        // require restructuring `load_model`'s ownership across that
+        // thread boundary, out of stage 2's cache-placement scope.
+        let vocab_bytes: Arc<Vec<Vec<u8>>> = {
+            let tokenizer_for_vocab = BpeTokenizer::from_tokenizer_json(&tokenizer_path_for_vocab)
+                .map_err(|e| {
+                    format!(
+                        "tokenizer load failed ({}): {e}",
+                        tokenizer_path_for_vocab.display()
+                    )
+                })?;
+            let vocab_size = Qwen35Config::from_model_dir(&model_dir)
+                .map(|cfg| cfg.vocab_size)
+                .map_err(|e| format!("config.json load failed: {e}"))?;
+            Arc::new(
+                tokenizer_for_vocab
+                    .vocab_bytes(vocab_size)
+                    .map_err(|e| format!("tokenizer vocab_bytes failed: {e}"))?,
+            )
+        };
+
         let state = AppState {
             jobs,
             model_id,
@@ -2050,6 +3203,8 @@ mod imp {
             model_max_context,
             max_pending,
             metrics: Arc::new(ServeMetrics::default()),
+            vocab_bytes,
+            grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2139,6 +3294,8 @@ mod imp {
                     model_max_context: 4096,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
+                    vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 }
             }
             let (jobs, _rx) = test_client_and_jobs();
@@ -2415,6 +3572,8 @@ mod imp {
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: Arc::new(vec![]),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             }
         }
 
@@ -2431,6 +3590,25 @@ mod imp {
                 .expect("error response must carry error.message")
                 .to_string();
             (status, message)
+        }
+
+        /// Like `error_message_of`, plus the OpenAI-style `error.code` (used
+        /// by the structured-output v0 tests to assert the exact machine
+        /// code -- `unsupported_strict_schema`, `blocked_constraint`,
+        /// `validation_failed`, `length_limit` -- not just the status).
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        async fn error_code_of(response: Response) -> (StatusCode, String) {
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("error response must be valid JSON");
+            let code = value["error"]["code"]
+                .as_str()
+                .expect("error response must carry error.code")
+                .to_string();
+            (status, code)
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -2559,6 +3737,1078 @@ mod imp {
             );
         }
 
+        // ── structured-output v0 (design note) ─────────────────────────────
+
+        /// A synthetic vocabulary sized for `V0_ROUTE_SCHEMA` specifically:
+        /// literal multi-byte tokens for exactly the bytes a closed
+        /// `{"ok": <boolean>}` value needs. Decoupled from whatever
+        /// tokenizer a given test's fake worker uses for prompt-side
+        /// tokenization -- `AppState.vocab_bytes` and the worker's
+        /// `BpeTokenizer` are two independent concerns. Deliberately NOT a
+        /// full byte-range vocabulary: `GrammarEngine::new`'s reachable-
+        /// state BFS fans out per distinguishable token at every state, and
+        /// an open `type: "string"` property (arbitrary content) combined
+        /// with a wide single-byte vocabulary blows `MAX_GRAMMAR_STATES`
+        /// even for a schema this small -- a real tokenizer's vocabulary is
+        /// large but mostly irrelevant to any one schema's few reachable
+        /// states, which a literal-token synthetic vocab does not model.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        fn route_test_vocab() -> Arc<Vec<Vec<u8>>> {
+            Arc::new(
+                ["{", "}", "\"", ":", "ok", "true", "false", ","]
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect(),
+            )
+        }
+
+        const V0_OBJECT_SCHEMA: &str = r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}"#;
+        /// Compiles within `route_test_vocab`'s small literal-token budget
+        /// (see that function's doc comment): used only by tests that
+        /// actually run admission through `GrammarEngine::new`, as opposed
+        /// to `V0_OBJECT_SCHEMA`, which is used by tests that stop at pure
+        /// schema-shape validation (`admit_v0_schema`) or reject before
+        /// compilation is ever attempted.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        const V0_ROUTE_SCHEMA: &str = r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}"#;
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        fn structured_body(schema: &str, strict: Option<&str>, stream: Option<bool>) -> String {
+            let strict_field = match strict {
+                Some(raw) => format!(r#","strict":{raw}"#),
+                None => String::new(),
+            };
+            let stream_field = match stream {
+                Some(v) => format!(r#","stream":{v}"#),
+                None => String::new(),
+            };
+            format!(
+                r#"{{"messages":[{{"role":"user","content":"hi"}}]{stream_field},
+                    "response_format":{{"type":"json_schema","json_schema":{{
+                        "name":"result"{strict_field},"schema":{schema}}}}}}}"#
+            )
+        }
+
+        /// Round-1 review blocker, finding 1: a duplicate root `"type"`
+        /// member inside the submitted schema must be rejected with 400
+        /// before any worker job is submitted. `test_app_state()`'s worker
+        /// receiver is dropped immediately, so a request that reached
+        /// admission/job-submission would simply have its `send` silently
+        /// fail rather than this test observing a clean 400 -- reaching the
+        /// 400 assertion is itself proof no job was submitted.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_rejects_duplicate_root_type_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{
+                        "name":"result","strict":true,
+                        "schema":{"type":"boolean","type":"string"}}}}"#
+                    .to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request_body");
+        }
+
+        /// Round-1 review blocker, finding 1: a duplicate nested
+        /// `"properties"` member inside an object schema must be rejected
+        /// with 400 before any worker job is submitted.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_rejects_duplicate_nested_properties_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{
+                        "name":"result","strict":true,
+                        "schema":{"type":"object",
+                            "properties":{"a":{"type":"boolean"}},
+                            "properties":{"a":{"type":"string"}},
+                            "required":["a"],"additionalProperties":false}}}}"#
+                    .to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request_body");
+        }
+
+        /// Round-1 review blocker, finding 1: a duplicate key inside a
+        /// nested `properties.<name>` schema object must be rejected with
+        /// 400 before any worker job is submitted.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_rejects_duplicate_key_inside_property_schema_400() {
+            let body = Body::from(
+                r#"{"messages":[{"role":"user","content":"hi"}],
+                    "response_format":{"type":"json_schema","json_schema":{
+                        "name":"result","strict":true,
+                        "schema":{"type":"object",
+                            "properties":{"a":{"type":"boolean","type":"string"}},
+                            "required":["a"],"additionalProperties":false}}}}"#
+                    .to_string(),
+            );
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request_body");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_missing_strict_400() {
+            let body = Body::from(structured_body(V0_OBJECT_SCHEMA, None, None));
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("strict must be true"), "{message}");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_strict_false_400() {
+            let body = Body::from(structured_body(V0_OBJECT_SCHEMA, Some("false"), None));
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("strict must be true"), "{message}");
+        }
+
+        /// Spec §"Accepted request profile" item 1: `stream: true` combined
+        /// with a structured request is rejected before a worker job is
+        /// submitted (`test_app_state()`'s worker has no running loop
+        /// behind it at all -- a job send here would simply vanish silently
+        /// rather than this test observing a 400, so reaching the 400
+        /// assertion below is itself proof admission ran first).
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_streaming_400() {
+            let body = Body::from(structured_body(V0_OBJECT_SCHEMA, Some("true"), Some(true)));
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, message) = error_message_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(message.contains("non-streaming"), "{message}");
+        }
+
+        /// Rejection coverage per unsupported keyword (design note
+        /// §"Correctness tests", item 1), driven through the real HTTP
+        /// route (not just the pure `admit_v0_schema` unit tests below) so
+        /// the `unsupported_strict_schema` code and pre-worker-submission
+        /// contract are both proven at the boundary the design note names.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_pattern_keyword_400() {
+            let schema = r#"{"type":"object","properties":{"name":{"type":"string","pattern":"^a"}},"required":["name"],"additionalProperties":false}"#;
+            let body = Body::from(structured_body(schema, Some("true"), None));
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "unsupported_strict_schema");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_enum_keyword_400() {
+            let schema = r#"{"type":"string","enum":["a","b"]}"#;
+            let body = Body::from(structured_body(schema, Some("true"), None));
+            let response = chat_completions(State(test_app_state()), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "unsupported_strict_schema");
+        }
+
+        /// Route test (design note §"Serve and backend integration", item
+        /// 1): an admitted strict request's worker job carries
+        /// `grammar.is_some()`, `enable_thinking == false` (sign-off Q5),
+        /// and the successful response carries `constraint_applied` --
+        /// asserted from a real, compiled `GrammarEngine`, not a stub, so a
+        /// route that merely returns schema-shaped JSON without actually
+        /// wiring the grammar would fail this test's `grammar.is_some()`
+        /// assertion even before the marker check.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_applies_grammar_and_marker() {
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            let jobs = spawn_fake(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                4096,
+                tokenizer,
+                move |_messages, cfg, _prompt_tokens, on_token, _should_cancel| {
+                    assert!(
+                        cfg.grammar.is_some(),
+                        "structured request must attach a compiled grammar to GenerateConfig"
+                    );
+                    assert!(
+                        !cfg.enable_thinking,
+                        "strict structured requests must force enable_thinking off (Q5)"
+                    );
+                    // The route handler builds response `content` from
+                    // streamed `Delta` events, not `GenerateOutput::text`
+                    // directly -- mirror that by pushing the delta through
+                    // `on_token` before returning, exactly like a real
+                    // generate closure would.
+                    on_token(r#"{"ok":true}"#, 0);
+                    Ok(GenerateOutput {
+                        text: r#"{"ok":true}"#.to_string(),
+                        token_ids: vec![0],
+                        prompt_tokens: 1,
+                        generated_tokens: 1,
+                        stopped: true,
+                        stop_reason: Some(lattice_inference::StopReason::Eos),
+                        token_logprobs: vec![],
+                    })
+                },
+            );
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
+            let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
+            let response = chat_completions(State(state), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("response must be valid JSON");
+            assert_eq!(
+                value["constraint_applied"],
+                serde_json::Value::Bool(true),
+                "a route returning valid JSON without the constraint_applied marker must fail: {value}"
+            );
+            assert_eq!(value["choices"][0]["message"]["content"], r#"{"ok":true}"#);
+        }
+
+        /// Sign-off Q4: a `WorkerEvent::ConstraintBlocked` event must surface
+        /// as HTTP 500 with the `blocked_constraint` machine code for a
+        /// structured request, never a 200 with partial/absent JSON. Round-1
+        /// review medium finding 2: replies via the raw `WorkerJob::reply`
+        /// seam (not `spawn_fake`'s `Result<_, String>` closure, which can
+        /// only ever produce a generic `WorkerEvent::Failed`) so this test
+        /// exercises the real production classification -- a distinct
+        /// `WorkerEvent` variant, not a message-text sniff.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_blocked_constraint_500() {
+            let (jobs, mut jobs_rx) = test_client_and_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.reply(WorkerEvent::ConstraintBlocked(
+                        "grammar constraint blocked every token; \
+                         no legal continuation exists in the current grammar state"
+                            .to_string(),
+                    ));
+                }
+            });
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
+            let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
+            let response = chat_completions(State(state), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(code, "blocked_constraint");
+        }
+
+        /// Round-1 review medium finding 2: a `WorkerEvent::Failed` (the
+        /// generic variant) whose message text happens to contain the
+        /// engine's grammar-exhausted-mask wording must NOT be classified as
+        /// `blocked_constraint` -- only the distinct `ConstraintBlocked`
+        /// variant may. Mutation-sensitive companion to the test above: if
+        /// the classification ever regresses back to sniffing `message`,
+        /// this test starts failing (this exact message string used to
+        /// produce `blocked_constraint` under the old `.contains(..)` check;
+        /// it must now produce `internal_error`).
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_failed_with_blocked_wording_stays_internal_error() {
+            let (jobs, mut jobs_rx) = test_client_and_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.reply(WorkerEvent::Failed(
+                        "grammar constraint blocked every token; \
+                         no legal continuation exists in the current grammar state"
+                            .to_string(),
+                    ));
+                }
+            });
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
+            let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
+            let response = chat_completions(State(state), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(code, "internal_error");
+        }
+
+        /// Sign-off Q4: `stopped == false` (length/KV-window exhaustion)
+        /// on a structured request must surface as HTTP 500
+        /// `length_limit`, never HTTP 200 with truncated JSON.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_length_limit_500() {
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            let jobs = spawn_fake(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                4096,
+                tokenizer,
+                move |_messages, _cfg, _prompt_tokens, _on_token, _should_cancel| {
+                    Ok(GenerateOutput {
+                        text: r#"{"ok":tr"#.to_string(),
+                        token_ids: vec![0],
+                        prompt_tokens: 1,
+                        generated_tokens: 1,
+                        stopped: false,
+                        stop_reason: Some(lattice_inference::StopReason::Length),
+                        token_logprobs: vec![],
+                    })
+                },
+            );
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
+            let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
+            let response = chat_completions(State(state), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(code, "length_limit");
+        }
+
+        /// Independent-validation failure path (design note's
+        /// "independent validation" requirement): the engine claims a
+        /// clean stop, but the produced text does not conform to the
+        /// admitted schema -- must still be a 500 `validation_failed`, not
+        /// a 200 with nonconforming JSON.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_structured_validation_failed_500() {
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            let jobs = spawn_fake(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                4096,
+                tokenizer,
+                move |_messages, _cfg, _prompt_tokens, on_token, _should_cancel| {
+                    on_token(r#"{"unexpected":1}"#, 0);
+                    Ok(GenerateOutput {
+                        // Conforms to neither `additionalProperties:false`
+                        // nor the required `ok` boolean field.
+                        text: r#"{"unexpected":1}"#.to_string(),
+                        token_ids: vec![0],
+                        prompt_tokens: 1,
+                        generated_tokens: 1,
+                        stopped: true,
+                        stop_reason: Some(lattice_inference::StopReason::Eos),
+                        token_logprobs: vec![],
+                    })
+                },
+            );
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: route_test_vocab(),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
+            let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
+            let response = chat_completions(State(state), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(code, "validation_failed");
+        }
+
+        // ── GrammarCache (stage 2: LRU + single-flight) ─────────────────────
+
+        const SCHEMA_CACHE_TEST_BOOL: &str = r#"{"type":"boolean"}"#;
+        const SCHEMA_CACHE_TEST_NULL: &str = r#"{"type":"null"}"#;
+        const SCHEMA_CACHE_TEST_EMPTY_OBJECT: &str =
+            r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#;
+
+        /// A vocabulary sized only for the tiny literal schemas above --
+        /// same rationale as `route_test_vocab`: a wide vocabulary combined
+        /// with these schemas' few reachable states is irrelevant work, not
+        /// a more faithful test.
+        fn cache_test_vocab() -> Arc<Vec<Vec<u8>>> {
+            Arc::new(
+                ["true", "false", "null", "{", "}"]
+                    .iter()
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect(),
+            )
+        }
+
+        fn compile_schema_for_cache_test(schema_json: &str) -> Result<GrammarEngine, String> {
+            let schema: Value = serde_json::from_str(schema_json).expect("test schema must parse");
+            let spec = GrammarSpec::JsonSchema(schema);
+            GrammarEngine::new(&spec, (*cache_test_vocab()).clone())
+                .map_err(|e| format!("test schema failed to compile: {e}"))
+        }
+
+        #[test]
+        fn grammar_cache_hit_returns_same_engine_without_recompiling() {
+            let cache = GrammarCache::new(GRAMMAR_CACHE_CAPACITY);
+            let key = canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap());
+            let first = cache
+                .get_or_compile(key.clone(), || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_BOOL)
+                })
+                .expect("first compile must succeed");
+            let second = cache
+                .get_or_compile(key, || {
+                    panic!("cache hit must not invoke the compile closure again")
+                })
+                .expect("cache hit must succeed");
+            assert!(
+                Arc::ptr_eq(&first, &second),
+                "cache hit must return the exact same Arc"
+            );
+            assert_eq!(cache.compile_count(), 1);
+        }
+
+        #[test]
+        fn grammar_cache_evicts_least_recently_used_at_capacity() {
+            let cache = GrammarCache::new(2);
+            let key_a =
+                canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap());
+            let key_b =
+                canonical_schema_key(&serde_json::from_str(SCHEMA_CACHE_TEST_NULL).unwrap());
+            let key_c = canonical_schema_key(
+                &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
+            );
+
+            cache
+                .get_or_compile(key_a.clone(), || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_BOOL)
+                })
+                .unwrap();
+            cache
+                .get_or_compile(key_b.clone(), || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_NULL)
+                })
+                .unwrap();
+            cache
+                .get_or_compile(key_c, || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
+                })
+                .unwrap();
+            assert_eq!(
+                cache.compile_count(),
+                3,
+                "three distinct schemas must each compile exactly once"
+            );
+
+            // `a` was the least-recently-used entry when `c` was inserted
+            // into a capacity-2 cache, so `b` must still be cached.
+            cache
+                .get_or_compile(key_b, || {
+                    panic!("b must still be cached: a, not b, was the LRU entry evicted by c")
+                })
+                .unwrap();
+            assert_eq!(cache.compile_count(), 3);
+
+            // `a` was evicted, so requesting it again must recompile.
+            cache
+                .get_or_compile(key_a, || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_BOOL)
+                })
+                .unwrap();
+            assert_eq!(
+                cache.compile_count(),
+                4,
+                "evicted key must recompile on next request"
+            );
+        }
+
+        #[test]
+        fn grammar_cache_single_flight_collapses_concurrent_identical_requests() {
+            let cache = Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY));
+            let key = canonical_schema_key(
+                &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
+            );
+            const N: usize = 8;
+            let barrier = Arc::new(std::sync::Barrier::new(N));
+            let handles: Vec<_> = (0..N)
+                .map(|_| {
+                    let cache = Arc::clone(&cache);
+                    let key = key.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        cache
+                            .get_or_compile(key, || {
+                                std::thread::sleep(std::time::Duration::from_millis(30));
+                                compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
+                            })
+                            .expect("compile must succeed")
+                    })
+                })
+                .collect();
+            let engines: Vec<Arc<GrammarEngine>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(
+                cache.compile_count(),
+                1,
+                "{N} concurrent identical requests must collapse into exactly 1 compile"
+            );
+            for engine in &engines[1..] {
+                assert!(
+                    Arc::ptr_eq(&engines[0], engine),
+                    "every waiter must observe the same compiled engine"
+                );
+            }
+        }
+
+        /// Round-2 review medium finding 1: the `catch_unwind` single-flight
+        /// recovery path (`get_or_compile`'s `Action::Compile` arm) had no
+        /// test exercising an actual owner-closure panic. `compile` is an
+        /// injectable `FnOnce` argument to `get_or_compile` already -- no
+        /// extra test-only seam is needed, since single-flight semantics
+        /// mean only the one thread that wins `Action::Compile` ever
+        /// invokes its closure, so every concurrent caller can safely be
+        /// handed the same panicking closure. Every caller's result is
+        /// collected over a channel with a bounded `recv_timeout` rather
+        /// than a plain `.join()`, so a regression that reintroduces a
+        /// missed `notify_all` fails this test deterministically instead of
+        /// hanging the suite.
+        #[test]
+        fn grammar_cache_panic_in_compile_notifies_waiters_with_internal_error() {
+            let cache = Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY));
+            let key = canonical_schema_key(
+                &serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap(),
+            );
+            const N: usize = 8;
+            let barrier = Arc::new(std::sync::Barrier::new(N));
+            let prev_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {})); // silence the expected injected panic
+            let (tx, rx) = std::sync::mpsc::channel();
+            for _ in 0..N {
+                let cache = Arc::clone(&cache);
+                let key = key.clone();
+                let barrier = Arc::clone(&barrier);
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let result = cache.get_or_compile(key, || {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        panic!("injected compile panic for single-flight regression test");
+                    });
+                    let _ = tx.send(result);
+                });
+            }
+            drop(tx);
+            for _ in 0..N {
+                match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+                    Ok(Err(CacheError::Internal(_))) => {}
+                    Ok(Err(other)) => panic!("expected CacheError::Internal, got Err({other:?})"),
+                    Ok(Ok(_)) => panic!("expected CacheError::Internal, got Ok(engine)"),
+                    Err(_) => panic!(
+                        "caller did not return within timeout -- single-flight panic recovery hung"
+                    ),
+                }
+            }
+            std::panic::set_hook(prev_hook);
+            assert_eq!(
+                cache.compile_count(),
+                1,
+                "panic-injected compile must run exactly once across all waiters"
+            );
+
+            // Poison-recovery: retrying the same key with a working compile
+            // must succeed, proving the slot was removed (not left poisoned
+            // or permanently occupied) after the panic.
+            cache
+                .get_or_compile(key, || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
+                })
+                .expect("retry after a panicked compile must succeed");
+            assert_eq!(
+                cache.compile_count(),
+                2,
+                "retry after panic recovery must actually recompile, not replay a poisoned entry"
+            );
+        }
+
+        #[test]
+        fn grammar_cache_key_is_invariant_to_object_property_order() {
+            let v1: Value = serde_json::from_str(
+                r#"{"type":"object","properties":{"a":{"type":"boolean"},"b":{"type":"null"}},"required":["a","b"],"additionalProperties":false}"#,
+            )
+            .unwrap();
+            let v2: Value = serde_json::from_str(
+                r#"{"additionalProperties":false,"required":["a","b"],"properties":{"b":{"type":"null"},"a":{"type":"boolean"}},"type":"object"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                canonical_schema_key(&v1),
+                canonical_schema_key(&v2),
+                "reordering object keys (including nested 'properties') must not change the cache key"
+            );
+
+            let different: Value = serde_json::from_str(SCHEMA_CACHE_TEST_BOOL).unwrap();
+            assert_ne!(
+                canonical_schema_key(&v1),
+                canonical_schema_key(&different),
+                "structurally different schemas must have different cache keys"
+            );
+        }
+
+        #[test]
+        fn grammar_cache_hits_across_reordered_but_equivalent_top_level_keys() {
+            let cache = GrammarCache::new(GRAMMAR_CACHE_CAPACITY);
+            const EMPTY_OBJ_REORDERED: &str =
+                r#"{"additionalProperties":false,"required":[],"properties":{},"type":"object"}"#;
+            let v1: Value = serde_json::from_str(SCHEMA_CACHE_TEST_EMPTY_OBJECT).unwrap();
+            let v2: Value = serde_json::from_str(EMPTY_OBJ_REORDERED).unwrap();
+            assert_eq!(canonical_schema_key(&v1), canonical_schema_key(&v2));
+
+            let first = cache
+                .get_or_compile(canonical_schema_key(&v1), || {
+                    compile_schema_for_cache_test(SCHEMA_CACHE_TEST_EMPTY_OBJECT)
+                })
+                .expect("v1 must compile");
+            let second = cache
+                .get_or_compile(canonical_schema_key(&v2), || {
+                    panic!("v2's canonical key must hit the entry compiled for v1")
+                })
+                .expect("v2 must hit cache");
+            assert!(Arc::ptr_eq(&first, &second));
+            assert_eq!(cache.compile_count(), 1);
+        }
+
+        // ── admit_v0_schema: golden accept per construct ────────────────────
+
+        #[test]
+        fn admit_v0_schema_accepts_closed_object() {
+            admit_v0_schema(&serde_json::from_str(V0_OBJECT_SCHEMA).unwrap())
+                .expect("closed all-required object must be admitted");
+        }
+
+        #[test]
+        fn admit_v0_schema_accepts_uniform_array() {
+            let schema = serde_json::json!({"type": "array", "items": {"type": "integer"}});
+            admit_v0_schema(&schema).expect("uniform array must be admitted");
+        }
+
+        #[test]
+        fn admit_v0_schema_accepts_every_primitive() {
+            for ty in ["string", "number", "integer", "boolean", "null"] {
+                let schema = serde_json::json!({"type": ty});
+                admit_v0_schema(&schema)
+                    .unwrap_or_else(|e| panic!("type '{ty}' must be admitted: {e}"));
+            }
+        }
+
+        #[test]
+        fn admit_v0_schema_accepts_nested_object_and_array() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"id": {"type": "integer"}},
+                            "required": ["id"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["items"],
+                "additionalProperties": false
+            });
+            admit_v0_schema(&schema).expect("nesting of admitted constructs must be admitted");
+        }
+
+        // ── admit_v0_schema: one rejection per unsupported keyword ─────────
+
+        #[test]
+        fn admit_v0_schema_rejects_enum() {
+            let err =
+                admit_v0_schema(&serde_json::json!({"type": "string", "enum": ["a"]})).unwrap_err();
+            assert!(err.contains("enum"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_const() {
+            let err =
+                admit_v0_schema(&serde_json::json!({"type": "string", "const": "a"})).unwrap_err();
+            assert!(err.contains("const"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_pattern() {
+            let err = admit_v0_schema(&serde_json::json!({"type": "string", "pattern": "^a"}))
+                .unwrap_err();
+            assert!(err.contains("pattern"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_length_and_numeric_constraints() {
+            for (kw, schema) in [
+                (
+                    "minLength",
+                    serde_json::json!({"type": "string", "minLength": 1}),
+                ),
+                (
+                    "maxLength",
+                    serde_json::json!({"type": "string", "maxLength": 1}),
+                ),
+                (
+                    "minimum",
+                    serde_json::json!({"type": "number", "minimum": 1}),
+                ),
+                (
+                    "maximum",
+                    serde_json::json!({"type": "number", "maximum": 1}),
+                ),
+                (
+                    "multipleOf",
+                    serde_json::json!({"type": "number", "multipleOf": 2}),
+                ),
+            ] {
+                let err = admit_v0_schema(&schema).unwrap_err();
+                assert!(err.contains(kw), "{kw}: {err}");
+            }
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_ref() {
+            let err = admit_v0_schema(&serde_json::json!({"$ref": "#/$defs/foo"})).unwrap_err();
+            assert!(err.contains("$ref"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_composition() {
+            for kw in ["anyOf", "oneOf", "allOf", "not"] {
+                let schema = serde_json::json!({kw: [{"type": "string"}]});
+                let err = admit_v0_schema(&schema).unwrap_err();
+                assert!(err.contains(kw), "{kw}: {err}");
+            }
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_type_union() {
+            let err =
+                admit_v0_schema(&serde_json::json!({"type": ["string", "null"]})).unwrap_err();
+            assert!(err.contains("union"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_missing_additional_properties() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"]
+            });
+            let err = admit_v0_schema(&schema).unwrap_err();
+            assert!(err.contains("additionalProperties"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_open_additional_properties() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"],
+                "additionalProperties": true
+            });
+            let err = admit_v0_schema(&schema).unwrap_err();
+            assert!(err.contains("additionalProperties"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_missing_required_entry() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+                "required": ["a"],
+                "additionalProperties": false
+            });
+            let err = admit_v0_schema(&schema).unwrap_err();
+            assert!(err.contains("required"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_prefix_items() {
+            let schema = serde_json::json!({
+                "type": "array",
+                "items": {"type": "string"},
+                "prefixItems": [{"type": "string"}]
+            });
+            let err = admit_v0_schema(&schema).unwrap_err();
+            assert!(err.contains("prefixItems"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_format() {
+            let err =
+                admit_v0_schema(&serde_json::json!({"type": "string", "format": "date-time"}))
+                    .unwrap_err();
+            assert!(err.contains("format"), "{err}");
+        }
+
+        #[test]
+        fn admit_v0_schema_rejects_unknown_keyword() {
+            let err =
+                admit_v0_schema(&serde_json::json!({"type": "string", "wat": true})).unwrap_err();
+            assert!(err.contains("wat"), "{err}");
+        }
+
+        /// Mutation-sensitivity check (round-1 review medium finding 3):
+        /// unlike a plain `.is_err()` check, this asserts the REJECTION
+        /// SOURCE is specifically `V0_REJECTED_KEYWORDS` (the denylist
+        /// layer walked before the per-type match in `admit_v0_schema_at`),
+        /// not the primitive per-type allowlist layer (`ALLOWED` inside the
+        /// `"string"` arm) that would also reject an unrecognized `enum`
+        /// key on its own. If `enum` is removed from
+        /// `V0_REJECTED_KEYWORDS`, this schema still gets rejected -- by the
+        /// allowlist layer instead -- but with a DIFFERENT message, so this
+        /// test (unlike a bare `.is_err()` check) fails as intended. See
+        /// the stage-1 report's mutation transcript for the revert/restore
+        /// procedure this test guards, and this session's report for the
+        /// re-run transcript.
+        #[test]
+        fn admit_v0_schema_mutation_sensitive_to_enum_admission() {
+            let schema = serde_json::json!({"type": "string", "enum": ["a", "b"]});
+            let err = admit_v0_schema(&schema)
+                .expect_err("v0 must reject enum (Q2: deferred from the first patch)");
+            assert!(
+                err.contains("is not supported by the v0 structured-output schema subset"),
+                "expected the denylist layer's own rejection wording, got: {err}"
+            );
+        }
+
+        /// Independent companion to the denylist test above (round-1 review
+        /// medium finding 3): a keyword that `V0_REJECTED_KEYWORDS` never
+        /// mentions at all (so the denylist layer can never be the one that
+        /// rejects it) must still be rejected by the primitive per-type
+        /// `ALLOWED`-keyword layer. Mutation-sensitive to a DIFFERENT
+        /// mutation than the test above: loosening `ALLOWED` for a
+        /// primitive type (e.g. adding `"default"`) makes this schema admit
+        /// successfully, failing this test -- independently of whatever
+        /// `V0_REJECTED_KEYWORDS` contains.
+        #[test]
+        fn admit_v0_schema_mutation_sensitive_to_primitive_allowlist() {
+            let schema = serde_json::json!({"type": "boolean", "default": true});
+            let err = admit_v0_schema(&schema)
+                .expect_err("v0 must reject an unrecognized primitive keyword");
+            assert!(
+                err.contains("is not supported for type 'boolean'"),
+                "expected the primitive-allowlist layer's own rejection wording, got: {err}"
+            );
+        }
+
+        // ── v0_validate_json: independent evaluator ─────────────────────────
+
+        #[test]
+        fn v0_validate_json_accepts_conforming_object() {
+            let schema: Value = serde_json::from_str(V0_OBJECT_SCHEMA).unwrap();
+            assert!(v0_validate_json(r#"{"name": "ok"}"#, &schema));
+        }
+
+        #[test]
+        fn v0_validate_json_rejects_extra_field() {
+            let schema: Value = serde_json::from_str(V0_OBJECT_SCHEMA).unwrap();
+            assert!(!v0_validate_json(r#"{"name": "ok", "extra": 1}"#, &schema));
+        }
+
+        #[test]
+        fn v0_validate_json_rejects_missing_field() {
+            let schema: Value = serde_json::from_str(V0_OBJECT_SCHEMA).unwrap();
+            assert!(!v0_validate_json("{}", &schema));
+        }
+
+        #[test]
+        fn v0_validate_json_rejects_wrong_type() {
+            let schema: Value = serde_json::from_str(V0_OBJECT_SCHEMA).unwrap();
+            assert!(!v0_validate_json(r#"{"name": 1}"#, &schema));
+        }
+
+        #[test]
+        fn v0_validate_json_rejects_malformed_json() {
+            let schema: Value = serde_json::from_str(V0_OBJECT_SCHEMA).unwrap();
+            assert!(!v0_validate_json(r#"{"name": "ok""#, &schema));
+        }
+
+        #[test]
+        fn v0_validate_json_rejects_trailing_garbage() {
+            let schema: Value = serde_json::from_str(V0_OBJECT_SCHEMA).unwrap();
+            assert!(!v0_validate_json(r#"{"name": "ok"} garbage"#, &schema));
+        }
+
+        /// Round-1 review major finding: a grammar-conforming integer
+        /// outside `u64`/`i64` range must validate, not produce a false
+        /// `validation_failed`.
+        #[test]
+        fn v0_validate_json_accepts_integer_outside_u64_range() {
+            let schema = serde_json::json!({"type": "integer"});
+            assert!(v0_validate_json("18446744073709551616", &schema));
+            assert!(v0_validate_json("-18446744073709551616", &schema));
+        }
+
+        #[test]
+        fn v0_validate_json_accepts_integer_in_u64_range() {
+            let schema = serde_json::json!({"type": "integer"});
+            assert!(v0_validate_json("42", &schema));
+            assert!(v0_validate_json("-1", &schema));
+        }
+
+        /// JSON Schema 2020-12 §6.1.1: a zero fractional part is still an
+        /// integer.
+        #[test]
+        fn v0_validate_json_accepts_integer_with_zero_fraction() {
+            let schema = serde_json::json!({"type": "integer"});
+            assert!(v0_validate_json("1.0", &schema));
+        }
+
+        #[test]
+        fn v0_validate_json_rejects_integer_with_nonzero_fraction() {
+            let schema = serde_json::json!({"type": "integer"});
+            assert!(!v0_validate_json("1.5", &schema));
+        }
+
+        #[test]
+        fn v0_validate_json_rejects_integer_lexeme_for_string_schema() {
+            let schema = serde_json::json!({"type": "string"});
+            assert!(!v0_validate_json("18446744073709551616", &schema));
+        }
+
+        /// End-to-end shape from the review's suggested test: a large
+        /// integer nested inside an admitted object schema.
+        #[test]
+        fn v0_validate_json_accepts_large_integer_nested_in_object() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {"n": {"type": "integer"}},
+                "required": ["n"],
+                "additionalProperties": false,
+            });
+            assert!(v0_validate_json(r#"{"n": 18446744073709551616}"#, &schema));
+        }
+
+        /// Round-2 review major finding 1: a valid UTF-16 surrogate pair
+        /// (the G-clef character, U+1D11E) spelled as its two `\uXXXX`
+        /// escape halves must validate under a string schema -- it is a
+        /// grammar-conforming strict completion, and rejecting it turned
+        /// into a false `validation_failed` 500 before this fix.
+        #[test]
+        fn v0_validate_json_accepts_surrogate_pair_under_string_schema() {
+            let schema = serde_json::json!({"type": "string"});
+            assert!(v0_validate_json(r#""\uD834\uDD1E""#, &schema));
+        }
+
+        /// Same surrogate pair, but as an object property value -- proves
+        /// the fix applies through `v0_validate_object`'s recursive
+        /// `v0_validate_at` call, not just the top-level string schema.
+        #[test]
+        fn v0_validate_json_accepts_surrogate_pair_as_object_property_value() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {"s": {"type": "string"}},
+                "required": ["s"],
+                "additionalProperties": false,
+            });
+            assert!(v0_validate_json(r#"{"s": "\uD834\uDD1E"}"#, &schema));
+        }
+
+        /// Grammar-parity: the compiled grammar admits any four-hex
+        /// `\uXXXX` escape independently of pairing (json_schema.rs
+        /// `escape_id` alternatives at ~1564), and its own
+        /// `string_accepts_legal_escapes` test (json_schema.rs ~2762)
+        /// explicitly accepts lone surrogate halves `\uD800` / `\uDC00`.
+        /// The validator must not be narrower than the grammar it guards,
+        /// so a lone (unpaired) surrogate escape must also validate here.
+        #[test]
+        fn v0_validate_json_accepts_lone_surrogate_escape_grammar_parity() {
+            let schema = serde_json::json!({"type": "string"});
+            assert!(v0_validate_json(r#""\uD834""#, &schema));
+            assert!(v0_validate_json(r#""\uDD1E""#, &schema));
+        }
+
+        /// Round-2 review major finding 1, second half: RFC 8259 §7
+        /// requires U+0000-U+001F to be escaped, and the compiled grammar
+        /// rejects them raw too (json_schema.rs
+        /// `string_rejects_raw_control_byte`). A literal BEL (0x07) byte
+        /// embedded unescaped in a string must fail validation.
+        #[test]
+        fn v0_validate_json_rejects_raw_control_char() {
+            let schema = serde_json::json!({"type": "string"});
+            let content = format!("\"{}\"", '\u{7}');
+            assert!(!v0_validate_json(&content, &schema));
+        }
+
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_n_greater_than_one_400() {
@@ -2652,6 +4902,8 @@ mod imp {
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: Arc::new(vec![]),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             (state, jobs_rx)
         }
@@ -3087,6 +5339,8 @@ mod imp {
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
+                    vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 }
             }
 
@@ -3191,6 +5445,8 @@ mod imp {
                     model_max_context: 4096,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
+                    vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 };
                 (state, unblock_tx, started_rx)
             }
@@ -3426,6 +5682,8 @@ mod imp {
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
+                    vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 }
             }
 
@@ -3618,6 +5876,8 @@ mod imp {
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
+                    vocab_bytes: Arc::new(vec![]),
+                    grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 };
                 let body = Body::from(
                     r#"{"messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#

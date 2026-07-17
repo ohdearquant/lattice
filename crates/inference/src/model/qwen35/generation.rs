@@ -189,7 +189,7 @@ impl Qwen35Model {
                 if engine.is_complete_without_continuation(gs) {
                     return Ok(grammar_output(String::new(), &[], prompt_len, true, vec![]));
                 }
-                return Err(InferenceError::InvalidInput(
+                return Err(InferenceError::GrammarConstraintBlocked(
                     "grammar constraint blocked every token at step 0; \
                      no legal first token exists in the current grammar state"
                         .into(),
@@ -640,7 +640,7 @@ impl Qwen35Model {
                 if engine.is_complete_without_continuation(gs) {
                     return Ok(grammar_output(String::new(), &[], prompt_len, true, vec![]));
                 }
-                return Err(InferenceError::InvalidInput(
+                return Err(InferenceError::GrammarConstraintBlocked(
                     "grammar constraint blocked every token at step 0; \
                      no legal first token exists in the current grammar state"
                         .into(),
@@ -817,7 +817,7 @@ impl Qwen35Model {
                             stop_reason = StopReason::Grammar;
                             break;
                         }
-                        return Err(InferenceError::InvalidInput(
+                        return Err(InferenceError::GrammarConstraintBlocked(
                             "grammar constraint blocked every token; \
                              no legal continuation exists in the current grammar state"
                                 .into(),
@@ -1025,7 +1025,7 @@ impl Qwen35Model {
                             stop_reason = StopReason::Grammar;
                             break;
                         }
-                        return Err(InferenceError::InvalidInput(
+                        return Err(InferenceError::GrammarConstraintBlocked(
                             "grammar constraint blocked every token; \
                              no legal continuation exists in the current grammar state"
                                 .into(),
@@ -1910,7 +1910,7 @@ fn decode_loop(
                 if engine.is_complete_without_continuation(gs) {
                     return Ok((true, StopReason::Grammar));
                 }
-                return Err(InferenceError::InvalidInput(
+                return Err(InferenceError::GrammarConstraintBlocked(
                     "grammar constraint blocked every token; \
                      no legal continuation exists in the current grammar state"
                         .into(),
@@ -2040,7 +2040,7 @@ fn decode_loop_with_stops(
                     stop_reason = StopReason::Grammar;
                     break;
                 }
-                return Err(InferenceError::InvalidInput(
+                return Err(InferenceError::GrammarConstraintBlocked(
                     "grammar constraint blocked every token; \
                      no legal continuation exists in the current grammar state"
                         .into(),
@@ -2727,11 +2727,11 @@ mod tests {
         };
 
         // The all-blocking grammar must trigger has_finite_logit inside generate()
-        // and return Err(InvalidInput). Any other outcome is a wiring failure.
+        // and return Err(GrammarConstraintBlocked). Any other outcome is a wiring failure.
         let result = model.generate("a", &gen_cfg);
         assert!(
-            matches!(result, Err(InferenceError::InvalidInput(_))),
-            "grammar blocking every token must return Err(InvalidInput); got {result:?}"
+            matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
+            "grammar blocking every token must return Err(GrammarConstraintBlocked); got {result:?}"
         );
     }
 

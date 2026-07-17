@@ -2761,6 +2761,12 @@ mod tests {
         // RFC 8259 ABNF, even though unpaired they are not interoperable text.
         assert!(accepts(&g, b"\"\\uD800\""));
         assert!(accepts(&g, b"\"\\uDC00\""));
+        // A full high+low surrogate pair (here: U+1D11E, the G-clef
+        // character) is just two of the above alternatives concatenated,
+        // so it must accept too -- the compiler/validator inclusion
+        // invariant pinned from the grammar side (see the `v0_parse_string`
+        // fix and its test-side pin in lattice_serve.rs).
+        assert!(accepts(&g, b"\"\\uD834\\uDD1E\""));
     }
 
     #[test]

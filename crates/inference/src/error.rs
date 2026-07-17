@@ -30,6 +30,14 @@ pub enum InferenceError {
     /// Prefix cache operation failed (restore, promote, lock poisoned, or
     /// geometry mismatch).
     PrefixCache(String),
+    /// Grammar-constrained decoding blocked every candidate token at some
+    /// step (#611): the mask left no legal continuation. Distinct from
+    /// [`InferenceError::InvalidInput`] (which also covers unrelated
+    /// caller-input problems) so downstream consumers -- e.g. the serve
+    /// binaries' `blocked_constraint` HTTP machine code -- can classify this
+    /// specific condition by type instead of pattern-matching the message
+    /// text (round-1 structured-output-v0 review, medium finding 2).
+    GrammarConstraintBlocked(String),
 }
 
 impl Display for InferenceError {
@@ -61,6 +69,9 @@ impl Display for InferenceError {
             Self::Inference(msg) => write!(f, "Inference error: {msg}"),
             Self::InvalidInput(msg) => write!(f, "Invalid input: {msg}"),
             Self::PrefixCache(msg) => write!(f, "Prefix cache error: {msg}"),
+            Self::GrammarConstraintBlocked(msg) => {
+                write!(f, "Grammar constraint blocked: {msg}")
+            }
         }
     }
 }

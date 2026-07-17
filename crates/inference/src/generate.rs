@@ -569,7 +569,7 @@ pub fn generate(
         // short-circuit would silently return token 0 (the lowest id after
         // sorting an all-NEG_INFINITY candidate set). Fail closed instead (#398).
         if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
-            return Err(InferenceError::InvalidInput(
+            return Err(InferenceError::GrammarConstraintBlocked(
                 "grammar constraint blocked every token at step 0; \
                  no legal first token exists in the current grammar state"
                     .into(),
@@ -640,7 +640,7 @@ pub fn generate(
                 // Same empty-mask guard as the first-token path: an all-NEG_INFINITY
                 // logit buffer would cause the sampler to silently emit token 0 (#398).
                 if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
-                    return Err(InferenceError::InvalidInput(
+                    return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token; \
                          no legal continuation exists in the current grammar state"
                             .into(),
