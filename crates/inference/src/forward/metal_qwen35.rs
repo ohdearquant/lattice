@@ -9608,19 +9608,13 @@ mod inner {
                         }
                     }
 
-                    let _signpost_sample = crate::forward::signpost::interval(
-                        crate::forward::signpost::Label::DecodeSample,
-                    );
-                    if use_compact {
-                        sample_from_candidates(
-                            &self.session.compact_result,
-                            gen_cfg,
-                            &all_ids,
-                            &mut rng_state,
-                        )
-                    } else {
-                        sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
-                    }
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
+                        gen_cfg,
+                        &all_ids,
+                        &mut rng_state,
+                    )
                 };
 
                 // Advance grammar state after sampling.
@@ -9956,7 +9950,8 @@ mod inner {
                 }
                 let step_logits = self.forward_step_decode(last_token, pos);
                 pos += 1;
-                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
+                let next_id =
+                    sample_decode_traced(None, &step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
                     stop_reason = StopReason::Eos;
@@ -10301,7 +10296,8 @@ mod inner {
                 if let Some(probe) = decode_logits_probe.as_deref_mut() {
                     probe.push(step_logits.clone());
                 }
-                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
+                let next_id =
+                    sample_decode_traced(None, &step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
                     stop_reason = StopReason::Eos;
@@ -14110,6 +14106,34 @@ mod inner {
         crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
     }
 
+    /// Signpost-traced sampling shared by every autoregressive decode loop's
+    /// per-step token pick: opens the `decode.sample` interval, then routes
+    /// to the compact-candidate or full-logits sampler.
+    ///
+    /// Centralizes what was five independent copy-pasted call sites (round-3
+    /// review finding: two of the five -- the multimodal decode loops --
+    /// had already drifted to call `sample_token` directly, with neither the
+    /// interval nor the compact-route policy the other three loops apply).
+    /// `compact` is `Some(candidates)` for the GPU-top-k route (mirrors the
+    /// `use_compact` branch every call site used to inline) and `None` for
+    /// callers with no compact route, which is the multimodal decode loops'
+    /// only case -- they gain `decode.sample` instrumentation as a side
+    /// effect of routing through here instead of `sample_token` directly.
+    fn sample_decode_traced(
+        compact: Option<&[crate::sampling::Candidate]>,
+        step_logits: &[f32],
+        cfg: &GenerateConfig,
+        previous_ids: &[u32],
+        rng_state: &mut u64,
+    ) -> u32 {
+        let _signpost_sample =
+            crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample);
+        match compact {
+            Some(candidates) => sample_from_candidates(candidates, cfg, previous_ids, rng_state),
+            None => sample_token(step_logits, cfg, previous_ids, rng_state),
+        }
+    }
+
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
         crate::model::qwen35::detokenize::decode_tokens(tokenizer, ids)
     }
@@ -14581,19 +14605,13 @@ mod inner {
                 }
 
                 let sampled_id = {
-                    let _signpost_sample = crate::forward::signpost::interval(
-                        crate::forward::signpost::Label::DecodeSample,
-                    );
-                    if use_compact {
-                        sample_from_candidates(
-                            &self.session.compact_result,
-                            gen_cfg,
-                            &all_ids,
-                            &mut rng_state,
-                        )
-                    } else {
-                        sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
-                    }
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
+                        gen_cfg,
+                        &all_ids,
+                        &mut rng_state,
+                    )
                 };
 
                 // One atomic per-step transition (ADR-080 C3, PR #787) --
@@ -17527,19 +17545,13 @@ mod inner {
                 }
 
                 let sampled_id = {
-                    let _signpost_sample = crate::forward::signpost::interval(
-                        crate::forward::signpost::Label::DecodeSample,
-                    );
-                    if use_compact {
-                        sample_from_candidates(
-                            &self.session.compact_result,
-                            gen_cfg,
-                            &all_ids,
-                            &mut rng_state,
-                        )
-                    } else {
-                        sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
-                    }
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
+                        gen_cfg,
+                        &all_ids,
+                        &mut rng_state,
+                    )
                 };
 
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` or
@@ -17787,6 +17799,59 @@ mod inner {
             CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, FullAttentionLayerWeights,
         };
         use crate::model::qwen35_config::LayerType;
+
+        // Mutation-sensitive regression for round-4 finding 1: five decode
+        // loops used to copy-paste their own `decode.sample` interval +
+        // compact/full-logits routing, and two of the five (the multimodal
+        // decode loops) had already drifted to call `sample_token` directly
+        // with no interval at all. `sample_decode_traced` is now the single
+        // shared call site; these two source-level checks guard both halves
+        // of that invariant without depending on a live Instruments/xctrace
+        // tool session (which real FFI emission would require to observe).
+        // See fix-round-4 report for the mutation run against this pair.
+        #[test]
+        fn sample_decode_traced_opens_the_decode_sample_interval() {
+            let src = include_str!("metal_qwen35.rs");
+            let start = src
+                .find("fn sample_decode_traced(")
+                .expect("sample_decode_traced must exist in this file");
+            let body_end = src[start..]
+                .find("\n    }\n")
+                .expect("sample_decode_traced's body must close with `\\n    }\\n`");
+            let body = &src[start..start + body_end];
+            assert!(
+                body.contains(
+                    "crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample)"
+                ),
+                "sample_decode_traced must open the decode.sample interval -- it is the \
+                 single call site all five decode loops now share; silently dropping this \
+                 line removes decode.sample instrumentation from every decode loop at once"
+            );
+        }
+
+        #[test]
+        fn all_five_decode_loops_call_sample_decode_traced() {
+            let src = include_str!("metal_qwen35.rs");
+            // Scope the search to production code, excluding `mod tests`
+            // itself -- this test's own source text contains the literal
+            // string `sample_decode_traced(` several times over (the
+            // `include_str!` search string, this function's name, etc.),
+            // which would otherwise self-count.
+            let production_end = src
+                .find("    mod tests {")
+                .expect("mod tests must exist in this file");
+            let production_src = &src[..production_end];
+            // One definition + five call sites (round-4 finding-1 table: the
+            // fix-round-4 report enumerates each by function and line).
+            let count = production_src.matches("sample_decode_traced(").count();
+            assert_eq!(
+                count, 6,
+                "expected sample_decode_traced's definition plus exactly 5 decode-loop \
+                 call sites; got {count} instead -- a decode loop likely reverted to \
+                 calling sample_token/sample_from_candidates directly, the exact drift \
+                 round 3's review caught in the two multimodal decode loops"
+            );
+        }
 
         /// #854: guards against a reintroduced manual copy of the RMS-norm
         /// reduction tree across qwen35.metal's seven RMS-norm-family kernels
