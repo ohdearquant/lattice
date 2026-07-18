@@ -18,7 +18,7 @@ use crate::attention::gdn::{
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::{
-    AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, ForwardScratch,
+    AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights, KvCache, Qwen35Model, qwen35_rms_norm, resize,
 };
 use crate::model::qwen35_config::Qwen35Config;
@@ -71,10 +71,6 @@ struct PrefillScratch {
     /// FFN output after down projection: `[seq_len, hidden_size]`.
     ffn_batch: Vec<f32>,
 
-    // ----- Single-token decode scratch -----
-    /// Reuses the existing single-token decode scratch after prompt prefill.
-    decode_scratch: ForwardScratch,
-
     // ----- Attention tiling config -----
     /// Tiling configuration for full-attention prompt prefill.
     tiled_config: TiledAttentionConfig,
@@ -124,7 +120,6 @@ impl PrefillScratch {
             gate_batch: Vec::new(),
             up_batch: Vec::new(),
             ffn_batch: Vec::new(),
-            decode_scratch: ForwardScratch::new(),
             tiled_config: TiledAttentionConfig::new(
                 cfg.num_attention_heads,
                 cfg.num_key_value_heads,
@@ -175,7 +170,6 @@ impl PrefillScratch {
         resize(&mut self.up_batch, seq_len * inter);
         resize(&mut self.ffn_batch, seq_len * hidden);
 
-        self.decode_scratch.ensure_capacity(cfg, seq_len + 1);
         resize(&mut self.logits, cfg.vocab_size);
 
         resize(&mut self.gdn_conv_token, qkv_dim);
@@ -1020,7 +1014,7 @@ fn softplus_prefill(x: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::lora_hook::LoraHook;
-    use crate::model::qwen35::ModelWeights;
+    use crate::model::qwen35::{ForwardScratch, ModelWeights};
     use crate::model::qwen35_config::LayerType;
     use crate::rope::RopeTable;
     use crate::tokenizer::bpe::BpeTokenizer;
