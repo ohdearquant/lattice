@@ -6,9 +6,15 @@
 //! lattice chat --model /path/to/model [--max-tokens 256] [--temperature 0.7]
 //! lattice serve --model /path/to/model [--host 127.0.0.1] [--port 8080] [--max-tokens 256]
 //! lattice doctor --model /path/to/model [--context 4096]
+//! lattice prune-score --q4-dir /path/to/model-q4 --tokenizer-dir /path/to/model \
+//!   --calibration-corpus calibration.txt --validation-corpus validation.txt \
+//!   --prune-layers 4 --output lattice_pruning.json
 //! ```
 
 use clap::{Parser, Subcommand};
+
+#[path = "lattice/prune_score.rs"]
+mod prune_score;
 
 #[derive(Parser)]
 #[command(name = "lattice", about = "Pure-Rust transformer inference engine")]
@@ -95,6 +101,11 @@ enum Command {
         /// co-located tokenizer; safetensors directories always ship one).
         #[arg(long)]
         tokenizer_dir: Option<String>,
+    },
+    /// Score layer importance on a calibration corpus and PPL-gate a pruning plan.
+    PruneScore {
+        #[command(flatten)]
+        args: prune_score::Args,
     },
 }
 
@@ -6805,5 +6816,13 @@ async fn main() {
                 }
             }
         }
+        Command::PruneScore { args } => match prune_score::run(&args) {
+            Ok(true) => {}
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        },
     }
 }
