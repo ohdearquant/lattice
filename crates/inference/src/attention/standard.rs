@@ -20,8 +20,10 @@ pub struct AttentionBuffers {
     // time and threaded in alongside `TransformerLayerWeights`, see
     // `crate::model::bert::LayerFusedQkv`) lands Q/K/V here interleaved per
     // row; the result is split into the contiguous `q`/`k`/`v` buffers above
-    // before any per-head work, so the `LoraHook` contract (a plain
-    // `[seq_len, hidden_size]` slice per tensor) is preserved exactly.
+    // before any per-head work, so `apply_lora_rows` can still hand
+    // `LoraHook::apply` one row at a time (`x`: one input row, `output`: the
+    // corresponding `[hidden_size]` output row) exactly as it does for every
+    // other projection.
     qkv: Vec<f32>,
 
     // Reshape buffers for SIMD matmul in attention scoring and context

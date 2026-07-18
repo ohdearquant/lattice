@@ -227,7 +227,7 @@ impl LoraAdapter {
     /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-representation-and-inference) for the matrix layout.
     ///
     /// This is called once per hooked row (see
-    /// [`lattice_inference::lora_hook::apply_lora_rows`]), so the lookup
+    /// `lattice_inference::lora_hook::apply_lora_rows`), so the lookup
     /// below scans the layer map with a borrowed `&str` instead of hashing
     /// an owned `(usize, String)` key — allocating a `String` per row here
     /// would dominate the hot path long before the scan itself could. The
@@ -330,6 +330,55 @@ impl LoraAdapter {
         }
         Ok(())
     }
+
+    /// Validate adapter dimensions against a BERT cross-encoder model's
+    /// geometry.
+    ///
+    /// Returns the first invalid layer, module, or projection-shape
+    /// mismatch. Call it before hooked BERT scoring (see
+    /// [`lattice_inference::model::cross_encoder::CrossEncoderModel::score_with_hook`],
+    /// which validates through the [`LoraHook`](lattice_inference::lora_hook::LoraHook)
+    /// trait object below) — this is the BERT counterpart to
+    /// [`Self::validate_against`], which covers Qwen3.5 module shapes.
+    ///
+    /// Per-layer `a`/`b` buffer lengths are not re-checked here for the same
+    /// reason as `validate_against`: [`Self::new`] already rejects any layer
+    /// whose buffers don't match its own `rank`/`d_in`/`d_out`.
+    pub fn validate_against_bert(
+        &self,
+        num_hidden_layers: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> crate::error::Result<()> {
+        self.config().validate()?;
+        for ((layer_idx, module), layer) in self.layers() {
+            if *layer_idx >= num_hidden_layers {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA layer index {layer_idx} >= BERT num_hidden_layers {num_hidden_layers} (module: {module})"
+                )));
+            }
+
+            let (expected_d_in, expected_d_out) = match module.as_str() {
+                "query" | "key" | "value" | "attn_output" => (hidden_size, hidden_size),
+                "ffn_intermediate" => (hidden_size, intermediate_size),
+                "ffn_output" => (intermediate_size, hidden_size),
+                m => {
+                    return Err(crate::error::TuneError::Validation(format!(
+                        "LoRA module '{m}' (layer {layer_idx}) is not a recognised BERT cross-encoder projection"
+                    )));
+                }
+            };
+
+            if layer.d_in != expected_d_in || layer.d_out != expected_d_out {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA adapter dims mismatch for layer {layer_idx} module '{module}': \
+                     adapter has (d_in={}, d_out={}) but BERT model expects (d_in={expected_d_in}, d_out={expected_d_out})",
+                    layer.d_in, layer.d_out
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 // Delegate inference hooks to the adapter's application path.
@@ -345,6 +394,16 @@ impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
         config: &lattice_inference::model::qwen35_config::Qwen35Config,
     ) -> Result<(), String> {
         LoraAdapter::validate_against(self, config).map_err(|e| e.to_string())
+    }
+
+    fn validate_against_bert(
+        &self,
+        num_hidden_layers: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<(), String> {
+        LoraAdapter::validate_against_bert(self, num_hidden_layers, hidden_size, intermediate_size)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -865,6 +924,135 @@ mod tests {
 
             // No `LoraAdapter` value exists to pass to `validate_against` or
             // `set_lora` — construction itself is the gate here.
+        }
+    }
+
+    /// BERT counterpart to `validate_against_tests`: covers
+    /// `LoraAdapter::validate_against_bert`, the geometry check
+    /// `CrossEncoderModel::score_with_hook` calls before hooked scoring
+    /// (lattice#1031 follow-up).
+    #[cfg(feature = "inference-hook")]
+    mod validate_against_bert_tests {
+        use super::*;
+
+        const NUM_HIDDEN_LAYERS: usize = 12;
+        const HIDDEN_SIZE: usize = 384;
+        const INTERMEDIATE_SIZE: usize = 1536;
+
+        fn make_bert_adapter(module: &str, d_in: usize, d_out: usize) -> LoraAdapter {
+            let rank = 4;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, module.to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * d_in],
+                    b: vec![0.0; d_out * rank],
+                    d_in,
+                    d_out,
+                    rank,
+                },
+            );
+            LoraAdapter::new(
+                LoraConfig {
+                    rank,
+                    alpha: rank as f32,
+                    target_modules: vec![module.to_string()],
+                },
+                layers,
+            )
+            .expect("valid adapter config")
+        }
+
+        #[test]
+        fn test_validate_against_bert_oversized_d_out_rejected() {
+            // The original bug: a self-consistent adapter declaring d_out >
+            // hidden_size, which `apply_lora` would slice `output[..d_out]`
+            // out of bounds on past a debug_assert release builds compile out.
+            let adapter = make_bert_adapter("query", HIDDEN_SIZE, HIDDEN_SIZE + 1);
+            let err = adapter
+                .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                .expect_err("d_out > hidden_size must be rejected");
+            assert!(err.to_string().contains("dims mismatch"));
+        }
+
+        #[test]
+        fn test_validate_against_bert_mismatched_d_in_rejected() {
+            // Even when d_out happens to fit, a wrong d_in is a
+            // silent-wrong-math bug, not merely a panic risk.
+            let adapter = make_bert_adapter("query", HIDDEN_SIZE + 1, HIDDEN_SIZE);
+            let err = adapter
+                .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                .expect_err("mismatched d_in must be rejected");
+            assert!(err.to_string().contains("dims mismatch"));
+        }
+
+        #[test]
+        fn test_validate_against_bert_layer_out_of_bounds_rejected() {
+            let adapter = make_bert_adapter("query", HIDDEN_SIZE, HIDDEN_SIZE);
+            let err = adapter
+                .validate_against_bert(0, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                .expect_err("layer 0 >= num_hidden_layers 0 must be rejected");
+            assert!(err.to_string().contains("num_hidden_layers"));
+        }
+
+        #[test]
+        fn test_validate_against_bert_unknown_module_rejected() {
+            let adapter = make_bert_adapter("xquery_typo", HIDDEN_SIZE, HIDDEN_SIZE);
+            let err = adapter
+                .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                .expect_err("unrecognised BERT module must be rejected");
+            assert!(err.to_string().contains("not a recognised"));
+        }
+
+        #[test]
+        fn test_validate_against_bert_all_modules_correct_dims_pass() {
+            let cases = [
+                ("query", HIDDEN_SIZE, HIDDEN_SIZE),
+                ("key", HIDDEN_SIZE, HIDDEN_SIZE),
+                ("value", HIDDEN_SIZE, HIDDEN_SIZE),
+                ("attn_output", HIDDEN_SIZE, HIDDEN_SIZE),
+                ("ffn_intermediate", HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                ("ffn_output", INTERMEDIATE_SIZE, HIDDEN_SIZE),
+            ];
+            for (module, d_in, d_out) in cases {
+                let adapter = make_bert_adapter(module, d_in, d_out);
+                assert!(
+                    adapter
+                        .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                        .is_ok(),
+                    "module {module} with correct dims (d_in={d_in}, d_out={d_out}) should validate"
+                );
+            }
+        }
+
+        #[test]
+        fn test_lora_hook_trait_validate_against_bert_delegates_to_inherent_method() {
+            use lattice_inference::lora_hook::LoraHook;
+
+            let mismatched = make_bert_adapter("query", HIDDEN_SIZE, HIDDEN_SIZE + 1);
+            assert!(
+                LoraHook::validate_against_bert(
+                    &mismatched,
+                    NUM_HIDDEN_LAYERS,
+                    HIDDEN_SIZE,
+                    INTERMEDIATE_SIZE
+                )
+                .is_err(),
+                "the LoraHook trait method must surface the same dim mismatch as \
+                 the inherent LoraAdapter::validate_against_bert"
+            );
+
+            let matching = make_bert_adapter("query", HIDDEN_SIZE, HIDDEN_SIZE);
+            assert!(
+                LoraHook::validate_against_bert(
+                    &matching,
+                    NUM_HIDDEN_LAYERS,
+                    HIDDEN_SIZE,
+                    INTERMEDIATE_SIZE
+                )
+                .is_ok(),
+                "the LoraHook trait method must accept an adapter with correct dims"
+            );
         }
     }
 }

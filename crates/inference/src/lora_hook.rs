@@ -40,6 +40,26 @@ pub trait LoraHook: Send + Sync {
     fn validate_against(&self, _config: &Qwen35Config) -> Result<(), String> {
         Ok(())
     }
+
+    /// **Unstable**: self-check this hook's declared projection geometry
+    /// against a BERT cross-encoder model's dimensions before it is used
+    /// for hooked scoring.
+    ///
+    /// [`crate::model::cross_encoder::CrossEncoderModel::score_with_hook`]
+    /// calls this before the forward pass (and before any row is sliced),
+    /// so a mismatched adapter is rejected with a recoverable error instead
+    /// of `apply_lora` slicing `output[..lora.d_out]` out of bounds past a
+    /// `debug_assert` that release builds compile out. Default: no-op
+    /// (trusts the caller) — real adapters with known geometry (e.g.
+    /// `lattice_tune::lora::LoraAdapter`) override it.
+    fn validate_against_bert(
+        &self,
+        _num_hidden_layers: usize,
+        _hidden_size: usize,
+        _intermediate_size: usize,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub(crate) fn apply_lora_rows(
