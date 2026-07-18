@@ -106,10 +106,14 @@ benchmarks show that SIMD setup costs are recovered.
 
 Every stage retains a SIMD-versus-scalar differential over sparse, dense, zero, odd, and tail-heavy
 inputs as appropriate. Floating-point comparisons use a documented scale-aware tolerance. Existing
-central-difference gates keep `max_rel < 1e-2`; a deliberate mutation must make the relevant test
-fail before the change is accepted. The assembled trainer gradient check and real-model differential
-run after each primitive stage because self-consistent local tests cannot detect a shared wrong
-model convention.
+per-primitive central-difference gates (`crates/inference/src/backward/ops.rs`,
+`attention_gqa.rs`, `attention/gdn_backward.rs`) keep `max_rel < 1e-2`; a deliberate mutation must
+make the relevant test fail before the change is accepted. The assembled full-depth trainer
+gradcheck in `crates/tune/src/bin/train_grad_full.rs` uses a looser `max_rel < 2e-2` for both GQA
+and GDN LoRA arrays, reflecting the compounded numerical error of the full model stack rather than
+one isolated primitive. The assembled trainer gradient check and real-model differential run after
+each primitive stage because self-consistent local tests cannot detect a shared wrong model
+convention.
 
 The GDN reverse-time recurrence is never vectorized across dependent timesteps. SIMD may accelerate
 independent heads or inner GEMV/reduction dimensions while preserving recurrence order and the

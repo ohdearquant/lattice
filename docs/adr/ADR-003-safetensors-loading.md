@@ -75,10 +75,14 @@ already checked shape products, byte extents, and exact contiguous coverage at t
 native Q4/KHF1, and Q8 readers retain their existing validation until their format adapters are
 routed through the seam; this ADR does not claim those migrations have landed.
 
-Each safetensors `TensorMeta` carries a `OnceLock<()>` validation marker separate from its optional
-F16/BF16 conversion cache. The marker is set only after validation succeeds. Repeated access to an
-aligned zero-copy F32 tensor therefore does not rescan already-validated memory-mapped pages, while
-a failed validation is never cached as success.
+Each safetensors `TensorMeta` carries a `OnceLock<Result<(), String>>` validation marker separate
+from its optional F16/BF16 conversion cache, populated through `get_or_init` rather than a
+separate check-then-set. `get_or_init` runs the validation closure at most once even under
+concurrent first access — every caller blocks on the same in-flight initialization instead of each
+independently observing an empty marker and redoing the O(n) finite-value scan before one `set`
+wins. Repeated access to an aligned zero-copy F32 tensor therefore does not rescan already-validated
+memory-mapped pages, and a failed validation is cached as its error message (`validate_ingested_tensor`
+only ever returns `InferenceError::InvalidSafetensors`) and never as success.
 
 ---
 

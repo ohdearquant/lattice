@@ -21,10 +21,25 @@ pub struct Qwen35Model {
 impl Qwen35Model {
     /// **Unstable**: load Qwen3.5-2B or Qwen3.6 from a local safetensors directory.
     ///
-    /// Required names are preflighted, then each tensor is validated while
-    /// owned weights are assembled. Any validation or shape failure drops the
-    /// local assembly state and returns an error without exposing a partially
-    /// built model.
+    /// Required names are preflighted, then each tensor's own declared
+    /// payload is decoded and finite-value-checked at the shared ingress
+    /// seam (`weights::ingress::validate_ingested_tensor`) while owned
+    /// weights are assembled; a failure there drops the local assembly state
+    /// and returns an error without exposing a partially built model.
+    ///
+    /// That ingress check validates a tensor's own metadata — that its
+    /// decoded element count matches its declared shape and every value is
+    /// finite — not that the shape is *compatible with this model's config*.
+    /// Embeddings, the LM head, the final norm, the MoE router/expert/
+    /// shared-expert tensors, and the GDN decay tensors (`in_proj_b`,
+    /// `in_proj_a`, `a_log`, `dt_bias`) are additionally checked against a
+    /// config-derived expected shape at assembly. Dense FFN weights, full
+    /// attention Q/K/V/O and their norms, per-layer input/post-attention
+    /// norms, and the remaining GDN projection tensors are not yet checked
+    /// against config-derived shapes, so a finite but undersized tensor at
+    /// one of those names can still reach a forward pass built for a larger
+    /// shape. Closing that gap for every required tensor is tracked in
+    /// #1035.
     pub fn from_safetensors(path: &Path) -> Result<Self, InferenceError> {
         let model_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");

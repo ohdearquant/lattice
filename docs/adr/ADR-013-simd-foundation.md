@@ -97,10 +97,14 @@ similarity, Euclidean distance, normalization, quantized-vector operations, and 
 variants. It does not cover transformer matrix multiplication or row kernels.
 
 In particular, `lattice_inference::forward::cpu::matmul_bt` is a GEMM-oriented row-pointer kernel
-with caller-proved matrix shapes, four scalar fallback accumulators, and inference-specific runtime
-dispatch. `lattice_embed::simd::dot_product` is a stable public slice API with its own dispatch,
-eight-accumulator AVX2 implementation, 384-dimension specialization, and batch-4 embedding
-workloads. Their operation contracts and tuning targets are intentionally distinct.
+with caller-proved matrix shapes and inference-specific runtime dispatch. Its non-macOS scalar
+fallback (`matmul_bt_scalar`) uses four accumulators for the general `m > 1` case, but the `1 x K`
+row case this ADR's synchronization test exercises (`m == 1`) dispatches to a dedicated
+`matmul_bt_scalar_m1` specialization with eight accumulators; on macOS, `matmul_bt`/`matmul_bt_scalar`
+are bypassed entirely in favor of Accelerate (`accelerate_matmul_bt`). `lattice_embed::simd::dot_product`
+is a stable public slice API with its own dispatch, an eight-accumulator AVX2 implementation, a
+384-dimension specialization, and batch-4 embedding workloads. Their operation contracts and tuning
+targets are intentionally distinct.
 
 `lattice-inference` must not depend on `lattice-embed` to reuse the embedding dot-product kernel.
 The `native` feature already makes `lattice-embed` depend downward on `lattice-inference`; reversing
