@@ -1016,7 +1016,7 @@ mod run_bounds_tests {
         }
     }
 
-    /// Mutation-sensitive: without the rank cap, an oversized rank reaches
+    /// Without the rank cap, an oversized rank reaches
     /// model loading and allocation instead of being rejected up front.
     #[test]
     fn run_rejects_rank_over_max() {
@@ -1029,7 +1029,7 @@ mod run_bounds_tests {
         );
     }
 
-    /// Mutation-sensitive: without the rank>0 guard, rank=0 reaches the tape
+    /// Without the rank>0 guard, rank=0 reaches the tape
     /// and divides by zero deriving `scale = alpha / rank`.
     #[test]
     fn run_rejects_zero_rank() {
@@ -1042,7 +1042,7 @@ mod run_bounds_tests {
         );
     }
 
-    /// Mutation-sensitive: without the step cap, `steps = usize::MAX` would
+    /// Without the step cap, `steps = usize::MAX` would
     /// monopolize a worker indefinitely instead of being rejected up front.
     #[test]
     fn run_rejects_steps_over_max() {
@@ -1055,7 +1055,7 @@ mod run_bounds_tests {
         );
     }
 
-    /// Mutation-sensitive: without `validate_loaded_depth`, a model shallower
+    /// Without `validate_loaded_depth`, a model shallower
     /// than `TOP_LAYER + 1` reaches `first_layer..=TOP_LAYER` layer access and
     /// panics indexing `weights.layers[layer_idx]` out of bounds instead of
     /// returning an error.
@@ -1074,7 +1074,7 @@ mod run_bounds_tests {
         validate_loaded_depth(40).unwrap();
     }
 
-    /// Mutation-sensitive: without the `log_every == 0` guard, a caller
+    /// Without the `log_every == 0` guard, a caller
     /// passing `--log-every 0` with `steps > 0` reaches `step % log_every`
     /// in the training loop and panics on divide-by-zero.
     #[test]
@@ -1088,7 +1088,7 @@ mod run_bounds_tests {
         );
     }
 
-    /// Mutation-sensitive: without the `--max-train` cap, an oversized value
+    /// Without the `--max-train` cap, an oversized value
     /// reaches JSONL tokenization and per-sample activation-cache work
     /// instead of being rejected up front.
     #[test]
@@ -1102,7 +1102,7 @@ mod run_bounds_tests {
         );
     }
 
-    /// Mutation-sensitive: without the `--max-valid` cap, an oversized value
+    /// Without the `--max-valid` cap, an oversized value
     /// reaches JSONL tokenization and per-sample activation-cache work
     /// instead of being rejected up front.
     #[test]
@@ -1116,7 +1116,7 @@ mod run_bounds_tests {
         );
     }
 
-    /// Mutation-sensitive: without the `--seq-len-cap` cap, an oversized
+    /// Without the `--seq-len-cap` cap, an oversized
     /// value reaches tokenization and per-sample activation-cache allocation
     /// (`seq_len * hidden` per sample) unbounded.
     #[test]
@@ -1141,7 +1141,7 @@ mod run_bounds_tests {
         );
     }
 
-    /// Mutation-sensitive: `MAX_SAMPLES` and `MAX_SEQ_LEN_CAP` bound sample
+    /// `MAX_SAMPLES` and `MAX_SEQ_LEN_CAP` bound sample
     /// count and per-sample length independently; neither bounds their
     /// product. This sample set passes both per-dimension caps individually
     /// (far under `MAX_SAMPLES` samples, far under `MAX_SEQ_LEN_CAP` tokens

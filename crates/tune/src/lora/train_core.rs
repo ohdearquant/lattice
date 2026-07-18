@@ -1320,7 +1320,7 @@ mod train_ctx_tests {
         assert!((train.scale() - 2.0).abs() < 1e-6); // alpha / rank = 16 / 8
     }
 
-    /// Mutation-sensitive: an out-of-range GQA slot layer (>= num_hidden_layers)
+    /// An out-of-range GQA slot layer (>= num_hidden_layers)
     /// must be rejected — without this guard the tape indexes
     /// `model.weights.layers[idx]` (or an equivalent slot array) out of bounds.
     #[test]
@@ -1341,7 +1341,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: a duplicate layer index within one slot list must
+    /// A duplicate layer index within one slot list must
     /// be rejected — two slots claiming the same layer would silently alias
     /// the same LoRA weights to two different gradient accumulators.
     #[test]
@@ -1362,7 +1362,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: a layer index claimed by both the GQA and GDN
+    /// A layer index claimed by both the GQA and GDN
     /// slot lists is a mixer-kind conflict — the same layer cannot be
     /// trained as both mixer kinds in one materialised tape. (Layer 19 is
     /// full-attention on the 0.8B preset, so this also exercises the
@@ -1436,7 +1436,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: this exact swap was unrejected pre-fix —
+    /// This exact swap was unrejected pre-fix —
     /// `gqa_layers = [20]` (actually GDN), `gdn_layers = [19]` (actually
     /// GQA) — both wrong, together. Must be rejected; before this fix
     /// `TrainCtx::try_new(...).is_ok()` on this input.
@@ -1476,7 +1476,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: non-finite alpha must be rejected before it can
+    /// Non-finite alpha must be rejected before it can
     /// propagate into `scale = alpha / rank` and poison every LoRA-scaled
     /// forward/backward computation with NaN/inf.
     #[test]
@@ -1499,7 +1499,7 @@ mod train_ctx_tests {
         }
     }
 
-    /// Mutation-sensitive: non-finite Adam hyperparameters (learning rate,
+    /// Non-finite Adam hyperparameters (learning rate,
     /// beta1, beta2, epsilon) must each be rejected — any one of them
     /// propagates NaN/inf into every optimizer step.
     #[test]
@@ -1525,7 +1525,7 @@ mod train_ctx_tests {
         }
     }
 
-    /// Mutation-sensitive: `Dims` built from a different model than
+    /// `Dims` built from a different model than
     /// `TapeGeometry.model` must be rejected — this is the geometry-
     /// consistency check the ten-argument signatures had no way to enforce.
     #[test]
@@ -1548,7 +1548,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: `GdnDims` built from a different model than
+    /// `GdnDims` built from a different model than
     /// `TapeGeometry.model` must be rejected, mirroring the `Dims` check.
     #[test]
     fn try_new_rejects_gdn_dims_model_mismatch() {
@@ -1570,7 +1570,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: NaN bypasses `(a - b).abs() > 1e-9` (NaN
+    /// NaN bypasses `(a - b).abs() > 1e-9` (NaN
     /// comparisons are always false), so a non-finite `Dims.eps` would
     /// silently pass the tolerance check and poison every RMSNorm call in
     /// the tape. The finite check ahead of the tolerance comparison must
@@ -1595,7 +1595,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: same NaN-bypasses-tolerance hole as `Dims.eps`,
+    /// Same NaN-bypasses-tolerance hole as `Dims.eps`,
     /// for `GdnDims.scale` — a non-finite scale would poison every
     /// GatedDeltaNet forward/backward call in the tape.
     #[test]
@@ -1632,7 +1632,7 @@ mod ffn_compute_range_tests {
         assert_eq!(range, 0..10);
     }
 
-    /// Mutation-sensitive: if the terminal-layer branch is dropped (or
+    /// If the terminal-layer branch is dropped (or
     /// inverted), the FFN block runs over the full prompt on the last layer
     /// every step — a confirmed O(prompt_length) regression, since only the
     /// completion positions' post-stack hidden state is ever read by the

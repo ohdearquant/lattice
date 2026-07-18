@@ -526,7 +526,7 @@ mod tests {
         }
     }
 
-    /// Mutation-sensitive: if the `pairs.is_empty()` guard is removed, this fails.
+    /// If the `pairs.is_empty()` guard is removed, this fails.
     #[test]
     fn validation_rejects_empty_pairs() {
         let err = validate_micro_lora_inputs(1000, 24, 24, &[], &default_cfg())
@@ -538,7 +538,7 @@ mod tests {
         );
     }
 
-    /// Mutation-sensitive: if the `tokens.len() < 2` guard is removed, this fails.
+    /// If the `tokens.len() < 2` guard is removed, this fails.
     #[test]
     fn validation_rejects_pair_with_one_token() {
         let pairs = [pair(vec![1], 0)];
@@ -551,7 +551,7 @@ mod tests {
         );
     }
 
-    /// Mutation-sensitive: if the `completion_start == 0` guard is removed, the
+    /// If the `completion_start == 0` guard is removed, the
     /// range `(completion_start - 1)..seq_len - 1` underflows to a huge integer
     /// and panics in forward_full — so this test must keep the guard in place.
     #[test]
@@ -567,7 +567,7 @@ mod tests {
         );
     }
 
-    /// Mutation-sensitive: if `completion_start >= tokens.len()` guard is removed,
+    /// If `completion_start >= tokens.len()` guard is removed,
     /// `tokens[t + 1]` at `t = completion_start - 1 = len - 1` is out-of-bounds.
     #[test]
     fn validation_rejects_completion_start_at_len() {
@@ -581,7 +581,7 @@ mod tests {
         );
     }
 
-    /// Mutation-sensitive: if the `tok >= vocab_size` guard is removed, the
+    /// If the `tok >= vocab_size` guard is removed, the
     /// forward pass panics at `logits[target as usize]`.
     #[test]
     fn validation_rejects_out_of_vocab_token() {
@@ -596,7 +596,7 @@ mod tests {
         );
     }
 
-    /// Mutation-sensitive: if `rank == 0` guard is removed, buffer products yield
+    /// If `rank == 0` guard is removed, buffer products yield
     /// zero-length Vecs and forward_full divides by zero in `scale = alpha / rank`.
     #[test]
     fn validation_rejects_rank_zero() {
@@ -643,7 +643,7 @@ mod tests {
         );
     }
 
-    /// Mutation-sensitive: a model shorter than `first_layer` must be rejected
+    /// A model shorter than `first_layer` must be rejected
     /// before the materialized layer loop performs direct model access.
     #[test]
     fn validation_rejects_model_with_too_few_layers() {
@@ -657,7 +657,7 @@ mod tests {
         );
     }
 
-    /// Mutation-sensitive: if the derived-top guard is removed, an out-of-range
+    /// If the derived-top guard is removed, an out-of-range
     /// first layer yields an inverted or empty layer range.
     #[test]
     fn validation_rejects_first_layer_above_top() {
@@ -683,7 +683,7 @@ mod tests {
 
     // ─── REQUIRED FIX 1: config-vs-loaded-weights desync — panic prevention ────
 
-    /// Mutation-sensitive: without the `num_hidden_layers != loaded_layer_count`
+    /// Without the `num_hidden_layers != loaded_layer_count`
     /// guard, a config mutated (e.g. via `Qwen35Model::config_mut`) to claim more
     /// layers than are actually loaded derives a range that runs past the loaded
     /// layer-weight vectors, and `train_micro_lora`'s materialization loop panics
@@ -722,7 +722,7 @@ mod tests {
 
     // ─── default layer range matches the model's true top suffix ──────────────
 
-    /// Mutation-sensitive: if `MicroLoraConfig::default()`'s `last_layer` is
+    /// If `MicroLoraConfig::default()`'s `last_layer` is
     /// pinned back to `Some(23)`, a model deeper than 24 layers trains only
     /// `19..=23` and then applies the LM head immediately — silently omitting
     /// every layer after 23 and optimizing a computation different from what
@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(range24.collect::<Vec<_>>(), vec![19, 20, 21, 22, 23]);
     }
 
-    /// Mutation-sensitive: a bounded trainable window (`last_layer =
+    /// A bounded trainable window (`last_layer =
     /// Some(23)`) must not truncate the materialised forward suffix on a
     /// model deeper than 24 layers. `train_micro_lora` uses
     /// `materialized_layer_range`, not `trainable_layer_range`, to build its
