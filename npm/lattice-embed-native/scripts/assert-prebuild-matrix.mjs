@@ -49,6 +49,8 @@ for (const command of [
   'if-no-files-found: error',
   'npm run create-npm-dirs',
   'npm run artifacts',
+  'TARGET_CC: clang',
+  'TARGET_CXX: clang++',
   'make publish-npm-dry',
   'make publish-npm'
 ]) {

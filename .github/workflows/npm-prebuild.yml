@@ -103,7 +103,17 @@ jobs:
         working-directory: npm/lattice-embed-native
         run: npm install --ignore-scripts
 
+      - name: Build native binding (aarch64 GNU)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        working-directory: npm/lattice-embed-native
+        shell: bash
+        env:
+          TARGET_CC: clang
+          TARGET_CXX: clang++
+        run: npm run build -- --target ${{ matrix.target }} ${{ matrix.args }}
+
       - name: Build native binding
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
         working-directory: npm/lattice-embed-native
         shell: bash
         run: npm run build -- --target ${{ matrix.target }} ${{ matrix.args }}
