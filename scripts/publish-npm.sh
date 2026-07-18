@@ -65,6 +65,31 @@ if [ -z "$PLATFORM_DIRS" ]; then
     exit 1
 fi
 
+# ---- Preflight: verify none of the packages we're about to publish already
+# exist on npm. name@version tuples are immutable, so a collision discovered
+# mid-publish (after some platform packages already went out) is unrecoverable
+# without a version bump. Fail closed here instead.
+echo "=== Preflight (version-exists check against the npm registry) ==="
+check_version_available() {
+    pkgdir="$1"
+    name=$(node -p "require('$pkgdir/package.json').name")
+    version=$(node -p "require('$pkgdir/package.json').version")
+    if npm view "$name@$version" version >/dev/null 2>&1; then
+        echo "ERROR: $name@$version is already published on npm and cannot be republished." >&2
+        echo "       npm name@version tuples are immutable. Bump the version in" >&2
+        echo "       $pkgdir/package.json (and every sibling package that must move in" >&2
+        echo "       lockstep) before publishing -- this is a coordinated release decision," >&2
+        echo "       not something this script infers automatically." >&2
+        exit 1
+    fi
+}
+check_version_available "$WASM_DIR"
+for pkgdir in $PLATFORM_DIRS; do
+    check_version_available "$pkgdir"
+done
+check_version_available "$NATIVE_DIR"
+echo "Preflight OK: no version collisions."
+
 # ---- Preflight: dry-run the ENTIRE release before any real publish. This
 # packs wasm (prepack rebuild), every present platform subpackage, and the
 # native main package (its prepublishOnly runs `napi artifacts && npm test`).
