@@ -20,6 +20,12 @@ pub struct Qwen35Model {
 
 impl Qwen35Model {
     /// **Unstable**: load Qwen3.5-2B or Qwen3.6 from a local safetensors directory.
+    ///
+    /// Every required tensor is shape-validated against a shape derived from `config.json`
+    /// during assembly (embeddings, output head, norms, attention, FFN, and GDN/linear-attention
+    /// projections alike): a checkpoint whose declared tensor shapes don't match what the config
+    /// requires returns `Err(InferenceError::ShapeMismatch)` from this call, rather than loading
+    /// successfully and later panicking inside a forward-pass matmul.
     pub fn from_safetensors(path: &Path) -> Result<Self, InferenceError> {
         let model_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");
