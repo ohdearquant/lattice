@@ -39,7 +39,7 @@
 //!
 //! [ADR-044]: ../../../../../docs/adr/ADR-044-quarot-rotated-quantization.md
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 
@@ -47,6 +47,9 @@ use memmap2::Mmap;
 use serde_json::Value;
 
 use crate::error::InferenceError;
+use crate::model::qwen35::qwen_layer_tensor_prefix;
+use crate::model::qwen35_config::Qwen35Config;
+use crate::quant::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
 use crate::weights::f32_weights::parse_index;
 
 /// On-disk storage dtype of a tensor.
@@ -153,7 +156,8 @@ fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
     match dtype_str {
         "F4" => Some(4),
         "F6_E2M3" | "F6_E3M2" => Some(6),
-        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" => Some(8),
+        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" | "F8_E4M3FNUZ"
+        | "F8_E5M2FNUZ" => Some(8),
         "I16" | "U16" | "F16" | "BF16" => Some(16),
         "I32" | "U32" | "F32" => Some(32),
         "I64" | "U64" | "F64" | "C64" => Some(64),
@@ -439,6 +443,373 @@ impl Backing {
     }
 }
 
+/// Version tag for the QuaRot artifact index (`quantize_index.json`).
+/// This is wired into the actual manifest schema:
+/// `crate::quant::quarot::convert::QuantizeIndex` carries an optional
+/// `online: Option<OnlineArtifactDescriptor>` field, and
+/// `read_quarot_seed_from_index` validates it (via
+/// [`OnlineArtifactDescriptor::validate`]) whenever it is present. A
+/// *structurally valid* `V1Online` descriptor is rejected there too (not
+/// merely validated-then-discarded), because no forward path executes R3/R4
+/// online rotations at runtime yet — see that function's doc comment for the
+/// full fail-closed contract.
+///
+/// `V0Residual` is every artifact produced by today's `convert_quarot_qwen35`
+/// (ADR-044/051): offline residual-stream rotation only, symmetric-only Q4,
+/// no R3/R4 metadata. `V1Online` pairs that offline rotation with one or
+/// more online (runtime) R3/R4 rotations and requires every Q4 tensor the
+/// online rotation touches to explicitly declare asymmetric mode.
+///
+/// **Hard rule (design doc §E.1(a)):** a `V0Residual` artifact must never be
+/// interpreted as online-capable. [`OnlineArtifactDescriptor::validate`]
+/// enforces this by refusing a `V0Residual` descriptor that carries any
+/// [`OnlineRotationSpec`] — that combination cannot occur from a real v0
+/// artifact and is evidence of a corrupted or hand-edited index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ArtifactVersion {
+    #[serde(rename = "v0-residual")]
+    V0Residual,
+    #[serde(rename = "v1-online-r3r4")]
+    V1Online,
+}
+
+/// Artifact-level descriptor pairing an [`ArtifactVersion`] with its online
+/// rotation recipe and per-tensor asymmetric-Q4 declarations. This type
+/// lives alongside the streaming reader rather than in `convert.rs` because
+/// `convert.rs` owns the wire-format struct (`QuantizeIndex`) while
+/// validation semantics live here; `QuantizeIndex`
+/// embeds this type directly (`online: Option<OnlineArtifactDescriptor>`)
+/// and `read_quarot_seed_from_index` calls [`Self::validate`] on it when
+/// present — this is no longer schema-only, it is consulted at load time
+/// (and a valid `V1Online` descriptor causes the load to be rejected
+/// outright, since no forward path executes its recipe yet).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OnlineArtifactDescriptor {
+    pub version: ArtifactVersion,
+    /// v1 contract: at most one spec per online transform site (per
+    /// [`super::plan::RotationId::online_transform_site`]) — a second spec
+    /// targeting the same site is rejected by [`Self::validate`] rather
+    /// than left for a future runtime to disambiguate.
+    pub online_rotations: Vec<OnlineRotationSpec>,
+    /// Names of every Q4 tensor that is affected by an online rotation
+    /// (i.e., every tensor an entry in `online_rotations` counter-rotates)
+    /// AND is stored asymmetric. Design doc §E.1(b): "an online artifact
+    /// declares asymmetric Q4 mode explicitly for every affected tensor."
+    pub asymmetric_tensor_names: Vec<String>,
+}
+
+impl OnlineArtifactDescriptor {
+    /// Upper bound on each caller-supplied vector (`online_rotations` and
+    /// `asymmetric_tensor_names`). A descriptor is publicly deserializable, so
+    /// [`Self::validate`] caps both vectors before any per-entry work: a real
+    /// recipe declares a handful of rotations and at most a few tensors per
+    /// layer, so this ceiling sits far above any legitimate artifact while
+    /// keeping validation cost strictly bounded regardless of input.
+    const MAX_VALIDATED_ENTRIES: usize = 4096;
+
+    /// Derive the exact set of per-layer tensor names this descriptor's
+    /// online rotations counter-rotate, from the recipe (`online_rotations`)
+    /// and `cfg` alone. This is the SINGLE internal representation of "what
+    /// this artifact affects" — [`Self::validate`] requires
+    /// `asymmetric_tensor_names` to equal this set exactly. This collapses
+    /// the prior three-representation contract — recipe-derived suffixes,
+    /// declared `asymmetric_tensor_names`, and a caller-supplied affected
+    /// slice — down to this one derived set plus the single external
+    /// declaration.
+    ///
+    /// Each entry pairs the owning spec's [`super::plan::RotationId`] and
+    /// layer index with the derived tensor name, so callers can report
+    /// which spec/layer a missing or unexpected name belongs to.
+    fn derive_expected_tensor_names(
+        &self,
+        cfg: &Qwen35Config,
+    ) -> Vec<(super::plan::RotationId, usize, String)> {
+        let mut expected = Vec::new();
+        for spec in &self.online_rotations {
+            let Some(site) = spec.id.online_transform_site() else {
+                continue;
+            };
+            let suffix = site.weight_tensor_suffix();
+            let layers: Vec<usize> = match &spec.layer_scope {
+                Some(layers) => layers.clone(),
+                None => (0..cfg.num_hidden_layers).collect(),
+            };
+            for idx in layers {
+                expected.push((
+                    spec.id,
+                    idx,
+                    format!("{}.{suffix}", qwen_layer_tensor_prefix(idx)),
+                ));
+            }
+        }
+        expected
+    }
+
+    /// Cross-check that a converter's actually-transformed tensor names
+    /// exactly match this descriptor's derived affected-tensor set (see
+    /// [`Self::derive_expected_tensor_names`]). Narrow entry point for a
+    /// future converter that wants to verify what it actually transformed
+    /// against the recipe — the core [`Self::validate`] path does not take
+    /// this input and does not call this method.
+    ///
+    /// `pub(crate)`, not `pub`: no caller (in-crate or cross-crate) exists
+    /// yet — this is a hook for a future converter, not a stable external
+    /// API. Widen to `pub` if/when that converter lands and needs to call
+    /// it from outside this crate. `allow(dead_code)` outside `test` cfg
+    /// for the same reason: today only this module's tests call it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn verify_affected(
+        &self,
+        cfg: &Qwen35Config,
+        transformed_tensor_names: &[&str],
+    ) -> Result<(), InferenceError> {
+        let expected = self.derive_expected_tensor_names(cfg);
+        for (id, idx, name) in &expected {
+            if !transformed_tensor_names.contains(&name.as_str()) {
+                return Err(InferenceError::Inference(format!(
+                    "OnlineArtifactDescriptor::verify_affected: {id:?} recipe \
+                     is scoped to layer {idx}, but the converter's \
+                     transformed-tensor list does not include the expected \
+                     tensor {name:?}"
+                )));
+            }
+        }
+        for name in transformed_tensor_names {
+            if !expected.iter().any(|(_, _, e)| e == name) {
+                return Err(InferenceError::Inference(format!(
+                    "OnlineArtifactDescriptor::verify_affected: converter \
+                     reports transforming {name:?}, which this descriptor's \
+                     online rotations do not counter-rotate"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate internal consistency, including that `asymmetric_tensor_names`
+    /// equals exactly the tensor set this descriptor's online rotations
+    /// derive from `spec` + `cfg` (see `Self::derive_expected_tensor_names`).
+    ///
+    /// Refuses (does not warn-and-continue) on:
+    /// - `V0Residual` carrying any online rotation metadata — a v0 artifact
+    ///   is never online-capable, so a non-empty `online_rotations` on a
+    ///   `V0Residual` descriptor is a corrupted/hand-edited index.
+    /// - `V1Online` declaring zero online rotations — an online artifact
+    ///   with no R3/R4 recipe is a contradiction, not a valid degenerate
+    ///   case (use `V0Residual` for that).
+    /// - `V1Online` with any rotation spec that fails its own internal
+    ///   invariants (see [`OnlineRotationSpec::validate`]) — e.g. wrong
+    ///   `side`, non-power-of-two `block_size`, or a `layer_scope` that
+    ///   contradicts its `RotationId`'s contract. Every `OnlineRotationSpec`
+    ///   field is publicly constructible, so a directly-built malformed spec
+    ///   (bypassing the `r3_full_attention`/`r4_dense_mlp` constructors)
+    ///   must be caught here rather than passing descriptor validation
+    ///   silently. `cfg` is threaded
+    ///   through to each spec as `Some(cfg)` so the config-aware
+    ///   divisibility/full-attention checks always run for `V1Online` (see
+    ///   below: `cfg` is mandatory at the descriptor level for that
+    ///   variant). Passing `cfg: None` to *this* method is valid only for
+    ///   an empty `V0Residual` descriptor: `V1Online` unconditionally
+    ///   rejects `cfg: None` below, and `V0Residual` never carries a spec to
+    ///   thread `cfg` into in the first place.
+    /// - `V1Online` with more than one spec in `online_rotations` targeting
+    ///   the same [`OnlineTransformSite`] (e.g. two `AttentionOutputR3`
+    ///   entries with different seeds) — the v1 recipe format allows at
+    ///   most one spec per runtime site, so a duplicate is rejected rather
+    ///   than left for a future runtime to decide whether to apply both,
+    ///   pick one, or merge them.
+    /// - `V1Online` with a nonempty rotation recipe but an empty
+    ///   `asymmetric_tensor_names` list — self-contradictory: a
+    ///   rotation-bearing recipe always counter-rotates at least one stored
+    ///   tensor, so an empty declaration list cannot be satisfied.
+    /// - `V1Online` with any `asymmetric_tensor_names` entry that is not in
+    ///   the exact set `Self::derive_expected_tensor_names` derives from
+    ///   this descriptor's `online_rotations` + `cfg` — an unrelated or
+    ///   out-of-scope declaration (e.g. `"unrelated"`, or a real tensor name
+    ///   from a layer outside the recipe's scope) must not satisfy the
+    ///   fail-closed requirement just by resembling a real tensor.
+    /// - `V1Online` where a scoped rotation's per-layer tensor coverage is
+    ///   incomplete: matching a tensor
+    ///   name by *suffix* alone (e.g. `self_attn.o_proj.weight`) is not
+    ///   sufficient — an R3 recipe scoped to layers `[3,7,11,15,19,23]`
+    ///   must not validate against a declaration set that only contains
+    ///   layer 0's tensor, even though that name has the right suffix.
+    ///   `asymmetric_tensor_names` is the **sole externally-supplied**
+    ///   representation of the affected-tensor contract (it collapses the
+    ///   prior recipe-suffix / declaration / caller-supplied-slice triple
+    ///   representation down to this one) and must equal
+    ///   `Self::derive_expected_tensor_names(cfg)` exactly — no missing
+    ///   entries, no extras. A future converter that wants to
+    ///   cross-check what it actually transformed against this contract
+    ///   should use `Self::verify_affected`, which `validate` itself does
+    ///   not call.
+    /// - `V1Online` called with `cfg: None`: a `None`-scoped (R4)
+    ///   rotation's full layer set is
+    ///   unknowable without a config, so a config-free call previously
+    ///   *skipped* per-layer completeness checking for R4 instead of
+    ///   refusing — letting a caller silently select weaker semantics by
+    ///   omitting `cfg`. `cfg` is now mandatory for `V1Online`; this method
+    ///   refuses immediately rather than downgrading to a partial check.
+    ///   `V0Residual` never claims per-layer completeness, so it stays
+    ///   `cfg`-free.
+    /// - `V0Residual` with any nonempty `asymmetric_tensor_names`: the V0
+    ///   contract is symmetric-only Q4
+    ///   with no R3/R4 metadata, so a V0 descriptor carrying asymmetric
+    ///   declarations is evidence of a corrupted or hand-edited index, same
+    ///   as a V0 descriptor carrying online rotations.
+    pub fn validate(&self, cfg: Option<&Qwen35Config>) -> Result<(), InferenceError> {
+        if self.online_rotations.len() > Self::MAX_VALIDATED_ENTRIES {
+            return Err(InferenceError::Inference(format!(
+                "OnlineArtifactDescriptor: online_rotations declares {} entries, \
+                 exceeding the maximum of {} — a descriptor this large is rejected \
+                 before validation to keep work bounded over untrusted input",
+                self.online_rotations.len(),
+                Self::MAX_VALIDATED_ENTRIES
+            )));
+        }
+        if self.asymmetric_tensor_names.len() > Self::MAX_VALIDATED_ENTRIES {
+            return Err(InferenceError::Inference(format!(
+                "OnlineArtifactDescriptor: asymmetric_tensor_names declares {} entries, \
+                 exceeding the maximum of {} — a descriptor this large is rejected \
+                 before validation to keep work bounded over untrusted input",
+                self.asymmetric_tensor_names.len(),
+                Self::MAX_VALIDATED_ENTRIES
+            )));
+        }
+        match self.version {
+            ArtifactVersion::V0Residual => {
+                if !self.online_rotations.is_empty() {
+                    return Err(InferenceError::Inference(
+                        "OnlineArtifactDescriptor: a V0Residual artifact must not \
+                         carry online rotation metadata — a v0 residual artifact \
+                         is never interpreted as online-capable"
+                            .to_string(),
+                    ));
+                }
+                if !self.asymmetric_tensor_names.is_empty() {
+                    return Err(InferenceError::Inference(
+                        "OnlineArtifactDescriptor: a V0Residual artifact must not \
+                         declare any asymmetric_tensor_names — the V0 contract is \
+                         symmetric-only Q4 with no R3/R4 metadata"
+                            .to_string(),
+                    ));
+                }
+            }
+            ArtifactVersion::V1Online => {
+                let cfg = cfg.ok_or_else(|| {
+                    InferenceError::Inference(
+                        "OnlineArtifactDescriptor: V1 online validation requires \
+                         model config — a config-free call cannot prove per-layer \
+                         tensor coverage is complete (an R4 recipe's \
+                         layer_scope=None 'every layer' claim is unverifiable \
+                         without knowing how many layers the model has), so \
+                         cfg=None is refused rather than silently downgrading to \
+                         a weaker, incomplete validation path"
+                            .to_string(),
+                    )
+                })?;
+                if self.online_rotations.is_empty() {
+                    return Err(InferenceError::Inference(
+                        "OnlineArtifactDescriptor: a V1Online artifact must declare \
+                         at least one R3/R4 online rotation"
+                            .to_string(),
+                    ));
+                }
+                for spec in &self.online_rotations {
+                    spec.validate(Some(cfg))?;
+                }
+                // Canonical-form contract (v1): at most one spec per online
+                // transform site. Two specs targeting the same runtime site
+                // (e.g. two `AttentionOutputR3` entries with different
+                // seeds) would leave the future runtime to invent whether
+                // to apply both, pick one, or merge them — reject the
+                // second spec outright rather than let that ambiguity into
+                // the artifact.
+                let mut seen_sites: Vec<OnlineTransformSite> = Vec::new();
+                for spec in &self.online_rotations {
+                    let Some(site) = spec.id.online_transform_site() else {
+                        continue;
+                    };
+                    if seen_sites.contains(&site) {
+                        return Err(InferenceError::Inference(format!(
+                            "OnlineArtifactDescriptor: more than one online \
+                             rotation spec targets the same runtime site \
+                             {site:?} — a V1Online artifact must declare at \
+                             most one spec per online transform site"
+                        )));
+                    }
+                    seen_sites.push(site);
+                }
+                // Fail-closed on an empty declaration list: a nonempty
+                // rotation recipe always counter-rotates at least one
+                // stored tensor, so a v1 descriptor with rotations but zero
+                // asymmetric declarations is self-contradictory.
+                if self.asymmetric_tensor_names.is_empty() {
+                    return Err(InferenceError::Inference(
+                        "OnlineArtifactDescriptor: a V1Online artifact with online \
+                         rotations must declare asymmetric Q4 mode for the tensors \
+                         those rotations affect; an empty asymmetric declaration \
+                         list is self-contradictory"
+                            .to_string(),
+                    ));
+                }
+                // Single-representation contract: `asymmetric_tensor_names`
+                // must equal the recipe-derived expected set exactly, derived
+                // once here via `derive_expected_tensor_names` rather than
+                // re-collected from any caller-supplied slice. The comparison
+                // runs through hash sets so it stays linear in the number of
+                // declared and expected names — a descriptor is publicly
+                // constructible and deserializable, so a nested-scan form
+                // would be quadratic in externally-supplied input — and
+                // duplicate declarations are rejected up front so the declared
+                // list is a true set. Missing-direction first (names the
+                // recipe requires but the descriptor doesn't declare), then
+                // extra-direction (declared names the recipe doesn't recognize,
+                // matched against the full derived name, not only a suffix).
+                let expected = self.derive_expected_tensor_names(cfg);
+                let mut declared_set: HashSet<&str> =
+                    HashSet::with_capacity(self.asymmetric_tensor_names.len());
+                for declared in &self.asymmetric_tensor_names {
+                    if !declared_set.insert(declared.as_str()) {
+                        return Err(InferenceError::Inference(format!(
+                            "OnlineArtifactDescriptor: asymmetric_tensor_names \
+                             declares {declared:?} more than once — each affected \
+                             tensor must be declared exactly once"
+                        )));
+                    }
+                }
+                for (id, idx, expected_name) in &expected {
+                    if !declared_set.contains(expected_name.as_str()) {
+                        return Err(InferenceError::Inference(format!(
+                            "OnlineArtifactDescriptor: V1Online artifact's \
+                             {id:?} recipe is scoped to layer {idx}, but \
+                             asymmetric_tensor_names does not declare the \
+                             expected tensor {expected_name:?} — per-layer \
+                             coverage is incomplete"
+                        )));
+                    }
+                }
+                let expected_set: HashSet<&str> =
+                    expected.iter().map(|(_, _, e)| e.as_str()).collect();
+                for declared in &self.asymmetric_tensor_names {
+                    if !expected_set.contains(declared.as_str()) {
+                        let expected_names: Vec<&str> =
+                            expected.iter().map(|(_, _, e)| e.as_str()).collect();
+                        return Err(InferenceError::Inference(format!(
+                            "OnlineArtifactDescriptor: asymmetric_tensor_names \
+                             declares {declared:?}, which does not match any \
+                             tensor this recipe's online rotations counter-rotate \
+                             ({expected_names:?}) — an unrelated declaration must \
+                             not satisfy the fail-closed asymmetric-Q4 requirement"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Streaming SafeTensors reader for the QuaRot conversion pipeline.
 ///
 /// See module documentation for layout detection and caching semantics.
@@ -663,6 +1034,7 @@ fn decode_bytes_to_f64(bytes: &[u8], dtype: SourceDType) -> Result<Vec<f64>, Inf
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::quarot::plan::{AbsorptionSide, RotationId};
     use std::fs::File;
     use std::io::Write;
 
@@ -971,6 +1343,46 @@ mod tests {
         let reader = QuarotTensorReader::open(dir.path()).unwrap();
         assert!(reader.has_tensor("supported"));
         assert!(!reader.has_tensor("ignored"));
+        let (data, _) = reader.read_tensor_f64("supported").unwrap();
+        assert_eq!(data, vec![7.0]);
+    }
+
+    #[test]
+    fn fnuz_dtype_tensors_are_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        // F8_E4M3FNUZ / F8_E5M2FNUZ are official SafeTensors dtypes this
+        // reader does not decode. Opening a checkpoint that merely contains
+        // one must still succeed and expose the readable tensors — it must
+        // not error out as an unrecognized dtype.
+        let header = serde_json::json!({
+            "supported": {
+                "dtype": "F32",
+                "shape": [1],
+                "data_offsets": [0, 4],
+            },
+            "e4m3fnuz": {
+                "dtype": "F8_E4M3FNUZ",
+                "shape": [1],
+                "data_offsets": [4, 5],
+            },
+            "e5m2fnuz": {
+                "dtype": "F8_E5M2FNUZ",
+                "shape": [1],
+                "data_offsets": [5, 6],
+            },
+        });
+        let header_str = serde_json::to_string(&header).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&(header_str.len() as u64).to_le_bytes());
+        buf.extend_from_slice(header_str.as_bytes());
+        buf.extend_from_slice(&7f32.to_le_bytes());
+        buf.extend_from_slice(&[0u8, 0u8]);
+        std::fs::write(dir.path().join("model.safetensors"), &buf).unwrap();
+
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
+        assert!(reader.has_tensor("supported"));
+        assert!(!reader.has_tensor("e4m3fnuz"));
+        assert!(!reader.has_tensor("e5m2fnuz"));
         let (data, _) = reader.read_tensor_f64("supported").unwrap();
         assert_eq!(data, vec![7.0]);
     }
@@ -1308,5 +1720,715 @@ mod tests {
         // We don't construct a config (it has many required fields); we
         // just want a fn pointer to prove visibility.
         let _f: fn(&Qwen35Config) -> Vec<String> = qwen_required_tensor_names;
+    }
+
+    // --- ArtifactVersion / OnlineArtifactDescriptor (issue #703 PR1) ---
+    //
+    // `ArtifactVersion`'s `#[serde(rename = ...)]` attributes are the single
+    // on-disk spelling of each tag; deserializing a JSON string through the
+    // derived `Deserialize` impl below is the one parser, exercised
+    // directly rather than through a second hand-written match.
+
+    #[test]
+    fn artifact_version_deserializes_known_tags() {
+        assert_eq!(
+            serde_json::from_str::<ArtifactVersion>("\"v0-residual\"").unwrap(),
+            ArtifactVersion::V0Residual
+        );
+        assert_eq!(
+            serde_json::from_str::<ArtifactVersion>("\"v1-online-r3r4\"").unwrap(),
+            ArtifactVersion::V1Online
+        );
+    }
+
+    #[test]
+    fn artifact_version_refuses_unknown_tag() {
+        assert!(serde_json::from_str::<ArtifactVersion>("\"v2-future\"").is_err());
+    }
+
+    #[test]
+    fn artifact_version_refuses_empty_tag() {
+        assert!(serde_json::from_str::<ArtifactVersion>("\"\"").is_err());
+    }
+
+    #[test]
+    fn artifact_version_refuses_case_variant() {
+        // Refuses rather than normalizing — an unexpected casing is
+        // evidence of a foreign/corrupted writer, not a legitimate variant.
+        assert!(serde_json::from_str::<ArtifactVersion>("\"V0-Residual\"").is_err());
+    }
+
+    fn sample_r3_cfg() -> Qwen35Config {
+        crate::model::qwen35_config::Qwen35Config::qwen35_0_8b()
+    }
+
+    fn sample_r3_spec() -> OnlineRotationSpec {
+        let cfg = sample_r3_cfg();
+        // block_size == num_attention_heads (8): one dense cross-head
+        // Hadamard covering every head (QuaRot Eq. 9's H_num_heads).
+        OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap()
+    }
+
+    /// Every tensor name `sample_r3_spec()`'s scope (`[3,7,11,15,19,23]`)
+    /// requires full coverage for — `model.language_model.layers.{i}.self_attn.o_proj.weight`
+    /// for each scoped layer index.
+    fn full_r3_layer_names() -> Vec<String> {
+        [3usize, 7, 11, 15, 19, 23]
+            .iter()
+            .map(|i| format!("model.language_model.layers.{i}.self_attn.o_proj.weight"))
+            .collect()
+    }
+
+    #[test]
+    fn v0_residual_with_no_online_rotations_is_valid() {
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V0Residual,
+            online_rotations: Vec::new(),
+            asymmetric_tensor_names: Vec::new(),
+        };
+        assert!(descriptor.validate(None).is_ok());
+    }
+
+    /// A V0Residual descriptor must never carry online rotation metadata —
+    /// feeding it one must be refused loudly rather than silently ignored
+    /// (which would let a hand-edited index sneak online-rotation intent
+    /// past a v0-only loader).
+    #[test]
+    fn v0_residual_with_online_rotation_is_refused() {
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V0Residual,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: Vec::new(),
+        };
+        let err = descriptor.validate(None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("never interpreted as online-capable"),
+            "got: {msg}"
+        );
+    }
+
+    /// A V0Residual descriptor must never carry
+    /// asymmetric-Q4 tensor declarations — the V0 contract is symmetric-only
+    /// Q4 with no R3/R4 metadata, so a nonempty `asymmetric_tensor_names`
+    /// list on a V0 descriptor is evidence of a corrupted or hand-edited
+    /// index, same as a nonempty `online_rotations` list.
+    #[test]
+    fn v0_residual_with_asymmetric_tensor_names_is_refused() {
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V0Residual,
+            online_rotations: Vec::new(),
+            asymmetric_tensor_names: vec![
+                "model.language_model.layers.3.self_attn.o_proj.weight".to_string(),
+            ],
+        };
+        let err = descriptor.validate(None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must not declare any asymmetric_tensor_names"),
+            "got: {msg}"
+        );
+    }
+
+    /// Mutation/refusal: V1Online with an empty rotation list is a
+    /// contradiction (an "online" artifact that rotates nothing).
+    #[test]
+    fn v1_online_with_zero_rotations_is_refused() {
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: Vec::new(),
+            asymmetric_tensor_names: Vec::new(),
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("at least one R3/R4"), "got: {msg}");
+    }
+
+    /// `validate` must refuse immediately for a
+    /// `V1Online` descriptor called without `cfg`, rather than silently
+    /// running a weaker (per-layer-coverage-skipping) check. This must hold
+    /// even for a descriptor that would otherwise validate cleanly with
+    /// `cfg` supplied — a caller cannot opt into the weaker semantics just
+    /// by omitting the config.
+    #[test]
+    fn v1_online_validate_without_cfg_is_refused() {
+        let names = full_r3_layer_names();
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: names,
+        };
+        let err = descriptor.validate(None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("requires model config"), "got: {msg}");
+        // The same descriptor passes once cfg is supplied — proving the
+        // None case above was refused for lack of cfg, not some other
+        // reason.
+        assert!(descriptor.validate(Some(&sample_r3_cfg())).is_ok());
+    }
+
+    /// Mutation/refusal: a declaration missing one scoped layer's tensor
+    /// must be refused — the single `asymmetric_tensor_names` declaration
+    /// must equal the recipe-derived set exactly: this is the same
+    /// requirement the pre-collapse
+    /// `affected_tensor_names` cross-check enforced, now checked entirely
+    /// from the descriptor's own fields).
+    #[test]
+    fn v1_online_missing_asymmetric_declaration_is_refused() {
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: vec![
+                "model.language_model.layers.3.self_attn.o_proj.weight".to_string(),
+            ],
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("coverage is incomplete"), "got: {msg}");
+        assert!(msg.contains("layer 7"), "got: {msg}");
+    }
+
+    /// Preserved under the single-representation
+    /// contract: a real rotation recipe with zero asymmetric declarations
+    /// must be refused internally rather than silently accepted.
+    #[test]
+    fn v1_online_empty_asymmetric_list_is_refused() {
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: vec![],
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("self-contradictory"), "got: {msg}");
+    }
+
+    /// A descriptor whose caller-supplied vectors exceed the validation cap is
+    /// rejected up front, before any per-entry scan, so validation cost stays
+    /// bounded regardless of how large an untrusted descriptor is.
+    #[test]
+    fn validate_rejects_descriptor_exceeding_entry_cap() {
+        let over_cap = OnlineArtifactDescriptor::MAX_VALIDATED_ENTRIES + 1;
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: (0..over_cap).map(|i| format!("t{i}")).collect(),
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("exceeding the maximum"), "got: {msg}");
+    }
+
+    /// Regression test, preserved under the
+    /// single-representation contract: a real R3 recipe declaring an
+    /// unrelated, nonempty `asymmetric_tensor_names` entry must be rejected
+    /// for not matching any tensor the recipe's derived expected set
+    /// contains — an unrelated string must not satisfy the fail-closed
+    /// requirement just by being nonempty.
+    #[test]
+    fn v1_online_unrelated_asymmetric_declaration_is_refused() {
+        // Full, correct per-layer coverage PLUS one unrelated extra entry —
+        // isolates the extra-direction (unrelated) check from the
+        // missing-direction check exercised by
+        // `v1_online_missing_asymmetric_declaration_is_refused` above.
+        let mut names = full_r3_layer_names();
+        names.push("unrelated".to_string());
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: names,
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unrelated") && msg.contains("does not match any tensor"),
+            "got: {msg}"
+        );
+    }
+
+    /// A declared name with the right suffix but an out-of-scope layer
+    /// (layer 0 is GDN, outside `sample_r3_spec()`'s full-attention scope)
+    /// must also be rejected as "extra" — exact-set equality, not a
+    /// suffix-only membership check.
+    #[test]
+    fn v1_online_out_of_scope_layer_declaration_is_refused() {
+        let mut names = full_r3_layer_names();
+        names.push("model.language_model.layers.0.self_attn.o_proj.weight".to_string());
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: names,
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("layers.0.self_attn.o_proj.weight")
+                && msg.contains("does not match any tensor"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn v1_online_with_full_asymmetric_coverage_is_valid() {
+        // Regression test: a complete, exact declaration
+        // (every scoped layer's tensor, nothing extra) must pass.
+        let names = full_r3_layer_names();
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: names,
+        };
+        // cfg is mandatory for V1Online — see
+        // `v1_online_validate_without_cfg_is_refused` for the None case.
+        assert!(descriptor.validate(Some(&sample_r3_cfg())).is_ok());
+    }
+
+    // --- OnlineRotationSpec::validate ---
+
+    #[test]
+    fn online_rotation_spec_accepts_constructor_built_specs() {
+        let cfg = sample_r3_cfg();
+        assert!(sample_r3_spec().validate(None).is_ok());
+        assert!(sample_r3_spec().validate(Some(&cfg)).is_ok());
+        let r4 = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 256).unwrap();
+        assert!(r4.validate(None).is_ok());
+        assert!(r4.validate(Some(&cfg)).is_ok());
+    }
+
+    /// The exact malformed spec: an R3 id
+    /// with `OutputSide`, `block_size=3` (not a power of two), and
+    /// `layer_scope=None` (R3 requires Some). Directly constructed —
+    /// bypassing `r3_full_attention` — because that is precisely how a
+    /// hand-edited or corrupted index could produce this. Must be rejected
+    /// both standalone and via the descriptor path.
+    #[test]
+    fn online_rotation_spec_rejects_the_reported_malformed_r3_spec() {
+        let malformed = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::OutputSide,
+            seed: 1,
+            block_size: 3,
+            layer_scope: None,
+        };
+        assert!(malformed.validate(None).is_err());
+
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![malformed],
+            asymmetric_tensor_names: vec![
+                "model.language_model.layers.3.self_attn.o_proj.weight".to_string(),
+            ],
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        assert!(
+            format!("{err}").contains("InputSide"),
+            "descriptor validation must surface the spec-level rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn online_rotation_spec_rejects_wrong_side() {
+        let spec = OnlineRotationSpec {
+            id: RotationId::MlpDownR4,
+            side: AbsorptionSide::OutputSide,
+            seed: 1,
+            block_size: 64,
+            layer_scope: None,
+        };
+        let err = spec.validate(None).unwrap_err();
+        assert!(format!("{err}").contains("InputSide"));
+    }
+
+    #[test]
+    fn online_rotation_spec_rejects_non_power_of_two_block_size() {
+        let spec = OnlineRotationSpec {
+            id: RotationId::MlpDownR4,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 96,
+            layer_scope: None,
+        };
+        let err = spec.validate(None).unwrap_err();
+        assert!(format!("{err}").contains("power-of-two"));
+    }
+
+    #[test]
+    fn online_rotation_spec_rejects_zero_block_size() {
+        let spec = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 0,
+            layer_scope: Some(vec![3]),
+        };
+        let err = spec.validate(None).unwrap_err();
+        assert!(format!("{err}").contains("power-of-two"));
+    }
+
+    #[test]
+    fn online_rotation_spec_rejects_r3_with_none_layer_scope() {
+        let spec = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: None,
+        };
+        let err = spec.validate(None).unwrap_err();
+        assert!(format!("{err}").contains("layer_scope"));
+    }
+
+    #[test]
+    fn online_rotation_spec_rejects_r3_with_empty_layer_scope() {
+        let spec = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: Some(vec![]),
+        };
+        let err = spec.validate(None).unwrap_err();
+        assert!(format!("{err}").contains("must not be empty"));
+    }
+
+    #[test]
+    fn online_rotation_spec_rejects_r4_with_some_layer_scope() {
+        let spec = OnlineRotationSpec {
+            id: RotationId::MlpDownR4,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 64,
+            layer_scope: Some(vec![0]),
+        };
+        let err = spec.validate(None).unwrap_err();
+        assert!(format!("{err}").contains("must be None"));
+    }
+
+    #[test]
+    fn online_rotation_spec_rejects_residual_stream_id() {
+        let spec = OnlineRotationSpec {
+            id: RotationId::ResidualStream,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: None,
+        };
+        let err = spec.validate(None).unwrap_err();
+        assert!(format!("{err}").contains("ResidualStream"));
+    }
+
+    #[test]
+    fn online_rotation_spec_cfg_aware_checks_catch_bad_divisibility_and_scope() {
+        let cfg = sample_r3_cfg();
+        // block_size divides nothing meaningful without cfg, but with cfg
+        // it must divide num_attention_heads (8) — 4 does. layer_scope must
+        // be the config's full-attention layers exactly, so this uses the
+        // full set (not a subset — see the equality test below).
+        let good_block = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 4, // power of two, divides 8 — valid without extra checks
+            layer_scope: Some(vec![3, 7, 11, 15, 19, 23]),
+        };
+        assert!(good_block.validate(Some(&cfg)).is_ok());
+
+        // A layer_scope entry that is not actually a full-attention layer
+        // (layer 0 is GDN in qwen35_0_8b) must be rejected once cfg is known.
+        let bad_scope = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: Some(vec![0]),
+        };
+        assert!(!cfg.is_full_attention(0), "sanity: layer 0 is GDN");
+        let err = bad_scope.validate(Some(&cfg)).unwrap_err();
+        assert!(format!("{err}").contains("layer 0"));
+    }
+
+    /// The cfg-aware check must reject a
+    /// `layer_scope` that is a strict subset of the config's full-attention
+    /// layers — membership alone is not sufficient, coverage must be
+    /// complete. For `qwen35_0_8b`, full-attention layers are
+    /// `[3,7,11,15,19,23]`; a scope of just `[3]` must be rejected, naming
+    /// the missing layers.
+    #[test]
+    fn online_rotation_spec_rejects_r3_scope_missing_full_attention_layers() {
+        let cfg = sample_r3_cfg();
+        let partial_scope = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: Some(vec![3]),
+        };
+        let err = partial_scope.validate(Some(&cfg)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("missing"), "got: {msg}");
+        for missing in ["7", "11", "15", "19", "23"] {
+            assert!(msg.contains(missing), "expected {missing} in: {msg}");
+        }
+
+        // The full set passes.
+        let full_scope = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: Some(vec![3, 7, 11, 15, 19, 23]),
+        };
+        assert!(full_scope.validate(Some(&cfg)).is_ok());
+
+        // A superset naming a non-full-attention layer is still rejected
+        // (the membership direction, unaffected by the equality fix).
+        let superset_with_non_member = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: Some(vec![0, 3, 7, 11, 15, 19, 23]),
+        };
+        let err = superset_with_non_member.validate(Some(&cfg)).unwrap_err();
+        assert!(format!("{err}").contains("layer 0"));
+    }
+
+    /// A scope with a duplicate layer index (the
+    /// exact `[3,3,7,11,15,19,23]` example from the review) must be
+    /// rejected outright — a naive set-equality check would silently dedup
+    /// it and accept. The check is cfg-independent, so it must also fire
+    /// with `cfg: None`.
+    #[test]
+    fn online_rotation_spec_rejects_duplicate_r3_layer_index() {
+        let duplicate_scope = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: Some(vec![3, 3, 7, 11, 15, 19, 23]),
+        };
+        let err = duplicate_scope.validate(None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("strictly sorted ascending") && msg.contains("duplicates"),
+            "got: {msg}"
+        );
+        let err = duplicate_scope
+            .validate(Some(&sample_r3_cfg()))
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("strictly sorted ascending"),
+            "duplicate rejection must fire before/independent of cfg checks"
+        );
+    }
+
+    /// An unsorted (but duplicate-free) scope must
+    /// also be rejected — the canonical form is strictly ascending, not
+    /// merely a valid set.
+    #[test]
+    fn online_rotation_spec_rejects_unsorted_r3_layer_scope() {
+        let unsorted_scope = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 8,
+            layer_scope: Some(vec![7, 3, 11, 15, 19, 23]),
+        };
+        let err = unsorted_scope.validate(None).unwrap_err();
+        assert!(
+            format!("{err}").contains("strictly sorted ascending"),
+            "got: {err}"
+        );
+    }
+
+    /// A V1Online descriptor must not accept two
+    /// online rotation specs targeting the same runtime site — two
+    /// `AttentionOutputR3` entries (even with different seeds) leave the
+    /// future runtime to invent duplicate-site semantics, so the second one
+    /// is rejected.
+    #[test]
+    fn v1_online_rejects_two_specs_targeting_the_same_site() {
+        let cfg = sample_r3_cfg();
+        let first = OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+        let second = OnlineRotationSpec::r3_full_attention(&cfg, 99, 8).unwrap();
+        let names = full_r3_layer_names();
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![first, second],
+            asymmetric_tensor_names: names,
+        };
+        let err = descriptor.validate(Some(&cfg)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("same runtime site") && msg.contains("AttentionOutputPreOProj"),
+            "got: {msg}"
+        );
+    }
+
+    /// A well-formed single-spec-per-site descriptor (R3 + R4 together)
+    /// must still pass — the same-site rejection must not false-positive
+    /// on two specs that target *different* sites.
+    #[test]
+    fn v1_online_with_distinct_sites_is_valid() {
+        let cfg = sample_r3_cfg();
+        let r3 = OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+        let r4 = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 256).unwrap();
+        let mut names = full_r3_layer_names();
+        for i in 0..cfg.num_hidden_layers {
+            names.push(format!(
+                "{}.mlp.down_proj.weight",
+                crate::model::qwen35::qwen_layer_tensor_prefix(i)
+            ));
+        }
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![r3, r4],
+            asymmetric_tensor_names: names,
+        };
+        assert!(descriptor.validate(Some(&cfg)).is_ok());
+    }
+
+    // --- canonical Qwen3.5 tensor namespace ---
+
+    /// The canonical Qwen3.5 tensor namespace is
+    /// `model.language_model.layers.{idx}.{suffix}` (matching
+    /// `qwen_required_tensor_names` and the QuaRot converter), not
+    /// `model.layers.{idx}.{suffix}`. A descriptor declaring the canonical
+    /// names for the full R3 scope must pass; the same descriptor rewritten
+    /// with the old, non-canonical prefix must now fail per-layer coverage.
+    #[test]
+    fn v1_online_per_layer_coverage_uses_canonical_qwen_namespace() {
+        let cfg = sample_r3_cfg();
+        let canonical_names = full_r3_layer_names();
+        for name in &canonical_names {
+            assert!(
+                name.starts_with("model.language_model.layers."),
+                "got: {name}"
+            );
+        }
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: canonical_names,
+        };
+        assert!(descriptor.validate(Some(&cfg)).is_ok());
+
+        let old_namespace_names: Vec<String> = [3usize, 7, 11, 15, 19, 23]
+            .iter()
+            .map(|i| format!("model.layers.{i}.self_attn.o_proj.weight"))
+            .collect();
+        let old_descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: old_namespace_names,
+        };
+        let err = old_descriptor.validate(Some(&cfg)).unwrap_err();
+        assert!(
+            format!("{err}").contains("coverage is incomplete"),
+            "old model.layers.* namespace must be rejected as incomplete coverage"
+        );
+    }
+
+    // --- per-layer tensor coverage ---
+
+    /// The exact scenario from the finding: an R3 recipe scoped to layers
+    /// `[3,7,11,15,19,23]` must not validate against a declaration that only
+    /// contains layer 0's tensor (suffix matches, layer doesn't). Must fail
+    /// naming a missing scoped layer.
+    #[test]
+    fn v1_online_layer_scope_coverage_rejects_wrong_layer_declaration() {
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: vec![
+                "model.language_model.layers.0.self_attn.o_proj.weight".to_string(),
+            ],
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("layer 3") && msg.contains("coverage is incomplete"),
+            "got: {msg}"
+        );
+    }
+
+    /// Partial coverage — every scoped layer but one declared — must still
+    /// be rejected, naming the missing layer.
+    #[test]
+    fn v1_online_layer_scope_coverage_rejects_partial_declaration() {
+        let mut names = full_r3_layer_names();
+        names.pop(); // drop layer 23
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: names,
+        };
+        let err = descriptor.validate(Some(&sample_r3_cfg())).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("layer 23") && msg.contains("coverage is incomplete"),
+            "got: {msg}"
+        );
+    }
+
+    /// R4 (`layer_scope: None`, "every layer"
+    /// semantics) validation without `cfg` is refused outright — the prior
+    /// behavior of silently *skipping* the per-layer coverage check for a
+    /// `None`-scoped rotation (because the full layer count was
+    /// "unknowable") was the exact bug the review escalated: a V1/R4
+    /// descriptor declaring only `model.language_model.layers.0.mlp.down_proj.weight` must
+    /// no longer pass any validation path that claims completeness, with or
+    /// without cfg games. With `cfg` supplied, the same partial declaration
+    /// is rejected for missing coverage of the layers `cfg` says exist.
+    #[test]
+    fn v1_online_r4_partial_declaration_rejected_regardless_of_cfg() {
+        let cfg = sample_r3_cfg();
+        let r4 = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 256).unwrap();
+        let partial_name = "model.language_model.layers.0.mlp.down_proj.weight".to_string();
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![r4],
+            asymmetric_tensor_names: vec![partial_name],
+        };
+        // Without cfg: refused immediately — no path claims completeness
+        // without model config.
+        let err = descriptor.validate(None).unwrap_err();
+        assert!(format!("{err}").contains("requires model config"));
+        // With cfg: full-layer coverage is enforced and layer 1..N are
+        // missing, so validation must fail here too.
+        let err = descriptor.validate(Some(&cfg)).unwrap_err();
+        assert!(format!("{err}").contains("coverage is incomplete"));
+    }
+
+    // --- verify_affected (narrow converter cross-check entry point) ---
+
+    #[test]
+    fn verify_affected_accepts_exact_match() {
+        let cfg = sample_r3_cfg();
+        let names = full_r3_layer_names();
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: names.clone(),
+        };
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(descriptor.verify_affected(&cfg, &refs).is_ok());
+    }
+
+    #[test]
+    fn verify_affected_rejects_missing_and_extra() {
+        let cfg = sample_r3_cfg();
+        let descriptor = OnlineArtifactDescriptor {
+            version: ArtifactVersion::V1Online,
+            online_rotations: vec![sample_r3_spec()],
+            asymmetric_tensor_names: full_r3_layer_names(),
+        };
+        // Missing: converter reports transforming nothing.
+        assert!(descriptor.verify_affected(&cfg, &[]).is_err());
+        // Extra: converter reports an unrelated tensor alongside full coverage.
+        let mut names = full_r3_layer_names();
+        names.push("unrelated".to_string());
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(descriptor.verify_affected(&cfg, &refs).is_err());
     }
 }
