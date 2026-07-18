@@ -83,6 +83,14 @@ mod tests {
             .unwrap();
 
         let input: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
+        let output = network.forward(&input).unwrap();
+        assert_eq!(output.len(), 10);
+        assert!(output.iter().all(|value| value.is_finite()));
+
+        if std::env::var("LATTICE_TIMING_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping wall-clock assertion; set LATTICE_TIMING_TESTS=1 on an idle host");
+            return;
+        }
 
         for _ in 0..10 {
             network.forward(&input).unwrap();

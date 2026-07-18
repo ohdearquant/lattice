@@ -211,7 +211,32 @@ fn test_simd_config_detect_consistent() {
 
 #[test]
 fn test_simd_config_cached() {
-    // simd_config() should return cached value quickly
+    let expected = simd_config();
+    let actual = simd_config();
+    assert_eq!(
+        (
+            actual.avx512f_enabled,
+            actual.avx2_enabled,
+            actual.fma_enabled,
+            actual.avx512vnni_enabled,
+            actual.neon_enabled,
+            actual.dotprod_enabled,
+        ),
+        (
+            expected.avx512f_enabled,
+            expected.avx2_enabled,
+            expected.fma_enabled,
+            expected.avx512vnni_enabled,
+            expected.neon_enabled,
+            expected.dotprod_enabled,
+        )
+    );
+
+    if std::env::var("LATTICE_TIMING_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping wall-clock assertion; set LATTICE_TIMING_TESTS=1 on an idle host");
+        return;
+    }
+
     let start = std::time::Instant::now();
     for _ in 0..10000 {
         let _ = simd_config();
@@ -449,6 +474,11 @@ fn test_large_batch_dot_product() {
 
     assert_eq!(results.len(), 1000);
     println!("1000 dot products in {:?}", elapsed);
+
+    if std::env::var("LATTICE_TIMING_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping wall-clock assertion; set LATTICE_TIMING_TESTS=1 on an idle host");
+        return;
+    }
 
     // Should complete in < 10ms with SIMD
     assert!(
