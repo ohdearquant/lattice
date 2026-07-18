@@ -233,7 +233,21 @@ fn resolve_safetensors_path(model_dir: &Path) -> PathBuf {
     shards.sort_unstable();
     shards.dedup();
     match shards.as_slice() {
-        [one] => model_dir.join(one),
+        // Route through the same containment policy production loading uses
+        // (`lattice_inference::weights::resolve_shard_path`), not a raw
+        // `model_dir.join(one)` -- otherwise an index value like
+        // `../outside/model.safetensors` would make this gate read outside
+        // the checkpoint while production correctly rejects it, so the gate
+        // could report parity against different weights than production
+        // ever loads.
+        [one] => {
+            lattice_inference::weights::resolve_shard_path(model_dir, one).unwrap_or_else(|e| {
+                panic!(
+                    "shard '{one}' referenced by {} is invalid: {e}",
+                    model_dir.join("model.safetensors.index.json").display()
+                )
+            })
+        }
         [] => panic!(
             "empty weight_map in {}",
             model_dir.join("model.safetensors.index.json").display()
@@ -321,8 +335,15 @@ mod resolver_strictness_tests {
             &dir,
             r#"{"weight_map":{"a":"only.safetensors","b":"only.safetensors"}}"#,
         );
+        // `resolve_safetensors_path` now resolves through the same
+        // containment policy as production (`resolve_shard_path`), which
+        // canonicalizes the candidate and therefore requires it to exist —
+        // so the shard file itself, not just the index entry naming it,
+        // must be present for the accept case.
+        std::fs::write(dir.join("only.safetensors"), b"stub").expect("write shard stub");
         let p = resolve_safetensors_path(&dir);
-        let expected = dir.join("only.safetensors");
+        let expected = std::fs::canonicalize(dir.join("only.safetensors"))
+            .expect("canonicalize expected shard path");
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(p, expected);
     }

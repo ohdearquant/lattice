@@ -749,8 +749,9 @@ mod doctor {
             let mut present_names: BTreeSet<String> = BTreeSet::new();
             let mut has_mtp_tensors = false;
             for entry in &entries {
-                let file_path = dir.join(&entry.file);
-                match std::fs::metadata(&file_path) {
+                let resolved = lattice_inference::weights::resolve_shard_path(dir, &entry.file)
+                    .and_then(|file_path| std::fs::metadata(&file_path).map_err(Into::into));
+                match resolved {
                     Ok(meta) => {
                         total_bytes +=
                             q4_resident_bytes(&entry.name, meta.len(), cfg.tie_word_embeddings);

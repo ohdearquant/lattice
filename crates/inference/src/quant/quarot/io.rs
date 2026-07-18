@@ -48,7 +48,7 @@ use serde_json::Value;
 
 use crate::error::InferenceError;
 use crate::weights::f32_weights::{
-    SafetensorsTensorLayout, parse_index, validate_safetensors_layout, validate_shard_relative_path,
+    SafetensorsTensorLayout, parse_index, resolve_contained_path, validate_safetensors_layout,
 };
 
 /// On-disk storage dtype of a tensor.
@@ -395,8 +395,8 @@ impl QuarotTensorReader {
                 if shards.contains_key(shard_file) {
                     continue;
                 }
-                validate_shard_relative_path(shard_file)?;
-                let shard = Shard::open(&model_dir.join(shard_file))?;
+                let shard_path = resolve_contained_path(model_dir, shard_file)?;
+                let shard = Shard::open(&shard_path)?;
                 shards.insert(shard_file.clone(), shard);
             }
             Ok(Self {
@@ -841,7 +841,7 @@ mod tests {
         let err = QuarotTensorReader::open(dir.path())
             .expect_err("shard filename with a parent-directory component must be rejected");
         assert!(
-            err.to_string().contains("parent-directory"),
+            err.to_string().contains("escapes the checkpoint directory"),
             "unexpected error: {err}"
         );
     }
@@ -869,7 +869,7 @@ mod tests {
         let err = QuarotTensorReader::open(dir.path())
             .expect_err("an absolute shard path must be rejected");
         assert!(
-            err.to_string().contains("absolute"),
+            err.to_string().contains("escapes the checkpoint directory"),
             "unexpected error: {err}"
         );
     }

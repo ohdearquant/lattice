@@ -3,7 +3,7 @@ use crate::error::InferenceError;
 use memmap2::Mmap;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -182,6 +182,53 @@ pub(crate) fn validate_shard_relative_path(name: &str) -> Result<(), InferenceEr
         }
     }
     Ok(())
+}
+
+/// Resolve an untrusted, checkpoint-supplied relative path onto `model_dir`
+/// and require the result to stay inside it, defeating symlink escapes in
+/// addition to the lexical `..`/absolute-path escapes
+/// [`validate_shard_relative_path`] already rejects.
+///
+/// Lexical validation alone is not sufficient: a shard name can pass every
+/// lexical check (no `..`, not absolute) yet still be a symlink that
+/// resolves outside the model directory, letting `File::open` disclose any
+/// file the process can read. This function canonicalizes both the model
+/// directory and the joined candidate — which follows symlinks and resolves
+/// `..` components — and requires the canonical candidate to be contained in
+/// the canonical root via [`Path::starts_with`] (a component-wise check, not
+/// a string prefix, so `/model` cannot match a sibling `/model-evil`).
+/// Canonicalizing both sides also normalizes platform path aliasing (e.g.
+/// macOS's `/tmp` → `/private/tmp` symlink).
+///
+/// An absolute `untrusted` value replaces `model_dir` entirely under
+/// `Path::join`'s semantics; canonicalizing the result and checking
+/// containment rejects it the same way as a symlink or `..` escape, so one
+/// check covers all three attack shapes.
+///
+/// If the candidate does not exist, this returns the same
+/// [`InferenceError::InvalidSafetensors`] "failed to open" shape that
+/// [`SafetensorsFile::open`] already returns for a missing shard, so callers
+/// do not observe a new error shape for the ordinary missing-file case.
+pub(crate) fn resolve_contained_path(
+    model_dir: &Path,
+    untrusted: &str,
+) -> Result<PathBuf, InferenceError> {
+    let candidate = model_dir.join(untrusted);
+    let canonical_root = fs::canonicalize(model_dir).map_err(|e| {
+        InferenceError::InvalidSafetensors(format!(
+            "failed to canonicalize model directory {}: {e}",
+            model_dir.display()
+        ))
+    })?;
+    let canonical_candidate = fs::canonicalize(&candidate).map_err(|e| {
+        InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", candidate.display()))
+    })?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "path {untrusted:?} escapes the checkpoint directory"
+        )));
+    }
+    Ok(canonical_candidate)
 }
 
 /// Resolve a safetensors header `dtype` string to a [`DType`], including
@@ -1143,19 +1190,19 @@ pub fn resolve_shard(
     Ok(PathBuf::from(shard_file))
 }
 
-/// Validate an index-derived shard filename and join it onto `root`.
+/// Validate an index-derived shard filename and resolve it onto `root`,
+/// rejecting the result if it escapes `root` once symlinks and `..`
+/// components are resolved.
 ///
 /// This is the crate-public entry point for the containment policy
-/// enforced by [`validate_shard_relative_path`], for callers outside
+/// enforced by [`resolve_contained_path`], for callers outside
 /// `lattice-inference` (e.g. `lattice-embed`) that need to resolve a
 /// `weight_map` value onto a model directory. Every caller that joins a
 /// `weight_map`/shard-index-derived filename onto a directory — in this
 /// crate or a downstream one — must go through this function (or
-/// `validate_shard_relative_path` directly, in-crate) before the join, not
-/// after.
+/// `resolve_contained_path` directly, in-crate) before the join, not after.
 pub fn resolve_shard_path(root: &Path, shard_file: &str) -> Result<PathBuf, InferenceError> {
-    validate_shard_relative_path(shard_file)?;
-    Ok(root.join(shard_file))
+    resolve_contained_path(root, shard_file)
 }
 
 /// Eagerly load all tensors from a sharded checkpoint into an owned map.
@@ -1177,8 +1224,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
-        validate_shard_relative_path(&shard_file)?;
-        let shard_path = model_dir.join(&shard_file);
+        let shard_path = resolve_contained_path(model_dir, &shard_file)?;
         let shard = SafetensorsFile::open(&shard_path)?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
@@ -1195,6 +1241,21 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
     Ok(tensors)
 }
 
+/// Cap on the number of distinct shard files a single manifest may name in
+/// [`ShardedSafetensors::open_index`].
+///
+/// `open_index` eagerly mmaps every unique shard the index names so
+/// `has_tensor`/`tensor_shape` never need a subsequent disk hit. That means
+/// the number of live mmaps at construction time is entirely
+/// manifest-controlled: a crafted `model.safetensors.index.json` naming many
+/// distinct, individually valid (containment-checked) shard filenames can
+/// exhaust address space or file descriptors purely at init, before any
+/// tensor is requested. The largest known real-world sharded checkpoints
+/// split into low hundreds of shards; this cap sits an order of magnitude
+/// above that so no legitimate checkpoint is affected while bounding the
+/// worst case.
+const MAX_SHARDED_MANIFEST_SHARDS: usize = 4096;
+
 impl ShardedSafetensors {
     /// Parse `model.safetensors.index.json` and eagerly format-validate
     /// every unique shard it references.
@@ -1205,13 +1266,20 @@ impl ShardedSafetensors {
             .to_path_buf();
         let index = parse_index(&root)?;
 
+        let unique_shards: std::collections::BTreeSet<&String> =
+            index.weight_map.values().collect();
+        if unique_shards.len() > MAX_SHARDED_MANIFEST_SHARDS {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "model.safetensors.index.json in {} names {} distinct shards, exceeding the \
+                 {MAX_SHARDED_MANIFEST_SHARDS}-shard cap enforced at load time",
+                root.display(),
+                unique_shards.len(),
+            )));
+        }
+
         let mut shards: HashMap<String, SafetensorsFile> = HashMap::new();
-        for shard_file in index.weight_map.values() {
-            if shards.contains_key(shard_file) {
-                continue;
-            }
-            validate_shard_relative_path(shard_file)?;
-            let shard_path = root.join(shard_file);
+        for shard_file in unique_shards {
+            let shard_path = resolve_contained_path(&root, shard_file)?;
             let shard = SafetensorsFile::open(&shard_path)?;
             shards.insert(shard_file.clone(), shard);
         }
@@ -1235,8 +1303,8 @@ impl ShardedSafetensors {
             .weight_map
             .get(tensor_name)
             .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-        validate_shard_relative_path(shard_file)?;
-        Ok((self.root.join(shard_file), tensor_name.to_string()))
+        let shard_path = resolve_contained_path(&self.root, shard_file)?;
+        Ok((shard_path, tensor_name.to_string()))
     }
 
     fn shard_file_for(&self, name: &str) -> Result<String, InferenceError> {
@@ -1247,10 +1315,13 @@ impl ShardedSafetensors {
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
     }
 
+    // `open_index` eagerly resolves and opens every distinct shard the
+    // manifest names, so by the time `self` exists every key `shard_file_for`
+    // can return is already present in `self.shards` — the lazy-open branch
+    // below is unreachable in practice but kept as a defensive fallback.
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
-            validate_shard_relative_path(shard_file)?;
-            let shard_path = self.root.join(shard_file);
+            let shard_path = resolve_contained_path(&self.root, shard_file)?;
             let shard = SafetensorsFile::open(&shard_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
@@ -2763,7 +2834,7 @@ mod tests {
         let err = load_sharded(&dir)
             .expect_err("shard filename with a parent-directory component must be rejected");
         assert!(
-            err.to_string().contains("parent-directory"),
+            err.to_string().contains("escapes the checkpoint directory"),
             "unexpected error: {err}"
         );
 
@@ -2790,11 +2861,76 @@ mod tests {
         // open `outside_file` directly instead of erroring.
         let err = load_sharded(&dir).expect_err("an absolute shard path must be rejected");
         assert!(
-            err.to_string().contains("absolute"),
+            err.to_string().contains("escapes the checkpoint directory"),
             "unexpected error: {err}"
         );
 
         fs::remove_dir_all(&outside_dir).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_load_sharded_rejects_symlink_shard_escape() {
+        let dir = temp_dir("lattice_shard_symlink_test");
+        let outside_dir = temp_dir("lattice_shard_symlink_outside");
+        let outside_file = outside_dir.join("secret.safetensors");
+        write_single_f32_tensor(&outside_file, "secret", &[9.0]);
+
+        // A shard filename that is lexically valid (no `..`, not absolute)
+        // but is actually a symlink resolving outside `dir`.
+        let symlink_name = "model-00001-of-00001.safetensors";
+        std::os::unix::fs::symlink(&outside_file, dir.join(symlink_name))
+            .expect("test setup: create symlink shard");
+
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            format!(r#"{{"weight_map":{{"tensor.a":"{symlink_name}"}}}}"#),
+        )
+        .expect("test setup: write index");
+
+        // Lexical validation alone would accept `symlink_name` (no `..`, not
+        // absolute) and `File::open` would happily follow the symlink,
+        // disclosing `outside_file`'s contents. Containment must reject it.
+        let err = load_sharded(&dir).expect_err(
+            "a shard filename that is a symlink escaping the model dir must be rejected",
+        );
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&outside_dir).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_open_index_rejects_manifest_exceeding_shard_cap() {
+        let dir = temp_dir("lattice_shard_cap_test");
+        let mut weight_map = String::from("{");
+        for i in 0..=MAX_SHARDED_MANIFEST_SHARDS {
+            if i > 0 {
+                weight_map.push(',');
+            }
+            weight_map.push_str(&format!(r#""tensor.{i}":"shard-{i}.safetensors""#));
+        }
+        weight_map.push('}');
+
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(&index_path, format!(r#"{{"weight_map":{weight_map}}}"#))
+            .expect("test setup: write index");
+
+        // None of the `MAX_SHARDED_MANIFEST_SHARDS + 1` shard files are
+        // ever created on disk: the cap must reject the manifest before
+        // `open_index` attempts to resolve or mmap a single one of them.
+        let err = ShardedSafetensors::open_index(&index_path)
+            .expect_err("a manifest naming more than the shard cap must be rejected");
+        assert!(
+            err.to_string().contains("exceeding"),
+            "unexpected error: {err}"
+        );
+
         fs::remove_dir_all(&dir).ok();
     }
 

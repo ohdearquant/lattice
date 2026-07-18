@@ -11,7 +11,7 @@ use crate::forward::metal::MetalForwardPass;
 use crate::pool::{l2_normalize, last_token_pool};
 use crate::rope::RopeTable;
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
-use crate::weights::f32_weights::validate_shard_relative_path;
+use crate::weights::f32_weights::{parse_index, validate_shard_relative_path};
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -385,23 +385,19 @@ fn resolve_weight_fingerprint_files(dir: &Path) -> Result<Vec<String>, Inference
     if dir.join("model.safetensors").is_file() {
         return Ok(vec!["model.safetensors".to_string()]);
     }
-    let index_path = dir.join("model.safetensors.index.json");
-    if let Ok(index_bytes) = std::fs::read(&index_path)
-        && let Ok(index_json) = serde_json::from_slice::<serde_json::Value>(&index_bytes)
-        && let Some(weight_map) = index_json.get("weight_map").and_then(|v| v.as_object())
-    {
-        let files: std::collections::BTreeSet<String> = weight_map
-            .values()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        for file in &files {
-            validate_shard_relative_path(file)?;
-        }
-        if !files.is_empty() {
-            return Ok(files.into_iter().collect());
-        }
+    // Reuse the strict index parser the runtime loaders use, rather than a
+    // separate ad hoc `serde_json::Value` walk that could silently drop a
+    // non-string shard value or collapse a duplicate tensor-name key --
+    // either of those would let this fingerprint diverge from what
+    // `QwenModel::from_directory` actually loads.
+    let Ok(index) = parse_index(dir) else {
+        return Ok(Vec::new());
+    };
+    let files: std::collections::BTreeSet<String> = index.weight_map.into_values().collect();
+    for file in &files {
+        validate_shard_relative_path(file)?;
     }
-    Ok(Vec::new())
+    Ok(files.into_iter().collect())
 }
 
 /// Fold one weight shard's filename, byte length, and boundary-sampled
@@ -414,10 +410,10 @@ fn fold_weight_file_into_hasher(
     hasher: &mut Sha256,
     dir: &Path,
     file_name: &str,
-) -> std::io::Result<()> {
+) -> Result<(), InferenceError> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let path = dir.join(file_name);
+    let path = crate::weights::f32_weights::resolve_contained_path(dir, file_name)?;
     let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
     let len = file.get_ref().metadata()?.len();
 

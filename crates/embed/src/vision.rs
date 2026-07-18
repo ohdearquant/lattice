@@ -629,13 +629,17 @@ mod tests {
     #[test]
     fn resolve_single_shard_rejects_parent_traversal_shard_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().parent().expect("temp dir has a parent");
+        let outside_file = outside.join("lattice_embed_vision_traversal_outside.safetensors");
+        std::fs::write(&outside_file, b"secret").expect("write outside file");
+
         let index_path = tmp.path().join("model.safetensors.index.json");
         // A mixed quantized/FP16 manifest can name an escaping FP16 shard;
         // without the shared containment helper this join would resolve
         // outside `tmp` instead of erroring.
         std::fs::write(
             &index_path,
-            r#"{"metadata":{},"weight_map":{"a":"../outside/decoder.safetensors"}}"#,
+            r#"{"metadata":{},"weight_map":{"a":"../lattice_embed_vision_traversal_outside.safetensors"}}"#,
         )
         .expect("write index");
 
@@ -643,9 +647,11 @@ mod tests {
             .expect_err("a shard name with a parent-directory component must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("parent-directory"),
+            msg.contains("escapes the checkpoint directory"),
             "expected the shared containment error, got: {msg}"
         );
+
+        std::fs::remove_file(&outside_file).ok();
     }
 
     #[test]
@@ -667,7 +673,7 @@ mod tests {
             resolve_single_shard(tmp.path()).expect_err("an absolute shard name must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("absolute"),
+            msg.contains("escapes the checkpoint directory"),
             "expected the shared containment error, got: {msg}"
         );
     }
