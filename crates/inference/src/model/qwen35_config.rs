@@ -21,6 +21,17 @@ pub const QWEN3_THINK_OPEN_TOKEN_ID: u32 = 248_068;
 pub const QWEN3_THINK_CLOSE_TOKEN_ID: u32 = 248_069;
 pub const QWEN3_NEWLINE_TOKEN_ID: u32 = 198;
 
+/// Upper bound on `num_hidden_layers` accepted from `config.json`.
+///
+/// `num_hidden_layers` comes from an untrusted checkpoint directory and, before this
+/// bound existed, only had a nonzero check. `compute_layer_types`, `normalize_layer_mask`,
+/// and the loader's `Vec::with_capacity` all allocate proportionally to it — an extreme
+/// value (e.g. `usize::MAX`) reaches those allocations before any structural validation,
+/// causing unbounded allocation / OOM / abort at model load. Real Qwen3.5 checkpoints are
+/// well under 100 layers; 512 rejects any config a real checkpoint would never carry while
+/// leaving generous headroom for future architectures.
+pub const MAX_HIDDEN_LAYERS: usize = 512;
+
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -612,6 +623,18 @@ impl Qwen35Config {
             if let Some(prf) = rp.partial_rotary_factor {
                 cfg.partial_rotary_factor = prf;
             }
+        }
+        // Bound `num_hidden_layers` before any layer-proportional allocation runs. This
+        // must precede the `compute_layer_types` call and `normalize_layer_mask` below,
+        // and the loader's `Vec::with_capacity(cfg.num_hidden_layers)` (which only ever
+        // runs against a config that passed this check) -- an unbounded value would
+        // otherwise reach those allocations first. See `MAX_HIDDEN_LAYERS` docs.
+        if cfg.num_hidden_layers > MAX_HIDDEN_LAYERS {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: num_hidden_layers ({}) exceeds MAX_HIDDEN_LAYERS \
+                 ({MAX_HIDDEN_LAYERS})",
+                cfg.num_hidden_layers
+            )));
         }
         if cfg.layer_types.len() != cfg.num_hidden_layers {
             // compute_layer_types uses `(i + 1) % interval`; a zero interval (from an
@@ -1480,6 +1503,45 @@ mod tests {
             .to_string();
         assert!(
             err.contains("num_hidden_layers"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// A checkpoint-controlled `num_hidden_layers` far past any real Qwen3.5 depth must be
+    /// rejected with a typed error at config-parse time, before `compute_layer_types` /
+    /// `normalize_layer_mask` (both of which allocate a `Vec` proportional to
+    /// `num_hidden_layers`) ever run. Uses `usize::MAX` -- the most extreme value a
+    /// malicious `config.json` could carry -- to demonstrate the guard fires before any
+    /// layer-proportional allocation is attempted.
+    #[test]
+    fn test_extreme_num_hidden_layers_rejected_before_allocation() {
+        let json = format!(
+            r#"{{"text_config": {{"num_hidden_layers": {}}}}}"#,
+            usize::MAX
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "num_hidden_layers: usize::MAX must yield an InferenceError, not a panic/OOM",
+            )
+            .to_string();
+        assert!(
+            err.contains("num_hidden_layers") && err.contains("MAX_HIDDEN_LAYERS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Same DoS vector as above with a value (10_000_000) large enough to be an absurd
+    /// layer count but small enough that, absent the `MAX_HIDDEN_LAYERS` guard, the
+    /// resulting allocation would actually complete rather than aborting the process --
+    /// this is the config used for the mutation revert-check (see fix report).
+    #[test]
+    fn test_ten_million_hidden_layers_rejected() {
+        let json = r#"{"text_config": {"num_hidden_layers": 10000000}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("num_hidden_layers: 10_000_000 must yield an InferenceError")
+            .to_string();
+        assert!(
+            err.contains("num_hidden_layers") && err.contains("MAX_HIDDEN_LAYERS"),
             "wrong guard fired: {err}"
         );
     }
