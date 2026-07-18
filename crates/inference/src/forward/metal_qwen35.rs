@@ -6838,6 +6838,461 @@ mod inner {
         /// work (and its GPU readback) is skipped. Callers with an intermediate chunk of
         /// a chunked, last-token-only (`!all_positions`) prefill — whose tail output is
         /// always discarded — pass `false`; every other caller passes `true`.
+        fn copy_prefill_embeddings(&self, token_ids: &[u32], hidden: usize) {
+            // SAFETY: embed_tokens is StorageModeShared f16 with no GPU work in flight;
+            // callers validate every token id before reaching the prefill schedulers.
+            unsafe {
+                let src_base = self.engine.embed_tokens.contents() as *const u16;
+                let dst_base = self.session.activations.hidden.contents() as *mut f32;
+                for (t, &id) in token_ids.iter().enumerate() {
+                    let src = src_base.add(id as usize * hidden);
+                    let dst = dst_base.add(t * hidden);
+                    convert_f16_row(src, dst, hidden);
+                }
+            }
+        }
+
+        fn encode_prefill_dense_mlp(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            common_w: &MetalCommonLayerWeights,
+            attention_delta: &Buffer,
+            cfg: &Qwen35Config,
+            m: u32,
+        ) {
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
+                MetalFfnWeights::Dense {
+                    gate_up_proj,
+                    down_proj,
+                } => {
+                    let byte_size = match self.engine.quant_format {
+                        QuantFormat::Q8_0 => (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64,
+                        QuantFormat::Q4_0 => (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64,
+                    };
+                    (gate_up_proj, down_proj, byte_size)
+                }
+                MetalFfnWeights::Moe(_) => {
+                    panic!("batch prefill does not support MoE layers when M>1")
+                }
+            };
+
+            self.dispatch_fused_residual_add_norm_batch(
+                enc,
+                &self.session.activations.residual,
+                attention_delta,
+                &self.session.activations.residual,
+                &self.session.activations.hidden,
+                &common_w.post_attention_layernorm,
+                hidden as u32,
+                m,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_gemm_at(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                w_gate_up,
+                0,
+                &self.session.activations.gate,
+                0,
+                m,
+                inter as u32,
+                hidden as u32,
+            );
+            self.dispatch_gemm_at(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                w_gate_up,
+                gate_byte_size,
+                &self.session.activations.up,
+                0,
+                m,
+                inter as u32,
+                hidden as u32,
+            );
+            self.dispatch_silu_mul(enc, m * inter as u32);
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.gate,
+                0,
+                w_down,
+                &self.session.activations.ffn_out,
+                0,
+                m,
+                hidden as u32,
+                inter as u32,
+            );
+            self.dispatch_add_and_copy(
+                enc,
+                &self.session.activations.ffn_out,
+                &self.session.activations.residual,
+                &self.session.activations.hidden,
+                m * hidden as u32,
+            );
+        }
+
+        fn encode_gdn_prefill_before_recurrence(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            cfg: &Qwen35Config,
+            m: u32,
+        ) {
+            let (attn_w, common_w) = &self.engine.layer_weights[compact_idx];
+            let MetalLayerAttnWeights::Linear(gdn_w) = attn_w else {
+                unreachable!()
+            };
+            self.dispatch_copy_and_rms_norm_batch(
+                enc,
+                &self.session.activations.hidden,
+                &self.session.activations.residual,
+                &common_w.input_layernorm,
+                cfg.hidden_size as u32,
+                m,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &gdn_w.in_proj_qkv,
+                &self.session.activations.gdn_qkv,
+                0,
+                m,
+                cfg.linear_qkv_dim() as u32,
+                cfg.hidden_size as u32,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &gdn_w.in_proj_z,
+                &self.session.activations.gdn_z,
+                0,
+                m,
+                cfg.linear_output_dim() as u32,
+                cfg.hidden_size as u32,
+            );
+        }
+
+        fn encode_gdn_prefill_recurrence(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            linear_idx: usize,
+            cfg: &Qwen35Config,
+            n: usize,
+            chunked_enabled: bool,
+        ) {
+            let MetalLayerAttnWeights::Linear(gdn_w) = &self.engine.layer_weights[compact_idx].0
+            else {
+                unreachable!()
+            };
+            let chunk_params = if chunked_enabled {
+                Self::make_gdn_chunk_params(cfg, n)
+            } else {
+                None
+            };
+            if let Some(params) = chunk_params {
+                let weights = GdnChunkedWeights {
+                    conv1d_weight: &gdn_w.conv1d_weight,
+                    in_proj_b: &gdn_w.in_proj_b,
+                    in_proj_a: &gdn_w.in_proj_a,
+                    a_log: &gdn_w.a_log,
+                    dt_bias: &gdn_w.dt_bias,
+                    norm_weight: &gdn_w.norm_weight,
+                };
+                self.dispatch_gdn_chunked_prefill_layer(enc, linear_idx, weights, params);
+                return;
+            }
+
+            let qkv_d = cfg.linear_qkv_dim();
+            let out_d = cfg.linear_output_dim();
+            let num_h = cfg.linear_num_key_heads;
+            let key_d = cfg.linear_key_head_dim;
+            let val_d = cfg.linear_value_head_dim;
+            let num_vh = cfg.linear_num_value_heads();
+            let q_total = (num_h * key_d) as u32;
+            #[repr(C)]
+            struct GdnRecurParams {
+                key_dim: u32,
+                value_dim: u32,
+                num_key_heads: u32,
+                num_value_heads: u32,
+                hidden_size: u32,
+                q_total: u32,
+                v_offset: u32,
+                scale: f32,
+                eps: f32,
+            }
+            let params = GdnRecurParams {
+                key_dim: key_d as u32,
+                value_dim: val_d as u32,
+                num_key_heads: num_h as u32,
+                num_value_heads: num_vh as u32,
+                hidden_size: cfg.hidden_size as u32,
+                q_total,
+                v_offset: q_total * 2,
+                scale: 1.0 / (key_d as f32).sqrt(),
+                eps: cfg.rms_norm_eps,
+            };
+            for t in 0..n {
+                let qkv_off = (t * qkv_d) as u64 * 4;
+                let z_off = (t * out_d) as u64 * 4;
+                let h_off = (t * cfg.hidden_size) as u64 * 4;
+
+                enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
+                enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+                enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), qkv_off);
+                enc.set_buffer(2, Some(&gdn_w.conv1d_weight), 0);
+                enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
+                let qd = qkv_d as u32;
+                let ks = cfg.linear_conv_kernel_dim as u32;
+                enc.set_bytes(4, 4, &qd as *const u32 as *const _);
+                enc.set_bytes(5, 4, &ks as *const u32 as *const _);
+                let wg = 256u64;
+                enc.dispatch_threads(
+                    MTLSize::new(div_ceil(qkv_d as u64, wg) * wg, 1, 1),
+                    MTLSize::new(wg, 1, 1),
+                );
+
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_recurrence);
+                enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
+                enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
+                enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
+                enc.set_buffer(3, Some(&self.session.activations.hidden), h_off);
+                enc.set_buffer(4, Some(&gdn_w.in_proj_b), 0);
+                enc.set_buffer(5, Some(&gdn_w.in_proj_a), 0);
+                enc.set_buffer(6, Some(&gdn_w.a_log), 0);
+                enc.set_buffer(7, Some(&gdn_w.dt_bias), 0);
+                enc.set_buffer(8, Some(&gdn_w.norm_weight), 0);
+                enc.set_buffer(9, Some(&self.session.activations.gdn_z), z_off);
+                enc.set_bytes(
+                    10,
+                    std::mem::size_of::<GdnRecurParams>() as u64,
+                    &params as *const GdnRecurParams as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_vh as u64, 1, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            }
+        }
+
+        fn encode_gdn_prefill_after_recurrence(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            cfg: &Qwen35Config,
+            m: u32,
+        ) {
+            let (attn_w, common_w) = &self.engine.layer_weights[compact_idx];
+            let MetalLayerAttnWeights::Linear(gdn_w) = attn_w else {
+                unreachable!()
+            };
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.gdn_z,
+                0,
+                &gdn_w.out_proj,
+                &self.session.activations.attn_out,
+                0,
+                m,
+                cfg.hidden_size as u32,
+                cfg.linear_output_dim() as u32,
+            );
+            self.encode_prefill_dense_mlp(
+                enc,
+                common_w,
+                &self.session.activations.attn_out,
+                cfg,
+                m,
+            );
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn encode_full_attention_prefill_layer(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            full_idx: usize,
+            cfg: &Qwen35Config,
+            n: usize,
+            m: u32,
+            start_pos: usize,
+        ) {
+            let hidden = cfg.hidden_size;
+            let kv_dim = cfg.full_kv_dim();
+            let q_dim = cfg.full_q_dim();
+            let num_q_heads = cfg.num_attention_heads;
+            let num_kv_heads = cfg.num_key_value_heads;
+            let head_dim = cfg.head_dim;
+            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
+            let (attn_w, common_w) = &self.engine.layer_weights[compact_idx];
+            let MetalLayerAttnWeights::Full(full_w) = attn_w else {
+                unreachable!()
+            };
+
+            self.dispatch_copy_and_rms_norm_batch(
+                enc,
+                &self.session.activations.hidden,
+                &self.session.activations.residual,
+                &common_w.input_layernorm,
+                hidden as u32,
+                m,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &full_w.q_proj,
+                &self.session.activations.q,
+                0,
+                m,
+                (2 * q_dim) as u32,
+                hidden as u32,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &full_w.k_proj,
+                &self.session.activations.k,
+                0,
+                m,
+                kv_dim as u32,
+                hidden as u32,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &full_w.v_proj,
+                &self.session.activations.v,
+                0,
+                m,
+                kv_dim as u32,
+                hidden as u32,
+            );
+
+            let base_pos = start_pos as u32;
+            let nqh = num_q_heads as u32;
+            let nkh = num_kv_heads as u32;
+            let hd = head_dim as u32;
+            self.dispatch_scatter_q_gate_batch(enc, m, nqh, hd);
+            self.dispatch_per_head_rms_norm_batch(
+                enc,
+                &self.session.activations.q_separated,
+                &full_w.q_norm,
+                m,
+                nqh,
+                hd,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_per_head_rms_norm_batch(
+                enc,
+                &self.session.activations.k,
+                &full_w.k_norm,
+                m,
+                nkh,
+                hd,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_partial_rope_batch(
+                enc,
+                &self.session.activations.q_separated,
+                m,
+                nqh,
+                hd,
+                half_rope_dim,
+                base_pos,
+            );
+            self.dispatch_partial_rope_batch(
+                enc,
+                &self.session.activations.k,
+                m,
+                nkh,
+                hd,
+                half_rope_dim,
+                base_pos,
+            );
+            self.dispatch_copy_kv_cache_batch(
+                enc,
+                &self.session.activations.k,
+                &self.session.activations.v,
+                &self.session.kv_cache.k_bufs[full_idx],
+                &self.session.kv_cache.v_bufs[full_idx],
+                m,
+                kv_dim as u32,
+                base_pos,
+            );
+
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            if self
+                .dispatch_prefill_attention_batched(
+                    enc,
+                    &self.session.kv_cache.k_bufs[full_idx],
+                    &self.session.kv_cache.v_bufs[full_idx],
+                    base_pos,
+                    m,
+                    hd,
+                    nqh,
+                    nkh,
+                    q_dim as u32,
+                    kv_dim as u32,
+                    scale,
+                )
+                .is_err()
+            {
+                for t in 0..n {
+                    let abs_pos = start_pos + t;
+                    let qs_off = (t * q_dim) as u64 * 4;
+                    let ao_off = (t * q_dim) as u64 * 4;
+                    let cache_len = (abs_pos + 1) as u32;
+                    if self.use_kv_f16 {
+                        enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention_f16);
+                    } else {
+                        enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention);
+                    }
+                    enc.set_buffer(0, Some(&self.session.activations.q_separated), qs_off);
+                    enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
+                    enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
+                    enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
+                    enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
+                    enc.set_bytes(5, 4, &hd as *const u32 as *const _);
+                    enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
+                    enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
+                    let qd = q_dim as u32;
+                    let kvd = kv_dim as u32;
+                    enc.set_bytes(8, 4, &qd as *const u32 as *const _);
+                    enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
+                    enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(nkh as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+            }
+
+            self.dispatch_sigmoid_gate(enc, m * q_dim as u32);
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.attn_out,
+                0,
+                &full_w.o_proj,
+                &self.session.activations.ffn_out,
+                0,
+                m,
+                hidden as u32,
+                q_dim as u32,
+            );
+            self.encode_prefill_dense_mlp(enc, common_w, &self.session.activations.ffn_out, cfg, m);
+        }
+
         fn forward_prefill_batched_chunk(
             &mut self,
             token_ids: &[u32],
@@ -6859,27 +7314,8 @@ mod inner {
             let cfg = self.engine.config.clone();
             let m = n as u32;
             let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
-            let kv_dim = cfg.full_kv_dim();
-            let q_dim = cfg.full_q_dim();
-            let num_q_heads = cfg.num_attention_heads;
-            let num_kv_heads = cfg.num_key_value_heads;
-            let head_dim = cfg.head_dim;
-            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
 
-            // Batch embedding: f16 → f32 for all N tokens
-            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
-            // all ids validated < vocab_size at the forward_prefill_impl entry point.
-            unsafe {
-                let src_base = self.engine.embed_tokens.contents() as *const u16;
-                let dst_base = self.session.activations.hidden.contents() as *mut f32;
-                for (t, &id) in token_ids.iter().enumerate() {
-                    let src = src_base.add(id as usize * hidden);
-                    let dst = dst_base.add(t * hidden);
-                    // SAFETY: embed_tokens row has hidden u16 values; dst row has hidden f32 values.
-                    convert_f16_row(src, dst, hidden);
-                }
-            }
+            self.copy_prefill_embeddings(token_ids, hidden);
 
             let mut active_layer_idx = 0usize;
             let mut linear_idx = 0usize;
@@ -6910,598 +7346,28 @@ mod inner {
                     MetalLayerAttnWeights::Linear(_)
                 );
 
-                // Extract weight pointers (avoids borrow conflict with &mut self)
-                let (_, common_w) = &self.engine.layer_weights[compact_idx];
-                let w_in_norm = &common_w.input_layernorm as *const Buffer;
-                let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
-                let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
-                    MetalFfnWeights::Dense {
-                        gate_up_proj,
-                        down_proj,
-                    } => {
-                        let byte_size: u64 = match self.engine.quant_format {
-                            QuantFormat::Q8_0 => {
-                                (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
-                            }
-                            QuantFormat::Q4_0 => {
-                                (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64
-                            }
-                        };
-                        (
-                            gate_up_proj as *const Q4WeightBuf,
-                            down_proj as *const Q4WeightBuf,
-                            byte_size,
-                        )
-                    }
-                    MetalFfnWeights::Moe(_) => {
-                        panic!(
-                            "forward_prefill batch GEMM: MoE layers are not supported in batch \
-                                prefill (M>1). ADR-053 v1 targets decode-mode only."
-                        );
-                    }
-                };
-
                 if is_linear {
-                    // ========= GDN layer: batch projections + sequential recurrence =========
-                    let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
-                        let MetalLayerAttnWeights::Linear(gdn_w) =
-                            &self.engine.layer_weights[compact_idx].0
-                        else {
-                            unreachable!()
-                        };
-                        (
-                            &gdn_w.in_proj_qkv as *const Q4WeightBuf,
-                            &gdn_w.in_proj_z as *const Q4WeightBuf,
-                            &gdn_w.in_proj_b as *const Buffer,
-                            &gdn_w.in_proj_a as *const Buffer,
-                            &gdn_w.a_log as *const Buffer,
-                            &gdn_w.dt_bias as *const Buffer,
-                            &gdn_w.conv1d_weight as *const Buffer,
-                            &gdn_w.norm_weight as *const Buffer,
-                            &gdn_w.out_proj as *const Q4WeightBuf,
-                        )
-                    };
-                    let qkv_d = cfg.linear_qkv_dim();
-                    let out_d = cfg.linear_output_dim();
-                    let num_h = cfg.linear_num_key_heads;
-                    let key_d = cfg.linear_key_head_dim;
-                    let val_d = cfg.linear_value_head_dim;
-                    let ks = cfg.linear_conv_kernel_dim as u32;
-
-                    // Batch: fused copy hidden → residual + norm hidden in-place.
-                    // SAFETY: w_in_norm is a live layer-owned buffer pointer (dropped only when
-                    // the model is destroyed). Activation buffers hidden/residual are sized for
-                    // m * hidden f32 elements. The Metal command buffer enc is active.
-                    unsafe {
-                        self.dispatch_copy_and_rms_norm_batch(
-                            enc,
-                            &self.session.activations.hidden,
-                            &self.session.activations.residual,
-                            &*w_in_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: QKV + Z projections (GEMM)
-                    // SAFETY: Raw GDN projection pointers are live layer-owned buffers;
-                    // GEMM dimensions match [m, hidden] by [qkv_d/out_d, hidden].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_qkv,
-                            &self.session.activations.gdn_qkv,
-                            0,
-                            m,
-                            qkv_d as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_z,
-                            &self.session.activations.gdn_z,
-                            0,
-                            m,
-                            out_d as u32,
-                            hidden as u32,
-                        );
-                    }
-
-                    // GDN recurrence: chunked-parallel path or default serial per-token.
-                    let chunk_params = if chunked_enabled {
-                        Self::make_gdn_chunk_params(&cfg, n)
-                    } else {
-                        None
-                    };
-                    if let Some(params) = chunk_params {
-                        // SAFETY: All weight/activation/state buffers are live;
-                        // GdnChunkParams dimensions match the allocation config.
-                        let weights = unsafe {
-                            GdnChunkedWeights {
-                                conv1d_weight: &*w_conv,
-                                in_proj_b: &*w_b,
-                                in_proj_a: &*w_a,
-                                a_log: &*w_alog,
-                                dt_bias: &*w_dtb,
-                                norm_weight: &*w_norm,
-                            }
-                        };
-                        self.dispatch_gdn_chunked_prefill_layer(enc, linear_idx, weights, params);
-                    } else {
-                        // Serial: conv1d + recurrence per token (causal dependency)
-                        for t in 0..n {
-                            let qkv_off = (t * qkv_d) as u64 * 4;
-                            let z_off = (t * out_d) as u64 * 4;
-                            let h_off = (t * hidden) as u64 * 4;
-
-                            // Conv1d + SiLU
-                            // SAFETY: Token offsets are within m-sized activation buffers;
-                            // conv/state/weight buffers are live for the command buffer.
-                            unsafe {
-                                enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                                enc.set_buffer(
-                                    0,
-                                    Some(&self.session.gdn_gpu_conv_bufs[linear_idx]),
-                                    0,
-                                );
-                                enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), qkv_off);
-                                enc.set_buffer(2, Some(&*w_conv), 0);
-                                enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
-                                let qd = qkv_d as u32;
-                                enc.set_bytes(4, 4, &qd as *const u32 as *const _);
-                                enc.set_bytes(5, 4, &ks as *const u32 as *const _);
-                                let wg = 256u64;
-                                enc.dispatch_threads(
-                                    MTLSize::new(div_ceil(qkv_d as u64, wg) * wg, 1, 1),
-                                    MTLSize::new(wg, 1, 1),
-                                );
-                            }
-
-                            // GDN recurrence
-                            // SAFETY: Token offsets are within the batch activation buffers;
-                            // GdnRecurParams dimensions are derived from the allocation config.
-                            unsafe {
-                                #[repr(C)]
-                                struct GdnRecurParams {
-                                    key_dim: u32,
-                                    value_dim: u32,
-                                    num_key_heads: u32,
-                                    num_value_heads: u32,
-                                    hidden_size: u32,
-                                    q_total: u32,
-                                    v_offset: u32,
-                                    scale: f32,
-                                    eps: f32,
-                                }
-                                let num_vh = cfg.linear_num_value_heads();
-                                let q_total = (num_h * key_d) as u32;
-                                let params = GdnRecurParams {
-                                    key_dim: key_d as u32,
-                                    value_dim: val_d as u32,
-                                    num_key_heads: num_h as u32,
-                                    num_value_heads: num_vh as u32,
-                                    hidden_size: hidden as u32,
-                                    q_total,
-                                    v_offset: q_total * 2,
-                                    scale: 1.0 / (key_d as f32).sqrt(),
-                                    eps: cfg.rms_norm_eps,
-                                };
-                                enc.set_compute_pipeline_state(
-                                    &self.engine.pipelines.gdn_recurrence,
-                                );
-                                enc.set_buffer(
-                                    0,
-                                    Some(&self.session.gdn_gpu_s_matrices[linear_idx]),
-                                    0,
-                                );
-                                enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
-                                enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
-                                enc.set_buffer(3, Some(&self.session.activations.hidden), h_off);
-                                enc.set_buffer(4, Some(&*w_b), 0);
-                                enc.set_buffer(5, Some(&*w_a), 0);
-                                enc.set_buffer(6, Some(&*w_alog), 0);
-                                enc.set_buffer(7, Some(&*w_dtb), 0);
-                                enc.set_buffer(8, Some(&*w_norm), 0);
-                                enc.set_buffer(9, Some(&self.session.activations.gdn_z), z_off);
-                                enc.set_bytes(
-                                    10,
-                                    std::mem::size_of::<GdnRecurParams>() as u64,
-                                    &params as *const GdnRecurParams as *const _,
-                                );
-                                enc.dispatch_thread_groups(
-                                    MTLSize::new(num_vh as u64, 1, 1),
-                                    MTLSize::new(32, 4, 1),
-                                );
-                            }
-                        }
-                    }
-
-                    // Batch: out_proj
-                    // SAFETY: The output projection pointer is live for this command
-                    // buffer and GEMM dimensions match [m, out_d] by [hidden, out_d].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gdn_z,
-                            0,
-                            &*w_out,
-                            &self.session.activations.attn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            out_d as u32,
-                        );
-                    }
-
-                    // Batch: fused residual-add + norm for MLP.
-                    // SAFETY: The post-attention norm pointer is live and hidden/m
-                    // match the activation rows in the preallocated buffers.
-                    unsafe {
-                        self.dispatch_fused_residual_add_norm_batch(
-                            enc,
-                            &self.session.activations.residual,
-                            &self.session.activations.attn_out,
-                            &self.session.activations.residual,
-                            &self.session.activations.hidden,
-                            &*w_post_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: MLP (gate + up + silu_mul + down)
-                    // SAFETY: Gate_up/down pointers are live layer-owned buffers; GEMM
-                    // dimensions match [m, hidden] by [inter, hidden].
-                    unsafe {
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            0,
-                            &self.session.activations.gate,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            gate_byte_size,
-                            &self.session.activations.up,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_silu_mul(enc, m * inter as u32);
-                    // SAFETY: Down projection pointer is live and dimensions match
-                    // [m, inter] by [hidden, inter].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gate,
-                            0,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-
-                    // Batch: fused end-of-layer residual add + copy.
-                    self.dispatch_add_and_copy(
+                    self.encode_gdn_prefill_before_recurrence(enc, compact_idx, &cfg, m);
+                    self.encode_gdn_prefill_recurrence(
                         enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
+                        compact_idx,
+                        linear_idx,
+                        &cfg,
+                        n,
+                        chunked_enabled,
                     );
-
+                    self.encode_gdn_prefill_after_recurrence(enc, compact_idx, &cfg, m);
                     linear_idx += 1;
                 } else {
-                    // ========= Full attention layer: batch proj + sequential attention =========
-                    let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
-                        let MetalLayerAttnWeights::Full(full_w) =
-                            &self.engine.layer_weights[compact_idx].0
-                        else {
-                            unreachable!()
-                        };
-                        (
-                            &full_w.q_proj as *const Q4WeightBuf,
-                            &full_w.k_proj as *const Q4WeightBuf,
-                            &full_w.v_proj as *const Q4WeightBuf,
-                            &full_w.o_proj as *const Q4WeightBuf,
-                            &full_w.q_norm as *const Buffer,
-                            &full_w.k_norm as *const Buffer,
-                        )
-                    };
-                    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-                    // Batch: fused copy hidden → residual + norm hidden in-place.
-                    // SAFETY: w_in_norm is a live layer-owned buffer pointer (dropped only when
-                    // the model is destroyed). Activation buffers hidden/residual are sized for
-                    // m * hidden f32 elements. The Metal command buffer enc is active.
-                    unsafe {
-                        self.dispatch_copy_and_rms_norm_batch(
-                            enc,
-                            &self.session.activations.hidden,
-                            &self.session.activations.residual,
-                            &*w_in_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: Q/K/V projections (GEMM)
-                    // SAFETY: Raw attention projection pointers are live layer-owned
-                    // buffers; GEMM dimensions match batch hidden/q/kv layouts.
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_q,
-                            &self.session.activations.q,
-                            0,
-                            m,
-                            (2 * q_dim) as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_k,
-                            &self.session.activations.k,
-                            0,
-                            m,
-                            kv_dim as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_v,
-                            &self.session.activations.v,
-                            0,
-                            m,
-                            kv_dim as u32,
-                            hidden as u32,
-                        );
-                    }
-
-                    // Win 1: batch scatter, norm, RoPE, and KV store — one dispatch each
-                    // instead of n dispatches. Attention loop (Win 2) kept per-token.
-                    {
-                        let base_pos = start_pos as u32;
-                        let num_tok = m;
-                        let nqh = num_q_heads as u32;
-                        let nkh = num_kv_heads as u32;
-                        let hd = head_dim as u32;
-                        let kvd = kv_dim as u32;
-                        // SAFETY: Layer norm weight pointers are live for the command buffer duration.
-                        let (qn_ref, kn_ref): (&Buffer, &Buffer) = unsafe { (&*w_qn, &*w_kn) };
-
-                        self.dispatch_scatter_q_gate_batch(enc, num_tok, nqh, hd);
-                        self.dispatch_per_head_rms_norm_batch(
-                            enc,
-                            &self.session.activations.q_separated,
-                            qn_ref,
-                            num_tok,
-                            nqh,
-                            hd,
-                            cfg.rms_norm_eps,
-                        );
-                        self.dispatch_per_head_rms_norm_batch(
-                            enc,
-                            &self.session.activations.k,
-                            kn_ref,
-                            num_tok,
-                            nkh,
-                            hd,
-                            cfg.rms_norm_eps,
-                        );
-                        self.dispatch_partial_rope_batch(
-                            enc,
-                            &self.session.activations.q_separated,
-                            num_tok,
-                            nqh,
-                            hd,
-                            half_rope_dim,
-                            base_pos,
-                        );
-                        self.dispatch_partial_rope_batch(
-                            enc,
-                            &self.session.activations.k,
-                            num_tok,
-                            nkh,
-                            hd,
-                            half_rope_dim,
-                            base_pos,
-                        );
-                        self.dispatch_copy_kv_cache_batch(
-                            enc,
-                            &self.session.activations.k,
-                            &self.session.activations.v,
-                            &self.session.kv_cache.k_bufs[full_idx],
-                            &self.session.kv_cache.v_bufs[full_idx],
-                            num_tok,
-                            kvd,
-                            base_pos,
-                        );
-                    }
-
-                    // Win 2: batched causal prefill attention — one dispatch for all n tokens.
-                    // Falls back to the per-token loop only if shape validation fails.
-                    if self
-                        .dispatch_prefill_attention_batched(
-                            enc,
-                            &self.session.kv_cache.k_bufs[full_idx],
-                            &self.session.kv_cache.v_bufs[full_idx],
-                            start_pos as u32,
-                            m,
-                            head_dim as u32,
-                            num_q_heads as u32,
-                            num_kv_heads as u32,
-                            q_dim as u32,
-                            kv_dim as u32,
-                            scale,
-                        )
-                        .is_err()
-                    {
-                        for t in 0..n {
-                            let abs_pos = start_pos + t;
-                            let qs_off = (t * q_dim) as u64 * 4;
-                            let ao_off = (t * q_dim) as u64 * 4;
-                            let cache_len = (abs_pos + 1) as u32;
-                            let hd = head_dim as u32;
-                            let nqh = num_q_heads as u32;
-                            let nkh = num_kv_heads as u32;
-                            let qd = q_dim as u32;
-                            let kvd = kv_dim as u32;
-                            // Per-token q/attn_out offsets are within batch activation buffers.
-                            {
-                                if self.use_kv_f16 {
-                                    enc.set_compute_pipeline_state(
-                                        &self.engine.pipelines.decode_attention_f16,
-                                    );
-                                } else {
-                                    enc.set_compute_pipeline_state(
-                                        &self.engine.pipelines.decode_attention,
-                                    );
-                                }
-                                enc.set_buffer(
-                                    0,
-                                    Some(&self.session.activations.q_separated),
-                                    qs_off,
-                                );
-                                enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
-                                enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
-                                enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
-                                enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
-                                enc.set_bytes(5, 4, &hd as *const u32 as *const _);
-                                enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
-                                enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
-                                enc.set_bytes(8, 4, &qd as *const u32 as *const _);
-                                enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
-                                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
-                                // Grid axis = num_kv_heads: see fallback site above for
-                                // the invariant. Same kernel, same geometry requirement.
-                                enc.dispatch_thread_groups(
-                                    MTLSize::new(nkh as u64, 1, 1),
-                                    MTLSize::new(256, 1, 1),
-                                );
-                            }
-                        }
-                    }
-
-                    // Sigmoid gate over all n*q_dim outputs in one dispatch.
-                    self.dispatch_sigmoid_gate(enc, m * q_dim as u32);
-
-                    // Batch: O projection (attn_out[N, q_dim] → ffn_out[N, hidden])
-                    // SAFETY: O-projection pointer is live and dimensions match
-                    // [m, q_dim] by [hidden, q_dim].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.attn_out,
-                            0,
-                            &*w_o,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            q_dim as u32,
-                        );
-                    }
-
-                    // Batch: fused residual-add + norm for MLP.
-                    // SAFETY: The post-attention norm pointer is live and hidden/m
-                    // match the activation rows in the preallocated buffers.
-                    unsafe {
-                        self.dispatch_fused_residual_add_norm_batch(
-                            enc,
-                            &self.session.activations.residual,
-                            &self.session.activations.ffn_out,
-                            &self.session.activations.residual,
-                            &self.session.activations.hidden,
-                            &*w_post_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: MLP
-                    // SAFETY: Gate_up/down pointers are live layer-owned buffers; GEMM
-                    // dimensions match [m, hidden] by [inter, hidden].
-                    unsafe {
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            0,
-                            &self.session.activations.gate,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            gate_byte_size,
-                            &self.session.activations.up,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_silu_mul(enc, m * inter as u32);
-                    // SAFETY: Down projection pointer is live and dimensions match
-                    // [m, inter] by [hidden, inter].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gate,
-                            0,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-
-                    // Batch: fused end-of-layer residual add + copy.
-                    self.dispatch_add_and_copy(
+                    self.encode_full_attention_prefill_layer(
                         enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
+                        compact_idx,
+                        full_idx,
+                        &cfg,
+                        n,
+                        m,
+                        start_pos,
                     );
-
                     full_idx += 1;
                 }
             }
@@ -7774,30 +7640,8 @@ mod inner {
             let cfg = self.engine.config.clone();
             let m = n as u32;
             let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
-            let kv_dim = cfg.full_kv_dim();
-            let q_dim = cfg.full_q_dim();
-            let num_q_heads = cfg.num_attention_heads;
-            let num_kv_heads = cfg.num_key_value_heads;
-            let head_dim = cfg.head_dim;
-            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
 
-            // Batch embedding: f16 -> f32 for all N tokens. Identical to
-            // forward_prefill_batched_chunk; embedding is CPU-side memcpy work, held
-            // fixed across serial/chunked and excluded from both timing buckets below
-            // (it happens before the first command buffer opens).
-            //
-            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight; token
-            // ids are validated by the harness bin before this is ever called.
-            unsafe {
-                let src_base = self.engine.embed_tokens.contents() as *const u16;
-                let dst_base = self.session.activations.hidden.contents() as *mut f32;
-                for (t, &id) in token_ids.iter().enumerate() {
-                    let src = src_base.add(id as usize * hidden);
-                    let dst = dst_base.add(t * hidden);
-                    convert_f16_row(src, dst, hidden);
-                }
-            }
+            self.copy_prefill_embeddings(token_ids, hidden);
 
             let mut active_layer_idx = 0usize;
             let mut linear_idx = 0usize;
@@ -7835,104 +7679,8 @@ mod inner {
                     MetalLayerAttnWeights::Linear(_)
                 );
 
-                // Extract weight pointers (avoids borrow conflict with &mut self) --
-                // identical pattern to forward_prefill_batched_chunk.
-                let (_, common_w) = &self.engine.layer_weights[compact_idx];
-                let w_in_norm = &common_w.input_layernorm as *const Buffer;
-                let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
-                let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
-                    MetalFfnWeights::Dense {
-                        gate_up_proj,
-                        down_proj,
-                    } => {
-                        let byte_size: u64 = match self.engine.quant_format {
-                            QuantFormat::Q8_0 => {
-                                (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
-                            }
-                            QuantFormat::Q4_0 => {
-                                (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64
-                            }
-                        };
-                        (
-                            gate_up_proj as *const Q4WeightBuf,
-                            down_proj as *const Q4WeightBuf,
-                            byte_size,
-                        )
-                    }
-                    MetalFfnWeights::Moe(_) => {
-                        panic!(
-                            "forward_prefill_chunk_gdn_isolated: MoE layers are not \
-                             supported in batch prefill (M>1); the #175 harness is \
-                             0.8B-only (dense), this branch is unreachable there."
-                        );
-                    }
-                };
-
                 if is_linear {
-                    // ========= GDN layer: batch projections + isolated recurrence =========
-                    let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
-                        let MetalLayerAttnWeights::Linear(gdn_w) =
-                            &self.engine.layer_weights[compact_idx].0
-                        else {
-                            unreachable!()
-                        };
-                        (
-                            &gdn_w.in_proj_qkv as *const Q4WeightBuf,
-                            &gdn_w.in_proj_z as *const Q4WeightBuf,
-                            &gdn_w.in_proj_b as *const Buffer,
-                            &gdn_w.in_proj_a as *const Buffer,
-                            &gdn_w.a_log as *const Buffer,
-                            &gdn_w.dt_bias as *const Buffer,
-                            &gdn_w.conv1d_weight as *const Buffer,
-                            &gdn_w.norm_weight as *const Buffer,
-                            &gdn_w.out_proj as *const Q4WeightBuf,
-                        )
-                    };
-                    let qkv_d = cfg.linear_qkv_dim();
-                    let out_d = cfg.linear_output_dim();
-                    let num_h = cfg.linear_num_key_heads;
-                    let key_d = cfg.linear_key_head_dim;
-                    let val_d = cfg.linear_value_head_dim;
-                    let ks = cfg.linear_conv_kernel_dim as u32;
-
-                    // Batch: fused copy hidden -> residual + norm hidden in-place.
-                    unsafe {
-                        self.dispatch_copy_and_rms_norm_batch(
-                            enc,
-                            &self.session.activations.hidden,
-                            &self.session.activations.residual,
-                            &*w_in_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: QKV + Z projections (GEMM) -- non-GDN, stays in this segment.
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_qkv,
-                            &self.session.activations.gdn_qkv,
-                            0,
-                            m,
-                            qkv_d as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_z,
-                            &self.session.activations.gdn_z,
-                            0,
-                            m,
-                            out_d as u32,
-                            hidden as u32,
-                        );
-                    }
+                    self.encode_gdn_prefill_before_recurrence(enc, compact_idx, &cfg, m);
 
                     // ---- GDN isolation boundary: close the pre-GDN (non-GDN) segment ----
                     enc.end_encoding();
@@ -7944,118 +7692,14 @@ mod inner {
                     let gdn_enc = gdn_cmd.new_compute_command_encoder();
                     let gdn_start = std::time::Instant::now();
 
-                    // GDN recurrence: chunked-parallel path or serial per-token --
-                    // dispatch calls/args are byte-identical to
-                    // forward_prefill_batched_chunk, only the target encoder differs.
-                    let chunk_params = if chunked_enabled {
-                        Self::make_gdn_chunk_params(&cfg, n)
-                    } else {
-                        None
-                    };
-                    if let Some(params) = chunk_params {
-                        let weights = unsafe {
-                            GdnChunkedWeights {
-                                conv1d_weight: &*w_conv,
-                                in_proj_b: &*w_b,
-                                in_proj_a: &*w_a,
-                                a_log: &*w_alog,
-                                dt_bias: &*w_dtb,
-                                norm_weight: &*w_norm,
-                            }
-                        };
-                        self.dispatch_gdn_chunked_prefill_layer(
-                            gdn_enc, linear_idx, weights, params,
-                        );
-                    } else {
-                        for t in 0..n {
-                            let qkv_off = (t * qkv_d) as u64 * 4;
-                            let z_off = (t * out_d) as u64 * 4;
-                            let h_off = (t * hidden) as u64 * 4;
-
-                            unsafe {
-                                gdn_enc
-                                    .set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                                gdn_enc.set_buffer(
-                                    0,
-                                    Some(&self.session.gdn_gpu_conv_bufs[linear_idx]),
-                                    0,
-                                );
-                                gdn_enc.set_buffer(
-                                    1,
-                                    Some(&self.session.activations.gdn_qkv),
-                                    qkv_off,
-                                );
-                                gdn_enc.set_buffer(2, Some(&*w_conv), 0);
-                                gdn_enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
-                                let qd = qkv_d as u32;
-                                gdn_enc.set_bytes(4, 4, &qd as *const u32 as *const _);
-                                gdn_enc.set_bytes(5, 4, &ks as *const u32 as *const _);
-                                let wg = 256u64;
-                                gdn_enc.dispatch_threads(
-                                    MTLSize::new(div_ceil(qkv_d as u64, wg) * wg, 1, 1),
-                                    MTLSize::new(wg, 1, 1),
-                                );
-                            }
-
-                            unsafe {
-                                #[repr(C)]
-                                struct GdnRecurParams {
-                                    key_dim: u32,
-                                    value_dim: u32,
-                                    num_key_heads: u32,
-                                    num_value_heads: u32,
-                                    hidden_size: u32,
-                                    q_total: u32,
-                                    v_offset: u32,
-                                    scale: f32,
-                                    eps: f32,
-                                }
-                                let num_vh = cfg.linear_num_value_heads();
-                                let q_total = (num_h * key_d) as u32;
-                                let params = GdnRecurParams {
-                                    key_dim: key_d as u32,
-                                    value_dim: val_d as u32,
-                                    num_key_heads: num_h as u32,
-                                    num_value_heads: num_vh as u32,
-                                    hidden_size: hidden as u32,
-                                    q_total,
-                                    v_offset: q_total * 2,
-                                    scale: 1.0 / (key_d as f32).sqrt(),
-                                    eps: cfg.rms_norm_eps,
-                                };
-                                gdn_enc.set_compute_pipeline_state(
-                                    &self.engine.pipelines.gdn_recurrence,
-                                );
-                                gdn_enc.set_buffer(
-                                    0,
-                                    Some(&self.session.gdn_gpu_s_matrices[linear_idx]),
-                                    0,
-                                );
-                                gdn_enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
-                                gdn_enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
-                                gdn_enc.set_buffer(
-                                    3,
-                                    Some(&self.session.activations.hidden),
-                                    h_off,
-                                );
-                                gdn_enc.set_buffer(4, Some(&*w_b), 0);
-                                gdn_enc.set_buffer(5, Some(&*w_a), 0);
-                                gdn_enc.set_buffer(6, Some(&*w_alog), 0);
-                                gdn_enc.set_buffer(7, Some(&*w_dtb), 0);
-                                gdn_enc.set_buffer(8, Some(&*w_norm), 0);
-                                gdn_enc.set_buffer(9, Some(&self.session.activations.gdn_z), z_off);
-                                gdn_enc.set_bytes(
-                                    10,
-                                    std::mem::size_of::<GdnRecurParams>() as u64,
-                                    &params as *const GdnRecurParams as *const _,
-                                );
-                                gdn_enc.dispatch_thread_groups(
-                                    MTLSize::new(num_vh as u64, 1, 1),
-                                    MTLSize::new(32, 4, 1),
-                                );
-                            }
-                        }
-                    }
+                    self.encode_gdn_prefill_recurrence(
+                        gdn_enc,
+                        compact_idx,
+                        linear_idx,
+                        &cfg,
+                        n,
+                        chunked_enabled,
+                    );
 
                     gdn_enc.end_encoding();
                     gdn_cmd.commit();
@@ -8084,354 +7728,18 @@ mod inner {
                     enc = cmd.new_compute_command_encoder();
                     seg_start = std::time::Instant::now();
 
-                    // Batch: out_proj -- non-GDN, in the fresh post-GDN segment.
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gdn_z,
-                            0,
-                            &*w_out,
-                            &self.session.activations.attn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            out_d as u32,
-                        );
-                    }
-
-                    // Batch: fused residual-add + norm for MLP.
-                    unsafe {
-                        self.dispatch_fused_residual_add_norm_batch(
-                            enc,
-                            &self.session.activations.residual,
-                            &self.session.activations.attn_out,
-                            &self.session.activations.residual,
-                            &self.session.activations.hidden,
-                            &*w_post_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: MLP (gate + up + silu_mul + down)
-                    unsafe {
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            0,
-                            &self.session.activations.gate,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            gate_byte_size,
-                            &self.session.activations.up,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_silu_mul(enc, m * inter as u32);
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gate,
-                            0,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-
-                    // Batch: fused end-of-layer residual add + copy.
-                    self.dispatch_add_and_copy(
-                        enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
-                    );
-
+                    self.encode_gdn_prefill_after_recurrence(enc, compact_idx, &cfg, m);
                     linear_idx += 1;
                 } else {
-                    // ========= Full attention layer: byte-identical to
-                    // forward_prefill_batched_chunk's else-branch. No GDN work here,
-                    // so it just dispatches into whichever segment is currently open
-                    // (never split). =========
-                    let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
-                        let MetalLayerAttnWeights::Full(full_w) =
-                            &self.engine.layer_weights[compact_idx].0
-                        else {
-                            unreachable!()
-                        };
-                        (
-                            &full_w.q_proj as *const Q4WeightBuf,
-                            &full_w.k_proj as *const Q4WeightBuf,
-                            &full_w.v_proj as *const Q4WeightBuf,
-                            &full_w.o_proj as *const Q4WeightBuf,
-                            &full_w.q_norm as *const Buffer,
-                            &full_w.k_norm as *const Buffer,
-                        )
-                    };
-                    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-                    unsafe {
-                        self.dispatch_copy_and_rms_norm_batch(
-                            enc,
-                            &self.session.activations.hidden,
-                            &self.session.activations.residual,
-                            &*w_in_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_q,
-                            &self.session.activations.q,
-                            0,
-                            m,
-                            (2 * q_dim) as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_k,
-                            &self.session.activations.k,
-                            0,
-                            m,
-                            kv_dim as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_v,
-                            &self.session.activations.v,
-                            0,
-                            m,
-                            kv_dim as u32,
-                            hidden as u32,
-                        );
-                    }
-
-                    {
-                        let base_pos = start_pos as u32;
-                        let num_tok = m;
-                        let nqh = num_q_heads as u32;
-                        let nkh = num_kv_heads as u32;
-                        let hd = head_dim as u32;
-                        let kvd = kv_dim as u32;
-                        let (qn_ref, kn_ref): (&Buffer, &Buffer) = unsafe { (&*w_qn, &*w_kn) };
-
-                        self.dispatch_scatter_q_gate_batch(enc, num_tok, nqh, hd);
-                        self.dispatch_per_head_rms_norm_batch(
-                            enc,
-                            &self.session.activations.q_separated,
-                            qn_ref,
-                            num_tok,
-                            nqh,
-                            hd,
-                            cfg.rms_norm_eps,
-                        );
-                        self.dispatch_per_head_rms_norm_batch(
-                            enc,
-                            &self.session.activations.k,
-                            kn_ref,
-                            num_tok,
-                            nkh,
-                            hd,
-                            cfg.rms_norm_eps,
-                        );
-                        self.dispatch_partial_rope_batch(
-                            enc,
-                            &self.session.activations.q_separated,
-                            num_tok,
-                            nqh,
-                            hd,
-                            half_rope_dim,
-                            base_pos,
-                        );
-                        self.dispatch_partial_rope_batch(
-                            enc,
-                            &self.session.activations.k,
-                            num_tok,
-                            nkh,
-                            hd,
-                            half_rope_dim,
-                            base_pos,
-                        );
-                        self.dispatch_copy_kv_cache_batch(
-                            enc,
-                            &self.session.activations.k,
-                            &self.session.activations.v,
-                            &self.session.kv_cache.k_bufs[full_idx],
-                            &self.session.kv_cache.v_bufs[full_idx],
-                            num_tok,
-                            kvd,
-                            base_pos,
-                        );
-                    }
-
-                    if self
-                        .dispatch_prefill_attention_batched(
-                            enc,
-                            &self.session.kv_cache.k_bufs[full_idx],
-                            &self.session.kv_cache.v_bufs[full_idx],
-                            start_pos as u32,
-                            m,
-                            head_dim as u32,
-                            num_q_heads as u32,
-                            num_kv_heads as u32,
-                            q_dim as u32,
-                            kv_dim as u32,
-                            scale,
-                        )
-                        .is_err()
-                    {
-                        for t in 0..n {
-                            let abs_pos = start_pos + t;
-                            let qs_off = (t * q_dim) as u64 * 4;
-                            let ao_off = (t * q_dim) as u64 * 4;
-                            let cache_len = (abs_pos + 1) as u32;
-                            let hd = head_dim as u32;
-                            let nqh = num_q_heads as u32;
-                            let nkh = num_kv_heads as u32;
-                            let qd = q_dim as u32;
-                            let kvd = kv_dim as u32;
-                            {
-                                if self.use_kv_f16 {
-                                    enc.set_compute_pipeline_state(
-                                        &self.engine.pipelines.decode_attention_f16,
-                                    );
-                                } else {
-                                    enc.set_compute_pipeline_state(
-                                        &self.engine.pipelines.decode_attention,
-                                    );
-                                }
-                                enc.set_buffer(
-                                    0,
-                                    Some(&self.session.activations.q_separated),
-                                    qs_off,
-                                );
-                                enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
-                                enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
-                                enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
-                                enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
-                                enc.set_bytes(5, 4, &hd as *const u32 as *const _);
-                                enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
-                                enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
-                                enc.set_bytes(8, 4, &qd as *const u32 as *const _);
-                                enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
-                                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
-                                enc.dispatch_thread_groups(
-                                    MTLSize::new(nkh as u64, 1, 1),
-                                    MTLSize::new(256, 1, 1),
-                                );
-                            }
-                        }
-                    }
-
-                    self.dispatch_sigmoid_gate(enc, m * q_dim as u32);
-
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.attn_out,
-                            0,
-                            &*w_o,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            q_dim as u32,
-                        );
-                    }
-
-                    unsafe {
-                        self.dispatch_fused_residual_add_norm_batch(
-                            enc,
-                            &self.session.activations.residual,
-                            &self.session.activations.ffn_out,
-                            &self.session.activations.residual,
-                            &self.session.activations.hidden,
-                            &*w_post_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    unsafe {
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            0,
-                            &self.session.activations.gate,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            gate_byte_size,
-                            &self.session.activations.up,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_silu_mul(enc, m * inter as u32);
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gate,
-                            0,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-
-                    self.dispatch_add_and_copy(
+                    self.encode_full_attention_prefill_layer(
                         enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
+                        compact_idx,
+                        full_idx,
+                        &cfg,
+                        n,
+                        m,
+                        start_pos,
                     );
-
                     full_idx += 1;
                 }
             }
@@ -25121,6 +24429,165 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             (cfg, weights)
         }
 
+        #[cfg(feature = "bench-internals")]
+        fn tiny_chunked_prefill_fixture() -> (Qwen35Config, ModelWeights) {
+            use crate::attention::gdn::GatedDeltaNetWeights;
+
+            let hidden = 1024usize;
+            let intermediate = 32usize;
+            let vocab = 32usize;
+            let num_kh = 16usize;
+            let kd = 128usize;
+            let vd = 128usize;
+            let qkv_dim = num_kh * (2 * kd + vd);
+            let out_dim = num_kh * vd;
+            let ks = 4usize;
+            let cfg = Qwen35Config {
+                hidden_size: hidden,
+                num_hidden_layers: 2,
+                vocab_size: vocab,
+                intermediate_size: intermediate,
+                rms_norm_eps: 1e-6,
+                num_attention_heads: 4,
+                num_key_value_heads: 1,
+                head_dim: 256,
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: 0.25,
+                rope_parameters: None,
+                linear_num_key_heads: num_kh,
+                linear_num_value_heads: Some(num_kh),
+                linear_key_head_dim: kd,
+                linear_value_head_dim: vd,
+                linear_conv_kernel_dim: ks,
+                num_experts: None,
+                num_experts_per_tok: None,
+                moe_intermediate_size: None,
+                shared_expert_intermediate_size: None,
+                output_router_logits: false,
+                router_aux_loss_coef: None,
+                tie_word_embeddings: true,
+                mtp_num_hidden_layers: 0,
+                mtp_use_dedicated_embeddings: false,
+                full_attention_interval: 2,
+                layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+                layer_mask: vec![true; 2],
+                eos_token_id: (vocab - 1) as u32,
+                max_position_embeddings: 64,
+                quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+            };
+
+            let patterned = |len: usize, seed: usize, scale: f32| -> Vec<f32> {
+                (0..len)
+                    .map(|i| {
+                        let bucket = (i.wrapping_mul(37).wrapping_add(seed)) % 31;
+                        (bucket as f32 - 15.0) * scale
+                    })
+                    .collect()
+            };
+            let make_common = || CommonLayerWeights {
+                input_layernorm: patterned(hidden, 1, 0.002),
+                post_attention_layernorm: patterned(hidden, 2, 0.002),
+                ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                    gate_proj: patterned(intermediate * hidden, 3, 0.001),
+                    up_proj: patterned(intermediate * hidden, 4, 0.001),
+                    down_proj: patterned(hidden * intermediate, 5, 0.001),
+                }),
+            };
+            let gdn = AttentionWeights::Linear(GatedDeltaNetWeights {
+                in_proj_qkv: patterned(qkv_dim * hidden, 6, 0.0005),
+                in_proj_qkv_rows: qkv_dim,
+                in_proj_qkv_cols: hidden,
+                in_proj_z: patterned(out_dim * hidden, 7, 0.0005),
+                in_proj_z_rows: out_dim,
+                in_proj_z_cols: hidden,
+                in_proj_b: patterned(num_kh * hidden, 8, 0.001),
+                in_proj_b_rows: num_kh,
+                in_proj_b_cols: hidden,
+                in_proj_a: patterned(num_kh * hidden, 9, 0.001),
+                in_proj_a_rows: num_kh,
+                in_proj_a_cols: hidden,
+                a_log: patterned(num_kh, 10, 0.01),
+                dt_bias: patterned(num_kh, 11, 0.01),
+                conv1d_weight: patterned(qkv_dim * ks, 12, 0.002),
+                conv_dim: qkv_dim,
+                kernel_size: ks,
+                norm_weight: patterned(out_dim, 13, 0.002),
+                out_proj: patterned(hidden * out_dim, 14, 0.0005),
+                out_proj_rows: hidden,
+                out_proj_cols: out_dim,
+            });
+            let full = AttentionWeights::Full(FullAttentionLayerWeights {
+                q_proj: patterned(2 * cfg.full_q_dim() * hidden, 15, 0.0005),
+                k_proj: patterned(cfg.full_kv_dim() * hidden, 16, 0.0005),
+                v_proj: patterned(cfg.full_kv_dim() * hidden, 17, 0.0005),
+                o_proj: patterned(hidden * cfg.full_q_dim(), 18, 0.0005),
+                q_norm: patterned(cfg.head_dim, 19, 0.002),
+                k_norm: patterned(cfg.head_dim, 20, 0.002),
+            });
+            let weights = ModelWeights {
+                embed_tokens: patterned(vocab * hidden, 21, 0.002),
+                lm_head: None,
+                final_norm: patterned(hidden, 22, 0.002),
+                layers: vec![(gdn, make_common()), (full, make_common())],
+            };
+            (cfg, weights)
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[derive(Debug, PartialEq)]
+        struct PrefillSchedulerArtifacts {
+            position: usize,
+            kv_rows: Vec<(Vec<u8>, Vec<u8>)>,
+            gdn_snapshot: crate::attention::gdn::GdnSnapshot,
+            next_token: usize,
+        }
+
+        #[cfg(feature = "bench-internals")]
+        fn prefill_scheduler_artifacts(
+            state: &mut MetalQwen35State,
+            token_ids: &[u32],
+            next_input: u32,
+        ) -> PrefillSchedulerArtifacts {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let kv_row_bytes = if state.use_kv_f16 { 2 } else { 4 };
+            let used_bytes = token_ids.len() * state.engine.config.full_kv_dim() * kv_row_bytes;
+            let kv_rows = state
+                .session
+                .kv_cache
+                .k_bufs
+                .iter()
+                .zip(&state.session.kv_cache.v_bufs)
+                .map(|(k, v)| {
+                    // SAFETY: Both buffers are StorageModeShared, the scheduler waited for its
+                    // command buffers, and used_bytes covers only initialized prefix rows.
+                    unsafe {
+                        let k_bytes =
+                            std::slice::from_raw_parts(k.contents() as *const u8, used_bytes)
+                                .to_vec();
+                        let v_bytes =
+                            std::slice::from_raw_parts(v.contents() as *const u8, used_bytes)
+                                .to_vec();
+                        (k_bytes, v_bytes)
+                    }
+                })
+                .collect();
+            let position = state.session.position;
+            let gdn_snapshot = state.snapshot_gdn_states();
+            let next_logits = state.forward_step(next_input, token_ids.len());
+            PrefillSchedulerArtifacts {
+                position,
+                kv_rows,
+                gdn_snapshot,
+                next_token: argmax_f32(&next_logits),
+            }
+        }
+
         #[test]
         fn forward_step_gdn_only_does_not_advance_kv_cache() {
             let Some(_) = metal::Device::system_default() else {
@@ -30382,6 +29849,132 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 MetalQwen35State::make_gdn_chunk_params(&cfg, 0).is_none(),
                 "n_tokens=0 should return None"
             );
+        }
+
+        #[cfg(feature = "bench-internals")]
+        fn run_gdn_prefill_scheduler_pair(
+            cfg: &Qwen35Config,
+            weights: &ModelWeights,
+            tokens: &[u32],
+            chunked: bool,
+        ) -> (
+            PrefillSchedulerArtifacts,
+            PrefillSchedulerArtifacts,
+            bench_support::GdnIsolatedChunkTiming,
+            Vec<bench_support::GdnLayerCapture>,
+        ) {
+            let mut production =
+                MetalQwen35State::new(weights, cfg, 16).expect("production scheduler fixture");
+            production.use_gdn_chunked = chunked;
+            let _ = production.forward_prefill_batched_chunk(tokens, 0, true, false);
+            let production_artifacts = prefill_scheduler_artifacts(&mut production, tokens, 9);
+
+            let mut isolated =
+                MetalQwen35State::new(weights, cfg, 16).expect("isolated scheduler fixture");
+            isolated.use_gdn_chunked = chunked;
+            let capture_requests = if chunked {
+                vec![bench_support::GdnCaptureRequest {
+                    linear_idx: 0,
+                    value_head: 3,
+                }]
+            } else {
+                vec![]
+            };
+            let (timing, captures) =
+                isolated.forward_prefill_chunk_gdn_isolated(tokens, 0, &capture_requests);
+            let isolated_artifacts = prefill_scheduler_artifacts(&mut isolated, tokens, 9);
+            (production_artifacts, isolated_artifacts, timing, captures)
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn gdn_prefill_production_and_isolated_scheduler_state_matches() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_chunked_prefill_fixture();
+            let tokens = [1, 3, 5, 7];
+            for chunked in [false, true] {
+                let (production, isolated, _, _) =
+                    run_gdn_prefill_scheduler_pair(&cfg, &weights, &tokens, chunked);
+                assert_eq!(production.position, isolated.position, "chunked={chunked}");
+                assert_eq!(production.kv_rows, isolated.kv_rows, "chunked={chunked}");
+                assert_eq!(
+                    production.gdn_snapshot, isolated.gdn_snapshot,
+                    "chunked={chunked}"
+                );
+            }
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn gdn_prefill_scheduler_followup_and_capture_match() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_chunked_prefill_fixture();
+            let tokens = [1, 3, 5, 7];
+            for chunked in [false, true] {
+                let (production, isolated, timing, captures) =
+                    run_gdn_prefill_scheduler_pair(&cfg, &weights, &tokens, chunked);
+                assert_eq!(
+                    production.next_token, isolated.next_token,
+                    "chunked={chunked}"
+                );
+                assert_eq!(timing.num_gdn_layers, 1, "chunked={chunked}");
+                if chunked {
+                    assert_eq!(captures.len(), 1);
+                    let capture = &captures[0];
+                    assert_eq!(capture.linear_idx, 0);
+                    assert_eq!(capture.value_head, 3);
+                    assert_eq!(capture.length, tokens.len());
+                    assert_eq!(capture.dk, 128);
+                    assert_eq!(capture.dv, 128);
+                    assert_eq!(capture.q.len(), tokens.len() * capture.dk);
+                    assert_eq!(capture.k.len(), tokens.len() * capture.dk);
+                    assert_eq!(capture.v.len(), tokens.len() * capture.dv);
+                    assert_eq!(capture.beta.len(), tokens.len());
+                    assert_eq!(capture.log_alpha.len(), tokens.len());
+                } else {
+                    assert!(captures.is_empty());
+                }
+            }
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn gdn_prefill_schedulers_preserve_unsupported_chunked_policy() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            assert!(!MetalQwen35State::supports_gdn_chunked_prefill(&cfg));
+
+            let mut production =
+                MetalQwen35State::new(&weights, &cfg, 8).expect("production fallback fixture");
+            production.use_gdn_chunked = true;
+            let _ = production.forward_prefill_batched_chunk(&[1, 2], 0, true, false);
+            assert_eq!(production.session.position, 2);
+            assert_eq!(production.session.kv_cache.seq_len, 2);
+
+            use crate::speculative::MtpTargetVerifier as _;
+            let mut isolated =
+                MetalQwen35State::new(&weights, &cfg, 8).expect("isolated preflight fixture");
+            isolated.use_gdn_chunked = true;
+            let before = isolated.snapshot_gdn_states();
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                isolated.forward_prefill_chunk_gdn_isolated(&[1, 2], 0, &[])
+            }));
+            assert!(
+                panic.is_err(),
+                "isolated scheduler must reject unsupported chunked GDN"
+            );
+            assert_eq!(isolated.session.position, 0);
+            assert_eq!(isolated.session.kv_cache.seq_len, 0);
+            assert_eq!(isolated.snapshot_gdn_states(), before);
         }
 
         /// Verify make_gdn_chunk_params with tail chunk (n_tokens not multiple of 32).
