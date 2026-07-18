@@ -196,6 +196,106 @@ const MAX_LOGITS_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// this driver.
 const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Upper bound on the per-sample training-tape allocation `forward_full`
+/// builds for one [`SeqCtx`]. Same 2 GiB order of magnitude as
+/// [`MAX_CACHE_BYTES`] and [`MAX_LOGITS_BYTES`].
+const MAX_TAPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Per-token `f32`-element count of every buffer a GQA layer's
+/// `forward_full` pass retains, EXCLUDING `softmax_probs` — that term is not
+/// linear in `seq_len` and is accounted separately by the caller. Mirrors
+/// `lattice_inference::backward::attention_gqa::AttnCache` (`x_input`;
+/// `q_raw`/`q_pre_rope`/`q_h`/`context`/`gate_z`, each `q_dim`;
+/// `k_raw`/`k_pre_rope`/`v`, each `kv_dim`; `h_q`/`h_v`, each `rank`;
+/// `cos_vals`/`sin_vals`, each `rope_dim / 2`) plus the shared `LayerFwd`
+/// bookkeeping every materialized layer carries (`h_layer_in`/`h_mid`, each
+/// `hidden`; `gate_pre`/`up_pre`, each `inter`).
+fn gqa_layer_linear_elems_per_token(dims: &Dims, rank: usize) -> u64 {
+    let q_dim = dims.q_dim as u64;
+    let kv_dim = dims.kv_dim as u64;
+    let hidden = dims.hidden as u64;
+    let rope_half = (dims.rope_dim / 2) as u64;
+    let rank = rank as u64;
+    let attn_cache = hidden + 5 * q_dim + 3 * kv_dim + 2 * rank + 2 * rope_half;
+    let layer_fwd = 2 * hidden + 2 * dims.inter as u64;
+    attn_cache + layer_fwd
+}
+
+/// Per-token `f32`-element count of every buffer a GDN layer's
+/// `forward_full` pass retains — all linear in `seq_len` (the recurrent
+/// state `s_after` is one `key_dim * value_dim` block per token, not one per
+/// token-pair). Mirrors `lattice_inference::attention::gdn_backward::GdnSaved`
+/// (`inputs`: `hidden`; `qkv_proj`/`conv_out`: `qkv_dim` each;
+/// `conv_buffers`: `qkv_dim * (kernel_size - 1)`; `z_proj`/`gated_buf`:
+/// `output_dim` each; `beta_raw`/`alpha_proj`/`beta`/`g`/`q_norm`/`k_norm`/
+/// `q_eps_norm`/`k_eps_norm`/`rms_vals`: `value_heads` each; `q_hat`/`k_hat`:
+/// `value_heads * key_dim` each; `v`/`kv_mem`/`o_heads`/`silu_z`:
+/// `value_heads * value_dim` each; `s_after`:
+/// `value_heads * key_dim * value_dim`; `h_qkv`/`h_z`/`h_b`/`h_a`/`h_out`:
+/// `rank` each) plus the shared `LayerFwd` bookkeeping.
+fn gdn_layer_linear_elems_per_token(dims: &Dims, gdn_dims: &GdnDims, rank: usize) -> u64 {
+    let vh = gdn_dims.value_heads as u64;
+    let key_dim = gdn_dims.key_dim as u64;
+    let value_dim = gdn_dims.value_dim as u64;
+    let qkv_dim = gdn_dims.qkv_dim as u64;
+    let output_dim = gdn_dims.output_dim as u64;
+    let kernel = gdn_dims.kernel_size as u64;
+    let hidden = dims.hidden as u64;
+    let rank = rank as u64;
+    let gdn_saved = hidden
+        + 2 * qkv_dim
+        + qkv_dim * kernel.saturating_sub(1)
+        + 2 * output_dim
+        + 9 * vh
+        + 2 * vh * key_dim
+        + 4 * vh * value_dim
+        + vh * key_dim * value_dim
+        + 5 * rank;
+    let layer_fwd = 2 * hidden + 2 * dims.inter as u64;
+    gdn_saved + layer_fwd
+}
+
+/// Reject a `seq_len_cap` whose worst-case per-sample `forward_full` tape —
+/// summed across every materialized GQA and GDN layer — would exceed
+/// [`MAX_TAPE_BYTES`]. `forward_full` builds and tears down one sample's tape
+/// per training step (`run`'s `caches[(step - 1) % caches.len()]`), so the
+/// peak allocation is bounded above by the single largest sample, which
+/// `load_jsonl` never lets exceed `seq_len_cap`. The dominant term is the GQA
+/// `softmax_probs` cache, which retains one causal row per query position
+/// per head — `num_q_heads * seq_len * (seq_len + 1) / 2` `f32`s per GQA
+/// layer, quadratic in `seq_len` — so a `seq_len_cap` that clears
+/// [`check_cache_budget`]'s linear bound can still exhaust memory once
+/// `forward_full` actually runs. Validates the derived total against a
+/// ceiling (rather than lowering [`MAX_SEQ_LEN_CAP`] itself) so the bound
+/// stays correct as head/layer counts change across models.
+fn check_tape_budget(
+    seq_len_cap: usize,
+    dims: &Dims,
+    gdn_dims: &GdnDims,
+    rank: usize,
+    num_gqa_layers: usize,
+    num_gdn_layers: usize,
+) -> Result<(), String> {
+    let seq = seq_len_cap as u64;
+    let quadratic_elems = dims.num_q_heads as u64 * seq * (seq + 1) / 2 * num_gqa_layers as u64;
+    let linear_elems = num_gqa_layers as u64 * gqa_layer_linear_elems_per_token(dims, rank) * seq
+        + num_gdn_layers as u64 * gdn_layer_linear_elems_per_token(dims, gdn_dims, rank) * seq;
+    let total_bytes = quadratic_elems
+        .saturating_add(linear_elems)
+        .saturating_mul(4);
+    if total_bytes > MAX_TAPE_BYTES {
+        return Err(format!(
+            "--seq-len-cap {seq_len_cap} across {num_gqa_layers} GQA + {num_gdn_layers} GDN \
+             materialized layers would allocate a ~{} MiB training tape per sample (dominated \
+             by the GQA softmax_probs cache, quadratic in seq-len), exceeds {} MiB cap - reduce \
+             --seq-len-cap or --first-layer",
+            total_bytes / (1024 * 1024),
+            MAX_TAPE_BYTES / (1024 * 1024),
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a sample set whose projected [`build_caches`] allocation
 /// (`sum(seq_len) * (hidden + rope_dim) * 4` bytes for `h_in` + `cos` +
 /// `sin`) would exceed [`MAX_CACHE_BYTES`]. The caller must run this BEFORE
@@ -412,6 +512,14 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     if num_slots == 0 && num_gdn_slots == 0 {
         return Err("no GQA or GDN layers in range — nothing to train".into());
     }
+    check_tape_budget(
+        seq_len_cap,
+        &dims,
+        &gdn_dims,
+        rank,
+        num_slots,
+        num_gdn_slots,
+    )?;
 
     let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
     let train_ctx = TrainCtx::try_new(
@@ -1189,6 +1297,99 @@ mod run_bounds_tests {
             })
             .collect();
         check_cache_budget(&samples, 4096, 128, "train").unwrap();
+    }
+
+    fn tape_test_dims() -> Dims {
+        Dims {
+            hidden: 2048,
+            vocab: 32_000,
+            num_q_heads: 8,
+            num_kv_heads: 2,
+            head_dim: 128,
+            rope_dim: 128,
+            inter: 4096,
+            q_dim: 1024,
+            kv_dim: 256,
+            eps: 1e-6,
+        }
+    }
+
+    /// Smaller than [`tape_test_dims`] so its own linear tape term stays well
+    /// under [`MAX_TAPE_BYTES`] at `MAX_SEQ_LEN_CAP` — isolating the
+    /// quadratic `softmax_probs` term as the sole reason the full budget
+    /// check rejects it.
+    fn quadratic_dominant_dims() -> Dims {
+        Dims {
+            hidden: 1024,
+            vocab: 32_000,
+            num_q_heads: 8,
+            num_kv_heads: 1,
+            head_dim: 64,
+            rope_dim: 64,
+            inter: 2048,
+            q_dim: 512,
+            kv_dim: 128,
+            eps: 1e-6,
+        }
+    }
+
+    fn tape_test_gdn_dims() -> GdnDims {
+        GdnDims {
+            num_kh: 2,
+            value_heads: 8,
+            key_dim: 64,
+            value_dim: 64,
+            qkv_dim: 2 * 64 * 2 + 8 * 64,
+            output_dim: 8 * 64,
+            kernel_size: 4,
+            scale: 1.0 / (64f32).sqrt(),
+        }
+    }
+
+    /// A single sample at `seq_len_cap` clears [`check_cache_budget`] (linear
+    /// in seq-len — only `h_in`/`cos`/`sin`), yet its `forward_full` tape
+    /// across the same materialized GQA layers is quadratic in seq-len via
+    /// `softmax_probs`. Without `check_tape_budget`, this combination would
+    /// pass every existing guard and exhaust memory once training starts.
+    #[test]
+    fn check_tape_budget_rejects_quadratic_overflow_that_cache_budget_misses() {
+        let dims = quadratic_dominant_dims();
+        let gdn_dims = tape_test_gdn_dims();
+        let seq_len_cap = MAX_SEQ_LEN_CAP; // 8_192
+        let rank = 8;
+        let num_gqa_layers = 2;
+
+        let single_sample = vec![Sample {
+            tokens: vec![0u32; seq_len_cap],
+            completion_start: 0,
+        }];
+        check_cache_budget(&single_sample, dims.hidden, dims.rope_dim, "train")
+            .expect("test setup: a single max-length sample must clear the linear cache budget");
+
+        let seq = seq_len_cap as u64;
+        let linear_only_bytes =
+            num_gqa_layers as u64 * gqa_layer_linear_elems_per_token(&dims, rank) * seq * 4;
+        assert!(
+            linear_only_bytes <= MAX_TAPE_BYTES,
+            "test setup must keep the linear tape term alone under budget, so the rejection \
+             below is attributable to the quadratic softmax_probs term specifically; got \
+             {linear_only_bytes} bytes"
+        );
+
+        let err = check_tape_budget(seq_len_cap, &dims, &gdn_dims, rank, num_gqa_layers, 0)
+            .expect_err("expected quadratic tape-budget rejection");
+        assert!(
+            err.contains("--seq-len-cap") && err.contains("softmax_probs"),
+            "expected tape-budget rejection naming the quadratic term; got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_tape_budget_accepts_modest_config() {
+        let dims = tape_test_dims();
+        let gdn_dims = tape_test_gdn_dims();
+        check_tape_budget(512, &dims, &gdn_dims, 16, 4, 4)
+            .expect("a modest seq-len/layer-count combination must stay under the tape budget");
     }
 }
 
