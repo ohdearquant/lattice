@@ -42,6 +42,19 @@ pub(crate) const MAX_HIDDEN_LAYERS: usize = 512;
 /// magnitude of headroom for future tokenizers.
 pub(crate) const MAX_VOCAB_SIZE: usize = 4_000_000;
 
+/// Upper bound, in bytes, on the text embedding tensor (`vocab_size * hidden_size * 4`)
+/// accepted from `config.json` (CLASS A3, materialization site 1).
+///
+/// `load_weights` (`model/qwen35/loading.rs:434`) materializes `embed_tokens` as an
+/// owned `Vec<f32>` of exactly this product; [`MAX_VOCAB_SIZE`] and [`MAX_HIDDEN_SIZE`]
+/// bound each factor individually, but not their product, which reaches multi-terabyte
+/// scale well within both individual caps (e.g. `vocab_size = 4_000_000`, `hidden_size =
+/// 1_048_576` passes both scalar caps while materializing ~16.8 TB). Real Qwen3.5/3.6
+/// presets top out around `vocab_size = 248_320` * `hidden_size = 8192` (~8.1 GiB); 32
+/// GiB (34_359_738_368) leaves roughly 4x headroom above that for future architectures
+/// while rejecting the terabyte-scale hostile case by several orders of magnitude.
+pub(crate) const MAX_EMBEDDING_BYTES: u128 = 34_359_738_368;
+
 /// Upper bound on `head_dim` accepted from `config.json`.
 ///
 /// `head_dim` comes from an untrusted checkpoint directory and sizes the RoPE table
@@ -234,6 +247,23 @@ const GDN_MAX_PREFILL_MIRROR: usize = 512;
 /// matching [`MAX_ROPE_TABLE_BYTES`]'s scale and style.
 pub(crate) const MAX_GDN_CHUNK_SCRATCH_BYTES: usize = 1_073_741_824;
 
+/// Upper bound, in bytes, on the SUM of every per-session GatedDeltaNet scratch/qkv
+/// buffer `new_session_inner` (`forward/metal_qwen35.rs`) allocates together (CLASS A2).
+///
+/// [`MAX_GDN_CHUNK_SCRATCH_BYTES`] only bounds the largest *single* `GdnChunkScratch`
+/// buffer, but `new_session_inner` allocates several key-dimension buffers
+/// (`gdn_qkv`, `gdn_z`, `gdn_qkvz`, `gdn_key_scratch`, `gdn_raw_out`) plus all twelve
+/// `GdnChunkScratch` buffers *together* for one session -- a config can pass every
+/// per-buffer guard while the aggregate still reaches several GiB. Mirrors every
+/// allocation-site formula from `new_session_inner` (see the CLASS A2 table in the PR
+/// body); computed in `u128` so the summation itself cannot overflow `usize`. Real
+/// Qwen3.5/3.6 GDN configs (worst preset: `qwen36_27b`, value_heads=48,
+/// key_dim=value_dim=128) sum to roughly 134 MiB; 2 GiB (2,147,483,648) leaves
+/// roughly 16x headroom above that while rejecting the ~6 GiB hostile geometries
+/// (e.g. `value_heads=4096, key_dim=128, value_dim=32`) that pass every per-buffer
+/// guard individually.
+pub(crate) const MAX_GDN_SESSION_BYTES: usize = 2_147_483_648;
+
 /// Upper bound on `linear_conv_kernel_dim` accepted from `config.json`.
 ///
 /// Previously checked only for zero (guarding the `linear_conv_kernel_dim - 1` unsigned
@@ -316,6 +346,22 @@ pub(crate) const MAX_VISION_NUM_POSITION_EMBEDDINGS: usize = 16_777_216;
 /// nonzero previously; feeds the `patch_embed_weight` product in `checked_derived_sizes`. Real
 /// Qwen3.5-VL presets use 3 (RGB); 256 leaves generous headroom.
 pub(crate) const MAX_VISION_IN_CHANNELS: usize = 256;
+
+/// Upper bound, in bytes, on any single derived vision tensor
+/// (`VisionModelConfig::checked_derived_sizes`) accepted from `config.json` (CLASS A3,
+/// materialization site 2).
+///
+/// `checked_derived_sizes` was previously overflow-checked only (`checked_mul` chains
+/// guarding `usize` wraparound); a huge-but-non-overflowing product (e.g. `hidden_size =
+/// 1_048_576`, `spatial_merge_size = 1`, `out_hidden_size = 1_048_576`,
+/// `num_position_embeddings = 16_777_216`, each individually in-budget per their own
+/// per-field caps) still passes every overflow guard while requiring multi-terabyte
+/// allocation for the merger / patch-embed / position-embed tensors in
+/// `vision/checkpoint.rs`'s `assemble`. Real Qwen3.5-VL vision towers (hidden_size ~
+/// 1,280, spatial_merge_size = 2) top out around 100 MiB per derived tensor (the merger
+/// fc1/fc2 weights); 512 MiB (536,870,912) leaves roughly 5x headroom above that while
+/// rejecting the multi-terabyte hostile case by several orders of magnitude.
+pub(crate) const MAX_VISION_TENSOR_BYTES: u128 = 536_870_912;
 
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
@@ -536,26 +582,50 @@ impl VisionModelConfig {
                 "invalid vision_config: a derived tensor size overflows usize".to_string(),
             )
         };
-        self.hidden_size.checked_mul(3).ok_or_else(overflow)?; // qkv_out
-        self.hidden_size.checked_mul(4).ok_or_else(overflow)?; // mlp_intermediate
+        // CLASS A3 (materialization site 2): each derived product below was previously
+        // overflow-checked only; a huge-but-non-overflowing product still reaches
+        // `vision/checkpoint.rs`'s `assemble` unbounded. Budget each product's byte size
+        // (elements * 4) against `MAX_VISION_TENSOR_BYTES`, in addition to the existing
+        // overflow guard, so the check runs before any tensor is materialized.
+        let budget = |elems: usize, what: &str| -> Result<(), InferenceError> {
+            let bytes = elems as u128 * 4;
+            if bytes > MAX_VISION_TENSOR_BYTES {
+                return Err(InferenceError::Inference(format!(
+                    "invalid vision_config: derived tensor {what} ({bytes} bytes) exceeds \
+                     MAX_VISION_TENSOR_BYTES ({MAX_VISION_TENSOR_BYTES})"
+                )));
+            }
+            Ok(())
+        };
+        let qkv_out = self.hidden_size.checked_mul(3).ok_or_else(overflow)?;
+        budget(qkv_out, "qkv_out")?;
+        let mlp_intermediate = self.hidden_size.checked_mul(4).ok_or_else(overflow)?;
+        budget(mlp_intermediate, "mlp_intermediate")?;
         let merge_in = self
             .spatial_merge_size
             .checked_mul(self.spatial_merge_size)
             .and_then(|sq| sq.checked_mul(self.hidden_size))
             .ok_or_else(overflow)?;
-        merge_in.checked_mul(merge_in).ok_or_else(overflow)?; // merger fc1
-        self.out_hidden_size
+        let merger_fc1 = merge_in.checked_mul(merge_in).ok_or_else(overflow)?;
+        budget(merger_fc1, "merger_fc1")?;
+        let merger_fc2 = self
+            .out_hidden_size
             .checked_mul(merge_in)
-            .ok_or_else(overflow)?; // merger fc2
-        self.hidden_size
+            .ok_or_else(overflow)?;
+        budget(merger_fc2, "merger_fc2")?;
+        let patch_embed_weight = self
+            .hidden_size
             .checked_mul(self.in_channels)
             .and_then(|v| v.checked_mul(self.temporal_patch_size))
             .and_then(|v| v.checked_mul(self.patch_size))
             .and_then(|v| v.checked_mul(self.patch_size))
-            .ok_or_else(overflow)?; // patch_embed_weight
-        self.num_position_embeddings
+            .ok_or_else(overflow)?;
+        budget(patch_embed_weight, "patch_embed_weight")?;
+        let pos_embed = self
+            .num_position_embeddings
             .checked_mul(self.hidden_size)
-            .ok_or_else(overflow)?; // pos_embed
+            .ok_or_else(overflow)?;
+        budget(pos_embed, "pos_embed")?;
         Ok(())
     }
 }
@@ -883,6 +953,49 @@ impl Default for Qwen35Config {
     }
 }
 
+/// A [`Qwen35Config`] that has passed [`Qwen35Config::validate`]'s full bounds/structural
+/// validation (CLASS C, the ingress-enumeration fix). The only way to construct one is
+/// [`Qwen35Config::validate`] (or the `TryFrom<Qwen35Config>` impl below, which wraps it) --
+/// there is no public constructor that skips validation. Non-Metal loaders and session
+/// constructors (`model/qwen35/loading.rs`, `model/qwen35/model.rs`) require this type
+/// rather than a raw `Qwen35Config`, so a config built via direct `serde` deserialization
+/// (which still lands on the raw, unvalidated `Qwen35Config` -- serde needs a type it can
+/// construct field-by-field) cannot reach them without going through this checked
+/// conversion first. `Deref` exposes read-only field access so call sites that only read
+/// config fields don't need `.into_inner()` or `&*validated`. See the CLASS C ingress table
+/// in the PR body for every entry point and its validation status.
+#[derive(Debug, Clone)]
+pub struct ValidatedQwen35Config(Qwen35Config);
+
+impl std::ops::Deref for ValidatedQwen35Config {
+    type Target = Qwen35Config;
+    fn deref(&self) -> &Qwen35Config {
+        &self.0
+    }
+}
+
+impl ValidatedQwen35Config {
+    /// Unwrap back into the raw `Qwen35Config`. Used by [`Qwen35Config::from_config_json_str`]
+    /// (and its `from_config_json` / `from_model_dir` siblings) to keep their return type
+    /// stable for existing callers while still running full validation underneath.
+    pub fn into_inner(self) -> Qwen35Config {
+        self.0
+    }
+}
+
+impl TryFrom<Qwen35Config> for ValidatedQwen35Config {
+    type Error = InferenceError;
+
+    /// The checked conversion CLASS C requires: a raw `Qwen35Config` (e.g. one built via
+    /// direct `serde_json::from_str::<Qwen35Config>`, which bypasses the `HfQwenConfigFile`
+    /// wrapper and its `text_config` nesting) can only become a `ValidatedQwen35Config` by
+    /// running the exact same [`Qwen35Config::validate`] bounds/structural checks that
+    /// `from_config_json_str` runs.
+    fn try_from(cfg: Qwen35Config) -> Result<Self, InferenceError> {
+        cfg.validate()
+    }
+}
+
 impl Qwen35Config {
     /// **Unstable**: default Qwen3.5-2B configuration; may change as model checkpoints update.
     pub fn qwen35_2b() -> Self {
@@ -1104,6 +1217,15 @@ impl Qwen35Config {
         Self::from_config_json_str(&json)
     }
 
+    /// Parse a HF config.json into a validated [`ValidatedQwen35Config`]. See
+    /// [`Self::from_config_json`] for the raw-`Qwen35Config`-returning sibling.
+    pub fn from_config_json_validated(
+        path: &Path,
+    ) -> Result<ValidatedQwen35Config, InferenceError> {
+        let json = std::fs::read_to_string(path).map_err(InferenceError::Io)?;
+        Self::from_config_json_str_validated(&json)
+    }
+
     /// Resolve the architecture config for a model directory, requiring a
     /// real `config.json`.
     ///
@@ -1132,8 +1254,25 @@ impl Qwen35Config {
         Self::from_config_json(&config_path)
     }
 
-    /// Parse HF config.json text into a `Qwen35Config`.
-    pub fn from_config_json_str(json: &str) -> Result<Self, InferenceError> {
+    /// [`Self::from_model_dir`]'s validated sibling; see [`Self::from_config_json_validated`].
+    pub fn from_model_dir_validated(dir: &Path) -> Result<ValidatedQwen35Config, InferenceError> {
+        let config_path = dir.join("config.json");
+        if !config_path.exists() {
+            return Err(InferenceError::ModelNotFound(format!(
+                "missing config.json in {} -- every supported Qwen checkpoint ships one; \
+                 no architecture preset is inferred from a config-less directory",
+                dir.display()
+            )));
+        }
+        Self::from_config_json_validated(&config_path)
+    }
+
+    /// Parse HF config.json text into a validated [`ValidatedQwen35Config`]. See
+    /// [`Self::from_config_json_str`] for the raw-`Qwen35Config`-returning sibling kept
+    /// stable for existing callers (CLASS C ingress table, PR body).
+    pub fn from_config_json_str_validated(
+        json: &str,
+    ) -> Result<ValidatedQwen35Config, InferenceError> {
         let parsed: HfQwenConfigFile = serde_json::from_str(json)
             .map_err(|e| InferenceError::Inference(format!("invalid Qwen config.json: {e}")))?;
         let mut cfg = parsed
@@ -1161,6 +1300,24 @@ impl Qwen35Config {
                 cfg.partial_rotary_factor = prf;
             }
         }
+        cfg.validate()
+    }
+
+    /// Parse HF config.json text into a `Qwen35Config`. Stable signature kept for existing
+    /// callers (e.g. `forward/metal_qwen35.rs`'s `from_q4_dir`, deferred to the #1037
+    /// rebase per the CLASS C ingress table in the PR body); runs the identical validation
+    /// as [`Self::from_config_json_str_validated`], just unwrapping the newtype.
+    pub fn from_config_json_str(json: &str) -> Result<Self, InferenceError> {
+        Self::from_config_json_str_validated(json).map(ValidatedQwen35Config::into_inner)
+    }
+
+    /// Run this config's full bounds/structural validation, consuming it and returning the
+    /// only way to construct a [`ValidatedQwen35Config`]. Applies the same checks whether
+    /// this config came from `config.json` (via [`Self::from_config_json_str_validated`])
+    /// or was constructed directly (e.g. via `serde_json::from_str::<Qwen35Config>` or a
+    /// preset mutated in place) -- see the CLASS C ingress table in the PR body.
+    pub fn validate(self) -> Result<ValidatedQwen35Config, InferenceError> {
+        let mut cfg = self;
         // Bound `num_hidden_layers` before any layer-proportional allocation runs. This
         // must precede the `compute_layer_types` call and `normalize_layer_mask` below,
         // and the loader's `Vec::with_capacity(cfg.num_hidden_layers)` (which only ever
@@ -1223,6 +1380,19 @@ impl Qwen35Config {
                 "invalid Qwen config.json: vocab_size ({}) must be > 0 and <= MAX_VOCAB_SIZE \
                  ({MAX_VOCAB_SIZE})",
                 cfg.vocab_size
+            )));
+        }
+        // CLASS A3 (materialization site 1): `load_weights` (`model/qwen35/loading.rs:434`)
+        // materializes `embed_tokens` as an owned `Vec<f32>` of `vocab_size * hidden_size`
+        // elements. `MAX_VOCAB_SIZE` and `MAX_HIDDEN_SIZE` bound each factor individually,
+        // but not their product -- see `MAX_EMBEDDING_BYTES` docs.
+        let embedding_bytes = cfg.vocab_size as u128 * cfg.hidden_size as u128 * 4;
+        if embedding_bytes > MAX_EMBEDDING_BYTES {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: embedding tensor size ({embedding_bytes} bytes) \
+                 exceeds MAX_EMBEDDING_BYTES ({MAX_EMBEDDING_BYTES}): vocab_size \
+                 ({}) * hidden_size ({})",
+                cfg.vocab_size, cfg.hidden_size
             )));
         }
         // `intermediate_size` is always present and drives MLP scratch buffer allocations
@@ -1557,6 +1727,59 @@ impl Qwen35Config {
                  max(linear_key_head_dim, linear_value_head_dim) ({max_head_dim})"
             )));
         }
+        // CLASS A2: `MAX_GDN_CHUNK_SCRATCH_BYTES` above only bounds the largest single
+        // `GdnChunkScratch` buffer, but `new_session_inner` allocates several
+        // key-dimension buffers (`gdn_qkv`, `gdn_z`, `gdn_qkvz`, `gdn_key_scratch`,
+        // `gdn_raw_out`) plus all twelve `GdnChunkScratch` buffers together for one
+        // session. Sum every allocation-site formula (mirroring `new_session_inner`
+        // exactly; see the CLASS A2 table in the PR body) and budget the aggregate. `bp`
+        // (the actual prefill window) is itself bounded by `GDN_MAX_PREFILL_MIRROR`
+        // regardless of `max_position_embeddings`, so it is safe to use the same
+        // worst-case upper bound here as the per-buffer check above. See
+        // `MAX_GDN_SESSION_BYTES` docs.
+        let bp_upper = GDN_MAX_PREFILL_MIRROR as u128;
+        let output_dim_u = linear_output_dim as u128;
+        let kd_u = cfg.linear_key_head_dim as u128;
+        let vd_u = cfg.linear_value_head_dim as u128;
+        let key_heads_u = key_heads as u128;
+        let value_heads_u = value_heads as u128;
+        // `linear_qkv_dim()`'s formula (`2 * linear_num_key_heads * linear_key_head_dim +
+        // linear_output_dim()`), computed here rather than reusing the `conv_dim` local
+        // (which is derived further below, after this check) to avoid reordering the
+        // existing validation sequence.
+        let qkv_dim_u = 2 * key_heads_u * kd_u + output_dim_u;
+        let gdn_qkv_elems = bp_upper * qkv_dim_u;
+        let gdn_z_elems = bp_upper * output_dim_u;
+        let gdn_qkvz_elems = qkv_dim_u + output_dim_u;
+        let gdn_key_scratch_elems = key_heads_u * (2 * kd_u + 1) + value_heads_u * 2;
+        let gdn_raw_out_elems = output_dim_u;
+        let chunk_raw_out_elems = bp_upper * output_dim_u;
+        let qkw_kright_elems = 4 * chunk_rows_upper * kd_u;
+        let vur_elems = 3 * chunk_rows_upper * vd_u;
+        let bla_elems = chunk_rows_upper * 2;
+        let gamma_elems = chunk_rows_upper;
+        let gamma_end_elems = num_chunks_upper * value_heads_u;
+        let kkt_qkl_elems = 2 * c2_upper;
+        let total_session_elems = gdn_qkv_elems
+            + gdn_z_elems
+            + gdn_qkvz_elems
+            + gdn_key_scratch_elems
+            + gdn_raw_out_elems
+            + chunk_raw_out_elems
+            + qkw_kright_elems
+            + vur_elems
+            + bla_elems
+            + gamma_elems
+            + gamma_end_elems
+            + kkt_qkl_elems;
+        let total_session_bytes = total_session_elems * 4;
+        if total_session_bytes > MAX_GDN_SESSION_BYTES as u128 {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: aggregate GatedDeltaNet per-session buffer size \
+                 ({total_session_bytes} bytes) exceeds MAX_GDN_SESSION_BYTES \
+                 ({MAX_GDN_SESSION_BYTES})"
+            )));
+        }
         // `MAX_LINEAR_NUM_KEY_HEADS` and `MAX_CONV_KERNEL_DIM` bound their respective factors
         // individually, but their product (via `linear_qkv_dim()`) still drives
         // `GatedDeltaNetState::new`'s `conv_buffer = vec![0.0; conv_dim * buf_len]`
@@ -1706,7 +1929,7 @@ impl Qwen35Config {
             )));
         }
 
-        Ok(cfg)
+        Ok(ValidatedQwen35Config(cfg))
     }
 
     /// Resolved linear value head count (falls back to 32 for Qwen3.6 if unset).
@@ -4023,10 +4246,15 @@ mod tests {
 
     #[test]
     fn parser_accepts_hidden_size_at_max() {
-        let json = format!(r#"{{"text_config": {{"hidden_size": {MAX_HIDDEN_SIZE}}}}}"#);
+        // hidden_size alone (with vocab_size at its own realistic-preset value) does not
+        // reach MAX_EMBEDDING_BYTES -- unlike the vision "_at_max" cases below, the text
+        // embedding budget is generous enough (32 GiB) to keep this at-max-in-isolation case
+        // accepted. See MAX_EMBEDDING_BYTES docs.
+        let json =
+            format!(r#"{{"text_config": {{"hidden_size": {MAX_HIDDEN_SIZE}, "vocab_size": 1}}}}"#);
         assert!(
             Qwen35Config::from_config_json_str(&json).is_ok(),
-            "hidden_size == MAX_HIDDEN_SIZE must be accepted"
+            "hidden_size == MAX_HIDDEN_SIZE must be accepted when paired with a small vocab_size"
         );
     }
 
@@ -4318,9 +4546,15 @@ mod tests {
                  though every individual factor is at or under its own cap",
             )
             .to_string();
+        // CLASS A2 (round p): the aggregate MAX_GDN_SESSION_BYTES check runs earlier in
+        // `validate()` than the MAX_GDN_CONV_BUFFER_SIZE check this test originally targeted,
+        // and this same hostile geometry now also exceeds the aggregate budget -- so the
+        // aggregate guard fires first. Both are legitimate rejections of the same hostile
+        // input; accept either.
         assert!(
-            err.contains("GatedDeltaNet conv buffer size")
-                && err.contains("MAX_GDN_CONV_BUFFER_SIZE"),
+            (err.contains("GatedDeltaNet conv buffer size")
+                && err.contains("MAX_GDN_CONV_BUFFER_SIZE"))
+                || err.contains("MAX_GDN_SESSION_BYTES"),
             "wrong guard fired: {err}"
         );
     }
@@ -4418,7 +4652,13 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_present_vision_config_with_hidden_size_at_max() {
+    fn parser_rejects_present_vision_config_with_hidden_size_at_max_over_byte_budget() {
+        // CLASS A3 (round p): MAX_VISION_HIDDEN_SIZE alone is still generous (matching
+        // MAX_HIDDEN_SIZE's scale), but composed into the merger fc1/fc2 and patch-embed
+        // products, hidden_size at its own per-field cap now exceeds MAX_VISION_TENSOR_BYTES
+        // even with every other field realistic -- the per-field cap is necessary but not
+        // sufficient; the byte budget is the binding constraint. See MAX_VISION_TENSOR_BYTES
+        // docs.
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
@@ -4432,9 +4672,12 @@ mod tests {
                 "in_channels": 3
             }}"#
         ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("hidden_size == MAX_VISION_HIDDEN_SIZE must be rejected by the byte budget")
+            .to_string();
         assert!(
-            Qwen35Config::from_config_json_str(&json).is_ok(),
-            "hidden_size == MAX_VISION_HIDDEN_SIZE must be accepted"
+            err.contains("MAX_VISION_TENSOR_BYTES"),
+            "wrong guard fired: {err}"
         );
     }
 
@@ -4465,17 +4708,21 @@ mod tests {
 
     #[test]
     fn parser_accepts_present_vision_config_with_num_heads_at_max() {
+        // num_heads itself does not feed any `checked_derived_sizes` product (only
+        // hidden_size % num_heads == 0 is checked), so it stays accepted at its own cap as
+        // long as hidden_size (here set to a realistic divisible value, not also maxed) keeps
+        // every derived tensor under MAX_VISION_TENSOR_BYTES.
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
                 "hidden_size": {MAX_VISION_NUM_HEADS},
                 "num_heads": {MAX_VISION_NUM_HEADS},
-                "patch_size": 16,
-                "spatial_merge_size": 2,
+                "patch_size": 4,
+                "spatial_merge_size": 1,
                 "out_hidden_size": 1024,
-                "temporal_patch_size": 2,
+                "temporal_patch_size": 1,
                 "num_position_embeddings": 2304,
-                "in_channels": 3
+                "in_channels": 1
             }}"#
         ));
         assert!(
@@ -4510,7 +4757,10 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_present_vision_config_with_patch_size_at_max() {
+    fn parser_rejects_present_vision_config_with_patch_size_at_max_over_byte_budget() {
+        // CLASS A3 (round p): patch_size is squared in patch_embed_weight; even at a
+        // realistic hidden_size, patch_size at its own generous per-field cap overflows
+        // MAX_VISION_TENSOR_BYTES. See MAX_VISION_TENSOR_BYTES docs.
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
@@ -4524,9 +4774,12 @@ mod tests {
                 "in_channels": 3
             }}"#
         ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("patch_size == MAX_VISION_PATCH_SIZE must be rejected by the byte budget")
+            .to_string();
         assert!(
-            Qwen35Config::from_config_json_str(&json).is_ok(),
-            "patch_size == MAX_VISION_PATCH_SIZE must be accepted"
+            err.contains("MAX_VISION_TENSOR_BYTES"),
+            "wrong guard fired: {err}"
         );
     }
 
@@ -4556,7 +4809,11 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_present_vision_config_with_spatial_merge_size_at_max() {
+    fn parser_rejects_present_vision_config_with_spatial_merge_size_at_max_over_byte_budget() {
+        // CLASS A3 (round p): spatial_merge_size is squared into merge_in, which is then
+        // squared again for merger_fc1 -- a quartic blowup that overflows
+        // MAX_VISION_TENSOR_BYTES at the field's own per-field cap even with everything else
+        // realistic. See MAX_VISION_TENSOR_BYTES docs.
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
@@ -4570,9 +4827,15 @@ mod tests {
                 "in_channels": 3
             }}"#
         ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "spatial_merge_size == MAX_VISION_SPATIAL_MERGE_SIZE must be rejected by the \
+                 byte budget",
+            )
+            .to_string();
         assert!(
-            Qwen35Config::from_config_json_str(&json).is_ok(),
-            "spatial_merge_size == MAX_VISION_SPATIAL_MERGE_SIZE must be accepted"
+            err.contains("MAX_VISION_TENSOR_BYTES"),
+            "wrong guard fired: {err}"
         );
     }
 
@@ -4602,7 +4865,11 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_present_vision_config_with_out_hidden_size_at_max() {
+    fn parser_rejects_present_vision_config_with_out_hidden_size_at_max_over_byte_budget() {
+        // CLASS A3 (round p): out_hidden_size is a direct factor of merger_fc2
+        // (`out_hidden_size * merge_in`); at its own per-field cap it overflows
+        // MAX_VISION_TENSOR_BYTES even with everything else realistic. See
+        // MAX_VISION_TENSOR_BYTES docs.
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
@@ -4616,9 +4883,15 @@ mod tests {
                 "in_channels": 3
             }}"#
         ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "out_hidden_size == MAX_VISION_OUT_HIDDEN_SIZE must be rejected by the byte \
+                 budget",
+            )
+            .to_string();
         assert!(
-            Qwen35Config::from_config_json_str(&json).is_ok(),
-            "out_hidden_size == MAX_VISION_OUT_HIDDEN_SIZE must be accepted"
+            err.contains("MAX_VISION_TENSOR_BYTES"),
+            "wrong guard fired: {err}"
         );
     }
 
@@ -4648,7 +4921,10 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_present_vision_config_with_temporal_patch_size_at_max() {
+    fn parser_rejects_present_vision_config_with_temporal_patch_size_at_max_over_byte_budget() {
+        // CLASS A3 (round p): temporal_patch_size is a direct factor of patch_embed_weight;
+        // at its own per-field cap it overflows MAX_VISION_TENSOR_BYTES even with everything
+        // else realistic. See MAX_VISION_TENSOR_BYTES docs.
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
@@ -4662,9 +4938,15 @@ mod tests {
                 "in_channels": 3
             }}"#
         ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "temporal_patch_size == MAX_VISION_TEMPORAL_PATCH_SIZE must be rejected by the \
+                 byte budget",
+            )
+            .to_string();
         assert!(
-            Qwen35Config::from_config_json_str(&json).is_ok(),
-            "temporal_patch_size == MAX_VISION_TEMPORAL_PATCH_SIZE must be accepted"
+            err.contains("MAX_VISION_TENSOR_BYTES"),
+            "wrong guard fired: {err}"
         );
     }
 
@@ -4698,7 +4980,10 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_present_vision_config_with_num_position_embeddings_at_max() {
+    fn parser_rejects_present_vision_config_with_num_position_embeddings_at_max_over_byte_budget() {
+        // CLASS A3 (round p): num_position_embeddings is a direct factor of pos_embed; at its
+        // own per-field cap it overflows MAX_VISION_TENSOR_BYTES even with everything else
+        // realistic. See MAX_VISION_TENSOR_BYTES docs.
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
@@ -4712,9 +4997,15 @@ mod tests {
                 "in_channels": 3
             }}"#
         ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "num_position_embeddings == MAX_VISION_NUM_POSITION_EMBEDDINGS must be \
+                 rejected by the byte budget",
+            )
+            .to_string();
         assert!(
-            Qwen35Config::from_config_json_str(&json).is_ok(),
-            "num_position_embeddings == MAX_VISION_NUM_POSITION_EMBEDDINGS must be accepted"
+            err.contains("MAX_VISION_TENSOR_BYTES"),
+            "wrong guard fired: {err}"
         );
     }
 
@@ -4855,7 +5146,7 @@ mod tests {
         );
     }
 
-    /// The specific attack the daemon's B2 finding described: `linear_value_head_dim = 1`
+    /// The specific attack this guard closes: `linear_value_head_dim = 1`
     /// lets `value_heads` alone satisfy `MAX_LINEAR_OUTPUT_DIM` and `MAX_GDN_STATE_SIZE`
     /// (both product budgets with `value_head_dim` as a factor) at values far above what
     /// `MAX_LINEAR_NUM_VALUE_HEADS` alone would allow through those two checks -- but a
@@ -4951,5 +5242,152 @@ mod tests {
             Qwen35Config::from_config_json_str(&json).is_ok(),
             "in_channels == MAX_VISION_IN_CHANNELS must be accepted"
         );
+    }
+
+    // ── CLASS A2: aggregate GDN session-buffer budget ───────────────────────────────
+
+    #[test]
+    fn parser_rejects_hostile_gdn_aggregate_value_heads_geometry() {
+        // Hostile geometry: passes the per-buffer MAX_GDN_CHUNK_SCRATCH_BYTES
+        // guard and every per-field/product guard individually, but the AGGREGATE across all
+        // GDN session buffers reaches multi-GiB.
+        let json = r#"{"text_config": {
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 4096,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 32
+        }}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("hostile aggregate GDN geometry (value_heads=4096) must be rejected")
+            .to_string();
+        assert!(
+            err.contains("MAX_GDN_SESSION_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_hostile_gdn_aggregate_key_head_dim_geometry() {
+        // Second hostile geometry: value_heads=1 keeps the three-factor
+        // MAX_GDN_STATE_SIZE product and the per-buffer chunk-scratch guard both passing at
+        // their boundary, but the free `linear_key_head_dim` multiplier still blows up the
+        // aggregate session-buffer sum.
+        let json = r#"{"text_config": {
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 524288,
+            "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 16
+        }}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("hostile aggregate GDN geometry (key_head_dim=524288) must be rejected")
+            .to_string();
+        assert!(
+            err.contains("MAX_GDN_SESSION_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_realistic_gdn_aggregate_geometry() {
+        // qwen36_27b's real worst-case GDN geometry (value_heads=48, key/value head dims
+        // 128) must stay well inside MAX_GDN_SESSION_BYTES.
+        let cfg = Qwen35Config::qwen36_27b();
+        assert!(
+            cfg.validate().is_ok(),
+            "realistic qwen36_27b GDN aggregate geometry must be accepted"
+        );
+    }
+
+    // ── CLASS A3: materialization-site byte budgets ─────────────────────────────────
+
+    #[test]
+    fn parser_rejects_hostile_embedding_product() {
+        let json = format!(
+            r#"{{"text_config": {{"vocab_size": 4000000, "hidden_size": {MAX_HIDDEN_SIZE}}}}}"#
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("hostile embedding product must be rejected before materialization")
+            .to_string();
+        assert!(
+            err.contains("MAX_EMBEDDING_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_realistic_embedding_product() {
+        let cfg = Qwen35Config::qwen36_35b_a3b();
+        assert!(
+            cfg.validate().is_ok(),
+            "realistic embedding product must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_hostile_vision_derived_tensor_product() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": {MAX_VISION_HIDDEN_SIZE},
+                "num_heads": 1,
+                "patch_size": 14,
+                "spatial_merge_size": 1,
+                "out_hidden_size": {MAX_VISION_OUT_HIDDEN_SIZE},
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 16777216,
+                "in_channels": 3
+            }}"#
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("hostile vision derived-tensor product must be rejected")
+            .to_string();
+        assert!(
+            err.contains("MAX_VISION_TENSOR_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    // ── CLASS C: ValidatedQwen35Config ingress enumeration ──────────────────────────
+
+    #[test]
+    fn validated_config_rejects_hostile_directly_constructed_config() {
+        // A raw Qwen35Config built directly (bypassing from_config_json_str entirely, e.g.
+        // via serde deserializing just the inner struct) must still be rejected by the
+        // checked TryFrom conversion -- device-free, no loader/allocation involved.
+        let mut cfg = Qwen35Config::qwen35_2b();
+        cfg.linear_num_key_heads = 16;
+        cfg.linear_num_value_heads = Some(4096);
+        cfg.linear_key_head_dim = 128;
+        cfg.linear_value_head_dim = 32;
+        let result: Result<ValidatedQwen35Config, InferenceError> = cfg.try_into();
+        assert!(
+            result.is_err(),
+            "hostile directly-constructed config must fail ValidatedQwen35Config::try_from"
+        );
+    }
+
+    #[test]
+    fn validated_config_accepts_and_derefs_realistic_config() {
+        let validated = Qwen35Config::qwen35_2b()
+            .validate()
+            .expect("realistic preset must validate");
+        // Deref exposes read-only field access without unwrapping.
+        assert_eq!(validated.hidden_size, 2048);
+        let raw = validated.into_inner();
+        assert_eq!(raw.hidden_size, 2048);
+    }
+
+    #[test]
+    fn from_config_json_str_validated_matches_from_config_json_str() {
+        let json = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/qwen36_config.json"
+        ));
+        let raw = Qwen35Config::from_config_json_str(json).expect("raw parse succeeds");
+        let validated =
+            Qwen35Config::from_config_json_str_validated(json).expect("validated parse succeeds");
+        assert_eq!(raw.hidden_size, validated.hidden_size);
+        assert_eq!(raw.num_hidden_layers, validated.num_hidden_layers);
     }
 }

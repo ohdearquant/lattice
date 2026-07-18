@@ -6,7 +6,7 @@ use super::weights::{
 };
 use crate::attention::gdn::GatedDeltaNetWeights;
 use crate::error::InferenceError;
-use crate::model::qwen35_config::Qwen35Config;
+use crate::model::qwen35_config::{Qwen35Config, ValidatedQwen35Config};
 use crate::weights::TensorSource;
 
 /// Return the complete list of required tensor names for a given config.
@@ -60,10 +60,14 @@ pub fn qwen_required_tensor_names(cfg: &Qwen35Config) -> Vec<String> {
     names
 }
 
+/// CLASS C ingress: takes `&ValidatedQwen35Config` rather than a raw `&Qwen35Config`, so an
+/// unvalidated config cannot reach the required-tensor-name derivation for a checkpoint on
+/// this (non-Metal) load path. See the CLASS C ingress table in the PR body.
 pub(super) fn validate_required_tensor_names<T: TensorSource + ?Sized>(
     source: &mut T,
-    cfg: &Qwen35Config,
+    validated_cfg: &ValidatedQwen35Config,
 ) -> Result<(), InferenceError> {
+    let cfg: &Qwen35Config = validated_cfg;
     for name in qwen_required_tensor_names(cfg) {
         if !source.has_tensor(&name)? {
             return Err(InferenceError::MissingTensor(name));
@@ -425,10 +429,14 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
 /// tensor whose shape does not match returns `Err(InferenceError::ShapeMismatch)`
 /// rather than being accepted and later panicking downstream (e.g. in a GEMM
 /// bounds assertion during the forward pass).
+/// CLASS C ingress: takes `&ValidatedQwen35Config` rather than a raw `&Qwen35Config`, so an
+/// unvalidated config cannot reach tensor materialization on this (non-Metal) load path.
+/// See the CLASS C ingress table in the PR body.
 pub(super) fn load_weights<T: TensorSource + ?Sized>(
     source: &mut T,
-    cfg: &Qwen35Config,
+    validated_cfg: &ValidatedQwen35Config,
 ) -> Result<ModelWeights, InferenceError> {
+    let cfg: &Qwen35Config = validated_cfg;
     let hidden = cfg.hidden_size;
 
     let embed_tokens = load_owned_tensor_checked(

@@ -309,7 +309,7 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
     // `should_stop_token` (the single shared stop predicate every CPU/Metal
     // decode loop calls) without adding any new public surface to
     // `GenerateConfig`.
-    model.config_mut().eos_token_id = u32::MAX;
+    model.set_eos_token_id(u32::MAX);
 
     // The deterministic profile (DESIGN.md section 2 "initial inference
     // profile"): greedy, EOS disabled (forced fixed-length decode),

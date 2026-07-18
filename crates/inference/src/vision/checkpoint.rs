@@ -19,7 +19,7 @@ use std::path::Path;
 use crate::error::InferenceError;
 use crate::model::qwen35_config::VisionModelConfig;
 use crate::quant::q4_manifest;
-use crate::weights::f32_weights::{ShardedSafetensors, TensorSource};
+use crate::weights::f32_weights::{ShardedSafetensors, TensorSource, contain_manifest_path};
 use crate::weights::q4_weights::{dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file};
 
 /// One ViT transformer block's real tensors (`model.visual.blocks.{i}.*`).
@@ -241,7 +241,11 @@ fn load_from_q4_dir(
                 entry.name,
             )));
         }
-        let file_path = model_dir.join(&entry.file);
+        // PATH CONTAINMENT: `entry.file` comes from `quantize_index.json`, part of the
+        // untrusted checkpoint directory -- route it through the shared containment
+        // helper (see the PATH CONTAINMENT table in the PR body) instead of joining it
+        // onto `model_dir` unchecked.
+        let file_path = contain_manifest_path(model_dir, &entry.file)?;
         let (data, shape) = if entry.quantized.unwrap_or(false) {
             let q4 = load_q4_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
@@ -261,6 +265,24 @@ fn load_from_q4_dir(
                     expected: q4.shape.clone(),
                     actual: manifest_shape.clone(),
                 });
+            }
+            // ORDERING FIX (CLASS A3): `dequantize_q4_to_f32` expands the packed q4
+            // buffer into a full f32 `Vec` sized by `q4.shape`'s product -- a value read
+            // from the on-disk tensor header, independent of `vision_cfg` and not yet
+            // checked against any expected shape at this point. Budget that product
+            // BEFORE dequantizing (materializing) rather than after, so a hostile
+            // declared shape is rejected before the allocation, not once `assemble`'s
+            // per-tensor shape check runs on the already-materialized buffer.
+            let q4_elems: u128 = q4.shape.iter().map(|&d| d as u128).product();
+            let q4_bytes = q4_elems * 4;
+            if q4_bytes > crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES {
+                return Err(InferenceError::Inference(format!(
+                    "vision checkpoint tensor {} in {}: dequantized size ({q4_bytes} bytes) \
+                     exceeds MAX_VISION_TENSOR_BYTES ({}) -- rejected before dequantizing",
+                    entry.name,
+                    file_path.display(),
+                    crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES
+                )));
             }
             let shape = q4.shape.clone();
             (dequantize_q4_to_f32(&q4), shape)

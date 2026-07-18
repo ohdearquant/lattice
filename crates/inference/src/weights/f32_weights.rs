@@ -1091,16 +1091,52 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
     })
 }
 
-/// Resolve a tensor name to its shard filename via the weight map.
+/// Joins `entry_name` (a manifest/index-derived tensor-shard filename, e.g. from
+/// `model.safetensors.index.json`'s `weight_map` or `quantize_index.json`'s per-tensor
+/// `file` field) onto `model_root`, then asserts the result is still inside `model_root`.
+///
+/// PATH CONTAINMENT (sibling class): every one of these manifests is part of an untrusted
+/// checkpoint directory, and every site that joins one of their filename fields onto the
+/// model root without this check lets a `../` entry (or an absolute path, which
+/// [`Path::join`] treats as a full replacement of the base) escape the model directory.
+/// Canonicalizing both sides catches a symlink-based escape the same way as a literal
+/// `../` traversal, since [`std::fs::canonicalize`] resolves symlinks. Every manifest ->
+/// path construction in this crate routes through this one function -- see the
+/// PATH CONTAINMENT table in the PR body.
+pub(crate) fn contain_manifest_path(
+    model_root: &Path,
+    entry_name: &str,
+) -> Result<PathBuf, InferenceError> {
+    if Path::new(entry_name).is_absolute() {
+        return Err(InferenceError::Inference(format!(
+            "manifest entry {entry_name:?} must be a path relative to the model directory, \
+             not absolute"
+        )));
+    }
+    let candidate = model_root.join(entry_name);
+    let canon_root = model_root.canonicalize().map_err(InferenceError::Io)?;
+    let canon_candidate = candidate.canonicalize().map_err(InferenceError::Io)?;
+    if !canon_candidate.starts_with(&canon_root) {
+        return Err(InferenceError::Inference(format!(
+            "manifest entry {entry_name:?} escapes model root {} (resolved to {})",
+            model_root.display(),
+            canon_candidate.display()
+        )));
+    }
+    Ok(canon_candidate)
+}
+
+/// Resolve a tensor name to its shard path, contained within `model_dir`.
 pub fn resolve_shard(
     index: &SafetensorsIndex,
+    model_dir: &Path,
     tensor_name: &str,
 ) -> Result<PathBuf, InferenceError> {
     let shard_file = index
         .weight_map
         .get(tensor_name)
         .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-    Ok(PathBuf::from(shard_file))
+    contain_manifest_path(model_dir, shard_file)
 }
 
 /// Eagerly load all tensors from a sharded checkpoint into an owned map.
@@ -1122,7 +1158,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
-        let shard_path = model_dir.join(&shard_file);
+        let shard_path = contain_manifest_path(model_dir, &shard_file)?;
         let shard = SafetensorsFile::open(&shard_path)?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
@@ -1159,14 +1195,15 @@ impl ShardedSafetensors {
         &self.index
     }
 
-    /// Resolve a tensor name to `(shard_path, tensor_name)`.
+    /// Resolve a tensor name to `(shard_path, tensor_name)`, contained within `self.root`.
     pub fn resolve_weight(&self, tensor_name: &str) -> Result<(PathBuf, String), InferenceError> {
         let shard_file = self
             .index
             .weight_map
             .get(tensor_name)
             .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-        Ok((self.root.join(shard_file), tensor_name.to_string()))
+        let shard_path = contain_manifest_path(&self.root, shard_file)?;
+        Ok((shard_path, tensor_name.to_string()))
     }
 
     fn shard_file_for(&self, name: &str) -> Result<String, InferenceError> {
@@ -1179,7 +1216,7 @@ impl ShardedSafetensors {
 
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
-            let shard_path = self.root.join(shard_file);
+            let shard_path = contain_manifest_path(&self.root, shard_file)?;
             let shard = SafetensorsFile::open(&shard_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
@@ -2456,12 +2493,14 @@ mod tests {
         assert_eq!(index.weight_map.len(), 2);
 
         // Test resolve_shard free function.
-        let shard_a_path = resolve_shard(&index, "tensor.a").expect("resolve_shard tensor.a");
+        let shard_a_path = resolve_shard(&index, &dir, "tensor.a").expect("resolve_shard tensor.a");
         assert_eq!(
-            shard_a_path.to_string_lossy(),
-            "model-00001-of-00002.safetensors"
+            shard_a_path,
+            shard_a
+                .canonicalize()
+                .expect("test setup: canonicalize shard_a")
         );
-        assert!(resolve_shard(&index, "tensor.missing").is_err());
+        assert!(resolve_shard(&index, &dir, "tensor.missing").is_err());
 
         // Test load_sharded free function.
         let loaded = load_sharded(&dir).expect("load_sharded succeeds");
@@ -2643,5 +2682,88 @@ mod tests {
             "expected ShapeMismatch, got {err:?}"
         );
         fs::remove_file(&path).ok();
+    }
+
+    // ── PATH CONTAINMENT ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn contain_manifest_path_rejects_absolute_entry() {
+        let root = temp_dir("lattice_containment_absolute");
+        let err = contain_manifest_path(&root, "/etc/passwd")
+            .expect_err("an absolute manifest entry must be rejected");
+        assert!(
+            matches!(err, InferenceError::Inference(ref msg) if msg.contains("absolute")),
+            "wrong error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn contain_manifest_path_rejects_relative_traversal_escape() {
+        let root = temp_dir("lattice_containment_traversal");
+        // A real file placed one level above `root`, reachable only via `../`.
+        let escape_target = root.parent().expect("temp dir has a parent").join(format!(
+            "lattice_containment_secret_{}.txt",
+            std::process::id()
+        ));
+        fs::write(&escape_target, b"secret").expect("test setup: write escape target");
+
+        let entry = format!(
+            "../{}",
+            escape_target.file_name().unwrap().to_str().unwrap()
+        );
+        let result = contain_manifest_path(&root, &entry);
+
+        fs::remove_file(&escape_target).ok();
+
+        let err = result.expect_err("a `../` traversal escaping model_root must be rejected");
+        assert!(
+            matches!(err, InferenceError::Inference(ref msg) if msg.contains("escapes")),
+            "wrong error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn contain_manifest_path_accepts_contained_entry() {
+        let root = temp_dir("lattice_containment_ok");
+        let shard = root.join("model-00001-of-00001.safetensors");
+        write_single_f32_tensor(&shard, "tensor.a", &[1.0]);
+
+        let resolved = contain_manifest_path(&root, "model-00001-of-00001.safetensors")
+            .expect("a contained entry must resolve");
+        assert_eq!(
+            resolved,
+            shard
+                .canonicalize()
+                .expect("test setup: canonicalize shard")
+        );
+    }
+
+    #[test]
+    fn load_sharded_rejects_hostile_index_with_traversal_entry() {
+        let root = temp_dir("lattice_containment_load_sharded");
+        let escape_target = root.parent().expect("temp dir has a parent").join(format!(
+            "lattice_containment_load_sharded_secret_{}.safetensors",
+            std::process::id()
+        ));
+        write_single_f32_tensor(&escape_target, "tensor.a", &[1.0, 2.0]);
+
+        let index_path = root.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            format!(
+                r#"{{"metadata": {{"total_size": 8.0}}, "weight_map": {{"tensor.a": "../{}"}}}}"#,
+                escape_target.file_name().unwrap().to_str().unwrap()
+            ),
+        )
+        .expect("test setup: write hostile index");
+
+        let result = load_sharded(&root);
+
+        fs::remove_file(&escape_target).ok();
+
+        assert!(
+            result.is_err(),
+            "load_sharded must reject a `../` traversal entry in the index manifest"
+        );
     }
 }
