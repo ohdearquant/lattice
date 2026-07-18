@@ -225,9 +225,21 @@ impl LoraAdapter {
     /// Add this adapter's correction to one projection output in place.
     /// A missing `(layer_idx, module)` layer is a no-op; slices must match its shape.
     /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-representation-and-inference) for the matrix layout.
+    ///
+    /// This is called once per hooked row (see
+    /// [`lattice_inference::lora_hook::apply_lora_rows`]), so the lookup
+    /// below scans the layer map with a borrowed `&str` instead of hashing
+    /// an owned `(usize, String)` key — allocating a `String` per row here
+    /// would dominate the hot path long before the scan itself could. The
+    /// map is bounded by `num_layers * target_modules.len()`, so the scan
+    /// stays cheap.
     pub fn apply(&self, layer_idx: usize, module: &str, x: &[f32], base_output: &mut [f32]) {
-        let key = (layer_idx, module.to_string());
-        if let Some(lora_layer) = self.layers().get(&key) {
+        let lora_layer = self
+            .layers()
+            .iter()
+            .find(|((idx, m), _)| *idx == layer_idx && m == module)
+            .map(|(_, layer)| layer);
+        if let Some(lora_layer) = lora_layer {
             let scale = self.config().scale();
             apply_lora(lora_layer, scale, x, base_output);
         }
@@ -464,6 +476,35 @@ mod tests {
         adapter.apply(1, "q_proj", &x, &mut output);
 
         assert!((output[0] - 10.0).abs() < 1e-6);
+    }
+
+    /// Regression for the per-row BERT LoRA dispatch path
+    /// (`lattice_inference::lora_hook::apply_lora_rows` calls `apply()` once
+    /// per token row): each row's output must depend only on that row's own
+    /// input, independent of how many rows came before it. This pins the
+    /// same per-row output the hash-keyed lookup produced before it was
+    /// replaced with a borrowed-key scan.
+    #[test]
+    fn test_adapter_apply_over_multiple_token_rows_matches_per_row_reference() {
+        let adapter = make_test_adapter();
+
+        let rows: [[f32; 4]; 3] = [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [0.0; 4]];
+
+        for row in rows {
+            let mut output = [0.0f32; 4];
+            adapter.apply(0, "q_proj", &row, &mut output);
+
+            // Same reference as `test_adapter_apply`: A picks the first two
+            // components of `x`, B is the 4x2 permutation built in
+            // `make_test_adapter`, scale = 2.0.
+            let expected = [2.0 * row[0], 2.0 * row[1], 0.0, 0.0];
+            for (got, want) in output.iter().zip(expected.iter()) {
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "got {output:?}, want {expected:?}"
+                );
+            }
+        }
     }
 
     #[test]
