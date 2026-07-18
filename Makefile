@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
+.PHONY: check clippy test test-timing fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
 
 check:
 	cargo check --workspace
@@ -8,6 +8,14 @@ clippy:
 
 test:
 	cargo test --workspace
+
+# Opt-in wall-clock regression checks (cached-SIMD-config lookup, 1000-batch
+# dot product, FANN inference) that `test`/`ci` skip by default because
+# absolute-time assertions flake under shared-CI scheduling contention. Run
+# on an idle host to get a real regression signal.
+test-timing:
+	LATTICE_TIMING_TESTS=1 cargo test -p lattice-embed --test integration
+	LATTICE_TIMING_TESTS=1 cargo test -p lattice-fann --lib
 
 fmt:
 	cargo fmt --all

@@ -213,24 +213,7 @@ fn test_simd_config_detect_consistent() {
 fn test_simd_config_cached() {
     let expected = simd_config();
     let actual = simd_config();
-    assert_eq!(
-        (
-            actual.avx512f_enabled,
-            actual.avx2_enabled,
-            actual.fma_enabled,
-            actual.avx512vnni_enabled,
-            actual.neon_enabled,
-            actual.dotprod_enabled,
-        ),
-        (
-            expected.avx512f_enabled,
-            expected.avx2_enabled,
-            expected.fma_enabled,
-            expected.avx512vnni_enabled,
-            expected.neon_enabled,
-            expected.dotprod_enabled,
-        )
-    );
+    assert_eq!(actual, expected);
 
     if std::env::var("LATTICE_TIMING_TESTS").as_deref() != Ok("1") {
         eprintln!("skipping wall-clock assertion; set LATTICE_TIMING_TESTS=1 on an idle host");
@@ -248,6 +231,21 @@ fn test_simd_config_cached() {
         elapsed.as_micros() < 1000, // Less than 1ms for 10k calls
         "simd_config() should be cached, took {:?}",
         elapsed
+    );
+}
+
+#[test]
+fn test_simd_config_full_equality_catches_field_diff() {
+    // Comparing the whole struct (rather than enumerating fields) must
+    // discriminate on every field, including ones added after this test
+    // was written.
+    let base = simd_config();
+    let mut mutated = base;
+    mutated.dotprod_enabled = !mutated.dotprod_enabled;
+
+    assert_ne!(
+        mutated, base,
+        "SimdConfig equality did not detect a differing field"
     );
 }
 
@@ -441,6 +439,11 @@ fn test_batch_faster_than_sequential() {
     let sequential_time = start.elapsed();
 
     println!("Batch: {:?}, Sequential: {:?}", batch_time, sequential_time);
+
+    if std::env::var("LATTICE_TIMING_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping wall-clock assertion; set LATTICE_TIMING_TESTS=1 on an idle host");
+        return;
+    }
 
     // Both should complete quickly (< 10ms for 99 pairs of 384-dim vectors)
     assert!(
