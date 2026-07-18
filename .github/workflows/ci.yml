@@ -173,6 +173,12 @@ jobs:
       # buffer bounds). Build AND run them here so the feature cannot rot silently.
       - name: tune — mixture (online router-refit, build + run tests)
         run: cargo test -p lattice-tune --features mixture --lib
+      # simulated-teacher gates the deterministic fixed-label test/example path
+      # (label_single_simulated, label_batch_simulated). Off by default, so the
+      # required `ci` job never compiles or runs it. Build AND run here so the
+      # opt-in API cannot rot silently.
+      - name: tune — simulated-teacher (build + run tests)
+        run: cargo test -p lattice-tune --features simulated-teacher --lib
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
       # wgpu-gpu is excluded from default builds and was silently broken under
