@@ -9241,15 +9241,26 @@ mod inner {
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
-                // If the grammar blocked every token the sampler's non-finite-max
-                // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
-                if !super::has_finite_logit(&prefill_logits) {
-                    return Err(InferenceError::GrammarConstraintBlocked(
-                        "grammar constraint blocked every token at step 0; \
-                         no legal first token exists in the current grammar state"
-                            .into(),
-                    ));
+                match super::grammar_mask_outcome(engine, gs, &prefill_logits) {
+                    super::GrammarMaskOutcome::Continue => {}
+                    super::GrammarMaskOutcome::Complete => {
+                        return Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: prompt_len,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: Some(StopReason::Grammar),
+                            token_logprobs: vec![],
+                        });
+                    }
+                    super::GrammarMaskOutcome::BlockedConstraint => {
+                        return Err(InferenceError::GrammarConstraintBlocked(
+                            "grammar constraint blocked every token at step 0; \
+                             no legal first token exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
                 }
             }
 
@@ -9403,14 +9414,20 @@ mod inner {
                     // Apply grammar masking before sampling (ADR-046).
                     if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                         engine.mask_logits(gs, &mut step_logits);
-                        // Fail closed if the grammar blocked every continuation,
-                        // matching the CPU contract (#611).
-                        if !super::has_finite_logit(&step_logits) {
-                            return Err(InferenceError::GrammarConstraintBlocked(
-                                "grammar constraint blocked every token; \
-                                 no legal continuation exists in the current grammar state"
-                                    .into(),
-                            ));
+                        match super::grammar_mask_outcome(engine, gs, &step_logits) {
+                            super::GrammarMaskOutcome::Continue => {}
+                            super::GrammarMaskOutcome::Complete => {
+                                stopped = true;
+                                stop_reason = StopReason::Grammar;
+                                break;
+                            }
+                            super::GrammarMaskOutcome::BlockedConstraint => {
+                                return Err(InferenceError::GrammarConstraintBlocked(
+                                    "grammar constraint blocked every token; \
+                                     no legal continuation exists in the current grammar state"
+                                        .into(),
+                                ));
+                            }
                         }
                     }
 
@@ -14177,15 +14194,26 @@ mod inner {
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
-                // If the grammar blocked every token the sampler's non-finite-max
-                // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
-                if !super::has_finite_logit(&prefill_logits) {
-                    return Err(InferenceError::GrammarConstraintBlocked(
-                        "grammar constraint blocked every token at step 0; \
-                         no legal first token exists in the current grammar state"
-                            .into(),
-                    ));
+                match super::grammar_mask_outcome(engine, gs, &prefill_logits) {
+                    super::GrammarMaskOutcome::Continue => {}
+                    super::GrammarMaskOutcome::Complete => {
+                        return Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: prompt_len,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: Some(StopReason::Grammar),
+                            token_logprobs: token_logprobs.clone(),
+                        });
+                    }
+                    super::GrammarMaskOutcome::BlockedConstraint => {
+                        return Err(InferenceError::GrammarConstraintBlocked(
+                            "grammar constraint blocked every token at step 0; \
+                             no legal first token exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
                 }
             }
 
@@ -14349,14 +14377,20 @@ mod inner {
                 // Apply grammar masking before sampling (ADR-046).
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     engine.mask_logits(gs, &mut step_logits);
-                    // Fail closed if the grammar blocked every continuation,
-                    // matching the CPU contract (#611).
-                    if !super::has_finite_logit(&step_logits) {
-                        return Err(InferenceError::GrammarConstraintBlocked(
-                            "grammar constraint blocked every token; \
-                             no legal continuation exists in the current grammar state"
-                                .into(),
-                        ));
+                    match super::grammar_mask_outcome(engine, gs, &step_logits) {
+                        super::GrammarMaskOutcome::Continue => {}
+                        super::GrammarMaskOutcome::Complete => {
+                            stopped = true;
+                            stop_reason = StopReason::Grammar;
+                            break;
+                        }
+                        super::GrammarMaskOutcome::BlockedConstraint => {
+                            return Err(InferenceError::GrammarConstraintBlocked(
+                                "grammar constraint blocked every token; \
+                                 no legal continuation exists in the current grammar state"
+                                    .into(),
+                            ));
+                        }
                     }
                 }
 
@@ -17075,15 +17109,41 @@ mod inner {
 
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 engine.mask_logits(gs, &mut prefill_logits);
-                // If the grammar blocked every token the sampler's non-finite-max
-                // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
-                if !super::has_finite_logit(&prefill_logits) {
-                    return Err(InferenceError::GrammarConstraintBlocked(
-                        "grammar constraint blocked every token at step 0; \
-                         no legal first token exists in the current grammar state"
-                            .into(),
-                    ));
+                match super::grammar_mask_outcome(engine, gs, &prefill_logits) {
+                    super::GrammarMaskOutcome::Continue => {}
+                    super::GrammarMaskOutcome::Complete => {
+                        self.save_cross_turn_prefix_or_clear(
+                            slot_id,
+                            metadata.clone(),
+                            prompt_ids.clone(),
+                            consumed_entry.take(),
+                        );
+                        return Ok(CachedGenerateOutput {
+                            output: GenerateOutput {
+                                text: String::new(),
+                                token_ids: vec![],
+                                prompt_tokens: prompt_len,
+                                generated_tokens: 0,
+                                stopped: true,
+                                stop_reason: Some(StopReason::Grammar),
+                                token_logprobs: vec![],
+                            },
+                            cache: CrossTurnCacheStats {
+                                slot_id,
+                                prompt_tokens: prompt_len,
+                                reused_tokens: plan.reusable_len,
+                                prefetched_tokens: plan.suffix_len,
+                                mode: plan.mode,
+                            },
+                        });
+                    }
+                    super::GrammarMaskOutcome::BlockedConstraint => {
+                        return Err(InferenceError::GrammarConstraintBlocked(
+                            "grammar constraint blocked every token at step 0; \
+                             no legal first token exists in the current grammar state"
+                                .into(),
+                        ));
+                    }
                 }
             }
 
@@ -17287,14 +17347,20 @@ mod inner {
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                     engine.mask_logits(gs, &mut step_logits);
-                    // Fail closed if the grammar blocked every continuation,
-                    // matching the CPU contract (#611).
-                    if !super::has_finite_logit(&step_logits) {
-                        return Err(InferenceError::GrammarConstraintBlocked(
-                            "grammar constraint blocked every token; \
-                             no legal continuation exists in the current grammar state"
-                                .into(),
-                        ));
+                    match super::grammar_mask_outcome(engine, gs, &step_logits) {
+                        super::GrammarMaskOutcome::Continue => {}
+                        super::GrammarMaskOutcome::Complete => {
+                            stopped = true;
+                            stop_reason = StopReason::Grammar;
+                            break;
+                        }
+                        super::GrammarMaskOutcome::BlockedConstraint => {
+                            return Err(InferenceError::GrammarConstraintBlocked(
+                                "grammar constraint blocked every token; \
+                                 no legal continuation exists in the current grammar state"
+                                    .into(),
+                            ));
+                        }
                     }
                 }
 
@@ -34802,36 +34868,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // -----------------------------------------------------------------------
-        // Grammar fail-closed DECODE-LOOP integration tests (#611)
+        // Grammar-complete DECODE-LOOP integration tests (#1015)
         //
-        // The three tests above only reach the post-prefill masking site: their
-        // fixture blocks every vocab entry from step 0, so `has_finite_logit`
-        // never survives long enough to exercise the second, structurally
-        // identical guard a few lines below in the decode loop of each function
-        // (`generate` :10502, `generate_streaming_with_cancel` :14821,
-        // `generate_streaming_with_prefix_cache_inner` :16975). Reverting any one
-        // of those three decode-loop guards left the three tests above green.
-        //
-        // Fixture: a real (non-empty) single-byte vocab table plus the GBNF
-        // grammar `root ::= "a"`. Token id 0 in `single_char_vocab_tokenizer` is
-        // `'a'`, so the initial-state mask allows exactly that one token and
-        // blocks the other 31. After `'a'` is sampled and the grammar state
-        // advances past it, the PDA stack is empty AND `complete == true`
-        // (`GrammarState::can_accept_more()` is `false`), so the *next* mask
-        // blocks all 32 tokens — the fixed point this test targets is one step
-        // later than the prefill-blocked fixture above. `max_new_tokens: 2`
-        // is required so the loop actually reaches the decode iteration that
-        // hits the second mask; with `max_new_tokens: 1` the function would
-        // return successfully after the prefill token and never reach the
-        // decode-loop guard at all.
-        //
-        // Mutation sensitivity: reverting the decode-loop `has_finite_logit`
-        // guard at the corresponding site leaves the all-`NEG_INFINITY` second
-        // mask in place, and the sampler's non-finite-max short-circuit then
-        // silently returns a token instead of failing — each assertion below
-        // fails instead of passing. Verified by temporarily reverse-applying
-        // the guard at each site (`touch`-ing the file so cargo rebuilds) and
-        // re-running these three tests; restored afterward.
+        // The all-empty-vocabulary tests above exercise a genuine blocked
+        // constraint. These tests use `root ::= "a"`: token 0 completes the
+        // grammar, and the following mask has no legal continuation. Each
+        // public Metal path must treat that accepting state as a clean grammar
+        // stop instead of returning `GrammarConstraintBlocked`.
 
         /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
         /// order (`'a'..='z'` then `'A'..='F'`), so a `GrammarEngine` built
@@ -34850,10 +34893,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .collect()
         }
 
-        /// #611: `generate`'s DECODE-LOOP grammar-masking site
-        /// (:10502) must fail closed too, not just the post-prefill site.
+        /// `generate` must stop cleanly after the grammar's only token.
         #[test]
-        fn generate_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+        fn generate_decode_loop_stops_on_complete_grammar() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -34864,7 +34906,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -34895,22 +34936,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 logprobs: None,
             };
 
-            let result = state.generate("a", &tokenizer, &gen_cfg);
-            assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard once the second step's mask blocks every \
-                 continuation; got {result:?}"
+            let output = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("a complete grammar must stop without an error");
+            assert_eq!(
+                output.stop_reason,
+                Some(StopReason::Grammar),
+                "the accepting state must be reported as a grammar stop"
             );
+            assert!(output.stopped);
+            assert_eq!(output.token_ids, vec![0]);
         }
 
-        /// #611: `generate_streaming`'s DECODE-LOOP grammar-masking
-        /// site (`generate_streaming_with_cancel` :14821) must fail closed
-        /// too. Also asserts `on_token` is invoked at most once — the
-        /// fail-open bug this closes would otherwise emit a bogus second
-        /// token to the caller instead of erroring.
+        /// `generate_streaming` must emit the only token and stop cleanly.
         #[test]
-        fn generate_streaming_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+        fn generate_streaming_decode_loop_stops_on_complete_grammar() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -34921,7 +34961,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -34953,31 +34992,25 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let mut on_token_calls = 0u32;
-            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
-                on_token_calls += 1;
-                true
-            });
+            let output = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                    on_token_calls += 1;
+                    true
+                })
+                .expect("a complete grammar must stop without an error");
 
-            assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard via generate_streaming(); got {result:?}"
-            );
-            assert!(
-                on_token_calls <= 1,
-                "the decode-loop guard must fire before a second (bogus) token \
-                 ever reaches on_token; got {on_token_calls} calls"
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert!(output.stopped);
+            assert_eq!(output.token_ids, vec![0]);
+            assert_eq!(
+                on_token_calls, 1,
+                "only the grammar's accepted token may reach on_token"
             );
         }
 
-        /// #611: `generate_streaming_with_prefix_cache`'s
-        /// DECODE-LOOP grammar-masking site (inside
-        /// `generate_streaming_with_prefix_cache_inner` :16975) must fail
-        /// closed too, AND the public wrapper's error path must not save a
-        /// cache entry the decode-loop failure invalidated.
+        /// Prefix-cache streaming must preserve the completed generation.
         #[test]
-        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_blocking_second_token()
-         {
+        fn generate_streaming_with_prefix_cache_decode_loop_stops_on_complete_grammar() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -34988,7 +35021,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -35020,24 +35052,18 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 logprobs: None,
             };
 
-            let result = state.generate_streaming_with_prefix_cache(
-                slot_id,
-                "a",
-                &tokenizer,
-                &gen_cfg,
-                |_, _| true,
-            );
+            let result = state
+                .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("a complete grammar must stop without an error");
 
+            assert_eq!(result.output.stop_reason, Some(StopReason::Grammar));
+            assert!(result.output.stopped);
+            assert_eq!(result.output.token_ids, vec![0]);
             assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard via generate_streaming_with_prefix_cache(); \
-                 got {result:?}"
-            );
-            assert!(
-                state.cross_turn_prefix_cache.entry.is_none(),
-                "a decode-loop grammar-fail-closed turn must not leave a stale \
-                 cache entry behind"
+                state.cross_turn_prefix_cache.entry.is_some(),
+                "the accepted grammar output must remain available for prefix reuse"
             );
         }
     }
@@ -36098,9 +36124,65 @@ pub(crate) fn has_finite_logit(logits: &[f32]) -> bool {
     logits.iter().any(|&l| l > f32::NEG_INFINITY)
 }
 
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrammarMaskOutcome {
+    Continue,
+    Complete,
+    BlockedConstraint,
+}
+
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn grammar_mask_outcome(
+    engine: &crate::grammar::GrammarEngine,
+    state: &crate::grammar::pda::GrammarState,
+    logits: &[f32],
+) -> GrammarMaskOutcome {
+    if has_finite_logit(logits) {
+        GrammarMaskOutcome::Continue
+    } else if engine.is_complete_without_continuation(state) {
+        GrammarMaskOutcome::Complete
+    } else {
+        GrammarMaskOutcome::BlockedConstraint
+    }
+}
+
 #[cfg(test)]
 mod has_finite_logit_tests {
-    use super::has_finite_logit;
+    use super::{GrammarMaskOutcome, grammar_mask_outcome, has_finite_logit};
+    use crate::grammar::{GrammarEngine, GrammarSpec};
+
+    #[test]
+    fn grammar_mask_outcome_distinguishes_complete_from_blocked_constraint() {
+        let complete_engine = GrammarEngine::new(
+            &GrammarSpec::Gbnf("root ::= \"a\"\n".to_string()),
+            vec![b"a".to_vec()],
+        )
+        .unwrap();
+        let mut complete_state = complete_engine.initial_state();
+        assert!(complete_engine.advance(&mut complete_state, 0));
+        let mut complete_logits = vec![0.0];
+        complete_engine.mask_logits(&mut complete_state, &mut complete_logits);
+
+        assert_eq!(
+            grammar_mask_outcome(&complete_engine, &complete_state, &complete_logits),
+            GrammarMaskOutcome::Complete
+        );
+
+        let blocked_engine = GrammarEngine::new(
+            &GrammarSpec::Gbnf("root ::= \"a\"\n".to_string()),
+            vec![vec![]],
+        )
+        .unwrap();
+        let mut blocked_state = blocked_engine.initial_state();
+        let mut blocked_logits = vec![0.0];
+        blocked_engine.mask_logits(&mut blocked_state, &mut blocked_logits);
+
+        assert_eq!(
+            grammar_mask_outcome(&blocked_engine, &blocked_state, &blocked_logits),
+            GrammarMaskOutcome::BlockedConstraint
+        );
+    }
 
     /// Mutation sensitivity: change `has_finite_logit` to always return `true`
     /// → this assertion fails, catching the regression that would let an
