@@ -186,6 +186,43 @@ const MAX_SEQ_LEN_CAP: usize = 8_192;
 /// training cache.
 const MAX_LOGITS_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// Upper bound on the frozen-prefix attention cache ([`build_caches`]'s
+/// `h_in` + RoPE `cos`/`sin` buffers) for one sample set, in bytes. Bounds
+/// the PRODUCT of raw token count and per-token buffer size — `MAX_SAMPLES`
+/// and `MAX_SEQ_LEN_CAP` bound sample count and per-sample length
+/// independently, and neither bounds their product (100_000 samples ×
+/// 8_192 tokens = 819.2M raw tokens). Same 2 GiB order of magnitude as
+/// [`MAX_LOGITS_BYTES`], the existing per-cache-set memory precedent for
+/// this driver.
+const MAX_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Reject a sample set whose projected [`build_caches`] allocation
+/// (`sum(seq_len) * (hidden + rope_dim) * 4` bytes for `h_in` + `cos` +
+/// `sin`) would exceed [`MAX_CACHE_BYTES`]. The caller must run this BEFORE
+/// [`build_caches`] — the check exists to prevent the allocation, not to
+/// report on it after the fact.
+fn check_cache_budget(
+    samples: &[Sample],
+    hidden: usize,
+    rope_dim: usize,
+    label: &str,
+) -> Result<(), String> {
+    let per_token_bytes = (hidden + rope_dim) as u64 * 4;
+    let total_tokens: u64 = samples.iter().map(|s| s.tokens.len() as u64).sum();
+    let projected_bytes = total_tokens.saturating_mul(per_token_bytes);
+    if projected_bytes > MAX_CACHE_BYTES {
+        return Err(format!(
+            "{label} frozen-prefix cache would require {} MiB ({total_tokens} raw tokens \
+             across {} samples * (hidden {hidden} + rope_dim {rope_dim}) * 4B), \
+             exceeds {} MiB cap - reduce --seq-len-cap or --max-{label}",
+            projected_bytes / (1024 * 1024),
+            samples.len(),
+            MAX_CACHE_BYTES / (1024 * 1024),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the loaded model's depth against the driver's fixed `TOP_LAYER`
 /// range before any layer access. [`Qwen35Model::gqa_layer_weights`] and
 /// [`Qwen35Model::gdn_layer_weights`] index layer storage directly by
@@ -398,6 +435,8 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     }
     println!("  {} samples loaded", train_samples.len());
 
+    check_cache_budget(&train_samples, dims.hidden, dims.rope_dim, "train")?;
+
     // Capture the frozen prefix output (h_in entering first_layer) per sample.
     println!("\nBuilding frozen-prefix cache (layers 0..{first_layer})...");
     let tcache = Instant::now();
@@ -429,6 +468,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             max_valid,
         ) {
             Ok(vs) if !vs.is_empty() => {
+                check_cache_budget(&vs, dims.hidden, dims.rope_dim, "valid")?;
                 let (vc, vpos) = build_caches(&model, &vs, first_layer)?;
                 let valid_logits_bytes = vpos * dims.vocab * 4;
                 if valid_logits_bytes > MAX_LOGITS_BYTES {
@@ -1099,6 +1139,56 @@ mod run_bounds_tests {
             err.contains("--seq-len-cap"),
             "expected zero-seq-len-cap rejection; got: {err}"
         );
+    }
+
+    /// Mutation-sensitive: `MAX_SAMPLES` and `MAX_SEQ_LEN_CAP` bound sample
+    /// count and per-sample length independently; neither bounds their
+    /// product. This sample set passes both per-dimension caps individually
+    /// (far under `MAX_SAMPLES` samples, far under `MAX_SEQ_LEN_CAP` tokens
+    /// each) but its aggregate `build_caches` allocation exceeds
+    /// `MAX_CACHE_BYTES`. Without `check_cache_budget`, nothing in `run()`
+    /// would have rejected this combination before `build_caches` started
+    /// allocating.
+    #[test]
+    fn check_cache_budget_rejects_oversized_aggregate() {
+        let hidden = 4096;
+        let rope_dim = 128;
+        let samples: Vec<Sample> = (0..2_000)
+            .map(|_| Sample {
+                tokens: vec![0u32; 100],
+                completion_start: 0,
+            })
+            .collect();
+        assert!(
+            samples.len() < MAX_SAMPLES,
+            "test setup must pass the sample-count cap"
+        );
+        assert!(
+            samples.iter().all(|s| s.tokens.len() < MAX_SEQ_LEN_CAP),
+            "test setup must pass the per-sample length cap"
+        );
+        let total_tokens: u64 = samples.iter().map(|s| s.tokens.len() as u64).sum();
+        assert!(
+            total_tokens * ((hidden + rope_dim) as u64) * 4 > MAX_CACHE_BYTES,
+            "test setup must actually exceed the aggregate cache budget"
+        );
+
+        let err = check_cache_budget(&samples, hidden, rope_dim, "train").unwrap_err();
+        assert!(
+            err.contains("frozen-prefix cache") && err.contains("--max-train"),
+            "expected aggregate cache-budget rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_cache_budget_accepts_small_aggregate() {
+        let samples: Vec<Sample> = (0..4)
+            .map(|_| Sample {
+                tokens: vec![0u32; 32],
+                completion_start: 0,
+            })
+            .collect();
+        check_cache_budget(&samples, 4096, 128, "train").unwrap();
     }
 }
 
