@@ -19,6 +19,10 @@ on:
     paths:
       - 'crates/inference/src/**'
       - 'crates/embed/src/**'
+      - 'crates/tune/src/**'
+      - 'crates/tune/tests/**'
+      - 'crates/tune/Cargo.toml'
+      - '.github/workflows/e2e-parity.yml'
       - 'scripts/ci-changed-files.sh'
   schedule:
     - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
@@ -55,6 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       engine: ${{ steps.filter.outputs.engine }}
+      tune: ${{ steps.filter.outputs.tune }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +72,7 @@ jobs:
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] || [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
+            echo "tune=true" >> "$GITHUB_OUTPUT"
             echo "→ $GITHUB_EVENT_NAME trigger: full parity suite REQUIRED"
             exit 0
           fi
@@ -88,6 +94,74 @@ jobs:
             echo "engine=false" >> "$GITHUB_OUTPUT"
             echo "→ no engine change: parity not required"
           fi
+          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^\.github/workflows/e2e-parity\.yml$' <<<"$CHANGED" >/dev/null; then
+            echo "tune=true" >> "$GITHUB_OUTPUT"
+            echo "→ tune training surface changed: layer-23 golden REQUIRED"
+          else
+            echo "tune=false" >> "$GITHUB_OUTPUT"
+            echo "→ no tune training change: layer-23 golden not required"
+          fi
+
+  layer23-golden:
+    name: layer-23 golden bridge
+    needs: changes
+    if: needs.changes.outputs.tune == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: layer23-golden-pip-${{ runner.os }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-v1
+
+      - name: Install model downloader
+        run: pip install "huggingface_hub==1.20.1"
+
+      - name: Provision Qwen3.5-0.8B
+        run: |
+          MODEL_CACHE=$(python3 -c "
+          from huggingface_hub import snapshot_download
+          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          ")
+          mkdir -p "$RUNNER_TEMP/lattice-models"
+          ln -sf "$MODEL_CACHE" "$RUNNER_TEMP/lattice-models/qwen3.5-0.8b"
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: layer23-golden
+
+      - name: Run legacy-to-shared layer-23 bridge
+        env:
+          LATTICE_LAYER23_GOLDEN_GATE_ENFORCE: '1'
+          LATTICE_LAYER23_GOLDEN_REPORT: ${{ runner.temp }}/layer23-golden-report.txt
+          LATTICE_MODEL_DIR: ${{ runner.temp }}/lattice-models/qwen3.5-0.8b
+        run: |
+          cargo test --release -p lattice-tune \
+            --test layer23_golden_bridge \
+            --features train-backward \
+            -- --nocapture
+
+      - name: Upload layer-23 bridge report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: layer23-golden-${{ github.sha }}
+          path: ${{ runner.temp }}/layer23-golden-report.txt
+          if-no-files-found: error
 
   parity:
     name: e2e parity
@@ -903,6 +977,13 @@ jobs:
   # exactly that skip. q4-ppl-quality is now armed
   # (golden captured on run 28841919096) and gates the shipping Q4 tier for
   # regressions.
+  #
+  # layer23-golden is checked independently of the engine branch below: it is
+  # gated by needs.changes.outputs.tune, not .engine, so a tune-only PR (tune
+  # filter true, engine filter false) must still consume its result before the
+  # gate can pass. The check runs unconditionally, ahead of the engine
+  # short-circuit — otherwise a tune-only change would hit the "no engine
+  # change" early PASS and never evaluate the bridge job at all.
   parity-gate:
     name: parity-gate
     needs:
@@ -917,6 +998,7 @@ jobs:
         ppl-gate-selftest,
         q4-ppl-quality,
         metal-parity,
+        layer23-golden,
       ]
     if: always()
     runs-on: ubuntu-latest
@@ -925,6 +1007,7 @@ jobs:
         run: |
           CHANGES_RESULT="${{ needs.changes.result }}"
           ENGINE="${{ needs.changes.outputs.engine }}"
+          TUNE="${{ needs.changes.outputs.tune }}"
           PARITY_RESULT="${{ needs.parity.result }}"
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
           WASM_RESULT="${{ needs.wasm-parity.result }}"
@@ -934,10 +1017,15 @@ jobs:
           PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
           Q4PPL_RESULT="${{ needs.q4-ppl-quality.result }}"
           METAL_RESULT="${{ needs.metal-parity.result }}"
+          LAYER23_RESULT="${{ needs.layer23-golden.result }}"
           EVENT_NAME="${{ github.event_name }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT metal-parity=$METAL_RESULT event=$EVENT_NAME"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
+            exit 1
+          fi
+          if [ "$TUNE" = "true" ] && [ "$LAYER23_RESULT" != "success" ]; then
+            echo "::error::Tune training surface changed and the layer-23 golden bridge did not succeed (result=$LAYER23_RESULT)."
             exit 1
           fi
           if [ "$ENGINE" != "true" ]; then

@@ -608,6 +608,26 @@ fn position_nll(logits: &[f32], target: u32) -> f32 {
     (-log_prob) as f32
 }
 
+/// Positions the per-token FFN block must actually run for. Every layer's
+/// mixer output at every position feeds the *next* layer (causal attention
+/// keys/values, GDN recurrent state), so the FFN block — a pointwise
+/// transform that feeds nothing but its own layer's output — must still run
+/// at every position on every non-terminal layer. On the terminal layer,
+/// though, only `completion_range` positions are ever read back out (the
+/// head loop only computes logits there), so prompt positions' FFN output
+/// would be computed and immediately discarded: skip them.
+fn ffn_compute_range(
+    is_last_layer: bool,
+    seq: usize,
+    completion_range: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    if is_last_layer {
+        completion_range
+    } else {
+        0..seq
+    }
+}
+
 pub fn forward_full(
     ctx: &SeqCtx,
     layers: &[LayerW<'_>],
@@ -625,8 +645,15 @@ pub fn forward_full(
     let seq = ctx.seq_len;
     let mut h = ctx.h_in.clone();
     let mut layers_fwd: Vec<LayerFwd> = Vec::with_capacity(layers.len());
+    let num_layers = layers.len();
+    // Only the completion positions' post-stack hidden state is ever read
+    // (the head loop below indexes `h[t]` for `t` in this same range), so on
+    // the terminal layer the pointwise FFN block need not run over prompt
+    // positions — their output is computed and immediately discarded.
+    let completion_range = (ctx.completion_start - 1)..(ctx.seq_len - 1);
 
-    for lw in layers {
+    for (li, lw) in layers.iter().enumerate() {
+        let is_last_layer = li + 1 == num_layers;
         let h_layer_in = h.clone();
         let (normed_pre, inv_pre) = rmsnorm_seq(&h, &lw.pre_shift, hidden, seq, d.eps);
 
@@ -735,10 +762,10 @@ pub fn forward_full(
         }
 
         let (normed_ffn, inv_ffn) = rmsnorm_seq(&h_mid, &lw.post_shift, hidden, seq, d.eps);
-        let mut gate_pre = Vec::with_capacity(seq);
-        let mut up_pre = Vec::with_capacity(seq);
+        let mut gate_pre: Vec<Vec<f32>> = vec![Vec::new(); seq];
+        let mut up_pre: Vec<Vec<f32>> = vec![Vec::new(); seq];
         let mut h_next = h_mid.clone();
-        for t in 0..seq {
+        for t in ffn_compute_range(is_last_layer, seq, completion_range.clone()) {
             let (ffn_out, gp, up) = swiglu_forward(
                 &normed_ffn[t * hidden..(t + 1) * hidden],
                 lw.w_gate,
@@ -753,8 +780,8 @@ pub fn forward_full(
             {
                 *o += *f;
             }
-            gate_pre.push(gp);
-            up_pre.push(up);
+            gate_pre[t] = gp;
+            up_pre[t] = up;
         }
 
         layers_fwd.push(LayerFwd {
@@ -835,6 +862,16 @@ pub fn nll_and_grads(
         .map(|_| GdnLoraParams::zeros(rank, hidden, gdn_dims))
         .collect::<Result<Vec<_>>>()?;
 
+    let num_layers = layers.len();
+    // Mirrors `forward_full`'s terminal-layer FFN skip: the completion
+    // positions are exactly where the loss injects nonzero gradient into
+    // `d_h`, so on the last layer the FFN backward at prompt positions
+    // would multiply a structurally zero incoming gradient through.
+    let completion_range = match (fwd.positions.first(), fwd.positions.last()) {
+        (Some(first), Some(last)) => first.t..(last.t + 1),
+        _ => 0..0,
+    };
+
     let mut d_h = vec![0.0f32; seq * hidden];
     let mut nll_sum = 0.0f64;
     for p in &fwd.positions {
@@ -862,9 +899,10 @@ pub fn nll_and_grads(
     for li in (0..layers.len()).rev() {
         let lw = &layers[li];
         let lf = &fwd.layers[li];
+        let is_last_layer = li + 1 == num_layers;
 
         let mut d_h_mid = d_h.clone();
-        for t in 0..seq {
+        for t in ffn_compute_range(is_last_layer, seq, completion_range.clone()) {
             let d_ffn_out = &d_h[t * hidden..(t + 1) * hidden];
             let (d_normed_ffn, _dm) = swiglu_backward(
                 d_ffn_out,
@@ -1563,5 +1601,40 @@ mod train_ctx_tests {
             err.contains("scale"),
             "expected non-finite GdnDims.scale rejection; got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ffn_compute_range_tests {
+    use super::*;
+
+    /// Non-terminal layers must still run the FFN block at every position:
+    /// their output feeds the next layer's mixer (causal K/V, GDN state) at
+    /// every position, not just the completion positions.
+    #[test]
+    fn non_terminal_layer_uses_full_sequence() {
+        let range = ffn_compute_range(false, 10, 6..9);
+        assert_eq!(range, 0..10);
+    }
+
+    /// Mutation-sensitive: if the terminal-layer branch is dropped (or
+    /// inverted), the FFN block runs over the full prompt on the last layer
+    /// every step — a confirmed O(prompt_length) regression, since only the
+    /// completion positions' post-stack hidden state is ever read by the
+    /// head loop.
+    #[test]
+    fn terminal_layer_uses_completion_positions_only() {
+        let range = ffn_compute_range(true, 10, 6..9);
+        assert_eq!(range, 6..9);
+        assert_ne!(range, 0..10, "must not degrade to the full-sequence range");
+    }
+
+    #[test]
+    fn terminal_layer_with_single_completion_position() {
+        // A one-token completion (e.g. a 2-token pair) still only computes
+        // FFN for that single position, not the whole prompt.
+        let range = ffn_compute_range(true, 64, 62..63);
+        assert_eq!(range, 62..63);
+        assert_eq!(range.len(), 1);
     }
 }
