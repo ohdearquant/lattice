@@ -2190,9 +2190,9 @@ fn truncate_token_logprobs_to_retained_text(
 
 /// Returns true when `token_id` is EOS or is in the `stop_token_ids` list.
 ///
-/// `pub(crate)` — all callers (Q8, F16, NEON, batch-prefill generate paths) live
-/// within this crate. Keeping the function crate-private avoids leaking a
-/// low-level sampling helper as part of the public API.
+/// `pub(crate)` — all call sites live within this crate. Keeping the function
+/// crate-private avoids leaking a low-level sampling helper as part of the
+/// public API.
 pub(crate) fn should_stop_token(
     cfg: &Qwen35Config,
     gen_cfg: &GenerateConfig,
@@ -2213,7 +2213,6 @@ pub(crate) fn should_stop_token(
 /// - `generate_q8` (`forward/cpu_q8.rs`)
 /// - `generate_f16` (`forward/cpu_f16.rs`)
 /// - `generate_q8_neon` (`forward/neon_forward.rs`)
-/// - `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`)
 /// - `multimodal_generate_preflight` (`forward/metal_qwen35.rs`)
 ///
 /// The base CPU `generate()` / `generate_streaming()` paths in this module wire
@@ -2255,8 +2254,7 @@ pub(crate) fn check_logprobs_not_set(gen_cfg: &GenerateConfig) -> Result<(), Inf
 /// string-level stop matching into its decode loop.
 ///
 /// Callers: `generate_f16` (`forward/cpu_f16.rs`), `generate_q8`
-/// (`forward/cpu_q8.rs`), `generate_q8_neon` (`forward/neon_forward.rs`),
-/// `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`).
+/// (`forward/cpu_q8.rs`), `generate_q8_neon` (`forward/neon_forward.rs`).
 ///
 /// The base CPU `generate()` / `generate_streaming()` paths in this module,
 /// and the Metal `generate()` / `generate_streaming()` / `generate_multimodal`
