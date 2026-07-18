@@ -50,7 +50,9 @@ pub struct GatedDeltaNetWeights {
     pub conv_dim: usize,
     pub kernel_size: usize,
 
-    /// Output gated RMSNorm gamma: `[output_dim]`
+    /// Output gated RMSNorm gamma: `[linear_value_head_dim]`, one per-head-dim gamma
+    /// shared across all value heads and applied identically to each (see the
+    /// gated-RMSNorm loop over `value_heads` in `gated_delta_net_step`).
     pub norm_weight: Vec<f32>,
 
     /// Output projection: [hidden_size, output_dim]

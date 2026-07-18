@@ -86,6 +86,19 @@ fn load_owned_tensor_checked<T: TensorSource + ?Sized>(
     name: &str,
     expected: &[usize],
 ) -> Result<Vec<f32>, InferenceError> {
+    // Preflight against the declared (metadata-only) shape before materializing the
+    // tensor: get_f32_tensor_owned decodes and finiteness-scans the full tensor, so a
+    // checkpoint declaring a large finite tensor with an incompatible shape must be
+    // rejected here, before that work runs, not after.
+    if let Some(declared_shape) = source.tensor_shape(name)?
+        && declared_shape != expected
+    {
+        return Err(InferenceError::ShapeMismatch {
+            name: name.to_string(),
+            expected: expected.to_vec(),
+            actual: declared_shape,
+        });
+    }
     let (data, shape) = source.get_f32_tensor_owned(name)?;
     if shape != expected {
         return Err(InferenceError::ShapeMismatch {
@@ -95,6 +108,79 @@ fn load_owned_tensor_checked<T: TensorSource + ?Sized>(
         });
     }
     Ok(data)
+}
+
+/// Doubles `value`, returning a typed error instead of panicking (debug) or wrapping
+/// (release) when the config-derived dimension is too large for `usize`.
+fn checked_double(value: usize, what: &str) -> Result<usize, InferenceError> {
+    value
+        .checked_mul(2)
+        .ok_or_else(|| InferenceError::InvalidInput(format!("{what} overflows usize: 2 * {value}")))
+}
+
+/// Full-attention Q projection row count (`num_attention_heads * head_dim`), computed
+/// with checked arithmetic so an attacker-controlled config.json cannot overflow it.
+fn checked_full_q_dim(cfg: &Qwen35Config) -> Result<usize, InferenceError> {
+    cfg.num_attention_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "full attention q_dim overflows usize: num_attention_heads({}) * head_dim({})",
+                cfg.num_attention_heads, cfg.head_dim
+            ))
+        })
+}
+
+/// Full-attention KV projection row count (`num_key_value_heads * head_dim`), checked.
+fn checked_full_kv_dim(cfg: &Qwen35Config) -> Result<usize, InferenceError> {
+    cfg.num_key_value_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "full attention kv_dim overflows usize: num_key_value_heads({}) * head_dim({})",
+                cfg.num_key_value_heads, cfg.head_dim
+            ))
+        })
+}
+
+/// GatedDeltaNet combined QKV projection row count (`Q + K + V`), checked. Mirrors
+/// `Qwen35Config::linear_qkv_dim`'s formula but rejects overflow with a typed error
+/// instead of panicking (debug) or wrapping (release).
+fn checked_linear_qkv_dim(cfg: &Qwen35Config) -> Result<usize, InferenceError> {
+    let k = cfg
+        .linear_num_key_heads
+        .checked_mul(cfg.linear_key_head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "linear attention k dim overflows usize: linear_num_key_heads({}) * linear_key_head_dim({})",
+                cfg.linear_num_key_heads, cfg.linear_key_head_dim
+            ))
+        })?;
+    let value_heads = cfg.linear_num_value_heads();
+    let v = value_heads.checked_mul(cfg.linear_value_head_dim).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "linear attention v dim overflows usize: linear_num_value_heads({}) * linear_value_head_dim({})",
+            value_heads, cfg.linear_value_head_dim
+        ))
+    })?;
+    k.checked_add(k)
+        .and_then(|qk| qk.checked_add(v))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "linear attention qkv_dim overflows usize: q({k}) + k({k}) + v({v})"
+            ))
+        })
+}
+
+/// GatedDeltaNet output projection row count (`linear_num_value_heads * linear_value_head_dim`), checked.
+fn checked_linear_output_dim(cfg: &Qwen35Config) -> Result<usize, InferenceError> {
+    let value_heads = cfg.linear_num_value_heads();
+    value_heads.checked_mul(cfg.linear_value_head_dim).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "linear attention output_dim overflows usize: linear_num_value_heads({}) * linear_value_head_dim({})",
+            value_heads, cfg.linear_value_head_dim
+        ))
+    })
 }
 
 fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
@@ -111,6 +197,10 @@ fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
     })?;
     let moe_inter = cfg.moe_intermediate_size();
     let shared_inter = cfg.shared_expert_intermediate_size();
+    let doubled_moe_inter = checked_double(
+        moe_inter,
+        "MoE gate_up_proj row count (2 * moe_intermediate_size)",
+    )?;
 
     let router = MoeRouter::new(
         load_owned_tensor_checked(
@@ -127,7 +217,7 @@ fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
         load_owned_tensor_checked(
             source,
             &format!("{prefix}.mlp.experts.gate_up_proj"),
-            &[num_experts, 2 * moe_inter, hidden],
+            &[num_experts, doubled_moe_inter, hidden],
         )?,
         load_owned_tensor_checked(
             source,
@@ -207,13 +297,17 @@ fn load_full_attention_weights<T: TensorSource + ?Sized>(
 ) -> Result<AttentionWeights, InferenceError> {
     // q_proj carries a fused sigmoid gate alongside Q, doubling its output rows
     // relative to k_proj/v_proj (see FullAttentionLayerWeights / project_qkv).
-    let q_dim = cfg.full_q_dim();
-    let kv_dim = cfg.full_kv_dim();
+    let q_dim = checked_full_q_dim(cfg)?;
+    let kv_dim = checked_full_kv_dim(cfg)?;
     let head_dim = cfg.head_dim;
+    let doubled_q_dim = checked_double(
+        q_dim,
+        "full attention q_proj row count (2 * q_dim, fused sigmoid gate)",
+    )?;
     let qw = load_owned_tensor_checked(
         source,
         &format!("{prefix}.self_attn.q_proj.weight"),
-        &[2 * q_dim, hidden],
+        &[doubled_q_dim, hidden],
     )?;
     let kw = load_owned_tensor_checked(
         source,
@@ -346,8 +440,8 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
 ) -> Result<ModelWeights, InferenceError> {
     let hidden = cfg.hidden_size;
     let num_heads = cfg.linear_num_key_heads;
-    let qkv_dim = cfg.linear_qkv_dim();
-    let output_dim = cfg.linear_output_dim();
+    let qkv_dim = checked_linear_qkv_dim(cfg)?;
+    let output_dim = checked_linear_output_dim(cfg)?;
     let kernel_size = cfg.linear_conv_kernel_dim;
 
     let embed_tokens = load_owned_tensor_checked(
@@ -595,11 +689,11 @@ mod tests {
     // to match so the tensor stays finite and self-consistent), and asserts that
     // `load_weights` returns `Err(InferenceError::ShapeMismatch)` naming that tensor.
     //
-    // Mutation check: reverting the checked-loader routing in `load_dense_ffn_weights`,
-    // `load_full_attention_weights`, or `load_linear_attention_weights` back to the
-    // unchecked `load_owned_tensor` makes the corresponding test below fail (the
-    // undersized tensor loads successfully and `load_weights` returns `Ok`, or a later
-    // out-of-bounds read panics instead of returning a typed error).
+    // Mutation check: removing the shape comparisons from `load_owned_tensor_checked`
+    // (the single loader every call site in this module routes through) makes the
+    // corresponding test below fail (the undersized tensor loads successfully and
+    // `load_weights` returns `Ok`, or a later out-of-bounds read panics instead of
+    // returning a typed error).
 
     /// Minimal single-layer config with tiny dimensions, so the tensors constructed for
     /// these tests stay small. `layer_type` controls whether the one layer is full
@@ -827,6 +921,159 @@ mod tests {
             Err(InferenceError::ShapeMismatch { name: got_name, .. }) => assert_eq!(got_name, name),
             Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
             Ok(_) => panic!("expected Err for undersized GDN tensor, got Ok"),
+        }
+    }
+
+    // ── Preflight-before-materialization (declared-shape check precedes decode) ────────
+
+    /// A `TensorSource` whose declared shape (`tensor_shape`) is available cheaply but
+    /// whose `get_f32_tensor_owned` panics if ever called — standing in for a checkpoint
+    /// tensor so large that materializing it would exhaust memory. Used to prove the
+    /// shape check runs before materialization, not just that it eventually returns an
+    /// error.
+    struct PanicsOnMaterializeTensorSource {
+        declared_shape: Vec<usize>,
+    }
+
+    impl TensorSource for PanicsOnMaterializeTensorSource {
+        fn has_tensor(&mut self, _name: &str) -> Result<bool, InferenceError> {
+            Ok(true)
+        }
+        fn tensor_shape(&mut self, _name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(Some(self.declared_shape.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            panic!(
+                "get_f32_tensor_owned must not be called when the declared shape already \
+                 mismatches the expected shape (tensor: {name})"
+            );
+        }
+    }
+
+    /// Mutation check: routing `load_owned_tensor_checked` back to comparing shapes only
+    /// after calling `get_f32_tensor_owned` (i.e. dropping the `tensor_shape` preflight)
+    /// makes this test panic — `PanicsOnMaterializeTensorSource::get_f32_tensor_owned`
+    /// would run. With the preflight in place, the mismatch is caught from `tensor_shape`
+    /// alone and materialization never happens.
+    #[test]
+    fn shape_mismatch_preflight_skips_materialization() {
+        let mut src = PanicsOnMaterializeTensorSource {
+            declared_shape: vec![3, 3],
+        };
+
+        match load_owned_tensor_checked(&mut src, "huge.declared.tensor", &[4, 4]) {
+            Err(InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(name, "huge.declared.tensor");
+                assert_eq!(expected, vec![4, 4]);
+                assert_eq!(actual, vec![3, 3]);
+            }
+            Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
+            Ok(_) => panic!("expected Err for mismatched declared shape, got Ok"),
+        }
+    }
+
+    // ── Checked config-derived dimension arithmetic (no panic/wrap on overflow) ────────
+
+    #[test]
+    fn full_attention_head_dim_overflow_returns_typed_error() {
+        let mut cfg = tiny_config(LayerType::FullAttention);
+        cfg.num_attention_heads = usize::MAX;
+        cfg.head_dim = 2;
+
+        match checked_full_q_dim(&cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("num_attention_heads") && msg.contains("head_dim"),
+                    "message should name the overflowing fields: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
+            Ok(v) => panic!(
+                "expected num_attention_heads * head_dim overflow to be rejected, got Ok({v})"
+            ),
+        }
+    }
+
+    #[test]
+    fn full_attention_kv_head_dim_overflow_returns_typed_error() {
+        let mut cfg = tiny_config(LayerType::FullAttention);
+        cfg.num_key_value_heads = usize::MAX;
+        cfg.head_dim = 2;
+
+        match checked_full_kv_dim(&cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("num_key_value_heads") && msg.contains("head_dim"),
+                    "message should name the overflowing fields: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
+            Ok(v) => panic!(
+                "expected num_key_value_heads * head_dim overflow to be rejected, got Ok({v})"
+            ),
+        }
+    }
+
+    #[test]
+    fn linear_qkv_dim_overflow_returns_typed_error() {
+        let mut cfg = tiny_config(LayerType::LinearAttention);
+        cfg.linear_num_key_heads = usize::MAX;
+        cfg.linear_key_head_dim = 2;
+
+        match checked_linear_qkv_dim(&cfg) {
+            Err(InferenceError::InvalidInput(_)) => {}
+            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
+            Ok(v) => panic!("expected linear qkv_dim overflow to be rejected, got Ok({v})"),
+        }
+    }
+
+    #[test]
+    fn moe_gate_up_proj_row_count_overflow_returns_typed_error() {
+        match checked_double(
+            usize::MAX,
+            "MoE gate_up_proj row count (2 * moe_intermediate_size)",
+        ) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("moe_intermediate_size"),
+                    "message should name the overflowing dimension: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
+            Ok(v) => {
+                panic!("expected 2 * moe_intermediate_size overflow to be rejected, got Ok({v})")
+            }
+        }
+    }
+
+    /// A full-config `moe_intermediate_size` that overflows when doubled must be rejected
+    /// by `load_moe_ffn_weights` with a typed error, not a panic — and rejected before any
+    /// tensor is touched (`NullTensorSource` would return `MissingTensor` for every name,
+    /// so an `InvalidInput` here proves the overflow check ran first).
+    #[test]
+    fn load_moe_ffn_weights_rejects_overflowing_moe_intermediate_size() {
+        let mut cfg = tiny_config(LayerType::FullAttention);
+        cfg.num_experts = Some(2);
+        cfg.num_experts_per_tok = Some(1);
+        cfg.moe_intermediate_size = Some(usize::MAX / 2 + 1);
+        let mut src = NullTensorSource;
+
+        match load_moe_ffn_weights(&mut src, &cfg, "layers.0", cfg.hidden_size) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("moe_intermediate_size"),
+                    "message should name the overflowing dimension: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
+            Ok(_) => panic!("expected Err for overflowing moe_intermediate_size, got Ok"),
         }
     }
 }
