@@ -20,6 +20,11 @@ pub struct Qwen35Model {
 
 impl Qwen35Model {
     /// **Unstable**: load Qwen3.5-2B or Qwen3.6 from a local safetensors directory.
+    ///
+    /// Required names are preflighted, then each tensor is validated while
+    /// owned weights are assembled. Any validation or shape failure drops the
+    /// local assembly state and returns an error without exposing a partially
+    /// built model.
     pub fn from_safetensors(path: &Path) -> Result<Self, InferenceError> {
         let model_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");

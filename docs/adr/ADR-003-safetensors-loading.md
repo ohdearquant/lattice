@@ -53,6 +53,33 @@ The `ShardedQwenBacking` struct holds these owned `Vec<f32>` allocations alongsi
 
 Use **`memmap2::Mmap` with a hand-written JSON header parser** for zero-copy weight access. F32 weights on LE-aligned hardware bypass deserialization entirely. F16/BF16 conversions are deferred to first access and cached in a `OnceLock<Box<[f32]>>` per tensor. Shards are opened lazily on first tensor access. Qwen3 weights are fused (QKV, gate+up) eagerly at load time into owned `Vec<f32>` to collapse multiple GEMM calls.
 
+### Ingress validation contract
+
+`weights::ingress` is the single internal validation seam between untrusted external bytes and
+trusted tensor data. A format-specific reader may parse framing and metadata before the seam, but a
+borrowed view or owned tensor must not escape the reader until the representation has passed the
+following checks, in order:
+
+1. The source representation and dtype are supported by that reader.
+2. Shape products and byte extents use checked arithmetic and agree exactly with the payload.
+3. Decoded floating-point values are finite.
+4. A quantizer verifies that its scale, bias, and encoded values satisfy the destination format's
+   representability postconditions before publishing output.
+5. Failures retain source and tensor attribution. Multi-tensor model construction is atomic at the
+   public facade: it assembles into local values and returns `Err` without exposing a partially
+   built model if any tensor fails.
+
+The shipped safetensors route normalizes F32/F16/BF16 payloads to `f32` before calling
+`ingress::validate_ingested_tensor` from `SafetensorsFile::get_f32_tensor`. Header parsing has
+already checked shape products, byte extents, and exact contiguous coverage at that point. QuaRot,
+native Q4/KHF1, and Q8 readers retain their existing validation until their format adapters are
+routed through the seam; this ADR does not claim those migrations have landed.
+
+Each safetensors `TensorMeta` carries a `OnceLock<()>` validation marker separate from its optional
+F16/BF16 conversion cache. The marker is set only after validation succeeds. Repeated access to an
+aligned zero-copy F32 tensor therefore does not rescan already-validated memory-mapped pages, while
+a failed validation is never cached as success.
+
 ---
 
 ## Key Design Choices
@@ -62,6 +89,11 @@ Use **`memmap2::Mmap` with a hand-written JSON header parser** for zero-copy wei
 3. **Zero-copy F32**: `bytes_to_f32_slice` returns `None` on misalignment and the caller falls back to a copy. In practice, safetensors aligns tensors to 8 bytes, which satisfies f32's 4-byte alignment requirement on all target platforms.
 4. **Eager QKV fusion**: Fusing at load time rather than inference time means the fusion cost is paid once and inference hot paths see a single contiguous weight matrix. The cost is ~30% higher peak memory during the load window (both original and fused forms exist briefly).
 5. **`unsafe` 'static lifetime extension**: `ShardedQwenBacking` is heap-allocated via `Box` and co-located with `QwenModel`. The tensor slices that borrow from it are given `'static` lifetime via `mem::transmute`. Safety is maintained by RFC 1857 drop ordering (fields drop in declaration order; the backing box is declared before the tensor slices). This is documented as a known unsafe pattern (57.5K LOC crate note in `src/lib.rs`).
+6. **Validate before exposure**: Format readers converge on `weights::ingress` immediately before
+   tensor data becomes trusted. Public model constructors only assemble `Self` after all required
+   tensors have loaded successfully.
+7. **Cache successful validation per tensor**: The validation marker prevents repeated scans of
+   zero-copy pages without allowing a failed scan to become sticky success.
 
 ---
 
@@ -84,6 +116,7 @@ Use **`memmap2::Mmap` with a hand-written JSON header parser** for zero-copy wei
 - F32 model startup is near-zero-copy: the OS maps pages on demand.
 - No serde dependency in the inference crate.
 - F16/BF16 conversion cost is paid at most once per tensor per process lifetime.
+- Finite-value validation cost is paid at most once per successfully accessed tensor.
 - Single-GEMM QKV path reduces per-layer arithmetic from 5 matmuls to 3.
 
 **Negative**:
@@ -101,6 +134,8 @@ Use **`memmap2::Mmap` with a hand-written JSON header parser** for zero-copy wei
 ## References
 
 - `src/weights/f32_weights.rs` — `SafetensorsFile`, `JsonParser`, `TensorMeta`, `ShardedSafetensors`
+- `src/weights/ingress.rs` — private external-bytes-to-tensor validation seam
+- `src/model/{bert.rs,qwen.rs,qwen35/model.rs}` — atomic public construction facades
 - `src/model/qwen.rs` — `SafetensorsStorage`, `ShardedQwenBacking`, field drop order comment
 - `src/lib.rs` — stability note on 153 unsafe blocks
 - SafeTensors format spec — https://github.com/huggingface/safetensors
