@@ -11,13 +11,15 @@
 //! - **EXCLUDE**: the stop token is detected *before* it is pushed, so
 //!   `token_ids`/`text` never contain it (the Qwen3.5 CPU family in
 //!   [`crate::model::qwen35::generation`], [`crate::forward::cpu_f16`],
-//!   [`crate::forward::cpu_q8`], [`crate::forward::neon_forward`],
-//!   [`crate::forward::batch_prefill`], and the Metal plain/streaming/
-//!   prefix-cache paths in [`crate::forward::metal_qwen35`]).
+//!   [`crate::forward::cpu_q8`], [`crate::forward::neon_forward`], and the
+//!   Metal plain/streaming/prefix-cache paths in
+//!   [`crate::forward::metal_qwen35`]).
 //!
-//! **Chosen contract: EXCLUDE.** It was already the majority behaviour (8 of
-//! 10 surveyed call sites), it matches the OpenAI/HF `stop` semantics most
-//! callers expect (the stop marker is a control signal, not content), and it
+//! **Chosen contract: EXCLUDE.** It was already the majority behaviour (9 of
+//! 11 surveyed call sites — the current entry-point manifest below, minus the
+//! two that needed a production change), it matches the OpenAI/HF `stop`
+//! semantics most callers expect (the stop marker is a control signal, not
+//! content), and it
 //! composes correctly with string-level `stop_strings` truncation, which by
 //! construction already drops the matched suffix. `GenerateOutput`'s doc
 //! comment (in [`crate::generate`] and [`crate::model::qwen35_config`]) now
@@ -112,8 +114,7 @@ mod tests {
 
     /// Shared zero-layer config: embed -> final_norm -> lm_head only, no
     /// attention/FFN. Mirrors the established fixture recipe already used by
-    /// `cpu_f16::zero_layer_f16_fixture`, `cpu_q8::zero_layer_q8_fixture`, and
-    /// `batch_prefill::zero_layer_batch_prefill_fixture`.
+    /// `cpu_f16::zero_layer_f16_fixture` and `cpu_q8::zero_layer_q8_fixture`.
     fn zero_layer_config() -> Qwen35Config {
         Qwen35Config {
             hidden_size: HIDDEN,
