@@ -1551,7 +1551,6 @@ mod inner {
     ///
     /// Stores up to `max_tokens + 1` snapshots (slot 0 = base, slot k = after k tokens).
     pub(crate) struct MetalGdnCheckpointPool {
-        #[allow(dead_code)] // capacity bound stored for future slot-overflow safety checks
         max_tokens: usize,
         conv_slots: Vec<Vec<Buffer>>, // [slot][linear_layer]
         s_slots: Vec<Vec<Buffer>>,    // [slot][linear_layer]
@@ -4753,12 +4752,12 @@ mod inner {
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<MetalVerifyOutput, crate::error::InferenceError> {
-            self.check_forward_range_capacity(start_pos, tokens.len())?;
             if self.session.gdn_checkpoints.is_none() {
                 return Err(crate::error::InferenceError::Inference(
                     "GDN checkpoint pool required for verify_tokens_batched".into(),
                 ));
             }
+            self.check_forward_range_capacity(start_pos, tokens.len(), true)?;
             if let Some(ref mut p) = self.session.gdn_checkpoints {
                 p.active_base_seq_len = Some(start_pos);
                 p.mtp_base_seq_len = self.session.mtp.as_ref().map(|m| m.cache.seq_len);
@@ -4818,11 +4817,7 @@ mod inner {
                     "GDN checkpoint pool required for verify_tokens_batch_gemm".into(),
                 ));
             }
-            assert!(
-                start_pos + n <= self.session.kv_cache.max_cache_len,
-                "verify_batch: would overflow KV cache (start={start_pos} n={n} max={})",
-                self.session.kv_cache.max_cache_len
-            );
+            self.check_forward_range_capacity(start_pos, n, false)?;
 
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
@@ -6709,31 +6704,71 @@ mod inner {
             Ok(())
         }
 
-        /// Same capacity check as [`Self::check_forward_step_capacity`], generalized to a
-        /// contiguous run of `token_count` positions starting at `start_pos` — every position
-        /// `start_pos..start_pos + token_count` must land inside the RoPE table / KV cache
-        /// before any of them reach Metal dispatch. Shared by every caller that forwards a
-        /// caller-supplied `start_pos` across multiple tokens in one call (batched verify).
-        fn check_forward_range_capacity(
-            &self,
+        /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
+        /// starting at `start_pos` — every position `start_pos..start_pos + token_count` must
+        /// land inside the RoPE table / KV cache, and (when `gdn_pool_capacity` is `Some`)
+        /// `token_count` must not exceed the fixed-size GDN checkpoint pool. Checked before any
+        /// of it reaches Metal dispatch or GDN checkpoint mutation, so a caller-supplied token
+        /// count can never leave session state partially advanced on rejection.
+        ///
+        /// `gdn_pool_capacity` bounds callers that checkpoint one pool slot per processed token
+        /// (slot 0 = base, slot k = after k tokens, so valid slots are `0..=capacity` and at
+        /// most `capacity` tokens may be processed after the base checkpoint).
+        ///
+        /// Free function (no `&self`) so it is unit-testable on CPU without a Metal device.
+        fn validate_dispatch_capacity(
             start_pos: usize,
             token_count: usize,
+            kv_capacity: usize,
+            gdn_pool_capacity: Option<usize>,
         ) -> Result<(), crate::error::InferenceError> {
             use crate::error::InferenceError;
 
             if token_count == 0 {
                 return Ok(());
             }
-            let max_cache_len = self.session.kv_cache.max_cache_len;
             let last_position = start_pos.saturating_add(token_count - 1);
-            if last_position >= max_cache_len {
+            if last_position >= kv_capacity {
                 return Err(InferenceError::InvalidInput(format!(
-                    "verify_tokens: start_pos {start_pos} + {token_count} tokens reaches position \
+                    "start_pos {start_pos} + {token_count} tokens reaches position \
                      {last_position}, exceeding max position {}",
-                    max_cache_len - 1
+                    kv_capacity - 1
+                )));
+            }
+            if let Some(pool_capacity) = gdn_pool_capacity
+                && token_count > pool_capacity
+            {
+                return Err(InferenceError::InvalidInput(format!(
+                    "start_pos {start_pos} + {token_count} tokens exceeds GDN checkpoint pool \
+                     capacity {pool_capacity} (checkpoint slots 0..={pool_capacity})"
                 )));
             }
             Ok(())
+        }
+
+        /// Method form of [`Self::validate_dispatch_capacity`], resolving the KV/RoPE bound
+        /// from live session state. Shared by every caller that dispatches Metal across a
+        /// caller-supplied `start_pos..start_pos + token_count` range. Pass
+        /// `check_gdn_pool = true` for callers that checkpoint one GDN pool slot per token
+        /// (`verify_tokens_batched`); other callers pass `false` since they never advance the
+        /// GDN checkpoint past the base slot.
+        fn check_forward_range_capacity(
+            &self,
+            start_pos: usize,
+            token_count: usize,
+            check_gdn_pool: bool,
+        ) -> Result<(), crate::error::InferenceError> {
+            let gdn_pool_capacity = if check_gdn_pool {
+                self.session.gdn_checkpoints.as_ref().map(|p| p.max_tokens)
+            } else {
+                None
+            };
+            Self::validate_dispatch_capacity(
+                start_pos,
+                token_count,
+                self.session.kv_cache.max_cache_len,
+                gdn_pool_capacity,
+            )
         }
 
         /// **Unstable**: fallible single-token forward step; kernel dispatch strategy evolving.
@@ -13328,7 +13363,7 @@ mod inner {
             // `score_layer_importance`'s `calibration_prompts`. Validate against the
             // session's RoPE/KV capacity before any pass dispatches, same as
             // `check_forward_step_capacity` does for `forward_step`.
-            self.check_forward_range_capacity(0, token_ids.len())?;
+            self.check_forward_range_capacity(0, token_ids.len(), false)?;
             let orig_cfg = self.engine.config.clone();
             let hidden = orig_cfg.hidden_size;
             let n = token_ids.len();
@@ -16235,13 +16270,7 @@ mod inner {
             if token_ids.len() == 1 {
                 return self.try_forward_step(token_ids[0], start_pos);
             }
-            if start_pos + token_ids.len() > self.session.kv_cache.max_cache_len {
-                return Err(InferenceError::InvalidInput(format!(
-                    "forward_prefill_from: start_pos {start_pos} + len {} exceeds max_cache_len {}",
-                    token_ids.len(),
-                    self.session.kv_cache.max_cache_len
-                )));
-            }
+            self.check_forward_range_capacity(start_pos, token_ids.len(), false)?;
             if self.lora.is_some() {
                 if all_positions {
                     return Err(InferenceError::PrefixCache(
@@ -19781,6 +19810,82 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect_err("token batch spilling past max_cache_len must be rejected");
             assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
             assert_eq!(state.session.kv_cache.seq_len, 0);
+        }
+
+        /// Pure test of the centralized capacity validator — no `Device`, no session,
+        /// runs on CPU. Guards the blocking gap: `verify_tokens_batched` checkpoints one
+        /// GDN pool slot per token (slot 0 = base, slot k = after k tokens), so a batch
+        /// larger than the pool's `max_tokens` must be rejected even when the KV/RoPE
+        /// cache has ample room — otherwise `checkpoint_gdn_to_slot` indexes past the
+        /// pool's allocated slots mid-batch.
+        #[test]
+        fn validate_dispatch_capacity_rejects_gdn_pool_overflow_independent_of_kv_capacity() {
+            // In-bounds: 5 tokens exactly fill a 5-slot GDN pool, KV cache has room.
+            assert!(
+                MetalQwen35State::validate_dispatch_capacity(0, 5, 10, Some(5)).is_ok(),
+                "5 tokens against a 5-token GDN pool and 10-slot KV cache must fit"
+            );
+
+            // KV/RoPE overflow still rejects (unchanged behavior from the prior round).
+            let err = MetalQwen35State::validate_dispatch_capacity(8, 3, 10, Some(5))
+                .expect_err("start_pos 8 + 3 tokens reaches position 10, at kv_capacity 10");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+
+            // GDN pool overflow: 6 tokens against a 5-token pool must be rejected even
+            // though the KV cache (100) has plenty of room — this is the blocking gap.
+            let err = MetalQwen35State::validate_dispatch_capacity(0, 6, 100, Some(5))
+                .expect_err("6 tokens against a 5-token GDN pool must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+
+            // Callers that never checkpoint per-token (batch-GEMM, prefill) pass
+            // `gdn_pool_capacity = None` and must not be bounded by the pool at all.
+            assert!(
+                MetalQwen35State::validate_dispatch_capacity(0, 6, 100, None).is_ok(),
+                "a caller that never checkpoints per-token must not be pool-bounded"
+            );
+        }
+
+        /// Deferred-run regression: full round-trip through the public
+        /// `MtpTargetVerifier::verify_tokens` entry point on a GDN-backed
+        /// `MetalQwen35State`, asserting a batch larger than the GDN checkpoint pool is
+        /// rejected before any dispatch or checkpoint mutation. Compiled under
+        /// `--features metal-gpu` (this crate's GDN checkpoint pool only exists in that
+        /// configuration) but NOT executed this session — GPU test runs are out of
+        /// scope tonight. Run on the next GPU pass; the CPU-only
+        /// `validate_dispatch_capacity_rejects_gdn_pool_overflow_independent_of_kv_capacity`
+        /// test above already proves the same guard logic without a device.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        fn verify_tokens_rejects_batch_exceeding_gdn_pool_capacity_before_dispatch() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let mut state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
+            });
+
+            let pool_capacity = state
+                .session
+                .gdn_checkpoints
+                .as_ref()
+                .expect("self-spec pool must be allocated")
+                .max_tokens;
+            // One more token than the pool holds: `checkpoint_gdn_to_slot` would index
+            // past the pool's allocated slots partway through this batch if dispatched.
+            let too_many: Vec<u32> = (0..(pool_capacity as u32 + 1)).map(|i| i % 2).collect();
+
+            let err = state
+                .verify_tokens(&too_many, 0)
+                .expect_err("a batch larger than the GDN checkpoint pool must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "rejected preflight must leave state unmutated — no dispatch, no checkpoint \
+                 mutation"
+            );
         }
 
         #[test]
