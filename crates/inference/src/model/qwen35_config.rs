@@ -63,6 +63,38 @@ pub const MAX_HEAD_DIM: usize = 2048;
 /// order of magnitude of headroom for future architectures.
 pub const MAX_NUM_EXPERTS: usize = 4096;
 
+/// Upper bound on the full-attention `q_dim` / `kv_dim` products
+/// (`num_attention_heads * head_dim`, `num_key_value_heads * head_dim`) accepted from
+/// `config.json`.
+///
+/// `head_dim` is separately bounded by [`MAX_HEAD_DIM`], but `num_attention_heads` and
+/// `num_key_value_heads` are not, so a non-overflowing product (e.g. `num_attention_heads =
+/// 2^40`, `head_dim = 2048`) can still pass the `checked_mul` overflow guard in
+/// `from_config_json_str` while driving `ForwardScratch::ensure_capacity`'s `q_buf` /
+/// `context` allocations to exabyte scale. Real Qwen3.5/3.6 full-attention geometry tops out
+/// around `num_attention_heads = 64` * `head_dim = 256` (`q_dim = 16384`); 1,048,576 (2^20)
+/// leaves roughly 64x headroom above that for future architectures.
+pub const MAX_FULL_ATTENTION_DIM: usize = 1_048_576;
+
+/// Upper bound on `intermediate_size`, `moe_intermediate_size`, and
+/// `shared_expert_intermediate_size` accepted from `config.json`.
+///
+/// These sizes drive MLP/MoE-expert scratch buffer (`Vec<f32>`) allocations at load and
+/// generation time; a present-but-malformed config can pair a huge intermediate size with
+/// zero-sized expert tensors (which pass shape checks trivially, being empty) and blow up
+/// those allocations before any tensor is read. Real Qwen3.5/3.6 presets range up to 17,408
+/// for `intermediate_size` and ~512 for the MoE/shared-expert variants; 1,048,576 (2^20)
+/// leaves roughly 60x headroom above the largest observed real value.
+pub const MAX_INTERMEDIATE_SIZE: usize = 1_048_576;
+
+/// Upper bound on `VisionModelConfig::depth` accepted from `config.json`.
+///
+/// The vision checkpoint loader mints ~12 tensor-name `String`s per ViT block *before* any
+/// tensor validation runs, so an unbounded `depth` (only checked nonzero) drives unbounded
+/// `String` allocation ahead of any shape check. Real Qwen3.5-VL vision towers are ~24-48
+/// blocks deep (Qwen3.5-VL vision ~32); 1024 leaves roughly 32x headroom above that.
+pub const MAX_VISION_DEPTH: usize = 1024;
+
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -127,6 +159,15 @@ impl VisionModelConfig {
             return Err(InferenceError::Inference(
                 "invalid vision_config: depth must be > 0".to_string(),
             ));
+        }
+        // The vision checkpoint loader mints ~12 tensor-name Strings per ViT block *before*
+        // any tensor validation runs, so an unbounded depth drives unbounded String
+        // allocation ahead of any shape check. See `MAX_VISION_DEPTH` docs.
+        if self.depth > MAX_VISION_DEPTH {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: depth ({}) exceeds MAX_VISION_DEPTH ({MAX_VISION_DEPTH})",
+                self.depth
+            )));
         }
         if self.hidden_size == 0 {
             return Err(InferenceError::Inference(
@@ -757,6 +798,15 @@ impl Qwen35Config {
                 cfg.vocab_size
             )));
         }
+        // `intermediate_size` is always present and drives MLP scratch buffer allocations
+        // at every forward pass. See `MAX_INTERMEDIATE_SIZE` docs.
+        if cfg.intermediate_size > MAX_INTERMEDIATE_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: intermediate_size ({}) exceeds \
+                 MAX_INTERMEDIATE_SIZE ({MAX_INTERMEDIATE_SIZE})",
+                cfg.intermediate_size
+            )));
+        }
         if cfg.num_attention_heads == 0 {
             return Err(InferenceError::Inference(
                 "invalid Qwen config.json: num_attention_heads must be > 0".to_string(),
@@ -814,7 +864,8 @@ impl Qwen35Config {
                  overflows usize: q_dim ({full_q_dim})"
             ))
         })?;
-        cfg.num_key_value_heads
+        let full_kv_dim = cfg
+            .num_key_value_heads
             .checked_mul(cfg.head_dim)
             .ok_or_else(|| {
                 InferenceError::Inference(format!(
@@ -823,6 +874,22 @@ impl Qwen35Config {
                     cfg.num_key_value_heads, cfg.head_dim
                 ))
             })?;
+        // The `checked_mul` calls above only reject wraparound; `head_dim` is separately
+        // bounded (`MAX_HEAD_DIM`), but `num_attention_heads` / `num_key_value_heads` are
+        // not, so a non-overflowing product can still be allocation-hostile. See
+        // `MAX_FULL_ATTENTION_DIM` docs.
+        if full_q_dim > MAX_FULL_ATTENTION_DIM {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: full-attention q_dim ({full_q_dim}) exceeds \
+                 MAX_FULL_ATTENTION_DIM ({MAX_FULL_ATTENTION_DIM})"
+            )));
+        }
+        if full_kv_dim > MAX_FULL_ATTENTION_DIM {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: full-attention kv_dim ({full_kv_dim}) exceeds \
+                 MAX_FULL_ATTENTION_DIM ({MAX_FULL_ATTENTION_DIM})"
+            )));
+        }
         if cfg.num_hidden_layers == 0 {
             return Err(InferenceError::Inference(
                 "invalid Qwen config.json: num_hidden_layers must be > 0".to_string(),
@@ -923,6 +990,28 @@ impl Qwen35Config {
                     )));
                 }
             }
+        }
+        // MoE/shared-expert intermediate sizes drive their own scratch buffer allocations
+        // independent of `num_experts` presence. Gate on each field's own presence (like the
+        // `num_experts` if-let gate above) so dense configs, which leave both `None`, are
+        // unaffected. See `MAX_INTERMEDIATE_SIZE` docs.
+        if let Some(moe_intermediate_size) = cfg.moe_intermediate_size
+            && moe_intermediate_size > MAX_INTERMEDIATE_SIZE
+        {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: moe_intermediate_size \
+                 ({moe_intermediate_size}) exceeds MAX_INTERMEDIATE_SIZE \
+                 ({MAX_INTERMEDIATE_SIZE})"
+            )));
+        }
+        if let Some(shared_expert_intermediate_size) = cfg.shared_expert_intermediate_size
+            && shared_expert_intermediate_size > MAX_INTERMEDIATE_SIZE
+        {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: shared_expert_intermediate_size \
+                 ({shared_expert_intermediate_size}) exceeds MAX_INTERMEDIATE_SIZE \
+                 ({MAX_INTERMEDIATE_SIZE})"
+            )));
         }
 
         Ok(cfg)
@@ -1938,6 +2027,80 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────────
+    // full-attention geometry allocation BUDGET (config-level, independent of
+    // layer mix) -- distinct from the overflow-only checks above: a
+    // non-overflowing-but-enormous num_attention_heads * head_dim must also be
+    // rejected, since it drives ForwardScratch::ensure_capacity's q_buf /
+    // context allocations to exabyte scale without ever wrapping usize.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// head_dim=2048 (== MAX_HEAD_DIM, itself legal) with num_attention_heads=513 gives
+    /// full_q_dim = 1,050,624 -- one order of magnitude within usize (no overflow) but over
+    /// MAX_FULL_ATTENTION_DIM. num_key_value_heads stays small so full_kv_dim is nowhere
+    /// near the budget, isolating the q_dim branch specifically.
+    #[test]
+    fn test_full_q_dim_over_budget_rejected_all_linear_config() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": {MAX_HEAD_DIM}, "num_attention_heads": 513,
+                "num_key_value_heads": 1, "num_hidden_layers": 2,
+                "partial_rotary_factor": 0.25,
+                "layer_types": ["linear_attention", "linear_attention"]}}}}"#
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "a non-overflowing but budget-exceeding full_q_dim must yield an \
+                 InferenceError even for an all-linear-attention config",
+            )
+            .to_string();
+        assert!(
+            err.contains("q_dim") && err.contains("MAX_FULL_ATTENTION_DIM"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Same allocation-budget bypass, but with num_attention_heads == num_key_value_heads so
+    /// full_kv_dim also exceeds the budget (kv_dim can never exceed q_dim given the
+    /// num_attention_heads-is-a-multiple-of-num_key_value_heads invariant enforced earlier in
+    /// this function, so this proves the KV-routed budget check is reachable via the same
+    /// global check rather than dead code, mirroring the existing overflow test pair above).
+    #[test]
+    fn test_full_kv_dim_over_budget_rejected_all_linear_config() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": {MAX_HEAD_DIM}, "num_attention_heads": 513,
+                "num_key_value_heads": 513, "num_hidden_layers": 2,
+                "partial_rotary_factor": 0.25,
+                "layer_types": ["linear_attention", "linear_attention"]}}}}"#
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "a non-overflowing but budget-exceeding full_kv_dim must yield an \
+                 InferenceError even for an all-linear-attention config",
+            )
+            .to_string();
+        assert!(
+            err.contains("MAX_FULL_ATTENTION_DIM"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Boundary: head_dim=2048 (MAX_HEAD_DIM) * num_attention_heads=512 == exactly
+    /// MAX_FULL_ATTENTION_DIM (1,048,576) must be accepted -- guards against an off-by-one
+    /// in the new budget check.
+    #[test]
+    fn test_full_attention_dims_at_budget_accepted_all_linear_config() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": {MAX_HEAD_DIM}, "num_attention_heads": 512,
+                "num_key_value_heads": 1, "num_hidden_layers": 2,
+                "partial_rotary_factor": 0.25,
+                "layer_types": ["linear_attention", "linear_attention"]}}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "full_q_dim == MAX_FULL_ATTENTION_DIM must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
     // MoE dimension bounds (num_experts / num_experts_per_tok)
     // ──────────────────────────────────────────────────────────────────────
 
@@ -2012,6 +2175,112 @@ mod tests {
         assert!(
             Qwen35Config::from_config_json_str(json).is_ok(),
             "a dense config with no MoE fields must be unaffected by the MoE dimension checks"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // intermediate size bounds (intermediate_size / moe_intermediate_size /
+    // shared_expert_intermediate_size)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `intermediate_size` is always present and drives MLP scratch buffer allocations on
+    /// every forward pass; a huge value paired with zero-sized tensors would otherwise pass
+    /// shape checks trivially before blowing up allocation at generation time.
+    #[test]
+    fn test_intermediate_size_over_max_errors() {
+        let json = format!(
+            r#"{{"text_config": {{"intermediate_size": {}}}}}"#,
+            MAX_INTERMEDIATE_SIZE + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "intermediate_size above MAX_INTERMEDIATE_SIZE must yield an InferenceError",
+            )
+            .to_string();
+        assert!(
+            err.contains("intermediate_size") && err.contains("MAX_INTERMEDIATE_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_intermediate_size_at_max_accepted() {
+        let json =
+            format!(r#"{{"text_config": {{"intermediate_size": {MAX_INTERMEDIATE_SIZE}}}}}"#);
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "intermediate_size == MAX_INTERMEDIATE_SIZE must be accepted"
+        );
+    }
+
+    /// `moe_intermediate_size` is gated on its own `Option` presence, independent of
+    /// `num_experts` -- explicitly set it (not just inherit the MoE preset default) so this
+    /// test actually exercises the if-let gate rather than silently passing through an
+    /// unrelated preset value.
+    #[test]
+    fn test_moe_intermediate_size_over_max_errors() {
+        let json = format!(
+            r#"{{"text_config": {{"moe_intermediate_size": {}}}}}"#,
+            MAX_INTERMEDIATE_SIZE + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "moe_intermediate_size above MAX_INTERMEDIATE_SIZE must yield an InferenceError",
+            )
+            .to_string();
+        assert!(
+            err.contains("moe_intermediate_size") && err.contains("MAX_INTERMEDIATE_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Same as above for `shared_expert_intermediate_size`, explicitly present so the if-let
+    /// gate is genuinely exercised rather than trivially satisfied by the preset default.
+    #[test]
+    fn test_shared_expert_intermediate_size_over_max_errors() {
+        let json = format!(
+            r#"{{"text_config": {{"shared_expert_intermediate_size": {}}}}}"#,
+            MAX_INTERMEDIATE_SIZE + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "shared_expert_intermediate_size above MAX_INTERMEDIATE_SIZE must yield an \
+                 InferenceError",
+            )
+            .to_string();
+        assert!(
+            err.contains("shared_expert_intermediate_size")
+                && err.contains("MAX_INTERMEDIATE_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_moe_and_shared_intermediate_size_at_max_accepted() {
+        let json = format!(
+            r#"{{"text_config": {{"moe_intermediate_size": {MAX_INTERMEDIATE_SIZE},
+                "shared_expert_intermediate_size": {MAX_INTERMEDIATE_SIZE}}}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "moe_intermediate_size / shared_expert_intermediate_size == \
+             MAX_INTERMEDIATE_SIZE must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_dense_config_no_moe_intermediate_fields_unaffected() {
+        // A dense (non-MoE) checkpoint leaves both fields absent; represent that explicitly
+        // with `null` so the struct-level `#[serde(default)]` fallback (which pulls from the
+        // MoE preset) does not mask the dense case.
+        let json = r#"{"text_config": {"moe_intermediate_size": null,
+            "shared_expert_intermediate_size": null,
+            "num_hidden_layers": 2,
+            "layer_types": ["linear_attention", "linear_attention"]}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "a dense config with no MoE intermediate fields must be unaffected by the \
+             MAX_INTERMEDIATE_SIZE gated checks"
         );
     }
 
@@ -2490,6 +2759,55 @@ mod tests {
         assert!(
             err.to_string().contains("num_heads"),
             "error must name num_heads: {err}"
+        );
+    }
+
+    /// The vision checkpoint loader mints ~12 tensor-name Strings per ViT block *before* any
+    /// tensor validation runs; an unbounded `depth` (previously only checked nonzero) drives
+    /// unbounded String allocation ahead of any shape check.
+    #[test]
+    fn parser_rejects_present_vision_config_with_depth_over_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": {},
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#,
+            MAX_VISION_DEPTH + 1
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("depth above MAX_VISION_DEPTH must be rejected at parse time")
+            .to_string();
+        assert!(
+            err.contains("depth") && err.contains("MAX_VISION_DEPTH"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_depth_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": {MAX_VISION_DEPTH},
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "depth == MAX_VISION_DEPTH must be accepted"
         );
     }
 
