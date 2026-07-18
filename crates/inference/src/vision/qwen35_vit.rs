@@ -40,6 +40,84 @@ use std::io::Cursor;
 const QWEN35_IMAGE_MEAN: f32 = 0.5;
 const QWEN35_IMAGE_STD: f32 = 0.5;
 
+/// Maximum accepted image width/height in pixels, enforced by
+/// [`preprocess_qwen35_image`] before any pixel data is decoded (ADR-069 S6 review round 1
+/// blocker). Nothing in `VisionModelConfig` bounds this naturally: `num_position_embeddings`
+/// only sizes the learned position-embedding table, which [`build_pos_embed_and_rope_tables`]
+/// bilinearly *interpolates* to whatever patch grid the input image produces, so it places no
+/// ceiling on `GridThw::num_patches()`. Left unbounded, the serve layer's compressed-byte
+/// clamps (which bound the encoded stream, not decoded pixels) let a small, highly-compressible
+/// image decode to an arbitrarily large pixel grid, driving an unbounded `num_patches *
+/// patch_len` allocation below and unbounded O(n^2) full-attention work in
+/// `multihead_attention_full`. Chosen as a conservative serving ceiling rather than derived from
+/// the checkpoint: 2048x2048 is exactly `64 * (patch_size=16 * spatial_merge_size=2)` for the
+/// real 0.8B checkpoint's factor, i.e. a 128x128 = 16,384-patch grid pre-merge. This cap alone
+/// is NOT the resource bound -- the O(n^2) full-attention cost bound is
+/// [`DEFAULT_MAX_VISION_PATCHES`] below (round-2 review); this dimension cap remains as the
+/// outer decoder-level limit the
+/// `image` crate can enforce during header parsing.
+const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
+
+/// Default value for the *serving-only* pre-merge patch-count budget applied by
+/// [`serve_max_vision_patches`] (ADR-069 S6 review round 2 blocker, scoped to the serve path only
+/// as of review round 5 -- see [`preprocess_qwen35_image`]'s `max_patches` parameter doc). The
+/// dimension cap above is not sufficient on its own to bound *serving latency* because the ViT's
+/// full attention materializes a per-head `scores[n, n]` f32 matrix (`multihead_attention_full`
+/// via `gemm_bt`): at the 2048x2048 dimension boundary with the real checkpoint's `patch_size=16`,
+/// `n = 128^2 = 16,384` and that single allocation is `16,384^2 * 4 = 1 GiB`, before compute.
+///
+/// PR #1021 review round 3 major finding: the score-allocation bound above (originally
+/// `n = 4,096`, a 1024x1024 image) does not bound *wall-clock serving time* on the single
+/// serialized Metal worker -- a real, end-to-end timed `qwen35_vit_forward_metal` pass at
+/// `n = 4,096` on this development machine (Apple M2 Max) measured **78.8 s**, monopolizing the
+/// worker for the whole request. Re-derived from a direct measurement of the same real
+/// checkpoint's ViT forward at several patch counts (`cargo test -p lattice-inference --features
+/// f16,metal-gpu,test-utils --lib -- <ad hoc timing harness>`, GPU-flock-serialized): `n=64` ->
+/// 330.7 ms, `n=256` -> 1,431.0 ms, `n=576` -> 4,811.6 ms, `n=4,096` -> 78,882.7 ms (cost grows
+/// worse than linearly but sub-quadratically across this range -- consistent with a
+/// dispatch-count-bound linear component plus an O(n^2) full-attention component). `n = 256`
+/// (a 256x256 image, patch_size=16 -- the same natural grid boundary the module's committed
+/// golden fixture already uses) is the largest measured grid whose wall time (1.43 s) stays
+/// under the ~2 s worst-case serving budget, rounded down from the next larger measured point
+/// (576 patches, 4.81 s, well over budget). Overridable per-machine via
+/// [`LATTICE_VISION_MAX_PATCHES_ENV`] without a rebuild.
+///
+/// Review round 5 finding: this budget is a *serving* policy, not a property of the checkpoint or
+/// the ViT forward pass itself, so it must never be applied inside [`preprocess_qwen35_image`] by
+/// default -- doing so silently regressed the public embedding path (a default-aligned 512x512
+/// image, 1,024 pre-merge patches, is well within what the checkpoint and the ViT forward can
+/// process, but was being rejected). Only [`crate::serve::metal_worker`] reads
+/// [`serve_max_vision_patches`] and passes it explicitly as `preprocess_qwen35_image`'s
+/// `max_patches` argument; every other caller (the public embedding path in
+/// [`super::pooled_embed`], golden-fixture tests) passes `None` and is bound only by
+/// `MAX_IMAGE_DIMENSION_PIXELS`.
+const DEFAULT_MAX_VISION_PATCHES: usize = 256;
+
+/// Environment variable overriding [`DEFAULT_MAX_VISION_PATCHES`] (PR #1021 review round 3): the
+/// measured default above is specific to the development machine it was measured on, so an
+/// operator serving on different hardware (or accepting a different latency/image-size
+/// tradeoff) can retune the cap without a rebuild. A missing, unparseable, or zero value falls
+/// back to the default.
+const LATTICE_VISION_MAX_PATCHES_ENV: &str = "LATTICE_VISION_MAX_PATCHES";
+
+/// Current *serving-only* patch-count budget: [`LATTICE_VISION_MAX_PATCHES_ENV`] if set to a
+/// valid positive integer, otherwise [`DEFAULT_MAX_VISION_PATCHES`]. Read fresh on every call
+/// (cheap -- this guard runs once per image request, not per patch) so a changed environment
+/// takes effect without restarting the process mid-test; production callers only ever observe
+/// the value fixed at process start, since nothing in this codebase mutates its own environment
+/// after startup.
+///
+/// Callers must pass this explicitly as [`preprocess_qwen35_image`]'s `max_patches` argument --
+/// it is never applied implicitly. Only the serve path ([`crate::serve::metal_worker`]) does so;
+/// see [`DEFAULT_MAX_VISION_PATCHES`]'s doc for why this must stay serve-only.
+pub fn serve_max_vision_patches() -> usize {
+    std::env::var(LATTICE_VISION_MAX_PATCHES_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_VISION_PATCHES)
+}
+
 /// The temporal/height/width patch-grid shape for one image (`grid_thw` in
 /// the HF reference). `t` is always 1 for a still image (video is out of
 /// scope — ADR-069 Deferred list).
@@ -68,6 +146,15 @@ impl GridThw {
 /// fixed 256x256 golden image satisfies this: 256 = 16 * 2 * 8). Images that
 /// need resizing are rejected with [`VisionError::InvalidConfig`].
 ///
+/// `max_patches`, if `Some`, additionally rejects (header-only, before pixel decode) any grid
+/// whose pre-merge patch count exceeds it -- this is how the *serving* path enforces
+/// [`serve_max_vision_patches`]'s wall-clock budget (see that function's doc). Pass `None` to
+/// admit whatever the checkpoint and [`MAX_IMAGE_DIMENSION_PIXELS`] allow, matching this
+/// function's behavior before that serving budget existed: this is the public embedding API's
+/// contract ([`super::pooled_embed`]) and must not silently pick up a serving-only latency policy
+/// (review round 5 finding -- round 4 applied [`serve_max_vision_patches`]'s value here
+/// unconditionally, rejecting a default-aligned 512x512 Qwen image before embedding).
+///
 /// # Errors
 ///
 /// [`VisionError::ImageDecode`] if the bytes cannot be decoded.
@@ -76,13 +163,73 @@ impl GridThw {
 pub fn preprocess_qwen35_image(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
+    max_patches: Option<usize>,
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
-    let reader = ImageReader::new(Cursor::new(image_bytes))
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION_PIXELS);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION_PIXELS);
+
+    // Cheap header-only dimension probe -- `into_dimensions()` parses just enough of the
+    // container (e.g. the PNG IHDR chunk) to report width/height, and with `limits` set both
+    // the PNG and JPEG decoders (the only formats this crate enables) enforce
+    // `max_image_width`/`max_image_height` at that same header-parse step, before any pixel
+    // data is read. Rejects an oversized image (ADR-069 S6 review round 1 blocker) without
+    // paying for full decode or the pixel-tensor allocation below.
+    let mut dim_reader = ImageReader::new(Cursor::new(image_bytes))
         .with_guessed_format()
         .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
-    let img: DynamicImage = reader
-        .decode()
-        .map_err(|e| VisionError::ImageDecode(format!("decode failed: {e}")))?;
+    dim_reader.limits(limits.clone());
+    let (header_w, header_h) = match dim_reader.into_dimensions() {
+        Ok(dims) => dims,
+        Err(image::ImageError::Limits(e)) => {
+            return Err(VisionError::DimensionsExceeded(format!(
+                "image exceeds the {MAX_IMAGE_DIMENSION_PIXELS}x{MAX_IMAGE_DIMENSION_PIXELS}-pixel \
+                 serving limit: {e}"
+            )));
+        }
+        Err(e) => {
+            return Err(VisionError::ImageDecode(format!(
+                "header/dimension read failed: {e}"
+            )));
+        }
+    };
+
+    // Attention-budget guard, still header-only (ADR-069 S6 review round 2 blocker): the
+    // dimension cap alone admits grids whose per-head `scores[n, n]` full-attention allocation
+    // reaches 1 GiB (see DEFAULT_MAX_VISION_PATCHES docs). Conservative ceil-division so unaligned
+    // dimensions (rejected later anyway) cannot round the estimate below the true patch count.
+    // A zero patch_size falls through to the InvalidConfig rejection below.
+    //
+    // Serve-only as of review round 5: this block runs at all only when the caller opts in via
+    // `max_patches`. The public embedding path passes `None` and is unaffected.
+    if let (true, Some(max_patches)) = (cfg.patch_size > 0, max_patches) {
+        let est_patches = (header_w as usize)
+            .div_ceil(cfg.patch_size)
+            .saturating_mul((header_h as usize).div_ceil(cfg.patch_size));
+        if est_patches > max_patches {
+            return Err(VisionError::DimensionsExceeded(format!(
+                "image {header_w}x{header_h} yields {est_patches} patches at \
+                 patch_size={}, exceeding the {max_patches}-patch serving \
+                 budget (full-attention cost is quadratic in patch count)",
+                cfg.patch_size
+            )));
+        }
+    }
+
+    // Independent defense-in-depth: re-apply the same strict limits on the actual decode call
+    // (not just the header probe above), in case a future format-specific quirk lets dimensions
+    // slip past `into_dimensions()`'s check without also being caught here.
+    let mut reader = ImageReader::new(Cursor::new(image_bytes))
+        .with_guessed_format()
+        .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
+    reader.limits(limits);
+    let img: DynamicImage = reader.decode().map_err(|e| match e {
+        image::ImageError::Limits(e) => VisionError::DimensionsExceeded(format!(
+            "image exceeds the {MAX_IMAGE_DIMENSION_PIXELS}x{MAX_IMAGE_DIMENSION_PIXELS}-pixel \
+             serving limit: {e}"
+        )),
+        e => VisionError::ImageDecode(format!("decode failed: {e}")),
+    })?;
     let rgb = img.into_rgb8();
     let (width, height) = (rgb.width() as usize, rgb.height() as usize);
 
@@ -110,10 +257,30 @@ pub fn preprocess_qwen35_image(
     };
 
     let in_channels = cfg.in_channels;
+    // Locally visible invariant (PR #1021 review round 6, issue 8): the loop below decodes
+    // every image to a fixed 3-channel `RgbImage` and indexes `pixel[c]` for `c in
+    // 0..in_channels`, so `in_channels` must never exceed 3 here. `VisionModelConfig::validate`
+    // is the real fail-closed gate (rejects `in_channels != 3` at config/load time, before this
+    // function can ever be reached with a bad config) -- this assert is defense in depth only,
+    // catching a config constructed directly without going through `validate`.
+    debug_assert!(
+        in_channels <= 3,
+        "in_channels={in_channels} would index past a 3-channel RgbImage; \
+         VisionModelConfig::validate should have rejected this"
+    );
     let temporal = cfg.temporal_patch_size;
     let patch_len = in_channels * temporal * patch_size * patch_size;
     let num_patches = grid.num_patches();
-    let mut out = vec![0.0f32; num_patches * patch_len];
+    // Defense in depth alongside the dimension guard above: checked arithmetic on the
+    // pixel-tensor allocation size itself, so a config/grid combination that somehow slips past
+    // the width/height limit still cannot drive an unchecked, attacker-influenced allocation.
+    let alloc_len = num_patches.checked_mul(patch_len).ok_or_else(|| {
+        VisionError::InvalidConfig(format!(
+            "image patch grid {grid:?} with patch_len={patch_len} overflows the pixel-tensor \
+             allocation size"
+        ))
+    })?;
+    let mut out = vec![0.0f32; alloc_len];
 
     let blocks_h = grid_h / merge;
     let blocks_w = grid_w / merge;
@@ -529,11 +696,241 @@ mod tests {
         buf
     }
 
+    /// Builds an all-black RGB PNG at `w`x`h` -- highly compressible (a real-world encoder
+    /// collapses uniform rows to a few bytes each), so this fixture stays tiny on disk/wire
+    /// while still decoding to the full `w * h` pixel grid. Mirrors the external review's
+    /// concrete construction: a small, standards-conformant PNG whose *decoded* dimensions are
+    /// the actual attack surface, distinct from `make_test_png`'s gradient fill (which this
+    /// guard test does not need).
+    fn make_black_test_png(w: u32, h: u32) -> Vec<u8> {
+        use image::RgbImage;
+        use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+        let img = RgbImage::new(w, h); // zero-initialized == solid black
+        let mut buf = Vec::new();
+        // Default compression leaves an all-black 4064x4064 fixture at ~245 KiB;
+        // Best gets it under the 64 KiB content-part clamp, which is the point
+        // of the construction (small wire size, huge decoded dimensions).
+        let encoder = PngEncoder::new_with_quality(
+            std::io::Cursor::new(&mut buf),
+            CompressionType::Best,
+            FilterType::Adaptive,
+        );
+        img.write_with_encoder(encoder).unwrap();
+        buf
+    }
+
+    /// ADR-069 S6 review round 1 blocker: a compressed-byte clamp at the HTTP boundary does not
+    /// bound decoded pixel dimensions. This reproduces the reviewer's concrete construction (an
+    /// all-black 4064x4064 RGB PNG, well under every byte clamp, 32-divisible so it would
+    /// otherwise pass the patch-alignment check too) and asserts `preprocess_qwen35_image`
+    /// rejects it with the dedicated `DimensionsExceeded` variant *before* ever reaching the
+    /// `num_patches * patch_len` pixel-tensor allocation or the ViT forward pass -- proven by
+    /// the fact that this test completes near-instantly rather than allocating/processing a
+    /// ~396 MB tensor for a 4064x4064 grid.
+    ///
+    /// Mutation-sensitive: temporarily commenting out the dimension-limit block in
+    /// `preprocess_qwen35_image` turns this from an instant `DimensionsExceeded` rejection into
+    /// either an `Ok` (full decode + huge allocation succeeds) or, at minimum, a decode that no
+    /// longer returns this error variant -- verified locally by reverting the guard and watching
+    /// this assertion fail, then restoring it (not committed).
+    #[test]
+    fn preprocess_rejects_oversized_decoded_dimensions_before_allocation() {
+        let cfg = tiny_cfg(); // factor = patch_size(2) * merge(2) = 4; 4064 % 4 == 0
+        let png = make_black_test_png(4064, 4064);
+        assert!(
+            png.len() < 65_536,
+            "fixture must itself be a realistic small-upload size (got {} bytes) -- the whole \
+             point is that byte-size clamps alone cannot catch this",
+            png.len()
+        );
+
+        let err = preprocess_qwen35_image(&png, &cfg, None).unwrap_err();
+        assert!(
+            matches!(err, VisionError::DimensionsExceeded(_)),
+            "expected DimensionsExceeded, got {err:?}"
+        );
+    }
+
+    /// The real 0.8B checkpoint's patch geometry, which the patch-budget
+    /// guard's boundary numbers are quoted in (round-2 review blocker).
+    fn real_geometry_cfg() -> VisionModelConfig {
+        VisionModelConfig {
+            patch_size: 16,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            in_channels: 3,
+            ..tiny_cfg()
+        }
+    }
+
+    #[test]
+    fn preprocess_rejects_attention_budget_at_admitted_dimension_boundary() {
+        // Pinned to the unset-env default (see `with_max_patches_env` docs): this test's
+        // boundary numbers are quoted against DEFAULT_MAX_VISION_PATCHES specifically, so it
+        // must not observe a concurrently-running env-override test's temporary value.
+        with_max_patches_env(None, || {
+            // 2048x2048 passes the MAX_IMAGE_DIMENSION_PIXELS cap exactly, but at the
+            // real patch_size=16 it is a 128x128 = 16,384-patch grid whose per-head
+            // full-attention scores allocation is 16,384^2 * 4 = 1 GiB. The *serve-path* patch
+            // budget must reject it from the header alone (round-2 review blocker) -- this test
+            // exercises the serve path by passing `Some(serve_max_vision_patches())` explicitly
+            // (round 5: the guard is no longer applied unless the caller opts in).
+            let cfg = real_geometry_cfg();
+            let png = make_black_test_png(2048, 2048);
+            assert!(
+                png.len() < 65_536,
+                "fixture must stay a realistic small-upload size (got {} bytes)",
+                png.len()
+            );
+            let err =
+                preprocess_qwen35_image(&png, &cfg, Some(serve_max_vision_patches())).unwrap_err();
+            assert!(
+                matches!(err, VisionError::DimensionsExceeded(_)),
+                "expected DimensionsExceeded from the patch budget, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn preprocess_accepts_largest_grid_within_attention_budget() {
+        // Pinned to the unset-env default -- see the sibling test above for why.
+        with_max_patches_env(None, || {
+            // 256x256 at patch_size=16 is exactly DEFAULT_MAX_VISION_PATCHES = 256 pre-merge
+            // patches (PR #1021 review round 3: re-measured from a real, end-to-end timed Metal
+            // ViT forward on this development machine -- see DEFAULT_MAX_VISION_PATCHES's doc
+            // comment for the measured numbers) -- the largest square grid the default *serve*
+            // budget admits. Must preprocess successfully on the serve path (not be rejected by
+            // either guard), proving the budget boundary sits where the docs say.
+            let cfg = real_geometry_cfg();
+            let png = make_black_test_png(256, 256);
+            let (patches, grid) =
+                preprocess_qwen35_image(&png, &cfg, Some(serve_max_vision_patches()))
+                    .expect("boundary grid accepted");
+            assert_eq!(grid, GridThw { t: 1, h: 16, w: 16 });
+            assert_eq!(grid.num_patches(), DEFAULT_MAX_VISION_PATCHES);
+            let patch_len =
+                cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+            assert_eq!(patches.len(), DEFAULT_MAX_VISION_PATCHES * patch_len);
+        });
+    }
+
+    /// Review round 5 blocking finding: the public embedding path
+    /// ([`super::super::pooled_embed`]) must accept exactly what it accepted before round 4's
+    /// serve-only patch budget was (wrongly) applied inside the shared preprocessor by default.
+    /// A default-aligned 512x512 Qwen image (patch_size=16, 1,024 pre-merge patches) exceeds the
+    /// serve budget (256) but must still succeed with no cap configured.
+    #[test]
+    fn preprocess_public_path_accepts_default_512x512_image_with_no_cap_configured() {
+        let cfg = real_geometry_cfg();
+        let png = make_black_test_png(512, 512);
+        let (patches, grid) = preprocess_qwen35_image(&png, &cfg, None)
+            .expect("public embedding path must accept a default-aligned 512x512 image");
+        assert_eq!(grid, GridThw { t: 1, h: 32, w: 32 });
+        assert_eq!(grid.num_patches(), 1024);
+        let patch_len = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+        assert_eq!(patches.len(), 1024 * patch_len);
+    }
+
+    /// Review round 5: the companion half of the regression pair above -- the serve path (which
+    /// explicitly passes `Some(serve_max_vision_patches())`, as `serve/metal_worker.rs` does)
+    /// must still reject the same over-budget 512x512 image with the error surface round 4 added.
+    #[test]
+    fn preprocess_serve_path_still_rejects_512x512_image_over_serve_budget() {
+        with_max_patches_env(None, || {
+            let cfg = real_geometry_cfg();
+            let png = make_black_test_png(512, 512);
+            let err =
+                preprocess_qwen35_image(&png, &cfg, Some(serve_max_vision_patches())).unwrap_err();
+            assert!(
+                matches!(err, VisionError::DimensionsExceeded(_)),
+                "expected the serve path to keep rejecting an over-budget image, got {err:?}"
+            );
+        });
+    }
+
+    /// Serializes every test below that mutates the real process environment
+    /// (`LATTICE_VISION_MAX_PATCHES` is process-global -- `cargo test` runs this file's tests on
+    /// multiple threads within one process, so unguarded concurrent `set_var`/`remove_var` calls
+    /// would race and flake). Same pattern as `moe_expert_cache.rs`'s `ENV_TEST_LOCK`.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Sets (or clears) `LATTICE_VISION_MAX_PATCHES` for the duration of `f`, holding
+    /// `ENV_TEST_LOCK` and restoring the prior value (including "was unset") on the way out,
+    /// even if `f` panics.
+    fn with_max_patches_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var(LATTICE_VISION_MAX_PATCHES_ENV).ok();
+        // SAFETY: serialized by `ENV_TEST_LOCK` above -- no concurrent reader/writer of this
+        // process-global variable.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(LATTICE_VISION_MAX_PATCHES_ENV, v),
+                None => std::env::remove_var(LATTICE_VISION_MAX_PATCHES_ENV),
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // SAFETY: see above.
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var(LATTICE_VISION_MAX_PATCHES_ENV, v),
+                None => std::env::remove_var(LATTICE_VISION_MAX_PATCHES_ENV),
+            }
+        }
+        match result {
+            Ok(r) => r,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    #[test]
+    fn max_vision_patches_unset_env_falls_back_to_default() {
+        with_max_patches_env(None, || {
+            assert_eq!(serve_max_vision_patches(), DEFAULT_MAX_VISION_PATCHES);
+        });
+    }
+
+    /// PR #1021 review round 3 major finding: the patch cap must be configurable per-machine
+    /// without a rebuild. Setting the env var below the default must make a request that the
+    /// default would admit get rejected instead -- proving the override actually reaches the
+    /// admission guard, not just the standalone `serve_max_vision_patches()` accessor.
+    #[test]
+    fn preprocess_honors_lower_env_override_below_default() {
+        with_max_patches_env(Some("64"), || {
+            assert_eq!(serve_max_vision_patches(), 64);
+            let cfg = real_geometry_cfg();
+            // 256x256 = 256 patches, which the DEFAULT_MAX_VISION_PATCHES=256 budget admits
+            // (proved above) but a 64-patch override must reject.
+            let png = make_black_test_png(256, 256);
+            let err =
+                preprocess_qwen35_image(&png, &cfg, Some(serve_max_vision_patches())).unwrap_err();
+            assert!(
+                matches!(err, VisionError::DimensionsExceeded(_)),
+                "expected the lowered env override to reject a default-admitted grid, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn max_vision_patches_malformed_or_zero_env_falls_back_to_default() {
+        for bad in ["not-a-number", "0", ""] {
+            with_max_patches_env(Some(bad), || {
+                assert_eq!(
+                    serve_max_vision_patches(),
+                    DEFAULT_MAX_VISION_PATCHES,
+                    "env value {bad:?} must fall back to the default, not panic or admit \
+                     unbounded patches"
+                );
+            });
+        }
+    }
+
     #[test]
     fn preprocess_rejects_misaligned_image() {
         let cfg = tiny_cfg(); // factor = patch_size(2) * merge(2) = 4
         let png = make_test_png(6, 4); // 6 not a multiple of 4
-        let err = preprocess_qwen35_image(&png, &cfg).unwrap_err();
+        let err = preprocess_qwen35_image(&png, &cfg, None).unwrap_err();
         assert!(matches!(err, VisionError::InvalidConfig(_)));
     }
 
@@ -541,7 +938,7 @@ mod tests {
     fn preprocess_produces_expected_shape_and_grid() {
         let cfg = tiny_cfg();
         let png = make_test_png(8, 8); // grid 4x4 patches of size 2
-        let (patches, grid) = preprocess_qwen35_image(&png, &cfg).expect("preprocess");
+        let (patches, grid) = preprocess_qwen35_image(&png, &cfg, None).expect("preprocess");
         assert_eq!(grid, GridThw { t: 1, h: 4, w: 4 });
         let patch_len = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
         assert_eq!(patches.len(), grid.num_patches() * patch_len);
@@ -609,7 +1006,7 @@ mod tests {
         let cfg = tiny_cfg();
         let weights = make_test_weights(&cfg);
         let png = make_test_png(8, 8);
-        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg).expect("preprocess");
+        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg, None).expect("preprocess");
 
         let out = qwen35_vit_forward(&weights, &cfg, &pixel_values, grid).expect("forward");
         assert_eq!(out.len(), grid.num_patches() * cfg.hidden_size);
@@ -631,7 +1028,7 @@ mod tests {
         let cfg = tiny_cfg();
         let weights = make_test_weights(&cfg);
         let png = make_test_png(8, 8);
-        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg).expect("preprocess");
+        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg, None).expect("preprocess");
 
         let out1 = qwen35_vit_forward(&weights, &cfg, &pixel_values, grid).expect("forward 1");
         let out2 = qwen35_vit_forward(&weights, &cfg, &pixel_values, grid).expect("forward 2");
@@ -647,7 +1044,7 @@ mod tests {
         let cfg = tiny_cfg();
         let mut weights = make_test_weights(&cfg);
         let png = make_test_png(8, 8);
-        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg).expect("preprocess");
+        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg, None).expect("preprocess");
 
         let baseline = qwen35_vit_forward(&weights, &cfg, &pixel_values, grid).expect("forward");
         weights.blocks[0].qkv_weight[0] += 5.0;

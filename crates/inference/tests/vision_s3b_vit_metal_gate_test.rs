@@ -101,10 +101,16 @@ mod gated {
     }
 
     /// Serializes GPU-heavy tests onto the single shared Metal device, both
-    /// in-process and machine-wide. Own copy of `metal_qwen35.rs`'s
-    /// `gpu_test_lock()` — see module docs for why external integration
-    /// tests can't import the original (private, nested in that file's own
-    /// `#[cfg(test)] mod tests`).
+    /// in-process and machine-wide. Own copy rather than a call to the
+    /// canonical `lattice_inference::serve::gpu_test_lock` module: that
+    /// module is gated `cfg(any(test, feature = "test-utils"))`, and this
+    /// file (a separate compilation unit, like every `tests/*.rs` binary) is
+    /// documented to compile and run its cosine gate with only
+    /// `--features f16,metal-gpu` -- no `test-utils` -- so it cannot reach a
+    /// `test-utils`-gated item without dropping that no-`test-utils` mode.
+    /// Loosening the canonical module's gate to accommodate this one caller
+    /// would ship a test-only lock helper as `pub` API in ordinary
+    /// production `metal-gpu` builds, which is out of scope here.
     struct GpuTestGuard {
         _process: std::sync::MutexGuard<'static, ()>,
         _machine: std::fs::File,
@@ -279,7 +285,7 @@ mod gated {
         let weights = make_weights(&cfg, 0x1234_5678);
         let image_bytes = load_golden_image();
         let (pixel_values, grid) =
-            preprocess_qwen35_image(&image_bytes, &cfg).expect("preprocess golden image");
+            preprocess_qwen35_image(&image_bytes, &cfg, None).expect("preprocess golden image");
         assert_eq!(grid.num_patches(), 256);
 
         let expected_dispatches = expected_dispatch_count(&cfg);

@@ -725,6 +725,30 @@ jobs:
           fi
           grep -Eq '^test result: ok\. 7 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
 
+      # S6 serve vision E2E gate (PR #1021 review round 6, issues 3+4+5): the real
+      # `lattice_serve` HTTP surface, driven end to end over Metal with an image
+      # content-part request, asserting the vision-dispatch marker fires for the image
+      # request and not for a text-only control request on the same running server --
+      # not just an HTTP 200. Reuses this job's already-provisioned checkpoint (same
+      # reasoning as S4/S5b above: no second checkout+download job). Requires
+      # `test-utils` (gates the test's `[[test]]` entry in Cargo.toml, and the shared
+      # `base64_codec`/`gpu_test_lock` test-only seams the test calls).
+      - name: Run S6 serve vision E2E gate (fail-closed)
+        env:
+          LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
+          LATTICE_VISION_S3_GATE_ENFORCE: '1'
+        run: |
+          if cargo test --release -p lattice-inference --features f16,metal-gpu,test-utils \
+            --test vision_serve_e2e_test -- --nocapture > vision-s6-serve-gate.log 2>&1
+          then
+            cat vision-s6-serve-gate.log
+          else
+            status=$?
+            cat vision-s6-serve-gate.log
+            exit "$status"
+          fi
+          grep -q 'LATTICE_VISION_S6_SERVE_SMOKE' vision-s6-serve-gate.log
+
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
   # unlike q4-ppl-quality, whose PPL golden bootstraps on the runner — this has

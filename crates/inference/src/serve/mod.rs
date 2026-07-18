@@ -38,6 +38,19 @@ pub mod metal_worker;
 /// `emit_serve_event`).
 pub mod metrics;
 
+/// Standard-alphabet (RFC 4648 §4) base64 codec, hand-rolled (no external `base64` crate
+/// dependency -- PR #1021 review round 5: this exact codec used to be reimplemented three times
+/// independently: `lattice_serve.rs`'s production decoder, that binary's `#[cfg(test)]` encoder,
+/// and `tests/vision_serve_e2e_test.rs`'s separate-compilation-unit encoder). Consolidated here
+/// so every caller shares one RFC-4648 implementation.
+pub mod base64_codec;
+
+/// Machine-wide Metal GPU test-serialization lock, exposed for separate-compilation-unit
+/// integration tests (PR #1021 review round 6, issue 6). Test-only: gated the same way
+/// `metal_worker`'s cross-binary test seams are (`cfg(any(test, feature = "test-utils"))`).
+#[cfg(any(test, feature = "test-utils"))]
+pub mod gpu_test_lock;
+
 /// Request body size cap shared by both HTTP servers: 1 MiB. Both binaries
 /// already enforced this exact limit independently (`lattice.rs` via
 /// `DefaultBodyLimit::max`, `lattice_serve.rs` via `to_bytes(body, LIMIT)`);

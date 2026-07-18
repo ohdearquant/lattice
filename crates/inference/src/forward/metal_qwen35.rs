@@ -979,13 +979,30 @@ pub enum ChatRole {
 }
 
 impl ChatRole {
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             ChatRole::System => "system",
             ChatRole::User => "user",
             ChatRole::Assistant => "assistant",
         }
     }
+}
+
+/// **Unstable**: an image attached to a [`ChatMessage`] (ADR-069 S6).
+/// Carries the raw, still-encoded (e.g. PNG/JPEG) image bytes as decoded
+/// from the caller's request -- preprocessing (resize/patchify/normalize)
+/// happens downstream in the vision pipeline, not here.
+#[derive(Debug, Clone)]
+pub struct ChatImage {
+    pub bytes: Vec<u8>,
+    /// Text that followed the image part within the same message, in the
+    /// caller's original content-part order (PR #1021 review round 3: the
+    /// image's own message can carry text both before AND after it, e.g.
+    /// `[text("before"), image, text("after")]` -- `ChatMessage::content`
+    /// carries the "before" text, this field carries "after" so the vision
+    /// span is spliced at its true position instead of always ahead of the
+    /// message's full text).
+    pub text_after: String,
 }
 
 /// **Unstable**: single chat message; fields may expand with tool call support.
@@ -995,6 +1012,9 @@ impl ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// At most one image per message (ADR-069 S6 v0: single-image requests
+    /// only). `None` for every plain-text message -- the pre-vision shape.
+    pub image: Option<ChatImage>,
 }
 
 impl ChatMessage {
@@ -1003,6 +1023,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content: content.into(),
+            image: None,
         }
     }
     /// **Unstable**: construct a user message.
@@ -1010,6 +1031,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: content.into(),
+            image: None,
         }
     }
     /// **Unstable**: construct an assistant message.
@@ -1017,8 +1039,55 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content: content.into(),
+            image: None,
         }
     }
+    /// **Unstable**: construct a message carrying an image (ADR-069 S6).
+    /// `text_before`/`text_after` are the message's text parts that sat
+    /// before/after the single `image_url` part in the caller's original
+    /// content-part order (PR #1021 review round 3 ordering fix).
+    pub fn with_image(
+        role: ChatRole,
+        text_before: impl Into<String>,
+        image_bytes: Vec<u8>,
+        text_after: impl Into<String>,
+    ) -> Self {
+        Self {
+            role,
+            content: text_before.into(),
+            image: Some(ChatImage {
+                bytes: image_bytes,
+                text_after: text_after.into(),
+            }),
+        }
+    }
+}
+
+/// Renders a ChatML turn header -- `<|im_start|>{role}\n` -- the one place this layout is
+/// defined (PR #1021 review round 5: previously reimplemented independently in
+/// `serve::metal_worker::build_vision_prompt_ids`, which risked silently drifting from this
+/// renderer if only one side was ever edited). [`format_chat_template`] uses this for a whole
+/// turn; the vision path's segmented renderer (`serve::metal_worker::build_vision_prompt_ids`)
+/// uses it to open the turn that its image span interrupts mid-content.
+pub(crate) fn push_chat_turn_open(out: &mut String, role: &str) {
+    out.push_str("<|im_start|>");
+    out.push_str(role);
+    out.push('\n');
+}
+
+/// Renders a ChatML turn terminator -- `<|im_end|>\n` -- the closing half of
+/// [`push_chat_turn_open`], shared for the same reason.
+pub(crate) fn push_chat_turn_close(out: &mut String) {
+    out.push_str("<|im_end|>\n");
+}
+
+/// Renders one complete ChatML turn (open + content + close) for `msg`. Shared by
+/// [`format_chat_template`] and the vision path's segmented renderer for every turn that is
+/// *not* interrupted by an image span.
+pub(crate) fn render_chat_turn(out: &mut String, msg: &ChatMessage) {
+    push_chat_turn_open(out, msg.role.as_str());
+    out.push_str(&msg.content);
+    push_chat_turn_close(out);
 }
 
 /// **Unstable**: format messages into Qwen3.5 chat template; template format may change.
@@ -1026,18 +1095,90 @@ impl ChatMessage {
 /// Format messages into Qwen3.5 chat template.
 /// Template: <|im_start|>{role}\n{content}<|im_end|>\n
 /// Final assistant turn left open for generation.
-pub fn format_chat_template(messages: &[ChatMessage]) -> String {
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] if any message carries an image
+/// (PR #1021 review round 6, issues 1+10): this renderer only ever emits
+/// `msg.content` for each turn, so a `ChatMessage::with_image` value silently
+/// lost its image bytes and `image.text_after` here before this fix, with no
+/// error at all -- a text-only entry point that happened to receive a valid,
+/// image-bearing `ChatMessage` produced a plausible-looking text-only
+/// completion instead of failing loudly. Rather than splitting `ChatMessage`
+/// into two types (API churn disproportionate to the fix), every public
+/// entry point that renders through this function now rejects image-bearing
+/// messages instead of dropping their images; callers that need image
+/// support use the dedicated multimodal path
+/// (`serve::metal_worker::build_vision_prompt_ids` /
+/// `generate_multimodal_vision_with_cancel`), which still renders
+/// image-bearing messages correctly.
+pub fn format_chat_template(
+    messages: &[ChatMessage],
+) -> Result<String, crate::error::InferenceError> {
+    if let Some(image_msg) = messages.iter().find(|m| m.image.is_some()) {
+        return Err(crate::error::InferenceError::InvalidInput(format!(
+            "message with role '{}' carries an image, but this is a text-only chat-completion \
+             entry point that cannot render it; use the multimodal serve path instead",
+            image_msg.role.as_str()
+        )));
+    }
     let mut prompt = String::new();
     for msg in messages {
-        prompt.push_str("<|im_start|>");
-        prompt.push_str(msg.role.as_str());
-        prompt.push('\n');
-        prompt.push_str(&msg.content);
-        prompt.push_str("<|im_end|>\n");
+        render_chat_turn(&mut prompt, msg);
     }
     // Open assistant turn for generation
     prompt.push_str("<|im_start|>assistant\n");
-    prompt
+    Ok(prompt)
+}
+
+#[cfg(test)]
+mod format_chat_template_image_rejection_tests {
+    // CPU-available (no `metal-gpu` feature needed): `ChatMessage`/`format_chat_template`
+    // live at module top level for exactly this reason (#668).
+    use super::{ChatMessage, ChatRole, format_chat_template};
+
+    /// PR #1021 review round 6, issues 1+10: a text-only entry point must reject an
+    /// image-bearing message instead of silently rendering only its text and dropping the
+    /// image bytes + `image.text_after`.
+    #[test]
+    fn text_only_renderer_rejects_image_bearing_message() {
+        let messages = vec![ChatMessage::with_image(
+            ChatRole::User,
+            "before",
+            vec![0xFFu8, 0xD8, 0xFF],
+            "after",
+        )];
+        let err = format_chat_template(&messages)
+            .expect_err("format_chat_template must reject an image-bearing message");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("multimodal"),
+            "error must direct the caller to the multimodal path: {msg}"
+        );
+        assert!(
+            msg.contains("user"),
+            "error must name the offending role: {msg}"
+        );
+    }
+
+    /// Sibling positive case: ordinary text-only messages are completely unaffected.
+    #[test]
+    fn text_only_renderer_still_accepts_plain_messages() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+        ];
+        let prompt =
+            format_chat_template(&messages).expect("plain text messages must still render");
+        assert_eq!(
+            prompt,
+            "<|im_start|>system\nsys<|im_end|>\n\
+             <|im_start|>user\nhello<|im_end|>\n\
+             <|im_start|>assistant\nhi<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -6046,9 +6187,11 @@ mod inner {
         /// Qwen3.5 vision (ADR-069 Metal MP3): same REPLACE-injection contract as
         /// [`Self::forward_step_injected`], plus a per-token interleaved-axis
         /// M-RoPE cos/sin row for the six GQA layers (see
-        /// `forward_step_inner_impl`'s `mrope_cos_sin` doc). Used for image-pad
-        /// prefill positions, where `injected_embedding` and `mrope_cos_sin` are
-        /// both `Some`.
+        /// `forward_step_inner_impl`'s `mrope_cos_sin` doc). Production image-pad prefill now
+        /// calls [`Self::forward_step_injected_mrope_with_head`] instead (it needs the
+        /// `emit_head` gate); this always-emit form is retained because unit tests exercise the
+        /// injection+M-RoPE contract without needing the gate.
+        #[allow(dead_code)]
         fn forward_step_injected_mrope(
             &mut self,
             embedding: &[f32],
@@ -6061,6 +6204,30 @@ mod inner {
                 position,
                 false,
                 false,
+                GdnStateTrafficScope::Decode,
+                Some(embedding),
+                mrope_cos_sin,
+            )
+            .logits
+        }
+
+        /// Same contract as [`Self::forward_step_injected_mrope`], with an `emit_head` gate:
+        /// pass `false` for a multimodal prefill position that is not the prompt's last
+        /// position (see [`Self::forward_step_mrope_with_head`]'s doc comment).
+        fn forward_step_injected_mrope_with_head(
+            &mut self,
+            embedding: &[f32],
+            position: usize,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+            emit_head: bool,
+        ) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner_impl_with_head(
+                0,
+                position,
+                false,
+                false,
+                emit_head,
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 mrope_cos_sin,
@@ -6093,6 +6260,32 @@ mod inner {
             .logits
         }
 
+        /// Same contract as [`Self::forward_step_mrope`], with an `emit_head` gate: pass
+        /// `false` for a multimodal prefill position that is not the prompt's last position --
+        /// the RMSNorm/lm_head/[vocab_size] readback tail is unobservable for any position
+        /// whose logits are never sampled, so skipping it changes no output (see
+        /// [`Self::forward_step_inner_impl_with_head`]'s doc comment for why this is safe).
+        fn forward_step_mrope_with_head(
+            &mut self,
+            token_id: u32,
+            position: usize,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+            emit_head: bool,
+        ) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner_impl_with_head(
+                token_id,
+                position,
+                false,
+                false,
+                emit_head,
+                GdnStateTrafficScope::Decode,
+                None,
+                mrope_cos_sin,
+            )
+            .logits
+        }
+
         /// `mrope_cos_sin`, when supplied (Qwen3.5 vision M-RoPE, ADR-069 MP3),
         /// replaces the six GQA layers' 1-D `engine.rope_cos`/`rope_sin` table
         /// lookup (keyed by `position`) with this caller-supplied interleaved-axis
@@ -6106,6 +6299,39 @@ mod inner {
             position: usize,
             capture_hidden: bool,
             skip_logits_readback: bool,
+            _traffic_scope: GdnStateTrafficScope,
+            injected_embedding: Option<&[f32]>,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+        ) -> MetalStepOutput {
+            self.forward_step_inner_impl_with_head(
+                token_id,
+                position,
+                capture_hidden,
+                skip_logits_readback,
+                true,
+                _traffic_scope,
+                injected_embedding,
+                mrope_cos_sin,
+            )
+        }
+
+        /// Same as [`Self::forward_step_inner_impl`], with an added `emit_head` gate: when
+        /// `false`, skips the terminal RMSNorm/lm_head/[`Self::encode_final_head`]/readback
+        /// tail entirely (only the per-layer GQA/GDN/MLP work runs, which is what advances the
+        /// KV cache and GDN recurrent state). Mirrors the batched chunked-prefill path's
+        /// `emit_logits` gate (`forward_prefill_batched_chunk`, `!emit_logits` branch): that
+        /// tail feeds only `self.session.activations.logits`/`pre_final_hidden`, both
+        /// step-local scratch buffers overwritten at the start of the next step, so omitting it
+        /// for a non-final multimodal prefill position cannot change the residual stream, KV
+        /// cache, or GDN state the next position's step depends on.
+        #[allow(clippy::too_many_arguments)]
+        fn forward_step_inner_impl_with_head(
+            &mut self,
+            token_id: u32,
+            position: usize,
+            capture_hidden: bool,
+            skip_logits_readback: bool,
+            emit_head: bool,
             _traffic_scope: GdnStateTrafficScope,
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
@@ -6306,8 +6532,11 @@ mod inner {
                     &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
                 };
                 let head_enc = head_cmd.new_compute_command_encoder();
-                let topk_which_inner =
-                    self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling);
+                let topk_which_inner = if emit_head {
+                    self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling)
+                } else {
+                    None
+                };
                 head_enc.end_encoding();
                 let t_gpu = std::time::Instant::now();
                 head_cmd.commit();
@@ -6383,7 +6612,9 @@ mod inner {
                 }
 
                 // SAFETY: GPU completed (wait_until_completed called above for head_cmd).
-                let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                let pre_final_hidden = if emit_head
+                    && (capture_hidden || self.session.mtp.is_some())
+                {
                     let h =
                         unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                     self.session.last_pre_final_hidden = h.clone();
@@ -6392,7 +6623,7 @@ mod inner {
                     Vec::new()
                 };
 
-                let logits = if skip_logits_readback {
+                let logits = if !emit_head || skip_logits_readback {
                     vec![]
                 } else if let Some(which) = topk_which_inner {
                     let k = self.session.compact_topk;
@@ -6464,8 +6695,16 @@ mod inner {
                 }
             } // end layer loop
 
-            let topk_which =
-                self.encode_final_head(enc, &cfg, capture_hidden, &mut prof, profiling);
+            // `emit_head=false` (non-final multimodal prefill position): the per-layer loop
+            // above has already fully advanced the residual stream, KV cache, and GDN
+            // recurrent state, so the RMSNorm/lm_head/top-k tail below is pure waste here --
+            // skip encoding it and commit only the layer work, mirroring
+            // `forward_prefill_batched_chunk`'s `!emit_logits` branch.
+            let topk_which = if emit_head {
+                self.encode_final_head(enc, &cfg, capture_hidden, &mut prof, profiling)
+            } else {
+                None
+            };
 
             // Single submit for entire forward pass + optional top-k.
             enc.end_encoding();
@@ -6524,9 +6763,11 @@ mod inner {
                 );
             }
 
-            // Read back pre-final hidden when requested (for MTP input).
+            // Read back pre-final hidden when requested (for MTP input). Gated on `emit_head`
+            // too: when `emit_head` is false, `encode_final_head`'s own pre-final-hidden copy
+            // never ran, so the buffer holds a stale value from a prior step.
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
-            let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+            let pre_final_hidden = if emit_head && (capture_hidden || self.session.mtp.is_some()) {
                 let h = unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                 self.session.last_pre_final_hidden = h.clone();
                 h
@@ -6534,7 +6775,7 @@ mod inner {
                 Vec::new()
             };
 
-            let logits = if skip_logits_readback {
+            let logits = if !emit_head || skip_logits_readback {
                 vec![]
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
@@ -9823,7 +10064,33 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
-            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None)
+            // Thin `should_cancel = || false` wrapper over the cancel-aware entry point below --
+            // same pattern as `generate_streaming`/`generate_streaming_with_cancel` (PR #1021
+            // review round 3 major finding: this path previously had no cancel-aware variant at
+            // all, so a disconnected client's job ran the vision decode loop to completion --
+            // up to the full remaining context window -- on the single serialized worker).
+            self.generate_multimodal_vision_with_cancel(request, tokenizer, gen_cfg, || false)
+        }
+
+        /// Cancel-aware [`Self::generate_multimodal_vision`] (PR #1021 review round 3): mirrors
+        /// [`Self::generate_streaming_with_prefix_cache_and_cancel`]'s contract on this entry
+        /// point -- `should_cancel` is polled once per decode-loop iteration, before that
+        /// iteration's GPU work, so a disconnected client stops paying for further decode steps
+        /// at the next step boundary instead of running to `max_new_tokens`/context-full. ViT
+        /// preprocessing/forward/merger cancellation is out of scope here (already covered,
+        /// separately, by `build_vision_request`'s own `should_cancel` checks in
+        /// `serve/metal_worker.rs` before this function is ever called).
+        pub fn generate_multimodal_vision_with_cancel<C>(
+            &mut self,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            should_cancel: C,
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
+        where
+            C: FnMut() -> bool,
+        {
+            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None, should_cancel)
         }
 
         /// Body of [`Self::generate_multimodal_vision`] with an optional
@@ -9836,13 +10103,17 @@ mod inner {
         /// assertions through this seam are what make the decode wiring
         /// mutation-detectable (same pattern as `gemma4`'s
         /// `generate_greedy_with_probe`).
-        fn generate_multimodal_vision_impl(
+        fn generate_multimodal_vision_impl<C>(
             &mut self,
             request: &Qwen35VisionRequest,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut decode_logits_probe: Option<&mut Vec<Vec<f32>>>,
-        ) -> Result<GenerateOutput, crate::error::InferenceError> {
+            mut should_cancel: C,
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
+        where
+            C: FnMut() -> bool,
+        {
             use crate::error::InferenceError;
 
             super::multimodal_generate_preflight(gen_cfg)?;
@@ -9986,11 +10257,38 @@ mod inner {
             let mut visual_row = 0usize;
             let mut last_logits = Vec::new();
             for (pos, &token_id) in prompt_ids.iter().enumerate() {
+                // Checked before each prefill step's GPU work (PR #1021 review round 5 major
+                // finding): unlike the text-only path's single batched `forward_prefill` dispatch
+                // (which can only be checked before/after the whole call), multimodal prefill is
+                // already a per-token loop, so it is polled at the same per-step granularity as
+                // the decode loop below -- a disconnected client stops paying for further prefill
+                // steps at the next token boundary instead of running the full image+text prompt
+                // through the serialized Metal worker. Mirrors the decode loop's contract exactly
+                // (`stopped` stays `false`, `stop_reason` becomes `Interrupt`, no tokens emitted).
+                if should_cancel() {
+                    return Ok(GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens: prompt_len,
+                        generated_tokens: 0,
+                        stopped: false,
+                        stop_reason: Some(StopReason::Interrupt),
+                        token_logprobs: vec![],
+                    });
+                }
                 let cos_sin = if has_image {
                     Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()))
                 } else {
                     None
                 };
+                // Only the LAST prefill position's logits are ever read (`sample_token` below
+                // draws the first generated token from `last_logits` after this loop exits) --
+                // every earlier position's RMSNorm/lm_head/[vocab_size] readback is computed
+                // and immediately discarded when `last_logits` is overwritten by the next
+                // iteration. `emit_head` skips that tail for every non-final position; the
+                // per-layer work that advances the KV cache and GDN recurrent state still runs
+                // unconditionally (see `forward_step_inner_impl_with_head`'s doc comment).
+                let emit_head = pos == prompt_len - 1;
                 if has_image && token_id == request.image_token_id {
                     let start = visual_row * request.decoder_hidden_size;
                     let end = start + request.decoder_hidden_size;
@@ -10004,9 +10302,11 @@ mod inner {
                         )));
                     }
                     visual_row += 1;
-                    last_logits = self.forward_step_injected_mrope(row, pos, cos_sin);
+                    last_logits =
+                        self.forward_step_injected_mrope_with_head(row, pos, cos_sin, emit_head);
                 } else {
-                    last_logits = self.forward_step_mrope(token_id, pos, cos_sin);
+                    last_logits =
+                        self.forward_step_mrope_with_head(token_id, pos, cos_sin, emit_head);
                 }
             }
 
@@ -10050,6 +10350,15 @@ mod inner {
             // `decode_axis = physical_pos + rope_delta`, recomputed into a single
             // cos/sin row via the same `build_decode_cos_sin` the CPU oracle uses.
             while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
+                // Checked before this iteration's GPU work, independent of whether it ends up
+                // producing a token -- mirrors `generate_streaming_with_prefix_cache_and_cancel`'s
+                // decode-loop check (PR #1021 review round 3 major finding: this loop previously
+                // had no cancellation check at all, so a disconnected client's job ran to
+                // `max_new_tokens`/context-full on the single serialized worker).
+                if should_cancel() {
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -13936,7 +14245,7 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<ChatCompletionOutput, crate::error::InferenceError> {
-            let prompt = format_chat_template(messages);
+            let prompt = format_chat_template(messages)?;
             // Add <|im_end|> as stop token
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -16008,7 +16317,7 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
-            let prompt = format_chat_template(messages);
+            let prompt = format_chat_template(messages)?;
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
                 && !cfg.stop_token_ids.contains(&im_end_id)
@@ -17501,7 +17810,7 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
-            let prompt = format_chat_template(messages);
+            let prompt = format_chat_template(messages)?;
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
                 && !cfg.stop_token_ids.contains(&im_end_id)
@@ -26194,6 +26503,168 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// PR #1021 review round 3 major finding: the multimodal decode loop did not honor
+        /// cancellation once generation started, so a disconnected client's job ran to
+        /// `max_new_tokens`/context-full on the single serialized worker. Forces `should_cancel`
+        /// `true` after two decode steps and asserts the loop stops there (well short of the
+        /// generous `max_new_tokens` requested) with `stop_reason: Some(StopReason::Interrupt)`
+        /// -- the same contract `generate_streaming_with_prefix_cache_and_cancel` already
+        /// guarantees on the text path.
+        ///
+        /// Mutation-sensitive: reverting the decode loop's `if should_cancel() { ... break; }`
+        /// check makes this run to the full `max_new_tokens` regardless of `should_cancel`,
+        /// which fails the `generated_tokens` bound below -- verified locally by reverting the
+        /// check and watching this assertion fail, then restoring it (not committed).
+        #[test]
+        fn generate_multimodal_vision_with_cancel_stops_decode_loop_early() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_with_cancel_stops_decode_loop_early",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 50,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let request = vision_gate_fixture(&cfg, 0.01);
+
+            let decode_calls = std::cell::Cell::new(0usize);
+            let cancel_after = 2usize;
+            let should_cancel = || {
+                let n = decode_calls.get();
+                decode_calls.set(n + 1);
+                n >= cancel_after
+            };
+
+            let out = state
+                .generate_multimodal_vision_with_cancel(
+                    &request,
+                    &tokenizer,
+                    &gen_cfg,
+                    should_cancel,
+                )
+                .expect("cancelled multimodal generate still returns Ok, not Err");
+
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Interrupt),
+                "mid-decode cancellation must surface as StopReason::Interrupt, got {:?}",
+                out.stop_reason
+            );
+            assert!(
+                out.generated_tokens < gen_cfg.max_new_tokens,
+                "cancellation must bound the decode loop well below max_new_tokens={}, got {}",
+                gen_cfg.max_new_tokens,
+                out.generated_tokens
+            );
+            assert!(
+                out.generated_tokens <= cancel_after + 1,
+                "decode loop must stop within one step of should_cancel going true \
+                 (cancel_after={cancel_after}), got {} generated tokens",
+                out.generated_tokens
+            );
+        }
+
+        /// PR #1021 review round 5 major finding: the multimodal *prefill* loop (every prompt
+        /// token, image-pad or text, injected via `forward_step_injected_mrope`/
+        /// `forward_step_mrope`) ran to completion with no cancellation check at all -- the first
+        /// `should_cancel` poll in `generate_multimodal_vision_impl` was in the decode loop, well
+        /// after the entire image+text prompt had already been forced through the serialized
+        /// Metal worker. Forces `should_cancel` `true` after two prefill steps (well short of
+        /// `vision_gate_fixture`'s 7-token prompt) and asserts the loop stops there with
+        /// `stop_reason: Some(StopReason::Interrupt)` and zero generated tokens -- proving
+        /// cancellation is observed *during* prefill, not merely before it starts or after it
+        /// finishes.
+        ///
+        /// Mutation-sensitive: reverting the prefill loop's `if should_cancel() { return Ok(...);
+        /// }` check makes `should_cancel_calls` reach the full prompt length (7) instead of
+        /// stopping at `cancel_after + 1` -- verified locally by reverting the check and watching
+        /// the assertion below fail (`should_cancel` still gets called 7+ times, `stop_reason`
+        /// comes back `Length`/`Eos` instead of `Interrupt`), then restoring it (not committed).
+        #[test]
+        fn generate_multimodal_vision_with_cancel_stops_prefill_loop_early() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_with_cancel_stops_prefill_loop_early",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 50,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+            let request = vision_gate_fixture(&cfg, 0.01);
+            assert!(
+                request.input_ids.len() > 4,
+                "fixture prompt must be long enough that cancel_after=2 fires mid-prefill, \
+                 got {} tokens",
+                request.input_ids.len()
+            );
+
+            let should_cancel_calls = std::cell::Cell::new(0usize);
+            let cancel_after = 2usize;
+            let should_cancel = || {
+                let n = should_cancel_calls.get();
+                should_cancel_calls.set(n + 1);
+                n >= cancel_after
+            };
+
+            let out = state
+                .generate_multimodal_vision_with_cancel(
+                    &request,
+                    &tokenizer,
+                    &gen_cfg,
+                    should_cancel,
+                )
+                .expect("cancelled multimodal generate still returns Ok, not Err");
+
+            assert_eq!(
+                out.stop_reason,
+                Some(StopReason::Interrupt),
+                "mid-prefill cancellation must surface as StopReason::Interrupt, got {:?}",
+                out.stop_reason
+            );
+            assert_eq!(
+                out.generated_tokens, 0,
+                "prefill cancellation must happen before any token is sampled, got {} \
+                 generated tokens",
+                out.generated_tokens
+            );
+            assert!(
+                !out.stopped,
+                "prefill cancellation is an interruption, not a stop condition"
+            );
+            assert!(
+                should_cancel_calls.get() <= cancel_after + 1,
+                "prefill loop must stop within one step of should_cancel going true \
+                 (cancel_after={cancel_after}), got {} should_cancel calls -- the full \
+                 {}-token prompt must not be processed",
+                should_cancel_calls.get(),
+                request.input_ids.len()
+            );
+        }
+
         /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): REPLACE-semantics
         /// structural check, complementing the behavioral mutation-sensitivity
         /// test above. `forward_step_inner_impl`'s `Some(row) => { ... }`
@@ -26511,6 +26982,109 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  through the 3-axis M-RoPE table, not the 1-D engine.rope_cos/rope_sin \
                  fallback — forcing the 1-D path produced indistinguishable final-prefill \
                  logits (max_abs_diff={max_abs_diff})"
+            );
+        }
+
+        /// PR #1021 review round 7 major finding: the multimodal prefill loop computed the
+        /// terminal RMSNorm/lm_head/[vocab_size] readback for every prompt position even
+        /// though only the final position's logits are ever sampled. `emit_head=false` (see
+        /// `forward_step_inner_impl_with_head`'s doc comment) skips that tail for every
+        /// non-final position while the per-layer GQA/GDN/MLP work -- the only work that feeds
+        /// the residual stream, KV cache, or GDN recurrent state -- still runs unconditionally.
+        ///
+        /// State/logit-equivalence proof: a "skip" run (`emit_head = pos ==
+        /// last_pos`, exactly `generate_multimodal_vision`'s own prefill loop logic) and a
+        /// "reference" run (`emit_head = true` on every position, the pre-fix behavior) against
+        /// the same real checkpoint and prompt must produce (a) byte-identical final-prefill
+        /// logits and (b) identical post-prefill state -- probed by taking one more decode step
+        /// on each state afterward (mirroring `generate_multimodal_vision_impl`'s own decode-step
+        /// cos/sin construction) and comparing THOSE logits too, since any KV-cache or GDN-state
+        /// divergence introduced during prefill would change the very next step's attention/
+        /// recurrence output. Equivalence holds in both directions: forcing the "skip" run's
+        /// `emit_head` to `true` everywhere (i.e. reverting the optimization) makes it identical
+        /// to the reference run by construction, so the comparison still passes.
+        ///
+        /// Mutation-sensitive: changing the skip run's predicate so the FINAL position is also
+        /// skipped (`emit_head = pos == last_pos && false`, i.e. never true) makes
+        /// `last_logits_skip` come back empty (`vec![]`, `encode_final_head`'s tail never ran)
+        /// while `last_logits_ref` stays the full `[vocab_size]` vector -- the length-equality
+        /// assertion below fails immediately. Verified locally: applying that predicate change
+        /// makes this test panic (`left: 0, right: 151936`-shaped mismatch), reverting restores
+        /// a pass.
+        #[test]
+        fn multimodal_prefill_emit_head_skip_preserves_final_logits_and_state() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "multimodal_prefill_emit_head_skip_preserves_final_logits_and_state",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let request = vision_gate_fixture(&cfg, 0.015);
+            let (positions, tables) = request
+                .build_mrope_tables(&cfg)
+                .expect("fixture request builds M-RoPE tables");
+            let last_pos = request.input_ids.len() - 1;
+
+            let run = |emit_head_for: &dyn Fn(usize) -> bool| {
+                let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                    .expect("real-checkpoint state");
+                state.reset_state();
+                let mut visual_row = 0usize;
+                let mut last_logits = Vec::new();
+                for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                    let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
+                    let emit_head = emit_head_for(pos);
+                    if token_id == request.image_token_id {
+                        let start = visual_row * request.decoder_hidden_size;
+                        let end = start + request.decoder_hidden_size;
+                        let row = &request.post_merger_rows[start..end];
+                        visual_row += 1;
+                        last_logits = state
+                            .forward_step_injected_mrope_with_head(row, pos, cos_sin, emit_head);
+                    } else {
+                        last_logits =
+                            state.forward_step_mrope_with_head(token_id, pos, cos_sin, emit_head);
+                    }
+                }
+                // Post-prefill state probe: one more decode step, same construction
+                // `generate_multimodal_vision_impl`'s decode loop uses.
+                let decode_axis = crate::vision::qwen35_mrope::decode_position(
+                    request.input_ids.len(),
+                    positions.rope_delta,
+                )
+                .expect("decode_position must succeed for this fixture");
+                let (decode_cos, decode_sin) = request
+                    .build_decode_cos_sin(&cfg, decode_axis)
+                    .expect("build_decode_cos_sin must succeed for this fixture");
+                let probe_logits = state.forward_step_mrope(
+                    /* arbitrary next token id */ 13,
+                    request.input_ids.len(),
+                    Some((decode_cos.as_slice(), decode_sin.as_slice())),
+                );
+                (last_logits, probe_logits)
+            };
+
+            // Skip run: exactly `generate_multimodal_vision_impl`'s own prefill loop logic.
+            let (last_logits_skip, probe_skip) = run(&|pos| pos == last_pos);
+            // Reference run: emit the full head every position (pre-fix behavior).
+            let (last_logits_ref, probe_ref) = run(&|_pos| true);
+
+            assert_eq!(
+                last_logits_skip.len(),
+                last_logits_ref.len(),
+                "skip run's final-position logits must be the full [vocab_size] vector, not \
+                 empty -- the final position must never be skipped"
+            );
+            assert_eq!(
+                last_logits_skip, last_logits_ref,
+                "skip run's final-prefill logits must be byte-identical to the reference run's"
+            );
+            assert_eq!(
+                probe_skip, probe_ref,
+                "post-prefill KV/GDN state must be identical between the skip and reference \
+                 runs -- observed indirectly via one more decode step's logits"
             );
         }
 
@@ -26839,7 +27413,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("real-checkpoint state");
             let mut probed: Vec<Vec<f32>> = Vec::new();
             let out = state_fn
-                .generate_multimodal_vision_impl(&request, &tokenizer, &gen_cfg, Some(&mut probed))
+                .generate_multimodal_vision_impl(
+                    &request,
+                    &tokenizer,
+                    &gen_cfg,
+                    Some(&mut probed),
+                    || false,
+                )
                 .expect("fixture multimodal generate succeeds");
             assert_eq!(
                 out.generated_tokens, 2,
@@ -27634,19 +28214,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// acquire the same path.
         ///
         /// Acquisition order is mutex-then-file, so at most one thread per
-        /// process ever contends the file lock. The file lock is polled with
-        /// `try_lock` so a wedged holder surfaces as a clear panic after a
-        /// generous timeout instead of a silent infinite hang.
+        /// process ever contends the file lock. The file lock protocol itself
+        /// (path, timeout, poll interval) lives only in
+        /// [`crate::serve::gpu_test_lock`], the canonical implementation --
+        /// this wrapper adds only the in-process mutex layer on top, which
+        /// `serve::gpu_test_lock` does not need (it has no other in-process
+        /// caller to serialize against).
         struct GpuTestGuard {
             _process: std::sync::MutexGuard<'static, ()>,
-            // Held for the guard's lifetime; dropping the File closes the fd,
-            // which releases the flock.
-            _machine: std::fs::File,
+            _machine: crate::serve::gpu_test_lock::GpuTestLockGuard,
         }
-
-        const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-        const GPU_MACHINE_LOCK_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(30 * 60);
 
         fn gpu_test_lock() -> GpuTestGuard {
             use std::sync::Mutex;
@@ -27654,39 +28231,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let process = GPU_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(GPU_MACHINE_LOCK_PATH)
-                .unwrap_or_else(|e| {
-                    panic!("gpu_test_lock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}")
-                });
-            let deadline = std::time::Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
-            loop {
-                match file.try_lock() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        if std::time::Instant::now() >= deadline {
-                            panic!(
-                                "gpu_test_lock: another process has held \
-                                 {GPU_MACHINE_LOCK_PATH} for over {}s — a Metal \
-                                 test run elsewhere on this machine is wedged or \
-                                 genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
-                                GPU_MACHINE_LOCK_TIMEOUT.as_secs()
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(std::fs::TryLockError::Error(e)) => {
-                        panic!("gpu_test_lock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
-                    }
-                }
-            }
+            let machine = crate::serve::gpu_test_lock::gpu_test_lock();
             GpuTestGuard {
                 _process: process,
-                _machine: file,
+                _machine: machine,
             }
         }
 

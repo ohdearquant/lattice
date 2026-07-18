@@ -49,12 +49,24 @@
 //! on `metal_qwen35.rs`'s own exhaustive Device-gated tests for the
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
-use crate::forward::metal_qwen35::{ChatMessage, MetalQwen35State, format_chat_template};
+#[cfg(test)]
+use crate::forward::metal_qwen35::{ChatImage, ChatRole};
+use crate::forward::metal_qwen35::{
+    ChatMessage, MetalQwen35State, format_chat_template, push_chat_turn_close, push_chat_turn_open,
+    render_chat_turn,
+};
 use crate::kv_cache::CrossTurnSlotId;
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
+use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, VisionModelConfig};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
+use crate::vision::VisionError;
+use crate::vision::checkpoint::{Qwen35VisionWeights, load_qwen35_vision_weights};
+use crate::vision::multimodal::Qwen35VisionRequest;
+use crate::vision::qwen35_merger::qwen35_merger_forward;
+use crate::vision::qwen35_vit::preprocess_qwen35_image;
+use crate::vision::qwen35_vit_metal::qwen35_vit_forward_metal;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
@@ -134,6 +146,7 @@ pub enum WorkerEvent {
 /// `Rejected` vs. `Failed` distinction (#656 vs. #611) at the type level
 /// instead of `lattice_serve.rs`'s prior string-prefix-sniffing convention
 /// (`PROMPT_EXCEEDS_WINDOW_PREFIX`).
+#[derive(Debug)]
 enum WorkerFailure {
     Rejected(ApiError),
     Failed(String),
@@ -365,6 +378,293 @@ fn check_prompt_fits_window(
     Ok(())
 }
 
+/// Render `messages` into the physical token id stream a [`Qwen35VisionRequest`]
+/// needs (ADR-069 S6): every turn is ChatML-rendered through the exact same shared
+/// turn primitives [`format_chat_template`] uses ([`render_chat_turn`] for a whole
+/// turn, [`push_chat_turn_open`]/[`push_chat_turn_close`] for the turn at
+/// `image_message_index`, which splices `vision_start_token_id`, `num_pads` copies
+/// of `image_token_id`, then `vision_end_token_id` between that turn's own
+/// `text_before` (`content`) and `text_after` (`image.text_after`) -- preserving
+/// the caller's original content-part order (PR #1021 review round 3: a prior
+/// version unconditionally inserted the vision span ahead of the turn's entire
+/// text, so `[text("before"), image, text("after")]` decoded as
+/// image -> "beforeafter" instead of "before" -> image -> "after"). Sharing the
+/// turn primitives with [`format_chat_template`] (PR #1021 review round 5) means
+/// there is exactly one definition of the ChatML layout (`<|im_start|>{role}\n` /
+/// `<|im_end|>\n`); editing it here automatically keeps the text-only path in
+/// sync, and vice versa. Tokenizes in exactly two calls (the text before the
+/// spliced ids, then the text after) rather than one call per ChatML segment, so
+/// only the one unavoidable seam next to the numeric image-pad ids is exposed to
+/// cross-call BPE boundary effects -- every other turn boundary stays inside a
+/// single `tokenizer.tokenize` call, identical to the plain-text path.
+fn build_vision_prompt_ids(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    tokenizer: &BpeTokenizer,
+    vision_start_token_id: u32,
+    vision_end_token_id: u32,
+    image_token_id: u32,
+    num_pads: usize,
+) -> Vec<u32> {
+    let tokenize = |text: &str| -> Vec<u32> {
+        let out = tokenizer.tokenize(text);
+        out.input_ids[..out.real_length].to_vec()
+    };
+
+    let mut before = String::new();
+    for m in &messages[..image_message_index] {
+        render_chat_turn(&mut before, m);
+    }
+    push_chat_turn_open(&mut before, messages[image_message_index].role.as_str());
+    // The image message's own text that preceded the image part in the
+    // caller's original content-part order (PR #1021 review round 3):
+    // without this, a `[text("before"), image, ...]` message loses "before"
+    // entirely -- the vision span spliced right after the role header with
+    // no text ahead of it at all.
+    before.push_str(&messages[image_message_index].content);
+
+    let mut after = String::new();
+    // The image message's text that followed the image part in the
+    // caller's original content-part order (PR #1021 review round 3):
+    // `messages[image_message_index].content` is that message's
+    // *before*-image text (already rendered into `before` above), so the
+    // vision span must be followed by `image.text_after`, not `content`
+    // again -- reusing `content` here is exactly the bug that decoded
+    // `[text("before"), image, text("after")]` as image -> "beforeafter"
+    // instead of "before" -> image -> "after".
+    after.push_str(
+        messages[image_message_index]
+            .image
+            .as_ref()
+            .expect("image_message_index selected only messages with Some(image)")
+            .text_after
+            .as_str(),
+    );
+    push_chat_turn_close(&mut after);
+    for m in &messages[image_message_index + 1..] {
+        render_chat_turn(&mut after, m);
+    }
+    after.push_str("<|im_start|>assistant\n");
+
+    let mut ids = tokenize(&before);
+    ids.push(vision_start_token_id);
+    ids.extend(std::iter::repeat_n(image_token_id, num_pads));
+    ids.push(vision_end_token_id);
+    ids.extend(tokenize(&after));
+    ids
+}
+
+/// Non-[`WorkerFailure`] outcome of [`build_vision_request`]: cancellation observed between its
+/// expensive phases (decode/preprocess, ViT, merger) must not surface as an ordinary failure.
+/// [`run_worker_loop`]'s shared cancellation contract classifies mid-flight cancellation (after
+/// a job has already been dequeued and started) as an `Ok(GenerateOutput)` carrying
+/// `stop_reason: Some(StopReason::Interrupt)` -- exactly how the pre-existing text-generation
+/// path already reports a should-cancel observed mid-prefill/mid-decode -- never a
+/// `WorkerEvent::Failed`. Keeping this distinct from [`WorkerFailure`] at the type level means
+/// the call site cannot accidentally collapse the two the way the pre-fix code did (returning
+/// `WorkerFailure::Failed("cancelled before vision generation started")`, which classified a
+/// disconnected client the same as a genuine internal error).
+#[derive(Debug)]
+enum VisionBuildStop {
+    /// `should_cancel` observed `true` between two of `build_vision_request`'s phases; the
+    /// caller must synthesize an interrupted [`GenerateOutput`] instead of propagating this.
+    Cancelled,
+    Failure(WorkerFailure),
+}
+
+/// Build a [`Qwen35VisionRequest`] for `messages` (exactly one of which
+/// carries an image, at `image_message_index`) against `vision_state`
+/// (ADR-069 S6): preprocess -> expanded token-id stream from
+/// [`build_vision_prompt_ids`] + `window_preflight` on its length -> lazy
+/// vision-weights load -> Metal ViT forward (S3b, transparently CPU-fallback
+/// per-GEMM when the Metal dispatch threshold isn't cleared -- see
+/// `qwen35_vit_metal`'s module docs) -> merger. The prompt ids are built
+/// (and the context window checked) BEFORE the ViT because the expanded
+/// length is fully determined by the tokenizer and the patch grid: an
+/// over-context request must cost only decode/preprocess, never a full
+/// vision forward pass. `vision_state.get_or_load()` is deferred to just
+/// before the ViT forward -- after preprocessing and window preflight have
+/// both already succeeded -- so a request that's going to be rejected
+/// anyway (bad image bytes, over-context prompt) never forces the
+/// serialized worker to load and retain the vision tensors. Returns
+/// [`VisionBuildStop::Failure`] wrapping [`WorkerFailure::Rejected`] for a
+/// caller-fixable problem (bad image bytes, oversized decoded dimensions,
+/// misaligned dimensions, over-context expanded prompt, missing checkpoint
+/// vision metadata, vision-weights load failure), [`WorkerFailure::Failed`]
+/// for an internal forward-pass error, and [`VisionBuildStop::Cancelled`] if
+/// `should_cancel` observes the caller is gone at any point between
+/// decode/preprocess, the weights load, ViT, and merger -- so a
+/// disconnected client stops paying for vision work at the earliest
+/// checkpoint instead of only after the full pass completes.
+#[allow(clippy::too_many_arguments)]
+fn build_vision_request(
+    vision_state: &mut LazyVision,
+    cfg: &crate::model::qwen35_config::Qwen35Config,
+    tokenizer: &BpeTokenizer,
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    image_bytes: &[u8],
+    should_cancel: &mut dyn FnMut() -> bool,
+    window_preflight: &dyn Fn(usize) -> Result<(), ApiError>,
+) -> Result<Qwen35VisionRequest, VisionBuildStop> {
+    let bad_request = |message: String| {
+        VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
+            message,
+            code: "invalid_image",
+        }))
+    };
+
+    let vision_cfg = cfg.vision_config.as_ref().ok_or_else(|| {
+        VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "this checkpoint has no vision_config; image input is unsupported".into(),
+            code: "vision_unsupported",
+        }))
+    })?;
+    let image_token_id = cfg
+        .image_token_id
+        .ok_or_else(|| bad_request("checkpoint has no image_token_id".into()))?;
+    let vision_start = cfg
+        .vision_start_token_id
+        .ok_or_else(|| bad_request("checkpoint has no vision_start_token_id".into()))?;
+    let vision_end = cfg
+        .vision_end_token_id
+        .ok_or_else(|| bad_request("checkpoint has no vision_end_token_id".into()))?;
+
+    // Checked before any decode/preprocess work: a client that disconnected between dequeue and
+    // here must not pay for the (potentially large) image decode below (PR #1021 review round 1
+    // major finding).
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
+    // Only the serve path opts into the serving-latency patch budget (PR #1021 review round 5):
+    // the shared preprocessor no longer applies it by default, so the public embedding API keeps
+    // accepting whatever it accepted before that budget existed.
+    let (pixel_values, grid) = preprocess_qwen35_image(
+        image_bytes,
+        vision_cfg,
+        Some(crate::vision::qwen35_vit::serve_max_vision_patches()),
+    )
+    .map_err(|e| {
+        // The dimension guard (ADR-069 S6 review round 1 blocker) gets its own HTTP code,
+        // distinct from ordinary image-rejection reasons, so a caller can tell "this image is
+        // fundamentally too large to serve" apart from "this image/data URI was malformed".
+        let code = if matches!(e, VisionError::DimensionsExceeded(_)) {
+            "image_dimensions_exceeded"
+        } else {
+            "invalid_image"
+        };
+        VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: format!("image preprocessing failed: {e}"),
+            code,
+        }))
+    })?;
+
+    // Grid -> expanded prompt ids BEFORE any ViT/merger work (daemon review
+    // blocker on round 2's head): the expanded prompt length is fully
+    // determined by the tokenizer and the patch grid, so a request that is
+    // guaranteed to be rejected as over-context must be rejected HERE --
+    // paying only decode/preprocess cost -- not after the full vision
+    // forward pass has run.
+    let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
+    if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
+        return Err(bad_request(format!(
+            "image dimensions produce a patch grid {grid:?} not divisible by \
+             spatial_merge_size^2 ({merge_sq})"
+        )));
+    }
+    let num_pads = grid.num_patches() / merge_sq;
+
+    let input_ids = build_vision_prompt_ids(
+        messages,
+        image_message_index,
+        tokenizer,
+        vision_start,
+        vision_end,
+        image_token_id,
+        num_pads,
+    );
+    window_preflight(input_ids.len())
+        .map_err(|e| VisionBuildStop::Failure(WorkerFailure::Rejected(e)))?;
+
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
+    // Deferred to here (after decode/preprocess and window preflight have both already
+    // succeeded): the first vision request against a checkpoint pays the weights-load cost,
+    // but only once it's known the request is otherwise going to proceed.
+    let vision_weights = match vision_state.get_or_load() {
+        Ok(Some(weights)) => weights,
+        Ok(None) => {
+            return Err(bad_request(
+                "image input requires a vision-capable model; this checkpoint has no vision \
+                 weights loaded"
+                    .into(),
+            ));
+        }
+        Err(_detail) => {
+            // `get_or_load` already logged the detailed loader error server-side; it can name
+            // the configured model directory / checkpoint path, so it must never reach the
+            // client-facing message. `vision_state` is still `Pending` here (see
+            // `LazyVision::get_or_load`'s doc comment), so the next image request retries the
+            // load instead of being permanently wedged.
+            return Err(VisionBuildStop::Failure(WorkerFailure::Rejected(
+                ApiError::BadRequest {
+                    message: "vision model failed to load".into(),
+                    code: "vision_load_failed",
+                },
+            )));
+        }
+    };
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
+    let pre_merger = qwen35_vit_forward_metal(vision_weights, vision_cfg, &pixel_values, grid)
+        .map_err(|e| {
+            VisionBuildStop::Failure(WorkerFailure::Failed(format!("ViT forward failed: {e}")))
+        })?;
+
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
+    let post_merger = qwen35_merger_forward(&vision_weights.merger, vision_cfg, &pre_merger)
+        .map_err(|e| {
+            VisionBuildStop::Failure(WorkerFailure::Failed(format!("merger forward failed: {e}")))
+        })?;
+
+    if should_cancel() {
+        return Err(VisionBuildStop::Cancelled);
+    }
+
+    Ok(Qwen35VisionRequest {
+        input_ids,
+        image_grids: vec![grid],
+        post_merger_rows: post_merger,
+        image_token_id,
+        spatial_merge_size: vision_cfg.spatial_merge_size,
+        decoder_hidden_size: cfg.hidden_size,
+    })
+}
+
+/// The `GenerateOutput` [`run_worker_loop`]'s shared cancellation contract requires for a job
+/// that started (was dequeued) but whose client disconnected before any tokens were produced --
+/// mirrors the identically-shaped literal the text-generation path returns from inside
+/// `MetalQwen35State::generate_streaming_with_prefix_cache_and_cancel` when `should_cancel` is
+/// observed `true` before prefill. `prompt_tokens: 0` here (unlike that text-path literal, which
+/// already knows the tokenized prompt length at that point) because the vision path can be
+/// interrupted before `build_vision_request` ever tokenizes anything; this is a best-effort
+/// terminal event, not a usage-accounting one.
+fn vision_cancelled_output() -> GenerateOutput {
+    GenerateOutput {
+        text: String::new(),
+        token_ids: vec![],
+        prompt_tokens: 0,
+        generated_tokens: 0,
+        stopped: false,
+        stop_reason: Some(crate::stop_reason::StopReason::Interrupt),
+        token_logprobs: vec![],
+    }
+}
+
 /// Dequeue -> cancel-check -> generate -> reply, serialized on whatever
 /// thread calls this (the dedicated Metal worker thread in production; a
 /// plain `std::thread::spawn` in this module's own tests).
@@ -445,6 +745,70 @@ fn run_worker_loop(
     }
 }
 
+/// A vision-capable checkpoint's `model.visual.*` tensors, loaded either eagerly at startup
+/// or lazily on the worker's first image request (PR #1021 review round 6, issue 7): eagerly
+/// reading and (for Q4 checkpoints) dequantizing all ~153 visual tensors -- about 384 MiB f32
+/// for Qwen3.5-0.8B -- taxed every text-only server's startup and steady-state memory, even
+/// though the overwhelming majority of requests never touch an image.
+///
+/// This type's `get_or_load` takes `&mut self` and is only ever called from inside
+/// [`run_worker_loop`]'s single-threaded, one-job-at-a-time loop, which is what makes the
+/// lazy path race-free without needing a real `OnceCell`/mutex: there is exactly one caller,
+/// on exactly one thread, one job at a time, so "first request wins" cannot race the way it
+/// could across real concurrent threads.
+pub enum LazyVision {
+    /// This checkpoint's `config.json` carries no `vision_config` at all -- never attempt a
+    /// load, no matter how many image requests arrive.
+    Unsupported,
+    /// Vision-capable checkpoint; weights not read from disk yet (the common case: startup
+    /// does zero vision tensor reads unless `--preload-vision` was passed).
+    Pending {
+        model_dir: PathBuf,
+        vision_cfg: VisionModelConfig,
+    },
+    /// Weights are resident -- either loaded eagerly at startup (`--preload-vision`) or lazily
+    /// by a prior image request. Stays resident for the rest of the process lifetime.
+    Loaded(Qwen35VisionWeights),
+}
+
+impl LazyVision {
+    /// Returns the loaded weights, loading them first if this is the first image request this
+    /// checkpoint has seen. Returns `Ok(None)` only for [`LazyVision::Unsupported`] (checkpoint
+    /// has no vision weights at all -- not a failure, just "this model can't do vision").
+    /// Returns `Err` on a load failure; the failure is loud (caller surfaces it as a request
+    /// error, not a silent text-only fallback) and this stays [`LazyVision::Pending`] so the
+    /// NEXT image request retries the load rather than being permanently wedged by one
+    /// transient failure.
+    fn get_or_load(&mut self) -> Result<Option<&Qwen35VisionWeights>, String> {
+        if let LazyVision::Pending {
+            model_dir,
+            vision_cfg,
+        } = self
+        {
+            eprintln!(
+                "[metal-worker] loading vision weights on first image request \
+                 (model_dir={}) ...",
+                model_dir.display()
+            );
+            match load_qwen35_vision_weights(model_dir, vision_cfg) {
+                Ok(weights) => *self = LazyVision::Loaded(weights),
+                Err(e) => {
+                    let message = format!("vision weights failed to load: {e}");
+                    eprintln!("[metal-worker] {message}");
+                    return Err(message);
+                }
+            }
+        }
+        Ok(match self {
+            LazyVision::Unsupported => None,
+            LazyVision::Loaded(weights) => Some(weights),
+            LazyVision::Pending { .. } => {
+                unreachable!("just transitioned to Loaded above, or returned Err")
+            }
+        })
+    }
+}
+
 /// Namespace for [`MetalWorker::spawn`] -- a zero-sized marker type (never
 /// constructed) so the shared worker's entry point reads as
 /// `MetalWorker::spawn(..)` at every call site, matching the association
@@ -474,8 +838,10 @@ impl MetalWorker {
     /// [`DEFAULT_MAX_PENDING_JOBS`]); this function applies no default of
     /// its own.
     pub fn spawn(
-        loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
-        + Send
+        loader: impl FnOnce() -> Result<
+            (MetalQwen35State, BpeTokenizer, WorkerMetadata, LazyVision),
+            String,
+        > + Send
         + 'static,
         max_pending: usize,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
@@ -490,14 +856,113 @@ impl MetalWorker {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WorkerMetadata, String>>();
 
         let join_handle = std::thread::spawn(move || match loader() {
-            Ok((mut state, tokenizer, meta)) => {
+            Ok((mut state, tokenizer, meta, mut vision_state)) => {
                 let _ = ready_tx.send(Ok(meta.clone()));
                 run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
+                    // ADR-069 S6: a job carrying an image takes a separate
+                    // path -- one Metal ViT+merger pass to build a
+                    // `Qwen35VisionRequest`, then the vision-aware decode
+                    // entry point -- instead of the plain ChatML render +
+                    // text `generate_streaming_with_prefix_cache_and_cancel`
+                    // below. `image_message_index` is `None` for every
+                    // plain-text request, which is the overwhelming
+                    // majority, so that request shape is completely
+                    // unaffected by this branch.
+                    let mut image_positions = messages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, m)| m.image.is_some());
+                    let image_message_index = image_positions.next().map(|(i, _)| i);
+                    if image_positions.next().is_some() {
+                        return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                            message: "only a single image is supported per request".into(),
+                            code: "vision_unsupported",
+                        }));
+                    }
+
+                    if let Some(image_message_index) = image_message_index {
+                        // Structured, single-line dispatch marker: the one stable, greppable
+                        // observable that a request took the vision path rather than the text
+                        // path -- distinct from any HTTP response shape, so a regression that
+                        // silently drops the image and falls back to a plausible-looking
+                        // text-only answer is still caught by asserting this line's
+                        // presence/absence, not just a 200 status.
+                        eprintln!("[metal-worker] route=vision dispatch=multimodal");
+                        // Checked before any vision work at all, including the lazy weights
+                        // load: a client that disconnected between dequeue and here must not
+                        // force the serialized worker to load and retain the (potentially
+                        // large) vision tensors before it can even get to the next queued job.
+                        if should_cancel() {
+                            return Ok(vision_cancelled_output());
+                        }
+                        let image_bytes = &messages[image_message_index]
+                            .image
+                            .as_ref()
+                            .expect("image_message_index selected only messages with Some(image)")
+                            .bytes;
+                        // Window preflight is threaded INTO the builder so it runs as soon
+                        // as the expanded prompt length is known (right after preprocess),
+                        // before the ViT/merger cost -- not after it (daemon review
+                        // blocker: over-context requests previously consumed the entire
+                        // vision prefill first).
+                        let window_preflight = |expanded_len: usize| {
+                            check_prompt_fits_window(
+                                meta.context_window_policy,
+                                meta.model_max_context,
+                                expanded_len,
+                                cfg,
+                            )
+                        };
+                        // `vision_state` (not a resolved `&Qwen35VisionWeights`) is passed
+                        // through: `build_vision_request` only calls `get_or_load` once
+                        // preprocessing and window preflight have both already succeeded, so a
+                        // request that's going to be rejected anyway (bad image bytes,
+                        // over-context prompt) never forces a weights load.
+                        let request = match build_vision_request(
+                            &mut vision_state,
+                            &state.engine.config,
+                            &tokenizer,
+                            messages,
+                            image_message_index,
+                            image_bytes,
+                            &mut *should_cancel,
+                            &window_preflight,
+                        ) {
+                            Ok(request) => request,
+                            Err(VisionBuildStop::Cancelled) => {
+                                return Ok(vision_cancelled_output());
+                            }
+                            Err(VisionBuildStop::Failure(failure)) => return Err(failure),
+                        };
+                        if should_cancel() {
+                            return Ok(vision_cancelled_output());
+                        }
+                        // `generate_multimodal_vision_with_cancel` is a single blocking call (no
+                        // incremental `on_token` hook exists on this entry point yet) -- the full
+                        // answer arrives as one delta rather than a token-by-token stream (known
+                        // ADR-069 S6 v0 limitation) -- but it does poll `should_cancel` once per
+                        // decode step internally (PR #1021 review round 3 major finding), so a
+                        // disconnected client still stops the decode loop early instead of
+                        // running to `max_new_tokens`/context-full.
+                        let output = state
+                            .generate_multimodal_vision_with_cancel(
+                                &request,
+                                &tokenizer,
+                                cfg,
+                                &mut *should_cancel,
+                            )
+                            .map_err(WorkerFailure::from)?;
+                        if !output.text.is_empty() {
+                            on_token(&output.text, 0);
+                        }
+                        return Ok(output);
+                    }
+
                     // Render the ChatML prompt exactly once (#828/#832: the
                     // prior `lattice_serve.rs` path rendered it a second
                     // time inside its own window preflight); reused for
                     // both the window check and the generation call below.
-                    let prompt = format_chat_template(messages);
+                    let prompt = format_chat_template(messages)?;
                     let prompt_len = tokenizer.tokenize(&prompt).real_length;
                     check_prompt_fits_window(
                         meta.context_window_policy,
@@ -700,7 +1165,7 @@ pub fn spawn_fake_with_cap(
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
     std::thread::spawn(move || {
         run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
-            let prompt = format_chat_template(messages);
+            let prompt = format_chat_template(messages)?;
             let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
             check_prompt_fits_window(context_window_policy, model_max_context, prompt_tokens, cfg)
                 .map_err(WorkerFailure::Rejected)?;
@@ -836,6 +1301,392 @@ mod tests {
                 token_logprobs: vec![],
             })
         }
+    }
+
+    // ── PR #1021 review round 1 major finding: `build_vision_request`
+    //    cancellation ordering ─────────────────────────────────────────────
+
+    fn tiny_vision_cfg() -> crate::model::qwen35_config::VisionModelConfig {
+        crate::model::qwen35_config::VisionModelConfig {
+            depth: 1,
+            hidden_size: 8,
+            num_heads: 2,
+            patch_size: 2,
+            spatial_merge_size: 2,
+            out_hidden_size: 8,
+            temporal_patch_size: 1,
+            num_position_embeddings: 16,
+            in_channels: 1,
+            deepstack_visual_indexes: vec![],
+        }
+    }
+
+    /// Deliberately empty/zero-length weight vectors: both cancellation tests below must never
+    /// touch these (the whole point is that `should_cancel` short-circuits before the ViT/merger
+    /// forward passes that would read them), so their contents don't matter.
+    fn empty_vision_weights() -> Qwen35VisionWeights {
+        use crate::vision::checkpoint::VisualMergerWeights;
+        Qwen35VisionWeights {
+            patch_embed_weight: vec![],
+            patch_embed_weight_shape: vec![],
+            patch_embed_bias: vec![],
+            pos_embed: vec![],
+            blocks: vec![],
+            merger: VisualMergerWeights {
+                fc1_weight: vec![],
+                fc1_bias: vec![],
+                fc2_weight: vec![],
+                fc2_bias: vec![],
+                norm_weight: vec![],
+                norm_bias: vec![],
+            },
+        }
+    }
+
+    fn vision_test_qwen35_config() -> crate::model::qwen35_config::Qwen35Config {
+        crate::model::qwen35_config::Qwen35Config {
+            vision_config: Some(tiny_vision_cfg()),
+            image_token_id: Some(100),
+            vision_start_token_id: Some(101),
+            vision_end_token_id: Some(102),
+            hidden_size: 8,
+            ..Default::default()
+        }
+    }
+
+    fn minimal_tokenizer() -> BpeTokenizer {
+        // The constructor requires a dense id range, so a single-entry vocab is
+        // the smallest valid tokenizer. The already-cancelled test stops before
+        // any tokenization; the mid-flight test does reach
+        // `build_vision_prompt_ids` (prompt ids now precede the ViT), where
+        // unknown characters fail soft (dropped, no unk_id configured) -- these
+        // tests assert cancellation ordering, never token content.
+        let vocab = std::collections::HashMap::from([("a".to_string(), 0u32)]);
+        BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("single-entry vocab must construct a tokenizer")
+    }
+
+    fn make_black_test_png(w: u32, h: u32) -> Vec<u8> {
+        use image::RgbImage;
+        let img = RgbImage::new(w, h);
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    /// PR #1021 review round 3 major finding: `build_vision_prompt_ids` unconditionally
+    /// inserted the vision span ahead of a message's *entire* text, so a message shaped
+    /// `[text("before"), image, text("after")]` decoded as image -> "beforeafter" instead of
+    /// "before" -> image -> "after". Drives `build_vision_prompt_ids` directly with a
+    /// single-char vocab so both text tokens are individually addressable, then asserts their
+    /// token ids appear on the correct side of the spliced vision span.
+    ///
+    /// Mutation-sensitive: reverting `before.push_str(&messages[image_message_index].content)`
+    /// (dropping the pre-image text) or reverting `after`'s source back to
+    /// `messages[image_message_index].content` (the old bug, re-inserting the full text again
+    /// instead of `image.text_after`) both change this exact token sequence -- verified locally
+    /// by reverting each hunk in turn and watching this assertion fail, then restoring the fix.
+    #[test]
+    fn build_vision_prompt_ids_preserves_before_and_after_text_order() {
+        let vocab =
+            std::collections::HashMap::from([("A".to_string(), 10u32), ("B".to_string(), 11u32)]);
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+            .expect("two-entry vocab must construct a tokenizer");
+
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "A".to_string(),
+            image: Some(ChatImage {
+                bytes: vec![],
+                text_after: "B".to_string(),
+            }),
+        }];
+
+        let ids = build_vision_prompt_ids(
+            &messages, 0, &tokenizer, /* vision_start */ 101, /* vision_end */ 102,
+            /* image_token */ 100, /* num_pads */ 2,
+        );
+
+        // "A" (before) -> vision span (start, 2 image pads, end) -> "B" (after); every
+        // template/role/newline character around them is unknown to this vocab and dropped, so
+        // the surviving ids are exactly this ordered sequence.
+        assert_eq!(ids, vec![10, 101, 100, 100, 102, 11]);
+    }
+
+    /// PR #1021 review round 1 major finding: the pre-fix code only checked `should_cancel`
+    /// *after* `build_vision_request` had already run the full decode/preprocess/ViT/merger
+    /// pass, so a disconnected client still paid for the entire vision prefill. Proves the fix:
+    /// with `should_cancel` already `true`, `build_vision_request` must stop before touching the
+    /// (deliberately invalid) image bytes at all -- if it decoded first, this would fail with an
+    /// image-decode error instead of `Cancelled`, and `should_cancel` would be observed more than
+    /// once.
+    ///
+    /// Mutation-sensitive: commenting out the first `if should_cancel() { return
+    /// Err(VisionBuildStop::Cancelled); }` in `build_vision_request` turns this from an
+    /// instant `Cancelled` into an `invalid_image` rejection from the garbage bytes reaching
+    /// `preprocess_qwen35_image` -- verified locally by reverting the check and watching this
+    /// assertion fail, then restoring it (not committed).
+    #[test]
+    fn build_vision_request_stops_before_any_work_when_already_cancelled() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let mut should_cancel = move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        let mut vision_state = LazyVision::Loaded(empty_vision_weights());
+        let cfg = vision_test_qwen35_config();
+        let tokenizer = minimal_tokenizer();
+        let messages = vec![ChatMessage::user("hi")];
+        let garbage_bytes = b"not an image";
+
+        let result = build_vision_request(
+            &mut vision_state,
+            &cfg,
+            &tokenizer,
+            &messages,
+            0,
+            garbage_bytes,
+            &mut should_cancel,
+            &|_| Ok(()),
+        );
+
+        assert!(
+            matches!(result, Err(VisionBuildStop::Cancelled)),
+            "expected Cancelled before any decode/preprocess work"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should_cancel must be checked exactly once, before any other work"
+        );
+    }
+
+    /// Defense-in-depth checkpoint: cancellation observed right after decode/preprocess
+    /// completes must stop `build_vision_request` before it ever calls the Metal-only
+    /// `qwen35_vit_forward_metal` (unreachable in this non-GPU gate) -- proven by the exact
+    /// `should_cancel` call count (one before preprocess, one immediately after) rather than by
+    /// exercising the GPU path itself.
+    #[test]
+    fn build_vision_request_stops_after_preprocess_before_vit_when_cancelled_mid_flight() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let mut should_cancel = move || calls2.fetch_add(1, Ordering::SeqCst) >= 1;
+
+        let mut vision_state = LazyVision::Loaded(empty_vision_weights());
+        let cfg = vision_test_qwen35_config();
+        let tokenizer = minimal_tokenizer();
+        // Must actually carry `image: Some(..)` at `image_message_index` (PR #1021 review round
+        // 3): `build_vision_prompt_ids` now reads `image.text_after` for the post-image text
+        // instead of reusing `content`, matching the real invariant every production caller
+        // already holds (`image_message_index` is only ever the index of a message
+        // `image_positions` filtered to `Some(image)`).
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hi".to_string(),
+            image: Some(ChatImage {
+                bytes: vec![],
+                text_after: String::new(),
+            }),
+        }];
+        let png = make_black_test_png(8, 8); // 8x8, aligned to tiny_vision_cfg's factor=4
+
+        let result = build_vision_request(
+            &mut vision_state,
+            &cfg,
+            &tokenizer,
+            &messages,
+            0,
+            &png,
+            &mut should_cancel,
+            &|_| Ok(()),
+        );
+
+        assert!(
+            matches!(result, Err(VisionBuildStop::Cancelled)),
+            "expected Cancelled between preprocess and the ViT forward pass"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "should_cancel must be checked once before preprocess and once after -- proving the \
+             Metal ViT forward was never entered"
+        );
+    }
+
+    /// A client-facing vision-load failure must never repeat the loader's detailed error text:
+    /// that text can name the configured model directory (an absolute filesystem path) and
+    /// checkpoint details. `model_dir` here points at an empty tempdir -- guaranteed to fail
+    /// `load_qwen35_vision_weights` (no manifest present) -- with otherwise-valid image bytes,
+    /// so the flow reaches `get_or_load` and fails there rather than at an earlier check.
+    #[test]
+    fn build_vision_request_load_failure_message_never_leaks_model_dir() {
+        let empty_dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = empty_dir.path().to_path_buf();
+        let mut vision_state = LazyVision::Pending {
+            model_dir: model_dir.clone(),
+            vision_cfg: tiny_vision_cfg(),
+        };
+        let cfg = vision_test_qwen35_config();
+        let tokenizer = minimal_tokenizer();
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hi".to_string(),
+            image: Some(ChatImage {
+                bytes: vec![],
+                text_after: String::new(),
+            }),
+        }];
+        let png = make_black_test_png(8, 8);
+
+        let result = build_vision_request(
+            &mut vision_state,
+            &cfg,
+            &tokenizer,
+            &messages,
+            0,
+            &png,
+            &mut || false,
+            &|_| Ok(()),
+        );
+
+        match result {
+            Err(VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
+                message,
+                code,
+            }))) => {
+                assert_eq!(code, "vision_load_failed");
+                assert_eq!(
+                    message, "vision model failed to load",
+                    "client-facing message must be the fixed generic string, not the loader's \
+                     detailed error"
+                );
+                let dir_str = model_dir.display().to_string();
+                assert!(
+                    !message.contains(&dir_str),
+                    "client-facing message must not contain the model directory path: {message}"
+                );
+            }
+            other => panic!("expected a vision_load_failed BadRequest, got {other:?}"),
+        }
+        assert!(
+            matches!(vision_state, LazyVision::Pending { .. }),
+            "a failed load must leave state Pending so the next image request retries"
+        );
+    }
+
+    /// PR #1021 review round 7 major finding: lazy vision-weight loading must not run before
+    /// the in-flight cancellation check. `build_vision_request` itself now defers
+    /// `get_or_load` past its own cancellation + preprocess + window-preflight checks (the
+    /// worker's job-dispatch closure also cancel-checks before ever calling into this
+    /// function at all -- this test covers the function-level ordering guarantee).
+    /// `model_dir` deliberately has no manifest, so if `get_or_load` ran despite
+    /// cancellation, this would either panic on a `LazyVision::Loaded` transition (it can't
+    /// succeed) or at minimum perform disk I/O this test proves never happens: the exact
+    /// `should_cancel` call count (1) shows nothing past the first check -- including
+    /// `get_or_load` -- ever executed.
+    #[test]
+    fn build_vision_request_cancelled_before_dispatch_never_touches_vision_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let mut should_cancel = move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            true
+        };
+
+        let model_dir = tempfile::tempdir().expect("tempdir").path().to_path_buf();
+        let mut vision_state = LazyVision::Pending {
+            model_dir: model_dir.clone(),
+            vision_cfg: tiny_vision_cfg(),
+        };
+        let cfg = vision_test_qwen35_config();
+        let tokenizer = minimal_tokenizer();
+        let messages = vec![ChatMessage::user("hi")];
+
+        let result = build_vision_request(
+            &mut vision_state,
+            &cfg,
+            &tokenizer,
+            &messages,
+            0,
+            b"not an image",
+            &mut should_cancel,
+            &|_| Ok(()),
+        );
+
+        assert!(matches!(result, Err(VisionBuildStop::Cancelled)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "should_cancel must be checked exactly once, before any other work -- including a \
+             vision weights load"
+        );
+        match vision_state {
+            LazyVision::Pending {
+                model_dir: unchanged,
+                ..
+            } => assert_eq!(
+                unchanged, model_dir,
+                "state must be untouched -- get_or_load must never have run"
+            ),
+            LazyVision::Loaded(_) => panic!("get_or_load must never have run, but state is Loaded"),
+            LazyVision::Unsupported => panic!("state must remain Pending, not Unsupported"),
+        }
+    }
+
+    /// Companion to the cancellation test above: an otherwise-cancellable-free request whose
+    /// image bytes are invalid must be rejected by preprocessing (`invalid_image`) before ever
+    /// reaching `get_or_load` -- proven by the returned error `code`, since `model_dir` has no
+    /// manifest and a load attempt against it fails with `vision_load_failed`, a different code
+    /// that would surface instead if `get_or_load` ran first.
+    #[test]
+    fn build_vision_request_invalid_image_never_triggers_vision_load() {
+        let model_dir = tempfile::tempdir().expect("tempdir").path().to_path_buf();
+        let mut vision_state = LazyVision::Pending {
+            model_dir: model_dir.clone(),
+            vision_cfg: tiny_vision_cfg(),
+        };
+        let cfg = vision_test_qwen35_config();
+        let tokenizer = minimal_tokenizer();
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: "hi".to_string(),
+            image: Some(ChatImage {
+                bytes: vec![],
+                text_after: String::new(),
+            }),
+        }];
+
+        let result = build_vision_request(
+            &mut vision_state,
+            &cfg,
+            &tokenizer,
+            &messages,
+            0,
+            b"not an image",
+            &mut || false,
+            &|_| Ok(()),
+        );
+
+        match result {
+            Err(VisionBuildStop::Failure(WorkerFailure::Rejected(ApiError::BadRequest {
+                code,
+                ..
+            }))) => {
+                assert_eq!(
+                    code, "invalid_image",
+                    "bad image bytes must be rejected by preprocessing, not surface as a \
+                     vision_load_failed error from a premature get_or_load call"
+                );
+            }
+            other => panic!("expected an invalid_image BadRequest, got {other:?}"),
+        }
+        assert!(
+            matches!(vision_state, LazyVision::Pending { .. }),
+            "an image rejected by preprocessing must never trigger a vision weights load"
+        );
     }
 
     /// Builds a `WorkerJob` plus the receiver its worker replies on and the
@@ -1268,7 +2119,7 @@ mod tests {
     #[test]
     fn max_pending_zero_is_rejected_before_semaphore_new() {
         let result = MetalWorker::spawn(
-            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> {
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata, LazyVision), String> {
                 panic!("loader must not run: max_pending=0 must be rejected first")
             },
             0,
@@ -1283,7 +2134,7 @@ mod tests {
     fn max_pending_above_max_permits_is_rejected_before_semaphore_new() {
         let too_big = Semaphore::MAX_PERMITS + 1;
         let result = MetalWorker::spawn(
-            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String> {
+            || -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata, LazyVision), String> {
                 panic!("loader must not run: max_pending above MAX_PERMITS must be rejected first")
             },
             too_big,
@@ -1665,5 +2516,129 @@ mod tests {
         drop(rx1);
         drop(client);
         handle.join().expect("worker thread must not panic");
+    }
+
+    // ── Issue 7 (PR #1021 review round 6): LazyVision lazy-load contract ──
+
+    /// Resolves a real Qwen3.5-0.8B checkpoint directory the same way
+    /// `vision_serve_e2e_test.rs` does (`LATTICE_VISION_S3_MODEL_DIR`, falling back to the
+    /// default model cache path), so these tests run out of the box on a machine that
+    /// already has the checkpoint and skip loudly otherwise.
+    fn real_vision_checkpoint_dir() -> Option<std::path::PathBuf> {
+        if let Ok(value) = std::env::var("LATTICE_VISION_S3_MODEL_DIR") {
+            let path = std::path::PathBuf::from(value);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        let home = std::env::var("HOME").ok()?;
+        let default = std::path::PathBuf::from(home)
+            .join(".lattice")
+            .join("models")
+            .join("qwen3.5-0.8b");
+        default.exists().then_some(default)
+    }
+
+    #[test]
+    fn lazy_vision_loads_on_first_image_request_then_never_touches_disk_again() {
+        let Some(real_dir) = real_vision_checkpoint_dir() else {
+            eprintln!(
+                "LAZY_VISION_TEST_SKIPPED reason=no_checkpoint -- set \
+                 LATTICE_VISION_S3_MODEL_DIR or place the checkpoint at \
+                 ~/.lattice/models/qwen3.5-0.8b"
+            );
+            return;
+        };
+        let cfg = crate::model::qwen35_config::Qwen35Config::from_model_dir(&real_dir)
+            .expect("real checkpoint's config.json must parse");
+        let vision_cfg = cfg
+            .vision_config
+            .clone()
+            .expect("real checkpoint carries vision_config");
+
+        // Symlink (not copy -- the shard is ~1.6 GiB) the files `load_qwen35_vision_weights`
+        // actually reads into an isolated tempdir, so this test can sever access to the
+        // weight shard afterward without touching the real checkpoint on disk -- the probe
+        // for "second call performs no disk read" is that a re-read would now fail.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        for name in ["config.json", "model.safetensors.index.json"] {
+            std::os::unix::fs::symlink(real_dir.join(name), tempdir.path().join(name))
+                .unwrap_or_else(|e| panic!("symlink {name}: {e}"));
+        }
+        let shard_name = "model.safetensors-00001-of-00001.safetensors";
+        let shard_link = tempdir.path().join(shard_name);
+        std::os::unix::fs::symlink(real_dir.join(shard_name), &shard_link)
+            .unwrap_or_else(|e| panic!("symlink {shard_name}: {e}"));
+
+        let mut state = LazyVision::Pending {
+            model_dir: tempdir.path().to_path_buf(),
+            vision_cfg,
+        };
+
+        let first = state
+            .get_or_load()
+            .expect("first image request must successfully load vision weights");
+        assert!(first.is_some(), "loaded weights must be Some on success");
+        assert!(
+            matches!(state, LazyVision::Loaded(_)),
+            "state must transition to Loaded after the first successful load"
+        );
+
+        // Sever disk access to the weight shard: if a second call re-read from disk, it would
+        // now fail (ModelNotFound/MissingTensor). It must not -- the weights stay resident.
+        std::fs::remove_file(&shard_link).expect("remove symlink (not the real file)");
+
+        let second = state
+            .get_or_load()
+            .expect("second call must reuse the already-loaded weights, not re-read from disk");
+        assert!(second.is_some());
+    }
+
+    #[test]
+    fn lazy_vision_unsupported_never_attempts_a_load() {
+        let mut state = LazyVision::Unsupported;
+        let result = state
+            .get_or_load()
+            .expect("Unsupported must not error -- it just means no vision weights exist");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lazy_vision_pending_load_failure_leaves_state_pending_for_retry() {
+        let Some(real_dir) = real_vision_checkpoint_dir() else {
+            eprintln!("LAZY_VISION_TEST_SKIPPED reason=no_checkpoint");
+            return;
+        };
+        let cfg = crate::model::qwen35_config::Qwen35Config::from_model_dir(&real_dir)
+            .expect("real checkpoint's config.json must parse");
+        let vision_cfg = cfg
+            .vision_config
+            .clone()
+            .expect("real checkpoint carries vision_config");
+
+        // A directory with no manifest at all -- every load attempt fails, proving a failed
+        // load leaves `state` retryable rather than permanently wedged (issue 7 ruling:
+        // "subsequent image requests may retry the load").
+        let empty_dir = tempfile::tempdir().expect("tempdir");
+        let mut state = LazyVision::Pending {
+            model_dir: empty_dir.path().to_path_buf(),
+            vision_cfg,
+        };
+
+        let first_err = state
+            .get_or_load()
+            .expect_err("no manifest present in an empty dir -- must fail");
+        assert!(
+            matches!(state, LazyVision::Pending { .. }),
+            "a failed load must leave state Pending so the next image request retries"
+        );
+
+        let second_err = state
+            .get_or_load()
+            .expect_err("retry must also attempt the load and fail the same way");
+        assert_eq!(
+            first_err, second_err,
+            "both attempts hit the same missing-manifest condition"
+        );
     }
 }

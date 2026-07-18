@@ -121,10 +121,19 @@ impl VisionModelConfig {
                 "invalid vision_config: num_position_embeddings must be > 0".to_string(),
             ));
         }
-        if self.in_channels == 0 {
-            return Err(InferenceError::Inference(
-                "invalid vision_config: in_channels must be > 0".to_string(),
-            ));
+        // The preprocessor (`vision::qwen35_vit::preprocess_qwen35_image`) is RGB-only by
+        // construction -- it decodes every image to a fixed 3-channel `RgbImage` and then
+        // indexes `pixel[c]` for `c in 0..in_channels`. A shape-consistent checkpoint
+        // declaring `in_channels >= 4` would otherwise pass this validation and panic the
+        // sole Metal worker on the first ordinary image request (`pixel[3]` is out of bounds
+        // for a 3-element `Rgb<u8>`). Fail closed here instead of silently truncating or
+        // padding channels (PR #1021 review round 6, issue 8).
+        if self.in_channels != 3 {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: in_channels must be 3 (RGB); got {} -- the image \
+                 preprocessor is RGB-only and cannot serve any other channel count",
+                self.in_channels
+            )));
         }
         if !self.hidden_size.is_multiple_of(self.num_heads) {
             return Err(InferenceError::Inference(format!(
@@ -1952,6 +1961,59 @@ mod tests {
         assert!(
             err.to_string().contains("num_heads"),
             "error must name num_heads: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_in_channels_four() {
+        // PR #1021 review round 6, issue 8: a shape-consistent checkpoint declaring
+        // in_channels=4 must be rejected here, at config validation -- not left to panic
+        // the sole Metal worker on the first ordinary image request (the preprocessor
+        // decodes to a fixed 3-channel RgbImage and indexes pixel[3] out of bounds).
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 12,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 4
+            }"#,
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("in_channels: 4 vision_config must be rejected at parse time");
+        assert!(
+            err.to_string().contains("in_channels"),
+            "error must name in_channels: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_in_channels_three() {
+        // Sibling positive case: the only supported channel count must still parse cleanly.
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 12,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }"#,
+        );
+        let cfg = Qwen35Config::from_config_json_str(&json)
+            .expect("in_channels: 3 vision_config must parse");
+        assert_eq!(
+            cfg.vision_config
+                .expect("vision_config present")
+                .in_channels,
+            3
         );
     }
 
