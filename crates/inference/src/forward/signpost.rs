@@ -318,7 +318,7 @@ mod imp {
     mod tests {
         use super::*;
 
-        // Regression for finding 4 (round-4 review): the two documented
+        // The two documented
         // capture paths need opposite `os_signpost_enabled` defaults, and
         // both are observable in-process with no Instruments/xctrace tool
         // attached — no external tooling needed to guard this. Constructs
@@ -470,7 +470,8 @@ mod tests {
     // "always" opts into the ordinary category the xctrace CLI path needs.
     // Deliberately does not touch `std::env` — see the in-process
     // `os_signpost_enabled` regression tests in `imp::tests` (macOS +
-    // `signpost` feature only) for the category-behavior half of finding 4.
+    // `signpost` feature only) for the category-behavior half of this
+    // guard.
     #[test]
     fn signpost_mode_from_env_value() {
         assert_eq!(SignpostMode::from_env_value(None), SignpostMode::Auto);
@@ -496,9 +497,8 @@ mod tests {
     // Mutation-sensitive: the mode -> category string mapping `decode_log()`
     // relies on. Also platform/feature independent (`category()` compiles
     // under every combination; only its callers are macOS+signpost-gated).
-    // Breaking this mapping (e.g. always returning "DynamicTracing") is
-    // exactly the round-4 finding-4 regression -- see fix-round-4 report
-    // for the mutation run.
+    // Breaking this mapping (e.g. always returning "DynamicTracing") makes
+    // this test fail.
     #[test]
     fn signpost_mode_category_mapping() {
         assert_eq!(SignpostMode::Auto.category(), "DynamicTracing");
@@ -543,11 +543,11 @@ mod tests {
 
     // Mutation-sensitive: pairing regression for `Label::DecodeSample`, the
     // exact label `sample_decode_traced` in `metal_qwen35.rs` opens --
-    // finding 1's round-4 fix made that one call site the *only* place any
+    // that call site is the *only* place any
     // of the five decode loops open a `decode.sample` interval (previously
     // five independent copies, two of which had already drifted with no
-    // interval at all). See fix-round-4 report for the mutation run
-    // breaking `RecordingInterval::begin` and observing this test fail.
+    // interval at all). This test fails if `RecordingInterval::begin`
+    // stops emitting the paired begin/end events.
     #[test]
     fn decode_sample_label_records_begin_end_pair() {
         super::recorder::clear();
@@ -569,7 +569,7 @@ mod tests {
     // record zero events; `Scope::Decode` must record the full begin/end
     // pair. Reverting the discriminator (emitting unconditionally, as the
     // shared helper did before this fix) makes the `NotDecode` assertion
-    // fail — see fix-round-3 report for the mutation run.
+    // fail.
     #[test]
     fn scope_discriminator_silences_non_decode_and_records_decode() {
         super::recorder::clear();

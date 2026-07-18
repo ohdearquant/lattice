@@ -235,8 +235,8 @@ mod imp {
             message: String,
             code: &'static str,
         },
-        /// A server-side malfunction discovered during admission (round-1
-        /// review medium finding 4a: e.g. the grammar cache's own lock/slot
+        /// A server-side malfunction discovered during admission (e.g. the
+        /// grammar cache's own lock/slot
         /// invariants broke) -- never the caller's fault, so it must not be
         /// reported as the 400 every other `RequestError` is.
         ServerError {
@@ -3792,10 +3792,10 @@ mod imp {
             assert_eq!(value["choices"][0]["message"]["content"], r#"{"ok":true}"#);
         }
 
-        /// Sign-off Q4: a `WorkerEvent::ConstraintBlocked` event must surface
+        /// A `WorkerEvent::ConstraintBlocked` event must surface
         /// as HTTP 500 with the `blocked_constraint` machine code for a
-        /// structured request, never a 200 with partial/absent JSON. Round-1
-        /// review medium finding 2: replies via the raw `WorkerJob::reply`
+        /// structured request, never a 200 with partial/absent JSON. Replies
+        /// via the raw `WorkerJob::reply`
         /// seam (not `spawn_fake`'s `Result<_, String>` closure, which can
         /// only ever produce a generic `WorkerEvent::Failed`) so this test
         /// exercises the real production classification -- a distinct
@@ -4127,9 +4127,9 @@ mod imp {
             }
         }
 
-        /// Round-2 review medium finding 1: the `catch_unwind` single-flight
-        /// recovery path (`get_or_compile`'s `Action::Compile` arm) had no
-        /// test exercising an actual owner-closure panic. `compile` is an
+        /// Exercises the `catch_unwind` single-flight
+        /// recovery path (`get_or_compile`'s `Action::Compile` arm) against
+        /// an actual owner-closure panic. `compile` is an
         /// injectable `FnOnce` argument to `get_or_compile` already -- no
         /// extra test-only seam is needed, since single-flight semantics
         /// mean only the one thread that wins `Action::Compile` ever
@@ -4431,10 +4431,8 @@ mod imp {
         /// key on its own. If `enum` is removed from
         /// `V0_REJECTED_KEYWORDS`, this schema still gets rejected -- by the
         /// allowlist layer instead -- but with a DIFFERENT message, so this
-        /// test (unlike a bare `.is_err()` check) fails as intended. See
-        /// the stage-1 report's mutation transcript for the revert/restore
-        /// procedure this test guards, and this session's report for the
-        /// re-run transcript.
+        /// test (unlike a bare `.is_err()` check) fails if the denylist
+        /// layer's rejection of `enum` regresses.
         #[test]
         fn admit_v0_schema_mutation_sensitive_to_enum_admission() {
             let schema = serde_json::json!({"type": "string", "enum": ["a", "b"]});
@@ -4540,7 +4538,7 @@ mod imp {
             assert!(!v0_validate_json("18446744073709551616", &schema));
         }
 
-        /// End-to-end shape from the review's suggested test: a large
+        /// End-to-end shape: a large
         /// integer nested inside an admitted object schema.
         #[test]
         fn v0_validate_json_accepts_large_integer_nested_in_object() {
@@ -4553,7 +4551,7 @@ mod imp {
             assert!(v0_validate_json(r#"{"n": 18446744073709551616}"#, &schema));
         }
 
-        /// Round-2 review major finding 1: a valid UTF-16 surrogate pair
+        /// A valid UTF-16 surrogate pair
         /// (the G-clef character, U+1D11E) spelled as its two `\uXXXX`
         /// escape halves must validate under a string schema -- it is a
         /// grammar-conforming strict completion, and rejecting it turned
@@ -4592,7 +4590,7 @@ mod imp {
             assert!(v0_validate_json(r#""\uDD1E""#, &schema));
         }
 
-        /// Round-2 review major finding 1, second half: RFC 8259 §7
+        /// RFC 8259 §7
         /// requires U+0000-U+001F to be escaped, and the compiled grammar
         /// rejects them raw too (json_schema.rs
         /// `string_rejects_raw_control_byte`). A literal BEL (0x07) byte
@@ -4920,7 +4918,7 @@ mod imp {
             );
         }
 
-        /// Reviewer finding (b): a mid-stream `WorkerEvent::Failed` (or
+        /// A mid-stream `WorkerEvent::Failed` (or
         /// `Rejected`/worker-gone) emits a client-facing SSE error event
         /// (asserted above) but, before this fix, the terminal `Phase::End`
         /// still recorded the request in `/metrics` as a plain 200 with no
@@ -5012,8 +5010,8 @@ mod imp {
         /// discovering `WorkerEvent::Rejected` only inside `Phase::Body`)
         /// makes this fail -- the response status would be 200 with an SSE body
         /// carrying a `finish_reason: "length"` terminal chunk instead of a
-        /// 400 error envelope. Verified by reverting the preflight and
-        /// re-running: see the PR body's mutation log.
+        /// 400 error envelope, so this test fails if the preflight
+        /// regresses.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse() {

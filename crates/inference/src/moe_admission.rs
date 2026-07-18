@@ -1111,9 +1111,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // BLOCKER regression (review round 1, finding 1): ArcPolicy must not
-    // evict an id resolved earlier in the SAME token. Replays the exact
-    // three-token scenario from the review verdict.
+    // ArcPolicy must not evict an id resolved earlier in the SAME token.
+    // Replays the exact three-token scenario that regressed this invariant.
     // -----------------------------------------------------------------
 
     #[test]
@@ -1413,8 +1412,7 @@ mod tests {
 
     #[test]
     fn run_simulation_rejects_zero_num_slots_and_top_k_together() {
-        // The exact failure scenario from the review verdict: a one-record
-        // trace with `selected_ids: []` and `--num-slots 0 --top-k 0`.
+        // A one-record trace with `selected_ids: []` and `--num-slots 0 --top-k 0`.
         let layers = vec![(0usize, vec![record(0, 0, &[])])];
         let cfg = SimConfig {
             num_slots: 0,

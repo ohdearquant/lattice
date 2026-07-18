@@ -723,8 +723,8 @@ impl Qwen35Config {
                  positive multiple of linear_num_key_heads ({key_heads})"
             )));
         }
-        // A present `vision_config` must be structurally valid (ADR-069 S1/S2 review
-        // feedback): a present-but-malformed object (e.g. `depth: 0`) is syntactically
+        // A present `vision_config` must be structurally valid (ADR-069):
+        // a present-but-malformed object (e.g. `depth: 0`) is syntactically
         // valid JSON and would otherwise silently load a truncated subset of
         // `model.visual.*` tensors instead of failing closed.
         if let Some(vision_cfg) = &cfg.vision_config {

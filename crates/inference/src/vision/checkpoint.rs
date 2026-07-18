@@ -483,8 +483,7 @@ mod tests {
     fn q4_full_inventory_with_depth_zero_is_rejected() {
         // A checkpoint that genuinely carries the full 153-tensor real inventory, paired
         // with a (malformed) vision_config claiming depth: 0, must error rather than
-        // silently returning a nine-tensor `Qwen35VisionWeights` (the S1/S2 review's
-        // exact failure scenario).
+        // silently returning a nine-tensor `Qwen35VisionWeights`.
         let tmp = tempfile::tempdir().unwrap();
         let full_cfg = real_vision_cfg();
         let entries: Vec<String> = tensor_names(&full_cfg)

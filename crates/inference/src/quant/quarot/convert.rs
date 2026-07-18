@@ -1604,7 +1604,7 @@ mod tests {
     // Path-layout refuses
     // ------------------------------------------------------------------
 
-    /// Major 1: when input and output paths resolve to the same canonical
+    /// When input and output paths resolve to the same canonical
     /// path, the converter must refuse before any write would corrupt
     /// the source `config.json`.
     #[test]
@@ -1631,7 +1631,7 @@ mod tests {
         );
     }
 
-    /// Major 1 sibling: even when the two paths differ literally (e.g.,
+    /// Sibling case: even when the two paths differ literally (e.g.,
     /// trailing slash, symlink), canonicalization must still catch the
     /// equivalence.
     #[test]
@@ -1648,7 +1648,7 @@ mod tests {
         assert!(msg.contains("same path"), "unexpected error: {msg}");
     }
 
-    /// Major 2: a pre-existing non-empty output directory must trigger
+    /// A pre-existing non-empty output directory must trigger
     /// refusal before any conversion work, so a previously-written `.q4`
     /// artifact cannot survive a gate failure and be picked up by the
     /// runtime loader.

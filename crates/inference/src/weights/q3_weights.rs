@@ -637,8 +637,7 @@ pub fn read_q3_header(
 /// or if `file_len` is smaller than `payload_offset + n_blocks * 16`.
 ///
 /// Only called from `mmap_q3_weight` (crates/inference/src/forward/metal_qwen35.rs)
-/// today, which live checkpoint loading does not yet reach — see
-/// w3_stage2_report.md "what shipped" for the scope decision.
+/// today, which live checkpoint loading does not yet reach.
 #[allow(dead_code)]
 pub(crate) fn validate_q3_header_payload_bounds(
     header: &Q3FileHeader,
@@ -1086,8 +1085,7 @@ mod tests {
     fn mlp_role_rejects_near_miss_suffixes() {
         // Exact-suffix contract: `.contains()` on the role substring would
         // wrongly accept these — a LoRA adapter branch, a renamed sibling
-        // tensor, and a trailing extra suffix after `.weight`. Table-driven
-        // per the round-1 review (codex_1014_r1_verdict.md finding 1).
+        // tensor, and a trailing extra suffix after `.weight`.
         for name in [
             "model.layers.3.mlp.gate_proj.lora_A.weight",
             "model.layers.3.mlp.up_proj_backup.weight",
