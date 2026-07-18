@@ -34,6 +34,7 @@
     "smoke": "node smoke.mjs",
     "packlist": "npm pack --dry-run --json | node scripts/assert-packlist.mjs",
     "packlist:darwin-arm64": "cd npm/darwin-arm64 && npm pack --dry-run --json | node ../../scripts/assert-platform-packlist.mjs",
+    "test:prebuild": "node scripts/assert-prebuild-matrix.mjs",
     "prepublishOnly": "npm run artifacts && npm test"
   },
   "napi": {

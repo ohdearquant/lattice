@@ -1,0 +1,256 @@
+name: npm-prebuild
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/embed/**'
+      - 'crates/inference/**'
+      - 'npm/lattice-embed-native/**'
+      - 'npm/lattice-embed-wasm/**'
+      - 'scripts/publish-npm.sh'
+      - 'Makefile'
+      - '.github/workflows/npm-prebuild.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/embed/**'
+      - 'crates/inference/**'
+      - 'npm/lattice-embed-native/**'
+      - 'npm/lattice-embed-wasm/**'
+      - 'scripts/publish-npm.sh'
+      - 'Makefile'
+      - '.github/workflows/npm-prebuild.yml'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish all npm embedding packages after the full preflight'
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: npm-prebuild-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            args: ''
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            args: ''
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            args: '--use-napi-cross'
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            args: '--use-napi-cross'
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            args: '-x'
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            args: '-x'
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: npm-prebuild-${{ matrix.target }}
+          workspaces: npm/lattice-embed-native -> target
+
+      - uses: mlugg/setup-zig@v2
+        if: contains(matrix.target, 'musl')
+        with:
+          version: 0.15.2
+
+      - uses: taiki-e/install-action@v2
+        if: contains(matrix.target, 'musl')
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tool: cargo-zigbuild
+
+      - name: Install napi build dependencies
+        working-directory: npm/lattice-embed-native
+        run: npm install --ignore-scripts
+
+      - name: Build native binding
+        working-directory: npm/lattice-embed-native
+        shell: bash
+        run: npm run build -- --target ${{ matrix.target }} ${{ matrix.args }}
+
+      - name: Upload native binding
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: npm/lattice-embed-native/*.node
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: package prebuilds
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install napi packaging dependencies
+        working-directory: npm/lattice-embed-native
+        run: npm install --ignore-scripts
+
+      - name: Validate the configured matrix
+        working-directory: npm/lattice-embed-native
+        run: npm run test:prebuild
+
+      - name: Create platform packages
+        working-directory: npm/lattice-embed-native
+        run: npm run create-npm-dirs
+
+      - name: Download native bindings
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: npm/lattice-embed-native
+          merge-multiple: true
+
+      - name: Assemble and verify platform packages
+        working-directory: npm/lattice-embed-native
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run artifacts
+          for suffix in \
+            darwin-arm64 \
+            darwin-x64 \
+            linux-x64-gnu \
+            linux-x64-musl \
+            linux-arm64-gnu \
+            linux-arm64-musl \
+            win32-x64-msvc; do
+            binary="npm/$suffix/lattice-embed-native.$suffix.node"
+            if [ ! -f "$binary" ]; then
+              echo "::error::missing prebuilt binary: $binary"
+              exit 1
+            fi
+            (cd "npm/$suffix" && npm publish --dry-run)
+          done
+
+      - name: Upload assembled platform packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-native-prebuilds
+          path: npm/lattice-embed-native/npm/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: npm release preflight
+    needs: package
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NODE_AUTH_TOKEN: unused
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: npm-publish-preflight
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.105
+
+      - name: Install napi packaging dependencies
+        working-directory: npm/lattice-embed-native
+        run: npm install --ignore-scripts
+
+      - name: Validate the configured matrix
+        working-directory: npm/lattice-embed-native
+        run: npm run test:prebuild
+
+      - name: Create platform packages
+        working-directory: npm/lattice-embed-native
+        run: npm run create-npm-dirs
+
+      - name: Download native bindings
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: npm/lattice-embed-native
+          merge-multiple: true
+
+      - name: Cache native test models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.lattice/models/all-minilm-l6-v2
+            ~/.lattice/models/bge-small-en-v1.5
+          key: npm-native-test-models-v1
+
+      - name: Provision native test models
+        run: |
+          cargo run --release -p lattice-embed --bin embed -- \
+            --model all-minilm-l6-v2 --download-only
+          cargo run --release -p lattice-embed --bin embed -- \
+            --model bge-small-en-v1.5 --download-only
+
+      - name: Preflight the npm release
+        if: ${{ !inputs.publish }}
+        run: make publish-npm-dry
+
+      - name: Publish the npm release
+        if: inputs.publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_PROVENANCE: '1'
+        run: make publish-npm
