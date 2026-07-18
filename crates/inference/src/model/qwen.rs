@@ -11,6 +11,7 @@ use crate::forward::metal::MetalForwardPass;
 use crate::pool::{l2_normalize, last_token_pool};
 use crate::rope::RopeTable;
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
+use crate::weights::f32_weights::validate_shard_relative_path;
 use crate::weights::{QwenWeights, SafetensorsFile, ShardedQwenBacking, ShardedSafetensors};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -372,9 +373,17 @@ const WEIGHT_FINGERPRINT_INLINE_CAP: u64 = 2 * 1024 * 1024; // 2 MiB
 /// `model.safetensors.index.json` if present (its `weight_map` values,
 /// deduplicated and lexically sorted so the fingerprint is stable regardless
 /// of key iteration order), else no weight files (config-only derivation).
-fn resolve_weight_fingerprint_files(dir: &Path) -> Vec<String> {
+///
+/// Every `weight_map` value is untrusted checkpoint content, so each one is
+/// validated with [`validate_shard_relative_path`] before it is returned —
+/// this must happen before any caller joins the name onto `dir` and opens
+/// it. An escaping entry (absolute or containing `..`) fails the whole
+/// derivation closed rather than returning the other, valid entries: the
+/// caller must not open *any* weight file for a checkpoint whose index is
+/// malformed.
+fn resolve_weight_fingerprint_files(dir: &Path) -> Result<Vec<String>, InferenceError> {
     if dir.join("model.safetensors").is_file() {
-        return vec!["model.safetensors".to_string()];
+        return Ok(vec!["model.safetensors".to_string()]);
     }
     let index_path = dir.join("model.safetensors.index.json");
     if let Ok(index_bytes) = std::fs::read(&index_path)
@@ -385,11 +394,14 @@ fn resolve_weight_fingerprint_files(dir: &Path) -> Vec<String> {
             .values()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
+        for file in &files {
+            validate_shard_relative_path(file)?;
+        }
         if !files.is_empty() {
-            return files.into_iter().collect();
+            return Ok(files.into_iter().collect());
         }
     }
-    Vec::new()
+    Ok(Vec::new())
 }
 
 /// Fold one weight shard's filename, byte length, and boundary-sampled
@@ -453,14 +465,19 @@ fn fold_weight_file_into_hasher(
 /// Returns `None` only when `config.json` itself is missing or unreadable
 /// (mirroring `derive_cache_compat_rev`), in which case the caller leaves
 /// `base_model_rev` at its existing sentinel. A read failure partway
-/// through a weight file degrades gracefully to the config-only derivation
+/// through a weight file, or a `weight_map` entry that fails shard-path
+/// validation, degrades gracefully to the config-only derivation
 /// (`derive_cache_compat_rev`) rather than failing `ModelInferenceConfig`
-/// construction.
+/// construction — in the validation-failure case this also means no weight
+/// file is ever opened, since `resolve_weight_fingerprint_files` rejects the
+/// whole file list before any of it reaches `fold_weight_file_into_hasher`.
 fn derive_base_model_rev(dir: &Path) -> Option<String> {
     let config_path = dir.join("config.json");
     let config_bytes = std::fs::read(&config_path).ok()?;
 
-    let weight_files = resolve_weight_fingerprint_files(dir);
+    let Ok(weight_files) = resolve_weight_fingerprint_files(dir) else {
+        return derive_cache_compat_rev(&config_path);
+    };
 
     let mut hasher = Sha256::new();
     hasher.update(&config_bytes);
@@ -2808,6 +2825,70 @@ mod tests {
             "flipping a byte in the second (non-first-mentioned) shard must change the rev"
         );
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_rejects_parent_traversal_weight_map_entry() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_traversal");
+        let outside_dir =
+            std::env::temp_dir().join("lattice_test_derive_base_rev_traversal_outside");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+
+        let outside_file = outside_dir.join("secret.safetensors");
+        write_pattern_bytes(&outside_file, 4096);
+
+        // Without shard-path validation ahead of the fold, this would open
+        // and hash `outside_file` via a `../` join instead of failing closed.
+        let index_json = format!(
+            r#"{{"weight_map": {{"a.weight": "../{}/secret.safetensors"}}}}"#,
+            outside_dir.file_name().unwrap().to_string_lossy()
+        );
+        std::fs::write(tmp.join("model.safetensors.index.json"), &index_json).unwrap();
+
+        let rev = derive_base_model_rev(&tmp);
+        let config_only = derive_cache_compat_rev(&tmp.join("config.json"));
+        assert_eq!(
+            rev, config_only,
+            "an escaping weight_map entry must fail closed to the config-only revision, \
+             not open a file outside the model directory"
+        );
+
+        std::fs::remove_dir_all(&outside_dir).ok();
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn derive_base_model_rev_rejects_absolute_weight_map_entry() {
+        let tmp = std::env::temp_dir().join("lattice_test_derive_base_rev_absolute");
+        let outside_dir =
+            std::env::temp_dir().join("lattice_test_derive_base_rev_absolute_outside");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(tmp.join("config.json"), b"{\"hidden_size\":1024}").unwrap();
+
+        let outside_file = outside_dir.join("secret.safetensors");
+        write_pattern_bytes(&outside_file, 4096);
+
+        let abs = outside_file.to_string_lossy().replace('\\', "\\\\");
+        let index_json = format!(r#"{{"weight_map": {{"a.weight": "{abs}"}}}}"#);
+        std::fs::write(tmp.join("model.safetensors.index.json"), &index_json).unwrap();
+
+        let rev = derive_base_model_rev(&tmp);
+        let config_only = derive_cache_compat_rev(&tmp.join("config.json"));
+        assert_eq!(
+            rev, config_only,
+            "an absolute weight_map entry must fail closed to the config-only revision, \
+             not open a file outside the model directory"
+        );
+
+        std::fs::remove_dir_all(&outside_dir).ok();
         std::fs::remove_dir_all(&tmp).ok();
     }
 

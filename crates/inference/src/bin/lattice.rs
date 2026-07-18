@@ -542,7 +542,13 @@ mod doctor {
             }
             let mut merged = HashMap::new();
             for shard_name in shard_names {
-                let shard_path = dir.join(&shard_name);
+                let shard_path = lattice_inference::weights::resolve_shard_path(dir, &shard_name)
+                    .map_err(|e| {
+                    format!(
+                        "shard '{shard_name}' referenced by {} is invalid: {e}",
+                        index_path.display()
+                    )
+                })?;
                 if !shard_path.exists() {
                     return Err(format!(
                         "shard '{shard_name}' referenced by {} not found in {}",

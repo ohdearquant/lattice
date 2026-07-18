@@ -1143,6 +1143,21 @@ pub fn resolve_shard(
     Ok(PathBuf::from(shard_file))
 }
 
+/// Validate an index-derived shard filename and join it onto `root`.
+///
+/// This is the crate-public entry point for the containment policy
+/// enforced by [`validate_shard_relative_path`], for callers outside
+/// `lattice-inference` (e.g. `lattice-embed`) that need to resolve a
+/// `weight_map` value onto a model directory. Every caller that joins a
+/// `weight_map`/shard-index-derived filename onto a directory — in this
+/// crate or a downstream one — must go through this function (or
+/// `validate_shard_relative_path` directly, in-crate) before the join, not
+/// after.
+pub fn resolve_shard_path(root: &Path, shard_file: &str) -> Result<PathBuf, InferenceError> {
+    validate_shard_relative_path(shard_file)?;
+    Ok(root.join(shard_file))
+}
+
 /// Eagerly load all tensors from a sharded checkpoint into an owned map.
 ///
 /// Groups tensor names by shard file to open each shard file exactly once.

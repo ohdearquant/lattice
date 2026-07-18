@@ -24,8 +24,8 @@ use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_inference::vision::checkpoint::{Qwen35VisionWeights, load_qwen35_vision_weights};
 use lattice_inference::vision::embed_image_from_bytes_f16;
-use lattice_inference::weights::SafetensorsFile;
 use lattice_inference::weights::f16_weights::{F16ModelWeights, load_f16_weights};
+use lattice_inference::weights::{SafetensorsFile, resolve_shard_path};
 use std::path::Path;
 
 pub use lattice_inference::forward::cpu_f16::PoolingStrategy;
@@ -202,7 +202,12 @@ fn resolve_single_shard(model_dir: &Path) -> Result<std::path::PathBuf> {
     shards.sort_unstable();
     shards.dedup();
     match shards.as_slice() {
-        [one] => Ok(model_dir.join(one)),
+        [one] => resolve_shard_path(model_dir, one).map_err(|e| {
+            EmbedError::ModelInitialization(format!(
+                "invalid shard filename in {}: {e}",
+                model_dir.join("model.safetensors.index.json").display()
+            ))
+        }),
         [] => Err(EmbedError::ModelInitialization(format!(
             "empty weight_map in {}",
             model_dir.join("model.safetensors.index.json").display()
@@ -619,6 +624,52 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let err = resolve_single_shard(tmp.path()).expect_err("missing manifest must be rejected");
         assert!(matches!(err, EmbedError::ModelInitialization(_)));
+    }
+
+    #[test]
+    fn resolve_single_shard_rejects_parent_traversal_shard_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index_path = tmp.path().join("model.safetensors.index.json");
+        // A mixed quantized/FP16 manifest can name an escaping FP16 shard;
+        // without the shared containment helper this join would resolve
+        // outside `tmp` instead of erroring.
+        std::fs::write(
+            &index_path,
+            r#"{"metadata":{},"weight_map":{"a":"../outside/decoder.safetensors"}}"#,
+        )
+        .expect("write index");
+
+        let err = resolve_single_shard(tmp.path())
+            .expect_err("a shard name with a parent-directory component must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("parent-directory"),
+            "expected the shared containment error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_single_shard_rejects_absolute_shard_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside_file = outside.path().join("decoder.safetensors");
+        std::fs::write(&outside_file, b"secret").expect("write outside file");
+
+        let index_path = tmp.path().join("model.safetensors.index.json");
+        let abs = outside_file.to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            &index_path,
+            format!(r#"{{"metadata":{{}},"weight_map":{{"a":"{abs}"}}}}"#),
+        )
+        .expect("write index");
+
+        let err =
+            resolve_single_shard(tmp.path()).expect_err("an absolute shard name must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absolute"),
+            "expected the shared containment error, got: {msg}"
+        );
     }
 
     /// `from_directory`'s documented contract requires an index/quantize
