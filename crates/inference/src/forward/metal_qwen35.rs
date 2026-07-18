@@ -1158,6 +1158,17 @@ mod inner {
     /// `StorageModeShared` buffer.  Stores the mmap owner inside the returned
     /// [`Q4WeightBuf`] so the pages remain valid for the lifetime of the buffer.
     ///
+    /// `validate_q4_file` here only checks header/geometry/exact file extent
+    /// (`O(1)`, no block bytes read) — this is the one Q4 load path with no
+    /// CPU-side pass over block bytes to fold a per-block scale/bias check
+    /// into (packed nibbles stay resident in the no-copy GPU buffer and are
+    /// dequantized by the Metal kernel at dispatch time, not read back to the
+    /// CPU). Adding a dedicated scan here would reintroduce exactly the
+    /// eager full-payload traversal this function is designed to avoid.
+    /// Every other Q4 path (CPU `load_q4_file`, Metal mmap-dequant-to-f16/f32,
+    /// per-expert MoE dequant) still validates scale/bias, folded into the
+    /// single pass each of those already makes over the payload.
+    ///
     /// # Safety invariant
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
     /// modified while the process is running.
@@ -14259,9 +14270,17 @@ mod inner {
             label: &str,
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
-            use crate::weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16, validate_q4_file};
+            use crate::weights::q4_weights::{
+                q4_f16_to_f32, q4_f32_to_f16, validate_q4_block_metadata, validate_q4_file,
+            };
             let mut file = std::fs::File::open(path)
                 .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            // Header/geometry/extent only — no block scan (see
+            // `validate_q4_file`'s doc comment). Per-block scale/bias
+            // metadata is validated below, folded into the dequant loop this
+            // function already runs over the mmap'd payload, instead of a
+            // separate pre-scan that would force every page in before this
+            // mmap is even created.
             let header = validate_q4_file(&mut file, path, Some(expected_shape))
                 .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
             // SAFETY: read-only mmap of a file this process does not mutate
@@ -14276,10 +14295,19 @@ mod inner {
                     mmap.len()
                 )
             })?;
+            let source = path.display().to_string();
+            let tensor_name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("native Q4 tensor");
             let mut f16_data: Vec<u16> = Vec::with_capacity(header.original_len);
-            for chunk in payload.chunks_exact(20) {
-                let scale = q4_f16_to_f32(u16::from_ne_bytes([chunk[0], chunk[1]]));
-                let bias = q4_f16_to_f32(u16::from_ne_bytes([chunk[2], chunk[3]]));
+            for (index, chunk) in payload.chunks_exact(20).enumerate() {
+                let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                let bias_bits = u16::from_ne_bytes([chunk[2], chunk[3]]);
+                validate_q4_block_metadata(&source, tensor_name, index, scale_bits, bias_bits)
+                    .map_err(|e| e.to_string())?;
+                let scale = q4_f16_to_f32(scale_bits);
+                let bias = q4_f16_to_f32(bias_bits);
                 for b in 0..16 {
                     let byte_val = chunk[4 + b];
                     f16_data.push(q4_f32_to_f16((byte_val & 0x0f) as f32 * scale + bias));
@@ -14313,9 +14341,13 @@ mod inner {
             label: &str,
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
-            use crate::weights::q4_weights::{dequantize_row_q4_0, validate_q4_file};
+            use crate::weights::q4_weights::{
+                dequantize_row_q4_0, validate_q4_block_metadata, validate_q4_file,
+            };
             let mut file = std::fs::File::open(path)
                 .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            // Header/geometry/extent only — no block scan (see
+            // `validate_q4_file`'s doc comment).
             let header = validate_q4_file(&mut file, path, Some(expected_shape))
                 .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
             // SAFETY: read-only mmap of a file this process does not mutate
@@ -14330,6 +14362,22 @@ mod inner {
                     mmap.len()
                 )
             })?;
+            // Only the two small CPU-read MoE scalar gates route through this
+            // f32 path (router gate, shared-expert gate — see doc comment
+            // above); `dequantize_row_q4_0` is shared with non-ingress call
+            // sites and cannot itself validate, so scale/bias metadata is
+            // checked here against the same already-mapped bytes it dequantizes.
+            let source = path.display().to_string();
+            let tensor_name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("native Q4 tensor");
+            for (index, chunk) in payload.chunks_exact(20).enumerate() {
+                let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                let bias_bits = u16::from_ne_bytes([chunk[2], chunk[3]]);
+                validate_q4_block_metadata(&source, tensor_name, index, scale_bits, bias_bits)
+                    .map_err(|e| e.to_string())?;
+            }
             let values = dequantize_row_q4_0(payload, header.original_len);
             Ok(make_buffer(device, &values, label))
         }

@@ -314,7 +314,7 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                     tensor.source, tensor.tensor_name, tensor.shape,
                 )));
             }
-            let expected_blocks = original_len.div_ceil(32);
+            let expected_blocks = original_len.div_ceil(super::q4_weights::Q4_BLOCK_WEIGHTS);
             if block_count != expected_blocks {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "{}: tensor {} (Q4) block count {block_count} does not match original_len \
