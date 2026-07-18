@@ -176,6 +176,64 @@ pub(crate) const MAX_HIDDEN_SIZE: usize = 1_048_576;
 /// leaving 512x headroom above that for future architectures.
 pub(crate) const MAX_LINEAR_NUM_KEY_HEADS: usize = 8_192;
 
+/// Upper bound on the *resolved* `linear_num_value_heads()` accepted from `config.json`.
+///
+/// Unlike `linear_num_key_heads`, `linear_num_value_heads` is a factor of two existing
+/// product budgets ([`MAX_LINEAR_OUTPUT_DIM`] bounds `value_heads * linear_value_head_dim`;
+/// [`MAX_GDN_STATE_SIZE`] bounds `value_heads * linear_key_head_dim * linear_value_head_dim`)
+/// -- but both are products, and with the *other* factor pinned at 1 (a value real
+/// checkpoints never carry, but a parseable config can), `value_heads` alone can reach
+/// 1,048,576 while still passing both checks. `new_session_inner`
+/// (`forward/metal_qwen35.rs`) uses `linear_num_value_heads()` directly as a free
+/// multiplier in its GatedDeltaNet chunk-scratch geometry (`chunk_rows = num_chunks *
+/// num_vh * GDN_CHUNK_SIZE`), independent of those two products, so this is the only
+/// remaining guard bounding that multiplier on its own. Real Qwen3.5/3.6 GDN configs use
+/// `linear_num_value_heads` up to 48; 8,192 matches [`MAX_LINEAR_NUM_KEY_HEADS`]'s scale
+/// while leaving 170x headroom above that for future architectures. See
+/// [`MAX_GDN_CHUNK_SCRATCH_BYTES`] for the accompanying product budget that this bound
+/// alone does not close (a huge `linear_key_head_dim` / `linear_value_head_dim` with a
+/// small `value_heads` still reaches multi-gigabyte chunk-scratch allocation).
+pub(crate) const MAX_LINEAR_NUM_VALUE_HEADS: usize = 8_192;
+
+/// Mirror of `forward/metal_qwen35.rs`'s `GDN_CHUNK_SIZE` constant (defined at
+/// `metal_qwen35.rs:1426`). `new_session_inner`'s GatedDeltaNet chunk-scratch geometry
+/// tiles the prefill window into chunks of this size; duplicated here (rather than
+/// imported) because `forward/metal_qwen35.rs` is behind the `metal-gpu` feature and
+/// `qwen35_config.rs` must validate on every build, including CPU-only ones. If the
+/// engine's chunk size ever changes, this mirror must change with it -- see the
+/// `test_gdn_chunk_scratch_mirror_matches_engine_constant` regression test.
+const GDN_CHUNK_SIZE_MIRROR: usize = 32;
+
+/// Mirror of `forward/metal_qwen35.rs`'s hardcoded `max_cache_len.min(512)` prefill cap
+/// used in both `new_session_inner` call sites (`metal_qwen35.rs:3682`, `:15676`). The
+/// number of GatedDeltaNet chunks (`num_chunks = bp.div_ceil(GDN_CHUNK_SIZE)`) is bounded
+/// by this literal regardless of `max_position_embeddings`, since `bp` is always
+/// `min(max_cache_len, 512)`. Duplicated here for the same reason as
+/// [`GDN_CHUNK_SIZE_MIRROR`].
+const GDN_MAX_PREFILL_MIRROR: usize = 512;
+
+/// Upper bound, in bytes, on the largest single GatedDeltaNet chunk-scratch buffer
+/// (`new_session_inner`'s `GdnChunkScratch`, `forward/metal_qwen35.rs`) accepted from
+/// `config.json`.
+///
+/// [`MAX_LINEAR_NUM_VALUE_HEADS`] bounds `linear_num_value_heads()` alone, but the
+/// chunk-scratch buffers multiply it by `linear_key_head_dim` or `linear_value_head_dim`
+/// (the `q`/`k`/`w`/`k_right` buffers are `chunk_rows * key_head_dim`; `v`/`u`/`r` are
+/// `chunk_rows * value_head_dim`; `kkt`/`qk_l` are `chunk_rows * GDN_CHUNK_SIZE`) -- a
+/// config with `value_heads` pinned small and either head-dim factor huge still passes
+/// [`MAX_GDN_STATE_SIZE`] (which bounds their three-factor product, so a huge head-dim
+/// with `value_heads = 1` satisfies it trivially) while reaching multi-gigabyte
+/// chunk-scratch allocation. `chunk_rows` itself is bounded independent of
+/// `max_position_embeddings`, since the engine caps the prefill window at
+/// [`GDN_MAX_PREFILL_MIRROR`] (`bp = max_cache_len.min(512)`) before deriving chunk count
+/// -- so this budget only needs `value_heads` and the two head-dim fields, not
+/// `max_position_embeddings`. Real Qwen3.5/3.6 GDN configs peak around `value_heads = 48`,
+/// `key_head_dim = value_head_dim = 128`: `chunk_rows_upper = 16 * 48 * 32 = 24,576`,
+/// worst single buffer `24,576 * 128 = 3,145,728` elements (~12.6 MiB f32). 1 GiB
+/// (1,073,741,824 bytes) leaves roughly 85x headroom above that for future architectures,
+/// matching [`MAX_ROPE_TABLE_BYTES`]'s scale and style.
+pub(crate) const MAX_GDN_CHUNK_SCRATCH_BYTES: usize = 1_073_741_824;
+
 /// Upper bound on `linear_conv_kernel_dim` accepted from `config.json`.
 ///
 /// Previously checked only for zero (guarding the `linear_conv_kernel_dim - 1` unsigned
@@ -430,6 +488,24 @@ impl VisionModelConfig {
                 "invalid vision_config: in_channels ({}) exceeds MAX_VISION_IN_CHANNELS \
                  ({MAX_VISION_IN_CHANNELS})",
                 self.in_channels
+            )));
+        }
+        // `build_pos_embed_and_rope_tables` (`vision/qwen35_vit.rs`) derives
+        // `side = (num_position_embeddings as f64).sqrt().round() as usize` and then indexes
+        // `pos_embed[(ch * side + cw) * hidden .. ]` for `ch, cw` up to `side - 1` -- i.e. it
+        // assumes a `side * side` grid. A non-square `num_position_embeddings` (in-budget per
+        // the `MAX_VISION_NUM_POSITION_EMBEDDINGS` check above, but geometrically invalid) makes
+        // `side * side != num_position_embeddings`: when `side * side` exceeds the true table
+        // length, `row_idx` can index past the `pos_embed` slice's end and panic; this is
+        // dimension (B) (semantic validity), not (A) (allocation) -- the field's own product
+        // budget passes trivially either way.
+        let side = (self.num_position_embeddings as f64).sqrt().round() as usize;
+        if side * side != self.num_position_embeddings {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: num_position_embeddings ({}) must be a perfect square \
+                 (nearest side {side} squares to {})",
+                self.num_position_embeddings,
+                side * side
             )));
         }
         if !self.hidden_size.is_multiple_of(self.num_heads) {
@@ -1287,6 +1363,20 @@ impl Qwen35Config {
                 cfg.linear_conv_kernel_dim
             )));
         }
+        // `RopeTable::new` (`rope.rs`) computes `freq = 1.0 / theta.powf(...)` for every
+        // table entry; `theta <= 0.0` (including `-0.0`) or non-finite drives every `freq`
+        // to `inf`/`NaN`, which propagates through `angle.cos()`/`angle.sin()` into every
+        // cos/sin table entry -- silently corrupting all attention output with no error
+        // signal, since neither is a panic. `linear_output_dim`-style bounds only catch
+        // allocation-hostile values, not correctness-hostile ones; this is dimension (B),
+        // not (A) -- `rope_theta` drives no allocation. Real Qwen3.5/3.6 presets use
+        // `10_000_000.0`.
+        if !(cfg.rope_theta.is_finite() && cfg.rope_theta > 0.0) {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: rope_theta ({}) must be finite and > 0.0",
+                cfg.rope_theta
+            )));
+        }
         // `rope_dim = (head_dim * partial_rotary_factor) as usize` is rotated in place over a
         // `head_dim`-length head slice; a factor > 1.0 makes `rope_dim` exceed `head_dim` and
         // indexes `head_vec[rope_dim / 2 + i]` out of bounds. Require a finite fraction.
@@ -1365,6 +1455,17 @@ impl Qwen35Config {
                  positive multiple of linear_num_key_heads ({key_heads})"
             )));
         }
+        // Sibling of the `linear_num_key_heads` bound above; `value_heads` is only
+        // implicitly bounded by `MAX_LINEAR_OUTPUT_DIM` / `MAX_GDN_STATE_SIZE` (both
+        // product budgets that carry it as a factor alongside a head-dim field that can be
+        // pinned at 1), so it needs its own direct cap the same way `linear_num_key_heads`
+        // does. See `MAX_LINEAR_NUM_VALUE_HEADS` docs.
+        if value_heads > MAX_LINEAR_NUM_VALUE_HEADS {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: linear_num_value_heads ({value_heads}) exceeds \
+                 MAX_LINEAR_NUM_VALUE_HEADS ({MAX_LINEAR_NUM_VALUE_HEADS})"
+            )));
+        }
         // `linear_key_head_dim` / `linear_value_head_dim` size the GatedDeltaNet state matrix
         // (`s_matrices = vec![0.0; value_heads * key_dim * value_dim]` in `attention/gdn.rs`);
         // zero in either dimension is a degenerate zero-width recurrence rather than a valid
@@ -1427,6 +1528,33 @@ impl Qwen35Config {
             return Err(InferenceError::Inference(format!(
                 "invalid Qwen config.json: GatedDeltaNet state size ({gdn_state_size}) exceeds \
                  MAX_GDN_STATE_SIZE ({MAX_GDN_STATE_SIZE})"
+            )));
+        }
+        // `MAX_LINEAR_NUM_VALUE_HEADS` bounds `value_heads` alone, but
+        // `new_session_inner`'s GatedDeltaNet chunk-scratch buffers (`forward/metal_qwen35.rs`)
+        // multiply it by `linear_key_head_dim` / `linear_value_head_dim`, which
+        // `MAX_GDN_STATE_SIZE` only bounds as a three-factor product with `value_heads` --
+        // a config with `value_heads` small and either head-dim field huge satisfies that
+        // product trivially while still reaching a multi-gigabyte chunk-scratch allocation.
+        // Mirror the exact engine formula (`chunk_rows = num_chunks * value_heads *
+        // GDN_CHUNK_SIZE`, capped independent of `max_position_embeddings` because the
+        // engine's prefill window is itself capped at `GDN_MAX_PREFILL_MIRROR`) via `u128`
+        // so the bound computation itself cannot overflow `usize`. See
+        // `MAX_GDN_CHUNK_SCRATCH_BYTES` docs.
+        let num_chunks_upper =
+            (GDN_MAX_PREFILL_MIRROR as u128).div_ceil(GDN_CHUNK_SIZE_MIRROR as u128);
+        let chunk_rows_upper =
+            num_chunks_upper * value_heads as u128 * GDN_CHUNK_SIZE_MIRROR as u128;
+        let max_head_dim = cfg.linear_key_head_dim.max(cfg.linear_value_head_dim) as u128;
+        let c2_upper = chunk_rows_upper * GDN_CHUNK_SIZE_MIRROR as u128;
+        let worst_chunk_scratch_elems = (chunk_rows_upper * max_head_dim).max(c2_upper);
+        let worst_chunk_scratch_bytes = worst_chunk_scratch_elems * 4;
+        if worst_chunk_scratch_bytes > MAX_GDN_CHUNK_SCRATCH_BYTES as u128 {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: GatedDeltaNet chunk-scratch size \
+                 ({worst_chunk_scratch_bytes} bytes) exceeds MAX_GDN_CHUNK_SCRATCH_BYTES \
+                 ({MAX_GDN_CHUNK_SCRATCH_BYTES}): linear_num_value_heads ({value_heads}) * \
+                 max(linear_key_head_dim, linear_value_head_dim) ({max_head_dim})"
             )));
         }
         // `MAX_LINEAR_NUM_KEY_HEADS` and `MAX_CONV_KERNEL_DIM` bound their respective factors
@@ -1556,6 +1684,16 @@ impl Qwen35Config {
                      ({MAX_INTERMEDIATE_SIZE})"
                 )));
             }
+        }
+        // A zero `max_position_embeddings` is geometrically degenerate: the RoPE table has
+        // zero rows (`RopeTable::max_positions() == 0`), so any non-empty forward pass
+        // indexes `cos_at(0)` / `sin_at(0)` past the empty table -- a panic reachable via
+        // the public debug forward (`qwen35_config.rs`'s own `cos_at`/`sin_at` callers).
+        // The upper-bound check below only ever guarded the ceiling; this guards the floor.
+        if cfg.max_position_embeddings == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: max_position_embeddings must be > 0".to_string(),
+            ));
         }
         // `max_position_embeddings` drives the Metal RoPE table allocation (`rope_max *
         // rope_dim / 2` entries in `build_rope_interleaved`) independent of `head_dim`. See
@@ -3480,17 +3618,20 @@ mod tests {
     /// panicking/wrapping downstream.
     #[test]
     fn parser_rejects_all_full_attention_config_with_overflowing_linear_output_dim() {
-        let json = r#"{"text_config": {
+        let json = format!(
+            r#"{{"text_config": {{
             "num_hidden_layers": 2,
             "layer_types": ["full_attention", "full_attention"],
             "linear_num_key_heads": 1,
-            "linear_num_value_heads": 18446744073709551615,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128
-        }}"#;
-        let err = Qwen35Config::from_config_json_str(json)
+            "linear_num_value_heads": 2,
+            "linear_key_head_dim": 1,
+            "linear_value_head_dim": {}
+        }}}}"#,
+            usize::MAX
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
             .expect_err(
-                "overflowing linear_num_value_heads on an all-full-attention config must be \
+                "overflowing linear_value_head_dim on an all-full-attention config must be \
                  rejected before any allocation",
             )
             .to_string();
@@ -3504,15 +3645,20 @@ mod tests {
     /// still be rejected against `MAX_LINEAR_OUTPUT_DIM`.
     #[test]
     fn parser_rejects_all_full_attention_config_with_linear_output_dim_over_max() {
-        let huge_value_heads = (MAX_LINEAR_OUTPUT_DIM / 128) + 1;
+        // `linear_num_value_heads` sits at its own `MAX_LINEAR_NUM_VALUE_HEADS` cap (so that
+        // guard does not fire first); `linear_value_head_dim` is the free factor that pushes
+        // the `linear_output_dim` product over `MAX_LINEAR_OUTPUT_DIM` while each individual
+        // factor stays within its own cap.
+        let value_heads = MAX_LINEAR_NUM_VALUE_HEADS;
+        let value_dim = (MAX_LINEAR_OUTPUT_DIM / value_heads) + 1;
         let json = format!(
             r#"{{"text_config": {{
                 "num_hidden_layers": 2,
                 "layer_types": ["full_attention", "full_attention"],
                 "linear_num_key_heads": 1,
-                "linear_num_value_heads": {huge_value_heads},
-                "linear_key_head_dim": 128,
-                "linear_value_head_dim": 128
+                "linear_num_value_heads": {value_heads},
+                "linear_key_head_dim": 1,
+                "linear_value_head_dim": {value_dim}
             }}}}"#
         );
         let err = Qwen35Config::from_config_json_str(&json)
@@ -4152,12 +4298,17 @@ mod tests {
     /// the product-hostility the per-factor caps above do not close on their own.
     #[test]
     fn parser_rejects_gdn_conv_buffer_size_over_max_with_bounded_factors() {
+        // `linear_num_key_heads` / `linear_num_value_heads` sit at their own caps and
+        // `linear_key_head_dim` / `linear_value_head_dim` are kept small enough that neither
+        // `MAX_GDN_STATE_SIZE` nor `MAX_GDN_CHUNK_SCRATCH_BYTES` fires first -- only the
+        // `linear_conv_kernel_dim` product (`linear_qkv_dim() * (kernel_dim - 1)`) is over
+        // `MAX_GDN_CONV_BUFFER_SIZE`.
         let json = format!(
             r#"{{"text_config": {{
                 "linear_num_key_heads": {MAX_LINEAR_NUM_KEY_HEADS},
-                "linear_num_value_heads": {MAX_LINEAR_NUM_KEY_HEADS},
-                "linear_key_head_dim": 2048,
-                "linear_value_head_dim": 1,
+                "linear_num_value_heads": {MAX_LINEAR_NUM_VALUE_HEADS},
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
                 "linear_conv_kernel_dim": {MAX_CONV_KERNEL_DIM}
             }}}}"#
         );
@@ -4564,6 +4715,195 @@ mod tests {
         assert!(
             Qwen35Config::from_config_json_str(&json).is_ok(),
             "num_position_embeddings == MAX_VISION_NUM_POSITION_EMBEDDINGS must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_non_square_num_position_embeddings() {
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2305,
+                "in_channels": 3
+            }"#,
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("non-square num_position_embeddings must be rejected")
+            .to_string();
+        assert!(
+            err.contains("num_position_embeddings") && err.contains("perfect square"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_square_num_position_embeddings() {
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }"#,
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "square num_position_embeddings (48^2 = 2304) must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_zero_max_position_embeddings() {
+        let json = r#"{"text_config": {"max_position_embeddings": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("max_position_embeddings: 0 must yield an InferenceError, not panic")
+            .to_string();
+        assert!(
+            err.contains("max_position_embeddings"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_max_position_embeddings_at_one() {
+        let json = r#"{"text_config": {"max_position_embeddings": 1}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "max_position_embeddings: 1 must be accepted (minimal nonzero RoPE table)"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_zero_rope_theta() {
+        let json = r#"{"text_config": {"rope_theta": 0.0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("rope_theta: 0.0 must yield an InferenceError, not NaN/inf propagation")
+            .to_string();
+        assert!(err.contains("rope_theta"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn parser_rejects_negative_rope_theta() {
+        let json = r#"{"text_config": {"rope_theta": -1.0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("negative rope_theta must yield an InferenceError")
+            .to_string();
+        assert!(err.contains("rope_theta"), "wrong guard fired: {err}");
+    }
+
+    // Note: a dedicated "non-finite rope_theta via config.json" test is not constructible --
+    // JSON has no `NaN`/`Infinity` literals, and serde_json itself rejects an out-of-range
+    // numeric literal (e.g. `1e400`) as a parse error before `from_config_json_str`'s
+    // validation ever runs, so that vector is already fail-closed one layer up. The
+    // `is_finite()` half of the `rope_theta` guard below is defense-in-depth for callers
+    // that construct `Qwen35Config` directly (bypassing JSON parsing); the zero/negative
+    // tests above cover the vectors actually reachable through `config.json`.
+
+    #[test]
+    fn parser_accepts_realistic_rope_theta() {
+        let json = r#"{"text_config": {"rope_theta": 10000000.0}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "realistic rope_theta must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_linear_num_value_heads_over_max() {
+        let value_heads = MAX_LINEAR_NUM_VALUE_HEADS + 1;
+        let json = format!(
+            r#"{{"text_config": {{
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": {value_heads},
+                "linear_key_head_dim": 1,
+                "linear_value_head_dim": 1
+            }}}}"#
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("linear_num_value_heads above MAX_LINEAR_NUM_VALUE_HEADS must be rejected")
+            .to_string();
+        assert!(
+            err.contains("linear_num_value_heads") && err.contains("MAX_LINEAR_NUM_VALUE_HEADS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_linear_num_value_heads_at_max() {
+        let json = format!(
+            r#"{{"text_config": {{
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": {MAX_LINEAR_NUM_VALUE_HEADS},
+                "linear_key_head_dim": 1,
+                "linear_value_head_dim": 1
+            }}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "linear_num_value_heads == MAX_LINEAR_NUM_VALUE_HEADS must be accepted"
+        );
+    }
+
+    /// The specific attack the daemon's B2 finding described: `linear_value_head_dim = 1`
+    /// lets `value_heads` alone satisfy `MAX_LINEAR_OUTPUT_DIM` and `MAX_GDN_STATE_SIZE`
+    /// (both product budgets with `value_head_dim` as a factor) at values far above what
+    /// `MAX_LINEAR_NUM_VALUE_HEADS` alone would allow through those two checks -- but a
+    /// large, non-degenerate `linear_key_head_dim` still drives the GatedDeltaNet
+    /// chunk-scratch buffers (`new_session_inner`, `forward/metal_qwen35.rs`) to multi-GiB
+    /// scale. This must be caught by `MAX_GDN_CHUNK_SCRATCH_BYTES`, not by the two
+    /// pre-existing product budgets (which this config satisfies trivially).
+    #[test]
+    fn parser_rejects_gdn_chunk_scratch_over_max_with_value_heads_and_state_size_in_budget() {
+        let huge_key_dim = 600_000;
+        let json = format!(
+            r#"{{"text_config": {{
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": {huge_key_dim},
+            "linear_value_head_dim": 1
+        }}}}"#
+        );
+        // Sanity: this config passes both pre-existing product budgets trivially
+        // (value_heads = 1, value_dim = 1, so both products collapse to `huge_key_dim` / 1).
+        assert!(
+            huge_key_dim <= MAX_GDN_STATE_SIZE,
+            "test fixture assumption: gdn_state_size must be within MAX_GDN_STATE_SIZE"
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "a GDN chunk-scratch product over MAX_GDN_CHUNK_SCRATCH_BYTES must be rejected \
+                 even though linear_num_value_heads, MAX_LINEAR_OUTPUT_DIM, and \
+                 MAX_GDN_STATE_SIZE all pass",
+            )
+            .to_string();
+        assert!(
+            err.contains("chunk-scratch") && err.contains("MAX_GDN_CHUNK_SCRATCH_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_realistic_gdn_chunk_scratch_geometry() {
+        let json = r#"{"text_config": {
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        }}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "realistic GDN chunk-scratch geometry must be accepted"
         );
     }
 

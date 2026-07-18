@@ -514,7 +514,7 @@ mod tests {
             spatial_merge_size: 1,
             out_hidden_size: 4,
             temporal_patch_size: 1,
-            num_position_embeddings: 2,
+            num_position_embeddings: 4,
             in_channels: 1,
             deepstack_visual_indexes: vec![],
         }
@@ -538,7 +538,7 @@ mod tests {
                 "model.visual.patch_embed.proj.bias".to_string(),
                 vec![hidden],
             ),
-            ("model.visual.pos_embed.weight".to_string(), vec![2, hidden]),
+            ("model.visual.pos_embed.weight".to_string(), vec![4, hidden]),
             (
                 "model.visual.merger.linear_fc1.weight".to_string(),
                 vec![merge_in, merge_in],
