@@ -144,6 +144,18 @@ pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
     sign | frac16
 }
 
+/// Test whether an IEEE-754 binary16 (f16) bit pattern encodes a finite
+/// value (not infinity, not NaN), without widening to `f32`.
+///
+/// An f16 bit pattern is infinity or NaN exactly when its 5-bit exponent
+/// field (bits 10..15) is all-ones (`0x1f`); every other exponent value is
+/// finite (zero, subnormal, or normal). Checking the exponent field directly
+/// avoids a widen-then-`is_finite()` round trip through `f32`.
+#[inline]
+pub(crate) fn f16_bits_is_finite(bits: u16) -> bool {
+    ((bits >> 10) & 0x1f) != 0x1f
+}
+
 /// Widen a bfloat16 bit pattern to `f32`.
 ///
 /// BF16 shares f32's sign+exponent layout truncated to a 7-bit mantissa, so
@@ -448,6 +460,18 @@ mod tests {
         assert_eq!(bf16_bits_to_f32(0x7f80), f32::INFINITY);
         assert_eq!(bf16_bits_to_f32(0xff80), f32::NEG_INFINITY);
         assert!(bf16_bits_to_f32(0x7fc0).is_nan());
+    }
+
+    #[test]
+    fn f16_bits_is_finite_matches_widen_is_finite_across_full_space() {
+        for bits in 0u32..=0xffff {
+            let bits = bits as u16;
+            assert_eq!(
+                f16_bits_is_finite(bits),
+                f16_bits_to_f32(bits).is_finite(),
+                "f16_bits_is_finite({bits:#06x}) diverges from widen-then-is_finite"
+            );
+        }
     }
 
     #[test]

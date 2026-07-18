@@ -50,6 +50,27 @@
 
 use crate::error::InferenceError;
 
+/// Create `path` for writing with fd-bound exclusive no-follow semantics:
+/// `create_new` refuses a pre-existing entry (including a stale file left by
+/// an earlier run) and `O_NOFOLLOW` refuses to follow a symlink planted at
+/// `path`, so a concurrent actor that plants a symlink at an output filename
+/// after an earlier existence check cannot redirect the write to overwrite
+/// an arbitrary target. Shared by every offline-conversion output writer
+/// (`.q4`, `.f16`, `quantize_index.json`, `config.json`).
+///
+/// # Errors
+///
+/// Returns an error if `path` already exists (including as a symlink) or
+/// cannot be created.
+pub(crate) fn create_output_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
 /// One Q4_0 quantization block: 32 weights packed as 4-bit unsigned integers.
 ///
 /// `scale` is stored as a raw IEEE-754 f16 bit pattern in a `u16` — the `half` crate
@@ -122,6 +143,57 @@ pub(crate) fn q4_f16_to_f32(bits: u16) -> f32 {
     crate::weights::half_bits::f16_bits_to_f32(bits)
 }
 
+/// Which Q4 block metadata field is being encoded — selects the field-specific
+/// underflow-guard wording below. A typed enum (rather than a free-form
+/// `field: &str`) means a typo can no longer silently bypass the guard for
+/// one field while claiming to check the other (the exact risk class the
+/// two-sided guard below exists to close).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Q4MetadataField {
+    Scale,
+    Bias,
+}
+
+impl Q4MetadataField {
+    fn label(self) -> &'static str {
+        match self {
+            Q4MetadataField::Scale => "scale",
+            Q4MetadataField::Bias => "bias",
+        }
+    }
+}
+
+/// Encode one Q4 block metadata value (`scale` or `bias`) to its f16 bit
+/// pattern, rejecting non-finite inputs/outputs and — for either field — a
+/// non-zero value that underflows to f16 zero.
+///
+/// Both fields are gated identically (two-sided): a non-zero `scale` that
+/// underflows collapses every dequantized value in the block to the bias
+/// (multiplicative term zeroed); a non-zero `bias` that underflows silently
+/// drops the block's zero-point offset, which is the same class of silent
+/// value destruction on the additive term instead of the multiplicative one
+/// (e.g. a constant block `[1e-9; 32]`: `scale = 1.0` legitimately, but the
+/// bias `1e-9` underflows to f16 zero and the whole block dequantizes to
+/// zero instead of `1e-9`). A genuinely zero-valued field (exact `0.0`) is
+/// not an underflow and still encodes successfully.
+fn encode_finite_q4_metadata(value: f32, field: Q4MetadataField) -> Result<u16, InferenceError> {
+    let bits = q4_f32_to_f16(value);
+    let label = field.label();
+    if !value.is_finite() || !crate::weights::half_bits::f16_bits_is_finite(bits) {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q4 {label} value {value} encodes as a non-finite f16 value"
+        )));
+    }
+    if value != 0.0 && q4_f16_to_f32(bits) == 0.0 {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q4 {label} value {value} underflows to f16 zero, which would silently \
+             destroy this block's {label} contribution to every dequantized value; \
+             refusing to quantize a block with a degenerate {label}"
+        )));
+    }
+    Ok(bits)
+}
+
 /// Convert a BF16 bit pattern (`u16`) to `f32`.
 ///
 /// BF16 has identical sign+exponent layout to f32; zero-extending the mantissa
@@ -180,7 +252,16 @@ fn quantize_block_with_mode_len(
         let scale = if abs_max == 0.0 {
             1.0f32
         } else {
-            abs_max / 7.0
+            let s = abs_max / 7.0;
+            if s == 0.0 {
+                return Err(InferenceError::InvalidInput(format!(
+                    "Q4 weight block has nonzero abs_max {abs_max} but abs_max/7.0 \
+                     underflows to f32 zero, which would silently collapse this \
+                     block's scale to zero; refusing to quantize a block with a \
+                     degenerate scale"
+                )));
+            }
+            s
         };
         let inv_scale = 1.0 / scale;
         let bias = -8.0 * scale;
@@ -191,8 +272,8 @@ fn quantize_block_with_mode_len(
             packed[b] = (q1 << 4) | (q0 & 0x0f);
         }
         Ok(Q4Block {
-            scale: q4_f32_to_f16(scale),
-            bias: q4_f32_to_f16(bias),
+            scale: encode_finite_q4_metadata(scale, Q4MetadataField::Scale)?,
+            bias: encode_finite_q4_metadata(bias, Q4MetadataField::Bias)?,
             packed,
         })
     } else {
@@ -200,7 +281,20 @@ fn quantize_block_with_mode_len(
         let min_val = real.iter().copied().fold(f32::INFINITY, f32::min);
         let max_val = real.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let range = max_val - min_val;
-        let scale = if range == 0.0 { 1.0f32 } else { range / 15.0 };
+        let scale = if range == 0.0 {
+            1.0f32
+        } else {
+            let s = range / 15.0;
+            if s == 0.0 {
+                return Err(InferenceError::InvalidInput(format!(
+                    "Q4 weight block has nonzero range {range} but range/15.0 \
+                     underflows to f32 zero, which would silently collapse this \
+                     block's scale to zero; refusing to quantize a block with a \
+                     degenerate scale"
+                )));
+            }
+            s
+        };
         let inv_scale = 1.0 / scale;
         let mut packed = [0u8; 16];
         for b in 0..16 {
@@ -209,8 +303,8 @@ fn quantize_block_with_mode_len(
             packed[b] = (q1 << 4) | (q0 & 0x0f);
         }
         Ok(Q4Block {
-            scale: q4_f32_to_f16(scale),
-            bias: q4_f32_to_f16(min_val),
+            scale: encode_finite_q4_metadata(scale, Q4MetadataField::Scale)?,
+            bias: encode_finite_q4_metadata(min_val, Q4MetadataField::Bias)?,
             packed,
         })
     }
@@ -229,7 +323,10 @@ fn quantize_block_with_mode_len(
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any value in `src` is non-finite.
+/// Returns [`InferenceError::InvalidInput`] if any value in `src` is
+/// non-finite, or if a non-constant block's computed scale underflows to
+/// f16 zero (which would silently collapse every dequantized value in that
+/// block to the bias).
 pub fn quantize_row_q4_0(src: &[f32]) -> Result<Vec<u8>, InferenceError> {
     let n_blocks = src.len().div_ceil(32);
     let mut out = Vec::with_capacity(n_blocks * 20);
@@ -280,7 +377,10 @@ pub fn dequantize_row_q4_0(data: &[u8], n_weights: usize) -> Vec<f32> {
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any value in `src` is non-finite.
+/// Returns [`InferenceError::InvalidInput`] if any value in `src` is
+/// non-finite, or if a non-constant block's computed scale underflows to
+/// f16 zero (which would silently collapse every dequantized value in that
+/// block to the bias).
 pub fn quantize_tensor_q4_0(
     src: &[f32],
     rows: usize,
@@ -304,7 +404,7 @@ pub fn quantize_tensor_q4_0(
 // BF16-input quantization API (for streaming model shards)
 // ---------------------------------------------------------------------------
 
-/// Assert that `shape.iter().product()` equals `data_len`.
+/// Validate that `shape.iter().product()` equals `data_len`.
 ///
 /// SafeTensors' own `TensorView::new` rejects shape/data-size mismatches
 /// (returns `InvalidTensorView`). The Q4 entry points keep the same
@@ -313,32 +413,33 @@ pub fn quantize_tensor_q4_0(
 /// `save_q4_file` will then write the inconsistent metadata into a `.q4`
 /// header that downstream loaders (`write_merged_qkvz`, the Metal
 /// runtime path) trust without re-verification. Uses `checked_mul` so
-/// `usize` overflow on a malformed shape surfaces as a panic at
-/// construction, not as a wraparound that aliases a valid length.
-#[track_caller]
-fn assert_shape_matches_data_len(shape: &[usize], data_len: usize) {
+/// `usize` overflow on a malformed shape returns an error instead of
+/// wrapping to a valid length.
+fn validate_shape_matches_data_len(shape: &[usize], data_len: usize) -> Result<(), InferenceError> {
     let numel = shape
         .iter()
         .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
-        .unwrap_or_else(|| {
-            panic!("shape product overflowed usize: shape={shape:?}");
-        });
-    assert_eq!(
-        numel, data_len,
-        "shape product {numel} (shape={shape:?}) must equal data length {data_len}"
-    );
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!("shape product overflows usize: shape={shape:?}"))
+        })?;
+    if numel != data_len {
+        return Err(InferenceError::InvalidInput(format!(
+            "shape product {numel} (shape={shape:?}) must equal data length {data_len}"
+        )));
+    }
+    Ok(())
 }
 
 /// Quantize a BF16 tensor (raw `u16` slice) into a [`Q4Tensor`].
 ///
-/// Panics if `shape.iter().product()` does not equal `data.len()`.
-///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any BF16 value decodes to a
-/// non-finite f32 (NaN or ±inf).
+/// Returns [`InferenceError::InvalidInput`] if shape metadata is inconsistent,
+/// any BF16 value decodes to a non-finite f32 (NaN or ±inf), or a
+/// non-constant block's computed scale underflows to f16 zero (which would
+/// silently collapse every dequantized value in that block to the bias).
 pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Result<Q4Tensor, InferenceError> {
-    assert_shape_matches_data_len(shape, data.len());
+    validate_shape_matches_data_len(shape, data.len())?;
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
     let mut blocks = Vec::with_capacity(n_blocks);
@@ -375,13 +476,12 @@ pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Result<Q4Tensor, In
 /// side of a Q4 bin boundary or shift `abs_max` for the block. The f32 path
 /// avoids that truncation.
 ///
-/// Panics if `shape.iter().product()` does not equal `data.len()`.
-///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any value in `data` is non-finite.
+/// Returns [`InferenceError::InvalidInput`] if shape metadata is inconsistent,
+/// any value in `data` is non-finite, or Q4 metadata is not finite in f16.
 pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Result<Q4Tensor, InferenceError> {
-    assert_shape_matches_data_len(shape, data.len());
+    validate_shape_matches_data_len(shape, data.len())?;
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
     let mut blocks = Vec::with_capacity(n_blocks);
@@ -420,12 +520,11 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Result<Q4Tensor, Inf
 /// at exact-midpoint values and rotated activations rarely sit on bin
 /// boundaries.
 ///
-/// Panics if `shape.iter().product()` does not equal `data.len()`.
-///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any f64 value is non-finite (NaN
-/// or ±inf), or if the f32 downcast produces a non-finite value.
+/// Returns [`InferenceError::InvalidInput`] if shape metadata is inconsistent,
+/// any f64 value is non-finite (NaN or ±inf), the f32 downcast is non-finite,
+/// or Q4 metadata is not finite in f16.
 pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Result<Q4Tensor, InferenceError> {
     quantize_f64_to_q4_mode(data, shape, true) // symmetric — QuaRot-rotated weights are zero-mean
 }
@@ -440,13 +539,14 @@ pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Result<Q4Tensor, Inf
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any value in `data` is non-finite.
+/// Returns [`InferenceError::InvalidInput`] if shape metadata is inconsistent,
+/// any value in `data` is non-finite, or Q4 metadata is not finite in f16.
 pub fn quantize_f64_to_q4_mode(
     data: &[f64],
     shape: &[usize],
     symmetric: bool,
 ) -> Result<Q4Tensor, InferenceError> {
-    assert_shape_matches_data_len(shape, data.len());
+    validate_shape_matches_data_len(shape, data.len())?;
     let original_len = data.len();
     let n_blocks = original_len.div_ceil(32);
     let mut blocks = Vec::with_capacity(n_blocks);
@@ -523,7 +623,11 @@ pub fn stream_quantize_shard(
 // File I/O
 // ---------------------------------------------------------------------------
 
-/// Write a [`Q4Tensor`] to a `.q4` file.
+/// Serialize a [`Q4Tensor`] to its on-disk `.q4` byte layout entirely in
+/// memory, without touching the filesystem. Shared by [`save_q4_file`] and
+/// any caller (e.g. the offline quantizer's fd-bound staging writer) that
+/// needs the exact on-disk bytes to write through an already-open file
+/// handle instead of a path.
 ///
 /// File format:
 /// ```text
@@ -534,28 +638,65 @@ pub fn stream_quantize_shard(
 /// original_len u64 LE    8 bytes
 /// blocks       [Q4Block; n]  n × 20 bytes
 /// ```
-pub fn save_q4_file(path: &std::path::Path, tensor: &Q4Tensor) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(b"KHQ4")?;
-    f.write_all(&2u32.to_le_bytes())?;
-    f.write_all(&(tensor.shape.len() as u32).to_le_bytes())?;
-    for &dim in &tensor.shape {
-        f.write_all(&(dim as u64).to_le_bytes())?;
-    }
-    f.write_all(&(tensor.original_len as u64).to_le_bytes())?;
+pub fn q4_file_bytes(tensor: &Q4Tensor) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        4 + 4 + 4 + 8 * tensor.shape.len() + 8 + tensor.blocks.len() * Q4_BLOCK_BYTES,
+    );
+    write_q4_tensor(&mut buf, tensor).expect("Vec<u8> writer never fails");
+    buf
+}
+
+/// Borrowed view of a [`Q4Tensor`]'s packed blocks as raw bytes, with no
+/// copy — the returned slice aliases `tensor.blocks` directly.
+fn q4_block_bytes(tensor: &Q4Tensor) -> &[u8] {
     // SAFETY: Q4Block is #[repr(C)] with size 20; its alignment is 2 (the
     // alignment of the leading `scale: u16` per the Rust Reference's repr(C)
     // rule). Casting to a `&[u8]` is valid because the target element type is
     // `u8` (alignment 1 ≤ source alignment 2). The resulting slice has length
     // `blocks.len() * 20` matching the source contiguous storage.
-    let block_bytes: &[u8] = unsafe {
+    unsafe {
         std::slice::from_raw_parts(
             tensor.blocks.as_ptr().cast::<u8>(),
-            tensor.blocks.len() * 20,
+            tensor.blocks.len() * Q4_BLOCK_BYTES,
         )
-    };
-    f.write_all(block_bytes)
+    }
+}
+
+/// Stream a [`Q4Tensor`] to `writer` as the header followed by the borrowed
+/// packed-block bytes, with no output-sized duplicate buffer — unlike
+/// [`q4_file_bytes`], which allocates and copies the full byte image before
+/// any write happens. `writer` is written in two `write_all` calls: header,
+/// then block bytes aliasing `tensor.blocks` directly.
+pub fn write_q4_tensor<W: std::io::Write>(
+    writer: &mut W,
+    tensor: &Q4Tensor,
+) -> std::io::Result<()> {
+    let mut header = Vec::with_capacity(4 + 4 + 4 + 8 * tensor.shape.len() + 8);
+    header.extend_from_slice(b"KHQ4");
+    header.extend_from_slice(&2u32.to_le_bytes());
+    header.extend_from_slice(&(tensor.shape.len() as u32).to_le_bytes());
+    for &dim in &tensor.shape {
+        header.extend_from_slice(&(dim as u64).to_le_bytes());
+    }
+    header.extend_from_slice(&(tensor.original_len as u64).to_le_bytes());
+    writer.write_all(&header)?;
+    writer.write_all(q4_block_bytes(tensor))
+}
+
+/// Write a [`Q4Tensor`] to a `.q4` file at `path`, creating or truncating it.
+/// See [`q4_file_bytes`] for the on-disk layout.
+///
+/// General-purpose library entry point — callers that need fd-bound
+/// exclusive no-follow creation against untrusted output paths (the QuaRot
+/// offline converter) use [`create_output_file`] plus [`write_q4_tensor`]
+/// directly instead of this function.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be created or the write fails.
+pub fn save_q4_file(path: &std::path::Path, tensor: &Q4Tensor) -> std::io::Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    write_q4_tensor(&mut file, tensor)
 }
 
 /// Header metadata returned by [`read_q4_header`] without allocating blocks.
@@ -741,7 +882,7 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
 
     // Fail closed on a header whose shape disagrees with its element count.
     // The quantize paths enforce `shape.product() == data.len()` via
-    // `assert_shape_matches_data_len`; the loader must reject the same
+    // `validate_shape_matches_data_len`; the loader must reject the same
     // inconsistency rather than return a tensor whose `shape` overstates the
     // block payload (downstream matmuls would read stale, out-of-range data).
     let shape_product = shape
@@ -1131,6 +1272,138 @@ mod tests {
             packed_off, 4,
             "packed field must start at byte offset 4 (after scale + bias, no padding)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-constant-block scale underflow.
+    //
+    // Mutation-sensitive: with the `value != 0.0 && encoded == 0.0` guard
+    // removed from `encode_finite_q4_metadata`, the first test below would
+    // instead succeed and silently collapse every dequantized value in the
+    // block to the bias.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn non_constant_block_with_underflowing_scale_is_rejected() {
+        // 31 zeros + one value 1e-9 above them: genuinely non-constant
+        // (max != min), but range/15 underflows to f16 zero.
+        let mut vals = vec![0.0f32; 32];
+        vals[0] = 1e-9;
+        let err = quantize_row_q4_0(&vals)
+            .expect_err("a non-constant block whose scale underflows to f16 zero must error");
+        assert!(
+            err.to_string().contains("underflows to f16 zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn constant_block_still_succeeds_and_round_trips_the_constant() {
+        // max == min: scale is legitimately forced to 1.0 (not derived from
+        // range), so it must NOT be rejected by the underflow guard above.
+        let vals = vec![3.5f32; 32];
+        let encoded =
+            quantize_row_q4_0(&vals).expect("a genuinely constant block must still quantize");
+        let decoded = dequantize_row_q4_0(&encoded, 32);
+        assert_eq!(decoded.len(), 32);
+        for v in decoded {
+            assert!((v - 3.5).abs() < 1e-6, "expected ~3.5, got {v}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Constant-block BIAS underflow (two-sided with scale).
+    //
+    // Mutation-sensitive: reverting the two-sided guard to gate only
+    // `Q4MetadataField::Scale` makes
+    // `constant_block_with_underflowing_bias_is_rejected` fail — the block's
+    // scale=1.0 never underflows, so only the new bias-side check catches
+    // this. Restoring the two-sided guard makes it error again; the
+    // zero-bias sibling below stays green throughout since `value == 0.0`
+    // is never gated.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn constant_block_with_underflowing_bias_is_rejected() {
+        // A genuinely constant block: scale is legitimately forced to 1.0
+        // (not derived from range, so it never underflows), but the bias
+        // (== the constant value itself, 1e-9) underflows to f16 zero,
+        // which would silently dequantize the whole block to 0.0 instead
+        // of 1e-9 — the same silent-value-destruction class the guard above
+        // targets, on the bias field instead of the scale field.
+        let vals = vec![1e-9f32; 32];
+        let err = quantize_row_q4_0(&vals)
+            .expect_err("a constant block whose bias underflows to f16 zero must error");
+        assert!(
+            err.to_string().contains("underflows to f16 zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // f32-division scale underflow (distinct from the f16-encoding underflow
+    // above): `range` (asymmetric) or `abs_max` (symmetric) is nonzero but so
+    // close to the smallest positive f32 subnormal that dividing it by 15.0
+    // / 7.0 flushes to *exactly* 0.0f32 before `encode_finite_q4_metadata`
+    // ever runs. Since the divide-by-zero guards above only special-case an
+    // exact-zero *input* (`range == 0.0` / `abs_max == 0.0`), the computed
+    // scale reaching exact zero here previously passed through as a
+    // "genuinely zero" field and silently zeroed the whole block.
+    //
+    // Mutation-sensitive: reverting the `s == 0.0` checks in
+    // `quantize_block_with_mode_len` makes both tests below fail (the calls
+    // succeed with a corrupted all-zero block instead of erroring).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn asymmetric_scale_underflow_from_subnormal_range_is_rejected() {
+        // min=0.0, max=the smallest positive f32 subnormal: range is
+        // nonzero, but range/15.0 underflows to exact 0.0f32.
+        let subnormal = f32::from_bits(1);
+        assert_ne!(subnormal, 0.0);
+        assert_eq!(
+            subnormal / 15.0,
+            0.0,
+            "test premise: division must underflow"
+        );
+        let mut vals = vec![0.0f32; 32];
+        vals[0] = subnormal;
+        let err = quantize_row_q4_0(&vals).expect_err(
+            "a nonzero-range block whose f32 scale computation underflows to zero must error",
+        );
+        assert!(
+            err.to_string().contains("underflows to f32 zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn symmetric_scale_underflow_from_subnormal_abs_max_is_rejected() {
+        let subnormal = f32::from_bits(1);
+        assert_eq!(
+            subnormal / 7.0,
+            0.0,
+            "test premise: division must underflow"
+        );
+        let mut vals = vec![0.0f64; 32];
+        vals[0] = subnormal as f64;
+        let err = quantize_f64_to_q4(&vals, &[32]).expect_err(
+            "a nonzero-abs_max block whose f32 scale computation underflows to zero must error",
+        );
+        assert!(
+            err.to_string().contains("underflows to f32 zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn constant_zero_block_still_accepts() {
+        // A genuinely-zero bias (constant-zero block) must not be flagged
+        // as an underflow — `value == 0.0` is the legitimate, non-degenerate
+        // case the guard explicitly excludes.
+        let vals = vec![0.0f32; 32];
+        let encoded = quantize_row_q4_0(&vals).expect("a constant-zero block must still quantize");
+        let decoded = dequantize_row_q4_0(&encoded, 32);
+        for v in decoded {
+            assert!(v.abs() < 1e-6, "expected ~0, got {v}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1965,40 +2238,56 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "shape product")]
     fn quantize_f32_to_q4_rejects_shape_data_mismatch() {
         let data = synthetic_f32_uniform(64, 41);
-        // shape claims 96 elements; data has 64 → must panic.
-        let _ = quantize_f32_to_q4(&data, &[3, 32]);
+        let err = quantize_f32_to_q4(&data, &[3, 32])
+            .expect_err("shape claims 96 elements but data has 64");
+        assert!(err.to_string().contains("shape product 96"));
     }
 
     #[test]
-    #[should_panic(expected = "shape product")]
     fn quantize_f64_to_q4_rejects_shape_data_mismatch() {
         let data: Vec<f64> = synthetic_f32_uniform(64, 43)
             .into_iter()
             .map(f64::from)
             .collect();
-        let _ = quantize_f64_to_q4(&data, &[3, 32]);
+        let err = quantize_f64_to_q4(&data, &[3, 32])
+            .expect_err("shape claims 96 elements but data has 64");
+        assert!(err.to_string().contains("shape product 96"));
     }
 
     #[test]
-    #[should_panic(expected = "shape product")]
     fn quantize_bf16_to_q4_rejects_shape_data_mismatch() {
         // Lock the same contract on the pre-existing BF16 entry point — the
         // SafeTensors source format rejects shape/data mismatches and the Q4
         // bridge must not silently weaken that invariant.
         let data: Vec<u16> = (0..64).map(|i| i as u16).collect();
-        let _ = quantize_bf16_to_q4(&data, &[3, 32]);
+        let err = quantize_bf16_to_q4(&data, &[3, 32])
+            .expect_err("shape claims 96 elements but data has 64");
+        assert!(err.to_string().contains("shape product 96"));
     }
 
     #[test]
-    #[should_panic(expected = "overflowed usize")]
     fn quantize_f32_to_q4_rejects_shape_product_overflow() {
         let data = vec![0.0_f32; 32];
         // usize::MAX * 2 overflows; checked_mul must catch it before the
         // length comparison aliases to a valid length by wraparound.
-        let _ = quantize_f32_to_q4(&data, &[usize::MAX, 2]);
+        let err = quantize_f32_to_q4(&data, &[usize::MAX, 2])
+            .expect_err("overflowing shape must return an error");
+        assert!(err.to_string().contains("overflows usize"));
+    }
+
+    #[test]
+    fn quantize_q4_rejects_non_finite_half_metadata() {
+        let f32_data = vec![f32::MAX; 32];
+        let f32_err = quantize_f32_to_q4(&f32_data, &[32])
+            .expect_err("finite f32 values that overflow f16 bias must be rejected");
+        assert!(f32_err.to_string().contains("non-finite"));
+
+        let f64_data = vec![f32::MAX as f64; 32];
+        let f64_err = quantize_f64_to_q4(&f64_data, &[32])
+            .expect_err("finite f64 values that overflow f16 scale must be rejected");
+        assert!(f64_err.to_string().contains("non-finite"));
     }
 
     #[test]
@@ -2154,7 +2443,7 @@ mod tests {
     fn test_q4_rejects_shape_product_mismatch() {
         // shape product (4*16=64) disagrees with original_len (32): the header
         // claims twice as many elements as the block payload covers. The
-        // quantize paths reject this via assert_shape_matches_data_len; the
+        // quantize paths reject this via validate_shape_matches_data_len; the
         // loader must too, with a clean Err rather than a Q4Tensor whose shape
         // overstates its data (downstream matmuls would read stale elements).
         let mut buf = Vec::new();

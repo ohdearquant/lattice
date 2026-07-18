@@ -7,7 +7,7 @@
 //! writes the converted model to `output_dir`:
 //!
 //! - Planned (rotated) tensors → `<sanitized>.q4` via
-//!   [`save_q4_file`].
+//!   [`write_q4_tensor`] against an fd-bound exclusive no-follow file.
 //! - Other required weights (norms, `A_log`, `dt_bias`, `conv1d.weight`,
 //!   etc.) → `<sanitized>.f16` with a `KHF1` header matching
 //!   `bin/quantize_q4`'s convention.
@@ -45,7 +45,7 @@ use crate::quant::quarot::pipeline::{
 };
 use crate::quant::quarot::plan::RotationPlan;
 use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use crate::weights::q4_weights::{q4_f32_to_f16, quantize_f64_to_q4, save_q4_file};
+use crate::weights::q4_weights::{create_output_file, quantize_f64_to_q4, write_q4_tensor};
 
 /// CLI / library options for [`convert_quarot_qwen35`].
 #[derive(Debug, Clone)]
@@ -273,9 +273,20 @@ fn write_mtp_weights_quarot(
         // Byte accounting uses the pure formula: same result as write_f16_file
         // would return, derived from shape and numel without any I/O.
         *total_bytes_out += f16_file_byte_count(data.len(), shape.len());
+        // Validate representability unconditionally: a
+        // dry run must reject exactly what the real write below would
+        // reject, not silently accept a value that later overflows f16.
+        let framed = encode_f16_payload(&file_name, name, &data, &shape)?;
         if !dry_run {
             let out_path = output_dir.join(&file_name);
-            write_f16_file(&out_path, &data, &shape)?;
+            create_output_file(&out_path)
+                .and_then(|mut f| f.write_all(&framed))
+                .map_err(|e| {
+                    InferenceError::Inference(format!(
+                        "write_mtp_weights_quarot: failed to write {}: {e}",
+                        out_path.display()
+                    ))
+                })?;
         }
         *kept_f16 += 1;
         index_entries.push(IndexEntry {
@@ -489,16 +500,25 @@ pub fn convert_quarot_qwen35(
             let header_bytes = (4 + 4 + 4 + 8 * entry.shape.len() + 8) as u64;
             let n_blocks = entry.data.len().div_ceil(32) as u64;
             total_bytes_out += header_bytes + n_blocks.saturating_mul(20);
+            // Validate Q4 representability unconditionally: quantize_f64_to_q4
+            // runs the same
+            // encode_finite_q4_metadata scale+bias underflow guard that the
+            // real write below depends on, so a dry run rejects exactly what
+            // the real run would reject (e.g. a constant block whose bias
+            // underflows to f16 zero) instead of only surfacing on the next
+            // real run. Only the file write is gated on `!opts.dry_run`.
+            let q4 = quantize_f64_to_q4(&entry.data, &entry.shape)?;
+            let file_name = format!("{sanitized}.q4");
             if !opts.dry_run {
-                let q4 = quantize_f64_to_q4(&entry.data, &entry.shape)?;
-                let file_name = format!("{sanitized}.q4");
                 let out_path = output_dir.join(&file_name);
-                save_q4_file(&out_path, &q4).map_err(|e| {
-                    InferenceError::Inference(format!(
-                        "convert_quarot_qwen35: failed to write {}: {e}",
-                        out_path.display()
-                    ))
-                })?;
+                create_output_file(&out_path)
+                    .and_then(|mut f| write_q4_tensor(&mut f, &q4))
+                    .map_err(|e| {
+                        InferenceError::Inference(format!(
+                            "convert_quarot_qwen35: failed to write {}: {e}",
+                            out_path.display()
+                        ))
+                    })?;
                 index_entries.push(IndexEntry {
                     name: name.clone(),
                     file: file_name,
@@ -511,10 +531,23 @@ pub fn convert_quarot_qwen35(
         } else {
             // f16 file footprint computed from shape and numel without writing.
             total_bytes_out += f16_file_byte_count(entry.data.len(), entry.shape.len());
+            let file_name = format!("{sanitized}.f16");
+            // Validate representability unconditionally:
+            // dry-run must reject exactly what the real write below would
+            // reject (e.g. a finite kept value that overflows f16 narrowing),
+            // not silently accept it and let the real run discover the
+            // rejection later.
+            let framed = encode_f16_payload(&file_name, name, &entry.data, &entry.shape)?;
             if !opts.dry_run {
-                let file_name = format!("{sanitized}.f16");
                 let out_path = output_dir.join(&file_name);
-                write_f16_file(&out_path, &entry.data, &entry.shape)?;
+                create_output_file(&out_path)
+                    .and_then(|mut f| f.write_all(&framed))
+                    .map_err(|e| {
+                        InferenceError::Inference(format!(
+                            "convert_quarot_qwen35: failed to write {}: {e}",
+                            out_path.display()
+                        ))
+                    })?;
                 index_entries.push(IndexEntry {
                     name: name.clone(),
                     file: file_name,
@@ -550,22 +583,26 @@ pub fn convert_quarot_qwen35(
                 "convert_quarot_qwen35: failed to serialize quantize_index.json: {e}"
             ))
         })?;
-        fs::write(&index_path, index_json).map_err(|e| {
-            InferenceError::Inference(format!(
-                "convert_quarot_qwen35: failed to write {}: {e}",
-                index_path.display()
-            ))
-        })?;
+        create_output_file(&index_path)
+            .and_then(|mut f| f.write_all(index_json.as_bytes()))
+            .map_err(|e| {
+                InferenceError::Inference(format!(
+                    "convert_quarot_qwen35: failed to write {}: {e}",
+                    index_path.display()
+                ))
+            })?;
 
         let mut output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
         output_config_json = inject_quarot_seed(&output_config_json, opts.rotation_seed)?;
         let out_config_path = output_dir.join("config.json");
-        fs::write(&out_config_path, &output_config_json).map_err(|e| {
-            InferenceError::Inference(format!(
-                "convert_quarot_qwen35: failed to write {}: {e}",
-                out_config_path.display()
-            ))
-        })?;
+        create_output_file(&out_config_path)
+            .and_then(|mut f| f.write_all(output_config_json.as_bytes()))
+            .map_err(|e| {
+                InferenceError::Inference(format!(
+                    "convert_quarot_qwen35: failed to write {}: {e}",
+                    out_config_path.display()
+                ))
+            })?;
     }
 
     Ok(ConversionReport {
@@ -654,8 +691,8 @@ fn sanitize_tensor_name(name: &str) -> String {
         .collect()
 }
 
-/// Write a `KHF1`-headed `.f16` file matching the convention used by
-/// `bin/quantize_q4` for non-quantized weights.
+/// Validate and encode one tensor's `KHF1`-framed `.f16` payload entirely in
+/// memory, without touching the filesystem.
 ///
 /// Layout:
 /// ```text
@@ -667,56 +704,88 @@ fn sanitize_tensor_name(name: &str) -> String {
 ///   payload    = numel × u16 (IEEE-754 f16, little-endian)
 /// ```
 ///
-/// Returns the total number of bytes written. f64 → f16 goes through
-/// f32 to share the existing converter (rounding-aware) — sufficient
-/// for the runtime's f16 fast path.
-fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, InferenceError> {
-    let mut file = fs::File::create(path).map_err(|e| {
+/// [`write_f16_file`] (the real-write path) and every dry-run byte-accounting
+/// path call this same function, so a dry run rejects exactly what a real
+/// write would reject — a finite kept tensor that overflows f16 narrowing
+/// (e.g. `f32::MAX`) errors here regardless of `dry_run`, instead of only
+/// surfacing on the next real run (dry-run/real-run representability
+/// parity).
+///
+/// `source` labels the origin in error messages (a destination path for a
+/// real write, or a synthetic label — e.g. the tensor name — when called
+/// from a dry-run path with no output path yet). `tensor_name` is always the
+/// original source tensor name (not derived from `source`), so a validation
+/// failure traces back to the source tensor even when the output filename
+/// has been sanitized.
+///
+/// # Errors
+///
+/// Returns an error when the tensor shape is inconsistent, a value is
+/// non-finite before or after f16 encoding, or numel/shape overflow `usize`.
+pub fn encode_f16_payload(
+    source: &str,
+    tensor_name: &str,
+    data: &[f64],
+    shape: &[usize],
+) -> Result<Vec<u8>, InferenceError> {
+    let mut payload = Vec::new();
+    crate::weights::ingress::validate_ingested_tensor(
+        crate::weights::ingress::IngestedTensor::encode_f16(
+            source,
+            tensor_name,
+            shape,
+            data,
+            &mut payload,
+        ),
+    )?;
+
+    let mut framed = Vec::with_capacity(4 + 4 + 4 + 8 * shape.len() + 8 + payload.len());
+    framed.extend_from_slice(b"KHF1");
+    framed.extend_from_slice(&1u32.to_le_bytes());
+    framed.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+    for &dim in shape {
+        framed.extend_from_slice(&(dim as u64).to_le_bytes());
+    }
+    framed.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    framed.extend_from_slice(&payload);
+    Ok(framed)
+}
+
+/// Write a `KHF1`-headed `.f16` file matching the convention used by
+/// `bin/quantize_q4` for non-quantized weights.
+///
+/// Returns the total number of bytes written. Validation and f64 → f16
+/// conversion (via [`encode_f16_payload`]) finish before the destination is
+/// created, so an invalid tensor cannot appear as a completed output
+/// artifact.
+///
+/// # Errors
+///
+/// Returns an error when the tensor shape is inconsistent, a value is
+/// non-finite before or after f16 encoding, or the output cannot be written.
+pub fn write_f16_file(
+    path: &Path,
+    tensor_name: &str,
+    data: &[f64],
+    shape: &[usize],
+) -> Result<usize, InferenceError> {
+    let source = path.display().to_string();
+    let framed = encode_f16_payload(&source, tensor_name, data, shape)?;
+
+    let mut file = create_output_file(path).map_err(|e| {
         InferenceError::Inference(format!(
             "write_f16_file: failed to create {}: {e}",
             path.display()
         ))
     })?;
-    let mut bytes_written: usize = 0;
+    file.write_all(&framed).map_err(|e| {
+        InferenceError::Inference(format!(
+            "write_f16_file: write failure on {}: {e}",
+            path.display()
+        ))
+    })?;
 
-    let mut write_all = |buf: &[u8]| -> Result<(), InferenceError> {
-        file.write_all(buf).map_err(|e| {
-            InferenceError::Inference(format!(
-                "write_f16_file: write failure on {}: {e}",
-                path.display()
-            ))
-        })
-    };
-
-    write_all(b"KHF1")?;
-    bytes_written += 4;
-    write_all(&1u32.to_le_bytes())?;
-    bytes_written += 4;
-    write_all(&(shape.len() as u32).to_le_bytes())?;
-    bytes_written += 4;
-    for &dim in shape {
-        write_all(&(dim as u64).to_le_bytes())?;
-        bytes_written += 8;
-    }
-    write_all(&(data.len() as u64).to_le_bytes())?;
-    bytes_written += 8;
-
-    let mut payload = Vec::with_capacity(data.len() * 2);
-    for &v in data {
-        // Use the subnormal-aware helper from `weights::q4_weights`. The
-        // hand-rolled flush-to-zero variant in `bin/quantize_q4.rs`
-        // silently rounds f16-subnormal-but-f32-normal values
-        // (~1e-7 range) to zero — relevant here because every kept
-        // tensor (norms, A_log, dt_bias, conv1d, etc.) passes through
-        // this path. `q4_f32_to_f16` round-trips through the f16
-        // subnormal range correctly.
-        let h = q4_f32_to_f16(v as f32);
-        payload.extend_from_slice(&h.to_le_bytes());
-    }
-    write_all(&payload)?;
-    bytes_written += payload.len();
-
-    Ok(bytes_written)
+    Ok(framed.len())
 }
 
 #[cfg(test)]
@@ -911,6 +980,19 @@ mod tests {
 
     /// Write every required tensor for `cfg` to a single safetensors file.
     fn write_required_tensors_for(cfg: &Qwen35Config, path: &Path, seed: u64) {
+        write_required_tensors_for_with_override(cfg, path, seed, None);
+    }
+
+    /// Like [`write_required_tensors_for`], but replaces the data of the
+    /// tensor named `override_entry.0` with `override_entry.1` before
+    /// writing. Used to force a specific planned (rotated) tensor to a
+    /// controlled magnitude for representability-boundary tests.
+    fn write_required_tensors_for_with_override(
+        cfg: &Qwen35Config,
+        path: &Path,
+        seed: u64,
+        override_entry: Option<(&str, Vec<f64>)>,
+    ) {
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let intermediate = cfg.intermediate_size;
@@ -1057,6 +1139,19 @@ mod tests {
             ));
         }
 
+        if let Some((name, data)) = &override_entry {
+            let entry = entries
+                .iter_mut()
+                .find(|(n, _, _)| n == name)
+                .unwrap_or_else(|| panic!("override target tensor `{name}` not found in fixture"));
+            assert_eq!(
+                entry.2.len(),
+                data.len(),
+                "override data length must match fixture tensor `{name}`'s numel"
+            );
+            entry.2 = data.clone();
+        }
+
         let borrowed: Vec<(&str, Vec<usize>, &[f64])> = entries
             .iter()
             .map(|(n, s, d)| (n.as_str(), s.clone(), d.as_slice()))
@@ -1070,9 +1165,61 @@ mod tests {
         write_required_tensors_for(cfg, &dir.join("model.safetensors"), seed);
     }
 
+    /// Like [`write_input_dir`], but overrides one required tensor's data
+    /// before writing — see [`write_required_tensors_for_with_override`].
+    fn write_input_dir_with_override(
+        cfg: &Qwen35Config,
+        dir: &Path,
+        seed: u64,
+        override_entry: (&str, Vec<f64>),
+    ) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("config.json"), tiny_config_json(cfg)).unwrap();
+        write_required_tensors_for_with_override(
+            cfg,
+            &dir.join("model.safetensors"),
+            seed,
+            Some(override_entry),
+        );
+    }
+
     // ------------------------------------------------------------------
     // Happy path
     // ------------------------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn create_output_file_refuses_a_preexisting_symlink() {
+        // Every converter output write (`write_f16_file`, the Q4 write in
+        // `convert_quarot_qwen35`, `quantize_index.json`, `config.json`)
+        // routes through `create_output_file`. `validate_output_dir_layout`
+        // only checks emptiness at the very start of the run, but the real
+        // writes happen much later — after loading every tensor and running
+        // the forward-equivalence gate — so a concurrent actor has a wide
+        // window to plant a symlink at a fixed output filename pointing at
+        // an external victim file. Mutation-sensitive: reverting
+        // `create_output_file` to a plain `fs::File::create` makes this
+        // test fail — the victim file would be truncated instead of the
+        // open being refused.
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, b"do-not-touch").unwrap();
+        let planted = tmp.path().join("config.json");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let err = create_output_file(&planted)
+            .expect_err("a pre-existing symlink at the output path must be refused");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "unexpected error kind: {err}"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"do-not-touch",
+            "victim file reached through the planted symlink must be untouched"
+        );
+    }
 
     #[test]
     fn convert_quarot_qwen35_tied_end_to_end() {
@@ -1204,6 +1351,103 @@ mod tests {
             !output.exists(),
             "dry-run must not create the output directory"
         );
+    }
+
+    /// The Q4 quantized-tensor branch: the
+    /// real-write path (`quantize_f64_to_q4` → `create_output_file` +
+    /// `write_q4_tensor`) validates Q4
+    /// representability via `encode_finite_q4_metadata`'s two-sided
+    /// scale+bias underflow guard, but that call used to be gated behind
+    /// `if !opts.dry_run`, so dry-run silently skipped it. A planned tensor
+    /// whose post-rotation magnitude underflows Q4's symmetric-mode
+    /// scale/bias to f16 zero (B4's constant-block repro, scaled to a whole
+    /// tensor here since Hadamard rotation mixes every element along a
+    /// planned tensor's rotated axis) must be rejected identically in
+    /// dry-run and the real run.
+    ///
+    /// Mutation-sensitive: re-gating `quantize_f64_to_q4` behind `if
+    /// !opts.dry_run` (the pre-fix state) makes the `dry_run: true`
+    /// iteration of this test pass silently through validation, diverging
+    /// from the `dry_run: false` iteration's `Err`.
+    #[test]
+    fn dry_run_rejects_q4_bias_underflow_that_the_real_run_would_also_reject() {
+        let cfg = tiny_cfg(true);
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+        let tensor_name = "model.language_model.layers.0.mlp.down_proj.weight";
+
+        for dry_run in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let input = tmp.path().join("input");
+            let output = tmp.path().join("output");
+            // A uniformly tiny planned tensor: Hadamard rotation is
+            // orthogonal (norm-preserving) along the rotated axis, so a
+            // uniform 1e-9 input stays bounded within a small constant
+            // factor of 1e-9 after rotation — well under the ~5.96e-8 f16
+            // subnormal floor that `encode_finite_q4_metadata` guards
+            // (symmetric-mode scale = abs_max/7, bias = -8*scale; both
+            // derive from the same tiny abs_max and underflow together).
+            let tiny = vec![1e-9_f64; hidden * intermediate];
+            write_input_dir_with_override(&cfg, &input, 200, (tensor_name, tiny));
+
+            let err = convert_quarot_qwen35(
+                &input,
+                &output,
+                &ConversionOptions {
+                    rotation_seed: 0xC0FFEE,
+                    tolerance: 1e-5,
+                    num_probe_tokens: 2,
+                    dry_run,
+                },
+            )
+            .expect_err(&format!(
+                "a Q4 block whose scale/bias underflows to f16 zero must be rejected \
+                 (dry_run={dry_run})"
+            ));
+            assert!(
+                err.to_string().contains("underflows to f16 zero"),
+                "unexpected error (dry_run={dry_run}): {err}"
+            );
+            if dry_run {
+                // Dry-run performs no writes at all (`opts.dry_run` gates
+                // every `fs::create_dir_all`/write in the function), so the
+                // output directory must never come into existence.
+                assert!(
+                    !output.exists(),
+                    "a dry-run rejection must not create output_dir"
+                );
+            }
+            // For the real run, `output_dir` is created before the
+            // per-tensor loop runs (so earlier-sorted tensors can stream
+            // their writes), so a mid-loop rejection can leave it created
+            // (possibly holding earlier tensors' output) — that pre-existing
+            // real-run behavior is orthogonal to the dry-run/real-run
+            // representability *parity* this test guards, which is: both
+            // must reject the SAME input with the SAME error.
+        }
+
+        // A representable planned tensor passes both dry-run and the real run.
+        for dry_run in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let input = tmp.path().join("input");
+            let output = tmp.path().join("output");
+            write_input_dir(&cfg, &input, 201);
+
+            let report = convert_quarot_qwen35(
+                &input,
+                &output,
+                &ConversionOptions {
+                    rotation_seed: 0xC0FFEE,
+                    tolerance: 1e-5,
+                    num_probe_tokens: 2,
+                    dry_run,
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!("representable tensor must be accepted (dry_run={dry_run}): {e}")
+            });
+            assert!(report.planned_quantized > 0);
+        }
     }
 
     /// Refuse-on-fail: tolerance set absurdly tight forces the gate to
@@ -1443,7 +1687,7 @@ mod tests {
         let p = tmp.path().join("test.f16");
         let data = vec![1.5_f64, -2.5, 0.25, -0.125];
         let shape = vec![2_usize, 2];
-        let bytes_written = write_f16_file(&p, &data, &shape).unwrap();
+        let bytes_written = write_f16_file(&p, "test-tensor", &data, &shape).unwrap();
         let raw = fs::read(&p).unwrap();
         assert_eq!(&raw[0..4], b"KHF1");
         assert_eq!(u32::from_le_bytes(raw[4..8].try_into().unwrap()), 1);
@@ -1456,30 +1700,45 @@ mod tests {
         assert_eq!(bytes_written, raw.len());
     }
 
-    /// Smoke check on `q4_f32_to_f16` (used by `write_f16_file`).
-    /// Includes an f16-subnormal regression, since fixed: the old local
-    /// helper flushed every value below f16's smallest
-    /// normal to zero, silently corrupting small-magnitude weights in
-    /// kept tensors (e.g., `A_log`, `dt_bias`, GDN `linear_attn.norm`).
     #[test]
-    fn q4_f32_to_f16_canonical_and_subnormal_values() {
-        assert_eq!(q4_f32_to_f16(0.0), 0x0000);
-        assert_eq!(q4_f32_to_f16(-0.0), 0x8000);
-        assert_eq!(q4_f32_to_f16(1.0), 0x3c00);
-        assert_eq!(q4_f32_to_f16(-1.0), 0xbc00);
-        assert_eq!(q4_f32_to_f16(f32::INFINITY), 0x7c00);
-        assert_eq!(q4_f32_to_f16(f32::NEG_INFINITY), 0xfc00);
-        // f16 smallest positive normal is 2^-14 ≈ 6.103515625e-5; values
-        // below that but above the f16 subnormal floor (2^-24) must NOT
-        // flush to zero — they should encode as f16 subnormals.
-        let h = q4_f32_to_f16(1e-7_f32);
-        assert_ne!(
-            h, 0,
-            "1e-7 (an f16 subnormal range value) must not flush to zero"
-        );
-        // f32 subnormals (well below f16's subnormal range) DO round to zero
-        // because there's no f16 representation for them.
-        assert_eq!(q4_f32_to_f16(1e-40_f32), 0);
+    fn f16_file_rejects_invalid_encoded_values_before_creation() {
+        for (case, value) in [
+            ("nan", f64::NAN),
+            ("positive-infinity", f64::INFINITY),
+            ("negative-infinity", f64::NEG_INFINITY),
+            ("finite-f16-overflow", f32::MAX as f64),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join(format!("{case}.f16"));
+            let err = write_f16_file(&path, "test-tensor", &[value], &[1])
+                .expect_err("invalid f16 output must be rejected");
+            assert!(
+                err.to_string().contains("non-finite"),
+                "unexpected {case} error: {err}"
+            );
+            assert!(
+                !path.exists(),
+                "validation must finish before publishing {case} output"
+            );
+        }
+    }
+
+    /// The shared KHF1 encoder preserves signed zero and f16 subnormals.
+    #[test]
+    fn f16_file_preserves_signed_zero_and_subnormal_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("edge-values.f16");
+        write_f16_file(&path, "test-tensor", &[0.0, -0.0, 1e-7, 1e-40], &[4]).unwrap();
+        let raw = fs::read(path).unwrap();
+        let payload = &raw[28..];
+        let bits: Vec<u16> = payload
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        assert_eq!(bits[0], 0x0000);
+        assert_eq!(bits[1], 0x8000);
+        assert_ne!(bits[2], 0, "f16 subnormal must not flush to zero");
+        assert_eq!(bits[3], 0);
     }
 
     /// f32_to_bf16_bits helper smoke check (used by the test fixture

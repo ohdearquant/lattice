@@ -54,6 +54,9 @@ test-utils = []
 [dependencies]
 half.workspace = true
 memmap2 = "0.9"
+# Unix directory-fd binding (openat/O_NOFOLLOW) for the QuaRot/Q4 offline
+# quantizer's staging-directory writes (path-race hardening, ADR-058).
+libc = "0.2"
 indexmap = "2"
 rustc-hash = "2"
 rayon = { workspace = true }

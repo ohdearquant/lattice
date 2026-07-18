@@ -40,14 +40,45 @@
 //! [ADR-044]: ../../../../../docs/adr/ADR-044-quarot-rotated-quantization.md
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::Path;
 
 use memmap2::Mmap;
 use serde_json::Value;
 
+use std::path::PathBuf;
+
 use crate::error::InferenceError;
 use crate::weights::f32_weights::parse_index;
+
+/// Resolve a manifest-declared shard filename against `model_root`, rejecting
+/// absolute paths and any resolution that escapes the model directory.
+///
+/// Mirrors `f32_weights::contain_manifest_path` from PR #1053 (not yet merged
+/// as of this writing) verbatim, so that once #1053 lands a follow-up rebase
+/// can drop this local copy and call the shared helper instead. Canonicalizing
+/// the candidate (rather than only the parent) is correct here because the
+/// shard file is expected to exist on disk at read time.
+pub(crate) fn contain_manifest_path(
+    model_root: &Path,
+    entry_name: &str,
+) -> Result<PathBuf, InferenceError> {
+    if Path::new(entry_name).is_absolute() {
+        return Err(InferenceError::Inference(format!(
+            "manifest entry {entry_name:?} must be a path relative to the model directory, not absolute"
+        )));
+    }
+    let candidate = model_root.join(entry_name);
+    let canon_root = model_root.canonicalize().map_err(InferenceError::Io)?;
+    let canon_candidate = candidate.canonicalize().map_err(InferenceError::Io)?;
+    if !canon_candidate.starts_with(&canon_root) {
+        return Err(InferenceError::Inference(format!(
+            "manifest entry {entry_name:?} escapes model root {} (resolved to {})",
+            model_root.display(),
+            canon_candidate.display()
+        )));
+    }
+    Ok(canon_candidate)
+}
 
 /// On-disk storage dtype of a tensor.
 ///
@@ -93,6 +124,7 @@ struct TensorHeader {
 
 #[derive(Debug)]
 struct Shard {
+    source: String,
     mmap: Mmap,
     /// Absolute file offset where the data section begins
     /// (`8 + header_len`).
@@ -162,10 +194,29 @@ fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
 }
 
 impl Shard {
+    /// Open `path` for mmap, refusing to follow a symlink at the final path
+    /// component (`O_NOFOLLOW`).
+    ///
+    /// For manifest-referenced shards, `contain_manifest_path` validates
+    /// containment before this call, but that canonicalize-then-open
+    /// sequence is not atomic: an attacker could replace `path` with a
+    /// symlink pointing outside the model root after the check and before
+    /// this open. `O_NOFOLLOW` means that swap makes the open fail outright
+    /// (`ELOOP`) instead of silently following the symlink and mapping bytes
+    /// from outside the model directory, regardless of the timing of the
+    /// swap.
     fn open(path: &Path) -> Result<Self, InferenceError> {
-        let file = File::open(path).map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
-        })?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| {
+                InferenceError::InvalidSafetensors(format!(
+                    "failed to open {}: {e}",
+                    path.display()
+                ))
+            })?;
         // SAFETY: the file is opened read-only; the returned Mmap owns the
         // mapping. The File handle can be dropped immediately after — the OS
         // keeps the fd alive through the map. Standard memmap2 usage.
@@ -381,6 +432,7 @@ impl Shard {
         }
 
         Ok(Shard {
+            source: path.display().to_string(),
             mmap,
             data_offset,
             headers,
@@ -478,7 +530,8 @@ impl QuarotTensorReader {
                 if shards.contains_key(shard_file) {
                     continue;
                 }
-                let shard = Shard::open(&model_dir.join(shard_file))?;
+                let shard_path = contain_manifest_path(model_dir, shard_file)?;
+                let shard = Shard::open(&shard_path)?;
                 shards.insert(shard_file.clone(), shard);
             }
             Ok(Self {
@@ -583,7 +636,7 @@ impl QuarotTensorReader {
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?
             .clone();
         let bytes = shard.tensor_bytes(name)?;
-        let data = decode_bytes_to_f64(bytes, header.dtype)?;
+        let data = decode_bytes_to_f64(&shard.source, name, bytes, header.dtype, &header.shape)?;
         Ok((data, header.shape))
     }
 
@@ -613,51 +666,31 @@ impl QuarotTensorReader {
     }
 }
 
-fn decode_bytes_to_f64(bytes: &[u8], dtype: SourceDType) -> Result<Vec<f64>, InferenceError> {
-    match dtype {
-        SourceDType::F32 => {
-            if !bytes.len().is_multiple_of(4) {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "F32 tensor byte length {} not divisible by 4",
-                    bytes.len()
-                )));
-            }
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
-                .collect())
-        }
-        SourceDType::BF16 => {
-            if !bytes.len().is_multiple_of(2) {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "BF16 tensor byte length {} not divisible by 2",
-                    bytes.len()
-                )));
-            }
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|b| {
-                    crate::weights::half_bits::bf16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]))
-                        as f64
-                })
-                .collect())
-        }
-        SourceDType::F16 => {
-            if !bytes.len().is_multiple_of(2) {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "F16 tensor byte length {} not divisible by 2",
-                    bytes.len()
-                )));
-            }
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|b| {
-                    crate::weights::half_bits::f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]))
-                        as f64
-                })
-                .collect())
-        }
-    }
+fn decode_bytes_to_f64(
+    source: &str,
+    tensor_name: &str,
+    bytes: &[u8],
+    dtype: SourceDType,
+    shape: &[usize],
+) -> Result<Vec<f64>, InferenceError> {
+    let raw_dtype = match dtype {
+        SourceDType::F32 => crate::weights::ingress::RawDType::F32,
+        SourceDType::F16 => crate::weights::ingress::RawDType::F16,
+        SourceDType::BF16 => crate::weights::ingress::RawDType::Bf16,
+    };
+    let mut values = Vec::new();
+    crate::weights::ingress::validate_ingested_tensor(
+        crate::weights::ingress::IngestedTensor::decode_f64(
+            source,
+            tensor_name,
+            shape,
+            dtype.name(),
+            bytes,
+            raw_dtype,
+            &mut values,
+        ),
+    )?;
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -667,7 +700,7 @@ mod tests {
     use std::io::Write;
 
     /// On-disk dtype for synthetic test fixtures.
-    #[derive(Copy, Clone)]
+    #[derive(Debug, Copy, Clone)]
     enum FixtureDType {
         F32,
         F16,
@@ -840,6 +873,40 @@ mod tests {
     }
 
     #[test]
+    fn read_tensor_f64_rejects_non_finite_values_with_provenance() {
+        for dtype in [FixtureDType::F32, FixtureDType::F16, FixtureDType::BF16] {
+            for (case, bad) in [
+                ("nan", f32::NAN),
+                ("positive-infinity", f32::INFINITY),
+                ("negative-infinity", f32::NEG_INFINITY),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("model.safetensors");
+                let values = [1.0, bad, 3.0];
+                write_safetensors(&path, &[("invalid.weight", dtype, vec![3], &values)]);
+
+                let reader = QuarotTensorReader::open(dir.path()).unwrap();
+                let err = reader
+                    .read_tensor_f64("invalid.weight")
+                    .expect_err("non-finite source value must be rejected");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("invalid.weight"),
+                    "{case} {dtype:?} error must name the tensor: {msg}"
+                );
+                assert!(
+                    msg.contains(path.to_string_lossy().as_ref()),
+                    "{case} {dtype:?} error must name the source path: {msg}"
+                );
+                assert!(
+                    msg.contains("element index 1"),
+                    "{case} {dtype:?} error must locate the bad value: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn sharded_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let shard_a = "model-00001-of-00002.safetensors";
@@ -891,6 +958,105 @@ mod tests {
         // Re-reading the same tensor exercises the cached-shard path.
         let (a_again, _) = reader.read_tensor_f64("a.weight").unwrap();
         assert_eq!(a_again, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    // -------------------------------------------------------------------
+    // Shard-path containment (mirrors PR #1053's `contain_manifest_path`).
+    //
+    // Mutation-sensitive: with `contain_manifest_path` bypassed (shard join
+    // reverted to a bare `model_dir.join(shard_file)`), both tests below
+    // would instead succeed in opening the reader and reading the escaped
+    // tensor's real contents from outside the model directory.
+    // -------------------------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn shard_open_refuses_a_symlink() {
+        // `contain_manifest_path` canonicalizes (and thus resolves) any
+        // symlink present at call time, so a symlink planted before that
+        // check runs is already caught there. The gap this guards is a
+        // symlink planted *after* the containment check passes and *before*
+        // `Shard::open`'s `File::open` — not reproducible end-to-end in a
+        // single-threaded test, so this exercises `Shard::open` directly
+        // with a symlink standing in for that later swap.
+        //
+        // Mutation-sensitive: reverting `Shard::open` to a plain
+        // `File::open` (dropping `O_NOFOLLOW`) makes this test fail — the
+        // open would succeed and follow the symlink.
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real.safetensors");
+        write_safetensors(
+            &real,
+            &[("secret.weight", FixtureDType::F32, vec![1], &[42.0])],
+        );
+        let link = root.path().join("linked.safetensors");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = Shard::open(&link).expect_err("Shard::open must refuse a symlink, not follow it");
+        assert!(
+            err.to_string().contains("failed to open"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sharded_index_rejects_path_traversal_shard_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let model_dir = root.path().join("model_root");
+        std::fs::create_dir(&model_dir).unwrap();
+
+        // A file OUTSIDE model_dir that a hostile index.json tries to reach.
+        write_safetensors(
+            &root.path().join("secret.safetensors"),
+            &[("secret.weight", FixtureDType::F32, vec![1], &[42.0])],
+        );
+
+        let index = serde_json::json!({
+            "metadata": {"total_size": 4usize},
+            "weight_map": {"secret.weight": "../secret.safetensors"},
+        });
+        std::fs::write(
+            model_dir.join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let err = QuarotTensorReader::open(&model_dir)
+            .expect_err("a shard entry escaping model_dir via ../ must be rejected");
+        assert!(
+            err.to_string().contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sharded_index_rejects_absolute_shard_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let model_dir = root.path().join("model_root");
+        std::fs::create_dir(&model_dir).unwrap();
+
+        write_safetensors(
+            &root.path().join("secret.safetensors"),
+            &[("secret.weight", FixtureDType::F32, vec![1], &[42.0])],
+        );
+
+        let absolute_target = root.path().join("secret.safetensors");
+        let index = serde_json::json!({
+            "metadata": {"total_size": 4usize},
+            "weight_map": {"secret.weight": absolute_target.to_str().unwrap()},
+        });
+        std::fs::write(
+            model_dir.join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let err = QuarotTensorReader::open(&model_dir)
+            .expect_err("an absolute shard entry must be rejected");
+        assert!(
+            err.to_string().contains("must be a path relative"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

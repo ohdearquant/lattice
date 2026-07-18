@@ -14,10 +14,14 @@
 //! alongside its `f32` downcast and Q4 output.
 
 use lattice_inference::quant::quarot::QuarotTensorReader;
-use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, quantize_f32_to_q4, save_q4_file};
+use lattice_inference::quant::quarot::convert::encode_f16_payload;
+use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, q4_file_bytes, quantize_f32_to_q4};
+use std::ffi::CString;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -77,91 +81,6 @@ fn should_quantize(name: &str) -> bool {
 
     // Default: quantize unknown weight matrices.
     true
-}
-
-// ---------------------------------------------------------------------------
-// F32 → F16 helper (for non-quantized tensors written as f16)
-// ---------------------------------------------------------------------------
-
-/// Convert f32 to IEEE-754 f16 bit pattern with round-to-nearest-even.
-#[inline]
-fn f32_to_f16(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let frac = bits & 0x007f_ffff;
-
-    if exp == 0xff {
-        if frac == 0 {
-            return sign | 0x7c00;
-        }
-        let mut payload = ((frac >> 13) as u16) & 0x03ff;
-        if payload == 0 {
-            payload = 1;
-        }
-        return sign | 0x7c00 | payload | 0x0200;
-    }
-    if exp == 0 {
-        return sign;
-    }
-
-    let exp32 = exp - 127;
-    if exp32 > 15 {
-        return sign | 0x7c00;
-    }
-
-    if exp32 >= -14 {
-        let frac16_raw = (frac >> 13) as u16;
-        let round_bit = ((frac >> 12) & 1) as u16;
-        let sticky = (frac & 0x0fff) != 0;
-        let frac16 = frac16_raw
-            + if round_bit == 1 && (sticky || (frac16_raw & 1) == 1) {
-                1
-            } else {
-                0
-            };
-        let mut exp16 = (exp32 + 15) as u16;
-        let mut frac16_final = frac16 & 0x03ff;
-        if frac16 == 0x0400 {
-            frac16_final = 0;
-            exp16 += 1;
-            if exp16 >= 0x1f {
-                return sign | 0x7c00;
-            }
-        }
-        return sign | (exp16 << 10) | frac16_final;
-    }
-
-    // exp32 < -14: the f32 value is normal-range but smaller than the
-    // smallest f16 normal. F16 still represents 2^-24..2^-14 as subnormals,
-    // and a source-F16 subnormal reaches this point after widening through
-    // f64 and narrowing back to f32 (both exact), so flushing to zero here
-    // would silently destroy a value f16 can represent exactly. Encode it
-    // as an f16 subnormal instead, using the same round-to-nearest-even
-    // shape as the normal-range path above.
-    let sig = 0x0080_0000u32 | frac;
-    let shift = (-exp32 - 1) as u32;
-
-    // Beyond this shift the discarded bits can never reach halfway to the
-    // smallest subnormal (2^-24), so the correctly rounded result is zero.
-    if shift >= 25 {
-        return sign;
-    }
-
-    let frac16_raw = (sig >> shift) as u16;
-    let round_bit = ((sig >> (shift - 1)) & 1) as u16;
-    let sticky = (sig & ((1u32 << (shift - 1)) - 1)) != 0;
-    let frac16 = frac16_raw
-        + if round_bit == 1 && (sticky || (frac16_raw & 1) == 1) {
-            1
-        } else {
-            0
-        };
-
-    // frac16 == 0x0400 means rounding overflowed the largest subnormal into
-    // the smallest normal f16 (exponent field 0x01, fraction 0) — that bit
-    // pattern is exactly `sign | 0x0400`, so no separate branch is needed.
-    sign | frac16
 }
 
 // ---------------------------------------------------------------------------
@@ -244,20 +163,326 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         print_usage_and_exit();
     });
 
-    if !dry_run {
-        fs::create_dir_all(&output_dir)?;
-        let source_config = model_dir.join("config.json");
-        let output_config = output_dir.join("config.json");
-        fs::copy(&source_config, &output_config).map_err(|e| {
+    quantize_model(&model_dir, &output_dir, dry_run)
+}
+
+/// Open `dir` as a directory fd bound to that exact inode, refusing to
+/// follow a symlink.
+///
+/// This is the fd-bind primitive every staging-directory write in this file
+/// routes through: a `Path` re-resolves at the moment of each syscall, so an
+/// attacker who can replace `dir` (or a child within it) between `mkdir` and
+/// a later path-based write redirects that write to wherever the path now
+/// points. A directory fd, once opened, is bound to the inode — later
+/// `openat` calls against this fd always land inside the directory that was
+/// actually created, regardless of what the path currently resolves to.
+/// `O_NOFOLLOW` additionally rejects the open outright if `dir` was swapped
+/// for a symlink between `mkdir` and this call.
+fn open_dir_nofollow(dir: &Path) -> Result<OwnedFd, Box<dyn std::error::Error>> {
+    let cpath = CString::new(dir.as_os_str().as_bytes()).map_err(|e| {
+        format!(
+            "staging directory path {} contains an interior NUL byte: {e}",
+            dir.display()
+        )
+    })?;
+    // SAFETY: `cpath` is a valid NUL-terminated C string owned for the
+    // duration of this call. `libc::open` returns either a valid owned fd
+    // (>= 0) or -1 with errno set; the -1 case is checked immediately below
+    // before any use of `raw`.
+    let raw = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(format!(
+            "failed to open staging directory {} (O_DIRECTORY|O_NOFOLLOW): {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    // SAFETY: `raw` was just returned by `libc::open` above, checked
+    // non-negative, and is not owned or closed anywhere else — `OwnedFd`
+    // becomes its sole owner and will close it on drop.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Publish directory for a conversion run: a fresh temp dir on success (`dry_run`
+/// leaves `output_dir` itself as the target, since nothing is ever written), or
+/// `output_dir` directly when there is nothing to atomically publish.
+///
+/// The `Drop` impl removes the temp dir unless [`TempPublishDir::publish`] has
+/// consumed it — so any early return via `?` between creation and publish
+/// discards the partially-written temp dir and leaves `output_dir` untouched.
+struct TempPublishDir {
+    /// `Some(temp_path)` when writes are staged in a temp dir pending an
+    /// atomic rename; `None` for dry runs, where there is nothing to publish.
+    temp: Option<PathBuf>,
+    /// Directory fd for `temp`, opened `O_DIRECTORY|O_NOFOLLOW` immediately
+    /// after `mkdir` and held for the lifetime of the conversion. Every
+    /// staging-directory write in [`quantize_model`] goes through
+    /// [`TempPublishDir::create_file`] against this fd — never a path-based
+    /// `File::create`/`fs::write` — so the write always lands in the
+    /// directory that was actually created, not wherever the staging path
+    /// resolves to at write time. `None` for dry runs (nothing is staged).
+    dir_fd: Option<OwnedFd>,
+    output_dir: PathBuf,
+}
+
+impl TempPublishDir {
+    /// Refuse a pre-existing non-empty `output_dir` (fail before any write),
+    /// then create a fresh temp dir adjacent to it (same parent => same
+    /// filesystem, so the final rename is atomic). A fresh dir has no
+    /// pre-planted symlinks. Immediately opens a directory fd bound to that
+    /// staging dir (`open_dir_nofollow`) — held for the rest of the run so
+    /// every subsequent write can bind to the fd instead of re-resolving
+    /// the staging path.
+    fn create(output_dir: &Path, dry_run: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        if dry_run {
+            return Ok(Self {
+                temp: None,
+                dir_fd: None,
+                output_dir: output_dir.to_path_buf(),
+            });
+        }
+
+        if let Ok(mut entries) = fs::read_dir(output_dir)
+            && entries.next().is_some()
+        {
+            return Err(format!(
+                "output directory {} already exists and is not empty; \
+                 refusing to overwrite (remove it first if this is intentional)",
+                output_dir.display()
+            )
+            .into());
+        }
+
+        let parent = output_dir.parent().ok_or_else(|| {
             format!(
-                "failed to copy {} to {}: {e}",
-                source_config.display(),
+                "output directory {} has no parent to stage a temp dir in",
+                output_dir.display()
+            )
+        })?;
+        // Restore the parent-creation behavior `fs::create_dir_all(output_dir)`
+        // used to provide before `TempPublishDir` replaced it: a valid
+        // `--output-dir` whose parent doesn't exist yet must still succeed
+        // (the adjacent temp dir and the final rename target both resolve
+        // once the parent exists). The refuse-non-empty-output check above
+        // already ran, so this can't paper over a stale non-empty target.
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "failed to create output directory parent {}: {e}",
+                parent.display()
+            )
+        })?;
+        let dir_name = output_dir
+            .file_name()
+            .ok_or_else(|| format!("output directory {} has no file name", output_dir.display()))?
+            .to_string_lossy();
+        let temp_dir = parent.join(format!(".{dir_name}.quantize-tmp-{}", std::process::id()));
+        fs::create_dir(&temp_dir).map_err(|e| {
+            format!(
+                "failed to create staging directory {}: {e}",
+                temp_dir.display()
+            )
+        })?;
+        let dir_fd = open_dir_nofollow(&temp_dir)?;
+
+        Ok(Self {
+            temp: Some(temp_dir),
+            dir_fd: Some(dir_fd),
+            output_dir: output_dir.to_path_buf(),
+        })
+    }
+
+    /// Directory that writes should target: the temp dir when staging, or
+    /// `output_dir` directly for a dry run. Used only for path *display* and
+    /// bookkeeping now — actual writes go through [`TempPublishDir::create_file`],
+    /// bound to `dir_fd`, never through this path.
+    fn write_dir(&self) -> &Path {
+        self.temp.as_deref().unwrap_or(&self.output_dir)
+    }
+
+    /// Create (and open for writing) a new file directly inside the staging
+    /// directory via `openat` against the held `dir_fd` — never a path-based
+    /// `File::create`. `filename` must be a plain file name (no separators);
+    /// every call site passes a literal or a sanitized tensor-name stem.
+    ///
+    /// `O_EXCL` refuses a pre-existing entry (including one an attacker
+    /// planted after `mkdir` but before this call); `O_NOFOLLOW` refuses to
+    /// follow it even if it is a symlink. Mode `0o600`: staging artifacts
+    /// are private to the invoking user until the final rename publishes
+    /// them under `output_dir`.
+    fn create_file(&self, filename: &str) -> Result<fs::File, Box<dyn std::error::Error>> {
+        let dir_fd = self.dir_fd.as_ref().ok_or_else(|| {
+            format!(
+                "staging directory {} has no open directory fd (dry run?)",
+                self.write_dir().display()
+            )
+        })?;
+        let cname = CString::new(filename)
+            .map_err(|e| format!("file name {filename} contains an interior NUL byte: {e}"))?;
+        // SAFETY: `dir_fd` is a valid open directory fd held for the
+        // lifetime of `self`; `cname` is a valid NUL-terminated C string
+        // owned for the duration of this call. `openat` returns either a
+        // valid owned fd (>= 0) or -1 with errno set; the -1 case is
+        // checked immediately below before any use of `raw`.
+        let raw = unsafe {
+            libc::openat(
+                dir_fd.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if raw < 0 {
+            return Err(format!(
+                "failed to create {filename} in staging directory {}: {}",
+                self.write_dir().display(),
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        // SAFETY: `raw` was just returned by `libc::openat` above, checked
+        // non-negative, and is not owned or closed anywhere else —
+        // `OwnedFd`/`File` becomes its sole owner and will close it on drop.
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        Ok(fs::File::from(owned))
+    }
+
+    /// fsync every held file handle written during this run, fsync the
+    /// staging directory itself (via the held `dir_fd`, not a path-based
+    /// reopen), then atomically rename the temp dir onto `output_dir`.
+    /// No-op for a dry run (nothing was staged).
+    ///
+    /// Consumes `written_files` (path + open file handle pairs, for fsync
+    /// and error-message display) rather than reopening each path — the
+    /// files were already opened bound to `dir_fd` by
+    /// [`TempPublishDir::create_file`], so fsyncing the held handle keeps
+    /// the whole write+durability path fd-bound end to end.
+    ///
+    /// Ownership of the staging dir/fd is released (`self.temp`/`self.dir_fd`
+    /// set to `None`) only *after* the rename succeeds — an earlier `?`
+    /// return (fsync failure) leaves them populated so `Drop` still cleans
+    /// up the orphaned staging directory instead of leaking it.
+    fn publish(
+        mut self,
+        written_files: Vec<(PathBuf, fs::File)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(temp_dir) = self.temp.clone() else {
+            return Ok(());
+        };
+        for (path, file) in &written_files {
+            file.sync_all()
+                .map_err(|e| format!("failed to fsync {}: {e}", path.display()))?;
+        }
+        let dir_fd = self.dir_fd.as_ref().ok_or_else(|| {
+            format!(
+                "staging directory {} has no open directory fd to fsync",
+                temp_dir.display()
+            )
+        })?;
+        // SAFETY: `dir_fd` is a valid open fd held for the lifetime of
+        // `self`. `libc::fsync` returns 0 on success or -1 with errno set.
+        if unsafe { libc::fsync(dir_fd.as_raw_fd()) } != 0 {
+            return Err(format!(
+                "failed to fsync staging directory {}: {}",
+                temp_dir.display(),
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        // `fs::rename` below is necessarily path-based (POSIX has no
+        // "rename this fd" call) — but `dir_fd` was bound to the inode
+        // `mkdir` actually created, so it is the one piece of ground truth
+        // an attacker cannot redirect. Compare it against a fresh stat of
+        // `temp_dir` immediately before the rename: if the path was swapped
+        // for a different directory (a plain directory substitution passes
+        // `O_NOFOLLOW`, which only rejects a symlink) between the last
+        // write and this call, the inode numbers diverge and the rename is
+        // refused instead of publishing the attacker's substituted
+        // directory as `output_dir`.
+        let mut fd_stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `dir_fd` is a valid open fd for the lifetime of `self`;
+        // `fd_stat` is a valid, fully-initialized (zeroed) `libc::stat` the
+        // kernel writes into. `fstat` returns 0 on success or -1 with errno
+        // set, checked immediately below.
+        if unsafe { libc::fstat(dir_fd.as_raw_fd(), &raw mut fd_stat) } != 0 {
+            return Err(format!(
+                "failed to fstat staging directory {}: {}",
+                temp_dir.display(),
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        let path_meta = fs::symlink_metadata(&temp_dir).map_err(|e| {
+            format!(
+                "failed to stat staging directory {} before publish: {e}",
+                temp_dir.display()
+            )
+        })?;
+        use std::os::unix::fs::MetadataExt;
+        if path_meta.dev() != fd_stat.st_dev as u64 || path_meta.ino() != fd_stat.st_ino {
+            return Err(format!(
+                "staging directory {} was replaced before publish (inode mismatch: \
+                 held fd is dev={} ino={}, path now resolves to dev={} ino={}); \
+                 refusing to publish a substituted directory",
+                temp_dir.display(),
+                fd_stat.st_dev,
+                fd_stat.st_ino,
+                path_meta.dev(),
+                path_meta.ino(),
+            )
+            .into());
+        }
+        fs::rename(&temp_dir, &self.output_dir).map_err(|e| {
+            format!(
+                "failed to publish {} to {}: {e}",
+                temp_dir.display(),
+                self.output_dir.display()
+            )
+        })?;
+        self.temp = None;
+        self.dir_fd = None;
+        Ok(())
+    }
+}
+
+impl Drop for TempPublishDir {
+    fn drop(&mut self) {
+        if let Some(temp_dir) = self.temp.take() {
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+    }
+}
+
+fn quantize_model(
+    model_dir: &Path,
+    output_dir: &Path,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let publish_dir = TempPublishDir::create(output_dir, dry_run)?;
+    let write_dir = publish_dir.write_dir().to_path_buf();
+    let mut written_files: Vec<(PathBuf, fs::File)> = Vec::new();
+
+    if !dry_run {
+        let source_config = model_dir.join("config.json");
+        let output_config = write_dir.join("config.json");
+        let config_bytes = fs::read(&source_config)
+            .map_err(|e| format!("failed to read {}: {e}", source_config.display()))?;
+        let mut f = publish_dir.create_file("config.json")?;
+        f.write_all(&config_bytes).map_err(|e| {
+            format!(
+                "failed to write {} to staging directory: {e}",
                 output_config.display()
             )
         })?;
+        written_files.push((output_config, f));
     }
 
-    let reader = QuarotTensorReader::open(&model_dir)?;
+    let reader = QuarotTensorReader::open(model_dir)?;
     let mut tensor_names = reader.tensor_names();
     tensor_names.sort();
     let n_tensors = tensor_names.len();
@@ -298,9 +523,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
 
-        // Reader decodes to f64; the Q4 quantizer works in f32 (ADR-044 step 3c).
-        let data_f32: Vec<f32> = data_f64.iter().map(|&v| v as f32).collect();
-        let numel = data_f32.len();
+        let numel = data_f64.len();
         total_bytes_in += bytes_in;
 
         let sanitized: String = tensor_name
@@ -315,16 +538,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         if should_quantize(tensor_name) {
+            // Reader decodes to f64; the Q4 quantizer works in f32 (ADR-044 step
+            // 3c). Only quantized tensors need this widening pass — kept
+            // tensors write directly from `data_f64` below.
+            let data_f32: Vec<f32> = data_f64.iter().map(|&v| v as f32).collect();
             let q4 = quantize_f32_to_q4(&data_f32, &shape)?;
             let bytes_out = (q4.blocks.len() * Q4_BLOCK_BYTES) as u64;
             total_bytes_out += bytes_out;
 
             let out_filename = format!("{sanitized}.q4");
-            let out_path = output_dir.join(&out_filename);
+            let out_path = write_dir.join(&out_filename);
 
             if !dry_run {
-                save_q4_file(&out_path, &q4)
+                let mut f = publish_dir.create_file(&out_filename)?;
+                f.write_all(&q4_file_bytes(&q4))
                     .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+                written_files.push((out_path, f));
             }
 
             let elapsed = tensor_start.elapsed();
@@ -348,29 +577,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // Kept tensor: reader already decoded to numeric values, so the
             // common path is decoded-value → f16 for every source dtype.
-            let f16_data: Vec<u8> = data_f32
-                .iter()
-                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                .collect();
-
-            let bytes_out = f16_data.len() as u64;
+            let bytes_out = (numel * 2) as u64;
             total_bytes_out += bytes_out;
 
             let out_filename = format!("{sanitized}.f16");
-            let out_path = output_dir.join(&out_filename);
+            let out_path = write_dir.join(&out_filename);
+
+            // Validate f16 representability unconditionally: a dry run must
+            // reject exactly what the real write below
+            // would reject — a finite kept value that overflows f16
+            // narrowing (e.g. `f32::MAX`) errors here regardless of
+            // `dry_run`, instead of only surfacing on the next real run.
+            let framed = encode_f16_payload(
+                &out_path.display().to_string(),
+                tensor_name,
+                &data_f64,
+                &shape,
+            )?;
 
             if !dry_run {
-                let mut f = fs::File::create(&out_path)
-                    .map_err(|e| format!("failed to create {}: {e}", out_path.display()))?;
-                // Minimal header: magic "KHF1" + version u32 + ndim u32 + shape[i] u64 + numel u64 + data
-                f.write_all(b"KHF1")?;
-                f.write_all(&1u32.to_le_bytes())?;
-                f.write_all(&(shape.len() as u32).to_le_bytes())?;
-                for &dim in &shape {
-                    f.write_all(&(dim as u64).to_le_bytes())?;
-                }
-                f.write_all(&(numel as u64).to_le_bytes())?;
-                f.write_all(&f16_data)?;
+                let mut f = publish_dir.create_file(&out_filename)?;
+                f.write_all(&framed)
+                    .map_err(|e| format!("failed to write {}: {e}", out_path.display()))?;
+                written_files.push((out_path, f));
             }
 
             let elapsed = tensor_start.elapsed();
@@ -396,14 +625,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         total_tensors += 1;
     }
 
-    // Write the quantization index.
+    // Write the quantization index, then atomically publish the whole run.
     if !dry_run {
-        let index_path = output_dir.join("quantize_index.json");
+        let index_path = write_dir.join("quantize_index.json");
         let index_json = serde_json::to_string_pretty(&index_entries)
             .map_err(|e| format!("failed to serialize index: {e}"))?;
-        fs::write(&index_path, index_json)
+        let mut f = publish_dir.create_file("quantize_index.json")?;
+        f.write_all(index_json.as_bytes())
             .map_err(|e| format!("failed to write {}: {e}", index_path.display()))?;
-        eprintln!("Index written: {}", index_path.display());
+        written_files.push((index_path, f));
+        eprintln!(
+            "Index written: {}",
+            output_dir.join("quantize_index.json").display()
+        );
+
+        publish_dir.publish(written_files)?;
     }
 
     let total_elapsed = global_start.elapsed();
@@ -442,7 +678,402 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::should_quantize;
+    use super::{quantize_model, should_quantize};
+    use std::fs;
+    use std::io::Write;
+    use std::path::Path;
+
+    fn write_single_f32_tensor(path: &Path, name: &str, values: &[f32]) {
+        let payload: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let header = serde_json::json!({
+            name: {
+                "dtype": "F32",
+                "shape": [values.len()],
+                "data_offsets": [0, payload.len()],
+            }
+        });
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&payload).unwrap();
+    }
+
+    #[test]
+    fn invalid_source_tensor_is_not_published() {
+        for (name, extension) in [("invalid.weight", "q4"), ("invalid.norm.weight", "f16")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let input = tmp.path().join("input");
+            let output = tmp.path().join("output");
+            fs::create_dir(&input).unwrap();
+            fs::write(input.join("config.json"), b"{}").unwrap();
+            write_single_f32_tensor(
+                &input.join("model.safetensors"),
+                name,
+                &[1.0, f32::NAN, 3.0],
+            );
+
+            let err = quantize_model(&input, &output, false)
+                .expect_err("offline quantizer must reject a non-finite source tensor");
+            let sanitized = name.replace('.', "_");
+            assert!(err.to_string().contains(name), "unexpected error: {err}");
+            assert!(
+                !output.join(format!("{sanitized}.{extension}")).exists(),
+                "invalid tensor must not have a completed output artifact"
+            );
+            assert!(!output.join("quantize_index.json").exists());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic publish + refuse-non-empty-output-dir.
+    //
+    // Mutation-sensitive: reverting `TempPublishDir` so writes land directly
+    // in `output_dir` (as before this fix) makes
+    // `atomic_publish_leaves_output_dir_untouched_on_mid_conversion_failure`
+    // fail (a partial `.q4`/`config.json` would appear in `output`), and
+    // dropping the up-front `fs::read_dir` non-empty check makes both
+    // `quantize_model_refuses_preexisting_nonempty_output_dir` and
+    // `quantize_model_refuses_output_dir_containing_planted_symlink` fail
+    // (the stray file / symlink would silently coexist with fresh output).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quantize_model_publishes_successful_run_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join("config.json"), b"{}").unwrap();
+        write_single_f32_tensor(
+            &input.join("model.safetensors"),
+            "model.layers.0.input_layernorm.weight",
+            &[1.0, 2.0, 3.0],
+        );
+
+        quantize_model(&input, &output, false).unwrap();
+
+        assert!(output.join("config.json").exists());
+        assert!(output.join("quantize_index.json").exists());
+        // No leftover staging directory beside the published output.
+        let siblings: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            siblings
+                .iter()
+                .filter(|n| *n != "input" && *n != "output")
+                .count(),
+            0,
+            "no temp staging directory should survive a successful run: {siblings:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_publish_leaves_output_dir_untouched_on_mid_conversion_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join("config.json"), b"{}").unwrap();
+        write_single_f32_tensor(
+            &input.join("model.safetensors"),
+            "invalid.norm.weight",
+            &[1.0, f32::NAN, 3.0],
+        );
+
+        quantize_model(&input, &output, false)
+            .expect_err("non-finite source tensor must fail the conversion");
+
+        assert!(
+            !output.exists(),
+            "a failed conversion must leave output_dir absent, not partially populated"
+        );
+        // No orphaned staging directory left behind either.
+        let siblings: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            siblings.iter().filter(|n| *n != "input").count(),
+            0,
+            "a failed conversion must not leave a temp staging directory: {siblings:?}"
+        );
+    }
+
+    #[test]
+    fn publish_refuses_staging_dir_substituted_with_different_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("output");
+
+        let staging = super::TempPublishDir::create(&output, false).unwrap();
+        let temp_path = staging.write_dir().to_path_buf();
+        staging
+            .create_file("real.q4")
+            .unwrap()
+            .write_all(b"legit")
+            .unwrap();
+
+        // Substitute the staging directory: remove the one `create()` made
+        // and `mkdir` a fresh plain directory at the same path. This is not
+        // a symlink, so `O_NOFOLLOW` on the held `dir_fd` (opened against
+        // the original inode) does not reject it — only an inode check
+        // right before the path-based `rename` can catch the swap.
+        fs::remove_dir_all(&temp_path).unwrap();
+        fs::create_dir(&temp_path).unwrap();
+        fs::write(temp_path.join("attacker-planted.txt"), b"evil").unwrap();
+
+        let err = staging
+            .publish(Vec::new())
+            .expect_err("publish must refuse a staging directory substituted after creation");
+        assert!(
+            err.to_string().contains("inode mismatch"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !output.exists(),
+            "a substituted staging directory must not be published as output_dir"
+        );
+    }
+
+    #[test]
+    fn quantize_model_refuses_preexisting_nonempty_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join("config.json"), b"{}").unwrap();
+        write_single_f32_tensor(
+            &input.join("model.safetensors"),
+            "model.layers.0.input_layernorm.weight",
+            &[1.0, 2.0, 3.0],
+        );
+        fs::create_dir(&output).unwrap();
+        fs::write(output.join("stray.txt"), b"pre-existing").unwrap();
+
+        let err = quantize_model(&input, &output, false)
+            .expect_err("a non-empty pre-existing output_dir must be refused");
+        assert!(
+            err.to_string().contains("already exists and is not empty"),
+            "unexpected error: {err}"
+        );
+        assert!(output.join("stray.txt").exists());
+        assert!(!output.join("quantize_index.json").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn quantize_model_refuses_output_dir_containing_planted_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join("config.json"), b"{}").unwrap();
+        write_single_f32_tensor(
+            &input.join("model.safetensors"),
+            "model.layers.0.input_layernorm.weight",
+            &[1.0, 2.0, 3.0],
+        );
+
+        let escape_target = tmp.path().join("outside_target");
+        fs::create_dir(&escape_target).unwrap();
+        fs::create_dir(&output).unwrap();
+        std::os::unix::fs::symlink(&escape_target, output.join("config.json")).unwrap();
+
+        let err = quantize_model(&input, &output, false)
+            .expect_err("an output_dir containing a planted symlink must be refused");
+        assert!(
+            err.to_string().contains("already exists and is not empty"),
+            "unexpected error: {err}"
+        );
+        // The attacker's symlink target must never have been written into.
+        assert_eq!(fs::read_dir(&escape_target).unwrap().count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fold: Drop-ordering — a failed `publish()` must leave the staging
+    // handle in `self` so `Drop` can still clean it up.
+    //
+    // Mutation-sensitive: reverting `publish()` to `.take()` `self.temp` (and
+    // `self.dir_fd`) up front makes this test fail — the
+    // staging directory would survive (leaked) after a failed rename,
+    // because `Drop` would find `self.temp == None` and do nothing.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn publish_failure_still_lets_drop_clean_up_the_staging_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("output");
+        // Pre-create `output` as a regular FILE (not a directory): the
+        // non-empty-dir refusal in `create()` only triggers for an existing
+        // *directory*, so `create()` succeeds, but the final
+        // `fs::rename(temp_dir, output)` in `publish()` fails (renaming a
+        // directory onto an existing non-directory is always rejected).
+        fs::write(&output, b"not a directory").unwrap();
+
+        let publish_dir = super::TempPublishDir::create(&output, false).unwrap();
+        let staging_path = publish_dir.write_dir().to_path_buf();
+        assert!(staging_path.is_dir());
+
+        let mut f = publish_dir.create_file("artifact.q4").unwrap();
+        f.write_all(b"data").unwrap();
+
+        // `publish` takes `self` by value, so `publish_dir` is dropped
+        // inside this call before the `Err` reaches the assertion below —
+        // whatever `Drop` does (or fails to do) has already happened by
+        // the time `.expect_err` runs.
+        let err = publish_dir
+            .publish(vec![(staging_path.join("artifact.q4"), f)])
+            .expect_err("renaming the staging dir onto an existing file must fail");
+        assert!(
+            err.to_string().contains("failed to publish"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            !staging_path.exists(),
+            "a failed publish must not leak the staging directory — Drop must \
+             still own cleanup because `self.temp`/`self.dir_fd` stayed \
+             populated until the rename actually succeeded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // fd-bind the staging directory (path race).
+    //
+    // Mutation-sensitive: reverting `TempPublishDir::create_file` to a
+    // the previous path-based `File::create(self.write_dir().join(filename))` makes `create_file_writes_land_in_original_dirfd_inode_not_a_
+    // post_create_symlink_swap` fail — the write would follow the attacker's
+    // symlink into `attacker_dir` instead of landing in the original staging
+    // inode, so the "attacker dir stays empty" assertion trips.
+    // -----------------------------------------------------------------------
+    #[test]
+    #[cfg(unix)]
+    fn create_file_writes_land_in_original_dirfd_inode_not_a_post_create_symlink_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("output");
+        let publish_dir = super::TempPublishDir::create(&output, false).unwrap();
+        let staging_path = publish_dir.write_dir().to_path_buf();
+        assert!(
+            staging_path.is_dir(),
+            "staging dir must exist right after TempPublishDir::create"
+        );
+
+        // Attacker replaces the staging PATH with a symlink to a directory
+        // they control, after the dir (and its fd) were already created.
+        // The original directory is preserved (moved aside via `rename`,
+        // which never touches inodes or open fds — only the still-open
+        // `dir_fd` keeps pointing at it) rather than `rmdir`'d: an already
+        // fully-unlinked (0-link) directory refuses further `openat` calls
+        // outright (verified on this platform), which would make the test
+        // pass for the wrong reason (ENOENT, not fd-binding) instead of
+        // proving the write actually lands in the original inode.
+        let attacker_dir = tmp.path().join("attacker_dir");
+        let moved_aside = tmp.path().join("staging_moved_aside");
+        fs::create_dir(&attacker_dir).unwrap();
+        fs::rename(&staging_path, &moved_aside).unwrap();
+        std::os::unix::fs::symlink(&attacker_dir, &staging_path).unwrap();
+
+        // Drive a child write through the dirfd-bound API.
+        let mut f = publish_dir.create_file("child.q4").unwrap();
+        f.write_all(b"trusted-payload").unwrap();
+        drop(f);
+
+        // The attacker's directory must never have been written into: a
+        // path-based write would have followed the swapped symlink here.
+        assert_eq!(
+            fs::read_dir(&attacker_dir).unwrap().count(),
+            0,
+            "attacker-controlled directory must stay empty; a path-based \
+             write would have redirected the child write here"
+        );
+
+        // Affirmative check: the write landed in the ORIGINAL staging
+        // inode — reachable at `moved_aside` (where the directory now
+        // lives) — not wherever `staging_path` currently resolves.
+        let landed = fs::read(moved_aside.join("child.q4"))
+            .expect("child write must land in the original (moved-aside) staging directory");
+        assert_eq!(landed, b"trusted-payload");
+    }
+
+    // -----------------------------------------------------------------------
+    // dry-run must validate f16 representability identically to
+    // the real run.
+    //
+    // Mutation-sensitive: hoisting the `encode_f16_payload` call back inside
+    // the `if !dry_run` block makes
+    // `dry_run_rejects_f16_overflow_that_the_real_run_would_also_reject`
+    // pass silently through dry-run (no error), diverging from the real-run
+    // sibling assertion below it.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn dry_run_rejects_f16_overflow_that_the_real_run_would_also_reject() {
+        for dry_run in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let input = tmp.path().join("input");
+            let output = tmp.path().join("output");
+            fs::create_dir(&input).unwrap();
+            fs::write(input.join("config.json"), b"{}").unwrap();
+            // A finite kept (non-quantized) tensor whose value overflows f16
+            // narrowing to +inf: `f32::MAX` is finite in f32/f64 but has no
+            // finite f16 representation.
+            write_single_f32_tensor(
+                &input.join("model.safetensors"),
+                "model.layers.0.input_layernorm.weight",
+                &[f32::MAX, 1.0, 2.0],
+            );
+
+            let err = quantize_model(&input, &output, dry_run).expect_err(&format!(
+                "a kept tensor with an f16-unrepresentable value must be rejected \
+                 (dry_run={dry_run})"
+            ));
+            assert!(
+                err.to_string().contains("non-finite"),
+                "unexpected error (dry_run={dry_run}): {err}"
+            );
+            assert!(
+                !output.exists(),
+                "a rejected conversion must not create output_dir (dry_run={dry_run})"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // restore missing-parent-directory creation.
+    //
+    // Mutation-sensitive: removing the `fs::create_dir_all(parent)` call
+    // added to `TempPublishDir::create` makes
+    // `quantize_model_creates_missing_output_parent_directories` fail with
+    // "failed to create staging directory" (no such file or directory),
+    // while the non-empty-output-dir refusal sibling stays green throughout.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn quantize_model_creates_missing_output_parent_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        // `output`'s parent ("nested/does/not/exist") does not exist yet.
+        let output = tmp
+            .path()
+            .join("nested")
+            .join("does")
+            .join("not")
+            .join("exist")
+            .join("out");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join("config.json"), b"{}").unwrap();
+        write_single_f32_tensor(
+            &input.join("model.safetensors"),
+            "model.layers.0.input_layernorm.weight",
+            &[1.0, 2.0, 3.0],
+        );
+
+        quantize_model(&input, &output, false)
+            .expect("a valid output path with a missing parent directory must succeed");
+
+        assert!(output.join("config.json").exists());
+        assert!(output.join("quantize_index.json").exists());
+    }
 
     // -----------------------------------------------------------------------
     // MoE routed-expert tensors (issue #874 regression coverage).
