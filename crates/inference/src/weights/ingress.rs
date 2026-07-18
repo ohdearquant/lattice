@@ -9,21 +9,21 @@
 //! route through immediately before a tensor view escapes to a caller, so
 //! the same class of gap cannot silently reopen at the next loader.
 //!
-//! Scope note: this issue wires up the "decoded F32" payload form only —
-//! safetensors F32/F16/BF16 all normalize to `f32` by the time they reach
-//! this seam (`SafetensorsFile::get_f32_tensor` widens F16/BF16 before
-//! returning). The other payload forms named in lattice#800 — raw
-//! safetensors F32/F16/BF16 bytes, decoded F64, native Q4 blocks/bytes, and
-//! Q8 data+scales — are added by the companion issues in this cluster
-//! (QuaRot/offline-quantizer routing, native Q4/KHF1 validation
-//! unification, Q8 routing) as those loaders start calling into this seam.
+//! Safetensors F32/F16/BF16 normalize to `f32` by the time they reach this
+//! seam (`SafetensorsFile::get_f32_tensor` widens F16/BF16 before
+//! returning). In-memory Q8 construction validates its decoded f32 source
+//! before quantization and its derived Q8 data/scales before returning, so
+//! the seam covers the conversion boundary as a whole. Other payload forms
+//! named in lattice#800 — raw safetensors F32/F16/BF16 bytes, decoded F64,
+//! and native Q4 blocks/bytes — are added as those loaders start calling
+//! into this seam.
 
 use crate::error::InferenceError;
 
 /// Sealed carrier for one tensor's ingested payload plus its provenance.
 ///
-/// Construction only happens through [`IngestedTensor::decoded_f32`], so a
-/// call site cannot fabricate an already-"validated" value and skip
+/// Construction only happens through the payload-specific constructors, so
+/// a call site cannot fabricate an already-"validated" value and skip
 /// [`validate_ingested_tensor`].
 #[derive(Debug)]
 pub(crate) struct IngestedTensor<'a> {
@@ -41,7 +41,34 @@ enum IngestPayload<'a> {
     DecodedF32 {
         values: &'a [f32],
         dtype_label: &'static str,
+        error_kind: IngressErrorKind,
     },
+    /// Derived Q8 data and per-row scales.
+    Q8 { data: &'a [i8], scales: &'a [f32] },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IngressErrorKind {
+    InvalidSafetensors,
+    InvalidInput,
+}
+
+impl IngressErrorKind {
+    fn error(self, message: String) -> InferenceError {
+        match self {
+            Self::InvalidSafetensors => InferenceError::InvalidSafetensors(message),
+            Self::InvalidInput => InferenceError::InvalidInput(message),
+        }
+    }
+}
+
+impl IngestPayload<'_> {
+    fn geometry_error(&self, message: String) -> InferenceError {
+        match self {
+            Self::DecodedF32 { error_kind, .. } => error_kind.error(message),
+            Self::Q8 { .. } => InferenceError::InvalidInput(message),
+        }
+    }
 }
 
 impl<'a> IngestedTensor<'a> {
@@ -60,7 +87,43 @@ impl<'a> IngestedTensor<'a> {
             payload: IngestPayload::DecodedF32 {
                 values,
                 dtype_label,
+                error_kind: IngressErrorKind::InvalidSafetensors,
             },
+        }
+    }
+
+    /// Wrap the decoded f32 source of an in-memory Q8 conversion.
+    pub(crate) fn q8_source(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        values: &'a [f32],
+    ) -> Self {
+        Self {
+            source,
+            tensor_name,
+            shape,
+            payload: IngestPayload::DecodedF32 {
+                values,
+                dtype_label: "F32",
+                error_kind: IngressErrorKind::InvalidInput,
+            },
+        }
+    }
+
+    /// Wrap derived Q8 matrix data and scales for validation.
+    pub(crate) fn q8(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        data: &'a [i8],
+        scales: &'a [f32],
+    ) -> Self {
+        Self {
+            source,
+            tensor_name,
+            shape,
+            payload: IngestPayload::Q8 { data, scales },
         }
     }
 }
@@ -71,28 +134,31 @@ impl<'a> IngestedTensor<'a> {
 /// must be finite (NaN and either infinity are rejected; signed zero and
 /// subnormals are accepted).
 ///
-/// Errors are `InferenceError::InvalidSafetensors` — no new public error
-/// variant is added — and carry source label, tensor name, dtype, shape,
-/// and (for a finite-value failure) the first offending element index.
+/// Safetensors failures use `InferenceError::InvalidSafetensors`; in-memory
+/// conversion failures use `InferenceError::InvalidInput`. Both carry source
+/// label, tensor name, dtype, shape, and (for a finite-value failure) the
+/// first offending element index.
 pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(), InferenceError> {
     let numel = tensor
         .shape
         .iter()
         .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
         .ok_or_else(|| {
-            InferenceError::InvalidSafetensors(format!(
+            let message = format!(
                 "{}: tensor {} shape {:?} overflows usize element count",
                 tensor.source, tensor.tensor_name, tensor.shape,
-            ))
+            );
+            tensor.payload.geometry_error(message)
         })?;
 
     match tensor.payload {
         IngestPayload::DecodedF32 {
             values,
             dtype_label,
+            error_kind,
         } => {
             if values.len() != numel {
-                return Err(InferenceError::InvalidSafetensors(format!(
+                return Err(error_kind.error(format!(
                     "{}: tensor {} ({dtype_label}) decoded element count {} does not match \
                      shape {:?} (expected {numel})",
                     tensor.source,
@@ -102,9 +168,69 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                 )));
             }
             if let Some((idx, bad)) = values.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-                return Err(InferenceError::InvalidSafetensors(format!(
+                return Err(error_kind.error(format!(
                     "{}: tensor {} ({dtype_label}) has non-finite value {bad} at element index \
                      {idx} of {numel} (shape {:?})",
+                    tensor.source, tensor.tensor_name, tensor.shape,
+                )));
+            }
+            Ok(())
+        }
+        IngestPayload::Q8 { data, scales } => {
+            if tensor.shape.len() != 2 {
+                return Err(InferenceError::InvalidInput(format!(
+                    "{}: tensor {} (Q8) shape {:?} must have exactly two dimensions",
+                    tensor.source, tensor.tensor_name, tensor.shape,
+                )));
+            }
+            if data.len() != numel {
+                return Err(InferenceError::InvalidInput(format!(
+                    "{}: tensor {} (Q8) data element count {} does not match shape {:?} \
+                     (expected {numel})",
+                    tensor.source,
+                    tensor.tensor_name,
+                    data.len(),
+                    tensor.shape,
+                )));
+            }
+
+            let expected_scales = tensor.shape[0];
+            if scales.len() != expected_scales {
+                return Err(InferenceError::InvalidInput(format!(
+                    "{}: tensor {} (Q8) scale count {} does not match row count \
+                     {expected_scales} (shape {:?})",
+                    tensor.source,
+                    tensor.tensor_name,
+                    scales.len(),
+                    tensor.shape,
+                )));
+            }
+            // Single pass over `scales`: both the non-finite and non-positive checks below
+            // scan the same per-row scale vector, so fusing them avoids a second full read.
+            // Priority is preserved exactly — non-finite is reported before non-positive when
+            // a row somehow triggers both (e.g. `-inf`, which `is_finite()` rejects but
+            // `<= 0.0` also matches) — by resolving `first_non_finite` first below.
+            let mut first_non_finite: Option<(usize, f32)> = None;
+            let mut first_non_positive: Option<(usize, f32)> = None;
+            for (row, &scale) in scales.iter().enumerate() {
+                if first_non_finite.is_none() && !scale.is_finite() {
+                    first_non_finite = Some((row, scale));
+                }
+                if first_non_positive.is_none() && scale <= 0.0 {
+                    first_non_positive = Some((row, scale));
+                }
+            }
+            if let Some((row, scale)) = first_non_finite {
+                return Err(InferenceError::InvalidInput(format!(
+                    "{}: tensor {} (Q8) has non-finite scale {scale} at row {row} of \
+                     {expected_scales} (shape {:?})",
+                    tensor.source, tensor.tensor_name, tensor.shape,
+                )));
+            }
+            if let Some((row, scale)) = first_non_positive {
+                return Err(InferenceError::InvalidInput(format!(
+                    "{}: tensor {} (Q8) has non-positive scale {scale} at row {row} of \
+                     {expected_scales} (shape {:?})",
                     tensor.source, tensor.tensor_name, tensor.shape,
                 )));
             }
@@ -169,6 +295,100 @@ mod tests {
         let tensor = IngestedTensor::decoded_f32("test", "t", &[4], "F32", &values);
         let err = validate_ingested_tensor(tensor).expect_err("count mismatch must be rejected");
         assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn q8_rejects_non_finite_source_with_tensor_attribution() {
+        let source_values = [1.0f32, 2.0, f32::NAN, 4.0];
+        let tensor = IngestedTensor::q8_source(
+            "in-memory Q8 quantization",
+            "q_proj",
+            &[2, 2],
+            &source_values,
+        );
+
+        let err = validate_ingested_tensor(tensor).expect_err("NaN must be rejected");
+        match err {
+            InferenceError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("q_proj"),
+                    "error should name the tensor: {msg}"
+                );
+                assert!(
+                    msg.contains("element index 2"),
+                    "error should point at the offending source value: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn q8_rejects_quantized_geometry_mismatch() {
+        let data = [1i8, 2, 3];
+        let scales = [0.5f32, 1.0];
+        let tensor = IngestedTensor::q8(
+            "in-memory Q8 quantization",
+            "q_proj",
+            &[2, 2],
+            &data,
+            &scales,
+        );
+
+        let err = validate_ingested_tensor(tensor).expect_err("short Q8 data must be rejected");
+        assert!(err.to_string().contains("data element count 3"));
+
+        let data = [1i8, 2, 3, 4];
+        let scales = [0.5f32];
+        let tensor = IngestedTensor::q8(
+            "in-memory Q8 quantization",
+            "q_proj",
+            &[2, 2],
+            &data,
+            &scales,
+        );
+        let err = validate_ingested_tensor(tensor).expect_err("short scales must be rejected");
+        assert!(err.to_string().contains("scale count 1"));
+    }
+
+    #[test]
+    fn q8_rejects_non_positive_scale() {
+        let data = [1i8, 2, 3, 4];
+
+        for bad in [0.0f32, -1.0] {
+            let scales = [0.5f32, bad];
+            let tensor = IngestedTensor::q8(
+                "in-memory Q8 quantization",
+                "q_proj",
+                &[2, 2],
+                &data,
+                &scales,
+            );
+
+            let err = validate_ingested_tensor(tensor)
+                .expect_err("non-positive Q8 scale must be rejected");
+            assert!(
+                err.to_string().contains("non-positive scale"),
+                "unexpected error for scale {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn q8_rejects_non_finite_scale() {
+        let data = [1i8, 2, 3, 4];
+        let scales = [0.5f32, f32::INFINITY];
+        let tensor = IngestedTensor::q8(
+            "in-memory Q8 quantization",
+            "q_proj",
+            &[2, 2],
+            &data,
+            &scales,
+        );
+
+        let err =
+            validate_ingested_tensor(tensor).expect_err("non-finite Q8 scale must be rejected");
+        assert!(err.to_string().contains("non-finite scale"));
     }
 
     /// Mutation sensitivity: with the `!v.is_finite()` scan removed (or

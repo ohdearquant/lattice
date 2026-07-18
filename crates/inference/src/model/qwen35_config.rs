@@ -21,6 +21,13 @@ pub const QWEN3_THINK_OPEN_TOKEN_ID: u32 = 248_068;
 pub const QWEN3_THINK_CLOSE_TOKEN_ID: u32 = 248_069;
 pub const QWEN3_NEWLINE_TOKEN_ID: u32 = 198;
 
+/// Upper bound on `Qwen35Config::num_hidden_layers` accepted from a parsed `config.json`.
+/// Enforced before any layer-count-sized allocation (`compute_layer_types`,
+/// `normalize_layer_mask`) so an attacker-controlled value cannot drive an unbounded
+/// allocation ahead of tensor-level validation. Real checkpoints stay in the low
+/// hundreds of layers at most.
+pub const MAX_HIDDEN_LAYERS: usize = 4096;
+
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -613,6 +620,20 @@ impl Qwen35Config {
                 cfg.partial_rotary_factor = prf;
             }
         }
+        // `num_hidden_layers` is attacker-controlled config.json input and is used below
+        // (and in `normalize_layer_mask`) to size a `Vec` before any tensor-level
+        // validation runs. Bound it against a defensible ceiling before that allocation:
+        // real Qwen checkpoints top out in the low hundreds of layers, so 4096 (this
+        // crate's existing ceiling for other untrusted-count fields, e.g.
+        // `grammar::json_schema::MAX_ARRAY_CARDINALITY`) rejects a pathological value
+        // like `2^63` while accepting every real preset with wide headroom.
+        if cfg.num_hidden_layers > MAX_HIDDEN_LAYERS {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: num_hidden_layers ({}) exceeds the maximum \
+                 supported value ({MAX_HIDDEN_LAYERS})",
+                cfg.num_hidden_layers
+            )));
+        }
         if cfg.layer_types.len() != cfg.num_hidden_layers {
             // compute_layer_types uses `(i + 1) % interval`; a zero interval (from an
             // explicit `"full_attention_interval": 0`, or the container `#[serde(default)]`
@@ -833,6 +854,94 @@ impl Qwen35Config {
         self.linear_num_value_heads() * self.linear_value_head_dim
     }
 
+    /// Checked variant of [`full_q_dim`](Self::full_q_dim). Config dimensions are parsed
+    /// from an untrusted checkpoint's `config.json`; `num_attention_heads * head_dim` must
+    /// reject overflow with a typed error instead of wrapping before Q8 geometry checks
+    /// consume the result.
+    pub fn checked_full_q_dim(&self) -> Result<usize, InferenceError> {
+        self.num_attention_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "invalid Qwen config: num_attention_heads ({}) * head_dim ({}) overflows usize",
+                    self.num_attention_heads, self.head_dim
+                ))
+            })
+    }
+
+    /// Checked variant of [`full_kv_dim`](Self::full_kv_dim). See [`checked_full_q_dim`](Self::checked_full_q_dim).
+    pub fn checked_full_kv_dim(&self) -> Result<usize, InferenceError> {
+        self.num_key_value_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "invalid Qwen config: num_key_value_heads ({}) * head_dim ({}) overflows usize",
+                    self.num_key_value_heads, self.head_dim
+                ))
+            })
+    }
+
+    /// Checked variant of [`linear_qkv_dim`](Self::linear_qkv_dim). See
+    /// [`checked_full_q_dim`](Self::checked_full_q_dim).
+    pub fn checked_linear_qkv_dim(&self) -> Result<usize, InferenceError> {
+        let overflow = || {
+            InferenceError::InvalidInput(format!(
+                "invalid Qwen config: linear_num_key_heads ({}) * linear_key_head_dim ({}) + \
+                 linear_num_value_heads ({}) * linear_value_head_dim ({}) overflows usize",
+                self.linear_num_key_heads,
+                self.linear_key_head_dim,
+                self.linear_num_value_heads(),
+                self.linear_value_head_dim,
+            ))
+        };
+        let q = self
+            .linear_num_key_heads
+            .checked_mul(self.linear_key_head_dim)
+            .ok_or_else(overflow)?;
+        let k = self
+            .linear_num_key_heads
+            .checked_mul(self.linear_key_head_dim)
+            .ok_or_else(overflow)?;
+        let v = self
+            .linear_num_value_heads()
+            .checked_mul(self.linear_value_head_dim)
+            .ok_or_else(overflow)?;
+        q.checked_add(k)
+            .and_then(|qk| qk.checked_add(v))
+            .ok_or_else(overflow)
+    }
+
+    /// Checked variant of [`linear_output_dim`](Self::linear_output_dim). See
+    /// [`checked_full_q_dim`](Self::checked_full_q_dim).
+    pub fn checked_linear_output_dim(&self) -> Result<usize, InferenceError> {
+        self.linear_num_value_heads()
+            .checked_mul(self.linear_value_head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "invalid Qwen config: linear_num_value_heads ({}) * linear_value_head_dim ({}) \
+                     overflows usize",
+                    self.linear_num_value_heads(),
+                    self.linear_value_head_dim
+                ))
+            })
+    }
+
+    /// Checked GatedDeltaNet conv1d weight element count: `linear_qkv_dim() * linear_conv_kernel_dim`.
+    /// GDN-specific; net-new (no upstream free-function counterpart). See
+    /// [`checked_full_q_dim`](Self::checked_full_q_dim).
+    pub fn checked_linear_conv_len(&self) -> Result<usize, InferenceError> {
+        let qkv_dim = self.checked_linear_qkv_dim()?;
+        qkv_dim
+            .checked_mul(self.linear_conv_kernel_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "invalid Qwen config: linear_qkv_dim ({qkv_dim}) * linear_conv_kernel_dim ({}) \
+                 overflows usize",
+                    self.linear_conv_kernel_dim
+                ))
+            })
+    }
+
     /// **Unstable**: returns true when layer `i` uses full GQA attention.
     pub fn is_full_attention(&self, layer_idx: usize) -> bool {
         self.layer_types
@@ -901,6 +1010,16 @@ impl Qwen35Config {
         cfg.apply_layer_mask(mask);
         cfg
     }
+}
+
+/// Checked doubling of a config-derived dimension (e.g. full-attention `q_rows = 2 * q_dim`).
+/// `what` names the quantity in the error message on overflow.
+pub(crate) fn checked_double(value: usize, what: &str) -> Result<usize, InferenceError> {
+    value.checked_mul(2).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "invalid Qwen config: 2 * {what} ({value}) overflows usize"
+        ))
+    })
 }
 
 /// **Unstable**: sampling configuration for text generation; temperature/top-k/top-p may expand.
@@ -1477,6 +1596,22 @@ mod tests {
         let json = r#"{"text_config": {"num_hidden_layers": 0}}"#;
         let err = Qwen35Config::from_config_json_str(json)
             .expect_err("num_hidden_layers: 0 must yield an InferenceError")
+            .to_string();
+        assert!(
+            err.contains("num_hidden_layers"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// `num_hidden_layers` is attacker-controlled `config.json` input consumed to size a
+    /// `Vec` (via `compute_layer_types`/`normalize_layer_mask`) before any tensor-level
+    /// validation runs. Rejects a layer count above `MAX_HIDDEN_LAYERS` as a typed error
+    /// at parse time, before any allocation is sized from it.
+    #[test]
+    fn test_num_hidden_layers_above_ceiling_errors_before_allocation() {
+        let json = r#"{"text_config": {"num_hidden_layers": 10000000}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("num_hidden_layers above MAX_HIDDEN_LAYERS must yield an InferenceError")
             .to_string();
         assert!(
             err.contains("num_hidden_layers"),
