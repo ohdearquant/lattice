@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 import os
@@ -31,7 +32,6 @@ OUT_DIR = REPO_ROOT / "docs" / "bench_results"
 LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
 MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b"
 OLLAMA_URL = os.environ.get("LATTICE_BENCH_OLLAMA_URL", "http://localhost:11434")
-DEFAULT_RUNS = 5
 SWEEP_CONTEXTS = (1000, 2000, 4000)
 BASE = (
     "The quick brown fox jumps over the lazy dog. "
@@ -46,6 +46,16 @@ _PROMPT_RE = re.compile(r"\[bench\] prompt_tokens=(\d+)")
 
 class AdapterOutputError(RuntimeError):
     """An engine returned output that cannot satisfy the harness contract."""
+
+
+@functools.lru_cache(maxsize=1)
+def _default_profile() -> harness.ProfileConfig:
+    """The unconfigured ``agentic`` profile, for deriving CLI/report defaults
+    (ctx, runs, report windows) so they cannot drift from
+    ``bench_decode_profiles.toml``.
+    """
+    _, profiles = harness.load_profiles_file(PROFILES_FILE)
+    return profiles["agentic"]
 
 
 def make_ollama_prompt(ctx: int) -> str:
@@ -194,6 +204,19 @@ class MlxAdapter:
     def __init__(self, model_id: str = "Qwen/Qwen3.5-0.8B"):
         self.model_id = model_id
         self._loaded: tuple[object, object] | None = None
+        self._tokenizer: object | None = None
+        self._prompt_token_counts: dict[str, int] = {}
+
+    def _load_tokenizer(self):
+        """Fetch only the tokenizer files (no model weights), so building the
+        shared tokenizer-padded prompt does not bring an MLX model into
+        residency before Lattice/Ollama are measured.
+        """
+        if self._tokenizer is None:
+            import mlx_lm.utils
+
+            self._tokenizer = mlx_lm.utils.load_tokenizer(self.model_id)
+        return self._tokenizer
 
     def _load(self):
         if self._loaded is None:
@@ -203,10 +226,13 @@ class MlxAdapter:
         return self._loaded
 
     def padded_prompt(self, ctx: int) -> str:
-        _, tokenizer = self._load()
+        tokenizer = self._load_tokenizer()
         prompt = ""
-        while len(tokenizer.encode(prompt)) < ctx:
+        token_count = 0
+        while token_count < ctx:
             prompt += BASE
+            token_count = len(tokenizer.encode(prompt))
+        self._prompt_token_counts[prompt] = token_count
         return prompt
 
     def run(self, *, prompt: str, n_tokens: int, warmup: bool, model: str, quantization: str):
@@ -216,9 +242,14 @@ class MlxAdapter:
         mlx_model, tokenizer = self._load()
         mlx_lm.generate(mlx_model, tokenizer, prompt=prompt, max_tokens=n_tokens, verbose=False)
         mx.eval(mx.array([0]))
+        actual_prompt_tokens = self._prompt_token_counts.get(prompt)
+        if actual_prompt_tokens is None:
+            # Warmup calls (and any prompt not built by padded_prompt) are not
+            # part of the measured region, so an on-demand encode here is safe.
+            actual_prompt_tokens = len(tokenizer.encode(prompt))
         return harness.AdapterRunResult(
             actual_completion_tokens=n_tokens,
-            actual_prompt_tokens=len(tokenizer.encode(prompt)),
+            actual_prompt_tokens=actual_prompt_tokens,
             engine_version="mlx_lm",
         )
 
@@ -287,10 +318,11 @@ def result_rows(
     missing_reasons: dict[str, str],
     ollama_adapter: OllamaAdapter | None,
 ) -> list[dict]:
+    ttft_window, total_window = result.profile.windows[0], result.profile.windows[-1]
     rows: list[dict] = []
     for engine in result.profile.engines:
-        ttft_ms = _median_ms(result, engine, 1)
-        total_ms = _median_ms(result, engine, 100)
+        ttft_ms = _median_ms(result, engine, ttft_window)
+        total_ms = _median_ms(result, engine, total_window)
         prompt_counts = [
             obs.actual_prompt_tokens
             for obs in result.observations
@@ -301,7 +333,7 @@ def result_rows(
                 {
                     "engine": engine,
                     "context": result.profile.requested_prompt_tokens,
-                    "response": 100,
+                    "response": total_window,
                     "runs": 0,
                     "ttft_ms": None,
                     "decode_ms": None,
@@ -318,13 +350,13 @@ def result_rows(
         row = {
             "engine": engine,
             "context": context,
-            "response": 100,
+            "response": total_window,
             "runs": result.profile.measured_repeats,
             "ttft_ms": round(ttft_ms, 1),
             "decode_ms": round(decode_ms, 1),
             "total_ms": round(total_ms, 1),
             "prefill_tok_s": round(context / (ttft_ms / 1000)) if ttft_ms > 0 else 0,
-            "decode_tok_s": round(100 / (decode_ms / 1000)) if decode_ms > 0 else 0,
+            "decode_tok_s": round(total_window / (decode_ms / 1000)) if decode_ms > 0 else 0,
             "source": "live",
         }
         if engine == "ollama" and ollama_adapter is not None and ollama_adapter.breakdowns:
@@ -339,9 +371,9 @@ def result_rows(
     return rows
 
 
-def render_table(rows: list[dict], ctx: int) -> str:
+def render_table(rows: list[dict], ctx: int, response_window: int) -> str:
     lines = [
-        f"\n## Agentic Workload: ~{ctx}-token context, 100-token response\n\n",
+        f"\n## Agentic Workload: ~{ctx}-token context, {response_window}-token response\n\n",
         "| Engine | Precision | Ctx (tok) | TTFT (ms) | Decode (ms) | Total (ms) | Prefill t/s | Decode t/s | Runs | Source |\n",
         "|--------|-----------|-----------|-----------|-------------|-----------|-------------|------------|------|--------|\n",
     ]
@@ -363,9 +395,9 @@ def render_table(rows: list[dict], ctx: int) -> str:
 
 
 def run_context(ctx: int, runs: int, allow_missing: bool, out: Path | None) -> list[dict]:
-    _, profiles = harness.load_profiles_file(PROFILES_FILE)
+    default_profile = _default_profile()
     adapters, missing, padded_prompt = register_available_adapters(ctx)
-    profile = configure_profile(profiles["agentic"], ctx=ctx, runs=runs, padded_prompt=padded_prompt)
+    profile = configure_profile(default_profile, ctx=ctx, runs=runs, padded_prompt=padded_prompt)
     result = harness.run_profile(profile, adapters, allow_missing_engine=allow_missing)
     raw_path = out if out is not None else OUT_DIR / f"agentic_{ctx}tok_raw.jsonl"
     harness.write_jsonl(list(result.observations), raw_path)
@@ -373,17 +405,18 @@ def run_context(ctx: int, runs: int, allow_missing: bool, out: Path | None) -> l
     rows = result_rows(result, missing, ollama if isinstance(ollama, OllamaAdapter) else None)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / f"agentic_{ctx}tok.json").write_text(json.dumps(rows, indent=2) + "\n")
-    if abs(ctx - 1000) <= 50:
+    if abs(ctx - default_profile.requested_prompt_tokens) <= 50:
         (OUT_DIR / "agentic_1k_compare.json").write_text(json.dumps(rows, indent=2) + "\n")
-    print(render_table(rows, ctx))
+    print(render_table(rows, ctx, default_profile.windows[-1]))
     print(f"Raw observations: {raw_path}")
     return rows
 
 
 def build_parser() -> argparse.ArgumentParser:
+    profile = _default_profile()
     parser = argparse.ArgumentParser(description="Profiled agentic decode benchmark")
-    parser.add_argument("--ctx", type=int, default=1000)
-    parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
+    parser.add_argument("--ctx", type=int, default=profile.requested_prompt_tokens)
+    parser.add_argument("--runs", type=int, default=profile.measured_repeats)
     parser.add_argument("--sweep", action="store_true")
     parser.add_argument("--allow-missing-engine", action="store_true")
     parser.add_argument("--out", type=Path)
