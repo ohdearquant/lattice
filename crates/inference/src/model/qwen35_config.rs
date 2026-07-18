@@ -162,6 +162,103 @@ pub(crate) const MAX_ATTENTION_HEADS: usize = 8_192;
 /// [`MAX_INTERMEDIATE_SIZE`] while leaving well over two orders of magnitude of headroom.
 pub(crate) const MAX_HIDDEN_SIZE: usize = 1_048_576;
 
+/// Upper bound on `linear_num_key_heads` accepted from `config.json`.
+///
+/// Unlike `linear_num_value_heads()`, which is implicitly bounded by [`MAX_LINEAR_OUTPUT_DIM`]
+/// and [`MAX_GDN_STATE_SIZE`] (both product budgets that carry it as a factor),
+/// `linear_num_key_heads` was previously checked only for zero -- it had no upper bound at
+/// all. It is a free multiplier in `linear_qkv_dim()` (`2 * linear_num_key_heads *
+/// linear_key_head_dim + linear_num_value_heads() * linear_value_head_dim`), which sizes the
+/// GatedDeltaNet QKV projection weight, conv1d weight, and conv/activation scratch buffers
+/// throughout `attention/gdn.rs`, `model/qwen35/loading.rs`, and `forward/metal_qwen35.rs` --
+/// none of those call sites re-validate it. Real Qwen3.5/3.6 GDN configs use
+/// `linear_num_key_heads = 16`; 8,192 matches the existing [`MAX_ATTENTION_HEADS`] scale while
+/// leaving 512x headroom above that for future architectures.
+pub(crate) const MAX_LINEAR_NUM_KEY_HEADS: usize = 8_192;
+
+/// Upper bound on `linear_conv_kernel_dim` accepted from `config.json`.
+///
+/// Previously checked only for zero (guarding the `linear_conv_kernel_dim - 1` unsigned
+/// underflow). It sizes the GatedDeltaNet causal conv1d buffer (`conv_dim *
+/// (linear_conv_kernel_dim - 1)` in `GatedDeltaNetState::new`, `attention/gdn.rs`) and the
+/// conv1d weight tensor (`qkv_dim * kernel_size` in `model/qwen35/loading.rs`), both
+/// unconditional at first generation / weight load regardless of layer mix. Real Qwen3.5/3.6
+/// GDN configs use `linear_conv_kernel_dim = 4`; 512 rejects any config a real checkpoint
+/// would never carry while leaving generous headroom for future architectures. See
+/// [`MAX_GDN_CONV_BUFFER_SIZE`] for the accompanying product budget.
+pub(crate) const MAX_CONV_KERNEL_DIM: usize = 512;
+
+/// Upper bound on the GatedDeltaNet conv1d buffer element count
+/// (`linear_qkv_dim() * (linear_conv_kernel_dim - 1)`) accepted from `config.json`.
+///
+/// [`MAX_CONV_KERNEL_DIM`] and [`MAX_LINEAR_NUM_KEY_HEADS`] bound their respective factors
+/// individually, but their product still drives `GatedDeltaNetState::new`'s `conv_buffer =
+/// vec![0.0; conv_dim * buf_len]` (mirrored in the Metal GDN conv buffer allocation in
+/// `forward/metal_qwen35.rs`) -- two generously-headroomed per-factor caps can still compose
+/// into a multi-gigabyte allocation. Real Qwen3.5/3.6 GDN configs have `linear_qkv_dim() ~
+/// 6144` and `linear_conv_kernel_dim - 1 = 3` (~18,432 elements); 16,777,216 (2^24) matches the
+/// [`MAX_GDN_STATE_SIZE`] scale while leaving roughly 900x headroom above that for future
+/// architectures.
+pub(crate) const MAX_GDN_CONV_BUFFER_SIZE: usize = 16_777_216;
+
+/// Upper bound, in bytes, on the Metal RoPE cos/sin table pair accepted from `config.json`.
+///
+/// `build_rope_interleaved` (`forward/metal_qwen35.rs`) allocates two `Vec<f32>` of
+/// `max_position_embeddings * (rope_dim / 2)` entries each (cos and sin tables) --
+/// `4 * max_position_embeddings * rope_dim` bytes total. [`MAX_POSITION_EMBEDDINGS`] bounds
+/// `max_position_embeddings` and [`MAX_HEAD_DIM`] bounds `rope_dim` transitively (via
+/// `partial_rotary_factor <= 1.0`), but neither bounds the product, which reaches multiple GiB
+/// well within both individual caps. Real Qwen3.5/3.6 presets are `max_position_embeddings =
+/// 262,144` and `rope_dim` up to 128 (~134 MiB); 1 GiB (1,073,741,824) leaves roughly 8x
+/// headroom above that for future architectures.
+pub(crate) const MAX_ROPE_TABLE_BYTES: usize = 1_073_741_824;
+
+/// Upper bound on `VisionModelConfig::hidden_size` accepted from `config.json`.
+///
+/// Only checked nonzero and overflow-guarded (via `checked_derived_sizes`'s `checked_mul`
+/// chains) before this bound; a huge-but-non-overflowing value drives the `qkv_out` /
+/// `mlp_intermediate` / patch-embed / position-embed tensor size derivations in
+/// `checked_derived_sizes` to gigabyte-plus scale without tripping any overflow guard. Real
+/// Qwen3.5-VL vision towers use ~1,280; 1,048,576 matches the [`MAX_HIDDEN_SIZE`] scale.
+pub(crate) const MAX_VISION_HIDDEN_SIZE: usize = 1_048_576;
+
+/// Upper bound on `VisionModelConfig::num_heads` accepted from `config.json`. Only checked
+/// nonzero previously. Real Qwen3.5-VL vision towers use ~16; 8,192 matches the
+/// [`MAX_ATTENTION_HEADS`] scale.
+pub(crate) const MAX_VISION_NUM_HEADS: usize = 8_192;
+
+/// Upper bound on `VisionModelConfig::patch_size` accepted from `config.json`. Only checked
+/// nonzero previously; feeds the `patch_embed_weight` product in `checked_derived_sizes`. Real
+/// Qwen3.5-VL presets use 14-32; 4,096 leaves generous headroom.
+pub(crate) const MAX_VISION_PATCH_SIZE: usize = 4_096;
+
+/// Upper bound on `VisionModelConfig::spatial_merge_size` accepted from `config.json`. Only
+/// checked nonzero previously; squared in the `merger fc1` product in `checked_derived_sizes`.
+/// Real Qwen3.5-VL presets use 2; 64 leaves generous headroom.
+pub(crate) const MAX_VISION_SPATIAL_MERGE_SIZE: usize = 64;
+
+/// Upper bound on `VisionModelConfig::out_hidden_size` accepted from `config.json`. Only
+/// checked nonzero previously; feeds the `merger fc2` product in `checked_derived_sizes`. Real
+/// Qwen3.5-VL presets match the text decoder `hidden_size`; 1,048,576 matches
+/// [`MAX_HIDDEN_SIZE`].
+pub(crate) const MAX_VISION_OUT_HIDDEN_SIZE: usize = 1_048_576;
+
+/// Upper bound on `VisionModelConfig::temporal_patch_size` accepted from `config.json`. Only
+/// checked nonzero previously; feeds the `patch_embed_weight` product in
+/// `checked_derived_sizes`. Real Qwen3.5-VL presets use 2; 256 leaves generous headroom.
+pub(crate) const MAX_VISION_TEMPORAL_PATCH_SIZE: usize = 256;
+
+/// Upper bound on `VisionModelConfig::num_position_embeddings` accepted from `config.json`.
+/// Only checked nonzero previously; feeds the `pos_embed` product (`num_position_embeddings *
+/// hidden_size`) in `checked_derived_sizes`. Real Qwen3.5-VL presets use tens of thousands;
+/// 16,777,216 (2^24) matches the [`MAX_GDN_STATE_SIZE`] scale.
+pub(crate) const MAX_VISION_NUM_POSITION_EMBEDDINGS: usize = 16_777_216;
+
+/// Upper bound on `VisionModelConfig::in_channels` accepted from `config.json`. Only checked
+/// nonzero previously; feeds the `patch_embed_weight` product in `checked_derived_sizes`. Real
+/// Qwen3.5-VL presets use 3 (RGB); 256 leaves generous headroom.
+pub(crate) const MAX_VISION_IN_CHANNELS: usize = 256;
+
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -241,40 +338,99 @@ impl VisionModelConfig {
                 "invalid vision_config: hidden_size must be > 0".to_string(),
             ));
         }
+        // Only overflow-guarded (via `checked_derived_sizes`'s `checked_mul` chains) before
+        // this bound; a huge-but-non-overflowing value reaches those tensor-size derivations
+        // unchecked. See `MAX_VISION_HIDDEN_SIZE` docs.
+        if self.hidden_size > MAX_VISION_HIDDEN_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: hidden_size ({}) exceeds MAX_VISION_HIDDEN_SIZE \
+                 ({MAX_VISION_HIDDEN_SIZE})",
+                self.hidden_size
+            )));
+        }
         if self.num_heads == 0 {
             return Err(InferenceError::Inference(
                 "invalid vision_config: num_heads must be > 0".to_string(),
             ));
+        }
+        if self.num_heads > MAX_VISION_NUM_HEADS {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: num_heads ({}) exceeds MAX_VISION_NUM_HEADS \
+                 ({MAX_VISION_NUM_HEADS})",
+                self.num_heads
+            )));
         }
         if self.patch_size == 0 {
             return Err(InferenceError::Inference(
                 "invalid vision_config: patch_size must be > 0".to_string(),
             ));
         }
+        if self.patch_size > MAX_VISION_PATCH_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: patch_size ({}) exceeds MAX_VISION_PATCH_SIZE \
+                 ({MAX_VISION_PATCH_SIZE})",
+                self.patch_size
+            )));
+        }
         if self.spatial_merge_size == 0 {
             return Err(InferenceError::Inference(
                 "invalid vision_config: spatial_merge_size must be > 0".to_string(),
             ));
+        }
+        if self.spatial_merge_size > MAX_VISION_SPATIAL_MERGE_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: spatial_merge_size ({}) exceeds \
+                 MAX_VISION_SPATIAL_MERGE_SIZE ({MAX_VISION_SPATIAL_MERGE_SIZE})",
+                self.spatial_merge_size
+            )));
         }
         if self.out_hidden_size == 0 {
             return Err(InferenceError::Inference(
                 "invalid vision_config: out_hidden_size must be > 0".to_string(),
             ));
         }
+        if self.out_hidden_size > MAX_VISION_OUT_HIDDEN_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: out_hidden_size ({}) exceeds \
+                 MAX_VISION_OUT_HIDDEN_SIZE ({MAX_VISION_OUT_HIDDEN_SIZE})",
+                self.out_hidden_size
+            )));
+        }
         if self.temporal_patch_size == 0 {
             return Err(InferenceError::Inference(
                 "invalid vision_config: temporal_patch_size must be > 0".to_string(),
             ));
+        }
+        if self.temporal_patch_size > MAX_VISION_TEMPORAL_PATCH_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: temporal_patch_size ({}) exceeds \
+                 MAX_VISION_TEMPORAL_PATCH_SIZE ({MAX_VISION_TEMPORAL_PATCH_SIZE})",
+                self.temporal_patch_size
+            )));
         }
         if self.num_position_embeddings == 0 {
             return Err(InferenceError::Inference(
                 "invalid vision_config: num_position_embeddings must be > 0".to_string(),
             ));
         }
+        if self.num_position_embeddings > MAX_VISION_NUM_POSITION_EMBEDDINGS {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: num_position_embeddings ({}) exceeds \
+                 MAX_VISION_NUM_POSITION_EMBEDDINGS ({MAX_VISION_NUM_POSITION_EMBEDDINGS})",
+                self.num_position_embeddings
+            )));
+        }
         if self.in_channels == 0 {
             return Err(InferenceError::Inference(
                 "invalid vision_config: in_channels must be > 0".to_string(),
             ));
+        }
+        if self.in_channels > MAX_VISION_IN_CHANNELS {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: in_channels ({}) exceeds MAX_VISION_IN_CHANNELS \
+                 ({MAX_VISION_IN_CHANNELS})",
+                self.in_channels
+            )));
         }
         if !self.hidden_size.is_multiple_of(self.num_heads) {
             return Err(InferenceError::Inference(format!(
@@ -1121,6 +1277,16 @@ impl Qwen35Config {
                 "invalid Qwen config.json: linear_conv_kernel_dim must be > 0".to_string(),
             ));
         }
+        // Sizes the GatedDeltaNet causal conv1d buffer (`conv_dim * (linear_conv_kernel_dim -
+        // 1)` in `GatedDeltaNetState::new`) and conv1d weight tensor unconditional on layer
+        // mix. See `MAX_CONV_KERNEL_DIM` docs.
+        if cfg.linear_conv_kernel_dim > MAX_CONV_KERNEL_DIM {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: linear_conv_kernel_dim ({}) exceeds \
+                 MAX_CONV_KERNEL_DIM ({MAX_CONV_KERNEL_DIM})",
+                cfg.linear_conv_kernel_dim
+            )));
+        }
         // `rope_dim = (head_dim * partial_rotary_factor) as usize` is rotated in place over a
         // `head_dim`-length head slice; a factor > 1.0 makes `rope_dim` exceed `head_dim` and
         // indexes `head_vec[rope_dim / 2 + i]` out of bounds. Require a finite fraction.
@@ -1154,6 +1320,22 @@ impl Qwen35Config {
                 prf = cfg.partial_rotary_factor,
             )));
         }
+        // `build_rope_interleaved` (`forward/metal_qwen35.rs`) allocates two `Vec<f32>` of
+        // `max_position_embeddings * (rope_dim / 2)` entries each (cos and sin tables) --
+        // `4 * max_position_embeddings * rope_dim` bytes total. `max_position_embeddings` and
+        // `rope_dim` are each individually bounded above, but not their product. Mirror the
+        // exact formula (cast through `u128` so the byte-count computation itself cannot
+        // overflow `usize` on the way to the bound check) rather than inventing a new
+        // rounding convention. See `MAX_ROPE_TABLE_BYTES` docs.
+        let rope_table_bytes = 4u128 * cfg.max_position_embeddings as u128 * rope_dim as u128;
+        if rope_table_bytes > MAX_ROPE_TABLE_BYTES as u128 {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: RoPE table size ({rope_table_bytes} bytes) exceeds \
+                 MAX_ROPE_TABLE_BYTES ({MAX_ROPE_TABLE_BYTES}): max_position_embeddings \
+                 ({}) * rope_dim ({rope_dim})",
+                cfg.max_position_embeddings
+            )));
+        }
         // The GatedDeltaNet fused path divides by these head counts: `value_heads / key_heads`
         // (gdn_fused.rs ratio) and `h / ratio` per value head. A parseable config with
         // `linear_num_key_heads == 0`, `linear_num_value_heads == 0`, or value-heads not a
@@ -1165,6 +1347,17 @@ impl Qwen35Config {
             return Err(InferenceError::Inference(
                 "invalid Qwen config.json: linear_num_key_heads must be > 0".to_string(),
             ));
+        }
+        // Unlike `linear_num_value_heads()`, `linear_num_key_heads` is not implicitly bounded
+        // by `MAX_LINEAR_OUTPUT_DIM` / `MAX_GDN_STATE_SIZE` (neither product carries it as a
+        // factor) -- it is a free multiplier in `linear_qkv_dim()`, which sizes the
+        // GatedDeltaNet QKV projection weight, conv1d weight, and conv/activation scratch
+        // buffers. See `MAX_LINEAR_NUM_KEY_HEADS` docs.
+        if key_heads > MAX_LINEAR_NUM_KEY_HEADS {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: linear_num_key_heads ({key_heads}) exceeds \
+                 MAX_LINEAR_NUM_KEY_HEADS ({MAX_LINEAR_NUM_KEY_HEADS})"
+            )));
         }
         if value_heads == 0 || !value_heads.is_multiple_of(key_heads) {
             return Err(InferenceError::Inference(format!(
@@ -1234,6 +1427,40 @@ impl Qwen35Config {
             return Err(InferenceError::Inference(format!(
                 "invalid Qwen config.json: GatedDeltaNet state size ({gdn_state_size}) exceeds \
                  MAX_GDN_STATE_SIZE ({MAX_GDN_STATE_SIZE})"
+            )));
+        }
+        // `MAX_LINEAR_NUM_KEY_HEADS` and `MAX_CONV_KERNEL_DIM` bound their respective factors
+        // individually, but their product (via `linear_qkv_dim()`) still drives
+        // `GatedDeltaNetState::new`'s `conv_buffer = vec![0.0; conv_dim * buf_len]`
+        // (`attention/gdn.rs`, mirrored in the Metal GDN conv buffer allocation in
+        // `forward/metal_qwen35.rs`), unconditional at first generation regardless of layer
+        // mix. Validate the checked product globally for the same reason as the
+        // `linear_output_dim` / `gdn_state_size` budgets above. See
+        // `MAX_GDN_CONV_BUFFER_SIZE` docs.
+        let conv_dim = key_heads
+            .checked_mul(cfg.linear_key_head_dim)
+            .and_then(|q| q.checked_mul(2))
+            .and_then(|q| q.checked_add(linear_output_dim))
+            .ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "invalid Qwen config.json: GatedDeltaNet qkv_dim overflows usize: \
+                 2 * linear_num_key_heads ({key_heads}) * linear_key_head_dim ({}) + \
+                 linear_output_dim ({linear_output_dim})",
+                    cfg.linear_key_head_dim
+                ))
+            })?;
+        let conv_buf_len = cfg.linear_conv_kernel_dim - 1;
+        let gdn_conv_buffer_size = conv_dim.checked_mul(conv_buf_len).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "invalid Qwen config.json: GatedDeltaNet conv buffer size overflows usize: \
+                 linear_qkv_dim ({conv_dim}) * (linear_conv_kernel_dim - 1) ({conv_buf_len})"
+            ))
+        })?;
+        if gdn_conv_buffer_size > MAX_GDN_CONV_BUFFER_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: GatedDeltaNet conv buffer size \
+                 ({gdn_conv_buffer_size}) exceeds MAX_GDN_CONV_BUFFER_SIZE \
+                 ({MAX_GDN_CONV_BUFFER_SIZE})"
             )));
         }
         // `RopeParams::mrope_section` is bounded at deserialize time
@@ -3810,8 +4037,12 @@ mod tests {
     /// `head_dim`.
     #[test]
     fn parser_rejects_max_position_embeddings_over_max() {
+        // `head_dim`/`partial_rotary_factor` pinned to the smallest valid `rope_dim` (2) so
+        // this trips only the `max_position_embeddings`-specific guard, not the
+        // `MAX_ROPE_TABLE_BYTES` product budget (which the default preset's `rope_dim = 64`
+        // would otherwise reach first at this `max_position_embeddings`).
         let json = format!(
-            r#"{{"text_config": {{"max_position_embeddings": {}}}}}"#,
+            r#"{{"text_config": {{"max_position_embeddings": {}, "head_dim": 2, "partial_rotary_factor": 1.0}}}}"#,
             MAX_POSITION_EMBEDDINGS + 1
         );
         let err = Qwen35Config::from_config_json_str(&json)
@@ -3831,6 +4062,554 @@ mod tests {
         assert!(
             Qwen35Config::from_config_json_str(&json).is_ok(),
             "max_position_embeddings == MAX_POSITION_EMBEDDINGS must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // linear_num_key_heads upper bound (MAX_LINEAR_NUM_KEY_HEADS)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `linear_num_key_heads` was previously checked only for zero; it is a free multiplier
+    /// in `linear_qkv_dim()` unconstrained by `MAX_LINEAR_OUTPUT_DIM` / `MAX_GDN_STATE_SIZE`
+    /// (neither product carries it as a factor).
+    #[test]
+    fn parser_rejects_linear_num_key_heads_over_max() {
+        let json = format!(
+            r#"{{"text_config": {{
+                "linear_num_key_heads": {over},
+                "linear_num_value_heads": {over},
+                "linear_key_head_dim": 1,
+                "linear_value_head_dim": 1
+            }}}}"#,
+            over = MAX_LINEAR_NUM_KEY_HEADS + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("linear_num_key_heads above MAX_LINEAR_NUM_KEY_HEADS must be rejected")
+            .to_string();
+        assert!(
+            err.contains("linear_num_key_heads") && err.contains("MAX_LINEAR_NUM_KEY_HEADS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_linear_num_key_heads_at_max() {
+        let json = format!(
+            r#"{{"text_config": {{
+                "linear_num_key_heads": {MAX_LINEAR_NUM_KEY_HEADS},
+                "linear_num_value_heads": {MAX_LINEAR_NUM_KEY_HEADS},
+                "linear_key_head_dim": 1,
+                "linear_value_head_dim": 1
+            }}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "linear_num_key_heads == MAX_LINEAR_NUM_KEY_HEADS must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // linear_conv_kernel_dim upper bound (MAX_CONV_KERNEL_DIM)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `linear_conv_kernel_dim` was previously checked only for zero (underflow guard on
+    /// `linear_conv_kernel_dim - 1`); it directly scales the GatedDeltaNet conv1d buffer.
+    #[test]
+    fn parser_rejects_linear_conv_kernel_dim_over_max() {
+        let json = format!(
+            r#"{{"text_config": {{"linear_conv_kernel_dim": {}}}}}"#,
+            MAX_CONV_KERNEL_DIM + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("linear_conv_kernel_dim above MAX_CONV_KERNEL_DIM must be rejected")
+            .to_string();
+        assert!(
+            err.contains("linear_conv_kernel_dim") && err.contains("MAX_CONV_KERNEL_DIM"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_linear_conv_kernel_dim_at_max() {
+        let json =
+            format!(r#"{{"text_config": {{"linear_conv_kernel_dim": {MAX_CONV_KERNEL_DIM}}}}}"#);
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "linear_conv_kernel_dim == MAX_CONV_KERNEL_DIM must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // GatedDeltaNet conv buffer two-factor product budget (MAX_GDN_CONV_BUFFER_SIZE)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `MAX_LINEAR_NUM_KEY_HEADS`, `MAX_CONV_KERNEL_DIM`, and `MAX_GDN_STATE_SIZE` each bound
+    /// their own factor and are individually satisfied here (`linear_num_key_heads` and
+    /// `linear_conv_kernel_dim` sit exactly at their caps; `linear_num_value_heads *
+    /// linear_key_head_dim * linear_value_head_dim` sits exactly at `MAX_GDN_STATE_SIZE`), yet
+    /// the conv buffer element count (`linear_qkv_dim() * (linear_conv_kernel_dim - 1)`) still
+    /// exceeds `MAX_GDN_CONV_BUFFER_SIZE` by roughly three orders of magnitude -- demonstrating
+    /// the product-hostility the per-factor caps above do not close on their own.
+    #[test]
+    fn parser_rejects_gdn_conv_buffer_size_over_max_with_bounded_factors() {
+        let json = format!(
+            r#"{{"text_config": {{
+                "linear_num_key_heads": {MAX_LINEAR_NUM_KEY_HEADS},
+                "linear_num_value_heads": {MAX_LINEAR_NUM_KEY_HEADS},
+                "linear_key_head_dim": 2048,
+                "linear_value_head_dim": 1,
+                "linear_conv_kernel_dim": {MAX_CONV_KERNEL_DIM}
+            }}}}"#
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "a conv buffer product over MAX_GDN_CONV_BUFFER_SIZE must be rejected even \
+                 though every individual factor is at or under its own cap",
+            )
+            .to_string();
+        assert!(
+            err.contains("GatedDeltaNet conv buffer size")
+                && err.contains("MAX_GDN_CONV_BUFFER_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Accept-case control: realistic GDN geometry (matching the preset) must still parse.
+    #[test]
+    fn parser_accepts_realistic_gdn_conv_buffer_size() {
+        let json = r#"{"text_config": {
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4
+        }}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "realistic GDN conv buffer geometry must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // RoPE table two-factor byte budget (MAX_ROPE_TABLE_BYTES)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `MAX_POSITION_EMBEDDINGS` bounds `max_position_embeddings` and `MAX_HEAD_DIM` bounds
+    /// `rope_dim` transitively, both satisfied here (`max_position_embeddings` at its cap,
+    /// `head_dim` at its cap with `partial_rotary_factor = 1.0`), yet the RoPE table byte
+    /// count (`4 * max_position_embeddings * rope_dim`) exceeds `MAX_ROPE_TABLE_BYTES` by
+    /// roughly 32x -- demonstrating the product-hostility neither per-factor cap closes alone.
+    #[test]
+    fn parser_rejects_rope_table_bytes_over_max_with_bounded_factors() {
+        let json = format!(
+            r#"{{"text_config": {{
+                "max_position_embeddings": {MAX_POSITION_EMBEDDINGS},
+                "head_dim": {MAX_HEAD_DIM},
+                "partial_rotary_factor": 1.0
+            }}}}"#
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "a RoPE table byte count over MAX_ROPE_TABLE_BYTES must be rejected even \
+                 though max_position_embeddings and head_dim are each at or under their own cap",
+            )
+            .to_string();
+        assert!(
+            err.contains("RoPE table size") && err.contains("MAX_ROPE_TABLE_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Accept-case control: realistic RoPE geometry (matching a real Qwen3.5/3.6 preset) must
+    /// still parse.
+    #[test]
+    fn parser_accepts_realistic_rope_table_bytes() {
+        let json = r#"{"text_config": {
+            "max_position_embeddings": 262144,
+            "head_dim": 256,
+            "partial_rotary_factor": 0.25
+        }}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "realistic RoPE table geometry must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // vision_config numeric field upper bounds
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Previously only overflow-guarded (via `checked_derived_sizes`); a huge-but-non-
+    /// overflowing `hidden_size` reaches those tensor-size derivations unchecked.
+    #[test]
+    fn parser_rejects_present_vision_config_with_hidden_size_over_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": {},
+                "num_heads": 1,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#,
+            MAX_VISION_HIDDEN_SIZE + 1
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("hidden_size above MAX_VISION_HIDDEN_SIZE must be rejected")
+            .to_string();
+        assert!(
+            err.contains("hidden_size") && err.contains("MAX_VISION_HIDDEN_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_hidden_size_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": {MAX_VISION_HIDDEN_SIZE},
+                "num_heads": 1,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "hidden_size == MAX_VISION_HIDDEN_SIZE must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_num_heads_over_max() {
+        let over = MAX_VISION_NUM_HEADS + 1;
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": {over},
+                "num_heads": {over},
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("num_heads above MAX_VISION_NUM_HEADS must be rejected")
+            .to_string();
+        assert!(
+            err.contains("num_heads") && err.contains("MAX_VISION_NUM_HEADS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_num_heads_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": {MAX_VISION_NUM_HEADS},
+                "num_heads": {MAX_VISION_NUM_HEADS},
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "num_heads == MAX_VISION_NUM_HEADS must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_patch_size_over_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": {},
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#,
+            MAX_VISION_PATCH_SIZE + 1
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("patch_size above MAX_VISION_PATCH_SIZE must be rejected")
+            .to_string();
+        assert!(
+            err.contains("patch_size") && err.contains("MAX_VISION_PATCH_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_patch_size_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": {MAX_VISION_PATCH_SIZE},
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "patch_size == MAX_VISION_PATCH_SIZE must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_spatial_merge_size_over_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": {},
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#,
+            MAX_VISION_SPATIAL_MERGE_SIZE + 1
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("spatial_merge_size above MAX_VISION_SPATIAL_MERGE_SIZE must be rejected")
+            .to_string();
+        assert!(
+            err.contains("spatial_merge_size") && err.contains("MAX_VISION_SPATIAL_MERGE_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_spatial_merge_size_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": {MAX_VISION_SPATIAL_MERGE_SIZE},
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "spatial_merge_size == MAX_VISION_SPATIAL_MERGE_SIZE must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_out_hidden_size_over_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": {},
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#,
+            MAX_VISION_OUT_HIDDEN_SIZE + 1
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("out_hidden_size above MAX_VISION_OUT_HIDDEN_SIZE must be rejected")
+            .to_string();
+        assert!(
+            err.contains("out_hidden_size") && err.contains("MAX_VISION_OUT_HIDDEN_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_out_hidden_size_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": {MAX_VISION_OUT_HIDDEN_SIZE},
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "out_hidden_size == MAX_VISION_OUT_HIDDEN_SIZE must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_temporal_patch_size_over_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": {},
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#,
+            MAX_VISION_TEMPORAL_PATCH_SIZE + 1
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("temporal_patch_size above MAX_VISION_TEMPORAL_PATCH_SIZE must be rejected")
+            .to_string();
+        assert!(
+            err.contains("temporal_patch_size") && err.contains("MAX_VISION_TEMPORAL_PATCH_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_temporal_patch_size_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": {MAX_VISION_TEMPORAL_PATCH_SIZE},
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "temporal_patch_size == MAX_VISION_TEMPORAL_PATCH_SIZE must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_num_position_embeddings_over_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": {},
+                "in_channels": 3
+            }}"#,
+            MAX_VISION_NUM_POSITION_EMBEDDINGS + 1
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "num_position_embeddings above MAX_VISION_NUM_POSITION_EMBEDDINGS must be \
+                 rejected",
+            )
+            .to_string();
+        assert!(
+            err.contains("num_position_embeddings")
+                && err.contains("MAX_VISION_NUM_POSITION_EMBEDDINGS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_num_position_embeddings_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": {MAX_VISION_NUM_POSITION_EMBEDDINGS},
+                "in_channels": 3
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "num_position_embeddings == MAX_VISION_NUM_POSITION_EMBEDDINGS must be accepted"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_present_vision_config_with_in_channels_over_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": {}
+            }}"#,
+            MAX_VISION_IN_CHANNELS + 1
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("in_channels above MAX_VISION_IN_CHANNELS must be rejected")
+            .to_string();
+        assert!(
+            err.contains("in_channels") && err.contains("MAX_VISION_IN_CHANNELS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_present_vision_config_with_in_channels_at_max() {
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": {MAX_VISION_IN_CHANNELS}
+            }}"#
+        ));
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "in_channels == MAX_VISION_IN_CHANNELS must be accepted"
         );
     }
 }
