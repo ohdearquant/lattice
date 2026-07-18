@@ -288,9 +288,8 @@ fn bf16_to_f32(v: u16) -> f32 {
 /// a full block would (padding zeros must never widen the range). Symmetric
 /// mode folds `abs_max` over the full padded array unconditionally: zero
 /// padding can never exceed a non-empty real element's absolute value, so the
-/// result is bit-identical to folding over the real elements alone, and doing
-/// it this way keeps the symmetric path source-identical to the pre-fix
-/// version (see `quantize_f64_to_q4_symmetric_partial_block_is_bit_identical_to_padded_block`).
+/// result is bit-identical to folding over the real elements alone (see
+/// `quantize_f64_to_q4_symmetric_partial_block_is_bit_identical_to_padded_block`).
 ///
 /// # Errors
 ///
@@ -1341,11 +1340,6 @@ mod tests {
         // the fd closes that window: writes always land in the directory
         // that was open at session start, regardless of what the path
         // currently resolves to.
-        //
-        // reverting `create_file_at` to
-        // `create_output_file(&dir_path.join(filename))` (path-based) makes
-        // this test fail — the write would land in the attacker's
-        // substituted directory instead of the original.
         use std::os::fd::AsRawFd;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1402,10 +1396,9 @@ mod tests {
     // -----------------------------------------------------------------------
     // Non-constant-block scale underflow.
     //
-    // with the `value != 0.0 && encoded == 0.0` guard
-    // removed from `encode_finite_q4_metadata`, the first test below would
-    // instead succeed and silently collapse every dequantized value in the
-    // block to the bias.
+    // `encode_finite_q4_metadata` rejects a nonzero field that encodes to
+    // f16 zero, so a non-constant block whose scale underflows errors
+    // instead of silently collapsing every dequantized value to the bias.
     // -----------------------------------------------------------------------
     #[test]
     fn non_constant_block_with_underflowing_scale_is_rejected() {
@@ -1438,12 +1431,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // Constant-block BIAS underflow (two-sided with scale).
     //
-    // reverting the two-sided guard to gate only
-    // `Q4MetadataField::Scale` makes
-    // `constant_block_with_underflowing_bias_is_rejected` fail — the block's
-    // scale=1.0 never underflows, so only the new bias-side check catches
-    // this. Restoring the two-sided guard makes it error again; the
-    // zero-bias sibling below stays green throughout since `value == 0.0`
+    // The underflow guard gates both `Q4MetadataField::Scale` and
+    // `Q4MetadataField::Bias`: a constant block's scale is forced to 1.0 and
+    // never underflows, so only the bias-side check catches an underflowing
+    // bias. The zero-bias sibling below is unaffected since `value == 0.0`
     // is never gated.
     // -----------------------------------------------------------------------
     #[test]
@@ -1473,9 +1464,9 @@ mod tests {
     // scale reaching exact zero here previously passed through as a
     // "genuinely zero" field and silently zeroed the whole block.
     //
-    // reverting the `s == 0.0` checks in
-    // `quantize_block_with_mode_len` makes both tests below fail (the calls
-    // succeed with a corrupted all-zero block instead of erroring).
+    // `quantize_block_with_mode_len` checks the computed scale itself for
+    // exact zero, not just the input it was derived from, so both cases
+    // below error instead of returning a corrupted all-zero block.
     // -----------------------------------------------------------------------
     #[test]
     fn asymmetric_scale_underflow_from_subnormal_range_is_rejected() {
@@ -2016,11 +2007,10 @@ mod tests {
 
     #[test]
     fn quantize_f32_to_q4_partial_block_uses_real_tail_min_max() {
-        // a tail block of [5, 6, 7] zero-padded to 32
-        // slots would (pre-fix) fold min/max over the padded zeros too,
-        // yielding min=0/max=7 instead of the real min=5/max=7. This test
-        // fails if the asymmetric path reverts to computing stats over the
-        // padded [f32; 32] array instead of the real `chunk.len()` elements.
+        // A tail block of [5, 6, 7] zero-padded to 32 slots: the asymmetric
+        // path computes min/max over the real `chunk.len()` elements, not
+        // the padded [f32; 32] array, so the range is min=5/max=7 rather
+        // than min=0/max=7.
         let src = [5.0f32, 6.0, 7.0];
         let q = quantize_f32_to_q4(&src, &[3]).unwrap();
         assert_eq!(q.original_len, 3);
@@ -2170,10 +2160,10 @@ mod tests {
     // Exercises the full composition: absorb_rotations (offline rotation
     // absorption) → quantize_f64_to_q4 → dequantize_q4_to_f32 → matmul,
     // and asserts correctness against an independent f64 reference that
-    // manually mirrors each step. Perturbing the rotation
-    // dispatch (pipeline.rs:226-230), absorption helpers (rotation.rs:161-164
-    // or rotation.rs:184-192), Q4 symmetric scale (q4_weights.rs:277 or :280),
-    // or Q4 symmetric mode flag (q4_weights.rs:523) must cause failure.
+    // mirrors each step, covering the rotation dispatch (pipeline.rs:226-230),
+    // absorption helpers (rotation.rs:161-164 and rotation.rs:184-192), Q4
+    // symmetric scale (q4_weights.rs:277 and :280), and Q4 symmetric mode
+    // flag (q4_weights.rs:523).
     // -----------------------------------------------------------------------
     #[test]
     fn quarot_rotated_q4_forward_matches_f64_reference() {
@@ -2436,9 +2426,9 @@ mod tests {
     // Tests for dequantize_row_q4_0 robustness (issue #263)
     //
     // These tests verify that dequantize_row_q4_0 does NOT panic on
-    // misaligned or undersized inputs. The function uses chunks_exact(20)
-    // which silently ignores trailing bytes, so removing the assert_eq!
-    // alignment check makes the behaviour well-defined on any input.
+    // misaligned or undersized inputs: it uses chunks_exact(20), which
+    // silently ignores trailing bytes, so behaviour is well-defined on any
+    // input length.
     // -----------------------------------------------------------------------
 
     /// Misaligned input (25 bytes = 1 complete block + 5 remainder bytes) must not panic.
@@ -2485,8 +2475,8 @@ mod tests {
         );
     }
 
-    /// Clean 2-block (40-byte) input with n_weights=64 still returns 64 correct values.
-    /// This is a regression guard: removing the assert must not break the happy path.
+    /// Clean 2-block (40-byte) input with n_weights=64 still returns 64 correct values —
+    /// the alignment guard for misaligned input above must not affect this happy path.
     #[test]
     fn dequantize_row_q4_0_exact_blocks_unchanged() {
         let src: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) / 10.0).collect();
@@ -2734,11 +2724,8 @@ mod tests {
         // reaches the block-payload guard (not the earlier shape-mismatch
         // guard). n_blocks*20 does not itself overflow u64 at this
         // magnitude, so this exercises the file_len-bound branch of
-        // checked_alloc_bytes: it must return a clean Err, never panic or
-        // attempt a multi-exabyte allocation. Removing the `checked_mul`
-        // guard (reverting to `n_blocks * 20`) does not panic here either
-        // since the multiply itself doesn't overflow — this test instead
-        // proves the *file_len bound* check is load-bearing on its own.
+        // checked_alloc_bytes on its own: it must return a clean Err, never
+        // panic or attempt a multi-exabyte allocation.
         let huge = usize::MAX - 3;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"KHQ4");
@@ -2762,10 +2749,9 @@ mod tests {
     fn test_f16_rejects_numel_whose_byte_count_exceeds_file_len() {
         // numel = usize::MAX / 4: numel*2 does NOT overflow (≈ 2^62), so the
         // checked_mul branch passes and rejection can only come from the
-        // file_len-bound branch of checked_alloc_bytes. This pins that branch
-        // for the f16 loader specifically — the assertion below must not
-        // accept "overflows usize", or a deleted file_len check would go
-        // unnoticed (the overflow branch is pinned separately by
+        // file_len-bound branch of checked_alloc_bytes. The assertion below
+        // requires that specific branch's message rather than "overflows
+        // usize" (the overflow branch is covered separately by
         // test_f16_rejects_numel_that_wraps_to_small_value_on_overflow).
         let huge = usize::MAX / 4;
         let mut buf = Vec::new();
@@ -2789,13 +2775,13 @@ mod tests {
     #[test]
     fn test_f16_rejects_numel_that_wraps_to_small_value_on_overflow() {
         // numel = usize::MAX/2 + 5: numel*2 overflows u64 and wraps to a
-        // *small* residual (10, mod 2^64) that would sail past the
-        // file_len-bound check if `checked_mul` were replaced by a plain
-        // wrapping multiply — a silent-corruption bug (an ~empty read
-        // reported as success with the wrong shape/numel) rather than the
-        // OOM/panic the near-usize::MAX test above guards against. This is
-        // the scenario `checked_mul` uniquely defends: the bound check alone
-        // cannot catch it because the wrapped byte count looks small.
+        // *small* residual (10, mod 2^64) that a plain wrapping multiply
+        // would let sail past the file_len-bound check — a silent-corruption
+        // bug (an ~empty read reported as success with the wrong
+        // shape/numel) rather than the OOM/panic the near-usize::MAX test
+        // above guards against. `checked_mul` is what catches this case,
+        // since the bound check alone cannot: the wrapped byte count looks
+        // small.
         let huge = usize::MAX / 2 + 5;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"KHF1");
@@ -2803,10 +2789,9 @@ mod tests {
         buf.extend_from_slice(&1u32.to_le_bytes()); // ndim
         buf.extend_from_slice(&(huge as u64).to_le_bytes()); // shape[0]
         buf.extend_from_slice(&(huge as u64).to_le_bytes()); // numel
-        // Trailing filler: `huge * 2` wraps to a small residue (10 bytes) if
-        // `checked_mul` is bypassed, so pad enough real bytes that a buggy
-        // wrapping multiply would successfully `read_exact` a plausible
-        // (wrong) buffer instead of also failing on a short read — isolating
+        // Trailing filler: `huge * 2` wraps to a small residue (10 bytes), so
+        // pad enough real bytes that a wrapping multiply's `read_exact`
+        // would succeed against a plausible (wrong) buffer size — isolating
         // the assertion to the overflow guard itself, not an incidental
         // short-file error.
         buf.extend_from_slice(&[0xABu8; 64]);
@@ -2837,9 +2822,9 @@ mod tests {
     // with a silently wrong entry. The guard at the top of
     // `quantize_block_with_mode` must catch this before the fold.
     //
-    // Mutation sensitivity: removing the `if !v.is_finite()` guard converts
-    // both `Err` returns below to `Ok`, turning `result.is_err()` → false
-    // and failing the assertion.
+    // The `if !v.is_finite()` guard at the top of `quantize_block_with_mode`
+    // is what makes both blocks below return `Err` rather than a
+    // plausible-looking but silently wrong `Q4Block`.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2873,16 +2858,13 @@ mod tests {
     // (#504 remaining slice: "Merged-Q4 cache: compatibility check is
     // size-only — no content integrity on the merged artifact.")
     //
-    // Mutation sensitivity: `merged_qkvz_cache_is_valid`'s size check alone
-    // (the pre-fix behavior) would accept a same-size tampered/stale merged
-    // file. `test_merged_qkvz_cache_rejects_same_size_corrupted_payload` and
-    // `test_merged_qkvz_cache_rejects_same_size_stale_source` are the
-    // discriminating tests: reverting the fingerprint comparison back to a
-    // bare `metadata.len() == expected_size` check makes both pass
-    // incorrectly (`is_valid` would wrongly return `true`), so they fail
-    // under the reverted code. Verified manually per the task's mutation-test
-    // protocol — see the session report for the reverse-apply/touch/restore
-    // proof.
+    // `merged_qkvz_cache_is_valid` compares a content fingerprint, not just
+    // `metadata.len() == expected_size`, so a same-size tampered or stale
+    // merged file is rejected rather than accepted on size alone.
+    // `test_merged_qkvz_cache_rejects_same_size_corrupted_payload` and
+    // `test_merged_qkvz_cache_rejects_same_size_stale_source` are the tests
+    // that specifically discriminate a size-only check from a fingerprint
+    // check.
     // -----------------------------------------------------------------------
 
     /// Write a minimal valid 2-D `.q4` source file (`shape = [rows, cols]`,
@@ -3053,9 +3035,9 @@ mod tests {
 
     #[test]
     fn test_merged_qkvz_cache_rejects_same_size_corrupted_payload() {
-        // Same-size bit flip inside the merged payload — the pre-fix
-        // size-only check would accept this file unchanged. This is the
-        // mutation-sensitive case for the content-integrity fix itself.
+        // Same-size bit flip inside the merged payload — a size-only check
+        // would accept this file unchanged, so this pins the
+        // content-integrity check specifically.
         let (qkv_p, z_p, merged_p) = merge_test_paths("corrupted");
         write_test_q4_source(&qkv_p, 4, 8, 1.0);
         write_test_q4_source(&z_p, 4, 8, 5.0);

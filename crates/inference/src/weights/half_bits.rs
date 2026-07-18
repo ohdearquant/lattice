@@ -199,10 +199,8 @@ mod tests {
         // NOT prove either function matches IEEE-754 or an external decoder,
         // because both sides of the comparison come from this module. A
         // decode bug that is exactly undone by a matching encode bug (or
-        // vice versa) passes this test silently: a wrong infinity decode
-        // constant and ties-away-from-zero rounding were both injected as
-        // test mutations and left this test green. Independent
-        // verification against a third-party decoder lives in
+        // vice versa) passes this test silently. Independent verification
+        // against a third-party decoder lives in
         // `f16_bits_to_f32_matches_independent_half_crate_oracle` and
         // `f16_bits_to_f32_signaling_nan_is_lossless_widen_independent_of_decoder`
         // below; do not treat this test alone as a correctness guarantee.

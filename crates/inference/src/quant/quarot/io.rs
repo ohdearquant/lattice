@@ -1145,10 +1145,9 @@ mod tests {
     // after `QuarotTensorReader::open`'s initial `open_dir_nofollow` cannot
     // redirect any later read.
     //
-    // with `open_manifest_entry` bypassed (shard
-    // resolution reverted to a bare `model_dir.join(shard_file)` reopened by
-    // path), every test below would instead succeed in reading the escaped
-    // tensor's real contents from outside the model directory.
+    // `open_manifest_entry` is the only path any shard read goes through,
+    // so a shard entry that resolves outside the model directory is
+    // refused rather than opened by a reconstructed path.
     // -------------------------------------------------------------------
 
     #[test]
@@ -1156,9 +1155,8 @@ mod tests {
     fn shard_entry_rejects_a_symlinked_final_component() {
         // A symlink planted at the shard's final path component — standing
         // in for a swap that lands between the initial `open_dir_nofollow`
-        // and the later per-shard `openat`. dropping
-        // `O_NOFOLLOW` from `openat_file_nofollow` makes this test fail —
-        // the open would succeed and follow the symlink.
+        // and the later per-shard `openat`. `openat_file_nofollow` refuses
+        // to follow it.
         let root = tempfile::tempdir().unwrap();
         let model_dir = root.path().join("model_root");
         std::fs::create_dir(&model_dir).unwrap();
@@ -1186,11 +1184,9 @@ mod tests {
         // The shard entry's intermediate directory component ("subdir") is a
         // symlink to a directory outside model_root. `O_NOFOLLOW` only
         // protects the *final* path component in a plain `open`, so this
-        // guards the hop-by-hop `openat_dir_nofollow` walk specifically.
-        // dropping `O_NOFOLLOW` from
-        // `openat_dir_nofollow` makes this test fail — the walk would
-        // follow the symlink into the outside directory and read the
-        // escaped tensor.
+        // guards the hop-by-hop `openat_dir_nofollow` walk specifically:
+        // each hop refuses to follow a symlink, so the walk cannot escape
+        // into the outside directory and read the escaped tensor.
         let root = tempfile::tempdir().unwrap();
         let model_dir = root.path().join("model_root");
         std::fs::create_dir(&model_dir).unwrap();

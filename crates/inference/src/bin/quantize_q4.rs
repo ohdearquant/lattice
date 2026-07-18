@@ -275,12 +275,11 @@ impl TempPublishDir {
                 output_dir.display()
             )
         })?;
-        // Restore the parent-creation behavior `fs::create_dir_all(output_dir)`
-        // used to provide before `TempPublishDir` replaced it: a valid
-        // `--output-dir` whose parent doesn't exist yet must still succeed
-        // (the adjacent temp dir and the final rename target both resolve
-        // once the parent exists). The refuse-non-empty-output check above
-        // already ran, so this can't paper over a stale non-empty target.
+        // A valid `--output-dir` whose parent doesn't exist yet must still
+        // succeed (the adjacent temp dir and the final rename target both
+        // resolve once the parent exists). The refuse-non-empty-output check
+        // above already ran, so this can't paper over a stale non-empty
+        // target.
         fs::create_dir_all(parent).map_err(|e| {
             format!(
                 "failed to create output directory parent {}: {e}",
@@ -964,11 +963,9 @@ mod tests {
         // `config.json` planted as a symlink to a file outside the model
         // directory — standing in for a hostile or concurrently-swapped
         // checkpoint trying to exfiltrate arbitrary readable bytes into the
-        // quantizer's output. reverting
-        // `read_file_at_nofollow` to a path-based `fs::read` (which follows
-        // the final symlink) makes this test fail — the secret contents
-        // would be copied into the staging directory instead of the read
-        // being refused.
+        // quantizer's output. `read_file_at_nofollow` refuses to follow the
+        // final symlink, so the secret contents are never copied into the
+        // staging directory.
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
         let output = tmp.path().join("output");
@@ -998,14 +995,12 @@ mod tests {
     // -----------------------------------------------------------------------
     // Atomic publish + refuse-non-empty-output-dir.
     //
-    // Reverting `TempPublishDir` so writes land directly
-    // in `output_dir` makes
-    // `atomic_publish_leaves_output_dir_untouched_on_mid_conversion_failure`
-    // fail (a partial `.q4`/`config.json` would appear in `output`), and
-    // dropping the up-front `fs::read_dir` non-empty check makes both
-    // `quantize_model_refuses_preexisting_nonempty_output_dir` and
-    // `quantize_model_refuses_output_dir_containing_planted_symlink` fail
-    // (the stray file / symlink would silently coexist with fresh output).
+    // `TempPublishDir` stages writes outside `output_dir` and only publishes
+    // on success, so a mid-conversion failure leaves `output_dir` untouched
+    // with no partial `.q4`/`config.json` present. The up-front
+    // `fs::read_dir` non-empty check refuses to run against a preexisting
+    // output directory, including one containing a planted symlink, instead
+    // of letting stray content silently coexist with fresh output.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1113,15 +1108,10 @@ mod tests {
         // `renameat(parent_fd, temp_name, parent_fd, output_name)` anchors
         // both the source and destination name to the parent-directory fd
         // `create()` opened — never a re-resolved `output_dir`/`temp_dir`
-        // full path. A `fs::rename(temp_dir, output_dir)` on reconstructed
-        // paths instead re-walks every ancestor of both paths at publish
-        // time, so swapping the shared parent directory between `create()`
-        // and `publish()` would redirect (or break) the final rename
-        // relative to the substituted parent. Reverting `publish()` to
-        // path-based `fs::rename` makes this test fail — the rename either
-        // errors (source path no longer resolves under the swapped parent)
-        // or lands under the wrong parent, instead of publishing under the
-        // parent whose fd was actually held.
+        // full path. Swapping the shared parent directory between
+        // `create()` and `publish()` therefore cannot redirect the final
+        // rename: it always lands under the parent whose fd was actually
+        // held, regardless of what the path currently resolves to.
         let tmp = tempfile::tempdir().unwrap();
         let real_parent = tmp.path().join("real_parent");
         fs::create_dir(&real_parent).unwrap();
@@ -1212,13 +1202,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Fold: Drop-ordering — a failed `publish()` must leave the staging
-    // handle in `self` so `Drop` can still clean it up.
-    //
-    // reverting `publish()` to `.take()` `self.temp` (and
-    // `self.dir_fd`) up front makes this test fail — the
-    // staging directory would survive (leaked) after a failed rename,
-    // because `Drop` would find `self.temp == None` and do nothing.
+    // Drop-ordering — a failed `publish()` must leave the staging handle in
+    // `self` so `Drop` can still clean it up: `self.temp` and `self.dir_fd`
+    // stay populated until the rename actually succeeds, so a failed rename
+    // still gets removed by `Drop` instead of being leaked.
     // -----------------------------------------------------------------------
     #[test]
     fn publish_failure_still_lets_drop_clean_up_the_staging_dir() {
@@ -1266,11 +1253,10 @@ mod tests {
         // no-publish / early-error path) rather than `publish()`: the
         // staging path is replaced with a fresh, unrelated directory that
         // holds attacker-planted content, then the guard drops without
-        // calling `publish`. Reverting `Drop` to a bare
-        // `fs::remove_dir_all(temp_dir)` (no inode check against the held
-        // `dir_fd`) makes this test fail — the substituted directory (and
-        // the attacker's file inside it) would be recursively deleted even
-        // though this run never created it.
+        // calling `publish`. `Drop` checks the substituted directory's
+        // inode against the held `dir_fd` before deleting anything, so the
+        // substituted directory (and the attacker's file inside it) is left
+        // untouched rather than recursively deleted.
         let tmp = tempfile::tempdir().unwrap();
         let output = tmp.path().join("output");
 
@@ -1298,11 +1284,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // fd-bind the staging directory (path race).
     //
-    // reverting `TempPublishDir::create_file` to a
-    // the previous path-based `File::create(self.write_dir().join(filename))` makes `create_file_writes_land_in_original_dirfd_inode_not_a_
-    // post_create_symlink_swap` fail — the write would follow the attacker's
-    // symlink into `attacker_dir` instead of landing in the original staging
-    // inode, so the "attacker dir stays empty" assertion trips.
+    // `TempPublishDir::create_file` opens each file relative to the held
+    // directory fd rather than through a reconstructed path, so a symlink
+    // planted at the staging path after creation cannot redirect the write
+    // into the attacker's directory.
     // -----------------------------------------------------------------------
     #[test]
     #[cfg(unix)]
@@ -1354,14 +1339,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // dry-run must validate f16 representability identically to
-    // the real run.
-    //
-    // hoisting the `encode_f16_payload` call back inside
-    // the `if !dry_run` block makes
-    // `dry_run_rejects_f16_overflow_that_the_real_run_would_also_reject`
-    // pass silently through dry-run (no error), diverging from the real-run
-    // sibling assertion below it.
+    // dry-run must validate f16 representability identically to the real
+    // run: `encode_f16_payload` runs unconditionally, not only inside an
+    // `if !dry_run` block, so a value that overflows f16 narrowing errors in
+    // dry-run the same way it would in the real run.
     // -----------------------------------------------------------------------
     #[test]
     fn dry_run_rejects_f16_overflow_that_the_real_run_would_also_reject() {
@@ -1396,13 +1377,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // restore missing-parent-directory creation.
+    // Missing parent directory creation.
     //
-    // removing the `fs::create_dir_all(parent)` call
-    // added to `TempPublishDir::create` makes
-    // `quantize_model_creates_missing_output_parent_directories` fail with
-    // "failed to create staging directory" (no such file or directory),
-    // while the non-empty-output-dir refusal sibling stays green throughout.
+    // `TempPublishDir::create` creates any missing ancestor directories of
+    // `output_dir` before staging writes there, so an output path whose
+    // parent does not exist yet still succeeds.
     // -----------------------------------------------------------------------
     #[test]
     fn quantize_model_creates_missing_output_parent_directories() {
@@ -1434,11 +1413,10 @@ mod tests {
     // -----------------------------------------------------------------------
     // MoE routed-expert tensors (issue #874 regression coverage).
     //
-    // these tensor names have no `.weight` suffix, so the
-    // pre-fix gate (`if !name.ends_with(".weight") ... return false`) rejects
-    // them before reaching any of the quantize-candidate checks. Reverting
-    // the `.experts.gate_up_proj` / `.experts.down_proj` special-case added
-    // in this fix makes every assertion below fail.
+    // These tensor names have no `.weight` suffix, so `should_quantize`
+    // special-cases the `.experts.gate_up_proj` / `.experts.down_proj`
+    // suffixes to accept them alongside the ordinary `.weight`-suffixed
+    // candidates.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1500,9 +1478,9 @@ mod tests {
 
     #[test]
     fn should_quantize_accepts_shared_expert_weights() {
-        // The shared (always-on) expert and its gate already carry a
-        // `.weight` suffix and were already quantized correctly pre-fix;
-        // this pins that they remain quantized post-fix.
+        // The shared (always-on) expert and its gate carry a `.weight`
+        // suffix, so the ordinary `.weight`-suffix rule alone quantizes
+        // them correctly.
         for name in [
             "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
             "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",

@@ -350,11 +350,9 @@ mod tests {
         assert!(err.to_string().contains("does not match"));
     }
 
-    /// Mutation sensitivity: with the `!v.is_finite()` scan removed (or
-    /// replaced by an always-`Ok` stub), this test's NaN input would pass
-    /// validation. Verified by temporarily deleting the scan and confirming
-    /// `rejects_nan` above goes red before restoring it (see PR description
-    /// for the revert/touch/restore cycle).
+    /// The finiteness scan checks every element, not just the first — a
+    /// NaN placed at the last index of a 64-element tensor is still caught
+    /// and reported at its actual index.
     #[test]
     fn all_of_a_finite_tensor_is_scanned_not_just_the_first_element() {
         let mut values = vec![1.0f32; 64];

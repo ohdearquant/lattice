@@ -1312,10 +1312,9 @@ mod tests {
         // writes happen much later — after loading every tensor and running
         // the forward-equivalence gate — so a concurrent actor has a wide
         // window to plant a symlink at a fixed output filename pointing at
-        // an external victim file. reverting
-        // `create_output_file` to a plain `fs::File::create` makes this
-        // test fail — the victim file would be truncated instead of the
-        // open being refused.
+        // an external victim file. `create_output_file` refuses to open a
+        // path that already resolves through a symlink, so the victim file
+        // is never truncated.
         let tmp = tempfile::tempdir().unwrap();
         let victim = tmp.path().join("victim.txt");
         fs::write(&victim, b"do-not-touch").unwrap();
@@ -1344,10 +1343,9 @@ mod tests {
         // by scanning the fd itself, that nothing was planted in the gap
         // between `create_dir_all` and `open_dir_nofollow` (a race, or a
         // plain-directory substitution that `O_NOFOLLOW` alone does not
-        // reject). Reverting the check to unconditionally report "empty"
-        // makes this test fail — planted content in the directory the fd
-        // is bound to would go undetected and the write session would
-        // proceed into it.
+        // reject). `dir_fd_is_nonempty` scans the fd's directory entries
+        // directly, so content planted in the directory the fd is bound to
+        // is detected regardless of how it got there.
         let tmp = tempfile::tempdir().unwrap();
         let empty_dir = tmp.path().join("empty");
         fs::create_dir(&empty_dir).unwrap();
@@ -1549,22 +1547,15 @@ mod tests {
         );
     }
 
-    /// The Q4 quantized-tensor branch: the
-    /// real-write path (`quantize_f64_to_q4` → `create_output_file` +
-    /// `write_q4_tensor`) validates Q4
-    /// representability via `encode_finite_q4_metadata`'s two-sided
-    /// scale+bias underflow guard, but that call used to be gated behind
-    /// `if !opts.dry_run`, so dry-run silently skipped it. A planned tensor
-    /// whose post-rotation magnitude underflows Q4's symmetric-mode
-    /// scale/bias to f16 zero (B4's constant-block repro, scaled to a whole
-    /// tensor here since Hadamard rotation mixes every element along a
-    /// planned tensor's rotated axis) must be rejected identically in
-    /// dry-run and the real run.
-    ///
-    /// re-gating `quantize_f64_to_q4` behind `if
-    /// !opts.dry_run` (the pre-fix state) makes the `dry_run: true`
-    /// iteration of this test pass silently through validation, diverging
-    /// from the `dry_run: false` iteration's `Err`.
+    /// The Q4 quantized-tensor branch: the real-write path
+    /// (`quantize_f64_to_q4` → `create_output_file` + `write_q4_tensor`)
+    /// validates Q4 representability via `encode_finite_q4_metadata`'s
+    /// two-sided scale+bias underflow guard, and dry-run runs the same
+    /// validation rather than skipping it. A planned tensor whose
+    /// post-rotation magnitude underflows Q4's symmetric-mode scale/bias to
+    /// f16 zero (a constant-block underflow, scaled to a whole tensor here
+    /// since Hadamard rotation mixes every element along a planned tensor's
+    /// rotated axis) is rejected identically in dry-run and the real run.
     #[test]
     fn dry_run_rejects_q4_bias_underflow_that_the_real_run_would_also_reject() {
         let cfg = tiny_cfg(true);
@@ -2741,10 +2732,10 @@ mod tests {
     fn read_quarot_seed_from_index_bare_array_is_none() {
         // `quantize_q4` (plain, non-rotated Q4 checkpoints) writes
         // `quantize_index.json` as a bare top-level tensor array, not the
-        // `{quarot_seed, tensors}` object `quantize_quarot` produces. This
-        // must be recognized as "no seed", not rejected as malformed —
-        // reverting the array-shape check makes serde misparse the first
-        // array element as the `quarot_seed: Option<u64>` field and error.
+        // `{quarot_seed, tensors}` object `quantize_quarot` produces. The
+        // array-shape check recognizes this as "no seed" before serde would
+        // otherwise try to parse the first array element as the
+        // `quarot_seed: Option<u64>` field and error.
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
             tmp.path().join("quantize_index.json"),
@@ -2776,10 +2767,10 @@ mod tests {
     #[test]
     fn read_quarot_seed_from_index_rejects_malformed_json() {
         // #504 remaining slice 2: a *present* file that fails to parse must
-        // be a hard error, not a silent None — the pre-fix behavior treated
-        // corruption/truncation identically to "legitimately absent",
-        // which would silently apply the wrong (or no) QuaRot rotation to
-        // a checkpoint that actually needed one.
+        // be a hard error, not a silent None, so corruption/truncation is
+        // never treated identically to "legitimately absent" — that
+        // distinction matters because a silent None would apply the wrong
+        // (or no) QuaRot rotation to a checkpoint that actually needed one.
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("quantize_index.json"), "not json").unwrap();
         let err = read_quarot_seed_from_index(tmp.path())
