@@ -161,7 +161,10 @@
 
 use crate::error::InferenceError;
 use crate::model::qwen::QwenConfig;
-use crate::quant::quarot::hadamard::RandomizedHadamard;
+use crate::model::qwen35_config::Qwen35Config;
+use crate::quant::quarot::hadamard::{
+    MAX_BLOCK_HADAMARD_BLOCKS, MAX_BLOCK_HADAMARD_LEN, RandomizedHadamard,
+};
 use crate::quant::quarot::rotation::{
     absorb_input_rotation, absorb_input_rotation_f64, absorb_output_rotation,
     absorb_output_rotation_f64,
@@ -174,7 +177,7 @@ use crate::quant::quarot::rotation::{
 ///
 /// `OutputSide`: `W ← R · W`. Used when the layer writes to a residual
 /// stream that should be pre-rotated by `R` for downstream consumers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AbsorptionSide {
     InputSide,
     OutputSide,
@@ -195,10 +198,530 @@ pub struct TensorRotation {
 /// is constructed once from `(seed, dim)` when the plan is materialized for
 /// execution — the plan itself does not own rotations so it stays cheap to
 /// clone and serialize.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `AttentionOutputR3` and `MlpDownR4` are **contract-only** as of issue
+/// #703 PR1: [`apply_tensor_rotation`] refuses them rather than silently
+/// treating them as a no-op, because no plan in this PR references them and
+/// no online (runtime) rotation is wired yet — see [`OnlineRotationSpec`]
+/// for the artifact-level metadata these identifiers carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RotationId {
     /// `R_res` of dimension `hidden_size`.
     ResidualStream,
+    /// `R3`: full-attention gated context, immediately before `o_proj`.
+    /// Scope is full-attention layers only (GDN excluded) — see
+    /// [`OnlineRotationSpec::r3_full_attention`].
+    AttentionOutputR3,
+    /// `R4`: post-`SiLU × up` MLP activation, immediately before
+    /// `down_proj`. Applies to every layer's dense MLP (both full-attention
+    /// and GDN layers carry a dense MLP in Qwen3.5 hybrid) — see
+    /// [`OnlineRotationSpec::r4_dense_mlp`].
+    MlpDownR4,
+}
+
+impl RotationId {
+    /// The physical activation site this rotation ID attaches to when used
+    /// as an *online* (runtime-applied) rotation, or `None` if this ID has
+    /// no online site (`ResidualStream`/R1 is purely an offline weight
+    /// fusion — see [`apply_tensor_rotation`]'s refusal of the other two IDs
+    /// there, which is the mirror-image rule: R3/R4 never go through offline
+    /// absorption, R1 never goes through an online site).
+    ///
+    /// This is the single authoritative `RotationId` → [`OnlineTransformSite`]
+    /// mapping. Anything that needs to know where an online rotation sits,
+    /// or which tensor absorbs it (via
+    /// [`OnlineTransformSite::weight_tensor_suffix`]), must go through this
+    /// method rather than re-deriving the association.
+    pub fn online_transform_site(self) -> Option<OnlineTransformSite> {
+        match self {
+            RotationId::ResidualStream => None,
+            RotationId::AttentionOutputR3 => Some(OnlineTransformSite::AttentionOutputPreOProj),
+            RotationId::MlpDownR4 => Some(OnlineTransformSite::MlpPreDownProj),
+        }
+    }
+}
+
+/// Which physical activation site an online (runtime-applied) rotation
+/// attaches to. Distinct from [`AbsorptionSide`], which describes which side
+/// of the *weight matrix* absorbs the offline counter-rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnlineTransformSite {
+    /// R3: full-attention gated context, immediately before `o_proj`.
+    AttentionOutputPreOProj,
+    /// R4: post-`SiLU × up` MLP activation, immediately before `down_proj`.
+    MlpPreDownProj,
+}
+
+impl OnlineTransformSite {
+    /// Suffix (matching [`RotationPlan::for_tensor`]'s suffix convention) of
+    /// the weight tensor whose input side absorbs this site's online
+    /// rotation. The authoritative link between "where the runtime rotation
+    /// sits" and "which stored tensor counter-rotates it" — callers that
+    /// need to know which tensors an online recipe affects (e.g.
+    /// [`super::io::OnlineArtifactDescriptor::validate`]) must go through
+    /// this method rather than re-deriving the tensor name independently.
+    pub fn weight_tensor_suffix(self) -> &'static str {
+        match self {
+            OnlineTransformSite::AttentionOutputPreOProj => "self_attn.o_proj.weight",
+            OnlineTransformSite::MlpPreDownProj => "mlp.down_proj.weight",
+        }
+    }
+}
+
+/// Artifact-level record of a single online (runtime) rotation: which
+/// physical site it attaches to, which side of the consuming weight
+/// absorbs its transpose (per `rotation.rs`'s documented `y = W R^T (R x)`
+/// algebra), its seed(s)/block size, and the explicit layer scope.
+///
+/// **v0 scope (issue #703 PR1): validated at load, not yet executed.** The
+/// load path deserializes this struct (via `io.rs`'s
+/// `OnlineArtifactDescriptor`) and calls [`Self::validate`] on every spec it
+/// carries — a structurally malformed R3/R4 recipe is already rejected
+/// before an artifact can be used. What is still absent is the forward-path
+/// consumer: no runtime code applies the recipe this struct describes to an
+/// activation yet, so a *structurally valid* `V1Online` descriptor is
+/// currently rejected at load too (see `read_quarot_seed_from_index`'s
+/// fail-closed contract), pending the later PR that wires the runtime side.
+/// The orientation recorded here (`side: InputSide` for both R3 and R4) is
+/// the winning orientation proven by the one-layer reference test in
+/// `r3_reference.rs` — see that module's doc comment for the full
+/// enumeration result.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OnlineRotationSpec {
+    pub id: RotationId,
+    /// Which side of the consuming weight (`o_proj` for R3, `down_proj`
+    /// for R4) absorbs the counter-rotation. Both R3 and R4 use
+    /// `InputSide`: the *runtime* activation is rotated by `R`, and the
+    /// weight's input side absorbs `R^T` offline — matching
+    /// `rotation.rs`'s `y = W · R^T · (R · x)` identity exactly, because
+    /// in both cases the transform sits on an activation that is the
+    /// weight's *input*, not its output onto the residual stream.
+    pub side: AbsorptionSide,
+    pub seed: u64,
+    /// Power-of-two block size dividing the transformed axis.
+    ///
+    /// For R3 this divides `num_attention_heads` — QuaRot's online
+    /// "Hadamard heads" factor (paper Eq. 9: `H_num_heads ⊗ I_head_dim`)
+    /// mixes values ACROSS heads at each fixed within-head channel, so the
+    /// axis being block-Hadamard-transformed is the head axis, not
+    /// `head_dim`. `block_size == num_attention_heads` reproduces the
+    /// paper's single dense `H_num_heads` exactly; a smaller power-of-two
+    /// divisor partitions the heads into independently-rotated groups —
+    /// the same `BlockHadamard` fallback pattern already used for
+    /// non-power-of-two axes elsewhere in this module (see
+    /// [`super::hadamard::BlockHadamard`]'s doc), applied here so
+    /// `num_attention_heads` values that are not themselves a power of two
+    /// (e.g. Qwen3.6-27B's 24) still admit a valid R3 recipe instead of
+    /// requiring a non-Hadamard randomized-orthogonal fallback.
+    ///
+    /// For R4 this divides `intermediate_size`.
+    pub block_size: usize,
+    /// Explicit layer indices this rotation applies to. `None` means every
+    /// layer that carries the target tensor. R3 is always `Some` and lists
+    /// only full-attention layer indices (GDN layers are excluded — the
+    /// design doc's §B "Hybrid Qwen3.5" scoping rule: GDN attention is not
+    /// paper-standard softmax attention and R3's derivation does not cover
+    /// it). R4 is always `None` because every layer (full-attention and
+    /// GDN alike) carries a dense MLP in Qwen3.5 hybrid.
+    ///
+    /// v1 contract: when `Some`, the indices must be strictly sorted
+    /// ascending with no duplicates — this is the artifact's sole canonical
+    /// representation, so no runtime consumer ever has to decide whether a
+    /// repeated index means "apply twice" or "de-dupe". See
+    /// [`Self::validate`].
+    pub layer_scope: Option<Vec<usize>>,
+}
+
+/// Reject `(dim, block_size)` pairs [`super::hadamard::BlockHadamard::new`]
+/// refuses to construct: `dim == 0`, `dim` exceeding
+/// [`MAX_BLOCK_HADAMARD_LEN`], or a block count (`dim / block_size`)
+/// exceeding [`MAX_BLOCK_HADAMARD_BLOCKS`]. This is the single shared
+/// source of truth between the two gates that certify an R3/R4 recipe
+/// against a config: the convenience constructors
+/// ([`OnlineRotationSpec::r3_full_attention`]/[`OnlineRotationSpec::r4_dense_mlp`])
+/// and [`OnlineRotationSpec::validate`]'s `cfg`-present branch (which also
+/// certifies hand-built specs that bypass the constructors, e.g. specs
+/// deserialized from an artifact). Without this shared check, a descriptor
+/// naming a `(dim, block_size)` pair `BlockHadamard` refuses to construct
+/// (e.g. Qwen3.6-27B's `intermediate_size = 17408` with `block_size = 4`,
+/// giving 4,352 blocks over the block-count cap; or `dim = 33_554_432`
+/// with `block_size = 8192`, giving exactly 4,096 blocks — under the
+/// block-count cap, but `dim` itself is over [`MAX_BLOCK_HADAMARD_LEN`])
+/// could pass both certification gates and only fail once a later PR
+/// tries to materialize the rotation at runtime.
+///
+/// Caller must already know `block_size` evenly divides `dim` (this
+/// function does not re-check divisibility) so `num_blocks = dim /
+/// block_size` is exact.
+fn check_block_hadamard_num_blocks_cap(
+    axis_name: &str,
+    dim: usize,
+    block_size: usize,
+) -> Result<(), InferenceError> {
+    if dim == 0 {
+        return Err(InferenceError::Inference(format!(
+            "OnlineRotationSpec: {axis_name} must be non-zero — \
+             BlockHadamard::new refuses a zero-length rotation axis"
+        )));
+    }
+    if dim > MAX_BLOCK_HADAMARD_LEN {
+        return Err(InferenceError::Inference(format!(
+            "OnlineRotationSpec: {axis_name} {dim} exceeds the \
+             MAX_BLOCK_HADAMARD_LEN cap of {MAX_BLOCK_HADAMARD_LEN} — this \
+             recipe cannot be materialized by BlockHadamard::new, so it is \
+             refused here rather than certified as a valid artifact"
+        )));
+    }
+    let num_blocks = dim / block_size;
+    if num_blocks > MAX_BLOCK_HADAMARD_BLOCKS {
+        return Err(InferenceError::Inference(format!(
+            "OnlineRotationSpec: {axis_name} {dim} with block_size \
+             {block_size} needs {num_blocks} BlockHadamard blocks, exceeding \
+             the MAX_BLOCK_HADAMARD_BLOCKS cap of \
+             {MAX_BLOCK_HADAMARD_BLOCKS} — this recipe cannot be \
+             materialized by BlockHadamard::new, so it is refused here \
+             rather than certified as a valid artifact"
+        )));
+    }
+    Ok(())
+}
+
+impl OnlineRotationSpec {
+    /// Build the R3 spec for Qwen3.5 hybrid: scope is exactly the
+    /// config-declared full-attention layer indices (GDN excluded).
+    ///
+    /// `block_size` divides `num_attention_heads` — see the `block_size`
+    /// field doc on [`OnlineRotationSpec`] for why the axis is heads, not
+    /// `head_dim` (QuaRot Eq. 9's cross-head `H_num_heads ⊗ I_head_dim`
+    /// online factor, confirmed against arXiv:2404.00456 Stage 1c: "insert
+    /// a block into the forward pass that computes `Z ← Z(H_nh ⊗ I)` [...]
+    /// denoted Hadamard heads").
+    ///
+    /// Refuses if `block_size` is zero, not a power of two, does not
+    /// divide `cfg.num_attention_heads`, or if the config has zero
+    /// full-attention layers (would silently produce a no-op rotation with
+    /// an empty scope — that is a config/architecture mismatch, not a valid
+    /// R3 artifact).
+    pub fn r3_full_attention(
+        cfg: &Qwen35Config,
+        seed: u64,
+        block_size: usize,
+    ) -> Result<Self, InferenceError> {
+        if block_size == 0 || !block_size.is_power_of_two() {
+            return Err(InferenceError::Inference(format!(
+                "OnlineRotationSpec::r3_full_attention requires a power-of-two \
+                 block_size, got {block_size}"
+            )));
+        }
+        if !cfg.num_attention_heads.is_multiple_of(block_size) {
+            return Err(InferenceError::Inference(format!(
+                "OnlineRotationSpec::r3_full_attention: block_size {block_size} \
+                 does not divide num_attention_heads {} — R3's online factor \
+                 is QuaRot Eq. 9's cross-head Hadamard (H_num_heads ⊗ \
+                 I_head_dim), so block_size divides the head axis, not \
+                 head_dim",
+                cfg.num_attention_heads
+            )));
+        }
+        check_block_hadamard_num_blocks_cap(
+            "num_attention_heads",
+            cfg.num_attention_heads,
+            block_size,
+        )?;
+        let layers: Vec<usize> = (0..cfg.num_hidden_layers)
+            .filter(|&i| cfg.is_full_attention(i))
+            .collect();
+        if layers.is_empty() {
+            return Err(InferenceError::Inference(
+                "OnlineRotationSpec::r3_full_attention: config resolved zero \
+                 full-attention layers — refusing an empty-scope R3 artifact"
+                    .to_string(),
+            ));
+        }
+        Ok(Self {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed,
+            block_size,
+            layer_scope: Some(layers),
+        })
+    }
+
+    /// Build the R4 spec for Qwen3.5 hybrid dense MLP: scope is every
+    /// layer (`layer_scope: None`).
+    ///
+    /// Refuses if `block_size` is zero, not a power of two, does not
+    /// divide `cfg.intermediate_size`, `cfg` is a MoE configuration (this
+    /// constructor's `mlp.down_proj.weight` target is the DENSE tensor
+    /// name — a MoE config's loader requires `mlp.experts.down_proj`
+    /// instead, so building an R4 spec against a MoE config would certify a
+    /// fabricated dense per-layer name; MoE R4 targets are not yet
+    /// modeled), or `cfg.intermediate_size / block_size` exceeds
+    /// [`MAX_BLOCK_HADAMARD_BLOCKS`] (a recipe [`super::hadamard::BlockHadamard::new`]
+    /// cannot construct — see [`check_block_hadamard_num_blocks_cap`]).
+    pub fn r4_dense_mlp(
+        cfg: &Qwen35Config,
+        seed: u64,
+        block_size: usize,
+    ) -> Result<Self, InferenceError> {
+        if cfg.is_moe() {
+            return Err(InferenceError::Inference(
+                "OnlineRotationSpec::r4_dense_mlp: this config is a MoE \
+                 configuration (loader requires mlp.experts.down_proj, not \
+                 the dense mlp.down_proj.weight this constructor targets) — \
+                 MoE R4 targets are not yet modeled"
+                    .to_string(),
+            ));
+        }
+        if block_size == 0 || !block_size.is_power_of_two() {
+            return Err(InferenceError::Inference(format!(
+                "OnlineRotationSpec::r4_dense_mlp requires a power-of-two \
+                 block_size, got {block_size}"
+            )));
+        }
+        if !cfg.intermediate_size.is_multiple_of(block_size) {
+            return Err(InferenceError::Inference(format!(
+                "OnlineRotationSpec::r4_dense_mlp: block_size {block_size} \
+                 does not divide intermediate_size {}",
+                cfg.intermediate_size
+            )));
+        }
+        check_block_hadamard_num_blocks_cap(
+            "intermediate_size",
+            cfg.intermediate_size,
+            block_size,
+        )?;
+        Ok(Self {
+            id: RotationId::MlpDownR4,
+            side: AbsorptionSide::InputSide,
+            seed,
+            block_size,
+            layer_scope: None,
+        })
+    }
+
+    /// Validate this spec's own internal invariants — independent of any
+    /// artifact-level tensor-declaration coverage (see
+    /// [`super::io::OnlineArtifactDescriptor::validate`] for that separate
+    /// check). Every public field on `OnlineRotationSpec` is directly
+    /// constructible: the convenience
+    /// constructors [`Self::r3_full_attention`]/[`Self::r4_dense_mlp`]
+    /// enforce these rules when building a spec, but nothing previously
+    /// stopped a hand-built spec (e.g. deserialized from a corrupted index,
+    /// or assembled by a future caller that skips the constructors) from
+    /// violating them. `OnlineArtifactDescriptor::validate` now calls this
+    /// on every spec it carries, so no descriptor with a malformed spec can
+    /// pass validation regardless of how the spec was constructed.
+    ///
+    /// Checks, independent of `cfg`:
+    /// - `id` must be [`RotationId::AttentionOutputR3`] or
+    ///   [`RotationId::MlpDownR4`] — [`RotationId::ResidualStream`] is a
+    ///   purely offline rotation (see [`RotationId::online_transform_site`]'s
+    ///   doc) and must never appear as an *online* spec.
+    /// - `side` must be [`AbsorptionSide::InputSide`] for both R3 and R4 —
+    ///   the only orientation proven correct by the one-layer reference
+    ///   test (see the `side` field doc).
+    /// - `block_size` must be nonzero and a power of two.
+    /// - R3 requires `layer_scope` to be `Some` and non-empty (an R3 recipe
+    ///   with no full-attention layers is a contract violation, not a valid
+    ///   degenerate case).
+    /// - R3's `layer_scope` must be strictly sorted ascending with no
+    ///   duplicate indices (canonical-form contract, cfg-independent) — a
+    ///   scope like `[3,3,7,11,15,19,23]` is rejected even though a
+    ///   set-equality check alone would silently accept it after collecting
+    ///   into a set.
+    /// - R4 requires `layer_scope` to be exactly `None` (every layer,
+    ///   full-attention and GDN alike, carries a dense MLP — see the
+    ///   `layer_scope` field doc). A hand-built R4 spec that restricts
+    ///   `layer_scope` to specific layers is `None`-wildcard semantics
+    ///   violated in the *other* direction and must also be rejected.
+    ///
+    /// Additional checks when `cfg` is supplied:
+    /// - R3's `block_size` must divide `cfg.num_attention_heads`, and
+    ///   `layer_scope` must be set-equal to `cfg`'s full-attention layers —
+    ///   every scoped index must be a valid full-attention layer
+    ///   (`cfg.is_full_attention`), AND every one of `cfg`'s full-attention
+    ///   layers must appear in `layer_scope` (a scope naming a strict
+    ///   subset, e.g. `[3]` when the
+    ///   config's full-attention layers are `[3,7,11,15,19,23]`, previously
+    ///   passed membership-only checking).
+    /// - R4's `block_size` must divide `cfg.intermediate_size`.
+    ///
+    /// `cfg: None` is accepted because `OnlineArtifactDescriptor::validate`
+    /// does not always have a config available (issue #703 PR1's v0 scope
+    /// is contract-only) — the cfg-independent checks above are exactly the
+    /// ones that catch the review's reported malformed spec (`OutputSide`,
+    /// `block_size=3`, `layer_scope=None` for an R3 id) without needing one.
+    pub fn validate(&self, cfg: Option<&Qwen35Config>) -> Result<(), InferenceError> {
+        if self.side != AbsorptionSide::InputSide {
+            return Err(InferenceError::Inference(format!(
+                "OnlineRotationSpec::validate: {:?} requires side=InputSide \
+                 (the only orientation proven correct by the R3/R4 reference \
+                 test), got {:?}",
+                self.id, self.side
+            )));
+        }
+        if self.block_size == 0 || !self.block_size.is_power_of_two() {
+            return Err(InferenceError::Inference(format!(
+                "OnlineRotationSpec::validate: {:?} requires a power-of-two \
+                 block_size, got {}",
+                self.id, self.block_size
+            )));
+        }
+        match self.id {
+            RotationId::ResidualStream => {
+                return Err(InferenceError::Inference(
+                    "OnlineRotationSpec::validate: RotationId::ResidualStream \
+                     is a purely offline rotation and must never appear as an \
+                     online OnlineRotationSpec"
+                        .to_string(),
+                ));
+            }
+            RotationId::AttentionOutputR3 => {
+                let layers = self.layer_scope.as_ref().ok_or_else(|| {
+                    InferenceError::Inference(
+                        "OnlineRotationSpec::validate: AttentionOutputR3 (R3) \
+                         requires an explicit non-empty layer_scope (full-\
+                         attention layers only) — layer_scope=None is invalid \
+                         for R3"
+                            .to_string(),
+                    )
+                })?;
+                if layers.is_empty() {
+                    return Err(InferenceError::Inference(
+                        "OnlineRotationSpec::validate: AttentionOutputR3 (R3) \
+                         layer_scope must not be empty"
+                            .to_string(),
+                    ));
+                }
+                // Canonical-form contract (v1, cfg-independent): layer_scope
+                // must be strictly sorted ascending with no duplicates. A
+                // duplicate index (e.g. `[3,3,7,...]`) would silently
+                // collapse to a smaller set under any downstream
+                // set-equality check, and an unsorted or repeated scope
+                // gives the future runtime no canonical answer for whether
+                // to de-duplicate, apply twice, or pick one — so both are
+                // rejected here rather than left ambiguous.
+                for pair in layers.windows(2) {
+                    if pair[0] >= pair[1] {
+                        return Err(InferenceError::Inference(format!(
+                            "OnlineRotationSpec::validate: R3 layer_scope {layers:?} \
+                             must be strictly sorted ascending with no \
+                             duplicates — found {} at or after {}",
+                            pair[1], pair[0]
+                        )));
+                    }
+                }
+                if let Some(cfg) = cfg {
+                    if !cfg.num_attention_heads.is_multiple_of(self.block_size) {
+                        return Err(InferenceError::Inference(format!(
+                            "OnlineRotationSpec::validate: R3 block_size {} \
+                             does not divide cfg.num_attention_heads {}",
+                            self.block_size, cfg.num_attention_heads
+                        )));
+                    }
+                    check_block_hadamard_num_blocks_cap(
+                        "num_attention_heads",
+                        cfg.num_attention_heads,
+                        self.block_size,
+                    )?;
+                    for &idx in layers {
+                        if idx >= cfg.num_hidden_layers || !cfg.is_full_attention(idx) {
+                            return Err(InferenceError::Inference(format!(
+                                "OnlineRotationSpec::validate: R3 layer_scope \
+                                 includes layer {idx}, which is not a valid \
+                                 full-attention layer for this config"
+                            )));
+                        }
+                    }
+                    // Membership alone is not enough: R3's contract (and the
+                    // r3_full_attention constructor) requires ALL of the
+                    // config's full-attention layers, not a strict subset —
+                    // a scope naming only some of them would leave the
+                    // omitted layers' weights un-counter-rotated at runtime
+                    // Require set
+                    // equality between `layers` and the config's full-
+                    // attention layers; the membership loop above already
+                    // rejects the "extra/non-member" direction, so this only
+                    // needs to check the "missing" direction.
+                    let required_full_attention_layers: Vec<usize> = (0..cfg.num_hidden_layers)
+                        .filter(|&idx| cfg.is_full_attention(idx))
+                        .collect();
+                    let missing_layers: Vec<usize> = required_full_attention_layers
+                        .iter()
+                        .copied()
+                        .filter(|idx| !layers.contains(idx))
+                        .collect();
+                    if !missing_layers.is_empty() {
+                        return Err(InferenceError::Inference(format!(
+                            "OnlineRotationSpec::validate: R3 layer_scope {layers:?} \
+                             does not cover all of this config's full-attention \
+                             layers {required_full_attention_layers:?} — missing \
+                             layer(s) {missing_layers:?}"
+                        )));
+                    }
+                }
+            }
+            RotationId::MlpDownR4 => {
+                if self.layer_scope.is_some() {
+                    return Err(InferenceError::Inference(
+                        "OnlineRotationSpec::validate: MlpDownR4 (R4) \
+                         layer_scope must be None — every layer carries a \
+                         dense MLP, so R4 is never restricted to a subset of \
+                         layers"
+                            .to_string(),
+                    ));
+                }
+                if let Some(cfg) = cfg {
+                    // R4's contract hard-codes the DENSE
+                    // `mlp.down_proj.weight` target (see
+                    // `OnlineTransformSite::weight_tensor_suffix`), but a MoE
+                    // config's loader requires `mlp.experts.down_proj`
+                    // instead (`is_moe()` — `num_experts`/
+                    // `num_experts_per_tok`/`moe_intermediate_size`/
+                    // `shared_expert_intermediate_size` set — see
+                    // `Qwen35Config::is_moe`). `Qwen35Config::qwen36_35b_a3b()`
+                    // is MoE, so without this check `r4_dense_mlp(&cfg, ...)`
+                    // and `validate(Some(&cfg))` would both succeed while
+                    // certifying a fabricated dense per-layer name that
+                    // never appears in a real MoE checkpoint. MoE R4 targets
+                    // are not yet modeled by this plan; refuse rather than
+                    // validate against the wrong tensor.
+                    if cfg.is_moe() {
+                        return Err(InferenceError::Inference(
+                            "OnlineRotationSpec::validate: MlpDownR4 (R4) \
+                             targets the dense mlp.down_proj.weight tensor, \
+                             but this config is a MoE configuration (loader \
+                             requires mlp.experts.down_proj instead) — MoE \
+                             R4 targets are not yet modeled by this plan"
+                                .to_string(),
+                        ));
+                    }
+                    if !cfg.intermediate_size.is_multiple_of(self.block_size) {
+                        return Err(InferenceError::Inference(format!(
+                            "OnlineRotationSpec::validate: R4 block_size {} \
+                             does not divide cfg.intermediate_size {}",
+                            self.block_size, cfg.intermediate_size
+                        )));
+                    }
+                    // A structurally valid, divisibility-passing recipe can
+                    // still name a block count BlockHadamard::new refuses to
+                    // construct (e.g. Qwen3.6-27B's intermediate_size=17408
+                    // with block_size=4 gives 4,352 blocks, over the
+                    // MAX_BLOCK_HADAMARD_BLOCKS cap of 4,096) — this gate
+                    // must independently reject that case for hand-built
+                    // specs that bypass `r4_dense_mlp`, not just rely on the
+                    // constructor's own check.
+                    check_block_hadamard_num_blocks_cap(
+                        "intermediate_size",
+                        cfg.intermediate_size,
+                        self.block_size,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Whether a rule must match at least one tensor to count as complete coverage.
@@ -526,6 +1049,14 @@ pub fn apply_tensor_rotation(
     };
     let rotation = match tr.rotation_id {
         RotationId::ResidualStream => residual_rotation,
+        RotationId::AttentionOutputR3 | RotationId::MlpDownR4 => {
+            return Err(InferenceError::Inference(
+                "apply_tensor_rotation: R3/R4 rotation IDs are contract-only in \
+                 this PR (issue #703 PR1) — no plan should reference them yet, \
+                 and no online rotation is wired into offline absorption"
+                    .to_string(),
+            ));
+        }
     };
     match tr.side {
         AbsorptionSide::InputSide => absorb_input_rotation(weight, rows, cols, rotation)?,
@@ -549,6 +1080,14 @@ pub fn apply_tensor_rotation_f64(
     };
     let rotation = match tr.rotation_id {
         RotationId::ResidualStream => residual_rotation,
+        RotationId::AttentionOutputR3 | RotationId::MlpDownR4 => {
+            return Err(InferenceError::Inference(
+                "apply_tensor_rotation_f64: R3/R4 rotation IDs are contract-only \
+                 in this PR (issue #703 PR1) — no plan should reference them \
+                 yet, and no online rotation is wired into offline absorption"
+                    .to_string(),
+            ));
+        }
     };
     match tr.side {
         AbsorptionSide::InputSide => absorb_input_rotation_f64(weight, rows, cols, rotation)?,
@@ -1087,5 +1626,310 @@ mod tests {
                 "tensor[{i}]: f32={a} vs f64={b}, delta={delta}"
             );
         }
+    }
+
+    // --- OnlineRotationSpec (R3/R4 contract, issue #703 PR1) ---
+
+    #[test]
+    fn r3_full_attention_scope_matches_qwen35_0_8b_layer_pattern() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        // block_size == num_attention_heads (8): one dense cross-head
+        // Hadamard covering every head, matching the paper's H_num_heads.
+        let spec = OnlineRotationSpec::r3_full_attention(&cfg, 7, 8).unwrap();
+        assert_eq!(spec.id, RotationId::AttentionOutputR3);
+        assert_eq!(spec.side, AbsorptionSide::InputSide);
+        assert_eq!(spec.block_size, 8);
+        // interval=4 over 24 layers -> layers 3,7,11,15,19,23 (0-indexed)
+        assert_eq!(
+            spec.layer_scope,
+            Some(vec![3usize, 7, 11, 15, 19, 23]),
+            "R3 scope must be exactly the config's full-attention layers"
+        );
+        assert_eq!(spec.layer_scope.as_ref().unwrap().len(), 6);
+        for &idx in spec.layer_scope.as_ref().unwrap() {
+            assert!(
+                cfg.is_full_attention(idx),
+                "layer {idx} must be full-attention"
+            );
+        }
+        for idx in 0..cfg.num_hidden_layers {
+            if !spec.layer_scope.as_ref().unwrap().contains(&idx) {
+                assert!(
+                    !cfg.is_full_attention(idx),
+                    "layer {idx} is full-attention but missing from R3 scope"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r3_rejects_block_size_not_dividing_num_attention_heads() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        // num_attention_heads = 8; 16 does not divide it.
+        assert!(OnlineRotationSpec::r3_full_attention(&cfg, 1, 16).is_err());
+    }
+
+    #[test]
+    fn r3_accepts_block_size_grouping_non_power_of_two_head_count() {
+        // Qwen3.6-27B has num_attention_heads = 24, not itself a power of
+        // two. block_size = 8 (a power-of-two divisor of 24) partitions the
+        // 24 heads into 3 independently-rotated cross-head blocks — the
+        // documented BlockHadamard fallback, not a randomized-orthogonal
+        // matrix, for a non-power-of-two head count.
+        let cfg = crate::model::qwen35_config::Qwen35Config::qwen36_27b();
+        assert_eq!(cfg.num_attention_heads, 24);
+        let spec = OnlineRotationSpec::r3_full_attention(&cfg, 1, 8).unwrap();
+        assert_eq!(spec.block_size, 8);
+        // 24 itself is not a power of two, so the "one dense H_num_heads"
+        // form from the paper is unavailable here.
+        assert!(!cfg.num_attention_heads.is_power_of_two());
+        assert!(OnlineRotationSpec::r3_full_attention(&cfg, 1, 24).is_err());
+    }
+
+    #[test]
+    fn r3_rejects_non_power_of_two_block_size() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        assert!(OnlineRotationSpec::r3_full_attention(&cfg, 1, 96).is_err());
+    }
+
+    #[test]
+    fn r3_rejects_zero_block_size() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        assert!(OnlineRotationSpec::r3_full_attention(&cfg, 1, 0).is_err());
+    }
+
+    #[test]
+    fn r4_dense_mlp_has_no_layer_scope_restriction() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let spec = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 256).unwrap();
+        assert_eq!(spec.id, RotationId::MlpDownR4);
+        assert_eq!(spec.side, AbsorptionSide::InputSide);
+        assert_eq!(spec.layer_scope, None);
+    }
+
+    /// `qwen36_35b_a3b()` is MoE (loader requires `mlp.experts.down_proj`,
+    /// not the dense `mlp.down_proj.weight` this constructor targets), so
+    /// both the constructor and the independent `validate` invariant check
+    /// must refuse it rather than certify a fabricated dense per-layer name.
+    #[test]
+    fn r4_dense_mlp_rejects_moe_config() {
+        let moe_cfg = Qwen35Config::qwen36_35b_a3b();
+        assert!(moe_cfg.is_moe(), "sanity: qwen36_35b_a3b is MoE");
+        let err = OnlineRotationSpec::r4_dense_mlp(&moe_cfg, 9, 256).unwrap_err();
+        assert!(format!("{err}").contains("MoE"), "got: {err}");
+
+        // A hand-built R4 spec (bypassing the constructor) must also be
+        // rejected by `validate` when a MoE cfg is supplied — the
+        // constructor and the invariant check are independent gates.
+        let hand_built = OnlineRotationSpec {
+            id: RotationId::MlpDownR4,
+            side: AbsorptionSide::InputSide,
+            seed: 9,
+            block_size: 256,
+            layer_scope: None,
+        };
+        let err = hand_built.validate(Some(&moe_cfg)).unwrap_err();
+        assert!(format!("{err}").contains("MoE"), "got: {err}");
+
+        // The dense 0.8B config is unaffected — still passes both paths.
+        let dense_cfg = Qwen35Config::qwen35_0_8b();
+        assert!(!dense_cfg.is_moe(), "sanity: qwen35_0_8b is dense");
+        assert!(OnlineRotationSpec::r4_dense_mlp(&dense_cfg, 9, 256).is_ok());
+        assert!(hand_built.validate(Some(&dense_cfg)).is_ok());
+    }
+
+    #[test]
+    fn r4_rejects_block_size_not_dividing_intermediate_size() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        // intermediate_size = 3584 = 2^9 * 7. 1024 is a power of two but
+        // does not divide 3584 (3584 / 1024 = 3.5), so this exercises the
+        // divisibility check on its own — a non-power-of-two block_size
+        // like 100 would be rejected earlier by the power-of-two check
+        // regardless of divisibility, leaving this test green even if the
+        // divisibility check were removed.
+        assert_eq!(
+            cfg.intermediate_size % 1024,
+            512,
+            "sanity: 1024 does not divide 3584"
+        );
+        assert!(OnlineRotationSpec::r4_dense_mlp(&cfg, 1, 1024).is_err());
+    }
+
+    /// Qwen3.6-27B is dense (`intermediate_size = 17408`), and 4 is a
+    /// power-of-two divisor of it, so `block_size = 4` clears every
+    /// divisibility check — but `17408 / 4 = 4,352` blocks exceeds
+    /// `BlockHadamard`'s `MAX_BLOCK_HADAMARD_BLOCKS` cap of 4,096, so
+    /// `BlockHadamard::new` refuses to construct this recipe. Both the
+    /// constructor and the independent `validate` gate (for a hand-built
+    /// spec bypassing the constructor) must reject this at certification
+    /// time, not merely at construction time.
+    #[test]
+    fn r4_dense_mlp_rejects_num_blocks_above_block_hadamard_cap() {
+        let cfg = Qwen35Config::qwen36_27b();
+        assert!(!cfg.is_moe(), "sanity: qwen36_27b is dense");
+        assert_eq!(cfg.intermediate_size, 17408);
+        assert_eq!(
+            cfg.intermediate_size / 4,
+            4352,
+            "sanity: 17408 / 4 = 4352 blocks"
+        );
+
+        let err = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 4).unwrap_err();
+        assert!(
+            format!("{err}").contains("4352") && format!("{err}").contains("4096"),
+            "expected the num_blocks cap error naming both the block count \
+             and the cap, got: {err}"
+        );
+
+        // A hand-built spec bypassing the constructor must be rejected by
+        // `validate` too — the mutation-sensitive gate: removing this check
+        // from `validate` while leaving the constructor's check in place
+        // must make this half of the assertion fail.
+        let hand_built = OnlineRotationSpec {
+            id: RotationId::MlpDownR4,
+            side: AbsorptionSide::InputSide,
+            seed: 9,
+            block_size: 4,
+            layer_scope: None,
+        };
+        let err = hand_built.validate(Some(&cfg)).unwrap_err();
+        assert!(
+            format!("{err}").contains("4352") && format!("{err}").contains("4096"),
+            "expected validate() to independently reject the hand-built \
+             spec with the num_blocks cap error, got: {err}"
+        );
+
+        // BlockHadamard itself must actually refuse to construct this
+        // geometry, confirming the cap check reflects a real limitation
+        // rather than an overly conservative guess.
+        assert!(super::super::hadamard::BlockHadamard::new(9, cfg.intermediate_size, 4).is_err());
+    }
+
+    /// The same 27B geometry with a realistic `block_size = 128` stays
+    /// comfortably under the cap (136 blocks) — both certification gates
+    /// accept it, and `BlockHadamard::new` actually constructs it.
+    #[test]
+    fn r4_dense_mlp_accepts_block_size_within_num_blocks_cap() {
+        let cfg = Qwen35Config::qwen36_27b();
+        assert_eq!(
+            cfg.intermediate_size / 128,
+            136,
+            "sanity: 17408 / 128 = 136 blocks"
+        );
+
+        let spec = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 128).unwrap();
+        assert!(spec.validate(Some(&cfg)).is_ok());
+
+        let bh = super::super::hadamard::BlockHadamard::new(9, cfg.intermediate_size, 128)
+            .expect("136 blocks must be constructible — well under the 4096 cap");
+        assert_eq!(bh.num_blocks(), 136);
+    }
+
+    /// `intermediate_size =
+    /// 33_554_432, block_size = 8192` gives exactly 4,096 blocks — AT the
+    /// `MAX_BLOCK_HADAMARD_BLOCKS` cap, so the block-count check alone
+    /// passes it — but `intermediate_size` itself (2^25) exceeds
+    /// `MAX_BLOCK_HADAMARD_LEN` (2^24), a bound `BlockHadamard::new`
+    /// enforces independently of block count. Before this fix the plan
+    /// gate certified this recipe while `BlockHadamard::new` refused to
+    /// construct it — validation and runtime disagreeing about what is
+    /// materializable.
+    #[test]
+    fn r4_dense_mlp_rejects_dim_over_max_block_hadamard_len_even_within_block_cap() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.intermediate_size = 33_554_432;
+        assert_eq!(
+            cfg.intermediate_size / 8192,
+            4096,
+            "sanity: exactly at MAX_BLOCK_HADAMARD_BLOCKS, not over it"
+        );
+
+        let err = OnlineRotationSpec::r4_dense_mlp(&cfg, 9, 8192)
+            .expect_err("dim over MAX_BLOCK_HADAMARD_LEN must be rejected by the plan gate");
+        assert!(
+            format!("{err}").contains("MAX_BLOCK_HADAMARD_LEN"),
+            "expected the plan gate to reject on the length bound, not the \
+             block-count bound (which this pair sits exactly at), got: {err}"
+        );
+
+        // Runtime agrees: BlockHadamard::new independently refuses this
+        // dimension too, confirming the plan gate now matches it.
+        assert!(
+            super::super::hadamard::BlockHadamard::new(9, cfg.intermediate_size, 8192).is_err()
+        );
+
+        // A legitimate dimension at the same block_size still passes both
+        // gates.
+        let small_cfg = Qwen35Config::qwen35_0_8b();
+        assert!(OnlineRotationSpec::r4_dense_mlp(&small_cfg, 9, 128).is_ok());
+    }
+
+    #[test]
+    fn r4_accepts_all_named_design_doc_block_sizes() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        for &b in &[64usize, 128, 256] {
+            assert_eq!(
+                cfg.intermediate_size % b,
+                0,
+                "block size {b} must divide 3584"
+            );
+            assert!(OnlineRotationSpec::r4_dense_mlp(&cfg, 1, b).is_ok());
+        }
+    }
+
+    #[test]
+    fn rotation_id_online_transform_site_pins_every_variant() {
+        assert_eq!(RotationId::ResidualStream.online_transform_site(), None);
+        assert_eq!(
+            RotationId::AttentionOutputR3.online_transform_site(),
+            Some(OnlineTransformSite::AttentionOutputPreOProj)
+        );
+        assert_eq!(
+            RotationId::MlpDownR4.online_transform_site(),
+            Some(OnlineTransformSite::MlpPreDownProj)
+        );
+        assert_eq!(
+            OnlineTransformSite::AttentionOutputPreOProj.weight_tensor_suffix(),
+            "self_attn.o_proj.weight"
+        );
+        assert_eq!(
+            OnlineTransformSite::MlpPreDownProj.weight_tensor_suffix(),
+            "mlp.down_proj.weight"
+        );
+    }
+
+    #[test]
+    fn apply_tensor_rotation_refuses_r3_rotation_id() {
+        // Mutation/refusal: a plan rule that (incorrectly, for this PR)
+        // referenced RotationId::AttentionOutputR3 must be refused loudly
+        // by apply_tensor_rotation rather than silently treated as a
+        // residual-stream rotation or a no-op.
+        let plan = RotationPlan {
+            rules: vec![Rule {
+                pattern: "self_attn.o_proj.weight".to_string(),
+                rotation: TensorRotation {
+                    side: AbsorptionSide::InputSide,
+                    rotation_id: RotationId::AttentionOutputR3,
+                },
+                requirement: RuleRequirement::Required,
+            }],
+        };
+        let hidden = 64;
+        let r = RandomizedHadamard::new(1, hidden).unwrap();
+        let mut weight = vec![1.0_f32; hidden * hidden];
+        let err = apply_tensor_rotation(
+            "model.layers.0.self_attn.o_proj.weight",
+            &mut weight,
+            hidden,
+            hidden,
+            &plan,
+            &r,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("contract-only"),
+            "expected a contract-only refusal, got: {msg}"
+        );
     }
 }
