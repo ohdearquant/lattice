@@ -26,6 +26,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use crate::error::InferenceError;
@@ -45,7 +46,9 @@ use crate::quant::quarot::pipeline::{
 };
 use crate::quant::quarot::plan::RotationPlan;
 use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use crate::weights::q4_weights::{create_output_file, quantize_f64_to_q4, write_q4_tensor};
+use crate::weights::q4_weights::{
+    create_file_at, create_output_file, open_dir_nofollow, quantize_f64_to_q4, write_q4_tensor,
+};
 
 /// CLI / library options for [`convert_quarot_qwen35`].
 #[derive(Debug, Clone)]
@@ -230,6 +233,7 @@ fn f16_file_byte_count(data_len: usize, shape_len: usize) -> u64 {
 fn write_mtp_weights_quarot(
     reader: &QuarotTensorReader,
     output_dir: &Path,
+    output_dir_fd: Option<&std::os::fd::OwnedFd>,
     dry_run: bool,
     index_entries: &mut Vec<IndexEntry>,
     kept_f16: &mut usize,
@@ -278,13 +282,19 @@ fn write_mtp_weights_quarot(
         // reject, not silently accept a value that later overflows f16.
         let framed = encode_f16_payload(&file_name, name, &data, &shape)?;
         if !dry_run {
-            let out_path = output_dir.join(&file_name);
-            create_output_file(&out_path)
+            let dirfd = output_dir_fd.ok_or_else(|| {
+                InferenceError::Inference(
+                    "write_mtp_weights_quarot: missing output directory fd for a non-dry-run write"
+                        .to_string(),
+                )
+            })?;
+            create_file_at(dirfd.as_raw_fd(), &file_name)
                 .and_then(|mut f| f.write_all(&framed))
                 .map_err(|e| {
                     InferenceError::Inference(format!(
-                        "write_mtp_weights_quarot: failed to write {}: {e}",
-                        out_path.display()
+                        "write_mtp_weights_quarot: failed to write {} in {}: {e}",
+                        file_name,
+                        output_dir.display()
                     ))
                 })?;
         }
@@ -462,14 +472,26 @@ pub fn convert_quarot_qwen35(
         },
     )?;
 
-    if !opts.dry_run {
+    // Opened once, right after creation, and held for every write below:
+    // binding the whole write session to one fd means an ancestor or
+    // output-dir swap after this point cannot redirect any later write,
+    // unlike re-joining and reopening `output_dir` by path for each file.
+    let output_dir_fd = if !opts.dry_run {
         fs::create_dir_all(output_dir).map_err(|e| {
             InferenceError::Inference(format!(
                 "convert_quarot_qwen35: failed to create output directory {}: {e}",
                 output_dir.display()
             ))
         })?;
-    }
+        Some(open_dir_nofollow(output_dir).map_err(|e| {
+            InferenceError::Inference(format!(
+                "convert_quarot_qwen35: failed to open output directory {}: {e}",
+                output_dir.display()
+            ))
+        })?)
+    } else {
+        None
+    };
 
     let mut names: Vec<String> = working_set.keys().cloned().collect();
     names.sort();
@@ -510,13 +532,18 @@ pub fn convert_quarot_qwen35(
             let q4 = quantize_f64_to_q4(&entry.data, &entry.shape)?;
             let file_name = format!("{sanitized}.q4");
             if !opts.dry_run {
-                let out_path = output_dir.join(&file_name);
-                create_output_file(&out_path)
+                let dirfd = output_dir_fd.as_ref().ok_or_else(|| {
+                    InferenceError::Inference(
+                        "convert_quarot_qwen35: missing output directory fd for a non-dry-run write"
+                            .to_string(),
+                    )
+                })?;
+                create_file_at(dirfd.as_raw_fd(), &file_name)
                     .and_then(|mut f| write_q4_tensor(&mut f, &q4))
                     .map_err(|e| {
                         InferenceError::Inference(format!(
-                            "convert_quarot_qwen35: failed to write {}: {e}",
-                            out_path.display()
+                            "convert_quarot_qwen35: failed to write {file_name} in {}: {e}",
+                            output_dir.display()
                         ))
                     })?;
                 index_entries.push(IndexEntry {
@@ -539,13 +566,18 @@ pub fn convert_quarot_qwen35(
             // rejection later.
             let framed = encode_f16_payload(&file_name, name, &entry.data, &entry.shape)?;
             if !opts.dry_run {
-                let out_path = output_dir.join(&file_name);
-                create_output_file(&out_path)
+                let dirfd = output_dir_fd.as_ref().ok_or_else(|| {
+                    InferenceError::Inference(
+                        "convert_quarot_qwen35: missing output directory fd for a non-dry-run write"
+                            .to_string(),
+                    )
+                })?;
+                create_file_at(dirfd.as_raw_fd(), &file_name)
                     .and_then(|mut f| f.write_all(&framed))
                     .map_err(|e| {
                         InferenceError::Inference(format!(
-                            "convert_quarot_qwen35: failed to write {}: {e}",
-                            out_path.display()
+                            "convert_quarot_qwen35: failed to write {file_name} in {}: {e}",
+                            output_dir.display()
                         ))
                     })?;
                 index_entries.push(IndexEntry {
@@ -564,6 +596,7 @@ pub fn convert_quarot_qwen35(
         write_mtp_weights_quarot(
             &reader,
             output_dir,
+            output_dir_fd.as_ref(),
             opts.dry_run,
             &mut index_entries,
             &mut kept_f16,
@@ -573,7 +606,13 @@ pub fn convert_quarot_qwen35(
     }
 
     if !opts.dry_run {
-        let index_path = output_dir.join("quantize_index.json");
+        let dirfd = output_dir_fd.as_ref().ok_or_else(|| {
+            InferenceError::Inference(
+                "convert_quarot_qwen35: missing output directory fd for a non-dry-run write"
+                    .to_string(),
+            )
+        })?;
+
         let index_record = QuantizeIndex {
             quarot_seed: Some(opts.rotation_seed),
             tensors: index_entries,
@@ -583,24 +622,23 @@ pub fn convert_quarot_qwen35(
                 "convert_quarot_qwen35: failed to serialize quantize_index.json: {e}"
             ))
         })?;
-        create_output_file(&index_path)
+        create_file_at(dirfd.as_raw_fd(), "quantize_index.json")
             .and_then(|mut f| f.write_all(index_json.as_bytes()))
             .map_err(|e| {
                 InferenceError::Inference(format!(
-                    "convert_quarot_qwen35: failed to write {}: {e}",
-                    index_path.display()
+                    "convert_quarot_qwen35: failed to write quantize_index.json in {}: {e}",
+                    output_dir.display()
                 ))
             })?;
 
         let mut output_config_json = untie_word_embeddings_in_config_json(&config_json)?;
         output_config_json = inject_quarot_seed(&output_config_json, opts.rotation_seed)?;
-        let out_config_path = output_dir.join("config.json");
-        create_output_file(&out_config_path)
+        create_file_at(dirfd.as_raw_fd(), "config.json")
             .and_then(|mut f| f.write_all(output_config_json.as_bytes()))
             .map_err(|e| {
                 InferenceError::Inference(format!(
-                    "convert_quarot_qwen35: failed to write {}: {e}",
-                    out_config_path.display()
+                    "convert_quarot_qwen35: failed to write config.json in {}: {e}",
+                    output_dir.display()
                 ))
             })?;
     }
@@ -1751,12 +1789,12 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Path-layout refuses (review findings, Majors 1 + 2)
+    // Path-layout refuses
     // ------------------------------------------------------------------
 
-    /// Major 1: when input and output paths resolve to the same canonical
-    /// path, the converter must refuse before any write would corrupt
-    /// the source `config.json`.
+    /// When input and output paths resolve to the same canonical path, the
+    /// converter must refuse before any write would corrupt the source
+    /// `config.json`.
     #[test]
     fn convert_quarot_qwen35_rejects_same_input_output_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1781,9 +1819,8 @@ mod tests {
         );
     }
 
-    /// Major 1 sibling: even when the two paths differ literally (e.g.,
-    /// trailing slash, symlink), canonicalization must still catch the
-    /// equivalence.
+    /// Even when the two paths differ literally (e.g., trailing slash,
+    /// symlink), canonicalization must still catch the equivalence.
     #[test]
     fn convert_quarot_qwen35_rejects_same_input_output_dir_via_trailing_slash() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1798,10 +1835,10 @@ mod tests {
         assert!(msg.contains("same path"), "unexpected error: {msg}");
     }
 
-    /// Major 2: a pre-existing non-empty output directory must trigger
-    /// refusal before any conversion work, so a previously-written `.q4`
-    /// artifact cannot survive a gate failure and be picked up by the
-    /// runtime loader.
+    /// A pre-existing non-empty output directory must trigger refusal
+    /// before any conversion work, so a previously-written `.q4` artifact
+    /// cannot survive a gate failure and be picked up by the runtime
+    /// loader.
     #[test]
     fn convert_quarot_qwen35_rejects_non_empty_output_dir() {
         let tmp = tempfile::tempdir().unwrap();

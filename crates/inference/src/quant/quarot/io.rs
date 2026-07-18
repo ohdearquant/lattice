@@ -40,44 +40,143 @@
 //! [ADR-044]: ../../../../../docs/adr/ADR-044-quarot-rotated-quantization.md
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path};
 
 use memmap2::Mmap;
 use serde_json::Value;
 
-use std::path::PathBuf;
-
 use crate::error::InferenceError;
 use crate::weights::f32_weights::parse_index;
 
-/// Resolve a manifest-declared shard filename against `model_root`, rejecting
-/// absolute paths and any resolution that escapes the model directory.
+/// Open `path` as a directory fd, refusing to follow a symlink at the final
+/// component (`O_NOFOLLOW|O_DIRECTORY`). Held for the lifetime of a
+/// [`QuarotTensorReader`] and used as the sole anchor for every subsequent
+/// `openat` in this module — no path string derived from `path` is ever
+/// re-resolved after this call returns.
+fn open_dir_nofollow(path: &Path) -> Result<OwnedFd, InferenceError> {
+    let cpath = CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+        InferenceError::Inference(format!("path {path:?} contains an interior NUL: {e}"))
+    })?;
+    // SAFETY: `cpath` is a valid NUL-terminated C string owned for the
+    // duration of this call. `open` returns either a valid fd (>= 0) or -1
+    // with errno set; the -1 case is checked immediately below.
+    let raw = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(InferenceError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `raw` was just returned by `libc::open` above, checked
+    // non-negative, and is not owned or closed anywhere else.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// `openat(dirfd, name, O_DIRECTORY|O_NOFOLLOW)` — one traversal hop bound to
+/// an already-held directory fd rather than a re-resolved path.
+fn openat_dir_nofollow(dirfd: RawFd, name: &std::ffi::OsStr) -> Result<OwnedFd, InferenceError> {
+    let cname = CString::new(name.as_bytes()).map_err(|e| {
+        InferenceError::Inference(format!(
+            "path component {name:?} contains an interior NUL: {e}"
+        ))
+    })?;
+    // SAFETY: `dirfd` is a valid open directory fd borrowed for the duration
+    // of this call; `cname` is a valid NUL-terminated C string. `openat`
+    // returns either a valid fd (>= 0) or -1 with errno set, checked below.
+    let raw = unsafe {
+        libc::openat(
+            dirfd,
+            cname.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(InferenceError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: see `open_dir_nofollow`.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// `openat(dirfd, name, O_RDONLY|O_NOFOLLOW)` — open the final path
+/// component as a file bound to an already-held directory fd.
+fn openat_file_nofollow(
+    dirfd: RawFd,
+    name: &std::ffi::OsStr,
+) -> Result<std::fs::File, InferenceError> {
+    let cname = CString::new(name.as_bytes()).map_err(|e| {
+        InferenceError::Inference(format!(
+            "path component {name:?} contains an interior NUL: {e}"
+        ))
+    })?;
+    // SAFETY: see `openat_dir_nofollow`.
+    let raw = unsafe {
+        libc::openat(
+            dirfd,
+            cname.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(InferenceError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: see `open_dir_nofollow`.
+    Ok(unsafe { std::fs::File::from(OwnedFd::from_raw_fd(raw)) })
+}
+
+/// Resolve a manifest-declared shard filename against a held `model_root`
+/// directory fd (`root_fd`) by walking every path component with its own
+/// `openat(..., O_NOFOLLOW)`, rather than canonicalizing the joined path and
+/// reopening it by string.
 ///
-/// Mirrors `f32_weights::contain_manifest_path` from PR #1053 (not yet merged
-/// as of this writing) verbatim, so that once #1053 lands a follow-up rebase
-/// can drop this local copy and call the shared helper instead. Canonicalizing
-/// the candidate (rather than only the parent) is correct here because the
-/// shard file is expected to exist on disk at read time.
-pub(crate) fn contain_manifest_path(
-    model_root: &Path,
+/// A canonicalize-then-open sequence is a snapshot: it stops being true the
+/// instant `canonicalize` returns, so an attacker who can replace an
+/// ancestor directory (or the model root itself) between the check and the
+/// later open can redirect a "contained" shard outside `model_root` even
+/// though the check passed. Walking component-by-component with `O_NOFOLLOW`
+/// on every hop makes containment a structural property of the traversal:
+/// each hop is bound to the fd opened for the *previous* hop, never to a
+/// re-resolved path string, and any component that is `..`, absolute, or a
+/// symlink is rejected outright.
+fn open_manifest_entry(
+    root_fd: &OwnedFd,
     entry_name: &str,
-) -> Result<PathBuf, InferenceError> {
-    if Path::new(entry_name).is_absolute() {
-        return Err(InferenceError::Inference(format!(
-            "manifest entry {entry_name:?} must be a path relative to the model directory, not absolute"
-        )));
+) -> Result<std::fs::File, InferenceError> {
+    let rel = Path::new(entry_name);
+    let mut components = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => components.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(InferenceError::Inference(format!(
+                    "manifest entry {entry_name:?} must be a plain relative path with no `..` \
+                     or root component"
+                )));
+            }
+        }
     }
-    let candidate = model_root.join(entry_name);
-    let canon_root = model_root.canonicalize().map_err(InferenceError::Io)?;
-    let canon_candidate = candidate.canonicalize().map_err(InferenceError::Io)?;
-    if !canon_candidate.starts_with(&canon_root) {
+    let Some((&last, dirs)) = components.split_last() else {
         return Err(InferenceError::Inference(format!(
-            "manifest entry {entry_name:?} escapes model root {} (resolved to {})",
-            model_root.display(),
-            canon_candidate.display()
+            "manifest entry {entry_name:?} resolves to an empty path"
         )));
+    };
+
+    let mut held_dir: Option<OwnedFd> = None;
+    for name in dirs {
+        let base_fd = held_dir
+            .as_ref()
+            .map_or(root_fd.as_raw_fd(), AsRawFd::as_raw_fd);
+        held_dir = Some(openat_dir_nofollow(base_fd, name)?);
     }
-    Ok(canon_candidate)
+    let base_fd = held_dir
+        .as_ref()
+        .map_or(root_fd.as_raw_fd(), AsRawFd::as_raw_fd);
+    openat_file_nofollow(base_fd, last)
 }
 
 /// On-disk storage dtype of a tensor.
@@ -194,40 +293,28 @@ fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
 }
 
 impl Shard {
-    /// Open `path` for mmap, refusing to follow a symlink at the final path
-    /// component (`O_NOFOLLOW`).
-    ///
-    /// For manifest-referenced shards, `contain_manifest_path` validates
-    /// containment before this call, but that canonicalize-then-open
-    /// sequence is not atomic: an attacker could replace `path` with a
-    /// symlink pointing outside the model root after the check and before
-    /// this open. `O_NOFOLLOW` means that swap makes the open fail outright
-    /// (`ELOOP`) instead of silently following the symlink and mapping bytes
-    /// from outside the model directory, regardless of the timing of the
-    /// swap.
-    fn open(path: &Path) -> Result<Self, InferenceError> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-            .map_err(|e| {
-                InferenceError::InvalidSafetensors(format!(
-                    "failed to open {}: {e}",
-                    path.display()
-                ))
-            })?;
+    /// Wrap an already-opened `file` for mmap. `file` must have been opened
+    /// descriptor-relative to a trusted directory anchor (`open_dir_nofollow`
+    /// together with `openat_file_nofollow`, or `open_manifest_entry`) with
+    /// `O_NOFOLLOW` on every path component — never reopened by a full path
+    /// string, which would re-resolve ancestor components an attacker could
+    /// have swapped after an earlier containment check. `display_path` is
+    /// used only for error messages.
+    fn open(file: std::fs::File, display_path: &Path) -> Result<Self, InferenceError> {
         // SAFETY: the file is opened read-only; the returned Mmap owns the
         // mapping. The File handle can be dropped immediately after — the OS
         // keeps the fd alive through the map. Standard memmap2 usage.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {}: {e}", path.display()))
+            InferenceError::InvalidSafetensors(format!(
+                "failed to mmap {}: {e}",
+                display_path.display()
+            ))
         })?;
 
         if mmap.len() < 8 {
             return Err(InferenceError::InvalidSafetensors(format!(
                 "{}: file too small to contain a safetensors header",
-                path.display()
+                display_path.display()
             )));
         }
 
@@ -241,7 +328,7 @@ impl Shard {
         if data_offset > mmap.len() {
             return Err(InferenceError::InvalidSafetensors(format!(
                 "{}: header extends past end of file (header_end={}, file_len={})",
-                path.display(),
+                display_path.display(),
                 data_offset,
                 mmap.len()
             )));
@@ -250,19 +337,19 @@ impl Shard {
         let header_str = std::str::from_utf8(&mmap[8..data_offset]).map_err(|e| {
             InferenceError::InvalidSafetensors(format!(
                 "{}: header is not valid UTF-8: {e}",
-                path.display()
+                display_path.display()
             ))
         })?;
         let root: Value = serde_json::from_str(header_str).map_err(|e| {
             InferenceError::InvalidSafetensors(format!(
                 "{}: header is not valid JSON: {e}",
-                path.display()
+                display_path.display()
             ))
         })?;
         let obj = root.as_object().ok_or_else(|| {
             InferenceError::InvalidSafetensors(format!(
                 "{}: header root is not a JSON object",
-                path.display()
+                display_path.display()
             ))
         })?;
 
@@ -405,7 +492,7 @@ impl Shard {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "{}: data_offsets non-contiguous at tensor {}: \
                      expected start={prev_end}, got [{}, {})",
-                    path.display(),
+                    display_path.display(),
                     p.name,
                     p.start,
                     p.end,
@@ -417,7 +504,7 @@ impl Shard {
             return Err(InferenceError::InvalidSafetensors(format!(
                 "{}: data section is {data_len} bytes but tensors cover {prev_end} bytes \
                  (trailing or missing payload)",
-                path.display(),
+                display_path.display(),
             )));
         }
 
@@ -432,7 +519,7 @@ impl Shard {
         }
 
         Ok(Shard {
-            source: path.display().to_string(),
+            source: display_path.display().to_string(),
             mmap,
             data_offset,
             headers,
@@ -515,37 +602,61 @@ impl QuarotTensorReader {
     /// forward-equivalence assertion would compare against a different
     /// model than the one Lattice actually serves from that directory.
     pub fn open(model_dir: &Path) -> Result<Self, InferenceError> {
-        let single_path = model_dir.join("model.safetensors");
-        let index_path = model_dir.join("model.safetensors.index.json");
-
-        if single_path.exists() {
-            let shard = Shard::open(&single_path)?;
-            Ok(Self {
-                backing: Backing::Single { shard },
-            })
-        } else if index_path.exists() {
-            let index = parse_index(model_dir)?;
-            let mut shards: HashMap<String, Shard> = HashMap::new();
-            for shard_file in index.weight_map.values() {
-                if shards.contains_key(shard_file) {
-                    continue;
-                }
-                let shard_path = contain_manifest_path(model_dir, shard_file)?;
-                let shard = Shard::open(&shard_path)?;
-                shards.insert(shard_file.clone(), shard);
-            }
-            Ok(Self {
-                backing: Backing::Sharded {
-                    weight_map: index.weight_map,
-                    shards,
-                },
-            })
-        } else {
-            Err(InferenceError::InvalidSafetensors(format!(
-                "{}: missing both model.safetensors and \
-                 model.safetensors.index.json",
+        // `model_dir` is opened exactly once and held as `root_fd` for the
+        // rest of this call. Every subsequent open (the single-file
+        // checkpoint, the index, and every shard) is `openat`-relative to
+        // this fd, so an ancestor swap after this line cannot redirect any
+        // later read — see `open_manifest_entry`.
+        let root_fd = open_dir_nofollow(model_dir).map_err(|e| {
+            InferenceError::InvalidSafetensors(format!(
+                "failed to open model directory {}: {e}",
                 model_dir.display()
-            )))
+            ))
+        })?;
+
+        match openat_file_nofollow(
+            root_fd.as_raw_fd(),
+            std::ffi::OsStr::new("model.safetensors"),
+        ) {
+            Ok(file) => {
+                let shard = Shard::open(file, &model_dir.join("model.safetensors"))?;
+                Ok(Self {
+                    backing: Backing::Single { shard },
+                })
+            }
+            Err(InferenceError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                openat_file_nofollow(
+                    root_fd.as_raw_fd(),
+                    std::ffi::OsStr::new("model.safetensors.index.json"),
+                )
+                .map_err(|_| {
+                    InferenceError::InvalidSafetensors(format!(
+                        "{}: missing both model.safetensors and \
+                         model.safetensors.index.json",
+                        model_dir.display()
+                    ))
+                })?;
+                let index = parse_index(model_dir)?;
+                let mut shards: HashMap<String, Shard> = HashMap::new();
+                for shard_file in index.weight_map.values() {
+                    if shards.contains_key(shard_file) {
+                        continue;
+                    }
+                    let file = open_manifest_entry(&root_fd, shard_file)?;
+                    let shard = Shard::open(file, &model_dir.join(shard_file))?;
+                    shards.insert(shard_file.clone(), shard);
+                }
+                Ok(Self {
+                    backing: Backing::Sharded {
+                        weight_map: index.weight_map,
+                        shards,
+                    },
+                })
+            }
+            Err(e) => Err(InferenceError::InvalidSafetensors(format!(
+                "failed to open {}: {e}",
+                model_dir.join("model.safetensors").display()
+            ))),
         }
     }
 
@@ -961,40 +1072,78 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Shard-path containment (mirrors PR #1053's `contain_manifest_path`).
+    // Shard-path containment via descriptor-relative traversal
+    // (`open_manifest_entry`). Containment is a structural property of the
+    // walk here, not a canonicalize-then-open string comparison: each hop
+    // opens relative to the fd from the previous hop, so an ancestor swap
+    // after `QuarotTensorReader::open`'s initial `open_dir_nofollow` cannot
+    // redirect any later read.
     //
-    // Mutation-sensitive: with `contain_manifest_path` bypassed (shard join
-    // reverted to a bare `model_dir.join(shard_file)`), both tests below
-    // would instead succeed in opening the reader and reading the escaped
+    // Mutation-sensitive: with `open_manifest_entry` bypassed (shard
+    // resolution reverted to a bare `model_dir.join(shard_file)` reopened by
+    // path), every test below would instead succeed in reading the escaped
     // tensor's real contents from outside the model directory.
     // -------------------------------------------------------------------
 
     #[test]
     #[cfg(unix)]
-    fn shard_open_refuses_a_symlink() {
-        // `contain_manifest_path` canonicalizes (and thus resolves) any
-        // symlink present at call time, so a symlink planted before that
-        // check runs is already caught there. The gap this guards is a
-        // symlink planted *after* the containment check passes and *before*
-        // `Shard::open`'s `File::open` — not reproducible end-to-end in a
-        // single-threaded test, so this exercises `Shard::open` directly
-        // with a symlink standing in for that later swap.
-        //
-        // Mutation-sensitive: reverting `Shard::open` to a plain
-        // `File::open` (dropping `O_NOFOLLOW`) makes this test fail — the
-        // open would succeed and follow the symlink.
+    fn shard_entry_rejects_a_symlinked_final_component() {
+        // A symlink planted at the shard's final path component — standing
+        // in for a swap that lands between the initial `open_dir_nofollow`
+        // and the later per-shard `openat`. Mutation-sensitive: dropping
+        // `O_NOFOLLOW` from `openat_file_nofollow` makes this test fail —
+        // the open would succeed and follow the symlink.
         let root = tempfile::tempdir().unwrap();
+        let model_dir = root.path().join("model_root");
+        std::fs::create_dir(&model_dir).unwrap();
+
         let real = root.path().join("real.safetensors");
         write_safetensors(
             &real,
             &[("secret.weight", FixtureDType::F32, vec![1], &[42.0])],
         );
-        let link = root.path().join("linked.safetensors");
+        let link = model_dir.join("linked.safetensors");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
-        let err = Shard::open(&link).expect_err("Shard::open must refuse a symlink, not follow it");
+        let root_fd = open_dir_nofollow(&model_dir).unwrap();
+        let err = open_manifest_entry(&root_fd, "linked.safetensors")
+            .expect_err("a symlinked shard entry must be refused, not followed");
         assert!(
-            err.to_string().contains("failed to open"),
+            matches!(err, InferenceError::Io(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shard_entry_rejects_a_symlinked_intermediate_directory() {
+        // The shard entry's intermediate directory component ("subdir") is a
+        // symlink to a directory outside model_root. `O_NOFOLLOW` only
+        // protects the *final* path component in a plain `open`, so this
+        // guards the hop-by-hop `openat_dir_nofollow` walk specifically.
+        // Mutation-sensitive: dropping `O_NOFOLLOW` from
+        // `openat_dir_nofollow` makes this test fail — the walk would
+        // follow the symlink into the outside directory and read the
+        // escaped tensor.
+        let root = tempfile::tempdir().unwrap();
+        let model_dir = root.path().join("model_root");
+        std::fs::create_dir(&model_dir).unwrap();
+
+        let outside_dir = root.path().join("outside");
+        std::fs::create_dir(&outside_dir).unwrap();
+        write_safetensors(
+            &outside_dir.join("shard.safetensors"),
+            &[("secret.weight", FixtureDType::F32, vec![1], &[42.0])],
+        );
+
+        let subdir_link = model_dir.join("subdir");
+        std::os::unix::fs::symlink(&outside_dir, &subdir_link).unwrap();
+
+        let root_fd = open_dir_nofollow(&model_dir).unwrap();
+        let err = open_manifest_entry(&root_fd, "subdir/shard.safetensors")
+            .expect_err("a symlinked intermediate directory must be refused");
+        assert!(
+            matches!(err, InferenceError::Io(_)),
             "unexpected error: {err}"
         );
     }
@@ -1024,7 +1173,7 @@ mod tests {
         let err = QuarotTensorReader::open(&model_dir)
             .expect_err("a shard entry escaping model_dir via ../ must be rejected");
         assert!(
-            err.to_string().contains("escapes model root"),
+            err.to_string().contains("no `..` or root component"),
             "unexpected error: {err}"
         );
     }
@@ -1054,7 +1203,7 @@ mod tests {
         let err = QuarotTensorReader::open(&model_dir)
             .expect_err("an absolute shard entry must be rejected");
         assert!(
-            err.to_string().contains("must be a path relative"),
+            err.to_string().contains("no `..` or root component"),
             "unexpected error: {err}"
         );
     }

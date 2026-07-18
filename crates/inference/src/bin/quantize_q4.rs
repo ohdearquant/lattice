@@ -18,8 +18,8 @@ use lattice_inference::quant::quarot::convert::encode_f16_payload;
 use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, q4_file_bytes, quantize_f32_to_q4};
 use std::ffi::CString;
 use std::fs;
-use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -207,6 +207,42 @@ fn open_dir_nofollow(dir: &Path) -> Result<OwnedFd, Box<dyn std::error::Error>> 
     // non-negative, and is not owned or closed anywhere else — `OwnedFd`
     // becomes its sole owner and will close it on drop.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Read `name` (a plain file name) from the directory bound to `dirfd` via
+/// `openat(..., O_NOFOLLOW)`, never a path-based `fs::read`. `fs::read`
+/// follows a symlink at the final path component; a hostile or
+/// concurrently-swapped model directory could plant one at `config.json`
+/// pointing at an arbitrary readable file, which `fs::read` would then copy
+/// into the output directory.
+fn read_file_at_nofollow(dirfd: RawFd, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let cname = CString::new(name)
+        .map_err(|e| format!("file name {name} contains an interior NUL byte: {e}"))?;
+    // SAFETY: `dirfd` is a valid open directory fd borrowed for the
+    // duration of this call; `cname` is a valid NUL-terminated C string.
+    // `openat` returns either a valid fd (>= 0) or -1 with errno set,
+    // checked immediately below.
+    let raw = unsafe {
+        libc::openat(
+            dirfd,
+            cname.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(format!(
+            "failed to open {name} (O_NOFOLLOW): {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    // SAFETY: `raw` was just returned by `libc::openat` above, checked
+    // non-negative, and is not owned or closed anywhere else.
+    let mut file = unsafe { fs::File::from(OwnedFd::from_raw_fd(raw)) };
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read {name}: {e}"))?;
+    Ok(buf)
 }
 
 /// Publish directory for a conversion run: a fresh temp dir on success (`dry_run`
@@ -451,9 +487,45 @@ impl TempPublishDir {
 }
 
 impl Drop for TempPublishDir {
+    /// Recursively deletes `temp_dir` only after proving, via the fd `mkdir`
+    /// bound at creation, that the path still resolves to the same inode
+    /// this run actually created. `fs::remove_dir_all` is necessarily
+    /// path-based (POSIX has no "delete relative to this fd" call for a
+    /// whole subtree), so without this check an attacker who replaces
+    /// `temp_dir` with a directory or symlink after the last write (a
+    /// failed conversion, a panic mid-run) makes a bare `remove_dir_all`
+    /// recursively delete a directory this process never created. On
+    /// identity mismatch, the staging directory is deliberately leaked
+    /// rather than deleted — reported to stderr for manual cleanup.
     fn drop(&mut self) {
-        if let Some(temp_dir) = self.temp.take() {
-            let _ = fs::remove_dir_all(temp_dir);
+        let Some(temp_dir) = self.temp.take() else {
+            return;
+        };
+        let identity_confirmed = self.dir_fd.as_ref().is_some_and(|dir_fd| {
+            let mut fd_stat: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `dir_fd` is a valid open fd held for the lifetime of
+            // `self`; `fd_stat` is a valid, fully-initialized (zeroed)
+            // `libc::stat`. `fstat` returns 0 on success or -1 with errno
+            // set, checked immediately below.
+            if unsafe { libc::fstat(dir_fd.as_raw_fd(), &raw mut fd_stat) } != 0 {
+                return false;
+            }
+            let Ok(path_meta) = fs::symlink_metadata(&temp_dir) else {
+                return false;
+            };
+            use std::os::unix::fs::MetadataExt;
+            path_meta.dev() == fd_stat.st_dev as u64 && path_meta.ino() == fd_stat.st_ino
+        });
+        if identity_confirmed {
+            let _ = fs::remove_dir_all(&temp_dir);
+        } else {
+            eprintln!(
+                "quantize_q4: staging directory {} was replaced before cleanup \
+                 could run (inode identity check failed); leaving it in place \
+                 instead of recursively deleting a directory this run may not \
+                 have created — remove it manually if it is safe to do so",
+                temp_dir.display()
+            );
         }
     }
 }
@@ -467,11 +539,21 @@ fn quantize_model(
     let write_dir = publish_dir.write_dir().to_path_buf();
     let mut written_files: Vec<(PathBuf, fs::File)> = Vec::new();
 
+    // Checkpoint validation (`QuarotTensorReader::open` parses and validates
+    // every SafeTensors header) runs BEFORE config.json is ever read or
+    // copied. Copying config.json first would let a hostile or
+    // concurrently-swapped model directory exfiltrate an arbitrary readable
+    // file into the output before the checkpoint is known to be valid.
+    let reader = QuarotTensorReader::open(model_dir)?;
+    let mut tensor_names = reader.tensor_names();
+    tensor_names.sort();
+    let n_tensors = tensor_names.len();
+
     if !dry_run {
-        let source_config = model_dir.join("config.json");
+        let model_dir_fd = open_dir_nofollow(model_dir)?;
+        let config_bytes = read_file_at_nofollow(model_dir_fd.as_raw_fd(), "config.json")
+            .map_err(|e| format!("failed to read {}/config.json: {e}", model_dir.display()))?;
         let output_config = write_dir.join("config.json");
-        let config_bytes = fs::read(&source_config)
-            .map_err(|e| format!("failed to read {}: {e}", source_config.display()))?;
         let mut f = publish_dir.create_file("config.json")?;
         f.write_all(&config_bytes).map_err(|e| {
             format!(
@@ -481,11 +563,6 @@ fn quantize_model(
         })?;
         written_files.push((output_config, f));
     }
-
-    let reader = QuarotTensorReader::open(model_dir)?;
-    let mut tensor_names = reader.tensor_names();
-    tensor_names.sort();
-    let n_tensors = tensor_names.len();
 
     eprintln!("=== quantize_q4: SafeTensors → Q4_0 ===");
     eprintln!("Model dir:  {}", model_dir.display());
@@ -726,6 +803,43 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn config_json_symlink_is_rejected_not_followed() {
+        // `config.json` planted as a symlink to a file outside the model
+        // directory — standing in for a hostile or concurrently-swapped
+        // checkpoint trying to exfiltrate arbitrary readable bytes into the
+        // quantizer's output. Mutation-sensitive: reverting
+        // `read_file_at_nofollow` to a path-based `fs::read` (which follows
+        // the final symlink) makes this test fail — the secret contents
+        // would be copied into the staging directory instead of the read
+        // being refused.
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        fs::create_dir(&input).unwrap();
+        write_single_f32_tensor(
+            &input.join("model.safetensors"),
+            "model.layers.0.input_layernorm.weight",
+            &[1.0, 2.0, 3.0],
+        );
+
+        let secret = tmp.path().join("secret.txt");
+        fs::write(&secret, b"do-not-exfiltrate").unwrap();
+        std::os::unix::fs::symlink(&secret, input.join("config.json")).unwrap();
+
+        let err = quantize_model(&input, &output, false)
+            .expect_err("a symlinked config.json must be refused, not followed");
+        assert!(
+            err.to_string().contains("config.json"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !output.exists() || fs::read_dir(&output).unwrap().next().is_none(),
+            "no output artifact may exist after a refused config.json read"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Atomic publish + refuse-non-empty-output-dir.
     //
@@ -936,6 +1050,43 @@ mod tests {
             "a failed publish must not leak the staging directory — Drop must \
              still own cleanup because `self.temp`/`self.dir_fd` stayed \
              populated until the rename actually succeeded"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn drop_refuses_to_delete_a_staging_dir_substituted_with_a_different_directory() {
+        // Same substitution as `publish_refuses_staging_dir_substituted_
+        // with_different_directory`, but exercised through `Drop` (the
+        // no-publish / early-error path) rather than `publish()`: the
+        // staging path is replaced with a fresh, unrelated directory that
+        // holds attacker-planted content, then the guard drops without
+        // calling `publish`. Mutation-sensitive: reverting `Drop` to a bare
+        // `fs::remove_dir_all(temp_dir)` (no inode check against the held
+        // `dir_fd`) makes this test fail — the substituted directory (and
+        // the attacker's file inside it) would be recursively deleted even
+        // though this run never created it.
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("output");
+
+        let staging = super::TempPublishDir::create(&output, false).unwrap();
+        let temp_path = staging.write_dir().to_path_buf();
+
+        fs::remove_dir_all(&temp_path).unwrap();
+        fs::create_dir(&temp_path).unwrap();
+        let planted = temp_path.join("attacker-planted.txt");
+        fs::write(&planted, b"evil").unwrap();
+
+        drop(staging);
+
+        assert!(
+            temp_path.exists(),
+            "a substituted staging directory must be leaked, not deleted"
+        );
+        assert_eq!(
+            fs::read(&planted).unwrap(),
+            b"evil",
+            "the attacker's substituted directory contents must be untouched"
         );
     }
 

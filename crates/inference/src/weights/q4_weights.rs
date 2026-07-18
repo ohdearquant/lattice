@@ -71,6 +71,78 @@ pub(crate) fn create_output_file(path: &std::path::Path) -> std::io::Result<std:
         .open(path)
 }
 
+/// Open `path` as a directory fd, refusing to follow a symlink at the final
+/// component (`O_DIRECTORY|O_NOFOLLOW`). A conversion run holds this fd for
+/// its whole writing session and creates every output file `openat`-relative
+/// to it via [`create_file_at`] rather than re-joining and reopening
+/// `path` for each write — a canonicalize-or-create-dir-all-then-reopen
+/// sequence is a snapshot that stops being true the instant it returns, so a
+/// long-running multi-file write session gives an attacker repeated windows
+/// to swap the directory between writes. Binding every write to one fd
+/// opened before the session starts closes that window structurally.
+///
+/// # Errors
+///
+/// Returns an error if `path` does not exist, is not a directory, is a
+/// symlink, or cannot be opened.
+pub(crate) fn open_dir_nofollow(path: &std::path::Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `cpath` is a valid NUL-terminated C string owned for the
+    // duration of this call. `open` returns either a valid fd (>= 0) or -1
+    // with errno set, checked immediately below.
+    let raw = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` was just returned by `libc::open` above, checked
+    // non-negative, and is not owned or closed anywhere else.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) })
+}
+
+/// Create `filename` (a plain file name — no separators, never a full path)
+/// for writing inside the directory bound to `dirfd`, with the same
+/// exclusive/no-follow semantics as [`create_output_file`] but resolved via
+/// `openat` against the held fd instead of a re-resolved path string.
+///
+/// # Errors
+///
+/// Returns an error if `filename` already exists under `dirfd` (including as
+/// a symlink) or cannot be created.
+pub(crate) fn create_file_at(
+    dirfd: std::os::fd::RawFd,
+    filename: &str,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let cname = std::ffi::CString::new(filename)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `dirfd` is a valid open directory fd borrowed for the duration
+    // of this call (owned by the caller for the writing session); `cname` is
+    // a valid NUL-terminated C string. `openat` returns either a valid fd
+    // (>= 0) or -1 with errno set, checked immediately below.
+    let raw = unsafe {
+        libc::openat(
+            dirfd,
+            cname.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o644,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` was just returned by `libc::openat` above, checked
+    // non-negative, and is not owned or closed anywhere else.
+    Ok(unsafe { std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(raw)) })
+}
+
 /// One Q4_0 quantization block: 32 weights packed as 4-bit unsigned integers.
 ///
 /// `scale` is stored as a raw IEEE-754 f16 bit pattern in a `u16` — the `half` crate
@@ -1254,6 +1326,59 @@ pub(crate) fn write_merged_qkvz(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn create_file_at_writes_land_in_original_dirfd_not_a_post_open_directory_swap() {
+        // `open_dir_nofollow` binds a directory fd to the inode `mkdir`
+        // created; a long-running multi-file write session then creates
+        // every output artifact `openat`-relative to that fd via
+        // `create_file_at`. A path-based `output_dir.join(name)` +
+        // `create_output_file` sequence would instead re-resolve
+        // `output_dir` on every write, so an attacker who swaps the
+        // directory after the fd was opened (but before a later write)
+        // redirects that write into the substituted directory. Binding to
+        // the fd closes that window: writes always land in the directory
+        // that was open at session start, regardless of what the path
+        // currently resolves to.
+        //
+        // Mutation-sensitive: reverting `create_file_at` to
+        // `create_output_file(&dir_path.join(filename))` (path-based) makes
+        // this test fail — the write would land in the attacker's
+        // substituted directory instead of the original.
+        use std::os::fd::AsRawFd;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real_output");
+        std::fs::create_dir(&real_dir).unwrap();
+
+        let dirfd = open_dir_nofollow(&real_dir).unwrap();
+
+        // Swap `real_output` for a fresh, unrelated directory after the fd
+        // was opened: move the original directory aside (same inode, new
+        // path — `dirfd` still refers to it) and plant an attacker
+        // directory at the original path.
+        let moved_aside = tmp.path().join("real_output_moved_aside");
+        std::fs::rename(&real_dir, &moved_aside).unwrap();
+        std::fs::create_dir(&real_dir).unwrap();
+
+        let mut f = create_file_at(dirfd.as_raw_fd(), "artifact.q4").unwrap();
+        use std::io::Write;
+        f.write_all(b"legit-bytes").unwrap();
+        drop(f);
+
+        assert_eq!(
+            std::fs::read_dir(&real_dir).unwrap().count(),
+            0,
+            "the substituted directory (now at the original path) must not receive the write"
+        );
+        assert_eq!(
+            std::fs::read(moved_aside.join("artifact.q4")).unwrap(),
+            b"legit-bytes",
+            "the write must land in the directory `dirfd` was opened against, \
+             wherever it now lives, not the directory currently at that path"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Test 1: Q4Block is exactly 20 bytes (scale + bias + 16 nibble bytes).
@@ -2702,7 +2827,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Non-finite input guard — mutation-sensitive tests (Finding 1, PR #452)
+    // Non-finite input guard — mutation-sensitive tests
     //
     // IEEE-754: `NaN > x` and `NaN < x` are always false, so a plain
     // `f32::max` / `f32::min` fold over a block that contains NaN silently
