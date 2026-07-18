@@ -149,6 +149,41 @@ pub(crate) fn validate_safetensors_layout<'a>(
     Ok(())
 }
 
+/// Reject a shard filename that would escape the model directory when
+/// joined onto it.
+///
+/// Shard filenames come from `model.safetensors.index.json`'s `weight_map`,
+/// which is untrusted checkpoint content, not a value this crate controls.
+/// Joining an unchecked value onto the model directory lets an absolute
+/// path or a `..` component redirect the reader to any file the process
+/// can read, outside the checkpoint. Every call site that joins an
+/// index-derived shard name onto a directory must validate it with this
+/// function first.
+pub(crate) fn validate_shard_relative_path(name: &str) -> Result<(), InferenceError> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "shard filename {name:?} is absolute; must be relative to the checkpoint directory"
+        )));
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "shard filename {name:?} contains a parent-directory (..) component"
+                )));
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "shard filename {name:?} contains a root or prefix component"
+                )));
+            }
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+        }
+    }
+    Ok(())
+}
+
 /// Resolve a safetensors header `dtype` string to a [`DType`], including
 /// non-float dtypes (tracked via `DType::Other` so extent validation still
 /// covers them). Returns `None` only for a string this crate has never
@@ -1071,9 +1106,15 @@ impl TensorSource for SafetensorsFile {
     }
 }
 
-/// Lazy-opening reader for sharded safetensors checkpoints.
+/// Reader for sharded safetensors checkpoints.
 ///
-/// Opens shard files on demand (first access) to avoid mapping 26 files upfront.
+/// `open_index` maps and format-validates every unique shard's header up
+/// front — matching `QuarotTensorReader`'s eager contract so a malformed
+/// shard is rejected at open time even if none of its tensors are ever
+/// requested. This only touches header bytes (mmap + JSON parse); tensor
+/// *data* stays lazily materialized on first `get_f32_tensor_owned` access,
+/// so the memory profile for large checkpoints (e.g. 26-shard Qwen3.6) is
+/// unchanged from the previous lazy-shard design.
 #[derive(Debug)]
 pub struct ShardedSafetensors {
     root: PathBuf,
@@ -1121,6 +1162,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
+        validate_shard_relative_path(&shard_file)?;
         let shard_path = model_dir.join(&shard_file);
         let shard = SafetensorsFile::open(&shard_path)?;
         for tensor_name in tensor_names {
@@ -1139,17 +1181,30 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 }
 
 impl ShardedSafetensors {
-    /// Parse `model.safetensors.index.json` and set up the lazy shard reader.
+    /// Parse `model.safetensors.index.json` and eagerly format-validate
+    /// every unique shard it references.
     pub fn open_index(index_path: &Path) -> Result<Self, InferenceError> {
         let root = index_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let index = parse_index(&root)?;
+
+        let mut shards: HashMap<String, SafetensorsFile> = HashMap::new();
+        for shard_file in index.weight_map.values() {
+            if shards.contains_key(shard_file) {
+                continue;
+            }
+            validate_shard_relative_path(shard_file)?;
+            let shard_path = root.join(shard_file);
+            let shard = SafetensorsFile::open(&shard_path)?;
+            shards.insert(shard_file.clone(), shard);
+        }
+
         Ok(Self {
             root,
             index,
-            shards: HashMap::new(),
+            shards,
         })
     }
 
@@ -1165,6 +1220,7 @@ impl ShardedSafetensors {
             .weight_map
             .get(tensor_name)
             .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
+        validate_shard_relative_path(shard_file)?;
         Ok((self.root.join(shard_file), tensor_name.to_string()))
     }
 
@@ -1178,6 +1234,7 @@ impl ShardedSafetensors {
 
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
+            validate_shard_relative_path(shard_file)?;
             let shard_path = self.root.join(shard_file);
             let shard = SafetensorsFile::open(&shard_path)?;
             self.shards.insert(shard_file.to_string(), shard);
@@ -2660,6 +2717,105 @@ mod tests {
         assert!(
             result.is_err(),
             "load_sharded must return Err when indexed shard file is absent"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_sharded_rejects_parent_traversal_shard_name() {
+        let dir = temp_dir("lattice_shard_traversal_test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("invariant: system time is after UNIX_EPOCH")
+            .as_nanos();
+        let outside_name = format!("lattice_shard_traversal_outside_{unique}.safetensors");
+        let outside = dir
+            .parent()
+            .expect("temp dir has a parent")
+            .join(&outside_name);
+        write_single_f32_tensor(&outside, "secret", &[9.0]);
+
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            format!(r#"{{"weight_map":{{"tensor.a":"../{outside_name}"}}}}"#),
+        )
+        .expect("test setup: write index");
+
+        // Without the shard-path guard this join would resolve outside
+        // `dir` and open `outside` successfully instead of erroring.
+        let err = load_sharded(&dir)
+            .expect_err("shard filename with a parent-directory component must be rejected");
+        assert!(
+            err.to_string().contains("parent-directory"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&outside).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_sharded_rejects_absolute_shard_path() {
+        let dir = temp_dir("lattice_shard_absolute_test");
+        let outside_dir = temp_dir("lattice_shard_absolute_outside");
+        let outside_file = outside_dir.join("model-00001-of-00001.safetensors");
+        write_single_f32_tensor(&outside_file, "secret", &[9.0]);
+
+        let index_path = dir.join("model.safetensors.index.json");
+        let abs = outside_file.to_string_lossy().replace('\\', "\\\\");
+        fs::write(
+            &index_path,
+            format!(r#"{{"weight_map":{{"tensor.a":"{abs}"}}}}"#),
+        )
+        .expect("test setup: write index");
+
+        // Without the shard-path guard this join would discard `dir` and
+        // open `outside_file` directly instead of erroring.
+        let err = load_sharded(&dir).expect_err("an absolute shard path must be rejected");
+        assert!(
+            err.to_string().contains("absolute"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&outside_dir).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_sharded_safetensors_open_index_rejects_malformed_unaccessed_shard() {
+        let dir = temp_dir("lattice_malformed_shard_test");
+        let shard_a = dir.join("model-00001-of-00002.safetensors");
+        let shard_b = dir.join("model-00002-of-00002.safetensors");
+        write_single_f32_tensor(&shard_a, "tensor.a", &[1.0, 2.0]);
+
+        // Shard b's header declares tensor.b as 3 f32 (12 bytes) but the
+        // data_offsets only span 8 bytes — a malformed layout that
+        // `validate_safetensors_layout` rejects. `tensor.b` is never
+        // requested by this test.
+        let header = r#"{"tensor.b":{"dtype":"F32","shape":[3],"data_offsets":[0,8]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        fs::write(&shard_b, &bytes).expect("test setup: write malformed shard b");
+
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            r#"{"weight_map":{"tensor.a":"model-00001-of-00002.safetensors","tensor.b":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
+
+        // Before the fix, `open_index` left shards unopened and this call
+        // would succeed even though shard_b is malformed, because nothing
+        // here ever calls `get_f32_tensor_owned("tensor.b")`.
+        let result = ShardedSafetensors::open_index(&index_path);
+        assert!(
+            result.is_err(),
+            "open_index must eagerly reject a malformed shard even when none of its \
+             tensors are ever requested, matching the QuaRot reader's eager contract"
         );
 
         fs::remove_dir_all(&dir).ok();

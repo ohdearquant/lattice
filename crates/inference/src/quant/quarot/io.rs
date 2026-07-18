@@ -48,7 +48,7 @@ use serde_json::Value;
 
 use crate::error::InferenceError;
 use crate::weights::f32_weights::{
-    SafetensorsTensorLayout, parse_index, validate_safetensors_layout,
+    SafetensorsTensorLayout, parse_index, validate_safetensors_layout, validate_shard_relative_path,
 };
 
 /// On-disk storage dtype of a tensor.
@@ -395,6 +395,7 @@ impl QuarotTensorReader {
                 if shards.contains_key(shard_file) {
                     continue;
                 }
+                validate_shard_relative_path(shard_file)?;
                 let shard = Shard::open(&model_dir.join(shard_file))?;
                 shards.insert(shard_file.clone(), shard);
             }
@@ -808,6 +809,69 @@ mod tests {
         // Re-reading the same tensor exercises the cached-shard path.
         let (a_again, _) = reader.read_tensor_f64("a.weight").unwrap();
         assert_eq!(a_again, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn sharded_open_rejects_parent_traversal_shard_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_vals: Vec<f32> = vec![42.0];
+        write_safetensors(
+            &outside.path().join("secret.safetensors"),
+            &[("secret", FixtureDType::F32, vec![1], &outside_vals)],
+        );
+
+        let outside_name = outside
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let traversal_shard = format!("../{outside_name}/secret.safetensors");
+
+        let index = serde_json::json!({
+            "weight_map": { "a.weight": traversal_shard },
+        });
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let err = QuarotTensorReader::open(dir.path())
+            .expect_err("shard filename with a parent-directory component must be rejected");
+        assert!(
+            err.to_string().contains("parent-directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sharded_open_rejects_absolute_shard_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_vals: Vec<f32> = vec![42.0];
+        let outside_file = outside.path().join("secret.safetensors");
+        write_safetensors(
+            &outside_file,
+            &[("secret", FixtureDType::F32, vec![1], &outside_vals)],
+        );
+
+        let index = serde_json::json!({
+            "weight_map": { "a.weight": outside_file.to_string_lossy() },
+        });
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let err = QuarotTensorReader::open(dir.path())
+            .expect_err("an absolute shard path must be rejected");
+        assert!(
+            err.to_string().contains("absolute"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
