@@ -218,12 +218,16 @@ fn test_simd_config_cached() {
     }
     let elapsed = start.elapsed();
 
-    // Should be very fast (cached)
-    assert!(
-        elapsed.as_micros() < 1000, // Less than 1ms for 10k calls
-        "simd_config() should be cached, took {:?}",
-        elapsed
-    );
+    // Should be very fast (cached). Wall-clock timing flakes under shared-CI
+    // load; assert only on a quiet non-CI machine (CI runners set the CI env
+    // var). The 10k calls above still run in CI as a smoke check.
+    if std::env::var_os("CI").is_none() {
+        assert!(
+            elapsed.as_micros() < 1000, // Less than 1ms for 10k calls
+            "simd_config() should be cached, took {:?}",
+            elapsed
+        );
+    }
 }
 
 // ============================================================================
@@ -417,12 +421,17 @@ fn test_batch_faster_than_sequential() {
 
     println!("Batch: {:?}, Sequential: {:?}", batch_time, sequential_time);
 
-    // Both should complete quickly (< 10ms for 99 pairs of 384-dim vectors)
-    assert!(
-        batch_time.as_millis() < 100,
-        "Batch operation too slow: {:?}",
-        batch_time
-    );
+    // Both should complete quickly (< 10ms for 99 pairs of 384-dim vectors).
+    // Wall-clock timing flakes under shared-CI load; assert only on a quiet
+    // non-CI machine (CI runners set the CI env var). The batch and sequential
+    // runs above still execute in CI as a smoke check.
+    if std::env::var_os("CI").is_none() {
+        assert!(
+            batch_time.as_millis() < 100,
+            "Batch operation too slow: {:?}",
+            batch_time
+        );
+    }
 }
 
 #[test]
@@ -450,10 +459,14 @@ fn test_large_batch_dot_product() {
     assert_eq!(results.len(), 1000);
     println!("1000 dot products in {:?}", elapsed);
 
-    // Should complete in < 10ms with SIMD
-    assert!(
-        elapsed.as_millis() < 100,
-        "Large batch too slow: {:?}",
-        elapsed
-    );
+    // Should complete in < 10ms with SIMD. Wall-clock timing flakes under
+    // shared-CI load; assert only on a quiet non-CI machine (CI runners set the
+    // CI env var). The results.len() correctness assert above always runs.
+    if std::env::var_os("CI").is_none() {
+        assert!(
+            elapsed.as_millis() < 100,
+            "Large batch too slow: {:?}",
+            elapsed
+        );
+    }
 }
