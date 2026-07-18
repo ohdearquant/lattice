@@ -10,7 +10,8 @@ use crate::model::qwen35_config::Qwen35Config;
 
 /// **Unstable**: trait for LoRA adapter injection into linear projections.
 ///
-/// The inference forward pass calls `apply()` after each `matmul_bt`.
+/// The inference forward pass calls `apply()` for each projected row after a
+/// `matmul_bt`.
 /// If a LoRA adapter exists for the given (layer, module), it adds:
 /// `output += scale * B @ (A @ x)`
 pub trait LoraHook: Send + Sync {
@@ -23,8 +24,8 @@ pub trait LoraHook: Send + Sync {
     ///   `"in_proj_z"`, `"in_proj_b"`, `"in_proj_a"`, `"out_proj"`.
     ///   MLP (all layers): `"gate_proj"`, `"up_proj"`, `"down_proj"`.
     ///   BERT: `"query"`, `"key"`, `"value"`, `"attn_output"`, `"ffn_intermediate"`, `"ffn_output"`.
-    /// * `x` - Input activation (the same input that was passed to the base projection)
-    /// * `output` - Base projection output to modify in-place
+    /// * `x` - One input row (the same activation passed to the base projection)
+    /// * `output` - The corresponding base projection output row to modify in-place
     fn apply(&self, layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]);
 
     /// **Unstable**: self-check this hook's declared rank/shape against a
@@ -41,6 +42,44 @@ pub trait LoraHook: Send + Sync {
     }
 }
 
+pub(crate) fn apply_lora_rows(
+    lora: &dyn LoraHook,
+    layer_idx: usize,
+    module: &str,
+    input: &[f32],
+    output: &mut [f32],
+    input_row_width: usize,
+    output_row_width: usize,
+) {
+    assert!(input_row_width > 0, "LoRA input row width must be non-zero");
+    assert!(
+        output_row_width > 0,
+        "LoRA output row width must be non-zero"
+    );
+    assert_eq!(
+        input.len() % input_row_width,
+        0,
+        "LoRA input must contain complete rows"
+    );
+    assert_eq!(
+        output.len() % output_row_width,
+        0,
+        "LoRA output must contain complete rows"
+    );
+    assert_eq!(
+        input.len() / input_row_width,
+        output.len() / output_row_width,
+        "LoRA input and output row counts must match"
+    );
+
+    for (input_row, output_row) in input
+        .chunks_exact(input_row_width)
+        .zip(output.chunks_exact_mut(output_row_width))
+    {
+        lora.apply(layer_idx, module, input_row, output_row);
+    }
+}
+
 /// No-op implementation. Used when no adapter is loaded.
 /// The compiler should inline and eliminate these calls entirely.
 pub struct NoopLoraHook;
@@ -48,4 +87,37 @@ pub struct NoopLoraHook;
 impl LoraHook for NoopLoraHook {
     #[inline(always)]
     fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RowSensitiveHook {
+        calls: AtomicUsize,
+    }
+
+    impl LoraHook for RowSensitiveHook {
+        fn apply(&self, _layer_idx: usize, _module: &str, x: &[f32], output: &mut [f32]) {
+            assert_eq!(x.len(), 2);
+            assert_eq!(output.len(), 3);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            output.fill(x[0]);
+        }
+    }
+
+    #[test]
+    fn applies_lora_to_each_flattened_token_row() {
+        let hook = RowSensitiveHook {
+            calls: AtomicUsize::new(0),
+        };
+        let input = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
+        let mut output = [0.0; 9];
+
+        apply_lora_rows(&hook, 0, "projection", &input, &mut output, 2, 3);
+
+        assert_eq!(hook.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(output, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0]);
+    }
 }

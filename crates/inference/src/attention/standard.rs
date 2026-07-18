@@ -1,6 +1,6 @@
 //! Standard attention buffers, multi-head attention, and in-place attention helpers.
 use crate::forward::cpu::{add_bias, matmul_bt, softmax_attention};
-use crate::lora_hook::LoraHook;
+use crate::lora_hook::{LoraHook, apply_lora_rows};
 use crate::weights::TransformerLayerWeights;
 
 /// **Unstable**: pre-allocated buffers for multi-head attention computation; field layout may change.
@@ -231,11 +231,8 @@ pub(crate) fn multi_head_attention_in_place(
     // Fused Q/K/V projection (#674): one matmul_bt against the layer's
     // [3*hidden, hidden] fused weight, instead of three separate [hidden,
     // hidden] projections. The interleaved [seq_len, 3*hidden] result is then
-    // split into the plain contiguous q/k/v buffers below in one pass, which
-    // is required regardless of fusion: LoraHook::apply's contract is a
-    // [seq_len, hidden_size] slice per tensor, and that trait lives outside
-    // this crate's optimizable surface, so its buffer contract is preserved
-    // exactly rather than exposed to a strided view.
+    // split into the plain contiguous q/k/v buffers below in one pass so each
+    // projected row can be passed to LoraHook::apply as a contiguous slice.
     {
         let AttentionBuffers { qkv, q, k, v, .. } = &mut *buffers;
         let qkv = &mut qkv[..seq_len * 3 * hidden_size];
@@ -258,23 +255,32 @@ pub(crate) fn multi_head_attention_in_place(
                 .copy_from_slice(&qkv[src + 2 * hidden_size..src + 3 * hidden_size]);
         }
     }
-    lora.apply(
+    apply_lora_rows(
+        lora,
         layer_idx,
         "query",
         hidden_states,
         &mut buffers.q[..used_hidden],
+        hidden_size,
+        hidden_size,
     );
-    lora.apply(
+    apply_lora_rows(
+        lora,
         layer_idx,
         "key",
         hidden_states,
         &mut buffers.k[..used_hidden],
+        hidden_size,
+        hidden_size,
     );
-    lora.apply(
+    apply_lora_rows(
+        lora,
         layer_idx,
         "value",
         hidden_states,
         &mut buffers.v[..used_hidden],
+        hidden_size,
+        hidden_size,
     );
 
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -422,7 +428,15 @@ pub(crate) fn multi_head_attention_in_place(
             hidden_size,
         );
         add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
-        lora.apply(layer_idx, "attn_output", concat, output);
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "attn_output",
+            concat,
+            output,
+            hidden_size,
+            hidden_size,
+        );
     }
 }
 
@@ -525,10 +539,9 @@ pub(crate) fn multi_head_attention_batched(
     // the packed batch against the layer's [3*hidden, hidden] fused weight,
     // instead of three separate [hidden, hidden] projections. The interleaved
     // [total, 3*hidden] result is split into plain contiguous q/k/v buffers in
-    // one pass, preserving LoraHook::apply's [total, hidden_size]-per-tensor
-    // contract exactly (that trait lives outside this crate's optimizable
-    // surface). This step is row-independent: it does not need `cu_seqlens`
-    // at all, only the total row count.
+    // one pass so each projected row can be passed to LoraHook::apply as a
+    // contiguous slice. This step is row-independent: it does not need
+    // `cu_seqlens` at all, only the total row count.
     {
         let qkv = &mut qkv[..used_hidden * 3];
         matmul_bt(
@@ -550,9 +563,33 @@ pub(crate) fn multi_head_attention_batched(
                 .copy_from_slice(&qkv[src + 2 * hidden_size..src + 3 * hidden_size]);
         }
     }
-    lora.apply(layer_idx, "query", hidden_states, &mut q[..used_hidden]);
-    lora.apply(layer_idx, "key", hidden_states, &mut k[..used_hidden]);
-    lora.apply(layer_idx, "value", hidden_states, &mut v[..used_hidden]);
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "query",
+        hidden_states,
+        &mut q[..used_hidden],
+        hidden_size,
+        hidden_size,
+    );
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "key",
+        hidden_states,
+        &mut k[..used_hidden],
+        hidden_size,
+        hidden_size,
+    );
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "value",
+        hidden_states,
+        &mut v[..used_hidden],
+        hidden_size,
+        hidden_size,
+    );
 
     let scale = 1.0 / (head_dim as f32).sqrt();
     let q = &q[..used_hidden];
@@ -678,7 +715,15 @@ pub(crate) fn multi_head_attention_batched(
         hidden_size,
     );
     add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
-    lora.apply(layer_idx, "attn_output", concat, output);
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "attn_output",
+        concat,
+        output,
+        hidden_size,
+        hidden_size,
+    );
 }
 
 /// Pre-#677 padded batched attention, preserved as a test-only reference.
@@ -769,9 +814,33 @@ pub(crate) fn multi_head_attention_batched_padded_reference(
                 .copy_from_slice(&qkv[src + 2 * hidden_size..src + 3 * hidden_size]);
         }
     }
-    lora.apply(layer_idx, "query", hidden_states, &mut q[..used_hidden]);
-    lora.apply(layer_idx, "key", hidden_states, &mut k[..used_hidden]);
-    lora.apply(layer_idx, "value", hidden_states, &mut v[..used_hidden]);
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "query",
+        hidden_states,
+        &mut q[..used_hidden],
+        hidden_size,
+        hidden_size,
+    );
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "key",
+        hidden_states,
+        &mut k[..used_hidden],
+        hidden_size,
+        hidden_size,
+    );
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "value",
+        hidden_states,
+        &mut v[..used_hidden],
+        hidden_size,
+        hidden_size,
+    );
 
     let scale = 1.0 / (head_dim as f32).sqrt();
     let q = &q[..used_hidden];
@@ -879,7 +948,15 @@ pub(crate) fn multi_head_attention_batched_padded_reference(
         hidden_size,
     );
     add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
-    lora.apply(layer_idx, "attn_output", concat, output);
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "attn_output",
+        concat,
+        output,
+        hidden_size,
+        hidden_size,
+    );
 }
 
 #[cfg(test)]
@@ -887,6 +964,20 @@ mod tests {
     use super::*;
     use crate::lora_hook::NoopLoraHook;
     use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RowShapeHook {
+        row_width: usize,
+        calls: AtomicUsize,
+    }
+
+    impl LoraHook for RowShapeHook {
+        fn apply(&self, _layer_idx: usize, _module: &str, x: &[f32], output: &mut [f32]) {
+            assert_eq!(x.len(), self.row_width);
+            assert_eq!(output.len(), self.row_width);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     /// Build identity-like weights and run multi_head_attention on a small
     /// 2-token, 2-head, head_dim=2 model to verify the SIMD matmul path
@@ -1490,6 +1581,10 @@ mod tests {
         let mut qkv = vec![0.0f32; 3 * used_hidden];
         let mut concat = vec![0.0f32; used_hidden];
         let mut output = vec![0.0f32; used_hidden];
+        let lora = RowShapeHook {
+            row_width: hidden_size,
+            calls: AtomicUsize::new(0),
+        };
 
         multi_head_attention_batched(
             &hidden_states_packed,
@@ -1506,9 +1601,11 @@ mod tests {
             &mut qkv,
             &mut concat,
             &mut output,
-            &NoopLoraHook,
+            &lora,
             0,
         );
+
+        assert_eq!(lora.calls.load(Ordering::Relaxed), total * 4);
 
         for out_val in output.iter() {
             assert!(
