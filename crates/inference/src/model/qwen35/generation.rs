@@ -3790,7 +3790,7 @@ mod tests {
              the prefill-derived first token -- not merely before the RawToken callback, \
              which a PrefillEnd emitted after sampling (but before the RawToken push) would \
              also satisfy while silently including sampling time in the reported prefill \
-             interval (codex round-2 medium, PR #882)"
+             interval (#882)"
         );
     }
 
