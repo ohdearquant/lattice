@@ -9,13 +9,13 @@ clippy:
 test:
 	cargo test --workspace
 
-# Opt-in wall-clock regression checks (cached-SIMD-config lookup, 1000-batch
-# dot product, FANN inference) that `test`/`ci` skip by default because
-# absolute-time assertions flake under shared-CI scheduling contention. Run
-# on an idle host to get a real regression signal.
+# The suites carrying wall-clock regression checks (cached-SIMD-config lookup,
+# 1000-batch dot product, FANN inference). Those assertions are skipped when the
+# CI env var is set, because absolute-time bounds flake under shared-CI
+# scheduling contention. Run this on an idle host to exercise them for real.
 test-timing:
-	LATTICE_TIMING_TESTS=1 cargo test -p lattice-embed --test integration
-	LATTICE_TIMING_TESTS=1 cargo test -p lattice-fann --lib
+	cargo test -p lattice-embed --test integration
+	cargo test -p lattice-fann --lib
 
 fmt:
 	cargo fmt --all

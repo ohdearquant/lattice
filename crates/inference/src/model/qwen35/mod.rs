@@ -97,7 +97,7 @@ pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert
 
 #[cfg(test)]
 pub use detokenize::bytes_to_unicode;
-// Needed by all generate paths (cpu_q8, cpu_f16, neon_forward, batch_prefill)
+// Needed by all generate paths (cpu_q8, cpu_f16, neon_forward)
 // and by tests. `pub(crate)` keeps it out of the public API surface.
 pub(crate) use generation::should_stop_token;
 // Public raw generation-lifecycle observer event, consumed by

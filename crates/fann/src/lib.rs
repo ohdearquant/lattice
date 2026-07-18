@@ -87,11 +87,6 @@ mod tests {
         assert_eq!(output.len(), 10);
         assert!(output.iter().all(|value| value.is_finite()));
 
-        if std::env::var("LATTICE_TIMING_TESTS").as_deref() != Ok("1") {
-            eprintln!("skipping wall-clock assertion; set LATTICE_TIMING_TESTS=1 on an idle host");
-            return;
-        }
-
         for _ in 0..10 {
             network.forward(&input).unwrap();
         }
@@ -106,8 +101,13 @@ mod tests {
         let avg_us = elapsed.as_micros() as f64 / iterations as f64;
         println!("Average inference time: {avg_us:.2} us");
 
-        // Should be well under 5ms (5000us)
-        assert!(avg_us < 5000.0, "Inference too slow: {avg_us} us");
+        // Wall-clock timing flakes under shared-CI load, so assert the bound only
+        // on a quiet non-CI machine (CI runners set the CI env var). The forward
+        // passes above still run in CI as a smoke check that inference does not
+        // panic or hang; perf regressions are tracked by the Criterion benches.
+        if std::env::var_os("CI").is_none() {
+            assert!(avg_us < 5000.0, "Inference too slow: {avg_us} us");
+        }
     }
 
     #[test]

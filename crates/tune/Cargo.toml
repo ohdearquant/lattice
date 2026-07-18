@@ -28,6 +28,8 @@ sqlite = ["dep:rusqlite", "serde"]
 # Online adapter-selector refit from preference feedback (experimental, bench-gated).
 # Pulls in the lattice-fann training primitives (RLOO / EWC++) for gate updates.
 mixture = ["lattice-fann/online-router"]
+# Fixed labels for tests and examples. Never enables the default labeling path.
+simulated-teacher = []
 
 [dependencies]
 lattice-fann = { version = "0.7.0", path = "../fann" }
