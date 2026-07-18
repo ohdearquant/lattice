@@ -156,7 +156,8 @@ fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
     match dtype_str {
         "F4" => Some(4),
         "F6_E2M3" | "F6_E3M2" => Some(6),
-        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" => Some(8),
+        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" | "F8_E4M3FNUZ"
+        | "F8_E5M2FNUZ" => Some(8),
         "I16" | "U16" | "F16" | "BF16" => Some(16),
         "I32" | "U32" | "F32" => Some(32),
         "I64" | "U64" | "F64" | "C64" => Some(64),
@@ -587,7 +588,7 @@ impl OnlineArtifactDescriptor {
 
     /// Validate internal consistency, including that `asymmetric_tensor_names`
     /// equals exactly the tensor set this descriptor's online rotations
-    /// derive from `spec` + `cfg` (see [`Self::derive_expected_tensor_names`]).
+    /// derive from `spec` + `cfg` (see `Self::derive_expected_tensor_names`).
     ///
     /// Refuses (does not warn-and-continue) on:
     /// - `V0Residual` carrying any online rotation metadata — a v0 artifact
@@ -622,7 +623,7 @@ impl OnlineArtifactDescriptor {
     ///   rotation-bearing recipe always counter-rotates at least one stored
     ///   tensor, so an empty declaration list cannot be satisfied.
     /// - `V1Online` with any `asymmetric_tensor_names` entry that is not in
-    ///   the exact set [`Self::derive_expected_tensor_names`] derives from
+    ///   the exact set `Self::derive_expected_tensor_names` derives from
     ///   this descriptor's `online_rotations` + `cfg` — an unrelated or
     ///   out-of-scope declaration (e.g. `"unrelated"`, or a real tensor name
     ///   from a layer outside the recipe's scope) must not satisfy the
@@ -637,10 +638,10 @@ impl OnlineArtifactDescriptor {
     ///   representation of the affected-tensor contract (it collapses the
     ///   prior recipe-suffix / declaration / caller-supplied-slice triple
     ///   representation down to this one) and must equal
-    ///   [`Self::derive_expected_tensor_names`]`(cfg)` exactly — no missing
+    ///   `Self::derive_expected_tensor_names(cfg)` exactly — no missing
     ///   entries, no extras. A future converter that wants to
     ///   cross-check what it actually transformed against this contract
-    ///   should use [`Self::verify_affected`], which `validate` itself does
+    ///   should use `Self::verify_affected`, which `validate` itself does
     ///   not call.
     /// - `V1Online` called with `cfg: None`: a `None`-scoped (R4)
     ///   rotation's full layer set is
@@ -1347,6 +1348,46 @@ mod tests {
     }
 
     #[test]
+    fn fnuz_dtype_tensors_are_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        // F8_E4M3FNUZ / F8_E5M2FNUZ are official SafeTensors dtypes this
+        // reader does not decode. Opening a checkpoint that merely contains
+        // one must still succeed and expose the readable tensors — it must
+        // not error out as an unrecognized dtype.
+        let header = serde_json::json!({
+            "supported": {
+                "dtype": "F32",
+                "shape": [1],
+                "data_offsets": [0, 4],
+            },
+            "e4m3fnuz": {
+                "dtype": "F8_E4M3FNUZ",
+                "shape": [1],
+                "data_offsets": [4, 5],
+            },
+            "e5m2fnuz": {
+                "dtype": "F8_E5M2FNUZ",
+                "shape": [1],
+                "data_offsets": [5, 6],
+            },
+        });
+        let header_str = serde_json::to_string(&header).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&(header_str.len() as u64).to_le_bytes());
+        buf.extend_from_slice(header_str.as_bytes());
+        buf.extend_from_slice(&7f32.to_le_bytes());
+        buf.extend_from_slice(&[0u8, 0u8]);
+        std::fs::write(dir.path().join("model.safetensors"), &buf).unwrap();
+
+        let reader = QuarotTensorReader::open(dir.path()).unwrap();
+        assert!(reader.has_tensor("supported"));
+        assert!(!reader.has_tensor("e4m3fnuz"));
+        assert!(!reader.has_tensor("e5m2fnuz"));
+        let (data, _) = reader.read_tensor_f64("supported").unwrap();
+        assert_eq!(data, vec![7.0]);
+    }
+
+    #[test]
     fn single_file_wins_when_both_layouts_present() {
         // Mirrors the runtime loaders at qwen35/model.rs:25 and qwen.rs:425,
         // which both check `model.safetensors` before the sharded index.
@@ -1748,10 +1789,10 @@ mod tests {
         assert!(descriptor.validate(None).is_ok());
     }
 
-    /// Mutation/refusal: a V0Residual descriptor must never carry online
-    /// rotation metadata — feeding it one must be refused loudly rather
-    /// than silently ignored (which would let a hand-edited index sneak
-    /// online-rotation intent past a v0-only loader).
+    /// A V0Residual descriptor must never carry online rotation metadata —
+    /// feeding it one must be refused loudly rather than silently ignored
+    /// (which would let a hand-edited index sneak online-rotation intent
+    /// past a v0-only loader).
     #[test]
     fn v0_residual_with_online_rotation_is_refused() {
         let descriptor = OnlineArtifactDescriptor {
@@ -2249,7 +2290,7 @@ mod tests {
 
     // --- canonical Qwen3.5 tensor namespace ---
 
-    /// The review's exact claim: the canonical Qwen3.5 tensor namespace is
+    /// The canonical Qwen3.5 tensor namespace is
     /// `model.language_model.layers.{idx}.{suffix}` (matching
     /// `qwen_required_tensor_names` and the QuaRot converter), not
     /// `model.layers.{idx}.{suffix}`. A descriptor declaring the canonical

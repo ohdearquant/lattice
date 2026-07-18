@@ -299,9 +299,9 @@ mod tests {
     impl KvBroadcastRotation {
         /// `seed` must match the `KV_DIM`-shaped `BlockHadamard::new(seed,
         /// KV_DIM, HEAD_DIM)` this broadcasts. Uses the SAME
-        /// `derive_block_seed` helper as `BlockHadamard` itself (daemon
-        /// review minor: a duplicated derivation here would silently drift
-        /// if the mixing ever changes again).
+        /// `derive_block_seed` helper as `BlockHadamard` itself — a
+        /// duplicated derivation here would silently drift if the mixing
+        /// ever changes again.
         fn matching(seed: u64) -> Self {
             let per_kv_head = (0..NUM_KV_HEADS)
                 .map(|kvh| RandomizedHadamard::new(derive_block_seed(seed, kvh), HEAD_DIM).unwrap())

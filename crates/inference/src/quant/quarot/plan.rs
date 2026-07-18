@@ -159,6 +159,8 @@
 //!   tensor names `mlp.experts.gate_up_proj`, `mlp.experts.down_proj`)
 //! - Batch LoRA kernel for prefill (currently falls back to sequential)
 
+use std::collections::HashSet;
+
 use crate::error::InferenceError;
 use crate::model::qwen::QwenConfig;
 use crate::model::qwen35_config::Qwen35Config;
@@ -387,6 +389,14 @@ fn check_block_hadamard_num_blocks_cap(
 }
 
 impl OnlineRotationSpec {
+    /// Upper bound on `layer_scope` length. A real R3 recipe scopes to a
+    /// config's full-attention layer count (tens, not thousands); this
+    /// ceiling sits far above any legitimate spec while keeping
+    /// [`Self::validate`]'s per-layer membership check bounded regardless
+    /// of how large a caller-supplied `layer_scope` is. Mirrors
+    /// [`super::io::OnlineArtifactDescriptor::MAX_VALIDATED_ENTRIES`].
+    const MAX_LAYER_SCOPE_ENTRIES: usize = 4096;
+
     /// Build the R3 spec for Qwen3.5 hybrid: scope is exactly the
     /// config-declared full-attention layer indices (GDN excluded).
     ///
@@ -457,8 +467,8 @@ impl OnlineRotationSpec {
     /// instead, so building an R4 spec against a MoE config would certify a
     /// fabricated dense per-layer name; MoE R4 targets are not yet
     /// modeled), or `cfg.intermediate_size / block_size` exceeds
-    /// [`MAX_BLOCK_HADAMARD_BLOCKS`] (a recipe [`super::hadamard::BlockHadamard::new`]
-    /// cannot construct — see [`check_block_hadamard_num_blocks_cap`]).
+    /// `MAX_BLOCK_HADAMARD_BLOCKS` (a recipe [`super::hadamard::BlockHadamard::new`]
+    /// cannot construct — see `check_block_hadamard_num_blocks_cap`).
     pub fn r4_dense_mlp(
         cfg: &Qwen35Config,
         seed: u64,
@@ -594,6 +604,16 @@ impl OnlineRotationSpec {
                             .to_string(),
                     ));
                 }
+                if layers.len() > Self::MAX_LAYER_SCOPE_ENTRIES {
+                    return Err(InferenceError::Inference(format!(
+                        "OnlineRotationSpec::validate: R3 layer_scope declares {} \
+                         entries, exceeding the maximum of {} — a spec this large \
+                         is rejected before the per-layer membership check to keep \
+                         validation cost bounded regardless of input",
+                        layers.len(),
+                        Self::MAX_LAYER_SCOPE_ENTRIES
+                    )));
+                }
                 // Canonical-form contract (v1, cfg-independent): layer_scope
                 // must be strictly sorted ascending with no duplicates. A
                 // duplicate index (e.g. `[3,3,7,...]`) would silently
@@ -638,19 +658,23 @@ impl OnlineRotationSpec {
                     // r3_full_attention constructor) requires ALL of the
                     // config's full-attention layers, not a strict subset —
                     // a scope naming only some of them would leave the
-                    // omitted layers' weights un-counter-rotated at runtime
-                    // Require set
-                    // equality between `layers` and the config's full-
-                    // attention layers; the membership loop above already
-                    // rejects the "extra/non-member" direction, so this only
-                    // needs to check the "missing" direction.
+                    // omitted layers' weights un-counter-rotated at runtime.
+                    // Require set equality between `layers` and the config's
+                    // full-attention layers; the membership loop above
+                    // already rejects the "extra/non-member" direction, so
+                    // this only needs to check the "missing" direction.
+                    // `layers` is bounded by MAX_LAYER_SCOPE_ENTRIES above, so
+                    // build a set once and probe it — O(n+m) instead of the
+                    // O(n*m) a `Vec::contains` scan per config layer would
+                    // cost.
+                    let scoped: HashSet<usize> = layers.iter().copied().collect();
                     let required_full_attention_layers: Vec<usize> = (0..cfg.num_hidden_layers)
                         .filter(|&idx| cfg.is_full_attention(idx))
                         .collect();
                     let missing_layers: Vec<usize> = required_full_attention_layers
                         .iter()
                         .copied()
-                        .filter(|idx| !layers.contains(idx))
+                        .filter(|idx| !scoped.contains(idx))
                         .collect();
                     if !missing_layers.is_empty() {
                         return Err(InferenceError::Inference(format!(
@@ -1705,6 +1729,29 @@ mod tests {
         assert_eq!(spec.id, RotationId::MlpDownR4);
         assert_eq!(spec.side, AbsorptionSide::InputSide);
         assert_eq!(spec.layer_scope, None);
+    }
+
+    /// A hand-built spec with a `layer_scope` far larger than any real R3
+    /// recipe (which scopes to a config's full-attention layer count, tens
+    /// of entries) must be rejected before the O(n) per-layer membership
+    /// check runs, so an untrusted descriptor cannot force unbounded
+    /// validation work by inflating `layer_scope` alone.
+    #[test]
+    fn r3_rejects_oversized_layer_scope() {
+        let oversized: Vec<usize> =
+            (0..(OnlineRotationSpec::MAX_LAYER_SCOPE_ENTRIES + 1)).collect();
+        let hand_built = OnlineRotationSpec {
+            id: RotationId::AttentionOutputR3,
+            side: AbsorptionSide::InputSide,
+            seed: 1,
+            block_size: 1,
+            layer_scope: Some(oversized),
+        };
+        let err = hand_built.validate(None).unwrap_err();
+        assert!(
+            format!("{err}").contains(&OnlineRotationSpec::MAX_LAYER_SCOPE_ENTRIES.to_string()),
+            "expected the layer_scope cap error naming the maximum, got: {err}"
+        );
     }
 
     /// `qwen36_35b_a3b()` is MoE (loader requires `mlp.experts.down_proj`,

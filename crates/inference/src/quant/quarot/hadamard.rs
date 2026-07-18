@@ -266,7 +266,7 @@ impl RandomizedHadamard {
 ///
 /// This is the standard QuaRot fallback for axes like Qwen3.5-0.8B's
 /// `intermediate_size = 3584` (not a power of two: `3584 = 2^9 · 7`) — see
-/// issue #703 and QuaRot §4 (https://arxiv.org/html/2404.00456). Padding to
+/// issue #703 and QuaRot §4 (<https://arxiv.org/html/2404.00456>). Padding to
 /// the next power of two is explicitly rejected by ADR-044 §Risks because it
 /// is not orthogonal (the padded zeros still participate in the transform
 /// and cannot be exactly un-padded after quantization noise is added); a
@@ -274,12 +274,12 @@ impl RandomizedHadamard {
 /// with zero padding, at the cost of not mixing outliers across block
 /// boundaries.
 ///
-/// Per-block signs are seeded via [`derive_block_seed`]: the block index is
+/// Per-block signs are seeded via `derive_block_seed`: the block index is
 /// spread by the golden-ratio constant and then passed through the full
 /// splitmix64 avalanche finalizer. The finalizer step is load-bearing, not
 /// cosmetic — spacing seeds linearly by the SAME constant that
-/// [`signs_from_seed`] advances its internal state by makes adjacent blocks'
-/// sign streams exact one-position-shifted copies (see [`derive_block_seed`]
+/// `signs_from_seed` advances its internal state by makes adjacent blocks'
+/// sign streams exact one-position-shifted copies (see `derive_block_seed`
 /// and the `adjacent_block_sign_streams_are_not_shifted_copies` regression).
 #[derive(Debug, Clone)]
 pub struct BlockHadamard {
@@ -348,8 +348,8 @@ impl BlockHadamard {
     /// using blocks of size `block_size`.
     ///
     /// Returns an error if `n == 0`, `n` exceeds
-    /// [`MAX_BLOCK_HADAMARD_LEN`], `num_blocks = n / block_size` exceeds
-    /// [`MAX_BLOCK_HADAMARD_BLOCKS`], `block_size == 0`, `block_size` is not
+    /// `MAX_BLOCK_HADAMARD_LEN`, `num_blocks = n / block_size` exceeds
+    /// `MAX_BLOCK_HADAMARD_BLOCKS`, `block_size == 0`, `block_size` is not
     /// a power of two, or `block_size` does not evenly divide `n`. Every
     /// bound check runs before any allocation, so an attacker-controlled or
     /// corrupted `(n, block_size)` pair (e.g. `n = usize::MAX` or
@@ -997,13 +997,10 @@ mod tests {
         assert!(bh.apply(&mut data).is_err());
     }
 
-    /// Mutation narrative: corrupt one block's sign seed (simulated by
-    /// constructing a second BlockHadamard that differs only in the seed for
-    /// one block's derivation — here we corrupt the *whole* seed, which
-    /// changes every block's signs, then restore the original seed and
-    /// re-verify round-trip health). This proves the round-trip test is
-    /// mutation-sensitive: a wrong sign vector on decode must NOT silently
-    /// round-trip.
+    /// A decoder built from the wrong seed must not reproduce the original
+    /// vector, and a decoder built from the matching seed must reproduce it
+    /// exactly — proving the round trip is sensitive to which seed derived
+    /// the block signs, not just whether a seed was supplied at all.
     #[test]
     fn block_hadamard_mutation_sensitive_round_trip() {
         let n = 3584;
@@ -1013,9 +1010,8 @@ mod tests {
 
         let original = synthetic_vec(n, 7);
 
-        // RED: apply with `good_seed`, invert with `corrupted_seed` — the
-        // corrupted decoder's blocks do not match the encoder's, so the
-        // round trip must fail to reproduce the original.
+        // A decoder seeded differently from the encoder must diverge from
+        // the original vector on decode.
         let encoder = BlockHadamard::new(good_seed, n, b).unwrap();
         let corrupted_decoder = BlockHadamard::new(corrupted_seed, n, b).unwrap();
         let mut data = original.clone();
@@ -1028,12 +1024,12 @@ mod tests {
             .fold(0.0, f32::max);
         assert!(
             corrupted_delta > 1e-2,
-            "corrupted-seed round trip should diverge from the original, got delta {corrupted_delta}"
+            "mismatched-seed round trip should diverge from the original, got delta {corrupted_delta}"
         );
 
-        // GREEN: restore the matching seed and re-verify the round trip
-        // passes cleanly, proving the corruption above — not some other
-        // bug — was what broke it.
+        // A decoder seeded to match the encoder reproduces the original
+        // exactly, confirming the divergence above traces to the seed
+        // mismatch and not some other defect.
         let restored_decoder = BlockHadamard::new(good_seed, n, b).unwrap();
         let mut data_restored = original.clone();
         encoder.apply(&mut data_restored).unwrap();
