@@ -45,6 +45,33 @@ assert.equal(
   'the prebuild workflow must contain exactly one build row per supported napi target'
 )
 
+const forIndex = workflow.indexOf('for suffix in')
+const doIndex = workflow.indexOf('; do', forIndex)
+assert.ok(
+  forIndex !== -1 && doIndex !== -1,
+  'expected a "for suffix in ...; do" package-assembly loop in the prebuild workflow'
+)
+const suffixes = workflow
+  .slice(forIndex, doIndex)
+  .split('\n')
+  .slice(1)
+  .map(line => line.trim().replace(/\\$/, '').trim())
+  .filter(Boolean)
+const expectedSuffixes = new Set(
+  Array.from(targetPackages.values(), pkg => pkg.replace('@khive-ai/lattice-embed-', ''))
+)
+
+assert.deepEqual(
+  new Set(suffixes),
+  expectedSuffixes,
+  'the package-assembly suffix loop must match the supported native prebuild matrix'
+)
+assert.equal(
+  suffixes.length,
+  expectedSuffixes.size,
+  'the package-assembly suffix loop must contain exactly one entry per supported napi target'
+)
+
 for (const command of [
   'if-no-files-found: error',
   'npm run create-npm-dirs',

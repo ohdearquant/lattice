@@ -4,6 +4,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - 'Cargo.toml'
       - 'crates/embed/**'
       - 'crates/inference/**'
       - 'npm/lattice-embed-native/**'
@@ -14,6 +15,7 @@ on:
   push:
     branches: [main]
     paths:
+      - 'Cargo.toml'
       - 'crates/embed/**'
       - 'crates/inference/**'
       - 'npm/lattice-embed-native/**'
@@ -101,7 +103,7 @@ jobs:
 
       - name: Install napi build dependencies
         working-directory: npm/lattice-embed-native
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts
 
       - name: Build native binding (aarch64 GNU)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -142,7 +144,7 @@ jobs:
 
       - name: Install napi packaging dependencies
         working-directory: npm/lattice-embed-native
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts
 
       - name: Validate the configured matrix
         working-directory: npm/lattice-embed-native
@@ -192,7 +194,13 @@ jobs:
   publish:
     name: npm release preflight
     needs: package
-    if: github.event_name == 'workflow_dispatch'
+    # Manual dispatch can target any branch, but the NPM_TOKEN-bearing steps
+    # below must only ever run against a protected main commit — never a
+    # collaborator-selected branch. `environment: npm-publish` adds a manual
+    # approval gate on top of the ref check (configured in repo Settings >
+    # Environments).
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    environment: npm-publish
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -201,28 +209,28 @@ jobs:
     env:
       NODE_AUTH_TOKEN: unused
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           registry-url: 'https://registry.npmjs.org'
 
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           targets: wasm32-unknown-unknown
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           shared-key: npm-publish-preflight
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
         with:
           tool: wasm-bindgen-cli@0.2.105
 
       - name: Install napi packaging dependencies
         working-directory: npm/lattice-embed-native
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts
 
       - name: Validate the configured matrix
         working-directory: npm/lattice-embed-native
@@ -233,14 +241,14 @@ jobs:
         run: npm run create-npm-dirs
 
       - name: Download native bindings
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: native-*
           path: npm/lattice-embed-native
           merge-multiple: true
 
       - name: Cache native test models
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.lattice/models/all-minilm-l6-v2
