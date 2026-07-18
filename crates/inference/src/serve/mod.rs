@@ -25,6 +25,9 @@ use tokio::sync::watch;
 
 use crate::model::qwen35_config::GenerateConfig;
 
+/// Shared chat-completions wire DTO and normalization policies.
+pub mod contract;
+
 /// Shared Metal GPU worker owner (issue #832, ADR-080 cluster C2/C3):
 /// the single dedicated thread that owns the `!Send` `MetalQwen35State` for
 /// the whole process lifetime, used by both the `lattice` unified server and
@@ -94,6 +97,15 @@ pub enum ApiError {
     /// is a shared, single-GPU capacity limit on the server as a whole, not
     /// a per-caller rate limit — the request itself was perfectly fine.
     ServiceUnavailable { message: String },
+    /// `Content-Type` missing or not JSON — HTTP 415. Mirrors axum's own
+    /// `Json` extractor rejection (`json_content_type` in axum 0.8's
+    /// `src/json.rs`): accepts iff the header parses as a MIME type with
+    /// `type_() == "application"` and (`subtype() == "json"` or a `+json`
+    /// structured-syntax suffix, e.g. `application/vnd.api+json`). See
+    /// [`require_json_content_type`]. Needed because `chat_completions`
+    /// (VALIDATE-BEFORE-MATERIALIZE) takes the raw request body directly
+    /// and no longer goes through `Json`, which enforced this for free.
+    UnsupportedMediaType { message: String },
 }
 
 impl ApiError {
@@ -106,6 +118,7 @@ impl ApiError {
             ApiError::Internal { message } => message,
             ApiError::ServerError { message, .. } => message,
             ApiError::ServiceUnavailable { message } => message,
+            ApiError::UnsupportedMediaType { message } => message,
         }
     }
 
@@ -121,6 +134,7 @@ impl ApiError {
             ApiError::Internal { .. } => "internal_error",
             ApiError::ServerError { code, .. } => code,
             ApiError::ServiceUnavailable { .. } => "server_busy",
+            ApiError::UnsupportedMediaType { .. } => "unsupported_media_type",
         }
     }
 }
@@ -196,7 +210,48 @@ impl IntoResponse for ApiError {
                 });
                 (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
             }
+            ApiError::UnsupportedMediaType { message } => {
+                let body = Json(ErrorBody {
+                    error: ErrorDetail {
+                        message,
+                        r#type: "invalid_request_error",
+                        code: "unsupported_media_type".to_string(),
+                        param: None,
+                    },
+                });
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, body).into_response()
+            }
         }
+    }
+}
+
+/// Enforces axum's own `Json` extractor Content-Type acceptance rule
+/// (`json_content_type` in axum 0.8's `src/json.rs`) against a raw request:
+/// accepts iff the `Content-Type` header parses as a MIME type with
+/// `type_() == "application"` and (`subtype() == "json"` or a `+json`
+/// structured-syntax suffix). A missing header, an unparsable header, or
+/// any other MIME type is rejected as [`ApiError::UnsupportedMediaType`]
+/// (HTTP 415) -- matching what `Json<T>`'s own extractor did before
+/// `chat_completions` moved to taking the raw request body
+/// (VALIDATE-BEFORE-MATERIALIZE) to let `contract::reject_message_flood`
+/// run ahead of typed deserialization. That change silently dropped this
+/// check, since only `Json`'s extractor enforced it; this function restores
+/// it as an explicit call both binaries make before touching the body.
+pub fn require_json_content_type(headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
+    let is_json_content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<mime::Mime>().ok())
+        .is_some_and(|mime| {
+            mime.type_() == "application"
+                && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
+        });
+    if is_json_content_type {
+        Ok(())
+    } else {
+        Err(ApiError::UnsupportedMediaType {
+            message: "Content-Type must be application/json".to_string(),
+        })
     }
 }
 
@@ -1263,13 +1318,6 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
     },
     ParityCase {
         name: "temperature_out_of_range_rejected",
-        // `lattice.rs`'s `validate_temperature` enforces `[0.0, 2.0]`
-        // (`crates/inference/src/bin/lattice.rs`); `lattice_serve.rs`'s
-        // `build_cfg` has NO temperature range check at all -- a
-        // caller-supplied value flows straight into `GenerateConfig`
-        // unclamped. This is a genuine, pre-existing divergence (not
-        // introduced by #828), pinned here the same way
-        // `max_tokens_over_cap_reject_vs_clamp` pins its own divergence.
         method: "POST",
         path: "/v1/chat/completions",
         body: CaseBody::Fixed(
@@ -1279,16 +1327,11 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
             status: 400,
             code: "invalid_temperature",
         },
-        lattice_serve: ExpectedResponse::Json {
-            status: 200,
-            fields: ACCEPTED_MINIMAL_FIELDS,
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_temperature",
         },
-        divergence_reason: Some(
-            "lattice.rs's validate_temperature rejects outside [0.0, 2.0]; \
-             lattice_serve.rs's build_cfg has no temperature range check at \
-             all and passes any client-supplied value straight into \
-             GenerateConfig -- a pre-existing gap, not introduced by #828.",
-        ),
+        divergence_reason: None,
     },
     ParityCase {
         name: "top_p_boundary_one_accepted",
@@ -1309,9 +1352,6 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
     },
     ParityCase {
         name: "top_p_zero_rejected",
-        // Same divergence shape as `temperature_out_of_range_rejected`:
-        // `lattice.rs`'s `validate_top_p` enforces `(0.0, 1.0]`;
-        // `lattice_serve.rs` has no top_p range check at all.
         method: "POST",
         path: "/v1/chat/completions",
         body: CaseBody::Fixed(
@@ -1321,16 +1361,11 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
             status: 400,
             code: "invalid_top_p",
         },
-        lattice_serve: ExpectedResponse::Json {
-            status: 200,
-            fields: ACCEPTED_MINIMAL_FIELDS,
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_top_p",
         },
-        divergence_reason: Some(
-            "lattice.rs's validate_top_p rejects a top_p of 0.0 ((0.0, 1.0] \
-             is half-open at zero); lattice_serve.rs's build_cfg has no \
-             top_p range check at all -- a pre-existing gap, not introduced \
-             by #828.",
-        ),
+        divergence_reason: None,
     },
     ParityCase {
         name: "top_p_above_one_rejected",
@@ -1343,15 +1378,11 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
             status: 400,
             code: "invalid_top_p",
         },
-        lattice_serve: ExpectedResponse::Json {
-            status: 200,
-            fields: ACCEPTED_MINIMAL_FIELDS,
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_top_p",
         },
-        divergence_reason: Some(
-            "lattice.rs's validate_top_p rejects anything above 1.0; \
-             lattice_serve.rs's build_cfg has no top_p range check at all \
-             -- a pre-existing gap, not introduced by #828.",
-        ),
+        divergence_reason: None,
     },
 ];
 
@@ -1435,6 +1466,69 @@ mod tests {
         assert_eq!(body["data"][0]["object"], "model");
         assert_eq!(body["data"][0]["created"], 1_700_000_000);
         assert_eq!(body["data"][0]["owned_by"], "lattice");
+    }
+
+    fn headers_with_content_type(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn require_json_content_type_accepts_application_json() {
+        require_json_content_type(&headers_with_content_type("application/json")).unwrap();
+    }
+
+    #[test]
+    fn require_json_content_type_accepts_json_with_charset_param() {
+        // axum's own rule strips parameters before comparing type/subtype.
+        require_json_content_type(&headers_with_content_type(
+            "application/json; charset=utf-8",
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn require_json_content_type_accepts_structured_suffix() {
+        require_json_content_type(&headers_with_content_type("application/vnd.api+json")).unwrap();
+    }
+
+    #[test]
+    fn require_json_content_type_rejects_text_plain() {
+        let err = require_json_content_type(&headers_with_content_type("text/plain")).unwrap_err();
+        assert!(matches!(err, ApiError::UnsupportedMediaType { .. }));
+        assert_eq!(err.code(), "unsupported_media_type");
+    }
+
+    #[test]
+    fn require_json_content_type_rejects_missing_header() {
+        let err = require_json_content_type(&axum::http::HeaderMap::new()).unwrap_err();
+        assert!(matches!(err, ApiError::UnsupportedMediaType { .. }));
+    }
+
+    #[test]
+    fn require_json_content_type_rejects_unparsable_header() {
+        // A raw byte sequence that fails `to_str()` -- the header value
+        // isn't a valid mime token at all.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        let err = require_json_content_type(&headers).unwrap_err();
+        assert!(matches!(err, ApiError::UnsupportedMediaType { .. }));
+    }
+
+    #[test]
+    fn unsupported_media_type_into_response_is_415() {
+        let response = (ApiError::UnsupportedMediaType {
+            message: "Content-Type must be application/json".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[test]

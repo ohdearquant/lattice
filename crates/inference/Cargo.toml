@@ -21,7 +21,7 @@ default = ["std", "download", "serve"]
 # keep including `lattice_serve` without needing an extra flag. Library
 # consumers building with `default-features = false` no longer pull an HTTP
 # server into their dependency tree (the lib itself never uses it).
-serve = ["dep:axum", "dep:tokio", "dep:futures"]
+serve = ["dep:axum", "dep:tokio", "dep:futures", "dep:mime"]
 std = []
 f16 = []
 metal-gpu = ["dep:metal", "dep:objc"]
@@ -63,6 +63,7 @@ thiserror.workspace = true
 tracing.workspace = true
 clap = { workspace = true }
 axum = { workspace = true, optional = true }
+mime = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 ureq = { version = "2", features = ["tls"], optional = true }
