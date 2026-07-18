@@ -60,6 +60,19 @@ pub trait LoraHook: Send + Sync {
     ) -> Result<(), String> {
         Ok(())
     }
+
+    /// **Unstable**: whether this hook has anything to apply for
+    /// `(layer_idx, module)`.
+    ///
+    /// [`apply_lora_rows`] calls this once per projection, before its
+    /// per-row loop, so a hook with nothing to do for this projection (the
+    /// default no-adapter case) skips the loop — and the one virtual call
+    /// per token row it would otherwise cost — entirely. Default: `true`
+    /// (assume active; correct but not optimized for hooks that don't
+    /// override it). [`NoopLoraHook`] overrides this to `false`.
+    fn is_active(&self, _layer_idx: usize, _module: &str) -> bool {
+        true
+    }
 }
 
 pub(crate) fn apply_lora_rows(
@@ -92,6 +105,13 @@ pub(crate) fn apply_lora_rows(
         "LoRA input and output row counts must match"
     );
 
+    // Resolved once per projection rather than once per row: on the default
+    // (no-adapter) path this skips straight past the per-row loop below
+    // instead of paying one virtual dispatch per token.
+    if !lora.is_active(layer_idx, module) {
+        return;
+    }
+
     for (input_row, output_row) in input
         .chunks_exact(input_row_width)
         .zip(output.chunks_exact_mut(output_row_width))
@@ -107,6 +127,11 @@ pub struct NoopLoraHook;
 impl LoraHook for NoopLoraHook {
     #[inline(always)]
     fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {}
+
+    #[inline(always)]
+    fn is_active(&self, _layer_idx: usize, _module: &str) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +164,50 @@ mod tests {
 
         assert_eq!(hook.calls.load(Ordering::Relaxed), 3);
         assert_eq!(output, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0]);
+    }
+
+    struct InactiveHook {
+        calls: AtomicUsize,
+    }
+
+    impl LoraHook for InactiveHook {
+        fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn is_active(&self, _layer_idx: usize, _module: &str) -> bool {
+            false
+        }
+    }
+
+    /// A hook that reports `is_active == false` for a projection must never
+    /// have `apply` dispatched for any row of that projection: `apply_lora_rows`
+    /// checks activity once, before the per-row loop, not per row.
+    #[test]
+    fn skips_the_per_row_loop_entirely_when_the_hook_is_inactive() {
+        let hook = InactiveHook {
+            calls: AtomicUsize::new(0),
+        };
+        let input = [1.0, 10.0, 2.0, 20.0, 3.0, 30.0];
+        let mut output = [7.0; 9];
+
+        apply_lora_rows(&hook, 0, "projection", &input, &mut output, 2, 3);
+
+        assert_eq!(
+            hook.calls.load(Ordering::Relaxed),
+            0,
+            "apply must not be called for any row when is_active is false"
+        );
+        assert_eq!(output, [7.0; 9], "output must be untouched");
+    }
+
+    /// `NoopLoraHook` (the default when no adapter is loaded) must report
+    /// itself inactive for every projection, so the default (no-adapter)
+    /// path stays off the per-row virtual-dispatch cost.
+    #[test]
+    fn noop_hook_reports_inactive_for_any_projection() {
+        let hook = NoopLoraHook;
+        assert!(!hook.is_active(0, "query"));
+        assert!(!hook.is_active(41, "ffn_output"));
     }
 }

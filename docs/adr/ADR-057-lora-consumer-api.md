@@ -64,19 +64,21 @@ pub fn score_with_hook(
     query: &str,
     document: &str,
     lora: &dyn LoraHook,
-) -> f32;
+) -> Result<f32, InferenceError>;
 
 pub fn score_batch_with_hook(
     &self,
     query: &str,
     documents: &[&str],
     lora: &dyn LoraHook,
-) -> Vec<f32>;
+) -> Result<Vec<f32>, InferenceError>;
 ```
+
+Both methods validate the hook's declared projection geometry against the model's BERT dimensions (via `LoraHook::validate_against_bert`) before the forward pass runs, and return `Err(InferenceError::InvalidInput)` if the geometry doesn't match — this is what lets a malformed or attacker-controlled adapter be rejected with a recoverable error instead of a forward pass indexing out of bounds.
 
 `BertModel::forward_tokenized` is `pub(crate)` today. The hook-aware variant stays `pub(crate)` — downstream consumers access hooks through `CrossEncoderModel::score_with_hook` (which is `pub`), not through the internal BERT forward method directly.
 
-The existing `forward_tokenized` and `score`/`score_batch` remain unchanged (they internally pass `&NoopLoraHook` from `lattice_inference::lora_hook::NoopLoraHook`). This is additive, not breaking.
+The existing `forward_tokenized` and `score`/`score_batch` remain unchanged (they internally pass `&NoopLoraHook` from `lattice_inference::lora_hook::NoopLoraHook`) and keep their infallible `f32`/`Vec<f32>` signatures. The hook-aware methods are new additions, but they return `Result` rather than the bare value, since a caller-supplied `LoraHook` can fail geometry validation.
 
 **Implementation note**: when D1 lands, the `LoraHook` trait doc comment (`crates/inference/src/lora_hook.rs:19-21`) and `LoraAdapter` module doc (`crates/tune/src/lora/mod.rs:12-15`) must be updated to include the BERT module names alongside the existing Qwen/GDN names.
 

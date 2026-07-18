@@ -28,16 +28,30 @@ const STACK_RANK_CAPACITY: usize = 128;
 /// sequential matvecs rather than a fused kernel. Called once per hooked
 /// row, so the `A @ x` intermediate is scratch space, not output — see
 /// `STACK_RANK_CAPACITY` for why it avoids a heap allocation.
+///
+/// Fails closed: if `x`, `output`, or the layer's own `a`/`b` buffers don't
+/// match the layer's declared `rank`/`d_in`/`d_out`, this is a no-op rather
+/// than an out-of-bounds slice.
 pub fn apply_lora(lora: &LoraLayer, scale: f32, x: &[f32], output: &mut [f32]) {
-    debug_assert_eq!(x.len(), lora.d_in, "x length must equal d_in");
-    debug_assert!(output.len() >= lora.d_out, "output length must be >= d_out");
-
-    // Step 1: intermediate = A @ x  -> shape (rank,)
-    // A is row-major (rank, d_in), so row r dot x gives intermediate[r].
+    // Adapter data is untrusted input: a `LoraLayer` reaching this function
+    // may not satisfy its own declared geometry (e.g. an empty or
+    // short buffer that slipped past an upstream validation guard, since
+    // this function is reachable from more than one caller). Rather than
+    // trust the caller and slice unchecked, verify the buffers actually
+    // match the declared `rank`/`d_in`/`d_out` and no-op otherwise.
     let rank = lora.rank;
     let d_in = lora.d_in;
     let d_out = lora.d_out;
+    let shapes_match = x.len() == d_in
+        && output.len() >= d_out
+        && rank.checked_mul(d_in) == Some(lora.a.len())
+        && d_out.checked_mul(rank) == Some(lora.b.len());
+    if !shapes_match {
+        return;
+    }
 
+    // Step 1: intermediate = A @ x  -> shape (rank,)
+    // A is row-major (rank, d_in), so row r dot x gives intermediate[r].
     let mut stack_buf = [0.0f32; STACK_RANK_CAPACITY];
     let mut heap_buf = Vec::new();
     let intermediate: &mut [f32] = if rank <= STACK_RANK_CAPACITY {
@@ -169,6 +183,32 @@ mod tests {
             "got {}, want {}",
             output[0],
             2.0 * expected
+        );
+    }
+
+    /// `apply_lora` must never index into a layer's `a`/`b` buffers past
+    /// their actual length: a layer whose declared `rank`/`d_in` implies a
+    /// buffer larger than what `a` actually holds (malformed/untrusted
+    /// adapter data that reached this function through some path other than
+    /// `LoraAdapter::new`) must be a no-op, not an out-of-bounds slice.
+    #[test]
+    fn test_apply_lora_mismatched_a_buffer_is_noop_not_panic() {
+        let lora = LoraLayer {
+            a: vec![], // declares rank=1, d_in=3 but holds zero elements
+            b: vec![1.0, 0.0],
+            d_in: 3,
+            d_out: 2,
+            rank: 1,
+        };
+
+        let x = [5.0, 3.0, 1.0];
+        let mut output = [100.0, 200.0];
+        apply_lora(&lora, 2.0, &x, &mut output);
+
+        assert_eq!(
+            output,
+            [100.0, 200.0],
+            "mismatched buffer must leave output untouched"
         );
     }
 

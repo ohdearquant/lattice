@@ -147,29 +147,35 @@ impl LoraAdapter {
     ///
     /// Every non-empty layer's `a`/`b` buffers must be sized exactly
     /// `rank * d_in` and `d_out * rank` (the layout `apply_lora` indexes
-    /// into); a layer with an empty `a` or `b` is an untrained/placeholder
+    /// into); a layer with BOTH `a` and `b` empty is an untrained/placeholder
     /// module and is exempt (mirrors `save_peft_safetensors`, which skips
-    /// the same layers). This is the single construction chokepoint
+    /// the same layers). A layer with exactly one of `a`/`b` empty is
+    /// malformed, not a placeholder, and is rejected like any other
+    /// length mismatch. This is the single construction chokepoint
     /// (safetensors loading, blending, and training all route through it),
     /// so downstream code — including
     /// [`validate_against`](Self::validate_against) and `apply` — can rely
-    /// on the invariant without re-checking it.
+    /// on the invariant without re-checking it. `apply_lora` itself also
+    /// verifies its input against the layer's declared geometry before
+    /// indexing, as a second boundary for adapter data built by other means.
     ///
     /// # Errors
     ///
     /// Returns an error when the adapter configuration is invalid, or when
-    /// any non-empty layer's `a`/`b` buffer length doesn't match its own
-    /// declared `rank`/`d_in`/`d_out`.
+    /// any non-placeholder layer's `a`/`b` buffer length doesn't match its
+    /// own declared `rank`/`d_in`/`d_out`.
     pub fn new(
         config: LoraConfig,
         layers: HashMap<(usize, String), LoraLayer>,
     ) -> crate::error::Result<Self> {
         config.validate()?;
         for ((layer_idx, module), layer) in &layers {
-            // An empty `a` or `b` denotes an untrained/not-yet-populated
+            // Both `a` and `b` empty denotes an untrained/not-yet-populated
             // module (see `save_peft_safetensors`, which skips these the
             // same way) and is exempt from the buffer/rank check below.
-            if layer.a.is_empty() || layer.b.is_empty() {
+            // Exactly one empty is not a valid placeholder state and falls
+            // through to the length checks, which reject it.
+            if layer.a.is_empty() && layer.b.is_empty() {
                 continue;
             }
             let expected_a = layer.rank.checked_mul(layer.d_in).ok_or_else(|| {
@@ -405,6 +411,10 @@ impl lattice_inference::lora_hook::LoraHook for LoraAdapter {
         LoraAdapter::validate_against_bert(self, num_hidden_layers, hidden_size, intermediate_size)
             .map_err(|e| e.to_string())
     }
+
+    fn is_active(&self, layer_idx: usize, module: &str) -> bool {
+        LoraAdapter::has_adapter(self, layer_idx, module)
+    }
 }
 
 #[cfg(test)]
@@ -630,10 +640,10 @@ mod tests {
         assert!(unknown.is_empty());
     }
 
-    /// Regression for the #972 follow-up finding: a layer with *correct*
-    /// `d_in`/`d_out` (what `validate_against` checked before this fix) but
-    /// a short `a` buffer must still be rejected at construction, not admitted
-    /// to later panic (slice-out-of-bounds) inside `apply_lora`.
+    /// Regression for #972: a layer with *correct* `d_in`/`d_out` (what
+    /// `validate_against` checked before this fix) but a short `a` buffer
+    /// must still be rejected at construction, not admitted to later panic
+    /// (slice-out-of-bounds) inside `apply_lora`.
     #[test]
     fn test_new_rejects_a_buffer_shorter_than_rank_times_d_in() {
         let config = LoraConfig {
@@ -881,7 +891,7 @@ mod tests {
             );
         }
 
-        /// Regression for the #972 follow-up finding: a layer whose
+        /// Regression for #972: a layer whose
         /// projection dims exactly match a real Qwen3.5 model's `q_proj`
         /// (the only thing `validate_against` checked before this fix) but
         /// whose `a` buffer is short must be rejected before it can ever
@@ -1052,6 +1062,112 @@ mod tests {
                 )
                 .is_ok(),
                 "the LoraHook trait method must accept an adapter with correct dims"
+            );
+        }
+
+        /// `LoraHook::is_active` must reflect whether this adapter actually
+        /// has a layer for `(layer_idx, module)`, so `apply_lora_rows` can
+        /// skip its per-row loop entirely for projections this adapter
+        /// doesn't touch, instead of paying one no-op virtual call per row.
+        #[test]
+        fn test_lora_hook_trait_is_active_reflects_has_adapter() {
+            use lattice_inference::lora_hook::LoraHook;
+
+            let adapter = make_bert_adapter("query", HIDDEN_SIZE, HIDDEN_SIZE);
+            assert!(
+                LoraHook::is_active(&adapter, 0, "query"),
+                "adapter has a layer for (0, query)"
+            );
+            assert!(
+                !LoraHook::is_active(&adapter, 0, "key"),
+                "adapter has no layer for (0, key)"
+            );
+            assert!(
+                !LoraHook::is_active(&adapter, 5, "query"),
+                "adapter has no layer for (5, query)"
+            );
+        }
+
+        /// A layer with an empty `a` factor but a non-empty `b` factor and
+        /// declared dims that match a real BERT projection's geometry is not
+        /// a valid "untrained placeholder" (that state requires BOTH `a` and
+        /// `b` empty) — it must be rejected at construction rather than
+        /// reaching `apply_lora`, which indexes into `a` assuming it holds
+        /// `rank * d_in` elements.
+        #[test]
+        fn test_new_rejects_empty_a_factor_with_matching_declared_dims() {
+            let rank = 4;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, "query".to_string()),
+                LoraLayer {
+                    a: vec![],
+                    b: vec![0.0; HIDDEN_SIZE * rank],
+                    d_in: HIDDEN_SIZE,
+                    d_out: HIDDEN_SIZE,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["query".to_string()],
+            };
+            let err = LoraAdapter::new(config, layers)
+                .expect_err("an empty A factor with a populated B factor must be rejected");
+            assert!(err.to_string().contains("A buffer length"));
+        }
+
+        /// Mirror of the above for an empty `b` factor with a populated `a`.
+        #[test]
+        fn test_new_rejects_empty_b_factor_with_matching_declared_dims() {
+            let rank = 4;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, "query".to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * HIDDEN_SIZE],
+                    b: vec![],
+                    d_in: HIDDEN_SIZE,
+                    d_out: HIDDEN_SIZE,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["query".to_string()],
+            };
+            let err = LoraAdapter::new(config, layers)
+                .expect_err("an empty B factor with a populated A factor must be rejected");
+            assert!(err.to_string().contains("B buffer length"));
+        }
+
+        /// A layer with BOTH `a` and `b` empty is the legitimate
+        /// untrained-placeholder state (mirrors `save_peft_safetensors`,
+        /// which skips these layers) and must still construct successfully.
+        #[test]
+        fn test_new_accepts_fully_empty_placeholder_layer() {
+            let rank = 4;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, "query".to_string()),
+                LoraLayer {
+                    a: vec![],
+                    b: vec![],
+                    d_in: HIDDEN_SIZE,
+                    d_out: HIDDEN_SIZE,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["query".to_string()],
+            };
+            assert!(
+                LoraAdapter::new(config, layers).is_ok(),
+                "a placeholder layer with both factors empty must still construct"
             );
         }
     }
