@@ -2,9 +2,9 @@
 """Decode-benchmark harness core (issue #813).
 
 `scripts/` grew seven independent implementations of the same
-prompt/decode-benchmark shape (`bench_apples_to_apples.sh`,
-`bench_apples_precise.sh`, `bench_q4_apples.sh`, `bench_context_scaling.sh`,
-`bench_compare_1k.py`, plus two proven-dead scripts tracked separately), each
+prompt/decode-benchmark shape (`legacy apples-to-apples consumer`,
+`legacy precise apples-to-apples consumer`, `legacy Q4 comparison consumer`, `legacy context-scaling consumer`,
+`legacy agentic consumer`, plus two proven-dead scripts tracked separately), each
 owning its own copy of warmup policy, sample-count policy,
 aggregation/confidence-interval method, and output rendering. This module is
 the single place that owns all of that: configuration validation, warmup
@@ -15,13 +15,10 @@ rendering.
 Engine adapters (Lattice, Ollama, MLX) own only invocation and parsing: they
 implement `EngineAdapter.run()`, may surface an engine-native duration as a
 diagnostic field, and MUST NOT choose repeat counts, discard samples, or
-compute verdicts. No adapters ship in this module yet — this lands the
-harness core only ("no public command change", issue #813 step 1). The five
-live scripts above are migrated onto profiles defined in
-`bench_decode_profiles.toml` one script per PR (issue #813 step 2); until
-then `bench_decode_profiles.toml` carries no profile definitions and the
-`run` subcommand below has nothing registered in `ADAPTER_REGISTRY`, so an
-engine request always resolves as "missing" (see `--allow-missing-engine`).
+compute verdicts. Adapter implementations remain isolated in sibling modules;
+the canonical `run --profile` CLI loads the matching module before executing
+the shared schedule. All five consumers are defined in
+`bench_decode_profiles.toml`.
 
 A profile's `engines` list is an ordered set of per-engine run groups, not
 a flat list of names: each entry carries its own warmup schedule
@@ -35,10 +32,10 @@ quantization per engine within one profile.
 A warmup is an explicit pre-window batch: `warmup_repeats` calls at
 `warmup_tokens` completion tokens execute ONCE per engine, entirely before
 that engine's measured windows -- never once per window -- so
-`bench_apples_to_apples.sh`'s single pre-loop 8-token MLX warmup,
-`bench_apples_precise.sh`'s twice-at-N2 warmup for every engine, and
-`bench_context_scaling.sh`'s single pre-loop 4-token MLX warmup are each
-exactly representable, including `bench_compare_1k.py`'s distinct
+`legacy apples-to-apples consumer`'s single pre-loop 8-token MLX warmup,
+`legacy precise apples-to-apples consumer`'s twice-at-N2 warmup for every engine, and
+`legacy context-scaling consumer`'s single pre-loop 4-token MLX warmup are each
+exactly representable, including `legacy agentic consumer`'s distinct
 per-engine warmup prompts via `warmup_prompt` (defaults to `profile.prompt`
 when omitted).
 
@@ -46,7 +43,7 @@ An EARLIER version of this module claimed `windows`/`measured_repeats`
 alone (profile-wide, one call per window, executed uniformly as
 `[w1 x R, w2 x R, ...]` for every engine) were sufficient to represent
 every legacy script's MEASURED schedule. That claim was FALSE:
-`bench_compare_1k.py` has three different measured shapes in one profile
+`legacy agentic consumer` has three different measured shapes in one profile
 -- Lattice runs all 1-token calls then all 100-token calls (window-major,
 which the uniform default does reproduce); Ollama issues exactly ONE
 100-token call per repeat and derives BOTH a window=1 (TTFT) and a
@@ -59,13 +56,13 @@ Each `EngineRunGroup` therefore carries an optional `measured_calls`: an
 ordered tuple of `MeasuredCall(n_tokens, yields_windows)`. When omitted,
 the harness derives the default -- one call per `profile.windows` entry,
 `yields_windows=(window,)` -- which reproduces every uniform-window
-script (`bench_apples_to_apples.sh`, `bench_apples_precise.sh`,
-`bench_q4_apples.sh`, `bench_context_scaling.sh`, and Lattice's half of
-`bench_compare_1k.py`) unchanged. `measured_order` (`"window_major"`,
+script (`legacy apples-to-apples consumer`, `legacy precise apples-to-apples consumer`,
+`legacy Q4 comparison consumer`, `legacy context-scaling consumer`, and Lattice's half of
+`legacy agentic consumer`) unchanged. `measured_order` (`"window_major"`,
 the default, or `"repeat_major"`) controls whether the call plan replays
 as "all repeats of call[0], then all repeats of call[1], ..." or "one
 full pass through the call plan per repeat" -- MLX's alternating
-`bench_compare_1k.py` shape needs `"repeat_major"`. A `MeasuredCall` with
+`legacy agentic consumer` shape needs `"repeat_major"`. A `MeasuredCall` with
 `len(yields_windows) > 1` (Ollama's shape: one 100-token call yielding
 both window=1 and window=100) requires the adapter to report
 `AdapterRunResult.component_ns`, a `{window: elapsed_ns}` map with an
@@ -85,7 +82,7 @@ engine index and the missing/undeclared/duplicate windows.
 A SECOND earlier version of this module additionally assumed the
 MEASURED prompt could stay profile-wide (`profile.prompt`, passed
 verbatim to every engine's measured calls). That assumption was ALSO
-FALSE: `bench_compare_1k.py` requires each engine to receive a DIFFERENT
+FALSE: `legacy agentic consumer` requires each engine to receive a DIFFERENT
 measured prompt for the same nominal context -- Lattice and MLX build a
 tokenizer-padded prompt, Ollama builds a distinct character-count-
 heuristic prompt. `EngineRunGroup.measured_prompt` (mirroring
@@ -109,7 +106,7 @@ figure, a hardware identifier, and a timestamp. Reports render from this raw
 data; they are not the source of truth.
 
 `trimmed_mean` aggregation reports `slope_ci95_legacy`: the pre-existing
-`bench_apples_precise.sh` normal-approximation spread heuristic, carried
+`legacy precise apples-to-apples consumer` normal-approximation spread heuristic, carried
 over unchanged. It is NOT a coverage-valid 95% confidence interval for the
 slope -- statistical-methodology correction is explicitly out of scope for
 issue #813 and is deferred to a separately reviewed follow-up.
@@ -124,6 +121,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -138,6 +136,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+
+sys.modules.setdefault("bench_decode_harness", sys.modules[__name__])
 
 SCHEMA_VERSION = 1
 
@@ -358,7 +358,7 @@ class MeasuredCall:
     observations) this ONE call produces a measured observation for. The
     common case is `len(yields_windows) == 1` (one call -> one
     observation, `yields_windows == (n_tokens,)`) -- every legacy script
-    except `bench_compare_1k.py`'s Ollama adapter fits this shape.
+    except `legacy agentic consumer`'s Ollama adapter fits this shape.
     Ollama's shape is the exception: it issues one `n_tokens=100` call per
     repeat and derives BOTH a window=1 (TTFT) and a window=100 (total)
     observation from that single response's two engine-reported timing
@@ -383,11 +383,11 @@ class EngineRunGroup:
 
     Every legacy script gives each engine its own warmup schedule, its
     own measured call shape, and its own model/quantization identity
-    (`bench_apples_to_apples.sh`: only MLX gets a warmup, once, at 8
-    tokens, before the N1/N2 loop; `bench_apples_precise.sh`: every
+    (`legacy apples-to-apples consumer`: only MLX gets a warmup, once, at 8
+    tokens, before the N1/N2 loop; `legacy precise apples-to-apples consumer`: every
     engine warms twice at N2=512, once before both measured windows;
-    `bench_context_scaling.sh`: MLX warms once at 4 tokens before the
-    baseline/comparison loop; `bench_compare_1k.py`: Ollama and MLX each
+    `legacy context-scaling consumer`: MLX warms once at 4 tokens before the
+    baseline/comparison loop; `legacy agentic consumer`: Ollama and MLX each
     warm at 4 tokens with their own warmup prompt, distinct from the
     measured prompt, AND the three engines' MEASURED shapes differ --
     Lattice is window-major `[1 x R, 100 x R]`, MLX is repeat-major
@@ -413,7 +413,7 @@ class EngineRunGroup:
 
     `measured_prompt`, when given, overrides `profile.prompt` for THIS
     engine's measured calls only -- mirroring `warmup_prompt`'s override
-    of the warmup prompt. `bench_compare_1k.py` needs this: Lattice and
+    of the warmup prompt. `legacy agentic consumer` needs this: Lattice and
     MLX build a tokenizer-padded prompt to reach a target context length,
     while Ollama builds a character-count-heuristic prompt for the SAME
     target -- two different strings for the same nominal context. The
@@ -636,7 +636,7 @@ def _parse_profile(name: str, raw: dict) -> ProfileConfig:
         # explicit measured_calls) replays across profile.measured_repeats
         # -- "window_major" (all repeats of call[0], then call[1], ...) or
         # "repeat_major" (one full pass through the plan per repeat, the
-        # shape MLX's alternating bench_compare_1k.py calls need).
+        # shape MLX's alternating legacy agentic consumer calls need).
         eg_measured_order = eg_raw.get("measured_order", "window_major")
         if not isinstance(eg_measured_order, str) or eg_measured_order not in _MEASURED_ORDER_VALUES:
             raise ProfileConfigError(
@@ -856,11 +856,9 @@ class EngineAdapter(Protocol):
     ) -> AdapterRunResult: ...
 
 
-# Populated by engine-adapter modules landed alongside each script migration
-# (issue #813 step 2). Empty at harness-core landing time by design: no
-# adapter means every profile's engines resolve as "missing" (see
-# `run_profile` / `--allow-missing-engine`), so the CLI never presents a
-# fabricated result for an engine it cannot actually invoke.
+# Populated by the adapter module selected by the canonical profile CLI.
+# Programmatic callers may instead pass their own adapter mapping directly to
+# `run_profile`, as the deterministic tests do.
 ADAPTER_REGISTRY: dict[str, EngineAdapter] = {}
 
 
@@ -930,9 +928,9 @@ def run_profile(
     `warmup_repeats` calls at `warmup_tokens` completion tokens, using
     `warmup_prompt` if given or `profile.prompt` otherwise — executes
     ONCE, entirely before any of that engine's measured calls (never once
-    per window; this is what makes `bench_apples_to_apples.sh`'s single
-    pre-loop MLX warmup, `bench_apples_precise.sh`'s twice-at-N2 warmup,
-    and `bench_context_scaling.sh`'s single pre-loop warmup all exactly
+    per window; this is what makes `legacy apples-to-apples consumer`'s single
+    pre-loop MLX warmup, `legacy precise apples-to-apples consumer`'s twice-at-N2 warmup,
+    and `legacy context-scaling consumer`'s single pre-loop warmup all exactly
     representable).
 
     Measured calls then execute per the group's OWN plan: `group.
@@ -941,7 +939,7 @@ def run_profile(
     `group.measured_order` selects "window_major" (default -- all repeats
     of call[0], then all repeats of call[1], ...) or "repeat_major" (one
     full pass through the call plan per repeat -- MLX's alternating
-    `bench_compare_1k.py` shape). A call with more than one yielded window
+    `legacy agentic consumer` shape). A call with more than one yielded window
     (Ollama's one-call-yields-two-windows shape) produces one Observation
     per yielded window from a SINGLE adapter invocation, using
     `AdapterRunResult.component_ns` for every window's `elapsed_ns` — see
@@ -1128,7 +1126,7 @@ def run_profile(
         # Measured calls: this engine's own plan (default or explicit),
         # replayed window-major or repeat-major per group.measured_order,
         # using this engine's own measured prompt (default: profile.prompt)
-        # -- e.g. bench_compare_1k.py's Lattice/MLX tokenizer-padded prompt
+        # -- e.g. legacy agentic consumer's Lattice/MLX tokenizer-padded prompt
         # vs Ollama's character-count-heuristic prompt for the same
         # nominal context: two different strings, hashed exactly as sent.
         calls = group.measured_calls if group.measured_calls is not None else _default_measured_calls()
@@ -1178,7 +1176,7 @@ class SlopeResult:
     window: int
     slope_tok_per_s: float
     # Legacy normal-approximation heuristic carried over verbatim from
-    # `bench_apples_precise.sh:118-143` (issue #813 explicitly defers
+    # `legacy precise apples-to-apples consumer:118-143` (issue #813 explicitly defers
     # statistical-methodology changes to a separately reviewed follow-up).
     # This is NOT a coverage-valid 95% confidence interval for the slope:
     # it treats the trimmed subset as an ordinary sample, applies a
@@ -1204,8 +1202,8 @@ def _primary_elapsed_seconds(o: Observation) -> float:
     invocation -- for the lattice/ollama subprocess-per-call adapters, that
     includes one subprocess spawn and (for lattice) one model load per
     measured/warmup call, time the legacy per-process-loop scripts
-    (`bench_apples_precise.sh`, `bench_q4_apples.sh`,
-    `bench_context_scaling.sh`) never paid per observation -- they load the
+    (`legacy precise apples-to-apples consumer`, `legacy Q4 comparison consumer`,
+    `legacy context-scaling consumer`) never paid per observation -- they load the
     model once and time only the engine's own reported duration
     (`RESULT total_ms=`/ollama's `total_duration`) for every repeat.
     Aggregating `elapsed_ns` unconditionally would silently make every
@@ -1232,7 +1230,7 @@ def _median_stat(values: list[float]) -> tuple[float, None]:
 def _trimmed_mean_stat(values: list[float], trim: int) -> tuple[float, float]:
     """Trimmed mean + the legacy normal-approximation spread heuristic.
 
-    The second return value is `bench_apples_precise.sh`'s pre-existing
+    The second return value is `legacy precise apples-to-apples consumer`'s pre-existing
     `1.96 * stdev / sqrt(n)` heuristic over the *retained* (trimmed)
     subset, carried over verbatim rather than corrected -- see
     `SlopeResult.slope_ci95_legacy` for why it is not a coverage-valid CI.
@@ -1261,7 +1259,7 @@ def aggregate(run_result: HarnessRunResult) -> list[SlopeResult]:
     elapsed time. `baseline_window` is always `profile.windows[0]`.
 
     `SlopeResult.slope_ci95_legacy`, when the profile uses `trimmed_mean`
-    aggregation, is the pre-existing `bench_apples_precise.sh` spread
+    aggregation, is the pre-existing `legacy precise apples-to-apples consumer` spread
     heuristic propagated through the slope's product/ratio form -- a
     legacy carry-over, not a corrected or coverage-valid CI (issue #813
     defers statistical-methodology changes to a separate review).
@@ -1331,7 +1329,7 @@ def render_report(run_result: HarnessRunResult, slopes: list[SlopeResult]) -> st
         lines.append("  (no measured data)")
         return "\n".join(lines)
     # "legacy ±CI" -- the normal-approximation heuristic carried over from
-    # bench_apples_precise.sh, not a coverage-valid 95% CI. See
+    # legacy precise apples-to-apples consumer, not a coverage-valid 95% CI. See
     # SlopeResult.slope_ci95_legacy.
     lines.append(
         f"  {'engine':<10}{'window':>8}{'slope tok/s':>13}{'legacy ±CI':>11}{'native tok/s':>14}{'n(base/win)':>13}"
@@ -2383,11 +2381,86 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Continue with whatever engine adapters are registered instead of failing on a missing one.",
     )
     run_p.add_argument("--out", type=Path, default=None, help="Write raw observations as JSONL to this path.")
+    run_p.add_argument("--runs", type=int, default=None, help="Override measured repeats for supported profiles.")
+    run_p.add_argument("--ctx", type=int, default=None, help="Agentic profile context depth in tokens.")
+    run_p.add_argument("--contexts", default=None, help="Context-scaling comparison windows, comma-separated.")
+    run_p.add_argument("--sweep", action="store_true", help="Run the agentic profile at 1000/2000/4000 tokens.")
+    run_p.add_argument("--chart-only", action="store_true", help="Regenerate the context-scaling chart only.")
 
     val_p = sub.add_parser("validate", help="Validate a raw-observation JSONL file against the schema.")
     val_p.add_argument("path", type=Path)
 
     return parser
+
+
+_PROFILE_ADAPTER_MODULES = {
+    "apples_to_apples_q8": "bench_decode_adapters_apples_to_apples",
+    "apples_to_apples_q4": "bench_decode_adapters_apples_to_apples",
+    "apples_precise": "bench_decode_adapters_apples_precise",
+    "q4_apples": "bench_decode_adapters_q4_apples",
+    "context_scaling": "bench_decode_adapters_context_scaling",
+    "agentic": "bench_decode_adapters_agentic",
+}
+
+
+def _append_flag(argv: list[str], name: str, value: object | None) -> None:
+    if value is not None:
+        argv.extend((name, str(value)))
+
+
+def _dispatch_special_profile(args: argparse.Namespace, module: object) -> int | None:
+    if args.profile == "agentic":
+        if args.contexts is not None or args.chart_only:
+            raise ProfileConfigError("profile 'agentic' does not accept --contexts or --chart-only")
+        argv: list[str] = []
+        _append_flag(argv, "--ctx", args.ctx)
+        _append_flag(argv, "--runs", args.runs)
+        _append_flag(argv, "--out", args.out)
+        if args.sweep:
+            argv.append("--sweep")
+        if args.allow_missing_engine:
+            argv.append("--allow-missing-engine")
+        return module.main(argv)
+    if args.profile == "context_scaling":
+        if args.ctx is not None or args.sweep:
+            raise ProfileConfigError("profile 'context_scaling' does not accept --ctx or --sweep")
+        argv = []
+        _append_flag(argv, "--contexts", args.contexts)
+        _append_flag(argv, "--runs", args.runs)
+        _append_flag(argv, "--out", args.out)
+        if args.chart_only:
+            argv.append("--chart-only")
+        if args.allow_missing_engine:
+            argv.append("--allow-missing-engine")
+        return module.main(argv)
+    return None
+
+
+def _load_profile_adapters(args: argparse.Namespace) -> int | None:
+    module_name = _PROFILE_ADAPTER_MODULES.get(args.profile)
+    if module_name is None:
+        return None
+    if args.profile in ("agentic", "context_scaling") and args.profiles_file != DEFAULT_PROFILES_FILE:
+        raise ProfileConfigError(f"profile {args.profile!r} does not support --profiles-file")
+    module = importlib.import_module(module_name)
+    special_result = _dispatch_special_profile(args, module)
+    if special_result is not None:
+        return special_result
+    unsupported = (
+        args.ctx is not None
+        or args.contexts is not None
+        or args.sweep
+        or args.chart_only
+        or args.runs is not None
+    )
+    if unsupported:
+        raise ProfileConfigError(f"profile {args.profile!r} does not accept the requested runtime override")
+    ADAPTER_REGISTRY.clear()
+    if args.profile.startswith("apples_to_apples_"):
+        module.register_available_adapters(["run", "--profile", args.profile])
+    else:
+        module.register_available_adapters()
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2416,6 +2489,13 @@ def main(argv: list[str] | None = None) -> int:
             available = ", ".join(sorted(profiles)) or "(none defined yet)"
             print(f"FAIL: unknown profile {args.profile!r}. Available: {available}", file=sys.stderr)
             return 1
+        try:
+            dispatched = _load_profile_adapters(args)
+        except ProfileConfigError as exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
+            return 1
+        if dispatched is not None:
+            return dispatched
         try:
             result = run_profile(profile, ADAPTER_REGISTRY, allow_missing_engine=args.allow_missing_engine)
         except MissingEngineError as exc:

@@ -593,7 +593,7 @@ jobs:
   # Deterministic fake-adapter unit tests + raw-observation schema validation
   # for the decode-benchmark harness core (issue #813 step 1) and every
   # migrated profile's adapter module (issue #813 step 2: apples_to_apples,
-  # apples_precise, q4_apples, context_scaling). Stdlib-only (mlx_lm/ollama
+  # apples_precise, q4_apples, context_scaling, agentic). Stdlib-only (mlx_lm/ollama
   # are never imported by these test files -- adapters are exercised only
   # through pure parsing helpers and the harness's own deterministic fake
   # adapters), no engine binary or model weights required — cheap
@@ -626,6 +626,8 @@ jobs:
         run: python3 tests/test_bench_decode_adapters_q4_apples.py -v
       - name: python3 tests/test_bench_decode_adapters_context_scaling.py
         run: python3 tests/test_bench_decode_adapters_context_scaling.py -v
+      - name: python3 tests/test_bench_decode_adapters_agentic.py
+        run: python3 tests/test_bench_decode_adapters_agentic.py -v
       # bench-compare's Spotlight-exclusion guard. Same "harness plumbing only"
       # scope as the steps above: it asserts the guard's exit codes and the
       # bench-compare.sh call site, and runs no benchmark.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Engine adapters + wrapper CLI for the `context_scaling` profile (issue
-#813 step 2: migrate `bench_context_scaling.sh`, keeping its chart
+"""Engine adapters + profile hooks for the `context_scaling` profile (issue
+#813 step 2: migrate `legacy context-scaling consumer`, keeping its chart
 renderer, `scripts/bench_context_scaling_chart.py`, unchanged).
 
 This module does more than exec `bench_decode_harness.main()` (unlike the
@@ -16,10 +16,9 @@ own (`render_report`/`aggregate` produce the harness's own report and raw
 JSONL, not a chart-compatible TSV).
 
 Run with (from repo root): `uv run --quiet --with mlx-lm python3
-scripts/bench_decode_adapters_context_scaling.py [--contexts 64,128,256]
-[--runs 5] [--chart-only] [--allow-missing-engine]` -- or via the thin shell
-wrapper `scripts/bench_context_scaling.sh`, which forwards
-`CONTEXTS`/`RUNS`/`CHART_ONLY` exactly as the legacy script did.
+scripts/bench_decode_harness.py run --profile context_scaling
+[--contexts 64,128,256] [--runs 5] [--chart-only]
+[--allow-missing-engine]`.
 """
 
 from __future__ import annotations
@@ -162,7 +161,7 @@ _REQUIRED_OLLAMA_FIELDS = ("eval_count", "eval_duration", "total_duration")
 
 
 def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
-    """Mirrors `bench_context_scaling.sh`'s `ollama_median()`: its median is
+    """Mirrors `legacy context-scaling consumer`'s `ollama_median()`: its median is
     over `total_duration/1e6` (ms) values -- the SAME primary field as the
     apples_to_apples/apples_precise adapters, just pre-divided by run count
     in the legacy shell function. `eval_count`/`eval_duration` are not used
@@ -226,7 +225,7 @@ def ollama_available(base_url: str = OLLAMA_BASE_URL, *, model_tag: str = OLLAMA
     server reachable. Unlike the legacy script's `command -v ollama &&
     curl ... | python3 -c "..."` one-liner, this does not attempt to start a
     down server (the legacy context-scaling script's own preflight is a pure
-    check, not a start-if-down like bench_apples_to_apples.sh's)."""
+    check, not a start-if-down like legacy apples-to-apples consumer's)."""
     if shutil.which("ollama") is None:
         return False
     try:
@@ -246,7 +245,7 @@ def ollama_available(base_url: str = OLLAMA_BASE_URL, *, model_tag: str = OLLAMA
 
 
 class MlxAdapter:
-    """Invokes `mlx_lm`, mirroring `bench_context_scaling.sh`'s MLX heredoc:
+    """Invokes `mlx_lm`, mirroring `legacy context-scaling consumer`'s MLX heredoc:
     load `Qwen/Qwen3.5-0.8B` from the Hub directly (the legacy heredoc never
     tries the local dir first, unlike the other three scripts), quantize to
     8 bits, one 4-token warmup (the profile's `warmup_repeats=1`/
@@ -322,13 +321,13 @@ def register_available_adapters() -> None:
 
 class ContextsConfigError(ValueError):
     """`--contexts` (or the `CONTEXTS` env var, forwarded verbatim by
-    `scripts/bench_context_scaling.sh`) failed validation."""
+    `the legacy context-scaling command`) failed validation."""
 
 
 def parse_contexts(raw: str, baseline_window: int) -> tuple[int, ...]:
     """Parse `--contexts` into an ORDERED tuple of context lengths,
     preserving the caller's order -- never sorted. `origin/main:scripts/
-    bench_context_scaling.sh`'s `read -ra CONTEXTS_ARR <<< "$CONTEXTS"`
+    legacy context-scaling consumer`'s `read -ra CONTEXTS_ARR <<< "$CONTEXTS"`
     keeps whatever order the caller gave (`CONTEXTS="256 64"` runs 256
     before 64); sorting silently changes run order and thermal/order
     exposure across the sweep (issue #813 codex round-1 finding 2a).
@@ -364,15 +363,15 @@ def parse_contexts(raw: str, baseline_window: int) -> tuple[int, ...]:
 
 
 def _legacy_ordered_median(values: list[float], engine: str) -> float:
-    """Reproduce `bench_context_scaling.sh`'s exact per-engine median
+    """Reproduce `legacy context-scaling consumer`'s exact per-engine median
     tie-break for an EVEN sample count (issue #813 codex round-1 finding
     2b). The legacy `lattice_median`/`ollama_median` shell helpers sort
     ascending and take the 1-indexed position `(n+1)/2` (bash integer
-    division) -- `origin/main:scripts/bench_context_scaling.sh:65-69,83` --
+    division) -- `origin/main:the legacy context-scaling command:65-69,83` --
     which is the exact middle value for odd `n` and the LOWER of the two
     middle values for even `n`. The MLX heredoc instead does
     `sorted(values)[len(values)//2]` (0-indexed) --
-    `origin/main:scripts/bench_context_scaling.sh:164` -- identical to the
+    `origin/main:the legacy context-scaling command:164` -- identical to the
     lattice/ollama rule for odd `n`, but the UPPER middle value for even
     `n`. `statistics.median()` would instead AVERAGE the two middle values
     for even `n`, silently changing every engine's rendered

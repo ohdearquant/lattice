@@ -62,7 +62,8 @@ ax.set_axisbelow(True)
 
 fig.text(0.5, 0.015,
          "Qwen3.5-0.8B (873M, hybrid GatedDeltaNet + GQA) · greedy · median of 5 runs · 2026-05-16\n"
-         "Reproduce: ./scripts/bench_apples_to_apples.sh   |   Note: Apple's MLX (Metal-native) "
+         "Reproduce: bench_decode_harness.py run --profile apples_to_apples_q8"
+         "   |   Note: Apple's MLX (Metal-native) "
          "decodes faster; see README for the full table & methodology.",
          ha="center", fontsize=8.2, color="#64748B")
 
