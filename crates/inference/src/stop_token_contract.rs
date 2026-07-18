@@ -30,18 +30,17 @@
 //! |---|---|---|
 //! | 1 | `Qwen35Model::generate` (f32) | this file |
 //! | 2 | `Qwen35Model::generate_streaming` (f32) | this file |
-//! | 3 | `Qwen35Model::generate_with_batch_prefill` | this file |
-//! | 4 | `forward::cpu_f16::generate_f16` | this file |
-//! | 5 | `forward::cpu_q8::generate_q8` | this file |
-//! | 6 | `forward::neon_forward::generate_q8_neon` | this file |
-//! | 7 | Metal `generate` (plain, no MTP/self-spec) | `forward::metal_qwen35::inner::tests` |
-//! | 8 | Metal `generate` with `LATTICE_MTP=1` | `forward::metal_qwen35::inner::tests` + `mtp_greedy_round_tests` |
-//! | 9 | Metal `generate` with `LATTICE_SELF_SPEC=1` | `forward::metal_qwen35::inner::tests` + `self_spec_eos_tests` |
-//! | 10 | Metal `generate_streaming` | `forward::metal_qwen35::inner::tests` |
-//! | 11 | Metal `generate_streaming_with_prefix_cache` | `forward::metal_qwen35::inner::tests` |
-//! | 12 | Metal `generate_multimodal` | `forward::metal_qwen35::inner::tests` |
+//! | 3 | `forward::cpu_f16::generate_f16` | this file |
+//! | 4 | `forward::cpu_q8::generate_q8` | this file |
+//! | 5 | `forward::neon_forward::generate_q8_neon` | this file |
+//! | 6 | Metal `generate` (plain, no MTP/self-spec) | `forward::metal_qwen35::inner::tests` |
+//! | 7 | Metal `generate` with `LATTICE_MTP=1` | `forward::metal_qwen35::inner::tests` + `mtp_greedy_round_tests` |
+//! | 8 | Metal `generate` with `LATTICE_SELF_SPEC=1` | `forward::metal_qwen35::inner::tests` + `self_spec_eos_tests` |
+//! | 9 | Metal `generate_streaming` | `forward::metal_qwen35::inner::tests` |
+//! | 10 | Metal `generate_streaming_with_prefix_cache` | `forward::metal_qwen35::inner::tests` |
+//! | 11 | Metal `generate_multimodal` | `forward::metal_qwen35::inner::tests` |
 //!
-//! Entry 12 (`generate_multimodal`) has its own independent sampling loop —
+//! Entry 11 (`generate_multimodal`) has its own independent sampling loop —
 //! it does not call `generate`/`generate_streaming` internally — and was
 //! missing from this manifest until the PR #632 review flagged it as
 //! an unguarded sibling-invocation path (#613's own warning pattern). Its
@@ -50,7 +49,7 @@
 //! autoregressive decode loop), so no production change was needed here —
 //! only manifest + test coverage.
 //!
-//! The Metal-family tests (7-11) live inside `metal_qwen35.rs`'s existing
+//! The Metal-family tests (6-11) live inside `metal_qwen35.rs`'s existing
 //! `mod tests` rather than here because its GPU test fixtures
 //! (`tiny_hybrid_fixture`, `minimal_bpe_tokenizer`, `with_self_spec_env`) are
 //! private to that module and already proven correct by dozens of existing
@@ -82,7 +81,7 @@
 //! `generated_tokens == 0`, `token_ids` and `text` empty, `stopped == true`,
 //! `stop_reason == Some(StopReason::Eos)`.
 //!
-//! Most of the paths tested here (1-6) were already EXCLUDE before this
+//! Most of the paths tested here (1-5) were already EXCLUDE before this
 //! session's fix — they regression-lock behaviour that was already correct.
 //! The two paths whose logic changed (MTP, self-spec) are unit-tested at the
 //! decision-function level in `metal_qwen35.rs`'s `mtp_greedy_round_tests`
@@ -255,16 +254,6 @@ mod tests {
             "generate_streaming must not emit an on_token callback for an \
              excluded stop token, got {deltas:?}"
         );
-    }
-
-    #[test]
-    #[allow(deprecated)] // exercises the deprecated path itself during its deprecation window (issue #807)
-    fn qwen35_model_generate_with_batch_prefill_excludes_stop_token() {
-        let model = zero_layer_qwen35_model();
-        let out = model
-            .generate_with_batch_prefill("h", &stop_gen_cfg())
-            .expect("generate_with_batch_prefill must succeed");
-        assert_excludes_stop_token(&out, "Qwen35Model::generate_with_batch_prefill");
     }
 
     #[test]

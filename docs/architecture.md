@@ -321,6 +321,7 @@ local safetensors directory -> Qwen35Model::from_safetensors
   -> required tensor validation (validate_required_tensor_names)
   -> load_weights                                    (model/qwen35/loading.rs)
   -> BpeTokenizer::from_tokenizer_json                (tokenizer.json)
+  -> Qwen35Model::generate / generate_streaming       (model/qwen35/generation.rs)
   -> Tokenizer::tokenize(prompt)                      (tokenizer/common.rs)
   -> prefill_tokens_batched_for_generate              (forward/batch_prefill.rs)
        -> prefill_prompt                              (forward/batch_prefill.rs)
@@ -340,11 +341,6 @@ single batched `prefill_prompt` pass over the whole prompt (PR #680) and returns
 prompt position's logits. Both then sample the first token with `sample_token`, and enter a
 decode loop that calls the single-token `forward_step` (`model/qwen35/forward.rs`) and
 `sample_token` once per generated token.
-
-Note: `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`) is a separate,
-**deprecated** (since 0.5.1, issue #807) standalone decode loop that predates the delegation
-above — it calls the same batched-prefill core directly but is not the canonical entry point.
-New callers should use `Qwen35Model::generate` / `generate_streaming`.
 
 Note: the tokenizer trait method is `tokenize`, not `encode` — `encode` is a method on the
 separate `QwenModel` embedding path (`model/qwen.rs`), not on the `Tokenizer` trait used here.

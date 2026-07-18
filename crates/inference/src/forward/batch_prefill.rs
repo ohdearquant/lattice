@@ -1,18 +1,10 @@
-//! Batched prompt prefill for Qwen3.5 hybrid attention.
+//! Shared batched prompt-prefill core for Qwen3.5 hybrid attention.
 //!
-//! This file is written to be included as a child module of `qwen35_model.rs`
-//! (for example `mod batch_prefill;` near the bottom of that file), because the
-//! provided ground-truth implementation keeps several model internals private.
-//! If you instead wire it from `lib.rs`, the same code works after promoting the
-//! touched internals to `pub(crate)`.
-//!
-//! This module's `Qwen35Model::prefill_tokens_batched_for_generate` batched-prefill
-//! core is what the canonical `Qwen35Model::generate` / `generate_streaming`
-//! (`crates/inference/src/model/qwen35/generation.rs`) delegate their own prefill phase
-//! to (PR #680). [`Qwen35Model::generate_with_batch_prefill`] predates that delegation:
-//! it is a standalone, now-redundant decode loop built directly on the same core and is
-//! **deprecated** as of 0.5.1 (issue #807) — new callers should use the canonical
-//! `generate` / `generate_streaming` methods instead.
+//! The canonical [`Qwen35Model::generate`] and [`Qwen35Model::generate_streaming`]
+//! methods delegate their prompt phase to
+//! [`Qwen35Model::prefill_tokens_batched_for_generate`]. The core advances the
+//! full-attention KV cache and GatedDeltaNet recurrent states for the whole prompt
+//! before returning the final prompt position's logits.
 //!
 //! LoRA adapters are applied per-token in all projection steps, matching the
 //! decode path. Each `matmul_bt` over the `[seq_len, dim]` batch is followed by
@@ -27,13 +19,9 @@ use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, ForwardScratch,
-    FullAttentionLayerWeights, KvCache, Qwen35Model, check_grammar_not_set, check_logprobs_not_set,
-    check_reasoning_budget_not_set, check_stop_strings_not_set, decode_tokens, qwen35_rms_norm,
-    resize, sample_token, should_stop_token,
+    FullAttentionLayerWeights, KvCache, Qwen35Model, qwen35_rms_norm, resize,
 };
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
-use crate::stop_reason::StopReason;
-use crate::tokenizer::common::Tokenizer;
+use crate::model::qwen35_config::Qwen35Config;
 
 /// Scratch buffers reused across batched prompt prefill.
 ///
@@ -361,200 +349,6 @@ impl Qwen35Model {
             &mut scratch,
             self.lora.as_ref(),
         )
-    }
-
-    /// **Unstable**: batched prefill generate.
-    ///
-    /// A standalone generate body that uses `prefill_prompt()` for the prompt
-    /// phase and then falls back to the existing single-token decode loop.
-    ///
-    /// This method predates the canonical [`Qwen35Model::generate`] /
-    /// [`Qwen35Model::generate_streaming`] delegating their own prefill phase to
-    /// `Self::prefill_tokens_batched_for_generate` (the same batched-prefill core
-    /// this method calls internally, see `crates/inference/src/model/qwen35/generation.rs`
-    /// around line 153). That delegation, wired in PR #680, made this method's
-    /// independent decode loop redundant; it has no production caller (issue #807).
-    #[deprecated(
-        since = "0.5.1",
-        note = "generate_with_batch_prefill is repository-dead and duplicates the canonical \
-                Qwen3.5 decode loop (Qwen35Model::generate / generate_streaming, which already \
-                delegate their prefill phase to the same batched-prefill core this method calls). \
-                Migrate to Qwen35Model::generate / generate_streaming. \
-                Scheduled for removal in 0.6.0."
-    )]
-    #[allow(dead_code)] // TODO(#1958): roadmap — remove in 0.6.0 (tracked by issue #807's follow-up removal PR)
-    pub fn generate_with_batch_prefill(
-        &self,
-        prompt: &str,
-        gen_cfg: &GenerateConfig,
-    ) -> Result<GenerateOutput, InferenceError> {
-        let cfg = &self.config;
-
-        if cfg.is_moe() {
-            return Err(InferenceError::UnsupportedModel(
-                "MoE batch prefill is not yet implemented".into(),
-            ));
-        }
-
-        // Initialize RNG.
-        let mut rng_state = match gen_cfg.seed {
-            Some(s) => {
-                if s == 0 {
-                    1
-                } else {
-                    s
-                }
-            }
-            None => {
-                use std::time::SystemTime;
-                let t = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0x12345678_9abcdef0);
-                if t == 0 { 1 } else { t }
-            }
-        };
-
-        // Tokenize prompt.
-        let input = self.tokenizer.tokenize(prompt);
-        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-        let prompt_len = prompt_ids.len();
-
-        if prompt_len == 0 {
-            return Err(InferenceError::Inference("empty prompt".into()));
-        }
-
-        // max_new_tokens == 0 means "generate nothing": return before sampling so
-        // we never emit a token the caller did not ask for. Mirrors the guard in
-        // Qwen35Model::generate (crates/inference/src/model/qwen35/generation.rs).
-        if gen_cfg.max_new_tokens == 0 {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: false,
-                stop_reason: Some(StopReason::Length),
-                token_logprobs: vec![],
-            });
-        }
-
-        // Grammar-constrained decoding is not wired into the batch-prefill path; reject
-        // grammar configs before any sampling to avoid silently producing unconstrained
-        // output when a caller sets gen_cfg.grammar (#397/#398).
-        check_grammar_not_set(gen_cfg)?;
-        // Same rationale for logprobs capture, which is also not wired into this
-        // generate loop (#585).
-        check_logprobs_not_set(gen_cfg)?;
-        // Same rationale for stop_strings matching and reasoning-budget forcing,
-        // neither of which is wired into this generate loop (ADR-080 C3, #783).
-        check_stop_strings_not_set(gen_cfg)?;
-        check_reasoning_budget_not_set(gen_cfg)?;
-        // Context preflight. apply_partial_rope indexes the precomputed cos/sin table
-        // without bounds checks, so a position at or past max_context() is an out-of-bounds
-        // slice access — a release panic, not a clean error. Mirror the same total-token
-        // policy as generate() and the HTTP server: prompt_len + max_new_tokens <= max_context.
-        let max_context = self.max_context();
-        if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
-            return Err(InferenceError::Inference(format!(
-                "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
-                 model context window ({max_context})",
-                gen_cfg.max_new_tokens
-            )));
-        }
-
-        // Initialize states.
-        let num_linear = cfg.num_linear_attention_layers();
-        let num_full = cfg.num_full_attention_layers();
-        let mut gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
-            .map(|_| GatedDeltaNetState::new(cfg))
-            .collect();
-        let mut kv_cache = KvCache::new(num_full);
-
-        // Pre-reserve KV storage for prompt prefill.
-        let kv_dim = cfg.full_kv_dim();
-        for i in 0..num_full {
-            kv_cache.k[i].reserve(prompt_len * kv_dim);
-            kv_cache.v[i].reserve(prompt_len * kv_dim);
-        }
-
-        let mut scratch = PrefillScratch::new(cfg);
-
-        let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
-        let mut all_ids = prompt_ids.clone();
-
-        let logits = self.prefill_prompt(
-            &prompt_ids,
-            &mut gdn_states,
-            &mut kv_cache,
-            &mut scratch,
-            self.lora.as_ref(),
-        )?;
-
-        // Sample from the final prefill logits.
-        let next_id = sample_token(&logits[..cfg.vocab_size], gen_cfg, &all_ids, &mut rng_state);
-
-        if should_stop_token(cfg, gen_cfg, next_id) {
-            return Ok(GenerateOutput {
-                text: String::new(),
-                token_ids: vec![],
-                prompt_tokens: prompt_len,
-                generated_tokens: 0,
-                stopped: true,
-                stop_reason: Some(StopReason::Eos),
-                token_logprobs: vec![],
-            });
-        }
-
-        generated_ids.push(next_id);
-        all_ids.push(next_id);
-
-        let mut stopped = false;
-        let mut stop_reason = StopReason::Length;
-        // Autoregressive decode is unchanged.
-        for _ in 1..gen_cfg.max_new_tokens {
-            let pos = kv_cache.seq_len;
-            let last_token = *all_ids
-                .last()
-                .expect("invariant: prompt or previous sample populated all_ids");
-
-            self.forward_step(
-                last_token,
-                pos,
-                &mut gdn_states,
-                &mut kv_cache,
-                &mut scratch.decode_scratch,
-            );
-            kv_cache.seq_len += 1;
-
-            let next_id = sample_token(
-                &scratch.decode_scratch.logits[..cfg.vocab_size],
-                gen_cfg,
-                &all_ids,
-                &mut rng_state,
-            );
-
-            if should_stop_token(cfg, gen_cfg, next_id) {
-                stopped = true;
-                stop_reason = StopReason::Eos;
-                break;
-            }
-
-            generated_ids.push(next_id);
-            all_ids.push(next_id);
-        }
-
-        let text = decode_tokens(&self.tokenizer, &generated_ids);
-
-        Ok(GenerateOutput {
-            text,
-            token_ids: generated_ids.clone(),
-            prompt_tokens: prompt_len,
-            generated_tokens: generated_ids.len(),
-            stopped,
-            stop_reason: Some(stop_reason),
-            token_logprobs: vec![],
-        })
     }
 
     /// Run one full-attention layer over the whole prompt at once.
@@ -1223,7 +1017,6 @@ fn softplus_prefill(x: f32) -> f32 {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // exercises generate_with_batch_prefill itself during its deprecation window (issue #807)
 mod tests {
     use super::*;
     use crate::lora_hook::LoraHook;
@@ -1302,47 +1095,21 @@ mod tests {
         cfg.shared_expert_intermediate_size = Some(32);
         assert!(cfg.is_moe());
 
+        let mut gdn_states: Vec<GatedDeltaNetState> = (0..cfg.num_linear_attention_layers())
+            .map(|_| GatedDeltaNetState::new(&cfg))
+            .collect();
+        let mut kv_cache = KvCache::new(cfg.num_full_attention_layers());
         let model = build_random_model(cfg, 0xfeed_face_cafe_beef);
         let err = model
-            .generate_with_batch_prefill("hello", &GenerateConfig::default())
+            .prefill_tokens_batched_for_generate(&[1], &mut gdn_states, &mut kv_cache)
             .expect_err("MoE batch prefill should return UnsupportedModel");
 
         assert!(
             matches!(err, InferenceError::UnsupportedModel(msg) if msg == "MoE batch prefill is not yet implemented")
         );
-    }
-
-    // ── Issue #403 preflight regression test ───────────────────────────────────
-    //
-    // Mutation contract: removing the `if prompt_len.saturating_add(gen_cfg.max_new_tokens)
-    // > max_context` guard added for #403 lets this test run a forward pass. Without the
-    // guard the call fails either by returning Ok — when generation stops before the RoPE
-    // boundary, tripping the `expect_err` below — or by an out-of-bounds RoPE panic if
-    // decode reaches the boundary. Either outcome changes the test result from PASS to FAIL.
-
-    #[test]
-    fn test_generate_with_batch_prefill_rejects_over_context_request() {
-        // Mutation contract: deleting the context preflight added for #403 makes this
-        // test fail either by returning Ok (generation stops before the RoPE boundary,
-        // so the `expect_err` below trips) or by an out-of-bounds RoPE panic if decode
-        // reaches the boundary. Either outcome changes the test result from PASS to FAIL.
-        let cfg = tiny_test_config();
-        let model = build_random_model(cfg, 0xC0D0_0403);
-        let max_context = model.max_context(); // 1024 from tiny_test_config()
-
-        // Single-token prompt ("a") plus max_new_tokens that overflows the window.
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: max_context, // 1 + 1024 = 1025 > 1024
-            ..GenerateConfig::default()
-        };
-        let err = model
-            .generate_with_batch_prefill("a", &gen_cfg)
-            .expect_err("prompt_len + max_new_tokens > max_context must return Err, not panic");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("context window") && msg.contains(&format!("{max_context}")),
-            "error must name the context window limit; got: {msg}"
-        );
+        assert_eq!(kv_cache.seq_len, 0);
+        assert!(kv_cache.k.iter().all(Vec::is_empty));
+        assert!(kv_cache.v.iter().all(Vec::is_empty));
     }
 
     /// A non-trivial LoRA hook that adds a fixed delta to a specific (layer, module) pair.
@@ -1882,158 +1649,6 @@ mod tests {
         (x >> 32) as u32
     }
 
-    /// Build a zero-layer Qwen35Model for generate_with_batch_prefill unit tests.
-    ///
-    /// All-zero embed_tokens → logits all 0 → greedy picks token 0.
-    /// eos_token_id=96 (vocab-1) so token 0 is NOT eos, making stop_token_ids=[0]
-    /// detectable as a distinct stop path.
-    fn zero_layer_batch_prefill_fixture() -> Qwen35Model {
-        let cfg = make_test_config(64, 128, 97, 0);
-        // make_test_config sets eos_token_id = vocab_size-1 = 96 ≠ 0 ✓
-
-        let rope_dim = cfg.rope_dim();
-        let rope_max = cfg.max_position_embeddings.min(8192);
-        let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
-
-        Qwen35Model {
-            config: cfg.clone(),
-            weights: ModelWeights {
-                // All zeros → logits all 0 → greedy always picks token 0.
-                embed_tokens: vec![0.0f32; cfg.vocab_size * cfg.hidden_size],
-                lm_head: None,
-                final_norm: vec![0.0f32; cfg.hidden_size],
-                layers: vec![],
-            },
-            tokenizer: dummy_tokenizer(),
-            rope,
-            lora: Box::new(crate::lora_hook::NoopLoraHook),
-        }
-    }
-
-    /// Build a 0-layer model where the greedy sequence is: token 1 → 2 → 3 (stop).
-    ///
-    /// embed_tokens uses standard basis vectors: embed[i][i] = 1.0 for i in 1..4 so
-    /// that each token lives in its own orthogonal direction. embed[0] and embed[4..]
-    /// are all zeros.
-    ///
-    /// lm_head is untied (ModelWeights::lm_head = Some(...)). It is a forward-shift
-    /// by one index in the basis:
-    ///   row 2 has col-1 = 1.0  → logit[2] wins from the embed[1] direction
-    ///   row 3 has col-2 = 1.0  → logit[3] wins from the embed[2] direction
-    ///
-    /// Greedy sequence from prompt "a" (→ token 1, eos_token_id=6):
-    ///   post-prefill: RMSNorm(embed[1]) = [0, 4, 0, …] → logit[2] = 4 wins → token 2
-    ///   decode step 1: RMSNorm(embed[2]) = [0, 0, 4, …] → logit[3] = 4 wins → stop(3)
-    fn rotation_model_fixture() -> Qwen35Model {
-        let cfg = make_test_config(16, 16, 7, 0);
-        let rope_dim = cfg.rope_dim();
-        let rope_max = cfg.max_position_embeddings.min(8192);
-        let rope = RopeTable::new(rope_dim, rope_max, cfg.rope_theta);
-        let hidden = cfg.hidden_size; // 16
-        let vocab = cfg.vocab_size; // 7
-
-        // Standard basis: each active token lives in its own orthogonal dimension.
-        let mut embed = vec![0.0f32; vocab * hidden];
-        embed[hidden + 1] = 1.0; // token 1 → e_1
-        embed[2 * hidden + 2] = 1.0; // token 2 → e_2
-        embed[3 * hidden + 3] = 1.0; // token 3 → e_3 (stop)
-
-        // Forward-shift lm_head: e_1 direction wins token 2; e_2 direction wins token 3.
-        // With RMSNorm(gamma=0), hidden = 4 * e_i for token i (inv_rms = 4.0 at hidden=16).
-        let mut lm_head = vec![0.0f32; vocab * hidden];
-        lm_head[2 * hidden + 1] = 1.0; // logit[2] = 4 * 1 = 4 from token 1
-        lm_head[3 * hidden + 2] = 1.0; // logit[3] = 4 * 1 = 4 from token 2
-
-        Qwen35Model {
-            config: cfg.clone(),
-            weights: ModelWeights {
-                embed_tokens: embed,
-                lm_head: Some(lm_head),
-                final_norm: vec![0.0f32; hidden],
-                layers: vec![],
-            },
-            tokenizer: dummy_tokenizer(),
-            rope,
-            lora: Box::new(crate::lora_hook::NoopLoraHook),
-        }
-    }
-
-    /// `generate_with_batch_prefill` must stop on a token in `stop_token_ids`
-    /// even when that token differs from `eos_token_id`.
-    ///
-    /// Setup: all-zero weights → greedy sampling always picks token 0.
-    /// Config has eos_token_id=96 (not 0) and stop_token_ids=[0].
-    /// With the fix the first sampled token (0) hits the stop list and the
-    /// function returns 0 generated tokens.
-    ///
-    /// Mutation check: reverting `should_stop_token` back to
-    /// `next_id == cfg.eos_token_id` in either check causes `0 == 96` to be false,
-    /// so token 0 is pushed to output and `generated_tokens` becomes ≥ 1.
-    #[test]
-    fn test_generate_with_batch_prefill_honors_stop_token_ids() {
-        let model = zero_layer_batch_prefill_fixture();
-
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 4,
-            stop_token_ids: vec![0], // token 0 is the stop signal, NOT eos (96)
-            temperature: 0.0,        // greedy: all-zero logits always yield token 0
-            ..Default::default()
-        };
-
-        let out = model
-            .generate_with_batch_prefill("a", &gen_cfg)
-            .expect("generate_with_batch_prefill must succeed with valid stop_token_ids");
-
-        assert_eq!(
-            out.generated_tokens, 0,
-            "generate_with_batch_prefill must stop immediately when the first \
-             greedy token (0) is in stop_token_ids — got {} generated tokens instead",
-            out.generated_tokens
-        );
-    }
-
-    /// `generate_with_batch_prefill` must also stop when the stop token first
-    /// appears in the **decode loop**, not only at the post-prefill check.
-    ///
-    /// Fixture: rotation_model_fixture(). Greedy sequence from prompt "a" (token 1):
-    ///   post-prefill  → token 2  (not stop=3)
-    ///   decode step 1 → token 3  (stop) → decode-loop fires
-    ///
-    /// Mutation proof: reverting ONLY the decode-loop `should_stop_token` check
-    /// (line 444 at time of writing) to `next_id == cfg.eos_token_id` leaves
-    /// token 3 uncaught (3 ≠ eos=6), the sequence continues, and generated_tokens
-    /// becomes ≥ 2 — failing the assertion below.
-    #[test]
-    fn test_generate_with_batch_prefill_honors_stop_token_ids_decode_loop() {
-        let model = rotation_model_fixture();
-
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 10,
-            stop_token_ids: vec![3], // stop on token 3 mid-decode-loop; eos_token_id=6≠3
-            temperature: 0.0,        // greedy: deterministic forward-shift sequence
-            ..Default::default()
-        };
-
-        // Prompt "a" → token 1.
-        // Post-prefill generates token 2 (not stop).
-        // Decode step 1 generates token 3 → decode-loop stop fires.
-        let out = model
-            .generate_with_batch_prefill("a", &gen_cfg)
-            .expect("generate_with_batch_prefill must succeed");
-
-        assert_eq!(
-            out.generated_tokens, 1,
-            "generate_with_batch_prefill must stop at decode-loop step 1 when token 3 \
-             is in stop_token_ids — got {} tokens; reverting only the decode-loop check \
-             lets token 3 through and produces ≥ 2 tokens",
-            out.generated_tokens
-        );
-        assert!(
-            out.stopped,
-            "generate_with_batch_prefill must set stopped=true when the decode-loop stop fires"
-        );
-    }
-
     /// Minimal byte-level BPE tokenizer parsed from a string — no temp file, no
     /// cross-test races.
     fn dummy_tokenizer() -> BpeTokenizer {
@@ -2060,134 +1675,6 @@ mod tests {
   }
 }"#;
         BpeTokenizer::from_tokenizer_json_str(json).expect("test tokenizer parses")
-    }
-
-    /// `generate_with_batch_prefill` must reject a `GenerateConfig` that sets `grammar`
-    /// with a typed `InvalidInput` error before sampling any token (#397/#398).
-    ///
-    /// Before the fix, grammar was silently ignored and unconstrained output was produced.
-    /// The guard fires before any weight access or state allocation, so a real (tiny) model
-    /// with valid weights is sufficient — the guard short-circuits before the prefill call.
-    ///
-    /// Mutation sensitivity: removing `check_grammar_not_set` causes the function to proceed
-    /// through the full prefill + decode path with the tiny weights, returning `Ok(...)`.
-    /// The `matches!(result, Err(InferenceError::InvalidInput(_)))` assert then fails.
-    #[test]
-    fn generate_with_batch_prefill_rejects_grammar_config_before_sampling() {
-        use crate::error::InferenceError;
-        use crate::grammar::{GrammarEngine, GrammarSpec};
-        use std::sync::Arc;
-
-        let cfg = tiny_test_config();
-        let model = build_random_model(cfg, 0x1234_5678_abcd_ef01);
-
-        let spec = GrammarSpec::Gbnf("root ::= \"a\" | \"b\"\n".to_string());
-        let grammar_vocab = vec![b"a".to_vec(), b"b".to_vec()];
-        let engine =
-            GrammarEngine::new(&spec, grammar_vocab).expect("trivial grammar must compile");
-
-        let gen_cfg = GenerateConfig {
-            grammar: Some(Arc::new(engine)),
-            ..Default::default()
-        };
-
-        let result = model.generate_with_batch_prefill("a b c", &gen_cfg);
-        assert!(
-            matches!(result, Err(InferenceError::InvalidInput(_))),
-            "generate_with_batch_prefill must fail closed with InvalidInput when grammar is \
-             set (#397/#398); got {result:?}"
-        );
-    }
-
-    /// `generate_with_batch_prefill` must reject a `GenerateConfig` that sets
-    /// `stop_strings` with a typed `InvalidInput` error before sampling any token
-    /// (ADR-080 C3, #783).
-    ///
-    /// Mutation sensitivity: removing `check_stop_strings_not_set` causes the
-    /// function to proceed through the full prefill + decode path with the tiny
-    /// weights, returning `Ok(...)`. The `matches!` assert then fails.
-    #[test]
-    fn generate_with_batch_prefill_rejects_stop_strings_config_before_sampling() {
-        use crate::error::InferenceError;
-
-        let cfg = tiny_test_config();
-        let model = build_random_model(cfg, 0x1234_5678_abcd_ef01);
-
-        let gen_cfg = GenerateConfig {
-            stop_strings: vec!["</s>".to_string()],
-            ..Default::default()
-        };
-
-        let result = model.generate_with_batch_prefill("a b c", &gen_cfg);
-        assert!(
-            matches!(result, Err(InferenceError::InvalidInput(_))),
-            "generate_with_batch_prefill must fail closed with InvalidInput when \
-             stop_strings is set (ADR-080 C3, #783); got {result:?}"
-        );
-    }
-
-    /// `generate_with_batch_prefill` must reject a `GenerateConfig` that sets
-    /// `reasoning_budget` with a typed `InvalidInput` error before sampling any
-    /// token (ADR-080 C3, #783).
-    ///
-    /// Mutation sensitivity: removing `check_reasoning_budget_not_set` causes the
-    /// function to proceed through the full prefill + decode path with the tiny
-    /// weights, returning `Ok(...)`. The `matches!` assert then fails.
-    #[test]
-    fn generate_with_batch_prefill_rejects_reasoning_budget_config_before_sampling() {
-        use crate::error::InferenceError;
-
-        let cfg = tiny_test_config();
-        let model = build_random_model(cfg, 0x1234_5678_abcd_ef01);
-
-        let gen_cfg = GenerateConfig {
-            reasoning_budget: Some(16),
-            ..Default::default()
-        };
-
-        let result = model.generate_with_batch_prefill("a b c", &gen_cfg);
-        assert!(
-            matches!(result, Err(InferenceError::InvalidInput(_))),
-            "generate_with_batch_prefill must fail closed with InvalidInput when \
-             reasoning_budget is set (ADR-080 C3, #783); got {result:?}"
-        );
-    }
-
-    /// `generate_with_batch_prefill` with `max_new_tokens == 0` must return zero
-    /// generated tokens without running prefill or sampling anything (#612, 3rd
-    /// recurrence of the #226/#456 bug class).
-    ///
-    /// Mutation sensitivity: removing the `max_new_tokens == 0` early return
-    /// causes the function to run `prefill_prompt` and sample one token from the
-    /// final logits, so `generated_tokens` becomes 1 instead of 0 and the
-    /// assertion below fails.
-    #[test]
-    fn generate_with_batch_prefill_max_new_tokens_zero_returns_empty() {
-        let cfg = tiny_test_config();
-        let model = build_random_model(cfg, 0x1234_5678_abcd_ef01);
-
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: 0,
-            ..Default::default()
-        };
-
-        let out = model
-            .generate_with_batch_prefill("a b c", &gen_cfg)
-            .expect("max_new_tokens=0 must succeed, not error");
-
-        assert_eq!(
-            out.generated_tokens, 0,
-            "max_new_tokens=0 must produce zero generated tokens"
-        );
-        assert!(
-            out.token_ids.is_empty(),
-            "max_new_tokens=0 must produce an empty token list"
-        );
-        assert_eq!(
-            out.stop_reason,
-            Some(StopReason::Length),
-            "max_new_tokens=0 must report stop_reason=Length"
-        );
     }
 
     /// ADR-080 C1 (#780): RED before the fix, `running_sum.max(f32::MIN_POSITIVE)`
