@@ -364,6 +364,15 @@ pub fn convert_quarot_qwen35(
     // happens, so the footguns cannot fire — callers may legitimately
     // dry-run against an existing populated output location or a
     // placeholder that happens to equal the input directory.
+    //
+    // This check is not the security boundary by itself: it is a plain path-based stat, re-resolved
+    // fresh and far in time from the directory fd this function actually
+    // writes through (acquired much later, right before the write loop,
+    // via `dir_fd_is_nonempty` below re-validating ON THE FD). A refused
+    // conversion (bad config, non-power-of-2 hidden size, MoE, or a
+    // forward-equivalence tolerance miss) must leave `output_dir`
+    // untouched, so the directory cannot be created until every one of
+    // those checks has already passed.
     if !opts.dry_run {
         validate_output_dir_layout(input_dir, output_dir)?;
     }
@@ -472,10 +481,16 @@ pub fn convert_quarot_qwen35(
         },
     )?;
 
-    // Opened once, right after creation, and held for every write below:
-    // binding the whole write session to one fd means an ancestor or
-    // output-dir swap after this point cannot redirect any later write,
-    // unlike re-joining and reopening `output_dir` by path for each file.
+    // The directory fd is acquired here — right before the write loop,
+    // with `dir_fd_is_nonempty` validating it immediately, back-to-back,
+    // with no intervening work — and held for every write below. The
+    // early `validate_output_dir_layout` call above is not the security
+    // boundary by itself (a path resolved there is not the path this
+    // `openat` resolves); the
+    // real security boundary is this fd plus the check on it: once held,
+    // nothing downstream may re-resolve `output_dir` as a path again, and
+    // `dir_fd_is_nonempty` proves — on the fd itself, not by re-reading
+    // the path — that nothing was planted between `mkdir` and `open`.
     let output_dir_fd = if !opts.dry_run {
         fs::create_dir_all(output_dir).map_err(|e| {
             InferenceError::Inference(format!(
@@ -483,12 +498,20 @@ pub fn convert_quarot_qwen35(
                 output_dir.display()
             ))
         })?;
-        Some(open_dir_nofollow(output_dir).map_err(|e| {
+        let fd = open_dir_nofollow(output_dir).map_err(|e| {
             InferenceError::Inference(format!(
                 "convert_quarot_qwen35: failed to open output directory {}: {e}",
                 output_dir.display()
             ))
-        })?)
+        })?;
+        if dir_fd_is_nonempty(fd.as_raw_fd())? {
+            return Err(InferenceError::Inference(format!(
+                "convert_quarot_qwen35: output directory {} became non-empty between \
+                 creation and opening its directory fd; refusing to write into it",
+                output_dir.display()
+            )));
+        }
+        Some(fd)
     } else {
         None
     };
@@ -715,6 +738,60 @@ fn validate_output_dir_layout(input_dir: &Path, output_dir: &Path) -> Result<(),
         )));
     }
     Ok(())
+}
+
+/// Whether the directory bound to `dirfd` contains any entry other than `.`
+/// / `..`, checked by scanning the fd itself (`fdopendir`/`readdir`) rather
+/// than re-reading the directory by path — the fd is the only thing an
+/// attacker cannot redirect once it is held.
+fn dir_fd_is_nonempty(dirfd: std::os::fd::RawFd) -> Result<bool, InferenceError> {
+    // SAFETY: `dirfd` is a valid, open, borrowed-for-this-call directory fd.
+    // `dup` returns either a new fd (>= 0, independent lifetime from
+    // `dirfd`) or -1 with errno set, checked immediately below.
+    let dup_fd = unsafe { libc::dup(dirfd) };
+    if dup_fd < 0 {
+        return Err(InferenceError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `dup_fd` was just returned by `libc::dup` above, checked
+    // non-negative. `fdopendir` takes ownership of it on success; on
+    // failure `dup_fd` is still open and closed explicitly below.
+    let dirp = unsafe { libc::fdopendir(dup_fd) };
+    if dirp.is_null() {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: `dup_fd` is still owned by us (fdopendir failed to take
+        // it) and open.
+        unsafe {
+            libc::close(dup_fd);
+        }
+        return Err(InferenceError::Io(err));
+    }
+    let mut found_entry = false;
+    loop {
+        // SAFETY: `dirp` is a valid, non-null `DIR*` for the duration of
+        // this loop, owned by this function and not shared with any other
+        // thread. `readdir` returns either a pointer into storage owned by
+        // `dirp` (valid until the next `readdir`/`closedir` call on `dirp`)
+        // or null at end-of-stream or on error; either null case is
+        // treated the same way here (stop scanning).
+        let entry = unsafe { libc::readdir(dirp) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `entry` was just checked non-null above and points at a
+        // `dirent` owned by `dirp`, valid for this statement's duration.
+        // `d_name` is NUL-terminated per the `readdir` contract.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            found_entry = true;
+            break;
+        }
+    }
+    // SAFETY: `dirp` was returned non-null by `fdopendir` above and has not
+    // been closed anywhere else.
+    unsafe {
+        libc::closedir(dirp);
+    }
+    Ok(found_entry)
 }
 
 fn sanitize_tensor_name(name: &str) -> String {
@@ -1235,7 +1312,7 @@ mod tests {
         // writes happen much later — after loading every tensor and running
         // the forward-equivalence gate — so a concurrent actor has a wide
         // window to plant a symlink at a fixed output filename pointing at
-        // an external victim file. Mutation-sensitive: reverting
+        // an external victim file. reverting
         // `create_output_file` to a plain `fs::File::create` makes this
         // test fail — the victim file would be truncated instead of the
         // open being refused.
@@ -1257,6 +1334,87 @@ mod tests {
             b"do-not-touch",
             "victim file reached through the planted symlink must be untouched"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dir_fd_is_nonempty_detects_content_planted_between_mkdir_and_open() {
+        // `convert_quarot_qwen35` treats a freshly `mkdir`'d output
+        // directory as safe to write into only after this check confirms,
+        // by scanning the fd itself, that nothing was planted in the gap
+        // between `create_dir_all` and `open_dir_nofollow` (a race, or a
+        // plain-directory substitution that `O_NOFOLLOW` alone does not
+        // reject). Reverting the check to unconditionally report "empty"
+        // makes this test fail — planted content in the directory the fd
+        // is bound to would go undetected and the write session would
+        // proceed into it.
+        let tmp = tempfile::tempdir().unwrap();
+        let empty_dir = tmp.path().join("empty");
+        fs::create_dir(&empty_dir).unwrap();
+        let fd = open_dir_nofollow(&empty_dir).unwrap();
+        assert!(!dir_fd_is_nonempty(fd.as_raw_fd()).unwrap());
+
+        let planted_dir = tmp.path().join("planted");
+        fs::create_dir(&planted_dir).unwrap();
+        fs::write(planted_dir.join("attacker.txt"), b"evil").unwrap();
+        let fd2 = open_dir_nofollow(&planted_dir).unwrap();
+        assert!(dir_fd_is_nonempty(fd2.as_raw_fd()).unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn convert_quarot_qwen35_output_dir_fd_survives_a_mid_run_directory_swap() {
+        // Every write goes through the ONE directory fd opened for this run
+        // — never a re-resolved `output_dir` path. A concurrent actor that
+        // replaces `output` with a fresh real directory (passing
+        // `O_NOFOLLOW`, which only rejects a symlink) after that fd was
+        // opened must not redirect any subsequent write into the
+        // substitute. A background thread swaps `output` for a fresh
+        // directory shortly after the run starts; artifacts must only ever
+        // appear in the directory whose fd was live at the moment each
+        // write happened — never in whatever directory currently occupies
+        // the `output` path.
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 1);
+        fs::create_dir(&output).unwrap();
+
+        let moved_aside = tmp.path().join("output_original");
+        let output_for_thread = output.clone();
+        let moved_aside_for_thread = moved_aside.clone();
+        let swapper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::fs::rename(&output_for_thread, &moved_aside_for_thread).unwrap();
+            std::fs::create_dir(&output_for_thread).unwrap();
+        });
+
+        let report = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xC0FFEE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        swapper.join().unwrap();
+
+        assert_eq!(
+            fs::read_dir(&output).unwrap().count(),
+            0,
+            "the directory now occupying the original output path must receive no artifacts"
+        );
+        assert!(
+            moved_aside.join("quantize_index.json").exists(),
+            "artifacts must land in the directory whose fd was bound at run start, \
+             wherever it now lives, not whatever directory currently sits at the \
+             output path"
+        );
+        assert!(report.planned_quantized > 0);
     }
 
     #[test]
@@ -1403,7 +1561,7 @@ mod tests {
     /// planned tensor's rotated axis) must be rejected identically in
     /// dry-run and the real run.
     ///
-    /// Mutation-sensitive: re-gating `quantize_f64_to_q4` behind `if
+    /// re-gating `quantize_f64_to_q4` behind `if
     /// !opts.dry_run` (the pre-fix state) makes the `dry_run: true`
     /// iteration of this test pass silently through validation, diverging
     /// from the `dry_run: false` iteration's `Err`.

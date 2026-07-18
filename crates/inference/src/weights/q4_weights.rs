@@ -1342,7 +1342,7 @@ mod tests {
         // that was open at session start, regardless of what the path
         // currently resolves to.
         //
-        // Mutation-sensitive: reverting `create_file_at` to
+        // reverting `create_file_at` to
         // `create_output_file(&dir_path.join(filename))` (path-based) makes
         // this test fail — the write would land in the attacker's
         // substituted directory instead of the original.
@@ -1402,7 +1402,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Non-constant-block scale underflow.
     //
-    // Mutation-sensitive: with the `value != 0.0 && encoded == 0.0` guard
+    // with the `value != 0.0 && encoded == 0.0` guard
     // removed from `encode_finite_q4_metadata`, the first test below would
     // instead succeed and silently collapse every dequantized value in the
     // block to the bias.
@@ -1438,7 +1438,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // Constant-block BIAS underflow (two-sided with scale).
     //
-    // Mutation-sensitive: reverting the two-sided guard to gate only
+    // reverting the two-sided guard to gate only
     // `Q4MetadataField::Scale` makes
     // `constant_block_with_underflowing_bias_is_rejected` fail — the block's
     // scale=1.0 never underflows, so only the new bias-side check catches
@@ -1473,7 +1473,7 @@ mod tests {
     // scale reaching exact zero here previously passed through as a
     // "genuinely zero" field and silently zeroed the whole block.
     //
-    // Mutation-sensitive: reverting the `s == 0.0` checks in
+    // reverting the `s == 0.0` checks in
     // `quantize_block_with_mode_len` makes both tests below fail (the calls
     // succeed with a corrupted all-zero block instead of erroring).
     // -----------------------------------------------------------------------
@@ -2016,7 +2016,7 @@ mod tests {
 
     #[test]
     fn quantize_f32_to_q4_partial_block_uses_real_tail_min_max() {
-        // Mutation-sensitive: a tail block of [5, 6, 7] zero-padded to 32
+        // a tail block of [5, 6, 7] zero-padded to 32
         // slots would (pre-fix) fold min/max over the padded zeros too,
         // yielding min=0/max=7 instead of the real min=5/max=7. This test
         // fails if the asymmetric path reverts to computing stats over the
@@ -2170,7 +2170,7 @@ mod tests {
     // Exercises the full composition: absorb_rotations (offline rotation
     // absorption) → quantize_f64_to_q4 → dequantize_q4_to_f32 → matmul,
     // and asserts correctness against an independent f64 reference that
-    // manually mirrors each step. Mutation-sensitive: perturbing the rotation
+    // manually mirrors each step. Perturbing the rotation
     // dispatch (pipeline.rs:226-230), absorption helpers (rotation.rs:161-164
     // or rotation.rs:184-192), Q4 symmetric scale (q4_weights.rs:277 or :280),
     // or Q4 symmetric mode flag (q4_weights.rs:523) must cause failure.
@@ -2827,7 +2827,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Non-finite input guard — mutation-sensitive tests
+    // Non-finite input guard tests
     //
     // IEEE-754: `NaN > x` and `NaN < x` are always false, so a plain
     // `f32::max` / `f32::min` fold over a block that contains NaN silently

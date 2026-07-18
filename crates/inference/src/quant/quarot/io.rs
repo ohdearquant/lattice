@@ -584,6 +584,14 @@ impl Backing {
 #[derive(Debug)]
 pub struct QuarotTensorReader {
     backing: Backing,
+    /// The model-directory fd opened once at [`QuarotTensorReader::open`]
+    /// and held for the reader's lifetime. [`QuarotTensorReader::read_file`]
+    /// resolves every name against this fd — a caller that already went
+    /// through `open()` to validate the checkpoint must never reopen the
+    /// model directory by path afterward to read a sibling file (e.g.
+    /// `config.json`): that second path resolution is a fresh TOCTOU window
+    /// an ancestor swap between the two opens can exploit.
+    root_fd: std::os::fd::OwnedFd,
 }
 
 impl QuarotTensorReader {
@@ -622,6 +630,7 @@ impl QuarotTensorReader {
                 let shard = Shard::open(file, &model_dir.join("model.safetensors"))?;
                 Ok(Self {
                     backing: Backing::Single { shard },
+                    root_fd,
                 })
             }
             Err(InferenceError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -651,6 +660,7 @@ impl QuarotTensorReader {
                         weight_map: index.weight_map,
                         shards,
                     },
+                    root_fd,
                 })
             }
             Err(e) => Err(InferenceError::InvalidSafetensors(format!(
@@ -658,6 +668,24 @@ impl QuarotTensorReader {
                 model_dir.join("model.safetensors").display()
             ))),
         }
+    }
+
+    /// Read `name` (a plain file name, no separators — e.g. `config.json`)
+    /// from the model directory this reader was opened against, via
+    /// `openat` against the held `root_fd`.
+    ///
+    /// A caller that has already validated the checkpoint through
+    /// [`QuarotTensorReader::open`] must read any other file from the same
+    /// model directory (such as `config.json`) through this method rather
+    /// than reopening the directory by path — a fresh path resolution is a
+    /// new TOCTOU window an ancestor swap between the two opens can use to
+    /// substitute a different directory for the second read.
+    pub fn read_file(&self, name: &str) -> Result<Vec<u8>, InferenceError> {
+        use std::io::Read;
+        let mut file = openat_file_nofollow(self.root_fd.as_raw_fd(), std::ffi::OsStr::new(name))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).map_err(InferenceError::Io)?;
+        Ok(buf)
     }
 
     /// All readable supported tensor names.
@@ -807,6 +835,7 @@ fn decode_bytes_to_f64(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::fs::File;
     use std::io::Write;
 
@@ -941,6 +970,43 @@ mod tests {
         for (g, &v) in got.iter().zip(values.iter()) {
             assert_eq!(*g, v as f64);
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_file_uses_the_fd_open_already_bound_not_a_fresh_path_resolution() {
+        // A caller that reads a sibling file (e.g. `config.json`) after
+        // `open()` has already validated the checkpoint must never
+        // re-resolve the model directory by path to do it — that second
+        // resolution is a fresh window an ancestor swap between the two
+        // opens can use to substitute a different directory's file.
+        // `read_file` instead resolves `name` against the same `root_fd`
+        // `open()` already holds. Swap the model directory for a different
+        // one (same path, fresh content) after `open()` returns, then
+        // confirm `read_file` still reaches the ORIGINAL directory's file,
+        // not the substituted one.
+        let dir = tempfile::tempdir().unwrap();
+        let model_dir = dir.path().join("model");
+        fs::create_dir(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), b"REAL-CONFIG").unwrap();
+        write_safetensors(
+            &model_dir.join("model.safetensors"),
+            &[("w", FixtureDType::F32, vec![1], &[1.0])],
+        );
+
+        let reader = QuarotTensorReader::open(&model_dir).unwrap();
+
+        let moved_aside = dir.path().join("model_moved_aside");
+        fs::rename(&model_dir, &moved_aside).unwrap();
+        fs::create_dir(&model_dir).unwrap();
+        fs::write(model_dir.join("config.json"), b"FAKE-CONFIG").unwrap();
+
+        let bytes = reader.read_file("config.json").unwrap();
+        assert_eq!(
+            bytes, b"REAL-CONFIG",
+            "read_file must reach the directory validated at open(), not \
+             whatever directory currently occupies the model_dir path"
+        );
     }
 
     #[test]
@@ -1079,7 +1145,7 @@ mod tests {
     // after `QuarotTensorReader::open`'s initial `open_dir_nofollow` cannot
     // redirect any later read.
     //
-    // Mutation-sensitive: with `open_manifest_entry` bypassed (shard
+    // with `open_manifest_entry` bypassed (shard
     // resolution reverted to a bare `model_dir.join(shard_file)` reopened by
     // path), every test below would instead succeed in reading the escaped
     // tensor's real contents from outside the model directory.
@@ -1090,7 +1156,7 @@ mod tests {
     fn shard_entry_rejects_a_symlinked_final_component() {
         // A symlink planted at the shard's final path component — standing
         // in for a swap that lands between the initial `open_dir_nofollow`
-        // and the later per-shard `openat`. Mutation-sensitive: dropping
+        // and the later per-shard `openat`. dropping
         // `O_NOFOLLOW` from `openat_file_nofollow` makes this test fail —
         // the open would succeed and follow the symlink.
         let root = tempfile::tempdir().unwrap();
@@ -1121,7 +1187,7 @@ mod tests {
         // symlink to a directory outside model_root. `O_NOFOLLOW` only
         // protects the *final* path component in a plain `open`, so this
         // guards the hop-by-hop `openat_dir_nofollow` walk specifically.
-        // Mutation-sensitive: dropping `O_NOFOLLOW` from
+        // dropping `O_NOFOLLOW` from
         // `openat_dir_nofollow` makes this test fail — the walk would
         // follow the symlink into the outside directory and read the
         // escaped tensor.

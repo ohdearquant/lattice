@@ -16,9 +16,9 @@
 use lattice_inference::quant::quarot::QuarotTensorReader;
 use lattice_inference::quant::quarot::convert::encode_f16_payload;
 use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, q4_file_bytes, quantize_f32_to_q4};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -209,42 +209,6 @@ fn open_dir_nofollow(dir: &Path) -> Result<OwnedFd, Box<dyn std::error::Error>> 
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// Read `name` (a plain file name) from the directory bound to `dirfd` via
-/// `openat(..., O_NOFOLLOW)`, never a path-based `fs::read`. `fs::read`
-/// follows a symlink at the final path component; a hostile or
-/// concurrently-swapped model directory could plant one at `config.json`
-/// pointing at an arbitrary readable file, which `fs::read` would then copy
-/// into the output directory.
-fn read_file_at_nofollow(dirfd: RawFd, name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let cname = CString::new(name)
-        .map_err(|e| format!("file name {name} contains an interior NUL byte: {e}"))?;
-    // SAFETY: `dirfd` is a valid open directory fd borrowed for the
-    // duration of this call; `cname` is a valid NUL-terminated C string.
-    // `openat` returns either a valid fd (>= 0) or -1 with errno set,
-    // checked immediately below.
-    let raw = unsafe {
-        libc::openat(
-            dirfd,
-            cname.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if raw < 0 {
-        return Err(format!(
-            "failed to open {name} (O_NOFOLLOW): {}",
-            std::io::Error::last_os_error()
-        )
-        .into());
-    }
-    // SAFETY: `raw` was just returned by `libc::openat` above, checked
-    // non-negative, and is not owned or closed anywhere else.
-    let mut file = unsafe { fs::File::from(OwnedFd::from_raw_fd(raw)) };
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
-        .map_err(|e| format!("failed to read {name}: {e}"))?;
-    Ok(buf)
-}
-
 /// Publish directory for a conversion run: a fresh temp dir on success (`dry_run`
 /// leaves `output_dir` itself as the target, since nothing is ever written), or
 /// `output_dir` directly when there is nothing to atomically publish.
@@ -264,6 +228,15 @@ struct TempPublishDir {
     /// directory that was actually created, not wherever the staging path
     /// resolves to at write time. `None` for dry runs (nothing is staged).
     dir_fd: Option<OwnedFd>,
+    /// Directory fd for `temp`'s parent (== `output_dir`'s parent — both are
+    /// created as direct children of it), opened once alongside `dir_fd`.
+    /// [`TempPublishDir::publish`] and `Drop` use this, together with the
+    /// bare file-name components, to reach both the temp dir and the final
+    /// `output_dir` name via `renameat`/`unlinkat` rather than re-resolving
+    /// either as a full path — an ancestor of `output_dir`'s parent being
+    /// swapped after this fd is opened cannot redirect the eventual publish
+    /// or cleanup. `None` for dry runs.
+    parent_fd: Option<OwnedFd>,
     output_dir: PathBuf,
 }
 
@@ -280,6 +253,7 @@ impl TempPublishDir {
             return Ok(Self {
                 temp: None,
                 dir_fd: None,
+                parent_fd: None,
                 output_dir: output_dir.to_path_buf(),
             });
         }
@@ -325,10 +299,12 @@ impl TempPublishDir {
             )
         })?;
         let dir_fd = open_dir_nofollow(&temp_dir)?;
+        let parent_fd = open_dir_nofollow(parent)?;
 
         Ok(Self {
             temp: Some(temp_dir),
             dir_fd: Some(dir_fd),
+            parent_fd: Some(parent_fd),
             output_dir: output_dir.to_path_buf(),
         })
     }
@@ -430,16 +406,24 @@ impl TempPublishDir {
             )
             .into());
         }
-        // `fs::rename` below is necessarily path-based (POSIX has no
-        // "rename this fd" call) — but `dir_fd` was bound to the inode
-        // `mkdir` actually created, so it is the one piece of ground truth
-        // an attacker cannot redirect. Compare it against a fresh stat of
-        // `temp_dir` immediately before the rename: if the path was swapped
-        // for a different directory (a plain directory substitution passes
-        // `O_NOFOLLOW`, which only rejects a symlink) between the last
-        // write and this call, the inode numbers diverge and the rename is
-        // refused instead of publishing the attacker's substituted
-        // directory as `output_dir`.
+        let parent_fd = self.parent_fd.as_ref().ok_or_else(|| {
+            format!(
+                "staging directory {} has no open parent directory fd to publish through",
+                temp_dir.display()
+            )
+        })?;
+        let temp_name = file_name_cstring(&temp_dir)?;
+        let output_name = file_name_cstring(&self.output_dir)?;
+
+        // `dir_fd` was bound to the inode `mkdir` actually created, so it is
+        // the one piece of ground truth an attacker cannot redirect. Compare
+        // it against a fresh `fstatat` of the CURRENT entry named
+        // `temp_name` inside `parent_fd` (never a full-path re-resolution):
+        // if that name now refers to a different directory (a plain
+        // directory substitution passes `O_NOFOLLOW`, which only rejects a
+        // symlink) between the last write and this call, the inode numbers
+        // diverge and the publish is refused instead of renaming the
+        // attacker's substituted directory into place.
         let mut fd_stat: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `dir_fd` is a valid open fd for the lifetime of `self`;
         // `fd_stat` is a valid, fully-initialized (zeroed) `libc::stat` the
@@ -453,78 +437,243 @@ impl TempPublishDir {
             )
             .into());
         }
-        let path_meta = fs::symlink_metadata(&temp_dir).map_err(|e| {
+        let entry_stat = fstatat_nofollow(parent_fd.as_raw_fd(), &temp_name).map_err(|e| {
             format!(
-                "failed to stat staging directory {} before publish: {e}",
+                "failed to stat staging directory entry {} before publish: {e}",
                 temp_dir.display()
             )
         })?;
-        use std::os::unix::fs::MetadataExt;
-        if path_meta.dev() != fd_stat.st_dev as u64 || path_meta.ino() != fd_stat.st_ino {
+        if entry_stat.st_dev != fd_stat.st_dev || entry_stat.st_ino != fd_stat.st_ino {
             return Err(format!(
                 "staging directory {} was replaced before publish (inode mismatch: \
-                 held fd is dev={} ino={}, path now resolves to dev={} ino={}); \
+                 held fd is dev={} ino={}, entry now resolves to dev={} ino={}); \
                  refusing to publish a substituted directory",
                 temp_dir.display(),
                 fd_stat.st_dev,
                 fd_stat.st_ino,
-                path_meta.dev(),
-                path_meta.ino(),
+                entry_stat.st_dev,
+                entry_stat.st_ino,
             )
             .into());
         }
-        fs::rename(&temp_dir, &self.output_dir).map_err(|e| {
-            format!(
-                "failed to publish {} to {}: {e}",
-                temp_dir.display(),
-                self.output_dir.display()
+        // `renameat` anchors BOTH the source and destination name to
+        // `parent_fd`, which is bound to the inode `create()` opened — an
+        // ancestor of that parent being swapped after this fd was opened
+        // cannot redirect either resolution, unlike `fs::rename` on
+        // reconstructed full paths.
+        //
+        // SAFETY: `parent_fd` is a valid open fd held for the lifetime of
+        // `self`; `temp_name`/`output_name` are valid NUL-terminated C
+        // strings owned for the duration of this call. `renameat` returns 0
+        // on success or -1 with errno set, checked immediately below.
+        if unsafe {
+            libc::renameat(
+                parent_fd.as_raw_fd(),
+                temp_name.as_ptr(),
+                parent_fd.as_raw_fd(),
+                output_name.as_ptr(),
             )
-        })?;
+        } != 0
+        {
+            return Err(format!(
+                "failed to publish {} to {}: {}",
+                temp_dir.display(),
+                self.output_dir.display(),
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
         self.temp = None;
         self.dir_fd = None;
+        self.parent_fd = None;
         Ok(())
     }
 }
 
+/// Extract the final path component of `path` as an owned `CString`, for use
+/// with `openat`/`renameat`/`unlinkat`-family calls against a held directory
+/// fd. Purely in-memory string manipulation — never touches the filesystem,
+/// so it does not re-resolve any part of `path`.
+fn file_name_cstring(path: &Path) -> Result<CString, Box<dyn std::error::Error>> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("path {} has no file name", path.display()))?;
+    CString::new(name.as_bytes())
+        .map_err(|e| format!("file name {name:?} contains an interior NUL byte: {e}").into())
+}
+
+/// `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)` — stat the entry named `name`
+/// inside the directory bound to `dirfd`, without following a symlink and
+/// without re-resolving any path component above `dirfd`.
+fn fstatat_nofollow(dirfd: RawFd, name: &CString) -> std::io::Result<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dirfd` is a valid open directory fd borrowed for the
+    // duration of this call; `name` is a valid NUL-terminated C string;
+    // `st` is a valid, fully-initialized (zeroed) `libc::stat` the kernel
+    // writes into. `fstatat` returns 0 on success or -1 with errno set,
+    // checked immediately below.
+    let rc = unsafe { libc::fstatat(dirfd, name.as_ptr(), &raw mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(st)
+}
+
+/// Recursively delete everything bound to `dirfd`, never re-resolving a
+/// path: each descent opens a child via `openat(dirfd, name,
+/// O_DIRECTORY|O_NOFOLLOW)` and each removal is `unlinkat(dirfd, name, ...)`
+/// against the fd of its ACTUAL parent, so there is no pathname an attacker
+/// can substitute between the scan and the removal.
+fn remove_dir_all_at(dirfd: RawFd) -> std::io::Result<()> {
+    // SAFETY: `dirfd` is a valid, open, borrowed-for-this-call directory fd.
+    // `dup` returns either a new independent fd (>= 0) or -1 with errno
+    // set, checked immediately below.
+    let dup_fd = unsafe { libc::dup(dirfd) };
+    if dup_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `dup_fd` was just returned by `libc::dup` above, checked
+    // non-negative. `fdopendir` takes ownership of it on success; on
+    // failure `dup_fd` is still open and is closed explicitly below.
+    let dirp = unsafe { libc::fdopendir(dup_fd) };
+    if dirp.is_null() {
+        let err = std::io::Error::last_os_error();
+        // SAFETY: `dup_fd` is still owned by us — `fdopendir` failed to
+        // take it — and open.
+        unsafe {
+            libc::close(dup_fd);
+        }
+        return Err(err);
+    }
+    let result = (|| -> std::io::Result<()> {
+        loop {
+            // SAFETY: `dirp` is a valid, non-null `DIR*` for the duration
+            // of this loop, owned solely by this function. `readdir`
+            // returns either a pointer into storage owned by `dirp` (valid
+            // until the next `readdir`/`closedir` call on `dirp`) or null
+            // at end-of-stream or on error; either null case stops the
+            // scan here.
+            let entry = unsafe { libc::readdir(dirp) };
+            if entry.is_null() {
+                return Ok(());
+            }
+            // SAFETY: `entry` was just checked non-null and points at a
+            // `dirent` owned by `dirp`, valid for this statement's
+            // duration. `d_name` is NUL-terminated per the `readdir`
+            // contract.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                continue;
+            }
+            // SAFETY: `entry` is valid for this statement's duration, as
+            // above.
+            let d_type = unsafe { (*entry).d_type };
+            let is_dir = if d_type == libc::DT_DIR {
+                true
+            } else if d_type == libc::DT_UNKNOWN {
+                fstatat_nofollow(dirfd, &name.to_owned())
+                    .map(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            if is_dir {
+                // SAFETY: `dirfd` is a valid open directory fd borrowed for
+                // the duration of this call; `name` is a valid
+                // NUL-terminated C string from `readdir` above. `openat`
+                // returns either a valid fd (>= 0) or -1 with errno set,
+                // checked immediately below.
+                let raw = unsafe {
+                    libc::openat(
+                        dirfd,
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if raw < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: `raw` was just returned by `libc::openat` above,
+                // checked non-negative, and is not owned or closed
+                // anywhere else.
+                let child_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+                remove_dir_all_at(child_fd.as_raw_fd())?;
+                // SAFETY: `dirfd` is valid for the duration of this call;
+                // `name` is a valid NUL-terminated C string.
+                if unsafe { libc::unlinkat(dirfd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            } else {
+                // SAFETY: `dirfd` is valid for the duration of this call;
+                // `name` is a valid NUL-terminated C string.
+                if unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) } != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
+    })();
+    // SAFETY: `dirp` was returned non-null by `fdopendir` above and has not
+    // been closed anywhere else.
+    unsafe {
+        libc::closedir(dirp);
+    }
+    result
+}
+
 impl Drop for TempPublishDir {
-    /// Recursively deletes `temp_dir` only after proving, via the fd `mkdir`
-    /// bound at creation, that the path still resolves to the same inode
-    /// this run actually created. `fs::remove_dir_all` is necessarily
-    /// path-based (POSIX has no "delete relative to this fd" call for a
-    /// whole subtree), so without this check an attacker who replaces
-    /// `temp_dir` with a directory or symlink after the last write (a
-    /// failed conversion, a panic mid-run) makes a bare `remove_dir_all`
-    /// recursively delete a directory this process never created. On
-    /// identity mismatch, the staging directory is deliberately leaked
-    /// rather than deleted — reported to stderr for manual cleanup.
+    /// Deletes the staging directory entirely through the fds `create()`
+    /// bound: contents are walked and unlinked via [`remove_dir_all_at`]
+    /// against `dir_fd` (bound to the inode `mkdir` actually created), then
+    /// the now-empty directory entry itself is removed via
+    /// `unlinkat(parent_fd, name, AT_REMOVEDIR)` — bound to `parent_fd`,
+    /// never a re-resolved full path. `AT_REMOVEDIR` only succeeds against
+    /// an empty directory, so even if the entry named `temp_dir`'s file name
+    /// was substituted for something else between the last write and this
+    /// call, the worst case is a failed (or no-op) removal, never a
+    /// recursive delete of attacker-supplied content: nothing this
+    /// function deletes is ever reached by re-resolving `temp_dir` as a
+    /// path.
     fn drop(&mut self) {
         let Some(temp_dir) = self.temp.take() else {
             return;
         };
-        let identity_confirmed = self.dir_fd.as_ref().is_some_and(|dir_fd| {
-            let mut fd_stat: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: `dir_fd` is a valid open fd held for the lifetime of
-            // `self`; `fd_stat` is a valid, fully-initialized (zeroed)
-            // `libc::stat`. `fstat` returns 0 on success or -1 with errno
-            // set, checked immediately below.
-            if unsafe { libc::fstat(dir_fd.as_raw_fd(), &raw mut fd_stat) } != 0 {
-                return false;
-            }
-            let Ok(path_meta) = fs::symlink_metadata(&temp_dir) else {
-                return false;
-            };
-            use std::os::unix::fs::MetadataExt;
-            path_meta.dev() == fd_stat.st_dev as u64 && path_meta.ino() == fd_stat.st_ino
-        });
-        if identity_confirmed {
-            let _ = fs::remove_dir_all(&temp_dir);
-        } else {
+        let (Some(dir_fd), Some(parent_fd)) = (self.dir_fd.take(), self.parent_fd.take()) else {
+            return;
+        };
+        if let Err(e) = remove_dir_all_at(dir_fd.as_raw_fd()) {
             eprintln!(
-                "quantize_q4: staging directory {} was replaced before cleanup \
-                 could run (inode identity check failed); leaving it in place \
-                 instead of recursively deleting a directory this run may not \
-                 have created — remove it manually if it is safe to do so",
+                "quantize_q4: failed to clean up contents of staging directory {} \
+                 (fd-relative walk): {e} — remove it manually if it is safe to do so",
                 temp_dir.display()
+            );
+            return;
+        }
+        drop(dir_fd);
+        let Ok(temp_name) = file_name_cstring(&temp_dir) else {
+            eprintln!(
+                "quantize_q4: staging directory {} has no file name; \
+                 its contents were removed but the directory entry itself \
+                 was left in place — remove it manually if it is safe to do so",
+                temp_dir.display()
+            );
+            return;
+        };
+        // SAFETY: `parent_fd` is a valid open fd owned by this call;
+        // `temp_name` is a valid NUL-terminated C string.
+        if unsafe {
+            libc::unlinkat(
+                parent_fd.as_raw_fd(),
+                temp_name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            eprintln!(
+                "quantize_q4: staging directory {} contents were removed but the \
+                 directory entry itself could not be (entry was substituted or \
+                 already gone): {} — remove it manually if it is safe to do so",
+                temp_dir.display(),
+                std::io::Error::last_os_error()
             );
         }
     }
@@ -550,8 +699,14 @@ fn quantize_model(
     let n_tensors = tensor_names.len();
 
     if !dry_run {
-        let model_dir_fd = open_dir_nofollow(model_dir)?;
-        let config_bytes = read_file_at_nofollow(model_dir_fd.as_raw_fd(), "config.json")
+        // Read through `reader`'s already-held model-directory fd — never a
+        // fresh `open_dir_nofollow(model_dir)` — so the checkpoint that was
+        // just validated above and the `config.json` read here resolve
+        // through the exact same directory fd. Reopening `model_dir` by
+        // path here would give an ancestor swap between the two opens a
+        // second window to substitute a different directory's config.json.
+        let config_bytes = reader
+            .read_file("config.json")
             .map_err(|e| format!("failed to read {}/config.json: {e}", model_dir.display()))?;
         let output_config = write_dir.join("config.json");
         let mut f = publish_dir.create_file("config.json")?;
@@ -809,7 +964,7 @@ mod tests {
         // `config.json` planted as a symlink to a file outside the model
         // directory — standing in for a hostile or concurrently-swapped
         // checkpoint trying to exfiltrate arbitrary readable bytes into the
-        // quantizer's output. Mutation-sensitive: reverting
+        // quantizer's output. reverting
         // `read_file_at_nofollow` to a path-based `fs::read` (which follows
         // the final symlink) makes this test fail — the secret contents
         // would be copied into the staging directory instead of the read
@@ -843,8 +998,8 @@ mod tests {
     // -----------------------------------------------------------------------
     // Atomic publish + refuse-non-empty-output-dir.
     //
-    // Mutation-sensitive: reverting `TempPublishDir` so writes land directly
-    // in `output_dir` (as before this fix) makes
+    // Reverting `TempPublishDir` so writes land directly
+    // in `output_dir` makes
     // `atomic_publish_leaves_output_dir_untouched_on_mid_conversion_failure`
     // fail (a partial `.q4`/`config.json` would appear in `output`), and
     // dropping the up-front `fs::read_dir` non-empty check makes both
@@ -953,6 +1108,56 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn publish_targets_original_parent_despite_a_parent_directory_swap() {
+        // `renameat(parent_fd, temp_name, parent_fd, output_name)` anchors
+        // both the source and destination name to the parent-directory fd
+        // `create()` opened — never a re-resolved `output_dir`/`temp_dir`
+        // full path. A `fs::rename(temp_dir, output_dir)` on reconstructed
+        // paths instead re-walks every ancestor of both paths at publish
+        // time, so swapping the shared parent directory between `create()`
+        // and `publish()` would redirect (or break) the final rename
+        // relative to the substituted parent. Reverting `publish()` to
+        // path-based `fs::rename` makes this test fail — the rename either
+        // errors (source path no longer resolves under the swapped parent)
+        // or lands under the wrong parent, instead of publishing under the
+        // parent whose fd was actually held.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real_parent");
+        fs::create_dir(&real_parent).unwrap();
+        let output = real_parent.join("output");
+
+        let staging = super::TempPublishDir::create(&output, false).unwrap();
+        staging
+            .create_file("real.q4")
+            .unwrap()
+            .write_all(b"legit")
+            .unwrap();
+
+        // Swap the parent directory itself: move it aside (open fds stay
+        // bound to the original inode regardless) and plant a fresh, empty
+        // directory at the original parent path.
+        let moved_aside_parent = tmp.path().join("real_parent_moved_aside");
+        fs::rename(&real_parent, &moved_aside_parent).unwrap();
+        fs::create_dir(&real_parent).unwrap();
+
+        staging
+            .publish(Vec::new())
+            .expect("publish must succeed via the held parent fd despite the path-level swap");
+
+        assert_eq!(
+            fs::read_dir(&real_parent).unwrap().count(),
+            0,
+            "the substituted parent directory must receive no published output"
+        );
+        assert!(
+            moved_aside_parent.join("output").join("real.q4").exists(),
+            "the published output must land under the parent directory whose \
+             fd was bound at create() time, wherever it now lives"
+        );
+    }
+
+    #[test]
     fn quantize_model_refuses_preexisting_nonempty_output_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
@@ -1010,7 +1215,7 @@ mod tests {
     // Fold: Drop-ordering — a failed `publish()` must leave the staging
     // handle in `self` so `Drop` can still clean it up.
     //
-    // Mutation-sensitive: reverting `publish()` to `.take()` `self.temp` (and
+    // reverting `publish()` to `.take()` `self.temp` (and
     // `self.dir_fd`) up front makes this test fail — the
     // staging directory would survive (leaked) after a failed rename,
     // because `Drop` would find `self.temp == None` and do nothing.
@@ -1061,7 +1266,7 @@ mod tests {
         // no-publish / early-error path) rather than `publish()`: the
         // staging path is replaced with a fresh, unrelated directory that
         // holds attacker-planted content, then the guard drops without
-        // calling `publish`. Mutation-sensitive: reverting `Drop` to a bare
+        // calling `publish`. Reverting `Drop` to a bare
         // `fs::remove_dir_all(temp_dir)` (no inode check against the held
         // `dir_fd`) makes this test fail — the substituted directory (and
         // the attacker's file inside it) would be recursively deleted even
@@ -1093,7 +1298,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // fd-bind the staging directory (path race).
     //
-    // Mutation-sensitive: reverting `TempPublishDir::create_file` to a
+    // reverting `TempPublishDir::create_file` to a
     // the previous path-based `File::create(self.write_dir().join(filename))` makes `create_file_writes_land_in_original_dirfd_inode_not_a_
     // post_create_symlink_swap` fail — the write would follow the attacker's
     // symlink into `attacker_dir` instead of landing in the original staging
@@ -1152,7 +1357,7 @@ mod tests {
     // dry-run must validate f16 representability identically to
     // the real run.
     //
-    // Mutation-sensitive: hoisting the `encode_f16_payload` call back inside
+    // hoisting the `encode_f16_payload` call back inside
     // the `if !dry_run` block makes
     // `dry_run_rejects_f16_overflow_that_the_real_run_would_also_reject`
     // pass silently through dry-run (no error), diverging from the real-run
@@ -1193,7 +1398,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // restore missing-parent-directory creation.
     //
-    // Mutation-sensitive: removing the `fs::create_dir_all(parent)` call
+    // removing the `fs::create_dir_all(parent)` call
     // added to `TempPublishDir::create` makes
     // `quantize_model_creates_missing_output_parent_directories` fail with
     // "failed to create staging directory" (no such file or directory),
@@ -1229,7 +1434,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // MoE routed-expert tensors (issue #874 regression coverage).
     //
-    // Mutation-sensitive: these tensor names have no `.weight` suffix, so the
+    // these tensor names have no `.weight` suffix, so the
     // pre-fix gate (`if !name.ends_with(".weight") ... return false`) rejects
     // them before reaching any of the quantize-candidate checks. Reverting
     // the `.experts.gate_up_proj` / `.experts.down_proj` special-case added
