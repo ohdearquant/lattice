@@ -232,11 +232,10 @@ impl IntoResponse for ApiError {
 /// structured-syntax suffix). A missing header, an unparsable header, or
 /// any other MIME type is rejected as [`ApiError::UnsupportedMediaType`]
 /// (HTTP 415) -- matching what `Json<T>`'s own extractor did before
-/// `chat_completions` moved to taking the raw request body
-/// (VALIDATE-BEFORE-MATERIALIZE) to let `contract::reject_message_flood`
-/// run ahead of typed deserialization. That change silently dropped this
-/// check, since only `Json`'s extractor enforced it; this function restores
-/// it as an explicit call both binaries make before touching the body.
+/// `chat_completions` moved to taking the raw request body directly. That
+/// change silently dropped this check, since only `Json`'s extractor
+/// enforced it; this function restores it as an explicit call both
+/// binaries make before touching the body.
 pub fn require_json_content_type(headers: &axum::http::HeaderMap) -> Result<(), ApiError> {
     let is_json_content_type = headers
         .get(axum::http::header::CONTENT_TYPE)

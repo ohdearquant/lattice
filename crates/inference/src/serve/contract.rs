@@ -62,8 +62,11 @@ pub struct ChatRequest {
     /// differently, so the distinction must survive deserialization.
     #[serde(default)]
     pub model: Option<String>,
-    /// Conversation messages.
-    #[serde(default)]
+    /// Conversation messages. Deserialization itself enforces
+    /// [`MAX_MESSAGE_COUNT`] (see [`deserialize_bounded_messages`]), so the
+    /// single authoritative `ChatRequest` parse both counts and materializes
+    /// the array in one traversal.
+    #[serde(default, deserialize_with = "deserialize_bounded_messages")]
     pub messages: Vec<Message>,
     /// Legacy generation-token budget.
     #[serde(default)]
@@ -264,7 +267,7 @@ enum MaxTokensPolicy {
     ClampToContext { context: usize },
 }
 
-/// Reviewed request-policy differences between the two server binaries.
+/// Request-policy differences between the two server binaries.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeProfile<'a> {
     model_name: ModelNamePolicy<'a>,
@@ -275,6 +278,12 @@ pub struct ServeProfile<'a> {
     reasoning_budget_supported: bool,
     structured_output_supported: bool,
     logprobs_supported: bool,
+    /// Whether a conflicting `max_tokens`/`max_completion_tokens` pair is
+    /// rejected ahead of the served-model check (matching each binary's
+    /// pre-shared-contract precedence for this one check): `true` on the
+    /// daemon profile, `false` on the `lattice` profile, where it is
+    /// checked after the model check instead (see [`normalize_max_tokens`]).
+    max_tokens_conflict_checked_early: bool,
 }
 
 impl<'a> ServeProfile<'a> {
@@ -291,6 +300,7 @@ impl<'a> ServeProfile<'a> {
             reasoning_budget_supported: false,
             structured_output_supported: false,
             logprobs_supported: true,
+            max_tokens_conflict_checked_early: false,
         }
     }
 
@@ -307,6 +317,7 @@ impl<'a> ServeProfile<'a> {
             reasoning_budget_supported: true,
             structured_output_supported: true,
             logprobs_supported: false,
+            max_tokens_conflict_checked_early: true,
         }
     }
 }
@@ -369,7 +380,12 @@ pub fn normalize_request<C>(
         });
     }
 
-    let max_tokens = normalize_max_tokens(req, defaults.max_tokens, profile.max_tokens)?;
+    let max_tokens = normalize_max_tokens(
+        req,
+        defaults.max_tokens,
+        profile.max_tokens,
+        profile.max_tokens_conflict_checked_early,
+    )?;
     let temperature = validate_temperature(req.temperature.unwrap_or(defaults.temperature))?;
     let top_p = validate_top_p(req.top_p.unwrap_or(defaults.top_p))?;
     let logprobs = normalize_logprobs(req)?;
@@ -431,14 +447,18 @@ pub fn normalize_request<C>(
 /// pre-refactor, `lattice.rs`'s own `reject_unsupported` rejected
 /// `stream: true` + `logprobs: true` here, and the standalone daemon's own
 /// `reject_unsupported` rejected `logprobs`/`top_logprobs` outright (it
-/// never supported them) and a conflicting `max_tokens` /
-/// `max_completion_tokens` pair, all ahead of the model-id match. The
-/// shared `normalize_request` cascade had moved those three checks into
-/// `normalize_logprobs` / `normalize_max_tokens`, which run after
-/// `validate_model_name` -- silently reordering client-observable
-/// first-error precedence. `top_logprobs`-without-`logprobs` and
-/// `top_logprobs > 20` stay in `normalize_logprobs`, matching both
-/// binaries' original post-model-check position for those two.
+/// never supported them), ahead of the model-id match. The shared
+/// `normalize_request` cascade had moved those two checks into
+/// `normalize_logprobs`, which runs after `validate_model_name` -- silently
+/// reordering client-observable first-error precedence. `top_logprobs`-
+/// without-`logprobs` and `top_logprobs > 20` stay in `normalize_logprobs`,
+/// matching both binaries' original post-model-check position for those
+/// two. The conflicting `max_tokens`/`max_completion_tokens` check is
+/// profile-gated (`ServeProfile::max_tokens_conflict_checked_early`)
+/// instead of unconditionally grouped here: the daemon profile checked it
+/// ahead of the model-id match pre-refactor, but the `lattice` profile
+/// checked it after (inside its `validate_max_tokens`), so it runs from
+/// [`normalize_max_tokens`] on that profile instead.
 fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<(), ApiError> {
     if req.tools.is_some() || req.tool_choice.is_some() {
         return unsupported("tools and tool_choice are not supported by this server");
@@ -456,16 +476,8 @@ fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<()
     if req.stream == Some(true) && req.logprobs.unwrap_or(false) {
         return unsupported("logprobs is not supported together with stream: true");
     }
-    if let (Some(max_tokens), Some(max_completion_tokens)) =
-        (req.max_tokens, req.max_completion_tokens)
-        && max_tokens != max_completion_tokens
-    {
-        return Err(ApiError::BadRequest {
-            message: format!(
-                "max_tokens ({max_tokens}) and max_completion_tokens ({max_completion_tokens}) differ; supply only one"
-            ),
-            code: "invalid_request",
-        });
+    if profile.max_tokens_conflict_checked_early {
+        reject_conflicting_max_tokens(req)?;
     }
     // top_k, repetition_penalty, and reasoning_budget are accepted-and-ignored
     // (not rejected) on profiles that don't support them, matching each
@@ -482,122 +494,80 @@ fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<()
     Ok(())
 }
 
-/// Sentinel embedded in [`BoundedMessages`]'s deserialize error so
-/// [`reject_message_flood`] can distinguish "the array exceeded
-/// [`MAX_MESSAGE_COUNT`]" from any other shape it can't interpret (not
-/// JSON, no `messages` field, `messages` not an array) -- only the former
-/// is raised; every other error stays lenient (`Ok(())`) and defers to the
-/// caller's authoritative typed parse, exactly as before.
-const MESSAGE_FLOOD_SENTINEL: &str = "lattice_message_flood_exceeded";
-
-/// A `messages` array that counts its own elements while deserializing and
-/// bails with [`MESSAGE_FLOOD_SENTINEL`] the instant the count exceeds
-/// [`MAX_MESSAGE_COUNT`], instead of first collecting a
-/// `Vec<`[`IgnoredAny`][ignored]`>` of every element and checking its
-/// length afterward. The bail is structural: `visit_seq` returns `Err`
-/// from inside its `next_element` loop on the (`MAX_MESSAGE_COUNT` + 1)-th
-/// element, so an over-limit array of any size N costs exactly
-/// `MAX_MESSAGE_COUNT` + 1 element-visits, never N -- the short-circuit
-/// [`reject_message_flood`]'s single `from_slice` pass below needs to stay
-/// a single pass.
-///
-/// [ignored]: serde::de::IgnoredAny
-struct BoundedMessages;
-
-impl<'de> Deserialize<'de> for BoundedMessages {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
+/// Rejects a present-but-disagreeing `max_tokens`/`max_completion_tokens`
+/// pair. Called from [`reject_unsupported`] (ahead of the model check) or
+/// [`normalize_max_tokens`] (after it), depending on
+/// `ServeProfile::max_tokens_conflict_checked_early`.
+fn reject_conflicting_max_tokens(req: &ChatRequest) -> Result<(), ApiError> {
+    if let (Some(max_tokens), Some(max_completion_tokens)) =
+        (req.max_tokens, req.max_completion_tokens)
+        && max_tokens != max_completion_tokens
     {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = BoundedMessages;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an array of messages")
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let mut count = 0usize;
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                    count += 1;
-                    if count > MAX_MESSAGE_COUNT {
-                        return Err(serde::de::Error::custom(MESSAGE_FLOOD_SENTINEL));
-                    }
-                }
-                Ok(BoundedMessages)
-            }
-        }
-        deserializer.deserialize_seq(Visitor)
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "max_tokens ({max_tokens}) and max_completion_tokens ({max_completion_tokens}) differ; supply only one"
+            ),
+            code: "invalid_request",
+        });
     }
+    Ok(())
 }
 
-/// Raw-bytes preflight over an undeserialized chat-completions request
-/// body: counts `messages` array entries without building `Message`
-/// structs, and rejects a body whose message count exceeds
-/// [`MAX_MESSAGE_COUNT`] before the caller's typed `ChatRequest`
-/// deserialization ever runs.
-///
-/// VALIDATE-BEFORE-MATERIALIZE: a body built from tens of thousands of tiny
-/// messages must never pay the cost of allocating a `Vec<Message>` (one
-/// heap `String` for every message's `role` and `content`) just to be
-/// rejected by [`check_message_bounds`]'s post-deserialization count check.
-/// That check still runs afterward as the authoritative bound (it also
-/// enforces [`MAX_CUMULATIVE_CONTENT_BYTES`], which this preflight does not
-/// attempt) -- this function is a cheap, best-effort filter ahead of it,
-/// not a replacement for it.
-///
-/// Single-pass and short-circuiting: a single `from_slice::<Preflight>`
-/// call both locates the `messages` field and counts its elements via
-/// [`BoundedMessages`], which bails at `MAX_MESSAGE_COUNT` + 1 instead of
-/// visiting every element of an arbitrarily large array. This replaced an
-/// earlier two-pass version (`from_slice::<Preflight>` capturing a
-/// `RawValue`, then a second `from_str::<Vec<IgnoredAny>>` over the whole
-/// `messages` span with no bail) that walked an over-limit array of N
-/// elements to completion before rejecting it.
-///
-/// The second, still-authoritative typed parse the caller runs afterward
-/// (`serde_json::from_slice::<ChatCompletionRequest>`/`ChatReq`) is not a
-/// redundant re-scan of this same work: VALIDATE-BEFORE-MATERIALIZE
-/// requires the flood check to run *before* the typed `Vec<Message>` is
-/// built, and this preflight only ever produces a bounded structural
-/// count (no typed structs, no N-sized `Vec`, early bail) -- it cannot
-/// itself also materialize the request. A single custom `Deserialize` on
-/// `ChatCompletionRequest` that counts-and-bails on `messages` inline,
-/// reaching one pass total instead of two, is a larger refactor than this
-/// round's scope -- ledgered, not built here.
-///
-/// Deliberately permissive on any shape this can't cheaply interpret: if
-/// the body isn't valid JSON, has no `messages` field, or `messages` isn't
-/// an array, this returns `Ok(())` and defers to the caller's authoritative
-/// typed parse to report the real error. It only ever raises the one
-/// message-count violation above.
-///
-/// Shared by both server binaries (`lattice` and `lattice_serve`) so the
-/// bound and its wording stay in exactly one place.
-pub fn reject_message_flood(body: &[u8]) -> Result<(), ApiError> {
-    #[derive(Deserialize)]
-    struct Preflight {
-        // Never read: this field exists purely so deserializing it drives
-        // `BoundedMessages`'s counting/bailing `Deserialize` impl below.
-        #[serde(default)]
-        #[allow(dead_code)]
-        messages: Option<BoundedMessages>,
-    }
+/// Sentinel embedded in [`deserialize_bounded_messages`]'s error so callers
+/// can distinguish "the array exceeded [`MAX_MESSAGE_COUNT`]" from any
+/// other deserialization failure and surface the specific over-limit
+/// message instead of a generic invalid-body error.
+const MESSAGE_FLOOD_SENTINEL: &str = "lattice_message_flood_exceeded";
 
-    match serde_json::from_slice::<Preflight>(body) {
-        Ok(_) => Ok(()),
-        Err(err) if err.to_string().contains(MESSAGE_FLOOD_SENTINEL) => Err(ApiError::BadRequest {
-            message: format!(
-                "messages has more than {MAX_MESSAGE_COUNT} entries; maximum is {MAX_MESSAGE_COUNT}"
-            ),
-            code: "invalid_request_body",
-        }),
-        Err(_) => Ok(()),
+/// Deserializes `messages` while bailing the instant its element count
+/// exceeds [`MAX_MESSAGE_COUNT`], instead of materializing an unbounded
+/// `Vec<Message>` and checking its length afterward. The bail is
+/// structural: `visit_seq` returns `Err` from inside its `next_element`
+/// loop on the (`MAX_MESSAGE_COUNT` + 1)-th element, so an over-limit array
+/// of any size N costs exactly `MAX_MESSAGE_COUNT` + 1 element-visits,
+/// never N. This runs inline as part of the single authoritative
+/// `ChatRequest` deserialization -- there is no separate raw-bytes preflight
+/// pass over the same array.
+fn deserialize_bounded_messages<'de, D>(deserializer: D) -> Result<Vec<Message>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<Message>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an array of messages")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut messages = Vec::new();
+            while let Some(message) = seq.next_element::<Message>()? {
+                messages.push(message);
+                if messages.len() > MAX_MESSAGE_COUNT {
+                    return Err(serde::de::Error::custom(MESSAGE_FLOOD_SENTINEL));
+                }
+            }
+            Ok(messages)
+        }
     }
+    deserializer.deserialize_seq(Visitor)
+}
+
+/// True when a `ChatRequest` deserialization failure was raised by
+/// [`deserialize_bounded_messages`]'s count bound, so callers can surface
+/// [`message_flood_text`] instead of a generic invalid-JSON-body error.
+pub fn is_message_flood_error(err: &serde_json::Error) -> bool {
+    err.to_string().contains(MESSAGE_FLOOD_SENTINEL)
+}
+
+/// Client-facing text for a message-flood rejection, shared so both server
+/// binaries surface identical wording.
+pub fn message_flood_text() -> String {
+    format!("messages has more than {MAX_MESSAGE_COUNT} entries; maximum is {MAX_MESSAGE_COUNT}")
 }
 
 /// Reject requests whose message count or cumulative content size exceeds
@@ -605,9 +575,11 @@ pub fn reject_message_flood(body: &[u8]) -> Result<(), ApiError> {
 /// per-message engine allocation, chat-template formatting, or tokenization
 /// runs: a sub-body-cap request built from tens of thousands of tiny
 /// messages must not reach those expensive stages before being rejected.
-/// [`reject_message_flood`] is the earlier, raw-bytes-only sibling of the
-/// message-count half of this check -- both binaries call it ahead of typed
-/// `ChatRequest` deserialization, before this function ever runs.
+/// The message-count bound is already enforced during `ChatRequest`
+/// deserialization ([`deserialize_bounded_messages`]) for both server
+/// binaries, which build every `ChatRequest` that way; the check here
+/// stays as defense-in-depth for any caller that constructs `messages`
+/// directly. The cumulative-content-bytes bound has no earlier check.
 fn check_message_bounds(messages: &[Message]) -> Result<(), ApiError> {
     if messages.len() > MAX_MESSAGE_COUNT {
         return Err(ApiError::BadRequest {
@@ -727,15 +699,23 @@ fn validate_model_name(
     })
 }
 
-/// Resolves the effective `max_tokens` request. `reject_unsupported` has
-/// already rejected a conflicting `max_tokens`/`max_completion_tokens` pair
-/// (B3: restores original first-error precedence over the served-model
-/// check), so a `Some, Some` pair reaching here is guaranteed equal.
+/// Resolves the effective `max_tokens` request. When
+/// `conflict_checked_early` is `true`, `reject_unsupported` has already
+/// rejected a conflicting `max_tokens`/`max_completion_tokens` pair (B3:
+/// restores the daemon profile's original first-error precedence over the
+/// served-model check), so a `Some, Some` pair reaching here is guaranteed
+/// equal. When it is `false` (the `lattice` profile), that check has not
+/// run yet -- it runs here instead, after the model check, matching that
+/// profile's original `validate_max_tokens` position.
 fn normalize_max_tokens(
     req: &ChatRequest,
     default_max_tokens: usize,
     policy: MaxTokensPolicy,
+    conflict_checked_early: bool,
 ) -> Result<usize, ApiError> {
+    if !conflict_checked_early {
+        reject_conflicting_max_tokens(req)?;
+    }
     let requested = match (req.max_tokens, req.max_completion_tokens) {
         (None, None) => default_max_tokens,
         (Some(value), None) | (None, Some(value)) => value,
@@ -1148,32 +1128,48 @@ mod tests {
     }
 
     #[test]
-    fn message_count_over_limit_is_rejected_before_context_check() {
-        // Regression: message-count/content bounds must reject before
-        // check_context runs, so a request built from many tiny messages
-        // never reaches per-message ChatMessage duplication, chat-template
-        // formatting, or tokenization.
+    fn message_count_over_limit_is_rejected_during_deserialization() {
+        // Regression: the message-count bound is enforced inline while
+        // `messages` deserializes ([`deserialize_bounded_messages`]), so an
+        // over-limit request never reaches a constructed `ChatRequest`,
+        // `normalize_request`, or `check_context` at all -- there is no
+        // separate preflight pass and no post-deserialization gap to close.
         let messages: Vec<String> = (0..MAX_MESSAGE_COUNT + 1)
             .map(|_| r#"{"role":"user","content":""}"#.to_string())
             .collect();
         let body = format!(r#"{{"model":"model","messages":[{}]}}"#, messages.join(","));
-        let req = request(&body);
-        let mut check_context_called = false;
-        let err = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| {
-                check_context_called = true;
-                Ok(())
-            },
-        )
-        .unwrap_err();
-        assert_eq!(err.code(), "invalid_request_body");
-        assert!(
-            !check_context_called,
-            "check_context must not run once the message-count bound is exceeded"
-        );
+        let err = serde_json::from_str::<ChatRequest>(&body).unwrap_err();
+        assert!(is_message_flood_error(&err));
+    }
+
+    #[test]
+    fn message_flood_error_short_circuits_at_max_plus_one() {
+        // Single-pass, short-circuiting: an array far larger than
+        // `MAX_MESSAGE_COUNT` still rejects promptly, because
+        // `deserialize_bounded_messages`'s visitor bails the instant its
+        // running count exceeds the limit -- it never visits the remaining
+        // elements. A large-but-finite array here proves the bail actually
+        // fires past the boundary, not just that a walk-to-completion would
+        // eventually reject it too.
+        let messages: Vec<String> = (0..MAX_MESSAGE_COUNT * 4)
+            .map(|_| r#"{"role":"user","content":""}"#.to_string())
+            .collect();
+        let body = format!(r#"{{"model":"model","messages":[{}]}}"#, messages.join(","));
+        let err = serde_json::from_str::<ChatRequest>(&body).unwrap_err();
+        assert!(is_message_flood_error(&err));
+    }
+
+    #[test]
+    fn non_flood_deserialize_errors_are_not_misclassified_as_message_flood() {
+        assert!(!is_message_flood_error(
+            &serde_json::from_str::<ChatRequest>("not json").unwrap_err()
+        ));
+        assert!(!is_message_flood_error(
+            &serde_json::from_str::<ChatRequest>(
+                r#"{"model":"model","messages":[{"role":123,"content":"hi"}]}"#
+            )
+            .unwrap_err()
+        ));
     }
 
     #[test]
@@ -1392,6 +1388,31 @@ mod tests {
     }
 
     #[test]
+    fn wrong_model_with_conflicting_max_tokens_alias_rejects_as_model_not_found_on_lattice_profile()
+    {
+        // Regression: the `lattice` profile's original (pre-shared-contract)
+        // precedence checked the max_tokens/max_completion_tokens conflict
+        // inside `validate_max_tokens`, which ran AFTER the model-id check
+        // -- unlike the daemon profile above. A wrong model combined with a
+        // conflicting alias pair must still surface `model_not_found` on
+        // this profile.
+        let req = request(
+            r#"{"model":"wrong-model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":20}"#,
+        );
+        assert_eq!(
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice("served-model", 32),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code(),
+            "model_not_found"
+        );
+    }
+
+    #[test]
     fn lattice_profile_still_rejects_genuinely_unsupported_fields() {
         // Control: tools/tool_choice remain a hard 400 on both profiles —
         // the restored tolerance is scoped to exactly the three named
@@ -1524,6 +1545,22 @@ mod tests {
     }
 
     #[test]
+    fn normalize_messages_checks_content_before_role() {
+        // Contract choice, deliberately kept rather than restored:
+        // `normalize_messages` validates content before role, matching
+        // `lattice.rs`'s original pre-shared-contract order.
+        // `lattice_serve.rs`'s original order was the reverse (role before
+        // content); the shared normalizer now applies content-before-role
+        // uniformly on both server profiles. A message with both an invalid
+        // role and unsupported (image) content surfaces the content error.
+        let messages = [message(
+            r#"{"role":"moderator","content":[{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}"#,
+        )];
+        let err = normalize_messages(&messages).unwrap_err();
+        assert_eq!(err.message(), "image input requires a vision-capable model");
+    }
+
+    #[test]
     fn honoring_profile_treats_explicit_null_sampling_fields_as_absent() {
         // Regression (null-handling): an explicit JSON `null` for an honored
         // extension field must default, same as an omitted field, not
@@ -1641,55 +1678,17 @@ mod tests {
     }
 
     #[test]
-    fn reject_message_flood_rejects_over_limit_before_any_typed_struct_exists() {
-        // Regression: `reject_message_flood` takes only `&[u8]`
-        // -- it has no `ChatRequest`/`Message` type in scope, so it
-        // structurally cannot construct one. Both binaries call it and
-        // propagate its `Err` via `?` strictly before their own
-        // `serde_json::from_slice::<ChatRequest>` call
-        // (`lattice_serve.rs::parse_chat_req`,
-        // `lattice.rs::serve::chat_completions`), so a body whose message
-        // count exceeds `MAX_MESSAGE_COUNT` never reaches typed
-        // deserialization -- see those call sites for the ordering.
-        let messages: Vec<String> = (0..MAX_MESSAGE_COUNT + 1)
-            .map(|_| r#"{"role":"user","content":""}"#.to_string())
-            .collect();
-        let body = format!(r#"{{"model":"model","messages":[{}]}}"#, messages.join(","));
-        let err = reject_message_flood(body.as_bytes()).unwrap_err();
-        assert_eq!(err.code(), "invalid_request_body");
-    }
-
-    #[test]
-    fn reject_message_flood_single_pass_short_circuits_at_max_plus_one() {
-        // Single-pass rewrite (avoids a non-short-circuiting double parse):
-        // a body with an absurdly large message count (far beyond what a
-        // full-array walk-then-check could cheaply afford in a test) must
-        // still reject promptly, because `BoundedMessages::deserialize`
-        // bails the instant its running count exceeds `MAX_MESSAGE_COUNT`
-        // -- it never visits the remaining elements. A large-but-finite
-        // array here proves the bail actually fires past the boundary, not
-        // just that a walk-to-completion would eventually reject it too.
-        let messages: Vec<String> = (0..MAX_MESSAGE_COUNT * 4)
-            .map(|_| r#"{"role":"user","content":""}"#.to_string())
-            .collect();
-        let body = format!(r#"{{"model":"model","messages":[{}]}}"#, messages.join(","));
-        let err = reject_message_flood(body.as_bytes()).unwrap_err();
-        assert_eq!(err.code(), "invalid_request_body");
-        assert!(err.message().contains(&MAX_MESSAGE_COUNT.to_string()));
-    }
-
-    #[test]
-    fn reject_message_flood_accepts_at_the_limit_and_defers_on_other_shapes() {
+    fn valid_request_body_is_parsed_by_a_single_deserialize_call() {
+        // Regression: there is no separate raw-bytes preflight pass over
+        // `messages` anymore -- `serde_json::from_str::<ChatRequest>` is the
+        // only parse a caller needs to run, and it both counts and
+        // materializes the array in that one call.
         let messages: Vec<String> = (0..MAX_MESSAGE_COUNT)
             .map(|_| r#"{"role":"user","content":""}"#.to_string())
             .collect();
         let body = format!(r#"{{"model":"model","messages":[{}]}}"#, messages.join(","));
-        reject_message_flood(body.as_bytes()).unwrap();
-
-        // No `messages` field, and not even valid JSON: both deferred to the
-        // caller's authoritative typed parse, not raised here.
-        reject_message_flood(br#"{"model":"model"}"#).unwrap();
-        reject_message_flood(b"not json").unwrap();
+        let req = serde_json::from_str::<ChatRequest>(&body).unwrap();
+        assert_eq!(req.messages.len(), MAX_MESSAGE_COUNT);
     }
 
     #[test]

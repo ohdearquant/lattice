@@ -3236,97 +3236,16 @@ mod serve {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Extract a plain text string from a message content value.
-    /// Returns `Err` for non-text content parts (image, audio, file).
-    #[cfg(test)]
-    fn message_text(content: &MessageContent) -> Result<String, ApiError> {
-        match content {
-            MessageContent::Text(text) => Ok(text.clone()),
-            MessageContent::Parts(parts) => {
-                let mut out = String::new();
-                for part in parts {
-                    match part {
-                        ContentPart::Text { text } => out.push_str(text),
-                        ContentPart::ImageUrl { .. } => {
-                            return Err(ApiError::BadRequest {
-                                message: "image input requires a vision-capable model".to_string(),
-                                code: "unsupported_feature",
-                            });
-                        }
-                        ContentPart::Unsupported { kind } => {
-                            return Err(ApiError::BadRequest {
-                                message: format!(
-                                    "content part type '{kind}' is not supported; only 'text' parts are accepted"
-                                ),
-                                code: "unsupported_feature",
-                            });
-                        }
-                    }
-                }
-                Ok(out)
-            }
-        }
-    }
-
-    /// One of the three roles this server accepts on `POST /v1/chat/completions`.
-    ///
-    /// `#[cfg(test)]`-only: this binary's own tests validate roles through
-    /// `ValidatedRole::parse` / `to_chat_messages` below as a local mirror of
-    /// the shared `serve::contract::normalize_messages`, which is the actual
-    /// production role-validation path (both backends, via
-    /// `prepare_chat_request`).
-    #[cfg(test)]
-    enum ValidatedRole {
-        System,
-        User,
-        Assistant,
-    }
-
-    #[cfg(test)]
-    impl ValidatedRole {
-        /// `tool` and `developer` are rejected as `"unsupported_feature"`
-        /// (a real OpenAI role this server doesn't implement yet); any other
-        /// value is rejected as `"invalid_role"` (not an OpenAI chat role at
-        /// all).
-        fn parse(role: &str) -> Result<Self, ApiError> {
-            match role {
-                "system" => Ok(ValidatedRole::System),
-                "user" => Ok(ValidatedRole::User),
-                "assistant" => Ok(ValidatedRole::Assistant),
-                "tool" | "developer" => Err(ApiError::BadRequest {
-                    message: format!("role '{role}' is not supported by this server"),
-                    code: "unsupported_feature",
-                }),
-                other => Err(ApiError::BadRequest {
-                    message: format!(
-                        "unsupported role '{other}'; must be 'system', 'user', or 'assistant'"
-                    ),
-                    code: "invalid_role",
-                }),
-            }
-        }
-    }
-
-    /// `#[cfg(test)]`-only local mirror of the shared
-    /// `serve::contract::normalize_messages`, used by this binary's own
-    /// role/content-part test fixtures below. Converts validated request
-    /// messages into the engine's `ChatMessage` list; production requests
-    /// go through `normalize_messages` directly (`prepare_chat_request`,
-    /// then rendered via the shared `format_chat_template`, #661/#668), not
-    /// through this function.
+    /// `#[cfg(test)]`-only alias for this binary's own role/content-part
+    /// test fixtures below. Production requests go through
+    /// `serve::contract::normalize_messages` directly (`prepare_chat_request`,
+    /// then rendered via the shared `format_chat_template`, #661/#668); this
+    /// exercises that same shared validator rather than a local copy of its
+    /// role/content-part logic, so those tests cannot drift from production
+    /// behavior.
     #[cfg(test)]
     fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> {
-        messages
-            .iter()
-            .map(|msg| {
-                let content = message_text(&msg.content)?;
-                Ok(match ValidatedRole::parse(&msg.role)? {
-                    ValidatedRole::System => ChatMessage::system(content),
-                    ValidatedRole::User => ChatMessage::user(content),
-                    ValidatedRole::Assistant => ChatMessage::assistant(content),
-                })
-            })
-            .collect()
+        lattice_inference::serve::contract::normalize_messages(messages)
     }
 
     // -----------------------------------------------------------------------
@@ -3596,17 +3515,15 @@ mod serve {
         });
     }
 
-    /// Axum route entry point (VALIDATE-BEFORE-MATERIALIZE):
-    /// takes the raw request body instead of `Json<ChatCompletionRequest>`
-    /// so `reject_message_flood` can run against the undeserialized bytes
-    /// *before* `ChatCompletionRequest` is ever constructed. The prior
-    /// `Json<ChatCompletionRequest>` extractor ran axum's typed
-    /// deserialization -- allocating the full `Vec<Message>` -- before this
-    /// handler body even started, which is exactly the amplification
-    /// this closes: a sub-body-cap request built from tens of
-    /// thousands of tiny messages must be rejected before that allocation,
-    /// not just before `normalize_request`'s own post-deserialization count
-    /// check inside [`chat_completions_with_request`].
+    /// Axum route entry point. Takes the raw request body instead of
+    /// `Json<ChatCompletionRequest>` so `require_json_content_type` can run
+    /// against the raw headers before the body is read (see below). The
+    /// message-count bound is enforced inline during the single
+    /// `serde_json::from_slice::<ChatCompletionRequest>` parse below
+    /// (`serve::contract::deserialize_bounded_messages`), so a sub-body-cap
+    /// request built from tens of thousands of tiny messages is rejected
+    /// without materializing a `Vec<Message>` entry for each one -- there is
+    /// no separate raw-bytes pass over `messages` ahead of that parse.
     ///
     /// `to_bytes(.., REQUEST_BODY_LIMIT_BYTES)` enforces the same cap the
     /// router's `DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)` layer
@@ -3633,16 +3550,34 @@ mod serve {
     ) -> Result<Response, ApiError> {
         lattice_inference::serve::require_json_content_type(&headers)?;
 
-        // Surface body-buffering failures as structured 413 responses.
+        // Surface a body-length-limit rejection as a structured 413
+        // response; any other body-buffering failure (e.g. a client
+        // disconnecting mid-stream) is not a size violation and gets the
+        // same non-413 invalid-body response as a malformed JSON body.
         let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
             .await
-            .map_err(|_| ApiError::PayloadTooLarge {
-                message: "request body exceeds 1 MiB limit".to_string(),
+            .map_err(|err| {
+                let is_length_limit = std::error::Error::source(&err)
+                    .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+                if is_length_limit {
+                    return ApiError::PayloadTooLarge {
+                        message: "request body exceeds 1 MiB limit".to_string(),
+                    };
+                }
+                eprintln!("invalid request body: {err}");
+                ApiError::BadRequest {
+                    message: "invalid JSON request body".to_string(),
+                    code: "invalid_request_body",
+                }
             })?;
 
-        lattice_inference::serve::contract::reject_message_flood(&bytes)?;
-
         let req: ChatCompletionRequest = serde_json::from_slice(&bytes).map_err(|err| {
+            if lattice_inference::serve::contract::is_message_flood_error(&err) {
+                return ApiError::BadRequest {
+                    message: lattice_inference::serve::contract::message_flood_text(),
+                    code: "invalid_request_body",
+                };
+            }
             eprintln!("invalid request body: {err}");
             ApiError::BadRequest {
                 message: "invalid JSON request body".to_string(),
@@ -5183,37 +5118,47 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // message_text helper
+        // message content normalization (via the shared normalize_messages,
+        // exercised here through the `to_chat_messages` alias)
         // -----------------------------------------------------------------------
 
         #[test]
         fn message_text_plain_string() {
-            let content = MessageContent::Text("hello".to_string());
-            assert_eq!(message_text(&content).unwrap(), "hello");
+            let messages = [Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }];
+            assert_eq!(to_chat_messages(&messages).unwrap()[0].content, "hello");
         }
 
         #[test]
         fn message_text_parts_concatenates() {
-            let content = MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "foo".to_string(),
-                },
-                ContentPart::Text {
-                    text: "bar".to_string(),
-                },
-            ]);
-            assert_eq!(message_text(&content).unwrap(), "foobar");
+            let messages = [Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "foo".to_string(),
+                    },
+                    ContentPart::Text {
+                        text: "bar".to_string(),
+                    },
+                ]),
+            }];
+            assert_eq!(to_chat_messages(&messages).unwrap()[0].content, "foobar");
         }
 
         #[test]
         fn message_text_parts_rejects_image() {
-            let content = MessageContent::Parts(vec![ContentPart::ImageUrl {
-                image_url: lattice_inference::serve::contract::ImageUrl {
-                    url: "https://example.com/image.png".to_string(),
-                    detail: None,
-                },
-            }]);
-            let err = message_text(&content).unwrap_err();
+            let messages = [Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: lattice_inference::serve::contract::ImageUrl {
+                        url: "https://example.com/image.png".to_string(),
+                        detail: None,
+                    },
+                }]),
+            }];
+            let err = to_chat_messages(&messages).unwrap_err();
             match err {
                 ApiError::BadRequest { message, code } => {
                     assert_eq!(code, "unsupported_feature");
@@ -5225,10 +5170,13 @@ mod serve {
 
         #[test]
         fn message_text_parts_rejects_unknown_part_type() {
-            let content = MessageContent::Parts(vec![ContentPart::Unsupported {
-                kind: "file".to_string(),
-            }]);
-            let err = message_text(&content).unwrap_err();
+            let messages = [Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![ContentPart::Unsupported {
+                    kind: "file".to_string(),
+                }]),
+            }];
+            let err = to_chat_messages(&messages).unwrap_err();
             match err {
                 ApiError::BadRequest { message, code } => {
                     assert_eq!(code, "unsupported_feature");
@@ -6179,12 +6127,10 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // Message-flood preflight (VALIDATE-BEFORE-MATERIALIZE):
-        // proves the fix at the real HTTP layer, not just at
-        // `serve::contract::reject_message_flood`'s own unit-test level --
-        // the router's `chat_completions` entry point must reject a body
-        // with more than `MAX_MESSAGE_COUNT` tiny messages without ever
-        // constructing the typed `ChatCompletionRequest`/`Vec<Message>`.
+        // Message-flood bound: proves the fix at the real HTTP layer, not just
+        // at `serve::contract`'s own unit-test level -- the router's
+        // `chat_completions` entry point must reject a body with more than
+        // `MAX_MESSAGE_COUNT` tiny messages.
         // -----------------------------------------------------------------------
         #[cfg(feature = "test-utils")]
         mod message_flood {
@@ -6193,28 +6139,15 @@ mod serve {
             use tower::ServiceExt as _;
 
             #[tokio::test]
-            async fn chat_completions_rejects_message_flood_before_typed_parse() {
+            async fn chat_completions_rejects_message_flood() {
                 // One more message than the bound, each as small as the wire
-                // format allows -- structurally this is exactly the shape
-                // this amplification concern describes: comfortably under the 1 MiB body cap,
-                // but tens of thousands of entries, so a body that reaches
-                // typed `Vec<Message>` construction would still pay a
-                // per-message allocation cost for every one of them before
-                // being rejected. `chat_completions`'s raw-`Bytes` preflight
-                // (`reject_message_flood`, called before
-                // `serde_json::from_slice::<ChatCompletionRequest>`) must
-                // reject this before that allocation ever happens --
-                // verified structurally (the preflight function only ever
-                // sees `&[u8]`, it has no `ChatCompletionRequest` type in
-                // scope to construct) and by mutation (see the PR body's
-                // mutation log: disabling the preflight call still yields
-                // the same HTTP-level 400/invalid_request_body here, because
-                // `normalize_request`'s own post-deserialization count check
-                // is a second, authoritative bound -- the observable
-                // difference the preflight makes is WHEN the 400 fires
-                // relative to allocation, which this test's sibling unit
-                // test in `serve::contract` pins directly on the raw-bytes
-                // function).
+                // format allows: comfortably under the 1 MiB body cap, but
+                // tens of thousands of entries. The message-count bound is
+                // enforced inline while `ChatCompletionRequest::messages`
+                // deserializes, so this never allocates a `Vec<Message>`
+                // entry per message before rejecting -- see this test's
+                // sibling unit tests in `serve::contract` for direct coverage
+                // of that deserializer.
                 let messages: Vec<String> = (0..MAX_MESSAGE_COUNT + 1)
                     .map(|_| r#"{"role":"user","content":""}"#.to_string())
                     .collect();

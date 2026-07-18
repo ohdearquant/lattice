@@ -73,8 +73,6 @@ mod imp {
         },
         routing::{get, post},
     };
-    #[cfg(test)]
-    use lattice_inference::forward::metal_qwen35::ChatMessage;
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
@@ -84,11 +82,11 @@ mod imp {
     use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatReq, GenerationDefaults, ServeProfile, ValidatedChatRequest,
-        normalize_request, reject_message_flood,
+        is_message_flood_error, message_flood_text, normalize_request,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
-        ContentPart as Part, ImageUrl, Message as InMsg, MessageContent,
+        ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, normalize_messages,
     };
     use lattice_inference::serve::metal_worker::{
         ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
@@ -1619,70 +1617,24 @@ mod imp {
     /// request. Never allocates the request's strings/arrays before the
     /// clamp has run.
     ///
-    /// `reject_message_flood` (VALIDATE-BEFORE-MATERIALIZE) runs
-    /// first: a body with more than `MAX_MESSAGE_COUNT` tiny messages must
-    /// be rejected before the typed `ChatReq` parse below ever allocates a
-    /// `Vec<Message>`, not just before `normalize_request`'s own
-    /// post-deserialization count check.
+    /// The message-count bound is enforced inline during the typed `ChatReq`
+    /// parse below (`serve::contract::deserialize_bounded_messages`): a body
+    /// with more than `MAX_MESSAGE_COUNT` tiny messages is rejected without
+    /// materializing a `Vec<Message>` entry for each one, in that same parse
+    /// -- there is no separate raw-bytes pass over `messages` ahead of it.
     fn parse_chat_req(body: &[u8]) -> Result<ChatReq, RequestError> {
-        reject_message_flood(body)
-            .map_err(|err| RequestError::bad_request(err.message().to_string(), err.code()))?;
         reject_duplicate_json_members(body)?;
         validate_content_part_limits(body)?;
-        serde_json::from_slice::<ChatReq>(body).map_err(|_| {
+        serde_json::from_slice::<ChatReq>(body).map_err(|err| {
+            if is_message_flood_error(&err) {
+                return RequestError::bad_request(message_flood_text(), "invalid_request_body");
+            }
             RequestError::bad_request(
                 "invalid JSON request body",
                 // Matches lattice.rs's JSON-extraction-failure code
                 // (ADR-080 C2).
                 "invalid_request_body",
             )
-        })
-    }
-
-    /// Flatten message content to plain text (#641, #649). Fails closed:
-    /// an `image_url` part returns the vision-model message, any other
-    /// unsupported part type names itself in the error rather than being
-    /// silently dropped.
-    #[cfg(test)]
-    fn content_text(content: &MessageContent) -> Result<String, RequestError> {
-        match content {
-            MessageContent::Text(text) => Ok(text.clone()),
-            MessageContent::Parts(parts) => {
-                let mut out = String::new();
-                for part in parts {
-                    match part {
-                        Part::Text { text } => out.push_str(text),
-                        Part::ImageUrl { .. } => {
-                            // Matches lattice.rs's `message_text` image
-                            // rejection code (ADR-080 C2).
-                            return Err(RequestError::bad_request(
-                                IMAGE_REQUIRES_VISION_MESSAGE,
-                                "unsupported_feature",
-                            ));
-                        }
-                        Part::Unsupported { kind } => {
-                            return Err(RequestError::bad_request(
-                                format!(
-                                    "unsupported content part type '{kind}'; only 'text' parts are accepted"
-                                ),
-                                "unsupported_feature",
-                            ));
-                        }
-                    }
-                }
-                Ok(out)
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn to_chat_message(m: &InMsg) -> Result<ChatMessage, RequestError> {
-        let role = MessageRole::parse(&m.role)?;
-        let content = content_text(&m.content)?;
-        Ok(match role {
-            MessageRole::System => ChatMessage::system(content),
-            MessageRole::User => ChatMessage::user(content),
-            MessageRole::Assistant => ChatMessage::assistant(content),
         })
     }
 
@@ -1914,27 +1866,54 @@ mod imp {
             );
             return err.into_response();
         }
-        let Ok(body) = to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await else {
-            emit_serve_event(
-                &s.metrics,
-                "POST",
-                "/v1/chat/completions",
-                413,
-                None,
-                None,
-                timer.elapsed().as_secs_f64() * 1000.0,
-                false,
-                Some("request_body_too_large"),
-            );
-            // ADR-080 C2: previously mapped to
-            // HTTP 400 + generic "invalid_request", diverging from
-            // lattice.rs's 413 + "request_body_too_large" for the identical
-            // oversized-body condition. Aligned to match.
-            return err_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
-                "request_body_too_large",
-            );
+        let body = match to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await {
+            Ok(body) => body,
+            Err(err) => {
+                // Only a length-limit rejection is an oversized-body
+                // condition; any other body-buffering failure (e.g. a
+                // client disconnecting mid-stream) is not, and must not be
+                // reported as 413.
+                let is_length_limit = std::error::Error::source(&err)
+                    .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+                if is_length_limit {
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        "/v1/chat/completions",
+                        413,
+                        None,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        false,
+                        Some("request_body_too_large"),
+                    );
+                    // ADR-080 C2: previously mapped to
+                    // HTTP 400 + generic "invalid_request", diverging from
+                    // lattice.rs's 413 + "request_body_too_large" for the identical
+                    // oversized-body condition. Aligned to match.
+                    return err_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
+                        "request_body_too_large",
+                    );
+                }
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    "/v1/chat/completions",
+                    400,
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some("invalid_request"),
+                );
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid request body",
+                    "invalid_request",
+                );
+            }
         };
         let req = match parse_chat_req(&body) {
             Ok(req) => req,
@@ -3090,48 +3069,65 @@ mod imp {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
             };
-            let chat_message = to_chat_message(&msg).expect("plain string content must parse");
+            let chat_message = normalize_messages(std::slice::from_ref(&msg))
+                .expect("plain string content must parse");
             assert_eq!(
-                chat_message.role,
+                chat_message[0].role,
                 lattice_inference::forward::metal_qwen35::ChatRole::User
             );
-            assert_eq!(chat_message.content, "hi");
+            assert_eq!(chat_message[0].content, "hi");
         }
 
         #[test]
         fn message_content_parts_concatenate_in_order() {
-            let content = MessageContent::Parts(vec![
-                Part::Text {
-                    text: "a".to_string(),
-                },
-                Part::Text {
-                    text: "b".to_string(),
-                },
-            ]);
-            assert_eq!(content_text(&content).unwrap(), "ab");
+            let msg = InMsg {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![
+                    Part::Text {
+                        text: "a".to_string(),
+                    },
+                    Part::Text {
+                        text: "b".to_string(),
+                    },
+                ]),
+            };
+            let chat_message = normalize_messages(std::slice::from_ref(&msg)).unwrap();
+            assert_eq!(chat_message[0].content, "ab");
         }
 
         #[test]
         fn message_content_image_url_rejected() {
-            let content = MessageContent::Parts(vec![Part::ImageUrl {
-                image_url: ImageUrl {
-                    url: "https://example.com/cat.png".to_string(),
-                    detail: None,
-                },
-            }]);
-            let err = content_text(&content).unwrap_err();
+            let msg = InMsg {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![Part::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/cat.png".to_string(),
+                        detail: None,
+                    },
+                }]),
+            };
+            let err = normalize_messages(std::slice::from_ref(&msg)).unwrap_err();
             assert_eq!(err.message(), IMAGE_REQUIRES_VISION_MESSAGE);
         }
 
         #[test]
         fn message_content_unknown_part_rejected() {
-            let content = MessageContent::Parts(vec![Part::Unsupported {
-                kind: "file".to_string(),
-            }]);
-            let err = content_text(&content).unwrap_err();
+            // The shared normalizer's wording ("content part type 'file' is
+            // not supported; ...") differs from this binary's now-removed
+            // local test-only copy ("unsupported content part type 'file';
+            // ..."); production always went through the shared normalizer
+            // (`normalize_request`), so this pins the wording clients
+            // actually receive.
+            let msg = InMsg {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![Part::Unsupported {
+                    kind: "file".to_string(),
+                }]),
+            };
+            let err = normalize_messages(std::slice::from_ref(&msg)).unwrap_err();
             assert_eq!(
                 err.message(),
-                "unsupported content part type 'file'; only 'text' parts are accepted"
+                "content part type 'file' is not supported; only 'text' parts are accepted"
             );
         }
 
