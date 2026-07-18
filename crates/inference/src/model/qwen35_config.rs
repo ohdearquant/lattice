@@ -30,7 +30,7 @@ pub const QWEN3_NEWLINE_TOKEN_ID: u32 = 198;
 /// causing unbounded allocation / OOM / abort at model load. Real Qwen3.5 checkpoints are
 /// well under 100 layers; 512 rejects any config a real checkpoint would never carry while
 /// leaving generous headroom for future architectures.
-pub const MAX_HIDDEN_LAYERS: usize = 512;
+pub(crate) const MAX_HIDDEN_LAYERS: usize = 512;
 
 /// Upper bound on `vocab_size` accepted from `config.json`.
 ///
@@ -40,7 +40,7 @@ pub const MAX_HIDDEN_LAYERS: usize = 512;
 /// config a real checkpoint would never carry (including a zero-byte-embedding attack that
 /// pairs a huge declared vocab with an empty tensor) while leaving over an order of
 /// magnitude of headroom for future tokenizers.
-pub const MAX_VOCAB_SIZE: usize = 4_000_000;
+pub(crate) const MAX_VOCAB_SIZE: usize = 4_000_000;
 
 /// Upper bound on `head_dim` accepted from `config.json`.
 ///
@@ -50,7 +50,7 @@ pub const MAX_VOCAB_SIZE: usize = 4_000_000;
 /// only guard standing between an attacker-controlled `head_dim` and that allocation. Real
 /// Qwen3.5/3.6 head dims are 64-256; 2048 rejects any config a real checkpoint would never
 /// carry while leaving 8x headroom for future architectures.
-pub const MAX_HEAD_DIM: usize = 2048;
+pub(crate) const MAX_HEAD_DIM: usize = 2048;
 
 /// Upper bound on `num_experts` accepted from `config.json` for MoE variants.
 ///
@@ -61,7 +61,7 @@ pub const MAX_HEAD_DIM: usize = 2048;
 /// value before that resize. Real Qwen3.5/3.6 MoE configs route across 8-256 experts;
 /// 4096 rejects any config a real checkpoint would never carry while leaving well over an
 /// order of magnitude of headroom for future architectures.
-pub const MAX_NUM_EXPERTS: usize = 4096;
+pub(crate) const MAX_NUM_EXPERTS: usize = 4096;
 
 /// Upper bound on the full-attention `q_dim` / `kv_dim` products
 /// (`num_attention_heads * head_dim`, `num_key_value_heads * head_dim`) accepted from
@@ -74,7 +74,7 @@ pub const MAX_NUM_EXPERTS: usize = 4096;
 /// `context` allocations to exabyte scale. Real Qwen3.5/3.6 full-attention geometry tops out
 /// around `num_attention_heads = 64` * `head_dim = 256` (`q_dim = 16384`); 1,048,576 (2^20)
 /// leaves roughly 64x headroom above that for future architectures.
-pub const MAX_FULL_ATTENTION_DIM: usize = 1_048_576;
+pub(crate) const MAX_FULL_ATTENTION_DIM: usize = 1_048_576;
 
 /// Upper bound on `intermediate_size`, `moe_intermediate_size`, and
 /// `shared_expert_intermediate_size` accepted from `config.json`.
@@ -85,7 +85,7 @@ pub const MAX_FULL_ATTENTION_DIM: usize = 1_048_576;
 /// those allocations before any tensor is read. Real Qwen3.5/3.6 presets range up to 17,408
 /// for `intermediate_size` and ~512 for the MoE/shared-expert variants; 1,048,576 (2^20)
 /// leaves roughly 60x headroom above the largest observed real value.
-pub const MAX_INTERMEDIATE_SIZE: usize = 1_048_576;
+pub(crate) const MAX_INTERMEDIATE_SIZE: usize = 1_048_576;
 
 /// Upper bound on `VisionModelConfig::depth` accepted from `config.json`.
 ///
@@ -93,7 +93,7 @@ pub const MAX_INTERMEDIATE_SIZE: usize = 1_048_576;
 /// tensor validation runs, so an unbounded `depth` (only checked nonzero) drives unbounded
 /// `String` allocation ahead of any shape check. Real Qwen3.5-VL vision towers are ~24-48
 /// blocks deep (Qwen3.5-VL vision ~32); 1024 leaves roughly 32x headroom above that.
-pub const MAX_VISION_DEPTH: usize = 1024;
+pub(crate) const MAX_VISION_DEPTH: usize = 1024;
 
 /// Upper bound on the length of small fixed-purpose config vectors accepted from
 /// `config.json`: `RopeParams::mrope_section` and `VisionModelConfig::deepstack_visual_indexes`.
@@ -104,7 +104,7 @@ pub const MAX_VISION_DEPTH: usize = 1024;
 /// `mrope_section` values carry 3-4 entries (one per M-RoPE axis) and real
 /// `deepstack_visual_indexes` lists carry a handful of layer indexes; 1024 rejects any config a
 /// real checkpoint would never carry while leaving generous headroom for future architectures.
-pub const MAX_CONFIG_VECTOR_LEN: usize = 1024;
+pub(crate) const MAX_CONFIG_VECTOR_LEN: usize = 1024;
 
 /// Upper bound on the GatedDeltaNet output dimension (`linear_num_value_heads *
 /// linear_value_head_dim`) accepted from `config.json`.
@@ -117,7 +117,50 @@ pub const MAX_CONFIG_VECTOR_LEN: usize = 1024;
 /// Qwen3.5/3.6 GDN configs top out around `linear_num_value_heads = 48` * `linear_value_head_dim
 /// = 128` (`linear_output_dim = 6144`); 1,048,576 (2^20) leaves roughly 170x headroom above
 /// that for future architectures.
-pub const MAX_LINEAR_OUTPUT_DIM: usize = 1_048_576;
+pub(crate) const MAX_LINEAR_OUTPUT_DIM: usize = 1_048_576;
+
+/// Upper bound on the GatedDeltaNet state-matrix three-factor product
+/// (`linear_num_value_heads() * linear_key_head_dim * linear_value_head_dim`) accepted from
+/// `config.json`.
+///
+/// `attention/gdn.rs` allocates `s_matrices = vec![0.0; value_heads * key_dim * value_dim]` at
+/// first generation. [`MAX_LINEAR_OUTPUT_DIM`] only bounds the `value_heads * value_dim`
+/// factor (`linear_output_dim()`); `linear_key_head_dim` is a free multiplier on top of that
+/// budget, so e.g. `value_heads = 1`, `value_dim` near the `MAX_LINEAR_OUTPUT_DIM` cap, and
+/// `linear_key_head_dim = 1_000_000` passes both existing guards while allocating on the order
+/// of terabytes. Real Qwen3.5/3.6 GDN configs are around `linear_num_value_heads = 48` *
+/// `linear_key_head_dim = 128` * `linear_value_head_dim = 128` (~786,432); 16,777,216 (2^24)
+/// leaves roughly 21x headroom above that for future architectures.
+pub(crate) const MAX_GDN_STATE_SIZE: usize = 16_777_216;
+
+/// Upper bound on `max_position_embeddings` accepted from `config.json`.
+///
+/// Drives the Metal RoPE table allocation (`rope_max * rope_dim / 2` entries in
+/// `build_rope_interleaved`) independent of `head_dim`, which is separately bounded by
+/// [`MAX_HEAD_DIM`]. Real Qwen3.5/3.6 presets default to 262,144 and advertise context windows
+/// up to roughly 1M; 4,194,304 (2^22) leaves roughly 4x headroom above that for future
+/// architectures.
+pub(crate) const MAX_POSITION_EMBEDDINGS: usize = 4_194_304;
+
+/// Upper bound on `num_attention_heads` and `num_key_value_heads` accepted from
+/// `config.json`.
+///
+/// `ForwardScratch::ensure_capacity` derives `scores = num_attention_heads * (max_kv_len + 1)`
+/// independent of `head_dim` -- [`MAX_FULL_ATTENTION_DIM`] bounds the `num_attention_heads *
+/// head_dim` product, but a config that pairs a small `head_dim` with a huge
+/// `num_attention_heads` can still pass that product check while inflating `scores` on its
+/// own. Real Qwen3.5/3.6 configs top out around 128 attention heads; 8,192 leaves roughly 64x
+/// headroom above that for future architectures.
+pub(crate) const MAX_ATTENTION_HEADS: usize = 8_192;
+
+/// Upper bound on `hidden_size` accepted from `config.json`.
+///
+/// Drives the `hidden` / `residual` / `attn_out` / `ffn_out` / `expert_out` scratch buffer
+/// allocations and the `max_q8_input` derivation in `ForwardScratch::ensure_capacity`, all
+/// unconditional on every forward pass regardless of layer mix. Real Qwen3.5/3.6 presets top
+/// out around 8,192; 1,048,576 (2^20) matches the scale of [`MAX_FULL_ATTENTION_DIM`] and
+/// [`MAX_INTERMEDIATE_SIZE`] while leaving well over two orders of magnitude of headroom.
+pub(crate) const MAX_HIDDEN_SIZE: usize = 1_048_576;
 
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
@@ -167,7 +210,7 @@ pub struct VisionModelConfig {
     /// Input image channel count.
     pub in_channels: usize,
     /// DeepStack visual layer indexes; empty for checkpoints that don't use DeepStack fusion.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_deepstack_visual_indexes")]
     pub deepstack_visual_indexes: Vec<usize>,
 }
 
@@ -435,6 +478,123 @@ where
     deserializer.deserialize_seq(BoundedVecVisitor(std::marker::PhantomData))
 }
 
+/// Deserializes a JSON array into `Vec<T>`, erroring once more than `MAX_CONFIG_VECTOR_LEN`
+/// elements have been pulled from the input. Used for `RopeParams::mrope_section` and
+/// `VisionModelConfig::deepstack_visual_indexes` -- both are small fixed-purpose vectors
+/// deserialized before `from_config_json_str`'s validation pass runs, so a post-parse `.len()`
+/// check does not prevent the allocation itself; erring during the `visit_seq` pull, like
+/// [`deserialize_bounded_vec`] does for `MAX_HIDDEN_LAYERS`, is what keeps the Vec from ever
+/// growing past the cap. `field_name` is threaded through so the resulting error names the
+/// specific config field, since both callers of this helper share one generic implementation.
+fn deserialize_config_vector<'de, D, T>(
+    deserializer: D,
+    field_name: &'static str,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T> {
+        field_name: &'static str,
+        marker: std::marker::PhantomData<T>,
+    }
+
+    impl<'de, T> serde::de::Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "a sequence of at most {MAX_CONFIG_VECTOR_LEN} elements for {}",
+                self.field_name
+            )
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while vec.len() < MAX_CONFIG_VECTOR_LEN {
+                match seq.next_element()? {
+                    Some(elem) => vec.push(elem),
+                    None => return Ok(vec),
+                }
+            }
+            if seq.next_element::<T>()?.is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "{} exceeds MAX_CONFIG_VECTOR_LEN ({MAX_CONFIG_VECTOR_LEN}) elements",
+                    self.field_name
+                )));
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor {
+        field_name,
+        marker: std::marker::PhantomData,
+    })
+}
+
+/// `serde(deserialize_with)` entry point for `VisionModelConfig::deepstack_visual_indexes`;
+/// see [`deserialize_config_vector`].
+fn deserialize_deepstack_visual_indexes<'de, D>(deserializer: D) -> Result<Vec<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_config_vector(deserializer, "deepstack_visual_indexes")
+}
+
+/// `serde(deserialize_with)` entry point for `RopeParams::mrope_section`. Wraps
+/// [`deserialize_config_vector`] to additionally handle the `Option` layer -- `mrope_section`
+/// is absent from most checkpoints -- so the bound is enforced without disturbing the
+/// existing `#[serde(default)]` behavior for a missing field.
+fn deserialize_mrope_section<'de, D>(deserializer: D) -> Result<Option<Vec<usize>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptionVisitor {
+        type Value = Option<Vec<usize>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "an optional sequence of at most {MAX_CONFIG_VECTOR_LEN} elements for \
+                 mrope_section"
+            )
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+        where
+            D2: serde::Deserializer<'de>,
+        {
+            deserialize_config_vector(deserializer, "mrope_section").map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(OptionVisitor)
+}
+
 fn default_tie_word_embeddings() -> bool {
     true
 }
@@ -455,7 +615,7 @@ pub struct RopeParams {
     /// `None` when the checkpoint has no vision M-RoPE config (text-only decoders use plain
     /// 1-D partial RoPE). Parsed but not yet consumed by the forward pass (ADR-069 S1; wired
     /// in S3+).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_mrope_section")]
     pub mrope_section: Option<Vec<usize>>,
     /// Whether M-RoPE frequencies are interleaved `[T, H, W, T, H, W, ...]` (true for
     /// Qwen3.5) rather than block-concatenated. `None` when absent (text-only decoders).
@@ -815,6 +975,17 @@ impl Qwen35Config {
                 "invalid Qwen config.json: hidden_size must be > 0".to_string(),
             ));
         }
+        // `hidden_size` drives the `hidden` / `residual` / `attn_out` / `ffn_out` /
+        // `expert_out` scratch buffers and the `max_q8_input` derivation in
+        // `ForwardScratch::ensure_capacity`, unconditionally on every forward pass. See
+        // `MAX_HIDDEN_SIZE` docs.
+        if cfg.hidden_size > MAX_HIDDEN_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: hidden_size ({}) exceeds MAX_HIDDEN_SIZE \
+                 ({MAX_HIDDEN_SIZE})",
+                cfg.hidden_size
+            )));
+        }
         if cfg.vocab_size == 0 || cfg.vocab_size > MAX_VOCAB_SIZE {
             return Err(InferenceError::Inference(format!(
                 "invalid Qwen config.json: vocab_size ({}) must be > 0 and <= MAX_VOCAB_SIZE \
@@ -823,7 +994,13 @@ impl Qwen35Config {
             )));
         }
         // `intermediate_size` is always present and drives MLP scratch buffer allocations
-        // at every forward pass. See `MAX_INTERMEDIATE_SIZE` docs.
+        // at every forward pass. See `MAX_INTERMEDIATE_SIZE` docs. Zero is a degenerate
+        // zero-width dense FFN, not a valid no-op.
+        if cfg.intermediate_size == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: intermediate_size must be > 0".to_string(),
+            ));
+        }
         if cfg.intermediate_size > MAX_INTERMEDIATE_SIZE {
             return Err(InferenceError::Inference(format!(
                 "invalid Qwen config.json: intermediate_size ({}) exceeds \
@@ -836,10 +1013,30 @@ impl Qwen35Config {
                 "invalid Qwen config.json: num_attention_heads must be > 0".to_string(),
             ));
         }
+        // `ForwardScratch::ensure_capacity` derives `scores = num_attention_heads *
+        // (max_kv_len + 1)` independent of `head_dim` -- `MAX_FULL_ATTENTION_DIM` bounds the
+        // `num_attention_heads * head_dim` product below, but a small `head_dim` paired with a
+        // huge `num_attention_heads` can pass that product check while still inflating
+        // `scores`. See `MAX_ATTENTION_HEADS` docs.
+        if cfg.num_attention_heads > MAX_ATTENTION_HEADS {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: num_attention_heads ({}) exceeds \
+                 MAX_ATTENTION_HEADS ({MAX_ATTENTION_HEADS})",
+                cfg.num_attention_heads
+            )));
+        }
         if cfg.num_key_value_heads == 0 {
             return Err(InferenceError::Inference(
                 "invalid Qwen config.json: num_key_value_heads must be > 0".to_string(),
             ));
+        }
+        // Sibling of the `num_attention_heads` bound above; same `MAX_ATTENTION_HEADS` budget.
+        if cfg.num_key_value_heads > MAX_ATTENTION_HEADS {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: num_key_value_heads ({}) exceeds \
+                 MAX_ATTENTION_HEADS ({MAX_ATTENTION_HEADS})",
+                cfg.num_key_value_heads
+            )));
         }
         if !cfg
             .num_attention_heads
@@ -975,6 +1172,22 @@ impl Qwen35Config {
                  positive multiple of linear_num_key_heads ({key_heads})"
             )));
         }
+        // `linear_key_head_dim` / `linear_value_head_dim` size the GatedDeltaNet state matrix
+        // (`s_matrices = vec![0.0; value_heads * key_dim * value_dim]` in `attention/gdn.rs`);
+        // zero in either dimension is a degenerate zero-width recurrence rather than a valid
+        // no-op. `linear_value_head_dim == 0` also collapses `linear_output_dim()` to zero,
+        // which passes the `MAX_LINEAR_OUTPUT_DIM` check below trivially, so that guard alone
+        // does not catch this case.
+        if cfg.linear_key_head_dim == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: linear_key_head_dim must be > 0".to_string(),
+            ));
+        }
+        if cfg.linear_value_head_dim == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: linear_value_head_dim must be > 0".to_string(),
+            ));
+        }
         // A global config-level budget, independent of layer mix: an all-full-attention config
         // never reaches `load_linear_attention_weights`'s per-layer `checked_linear_output_dim`
         // derivation, yet `ForwardScratch::ensure_capacity` unconditionally derives
@@ -998,36 +1211,42 @@ impl Qwen35Config {
                  exceeds MAX_LINEAR_OUTPUT_DIM ({MAX_LINEAR_OUTPUT_DIM})"
             )));
         }
-        // `RopeParams::mrope_section` is deserialized as a `Vec<usize>` before this validation
-        // pass runs, so an unbounded declared length drives uncontrolled allocation at parse
-        // time even though the field is not yet consumed by the forward pass. See
-        // `MAX_CONFIG_VECTOR_LEN` docs.
-        if let Some(rp) = &cfg.rope_parameters
-            && let Some(mrope_section) = &rp.mrope_section
-            && mrope_section.len() > MAX_CONFIG_VECTOR_LEN
-        {
+        // `MAX_LINEAR_OUTPUT_DIM` above only bounds the `value_heads * linear_value_head_dim`
+        // factor; `linear_key_head_dim` is a free multiplier on top of it in the GatedDeltaNet
+        // state matrix (`s_matrices = vec![0.0; value_heads * key_dim * value_dim]` in
+        // `attention/gdn.rs`) -- a config with `value_heads = 1`, `linear_value_head_dim` near
+        // the `MAX_LINEAR_OUTPUT_DIM` cap, and a huge `linear_key_head_dim` passes both guards
+        // above while allocating on the order of terabytes at first generation. Validate the
+        // full three-factor product globally, independent of layer mix, for the same reason as
+        // the `linear_output_dim` budget above. See `MAX_GDN_STATE_SIZE` docs.
+        let gdn_state_size = value_heads
+            .checked_mul(cfg.linear_key_head_dim)
+            .and_then(|v| v.checked_mul(cfg.linear_value_head_dim))
+            .ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "invalid Qwen config.json: GatedDeltaNet state size overflows usize: \
+                 linear_num_value_heads ({value_heads}) * linear_key_head_dim ({}) * \
+                 linear_value_head_dim ({})",
+                    cfg.linear_key_head_dim, cfg.linear_value_head_dim
+                ))
+            })?;
+        if gdn_state_size > MAX_GDN_STATE_SIZE {
             return Err(InferenceError::Inference(format!(
-                "invalid Qwen config.json: rope_parameters.mrope_section length ({}) exceeds \
-                 MAX_CONFIG_VECTOR_LEN ({MAX_CONFIG_VECTOR_LEN})",
-                mrope_section.len()
+                "invalid Qwen config.json: GatedDeltaNet state size ({gdn_state_size}) exceeds \
+                 MAX_GDN_STATE_SIZE ({MAX_GDN_STATE_SIZE})"
             )));
         }
+        // `RopeParams::mrope_section` is bounded at deserialize time
+        // (`deserialize_mrope_section`, capped at `MAX_CONFIG_VECTOR_LEN`) rather than here --
+        // a post-parse `.len()` check runs after serde has already materialized the Vec in
+        // full, which does not prevent the allocation an oversized declared length would drive.
         // A present `vision_config` must be structurally valid (ADR-069 S1/S2 review
         // feedback): a present-but-malformed object (e.g. `depth: 0`) is syntactically
         // valid JSON and would otherwise silently load a truncated subset of
         // `model.visual.*` tensors instead of failing closed.
         if let Some(vision_cfg) = &cfg.vision_config {
-            // `deepstack_visual_indexes` is deserialized as a `Vec<usize>` before validation
-            // runs, so an unbounded declared length drives uncontrolled allocation at parse
-            // time regardless of whether the indexes are ever consumed. See
-            // `MAX_CONFIG_VECTOR_LEN` docs.
-            if vision_cfg.deepstack_visual_indexes.len() > MAX_CONFIG_VECTOR_LEN {
-                return Err(InferenceError::Inference(format!(
-                    "invalid Qwen config.json: vision_config.deepstack_visual_indexes length \
-                     ({}) exceeds MAX_CONFIG_VECTOR_LEN ({MAX_CONFIG_VECTOR_LEN})",
-                    vision_cfg.deepstack_visual_indexes.len()
-                )));
-            }
+            // `deepstack_visual_indexes` is likewise bounded at deserialize time
+            // (`deserialize_deepstack_visual_indexes`) for the same reason -- see above.
             vision_cfg.validate()?;
         }
         // MoE routing dimensions come from an untrusted checkpoint directory and drive
@@ -1035,8 +1254,27 @@ impl Qwen35Config {
         // cfg.num_experts.unwrap_or(0))` and `router_selected.resize(cfg.num_experts_per_tok
         // .unwrap_or(0), ..)` on every forward pass. A zero-element tensor satisfies shape
         // checks trivially, so nothing else catches an inflated `num_experts` /
-        // `num_experts_per_tok` before those resizes run. Gate on presence so dense
-        // (non-MoE) configs, which leave both fields `None`, are unaffected.
+        // `num_experts_per_tok` before those resizes run.
+        //
+        // `num_experts_per_tok` drives `router_selected.resize` independent of `num_experts`
+        // presence -- a checkpoint can set `num_experts_per_tok` while leaving `num_experts`
+        // unset, so this bound is unconditional rather than gated on `num_experts` like the
+        // "must not exceed num_experts" check further down.
+        if let Some(num_experts_per_tok) = cfg.num_experts_per_tok {
+            if num_experts_per_tok == 0 {
+                return Err(InferenceError::Inference(
+                    "invalid Qwen config.json: num_experts_per_tok must be > 0".to_string(),
+                ));
+            }
+            if num_experts_per_tok > MAX_NUM_EXPERTS {
+                return Err(InferenceError::Inference(format!(
+                    "invalid Qwen config.json: num_experts_per_tok ({num_experts_per_tok}) \
+                     exceeds MAX_NUM_EXPERTS ({MAX_NUM_EXPERTS})"
+                )));
+            }
+        }
+        // Gate on `num_experts` presence so dense (non-MoE) configs, which leave it `None`,
+        // are unaffected.
         if let Some(num_experts) = cfg.num_experts {
             if num_experts == 0 {
                 return Err(InferenceError::Inference(
@@ -1049,40 +1287,57 @@ impl Qwen35Config {
                      MAX_NUM_EXPERTS ({MAX_NUM_EXPERTS})"
                 )));
             }
-            if let Some(num_experts_per_tok) = cfg.num_experts_per_tok {
-                if num_experts_per_tok == 0 {
-                    return Err(InferenceError::Inference(
-                        "invalid Qwen config.json: num_experts_per_tok must be > 0".to_string(),
-                    ));
-                }
-                if num_experts_per_tok > num_experts {
-                    return Err(InferenceError::Inference(format!(
-                        "invalid Qwen config.json: num_experts_per_tok \
-                         ({num_experts_per_tok}) must not exceed num_experts ({num_experts})"
-                    )));
-                }
+            if let Some(num_experts_per_tok) = cfg.num_experts_per_tok
+                && num_experts_per_tok > num_experts
+            {
+                return Err(InferenceError::Inference(format!(
+                    "invalid Qwen config.json: num_experts_per_tok \
+                     ({num_experts_per_tok}) must not exceed num_experts ({num_experts})"
+                )));
             }
         }
         // MoE/shared-expert intermediate sizes drive their own scratch buffer allocations
         // independent of `num_experts` presence. Gate on each field's own presence (like the
         // `num_experts` if-let gate above) so dense configs, which leave both `None`, are
-        // unaffected. See `MAX_INTERMEDIATE_SIZE` docs.
-        if let Some(moe_intermediate_size) = cfg.moe_intermediate_size
-            && moe_intermediate_size > MAX_INTERMEDIATE_SIZE
-        {
-            return Err(InferenceError::Inference(format!(
-                "invalid Qwen config.json: moe_intermediate_size \
-                 ({moe_intermediate_size}) exceeds MAX_INTERMEDIATE_SIZE \
-                 ({MAX_INTERMEDIATE_SIZE})"
-            )));
+        // unaffected. Zero is a degenerate zero-width expert FFN, not a valid no-op, mirroring
+        // the `intermediate_size == 0` check above. See `MAX_INTERMEDIATE_SIZE` docs.
+        if let Some(moe_intermediate_size) = cfg.moe_intermediate_size {
+            if moe_intermediate_size == 0 {
+                return Err(InferenceError::Inference(
+                    "invalid Qwen config.json: moe_intermediate_size must be > 0".to_string(),
+                ));
+            }
+            if moe_intermediate_size > MAX_INTERMEDIATE_SIZE {
+                return Err(InferenceError::Inference(format!(
+                    "invalid Qwen config.json: moe_intermediate_size \
+                     ({moe_intermediate_size}) exceeds MAX_INTERMEDIATE_SIZE \
+                     ({MAX_INTERMEDIATE_SIZE})"
+                )));
+            }
         }
-        if let Some(shared_expert_intermediate_size) = cfg.shared_expert_intermediate_size
-            && shared_expert_intermediate_size > MAX_INTERMEDIATE_SIZE
-        {
+        if let Some(shared_expert_intermediate_size) = cfg.shared_expert_intermediate_size {
+            if shared_expert_intermediate_size == 0 {
+                return Err(InferenceError::Inference(
+                    "invalid Qwen config.json: shared_expert_intermediate_size must be > 0"
+                        .to_string(),
+                ));
+            }
+            if shared_expert_intermediate_size > MAX_INTERMEDIATE_SIZE {
+                return Err(InferenceError::Inference(format!(
+                    "invalid Qwen config.json: shared_expert_intermediate_size \
+                     ({shared_expert_intermediate_size}) exceeds MAX_INTERMEDIATE_SIZE \
+                     ({MAX_INTERMEDIATE_SIZE})"
+                )));
+            }
+        }
+        // `max_position_embeddings` drives the Metal RoPE table allocation (`rope_max *
+        // rope_dim / 2` entries in `build_rope_interleaved`) independent of `head_dim`. See
+        // `MAX_POSITION_EMBEDDINGS` docs.
+        if cfg.max_position_embeddings > MAX_POSITION_EMBEDDINGS {
             return Err(InferenceError::Inference(format!(
-                "invalid Qwen config.json: shared_expert_intermediate_size \
-                 ({shared_expert_intermediate_size}) exceeds MAX_INTERMEDIATE_SIZE \
-                 ({MAX_INTERMEDIATE_SIZE})"
+                "invalid Qwen config.json: max_position_embeddings ({}) exceeds \
+                 MAX_POSITION_EMBEDDINGS ({MAX_POSITION_EMBEDDINGS})",
+                cfg.max_position_embeddings
             )));
         }
 
@@ -2036,6 +2291,16 @@ mod tests {
     /// `ForwardScratch::ensure_capacity` unconditionally computes `full_q_dim()` and
     /// `2 * q_dim` for every config during generation. `num_attention_heads * head_dim`
     /// must be rejected at parse time even when no full-attention layer is present.
+    ///
+    /// Originally exercised the `checked_mul` overflow guard directly (an `usize::MAX`
+    /// `num_attention_heads` overflowing the `* head_dim` product). `MAX_ATTENTION_HEADS`
+    /// (added alongside `MAX_HIDDEN_SIZE` / `MAX_POSITION_EMBEDDINGS` in the allocation-scalar
+    /// sweep) now rejects any `num_attention_heads` above 8,192 before that multiplication
+    /// runs -- and since `MAX_ATTENTION_HEADS * MAX_HEAD_DIM` (8,192 * 2,048 = 16,777,216)
+    /// never overflows `usize`, the overflow branch is no longer reachable through
+    /// `num_attention_heads` alone. The `checked_mul` call stays in the source as
+    /// defense-in-depth (e.g. against a future `MAX_ATTENTION_HEADS` or `MAX_HEAD_DIM`
+    /// increase); this test now covers `MAX_ATTENTION_HEADS` catching the same extreme input.
     #[test]
     fn test_full_q_dim_overflow_rejected_all_linear_config() {
         let json = format!(
@@ -2046,12 +2311,12 @@ mod tests {
         );
         let err = Qwen35Config::from_config_json_str(&json)
             .expect_err(
-                "num_attention_heads * head_dim overflow must yield an InferenceError even for \
-                 an all-linear-attention config",
+                "an extreme num_attention_heads must yield an InferenceError even for an \
+                 all-linear-attention config",
             )
             .to_string();
         assert!(
-            err.contains("q_dim") && err.contains("overflows"),
+            err.contains("num_attention_heads") && err.contains("MAX_ATTENTION_HEADS"),
             "wrong guard fired: {err}"
         );
     }
@@ -2062,6 +2327,10 @@ mod tests {
     /// this still proves the KV-dimension geometry is bound by the same global check, since
     /// `full_kv_dim` shares `head_dim` with `full_q_dim` and neither guard can be bypassed by
     /// routing the overflow through the KV head count instead of the Q head count.
+    ///
+    /// As with the Q-dim test above, `MAX_ATTENTION_HEADS` now catches this extreme
+    /// `num_attention_heads` (checked before `num_key_value_heads`) ahead of the
+    /// `checked_mul` overflow branch it originally targeted; see that test's doc comment.
     #[test]
     fn test_full_kv_dim_overflow_rejected_all_linear_config() {
         let json = format!(
@@ -2072,11 +2341,14 @@ mod tests {
         );
         let err = Qwen35Config::from_config_json_str(&json)
             .expect_err(
-                "num_key_value_heads * head_dim overflow must yield an InferenceError even for \
-                 an all-linear-attention config",
+                "an extreme num_attention_heads / num_key_value_heads must yield an \
+                 InferenceError even for an all-linear-attention config",
             )
             .to_string();
-        assert!(err.contains("overflows"), "wrong guard fired: {err}");
+        assert!(
+            err.contains("MAX_ATTENTION_HEADS"),
+            "wrong guard fired: {err}"
+        );
     }
 
     #[test]
@@ -2469,29 +2741,14 @@ mod tests {
         assert!(err.contains("rope_dim"), "wrong guard fired: {err}");
     }
 
-    #[test]
-    fn test_rope_dim_exceeds_head_dim_via_f32_rounding_errors() {
-        // Originally exercised the `rope_dim > cfg.head_dim` guard's f32-rounding edge case:
-        // rope_dim() casts head_dim through f32, and head_dim=16_777_219 (2^24 + 3) -- above
-        // f32's exact-integer range -- rounds UP to 16_777_220, so partial_rotary_factor=1.0
-        // (which keeps rope_dim <= head_dim in real arithmetic) still yields rope_dim >
-        // head_dim after the cast.
-        //
-        // `MAX_HEAD_DIM` (2048) now rejects this head_dim before rope_dim is even computed --
-        // and since 2048 is far below f32's 2^24 exact-integer boundary, the rounding artifact
-        // this test targeted is no longer reachable through any head_dim MAX_HEAD_DIM admits.
-        // The `rope_dim > cfg.head_dim` line stays in place as defense-in-depth (e.g. against
-        // a future MAX_HEAD_DIM increase); at this input, both guards independently reject, so
-        // this test alone can't isolate either one's mutation sensitivity --
-        // `test_head_dim_over_max_rejected_all_linear_config` covers `MAX_HEAD_DIM` in
-        // isolation (head_dim just above the cap, with a `partial_rotary_factor` too small to
-        // also trip the rope_dim guard).
-        let json = r#"{"text_config": {"head_dim": 16777219, "partial_rotary_factor": 1.0}}"#;
-        let err = Qwen35Config::from_config_json_str(json)
-            .expect_err("head_dim=16_777_219 must yield an InferenceError, not OOB")
-            .to_string();
-        assert!(err.contains("head_dim"), "wrong guard fired: {err}");
-    }
+    // `test_rope_dim_exceeds_head_dim_via_f32_rounding_errors` removed: it targeted
+    // `rope_dim() casting head_dim through f32 and rounding up past head_dim`, only
+    // observable at head_dim >= 2^24 (16,777,216). `MAX_HEAD_DIM` (2048) now rejects every
+    // head_dim in that range before `rope_dim()` is ever computed, so the f32-rounding edge
+    // is no longer reachable through any config this parser admits. `MAX_HEAD_DIM` itself is
+    // covered by `test_head_dim_over_max_rejected_all_linear_config` /
+    // `test_head_dim_at_max_accepted_all_linear_config`; the `rope_dim > cfg.head_dim` line
+    // stays in the source as defense-in-depth against a future `MAX_HEAD_DIM` increase.
 
     #[test]
     fn test_generate_config_enable_thinking_default_and_toggle() {
@@ -3296,6 +3553,284 @@ mod tests {
         assert!(
             err.to_string().contains("config.json") || err.to_string().contains("invalid Qwen"),
             "error must reflect the parse failure: {err}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // GatedDeltaNet state-matrix three-factor budget (MAX_GDN_STATE_SIZE)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `MAX_LINEAR_OUTPUT_DIM` only bounds `value_heads * linear_value_head_dim`;
+    /// `linear_key_head_dim` is a free multiplier on top of it in `attention/gdn.rs`'s
+    /// `s_matrices` allocation. `value_heads = 1`, `linear_value_head_dim` just under the
+    /// `MAX_LINEAR_OUTPUT_DIM` cap, and a huge `linear_key_head_dim` must pass
+    /// `MAX_LINEAR_OUTPUT_DIM` (linear_output_dim = value_dim, well under the cap) while still
+    /// being rejected by the three-factor `MAX_GDN_STATE_SIZE` budget.
+    #[test]
+    fn parser_rejects_gdn_state_size_over_max_with_small_output_dim() {
+        let json = r#"{"text_config": {
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 1000000,
+            "linear_value_head_dim": 128
+        }}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err(
+                "a huge linear_key_head_dim must be rejected by MAX_GDN_STATE_SIZE even though \
+                 linear_output_dim (value_heads * linear_value_head_dim) is tiny",
+            )
+            .to_string();
+        assert!(
+            err.contains("GatedDeltaNet state size") && err.contains("MAX_GDN_STATE_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Accept-case control: realistic GDN geometry (matching the preset) must still parse.
+    #[test]
+    fn parser_accepts_realistic_gdn_state_size() {
+        let json = r#"{"text_config": {
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        }}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "realistic GDN geometry must be accepted"
+        );
+    }
+
+    /// Zero `linear_key_head_dim` is a degenerate zero-width GDN recurrence.
+    #[test]
+    fn parser_rejects_zero_linear_key_head_dim() {
+        let json = r#"{"text_config": {"linear_key_head_dim": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("linear_key_head_dim: 0 must be rejected")
+            .to_string();
+        assert!(
+            err.contains("linear_key_head_dim"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Zero `linear_value_head_dim` is a degenerate zero-width GDN recurrence, and would
+    /// otherwise collapse `linear_output_dim()` to zero -- passing `MAX_LINEAR_OUTPUT_DIM`
+    /// trivially rather than being caught by it.
+    #[test]
+    fn parser_rejects_zero_linear_value_head_dim() {
+        let json = r#"{"text_config": {"linear_value_head_dim": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("linear_value_head_dim: 0 must be rejected")
+            .to_string();
+        assert!(
+            err.contains("linear_value_head_dim"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // hidden_size upper bound (MAX_HIDDEN_SIZE)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parser_rejects_hidden_size_over_max() {
+        let json = format!(
+            r#"{{"text_config": {{"hidden_size": {}}}}}"#,
+            MAX_HIDDEN_SIZE + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("hidden_size above MAX_HIDDEN_SIZE must be rejected")
+            .to_string();
+        assert!(
+            err.contains("hidden_size") && err.contains("MAX_HIDDEN_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_hidden_size_at_max() {
+        let json = format!(r#"{{"text_config": {{"hidden_size": {MAX_HIDDEN_SIZE}}}}}"#);
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "hidden_size == MAX_HIDDEN_SIZE must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // attention head-count upper bound (MAX_ATTENTION_HEADS)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `num_attention_heads` drives `scores = num_attention_heads * (max_kv_len + 1)`
+    /// independent of `head_dim`; a small `head_dim` (1) paired with a huge
+    /// `num_attention_heads` still passes `MAX_FULL_ATTENTION_DIM` (the product stays small)
+    /// so `MAX_ATTENTION_HEADS` must fire on its own.
+    #[test]
+    fn parser_rejects_num_attention_heads_over_max() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": 1, "num_attention_heads": {}, "num_key_value_heads": 1}}}}"#,
+            MAX_ATTENTION_HEADS + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("num_attention_heads above MAX_ATTENTION_HEADS must be rejected")
+            .to_string();
+        assert!(
+            err.contains("num_attention_heads") && err.contains("MAX_ATTENTION_HEADS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_num_attention_heads_at_max() {
+        // head_dim=8 with the default partial_rotary_factor (0.25) gives rope_dim=2, the
+        // smallest value that clears the `rope_dim >= 2` guard -- head_dim=1 would derive
+        // rope_dim=0 and fail that unrelated check instead of exercising this bound.
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": 8, "num_attention_heads": {MAX_ATTENTION_HEADS}, "num_key_value_heads": 1}}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "num_attention_heads == MAX_ATTENTION_HEADS must be accepted"
+        );
+    }
+
+    /// `num_attention_heads` must be divisible by `num_key_value_heads`, which forces
+    /// `num_attention_heads >= num_key_value_heads` -- so isolating this bound requires
+    /// `num_attention_heads` to stay within its own budget while `num_key_value_heads` alone
+    /// exceeds it (the reverse combination is unreachable: an out-of-budget
+    /// `num_key_value_heads` would always drag `num_attention_heads` out of budget too).
+    #[test]
+    fn parser_rejects_num_key_value_heads_over_max() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": 1, "num_attention_heads": {MAX_ATTENTION_HEADS}, "num_key_value_heads": {}}}}}"#,
+            MAX_ATTENTION_HEADS + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("num_key_value_heads above MAX_ATTENTION_HEADS must be rejected")
+            .to_string();
+        assert!(
+            err.contains("num_key_value_heads") && err.contains("MAX_ATTENTION_HEADS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_num_key_value_heads_at_max() {
+        // head_dim=8: see parser_accepts_num_attention_heads_at_max for why not 1.
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": 8, "num_attention_heads": {MAX_ATTENTION_HEADS}, "num_key_value_heads": {MAX_ATTENTION_HEADS}}}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "num_key_value_heads == MAX_ATTENTION_HEADS must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // num_experts_per_tok upper bound independent of num_experts presence
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `router_selected.resize(cfg.num_experts_per_tok.unwrap_or(0), ..)` runs regardless of
+    /// whether `num_experts` is present; a checkpoint that sets `num_experts_per_tok` while
+    /// leaving `num_experts` unset must still be bounded.
+    #[test]
+    fn parser_rejects_num_experts_per_tok_over_max_without_num_experts() {
+        let json = format!(
+            r#"{{"text_config": {{"num_experts": null, "num_experts_per_tok": {}}}}}"#,
+            MAX_NUM_EXPERTS + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "num_experts_per_tok above MAX_NUM_EXPERTS must be rejected even when \
+                 num_experts is absent",
+            )
+            .to_string();
+        assert!(
+            err.contains("num_experts_per_tok") && err.contains("MAX_NUM_EXPERTS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_num_experts_per_tok_at_max_without_num_experts() {
+        let json = format!(
+            r#"{{"text_config": {{"num_experts": null, "num_experts_per_tok": {MAX_NUM_EXPERTS}}}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "num_experts_per_tok == MAX_NUM_EXPERTS must be accepted when num_experts is absent"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // nonzero lower bounds: intermediate_size / moe / shared-expert intermediate sizes
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parser_rejects_zero_intermediate_size() {
+        let json = r#"{"text_config": {"intermediate_size": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("intermediate_size: 0 must be rejected")
+            .to_string();
+        assert!(
+            err.contains("intermediate_size"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_zero_moe_intermediate_size() {
+        let json = r#"{"text_config": {"moe_intermediate_size": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("moe_intermediate_size: 0 must be rejected")
+            .to_string();
+        assert!(
+            err.contains("moe_intermediate_size"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_rejects_zero_shared_expert_intermediate_size() {
+        let json = r#"{"text_config": {"shared_expert_intermediate_size": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("shared_expert_intermediate_size: 0 must be rejected")
+            .to_string();
+        assert!(
+            err.contains("shared_expert_intermediate_size"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // max_position_embeddings upper bound (MAX_POSITION_EMBEDDINGS)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Drives the Metal RoPE table allocation (`rope_max * rope_dim / 2`), independent of
+    /// `head_dim`.
+    #[test]
+    fn parser_rejects_max_position_embeddings_over_max() {
+        let json = format!(
+            r#"{{"text_config": {{"max_position_embeddings": {}}}}}"#,
+            MAX_POSITION_EMBEDDINGS + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("max_position_embeddings above MAX_POSITION_EMBEDDINGS must be rejected")
+            .to_string();
+        assert!(
+            err.contains("max_position_embeddings") && err.contains("MAX_POSITION_EMBEDDINGS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_max_position_embeddings_at_max() {
+        let json = format!(
+            r#"{{"text_config": {{"max_position_embeddings": {MAX_POSITION_EMBEDDINGS}}}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "max_position_embeddings == MAX_POSITION_EMBEDDINGS must be accepted"
         );
     }
 }
