@@ -213,8 +213,13 @@ pub(crate) const MAX_LINEAR_NUM_VALUE_HEADS: usize = 8_192;
 /// tiles the prefill window into chunks of this size; duplicated here (rather than
 /// imported) because `forward/metal_qwen35.rs` is behind the `metal-gpu` feature and
 /// `qwen35_config.rs` must validate on every build, including CPU-only ones. If the
-/// engine's chunk size ever changes, this mirror must change with it -- see the
-/// `test_gdn_chunk_scratch_mirror_matches_engine_constant` regression test.
+/// engine's chunk size ever changes, this mirror must change with it. No automated
+/// drift-guard test asserts this equality: `metal_qwen35.rs`'s `GDN_CHUNK_SIZE` is a
+/// private `const` inside a module gated by the `metal-gpu` feature, and exposing it to a
+/// cross-module equality test would require changing that file's visibility -- out of
+/// scope for a round that must leave `forward/metal_qwen35.rs` untouched (see this PR's
+/// scoping note). Change both constants together by hand if the engine's chunk size ever
+/// changes; a `metal-gpu`-gated drift test is tracked as follow-up work.
 const GDN_CHUNK_SIZE_MIRROR: usize = 32;
 
 /// Mirror of `forward/metal_qwen35.rs`'s hardcoded `max_cache_len.min(512)` prefill cap
