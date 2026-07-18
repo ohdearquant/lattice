@@ -53,12 +53,13 @@ pub struct MicroLoraConfig {
     /// Index of the first materialised (trained) layer. Layers before this are
     /// run frozen by the model's own forward pass.
     pub first_layer: usize,
-    /// Index of the last materialised (trained) layer, inclusive. `None`
-    /// trains through the model's true top layer (the full suffix from
-    /// `first_layer`), so the trained computation always matches the
-    /// deployed forward pass regardless of the loaded model's depth.
-    /// Callers that need a narrower bounded window (e.g. matching a
-    /// specific historical checkpoint) set this explicitly.
+    /// Index of the last LoRA-adapted (trainable) layer, inclusive. Layers
+    /// above this bound, through the model's true top layer, are still
+    /// materialised and run frozen — the forward pass, loss, and gradients
+    /// always cover the full deployed suffix from `first_layer` regardless
+    /// of where the trainable window ends. `None` trains through the
+    /// model's true top layer, leaving no frozen suffix above the trained
+    /// window.
     pub last_layer: Option<usize>,
     /// Number of Adam steps.
     pub steps: usize,
@@ -128,6 +129,15 @@ fn trainable_layer_range(
         None => top_layer,
     };
     Ok(first_layer..=end_layer)
+}
+
+/// Layer indices the tape must materialise, always ending at `top_layer`
+/// regardless of where the trainable (LoRA-adapted) window ends. Bounding
+/// this by the trainable window's own end instead would silently drop the
+/// frozen suffix above it from the forward pass, so the computed loss and
+/// gradients would reflect a network shorter than the one that is deployed.
+fn materialized_layer_range(first_layer: usize, top_layer: usize) -> RangeInclusive<usize> {
+    first_layer..=top_layer
 }
 
 /// Validate `train_micro_lora` inputs before model access or allocation.
@@ -265,20 +275,33 @@ pub fn train_micro_lora(
         final_shift: &final_shift,
     };
 
-    // Build the materialised layer stack through the model's true top layer.
-    let mut layers: Vec<LayerW> = Vec::new();
-    let mut slot_layers: Vec<usize> = Vec::new();
-    for layer_idx in trainable_layer_range(
+    // The trainable (LoRA-adapted) window may end before the model's true
+    // top layer; the materialised stack always extends through the true top
+    // so the forward pass matches the deployed full-depth model. Layers
+    // above the trainable window are still materialised and run through
+    // the tape, but frozen (no LoRA slot).
+    let trainable_range = trainable_layer_range(
         num_hidden_layers,
         loaded_layer_count,
         first_layer,
         config.last_layer,
-    )? {
+    )?;
+    let trainable_last = *trainable_range.end();
+    let top_layer = num_hidden_layers - 1;
+    let mut layers: Vec<LayerW> = Vec::new();
+    let mut slot_layers: Vec<usize> = Vec::new();
+    for layer_idx in materialized_layer_range(first_layer, top_layer) {
+        let trainable = layer_idx <= trainable_last;
         if let Some((w_q, w_k, w_v, w_o, q_norm, k_norm, pre, post, gate, up, down)) =
             model.gqa_layer_weights(layer_idx)
         {
-            let slot = slot_layers.len();
-            slot_layers.push(layer_idx);
+            let lora_slot = if trainable {
+                let slot = slot_layers.len();
+                slot_layers.push(layer_idx);
+                Some(slot)
+            } else {
+                None
+            };
             layers.push(LayerW {
                 kind: MixerKind::Gqa,
                 w_q,
@@ -293,7 +316,7 @@ pub fn train_micro_lora(
                 w_gate: gate,
                 w_up: up,
                 w_down: down,
-                lora_slot: Some(slot),
+                lora_slot,
             });
         } else if let Some((gdn, pre, post, gate, up, down)) = model.gdn_layer_weights(layer_idx) {
             layers.push(LayerW {
@@ -717,5 +740,32 @@ mod tests {
         // On the original 24-layer checkpoint the suffix is unchanged.
         let range24 = trainable_layer_range(24, 24, cfg.first_layer, cfg.last_layer).unwrap();
         assert_eq!(range24.collect::<Vec<_>>(), vec![19, 20, 21, 22, 23]);
+    }
+
+    /// Mutation-sensitive: a bounded trainable window (`last_layer =
+    /// Some(23)`) must not truncate the materialised forward suffix on a
+    /// model deeper than 24 layers. `train_micro_lora` uses
+    /// `materialized_layer_range`, not `trainable_layer_range`, to build its
+    /// `layers` tape — the trainable window only decides which materialised
+    /// GQA layers get a LoRA slot. If the materialisation loop is reverted to
+    /// stop at `trainable_last` (the pre-fix behavior), this range would end
+    /// at 23 instead of 39, and every frozen layer above 23 would be missing
+    /// from the tape.
+    #[test]
+    fn materialized_layer_range_reaches_true_top_past_a_bounded_trainable_window() {
+        let materialized: Vec<usize> = materialized_layer_range(19, 39).collect();
+        assert_eq!(materialized.first(), Some(&19));
+        assert_eq!(
+            materialized.last(),
+            Some(&39),
+            "materialization must reach the model's true top layer (39), \
+             not stop at a bounded trainable window's end (23)"
+        );
+        assert_eq!(materialized.len(), 21);
+
+        // The trainable window itself is still correctly bounded — only
+        // layers up to 23 are eligible for a LoRA slot.
+        let trainable = trainable_layer_range(40, 40, 19, Some(23)).unwrap();
+        assert_eq!(*trainable.end(), 23);
     }
 }

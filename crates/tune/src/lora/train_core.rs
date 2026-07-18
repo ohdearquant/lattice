@@ -659,10 +659,24 @@ pub fn forward_full(
 
         let (mixer_out, mixer_cache) = match lw.kind {
             MixerKind::Gqa => {
-                let slot = lw.lora_slot.ok_or_else(|| {
-                    TuneError::Validation("GQA layer is missing a LoRA slot".to_string())
-                })?;
-                let lora = &loras[slot];
+                let (lora_a_q, lora_b_q, lora_a_v, lora_b_v, eff_rank, eff_scale) =
+                    match lw.lora_slot {
+                        Some(slot) => {
+                            let lora = &loras[slot];
+                            (
+                                Some(lora.a_q.as_slice()),
+                                Some(lora.b_q.as_slice()),
+                                Some(lora.a_v.as_slice()),
+                                Some(lora.b_v.as_slice()),
+                                rank,
+                                scale,
+                            )
+                        }
+                        // A layer above the trainable window: still runs
+                        // frozen so the forward pass covers the model's
+                        // full deployed suffix.
+                        None => (None, None, None, None, 0, 0.0),
+                    };
                 let (out, cache) = gqa_forward_with_cache(
                     &normed_pre,
                     lw.w_q,
@@ -671,12 +685,12 @@ pub fn forward_full(
                     lw.w_o,
                     lw.q_norm,
                     lw.k_norm,
-                    Some(&lora.a_q),
-                    Some(&lora.b_q),
-                    Some(&lora.a_v),
-                    Some(&lora.b_v),
-                    rank,
-                    scale,
+                    lora_a_q,
+                    lora_b_q,
+                    lora_a_v,
+                    lora_b_v,
+                    eff_rank,
+                    eff_scale,
                     seq,
                     hidden,
                     d.num_q_heads,
@@ -927,32 +941,33 @@ pub fn nll_and_grads(
 
         let d_normed_pre: Vec<f32> = match &lf.mixer {
             MixerCache::Gqa(cache) => {
-                let slot = lw.lora_slot.ok_or_else(|| {
-                    TuneError::Validation("GQA layer missing LoRA slot in backward".to_string())
-                })?;
-                let lora = &loras[slot];
+                let (lora_a_q, lora_b_q, lora_a_v, lora_b_v, eff_rank, eff_scale) =
+                    match lw.lora_slot {
+                        Some(slot) => {
+                            let lora = &loras[slot];
+                            (
+                                Some(lora.a_q.as_slice()),
+                                Some(lora.b_q.as_slice()),
+                                Some(lora.a_v.as_slice()),
+                                Some(lora.b_v.as_slice()),
+                                rank,
+                                scale,
+                            )
+                        }
+                        None => (None, None, None, None, 0, 0.0),
+                    };
                 let g = gqa_backward(
-                    &d_h_mid,
-                    cache,
-                    lw.w_q,
-                    lw.w_k,
-                    lw.w_v,
-                    lw.w_o,
-                    lw.q_norm,
-                    lw.k_norm,
-                    Some(&lora.a_q),
-                    Some(&lora.b_q),
-                    Some(&lora.a_v),
-                    Some(&lora.b_v),
-                    rank,
-                    scale,
+                    &d_h_mid, cache, lw.w_q, lw.w_k, lw.w_v, lw.w_o, lw.q_norm, lw.k_norm,
+                    lora_a_q, lora_b_q, lora_a_v, lora_b_v, eff_rank, eff_scale,
                 );
-                grads[slot] = Grads {
-                    a_q: g.grad_a_q,
-                    b_q: g.grad_b_q,
-                    a_v: g.grad_a_v,
-                    b_v: g.grad_b_v,
-                };
+                if let Some(slot) = lw.lora_slot {
+                    grads[slot] = Grads {
+                        a_q: g.grad_a_q,
+                        b_q: g.grad_b_q,
+                        a_v: g.grad_a_v,
+                        b_v: g.grad_b_v,
+                    };
+                }
                 g.dx
             }
             MixerCache::Gdn(saved) => {

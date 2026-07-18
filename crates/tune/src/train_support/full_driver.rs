@@ -170,6 +170,22 @@ const MAX_RANK: usize = 512;
 /// caller-controlled work (mirrors [`crate::lora::train`]'s bound).
 const MAX_STEPS: usize = 100_000;
 
+/// Upper bound on `--max-train` / `--max-valid` sample counts accepted by
+/// [`run`]. Bounds tokenization and per-sample activation-cache work before
+/// any of it runs; a real training or validation set this large is already
+/// well beyond what a single CPU driver invocation is meant to process.
+const MAX_SAMPLES: usize = 100_000;
+
+/// Upper bound on `--seq-len-cap` accepted by [`run`]. Mirrors
+/// [`crate::lora::train`]'s `MAX_TRAIN_SEQ_LEN`, the same per-pair sequence
+/// ceiling used by the public micro-LoRA trainer.
+const MAX_SEQ_LEN_CAP: usize = 8_192;
+
+/// Upper bound on captured-logits memory for one cache set (training or
+/// validation), matching the 2 GiB `f32` cap already enforced for the
+/// training cache.
+const MAX_LOGITS_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 /// Validate the loaded model's depth against the driver's fixed `TOP_LAYER`
 /// range before any layer access. [`Qwen35Model::gqa_layer_weights`] and
 /// [`Qwen35Model::gdn_layer_weights`] index layer storage directly by
@@ -215,6 +231,18 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     }
     if steps > MAX_STEPS {
         return Err(format!("--steps {steps} must be <= {MAX_STEPS}").into());
+    }
+    if log_every == 0 {
+        return Err("--log-every must be > 0".into());
+    }
+    if max_train > MAX_SAMPLES {
+        return Err(format!("--max-train {max_train} exceeds maximum {MAX_SAMPLES}").into());
+    }
+    if max_valid > MAX_SAMPLES {
+        return Err(format!("--max-valid {max_valid} exceeds maximum {MAX_SAMPLES}").into());
+    }
+    if seq_len_cap == 0 || seq_len_cap > MAX_SEQ_LEN_CAP {
+        return Err(format!("--seq-len-cap {seq_len_cap} must be in 1..={MAX_SEQ_LEN_CAP}").into());
     }
     if let Some(amplitude) = a_init_amp
         && (!amplitude.is_finite() || amplitude < 0.0)
@@ -375,7 +403,6 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     let tcache = Instant::now();
     let (caches, total_positions) = build_caches(&model, &train_samples, first_layer)?;
     let logits_bytes = total_positions * dims.vocab * 4;
-    const MAX_LOGITS_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
     if logits_bytes > MAX_LOGITS_BYTES {
         return Err(format!(
             "logits buffer would require {} MiB ({} positions × {} vocab × 4B), \
@@ -403,6 +430,16 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         ) {
             Ok(vs) if !vs.is_empty() => {
                 let (vc, vpos) = build_caches(&model, &vs, first_layer)?;
+                let valid_logits_bytes = vpos * dims.vocab * 4;
+                if valid_logits_bytes > MAX_LOGITS_BYTES {
+                    return Err(format!(
+                        "held-out logits buffer would require {} MiB ({vpos} positions × {} \
+                         vocab × 4B), exceeds 2 GiB cap — reduce --seq-len or --max-valid",
+                        valid_logits_bytes / (1024 * 1024),
+                        dims.vocab,
+                    )
+                    .into());
+                }
                 println!(
                     "  held-out: {vpos} completion positions across {} valid samples",
                     vc.len()
@@ -995,6 +1032,73 @@ mod run_bounds_tests {
     fn validate_loaded_depth_accepts_sufficient_model() {
         validate_loaded_depth(TOP_LAYER + 1).unwrap();
         validate_loaded_depth(40).unwrap();
+    }
+
+    /// Mutation-sensitive: without the `log_every == 0` guard, a caller
+    /// passing `--log-every 0` with `steps > 0` reaches `step % log_every`
+    /// in the training loop and panics on divide-by-zero.
+    #[test]
+    fn run_rejects_zero_log_every() {
+        let mut cfg = base_config();
+        cfg.log_every = 0;
+        let err = expect_err(run(cfg));
+        assert!(
+            err.contains("--log-every"),
+            "expected log-every rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: without the `--max-train` cap, an oversized value
+    /// reaches JSONL tokenization and per-sample activation-cache work
+    /// instead of being rejected up front.
+    #[test]
+    fn run_rejects_max_train_over_max() {
+        let mut cfg = base_config();
+        cfg.max_train = MAX_SAMPLES + 1;
+        let err = expect_err(run(cfg));
+        assert!(
+            err.contains("--max-train") && err.contains(&MAX_SAMPLES.to_string()),
+            "expected max-train-over-cap rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: without the `--max-valid` cap, an oversized value
+    /// reaches JSONL tokenization and per-sample activation-cache work
+    /// instead of being rejected up front.
+    #[test]
+    fn run_rejects_max_valid_over_max() {
+        let mut cfg = base_config();
+        cfg.max_valid = MAX_SAMPLES + 1;
+        let err = expect_err(run(cfg));
+        assert!(
+            err.contains("--max-valid") && err.contains(&MAX_SAMPLES.to_string()),
+            "expected max-valid-over-cap rejection; got: {err}"
+        );
+    }
+
+    /// Mutation-sensitive: without the `--seq-len-cap` cap, an oversized
+    /// value reaches tokenization and per-sample activation-cache allocation
+    /// (`seq_len * hidden` per sample) unbounded.
+    #[test]
+    fn run_rejects_seq_len_cap_over_max() {
+        let mut cfg = base_config();
+        cfg.seq_len_cap = MAX_SEQ_LEN_CAP + 1;
+        let err = expect_err(run(cfg));
+        assert!(
+            err.contains("--seq-len-cap") && err.contains(&MAX_SEQ_LEN_CAP.to_string()),
+            "expected seq-len-cap-over-cap rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_rejects_zero_seq_len_cap() {
+        let mut cfg = base_config();
+        cfg.seq_len_cap = 0;
+        let err = expect_err(run(cfg));
+        assert!(
+            err.contains("--seq-len-cap"),
+            "expected zero-seq-len-cap rejection; got: {err}"
+        );
     }
 }
 
