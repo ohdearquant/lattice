@@ -72,11 +72,27 @@ pub(super) fn validate_required_tensor_names<T: TensorSource + ?Sized>(
     Ok(())
 }
 
+/// Loads and shape-checks a tensor, validating the declared shape against
+/// `expected` *before* materializing the owned buffer. Rejecting a mismatch
+/// at the metadata stage (via [`TensorSource::tensor_shape`]) avoids decoding
+/// and copying a tensor the caller is about to discard, which matters for a
+/// checkpoint carrying an oversized mismatched tensor. A tensor absent from
+/// the source (`tensor_shape` returns `Ok(None)`) falls through to
+/// `get_f32_tensor_owned`, which reports the missing-tensor error.
 fn load_owned_tensor_checked<T: TensorSource + ?Sized>(
     source: &mut T,
     name: &str,
     expected: &[usize],
 ) -> Result<Vec<f32>, InferenceError> {
+    if let Some(declared) = source.tensor_shape(name)?
+        && declared != expected
+    {
+        return Err(InferenceError::ShapeMismatch {
+            name: name.to_string(),
+            expected: expected.to_vec(),
+            actual: declared,
+        });
+    }
     let (data, shape) = source.get_f32_tensor_owned(name)?;
     if shape != expected {
         return Err(InferenceError::ShapeMismatch {
@@ -325,12 +341,11 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
     source: &mut T,
     cfg: &Qwen35Config,
     prefix: &str,
-    hidden: usize,
-    _num_heads: usize,
-    qkv_dim: usize,
-    output_dim: usize,
-    kernel_size: usize,
 ) -> Result<AttentionWeights, InferenceError> {
+    let hidden = cfg.hidden_size;
+    let qkv_dim = checked_linear_qkv_dim(cfg)?;
+    let output_dim = checked_linear_output_dim(cfg)?;
+    let kernel_size = cfg.linear_conv_kernel_dim;
     let value_heads = cfg.linear_num_value_heads();
     let value_dim = cfg.linear_value_head_dim;
     let qkv = load_owned_tensor_checked(
@@ -415,10 +430,6 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
     cfg: &Qwen35Config,
 ) -> Result<ModelWeights, InferenceError> {
     let hidden = cfg.hidden_size;
-    let num_heads = cfg.linear_num_key_heads;
-    let qkv_dim = checked_linear_qkv_dim(cfg)?;
-    let output_dim = checked_linear_output_dim(cfg)?;
-    let kernel_size = cfg.linear_conv_kernel_dim;
 
     let embed_tokens = load_owned_tensor_checked(
         source,
@@ -470,16 +481,7 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
         let attn = if cfg.is_full_attention(i) {
             load_full_attention_weights(source, cfg, &prefix)?
         } else {
-            load_linear_attention_weights(
-                source,
-                cfg,
-                &prefix,
-                hidden,
-                num_heads,
-                qkv_dim,
-                output_dim,
-                kernel_size,
-            )?
+            load_linear_attention_weights(source, cfg, &prefix)?
         };
 
         layers.push((attn, common));
@@ -523,6 +525,36 @@ mod tests {
         }
     }
 
+    /// A mock tensor source whose declared metadata shape (`tensor_shape`) can differ
+    /// from the actual stored tensor shape, and which counts calls to
+    /// `get_f32_tensor_owned`. Used to prove the shape preflight in
+    /// `load_owned_tensor_checked` rejects a mismatch from metadata alone, without
+    /// ever materializing the owned buffer.
+    struct CallCountingMockTensorSource {
+        /// name -> (data, declared shape returned by `tensor_shape`)
+        tensors: std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>,
+        owned_get_calls: std::cell::Cell<usize>,
+    }
+
+    impl TensorSource for CallCountingMockTensorSource {
+        fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+            Ok(self.tensors.contains_key(name))
+        }
+        fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, s)| s.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.owned_get_calls.set(self.owned_get_calls.get() + 1);
+            self.tensors
+                .get(name)
+                .map(|(d, s)| (d.clone(), s.clone()))
+                .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
     impl TensorSource for NullTensorSource {
         fn has_tensor(&mut self, _name: &str) -> Result<bool, InferenceError> {
             Ok(false)
@@ -550,7 +582,6 @@ mod tests {
         let value_heads = cfg.linear_num_value_heads(); // 32
         let qkv_dim = cfg.linear_qkv_dim();
         let output_dim = cfg.linear_output_dim();
-        let kernel_size = cfg.linear_conv_kernel_dim;
 
         assert_ne!(
             key_heads, value_heads,
@@ -581,16 +612,7 @@ mod tests {
             .collect(),
         };
 
-        let result = load_linear_attention_weights(
-            &mut src,
-            &cfg,
-            prefix,
-            hidden,
-            key_heads,
-            qkv_dim,
-            output_dim,
-            kernel_size,
-        );
+        let result = load_linear_attention_weights(&mut src, &cfg, prefix);
 
         match result {
             Err(InferenceError::ShapeMismatch {
@@ -710,10 +732,7 @@ mod tests {
     fn gdn_undersized_in_proj_qkv_shape_rejected() {
         let cfg = Qwen35Config::qwen35_0_8b();
         let hidden = cfg.hidden_size;
-        let key_heads = cfg.linear_num_key_heads;
         let qkv_dim = cfg.linear_qkv_dim();
-        let output_dim = cfg.linear_output_dim();
-        let kernel_size = cfg.linear_conv_kernel_dim;
         let prefix = "layers.0";
         let undersized_rows = qkv_dim / 2;
 
@@ -729,16 +748,7 @@ mod tests {
             .collect(),
         };
 
-        let result = load_linear_attention_weights(
-            &mut src,
-            &cfg,
-            prefix,
-            hidden,
-            key_heads,
-            qkv_dim,
-            output_dim,
-            kernel_size,
-        );
+        let result = load_linear_attention_weights(&mut src, &cfg, prefix);
 
         match result {
             Err(InferenceError::ShapeMismatch {
@@ -874,5 +884,71 @@ mod tests {
             Err(InferenceError::InvalidInput(msg)) => assert!(msg.contains("output_dim")),
             other => panic!("expected InvalidInput overflow error, got {other:?}"),
         }
+    }
+
+    // ── shape-preflight-before-materialization tests ───────────────────────────────
+    //
+    // `load_owned_tensor_checked` must reject a shape mismatch using only the
+    // metadata `tensor_shape` returns, before ever calling `get_f32_tensor_owned`.
+    // A checkpoint tensor whose declared shape is oversized should not pay the cost
+    // of decoding/copying the owned buffer just to be rejected afterward.
+
+    #[test]
+    fn mismatched_shape_rejected_without_materializing_owned_buffer() {
+        let name = "layers.0.mlp.gate_proj.weight";
+        // Declared (metadata) shape is huge and mismatched; the actual stored data is
+        // tiny, so if the preflight were skipped and get_f32_tensor_owned were called,
+        // it would return this tiny buffer paired with the huge declared shape below.
+        let declared_mismatched_shape = vec![1 << 20, 1 << 20];
+        let mut src = CallCountingMockTensorSource {
+            tensors: [(
+                name.to_string(),
+                (vec![0.0f32; 4], declared_mismatched_shape.clone()),
+            )]
+            .into_iter()
+            .collect(),
+            owned_get_calls: std::cell::Cell::new(0),
+        };
+
+        let result = load_owned_tensor_checked(&mut src, name, &[4, 4]);
+
+        match result {
+            Err(InferenceError::ShapeMismatch {
+                name: got_name,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(got_name, name);
+                assert_eq!(expected, vec![4, 4]);
+                assert_eq!(actual, declared_mismatched_shape);
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            src.owned_get_calls.get(),
+            0,
+            "a mismatched tensor must be rejected via the metadata preflight \
+             without ever materializing the owned buffer"
+        );
+    }
+
+    #[test]
+    fn correctly_shaped_tensor_still_loads() {
+        let name = "layers.0.mlp.gate_proj.weight";
+        let mut src = CallCountingMockTensorSource {
+            tensors: [(name.to_string(), (vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]))]
+                .into_iter()
+                .collect(),
+            owned_get_calls: std::cell::Cell::new(0),
+        };
+
+        let result = load_owned_tensor_checked(&mut src, name, &[2, 2]);
+
+        assert_eq!(result.unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            src.owned_get_calls.get(),
+            1,
+            "a correctly-shaped tensor must still be materialized exactly once"
+        );
     }
 }
