@@ -95,6 +95,30 @@ pub const MAX_INTERMEDIATE_SIZE: usize = 1_048_576;
 /// blocks deep (Qwen3.5-VL vision ~32); 1024 leaves roughly 32x headroom above that.
 pub const MAX_VISION_DEPTH: usize = 1024;
 
+/// Upper bound on the length of small fixed-purpose config vectors accepted from
+/// `config.json`: `RopeParams::mrope_section` and `VisionModelConfig::deepstack_visual_indexes`.
+///
+/// Both fields are deserialized as `Vec<usize>` before `from_config_json_str`'s validation
+/// pass runs, so an unbounded declared length drives uncontrolled allocation at parse time --
+/// even while neither field is yet consumed downstream (ADR-069 S1; wired in S3+). Real
+/// `mrope_section` values carry 3-4 entries (one per M-RoPE axis) and real
+/// `deepstack_visual_indexes` lists carry a handful of layer indexes; 1024 rejects any config a
+/// real checkpoint would never carry while leaving generous headroom for future architectures.
+pub const MAX_CONFIG_VECTOR_LEN: usize = 1024;
+
+/// Upper bound on the GatedDeltaNet output dimension (`linear_num_value_heads *
+/// linear_value_head_dim`) accepted from `config.json`.
+///
+/// `linear_output_dim()` is only checked-multiplied inside `load_linear_attention_weights`,
+/// which an all-full-attention config never calls, yet `ForwardScratch::ensure_capacity`
+/// unconditionally derives `max_q8_input` from it and resizes `x_q_scratch` regardless of
+/// layer mix. A non-overflowing but attacker-inflated product (or one that wraps `usize`)
+/// therefore reaches that allocation with no other guard in its path for such a config. Real
+/// Qwen3.5/3.6 GDN configs top out around `linear_num_value_heads = 48` * `linear_value_head_dim
+/// = 128` (`linear_output_dim = 6144`); 1,048,576 (2^20) leaves roughly 170x headroom above
+/// that for future architectures.
+pub const MAX_LINEAR_OUTPUT_DIM: usize = 1_048_576;
+
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -951,11 +975,59 @@ impl Qwen35Config {
                  positive multiple of linear_num_key_heads ({key_heads})"
             )));
         }
+        // A global config-level budget, independent of layer mix: an all-full-attention config
+        // never reaches `load_linear_attention_weights`'s per-layer `checked_linear_output_dim`
+        // derivation, yet `ForwardScratch::ensure_capacity` unconditionally derives
+        // `max_q8_input` from `linear_output_dim()` and resizes `x_q_scratch` for every config
+        // regardless of whether any layer is actually linear-attention. Validate the same
+        // checked product here, globally, so an all-full-attention config cannot smuggle an
+        // overflowing or allocation-hostile linear-attention output dimension past load. See
+        // `MAX_LINEAR_OUTPUT_DIM` docs.
+        let linear_output_dim = value_heads
+            .checked_mul(cfg.linear_value_head_dim)
+            .ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "invalid Qwen config.json: linear attention output_dim overflows usize: \
+                 linear_num_value_heads ({value_heads}) * linear_value_head_dim ({})",
+                    cfg.linear_value_head_dim
+                ))
+            })?;
+        if linear_output_dim > MAX_LINEAR_OUTPUT_DIM {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: linear attention output_dim ({linear_output_dim}) \
+                 exceeds MAX_LINEAR_OUTPUT_DIM ({MAX_LINEAR_OUTPUT_DIM})"
+            )));
+        }
+        // `RopeParams::mrope_section` is deserialized as a `Vec<usize>` before this validation
+        // pass runs, so an unbounded declared length drives uncontrolled allocation at parse
+        // time even though the field is not yet consumed by the forward pass. See
+        // `MAX_CONFIG_VECTOR_LEN` docs.
+        if let Some(rp) = &cfg.rope_parameters
+            && let Some(mrope_section) = &rp.mrope_section
+            && mrope_section.len() > MAX_CONFIG_VECTOR_LEN
+        {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: rope_parameters.mrope_section length ({}) exceeds \
+                 MAX_CONFIG_VECTOR_LEN ({MAX_CONFIG_VECTOR_LEN})",
+                mrope_section.len()
+            )));
+        }
         // A present `vision_config` must be structurally valid (ADR-069 S1/S2 review
         // feedback): a present-but-malformed object (e.g. `depth: 0`) is syntactically
         // valid JSON and would otherwise silently load a truncated subset of
         // `model.visual.*` tensors instead of failing closed.
         if let Some(vision_cfg) = &cfg.vision_config {
+            // `deepstack_visual_indexes` is deserialized as a `Vec<usize>` before validation
+            // runs, so an unbounded declared length drives uncontrolled allocation at parse
+            // time regardless of whether the indexes are ever consumed. See
+            // `MAX_CONFIG_VECTOR_LEN` docs.
+            if vision_cfg.deepstack_visual_indexes.len() > MAX_CONFIG_VECTOR_LEN {
+                return Err(InferenceError::Inference(format!(
+                    "invalid Qwen config.json: vision_config.deepstack_visual_indexes length \
+                     ({}) exceeds MAX_CONFIG_VECTOR_LEN ({MAX_CONFIG_VECTOR_LEN})",
+                    vision_cfg.deepstack_visual_indexes.len()
+                )));
+            }
             vision_cfg.validate()?;
         }
         // MoE routing dimensions come from an untrusted checkpoint directory and drive
@@ -2808,6 +2880,184 @@ mod tests {
         assert!(
             Qwen35Config::from_config_json_str(&json).is_ok(),
             "depth == MAX_VISION_DEPTH must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // config vector length bounds (mrope_section / deepstack_visual_indexes)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `RopeParams::mrope_section` is deserialized as a `Vec<usize>` before any validation
+    /// runs; a huge declared length must be rejected at parse time rather than reaching an
+    /// uncontrolled allocation, even though the field is not yet consumed by the forward pass.
+    #[test]
+    fn parser_rejects_present_mrope_section_over_max() {
+        let huge: Vec<String> = (0..MAX_CONFIG_VECTOR_LEN + 1)
+            .map(|_| "0".to_string())
+            .collect();
+        let json = format!(
+            r#"{{"text_config": {{"rope_parameters": {{"mrope_section": [{}]}}}}}}"#,
+            huge.join(",")
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("mrope_section length above MAX_CONFIG_VECTOR_LEN must be rejected")
+            .to_string();
+        assert!(
+            err.contains("mrope_section") && err.contains("MAX_CONFIG_VECTOR_LEN"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Accept-case control: a realistic `mrope_section` (one entry per M-RoPE axis) must
+    /// still parse cleanly.
+    #[test]
+    fn parser_accepts_present_mrope_section_realistic_size() {
+        let json = r#"{"text_config": {"rope_parameters": {"mrope_section": [11, 11, 10]}}}"#;
+        let cfg = Qwen35Config::from_config_json_str(json)
+            .expect("realistic mrope_section must be accepted");
+        assert_eq!(
+            cfg.rope_parameters
+                .expect("rope_parameters present")
+                .mrope_section,
+            Some(vec![11, 11, 10])
+        );
+    }
+
+    /// `VisionModelConfig::deepstack_visual_indexes` is deserialized as a `Vec<usize>` before
+    /// any validation runs; a huge declared length must be rejected at parse time regardless
+    /// of whether the indexes are ever consumed.
+    #[test]
+    fn parser_rejects_present_deepstack_visual_indexes_over_max() {
+        let huge: Vec<String> = (0..MAX_CONFIG_VECTOR_LEN + 1)
+            .map(|_| "0".to_string())
+            .collect();
+        let json = config_json_with_vision(&format!(
+            r#"{{
+                "depth": 12,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3,
+                "deepstack_visual_indexes": [{}]
+            }}"#,
+            huge.join(",")
+        ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "deepstack_visual_indexes length above MAX_CONFIG_VECTOR_LEN must be rejected",
+            )
+            .to_string();
+        assert!(
+            err.contains("deepstack_visual_indexes") && err.contains("MAX_CONFIG_VECTOR_LEN"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Accept-case control: a realistic `deepstack_visual_indexes` (a handful of in-range
+    /// layer indexes) must still parse cleanly.
+    #[test]
+    fn parser_accepts_present_deepstack_visual_indexes_realistic_size() {
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 12,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3,
+                "deepstack_visual_indexes": [2, 5, 8]
+            }"#,
+        );
+        let cfg = Qwen35Config::from_config_json_str(&json)
+            .expect("realistic deepstack_visual_indexes must be accepted");
+        assert_eq!(
+            cfg.vision_config
+                .expect("vision_config present")
+                .deepstack_visual_indexes,
+            vec![2, 5, 8]
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // global linear-attention output-dim budget (independent of layer mix)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// An all-full-attention config never reaches `load_linear_attention_weights`'s per-layer
+    /// `checked_linear_output_dim` derivation, yet `ForwardScratch::ensure_capacity`
+    /// unconditionally derives `linear_output_dim()` for every config. A
+    /// `linear_num_value_heads` of `usize::MAX` must overflow-reject here rather than
+    /// panicking/wrapping downstream.
+    #[test]
+    fn parser_rejects_all_full_attention_config_with_overflowing_linear_output_dim() {
+        let json = r#"{"text_config": {
+            "num_hidden_layers": 2,
+            "layer_types": ["full_attention", "full_attention"],
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 18446744073709551615,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        }}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err(
+                "overflowing linear_num_value_heads on an all-full-attention config must be \
+                 rejected before any allocation",
+            )
+            .to_string();
+        assert!(
+            err.contains("output_dim") && err.contains("overflows"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Same all-full-attention scenario, but with a huge, non-overflowing product that must
+    /// still be rejected against `MAX_LINEAR_OUTPUT_DIM`.
+    #[test]
+    fn parser_rejects_all_full_attention_config_with_linear_output_dim_over_max() {
+        let huge_value_heads = (MAX_LINEAR_OUTPUT_DIM / 128) + 1;
+        let json = format!(
+            r#"{{"text_config": {{
+                "num_hidden_layers": 2,
+                "layer_types": ["full_attention", "full_attention"],
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": {huge_value_heads},
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128
+            }}}}"#
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "linear_output_dim above MAX_LINEAR_OUTPUT_DIM on an all-full-attention config \
+                 must be rejected",
+            )
+            .to_string();
+        assert!(
+            err.contains("output_dim") && err.contains("MAX_LINEAR_OUTPUT_DIM"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Accept-case control: realistic linear-attention dims on an all-full-attention config
+    /// must still parse cleanly -- the global budget must not reject real geometry.
+    #[test]
+    fn parser_accepts_all_full_attention_config_with_realistic_linear_dims() {
+        let json = r#"{"text_config": {
+            "num_hidden_layers": 2,
+            "layer_types": ["full_attention", "full_attention"],
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        }}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "realistic linear-attention dims on an all-full-attention config must be accepted"
         );
     }
 
