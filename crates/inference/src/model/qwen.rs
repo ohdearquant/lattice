@@ -3344,6 +3344,75 @@ mod tests {
         model
     }
 
+    /// Base config for `effective_context_len` tests — cheap to construct, none of
+    /// these fields participate in the min() policy under test.
+    fn context_len_test_config(max_position_embeddings: usize) -> QwenConfig {
+        QwenConfig {
+            vocab_size: 8,
+            hidden_size: 2,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            intermediate_size: 1,
+            max_position_embeddings,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+        }
+    }
+
+    #[test]
+    fn effective_context_len_picks_max_position_embeddings_when_tightest() {
+        let config = context_len_test_config(10);
+        let inference_config = ModelInferenceConfig {
+            rope_table_max_seq_len: 50,
+            ..Default::default()
+        };
+        let result = effective_context_len(&config, &inference_config, 1000).unwrap();
+        assert_eq!(
+            result, 10,
+            "must take the minimum, not max_position_embeddings alone"
+        );
+    }
+
+    #[test]
+    fn effective_context_len_picks_rope_table_max_seq_len_when_tightest() {
+        let config = context_len_test_config(100);
+        let inference_config = ModelInferenceConfig {
+            rope_table_max_seq_len: 20,
+            ..Default::default()
+        };
+        let result = effective_context_len(&config, &inference_config, 1000).unwrap();
+        assert_eq!(
+            result, 20,
+            "must take the minimum, not max_position_embeddings alone"
+        );
+    }
+
+    #[test]
+    fn effective_context_len_picks_tokenizer_max_seq_len_when_tightest() {
+        let config = context_len_test_config(100);
+        let inference_config = ModelInferenceConfig {
+            rope_table_max_seq_len: 50,
+            ..Default::default()
+        };
+        let result = effective_context_len(&config, &inference_config, 5).unwrap();
+        assert_eq!(result, 5, "must take the minimum, not the other two bounds");
+    }
+
+    #[test]
+    fn effective_context_len_rejects_zero_result() {
+        // max_position_embeddings=0 forces the min() to 0 regardless of the other
+        // two bounds — this is the constructor policy `RopeTable::new` depends on
+        // (a zero-length RoPE table) and must fail closed, not build a table nobody
+        // can ever index into.
+        let config = context_len_test_config(0);
+        let inference_config = ModelInferenceConfig::default();
+        let err = effective_context_len(&config, &inference_config, 100)
+            .expect_err("zero effective context must be rejected");
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
     #[test]
     fn qwen_encode_rejects_input_beyond_rope_capacity() {
         let model = build_rope_capacity_test_model();
