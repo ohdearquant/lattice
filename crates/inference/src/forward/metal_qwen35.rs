@@ -1040,6 +1040,232 @@ pub fn format_chat_template(messages: &[ChatMessage]) -> String {
     prompt
 }
 
+// ---------------------------------------------------------------------------
+// Device-free Q4 shape validation (#1037)
+//
+// This helper (and the pure unit test exercising it, in the
+// `q4_mmap_guard_tests` module below) does not touch a `Device` or any Metal
+// API -- it is a `Vec<usize>` comparison. It previously lived inside `mod
+// inner`, which is gated on `cfg(all(target_os = "macos", feature =
+// "metal-gpu"))`; that silently defeated the device-free contract it was
+// built to satisfy, since the default (non-metal-gpu) CPU test
+// configuration could not compile or run it at all. Module scope (here,
+// above `mod inner`) makes it and its tests part of every build; `mod
+// inner`'s mmap loaders call it via `super::`.
+//
+// The format-neutral mmap trust-boundary gate (mode/uid + macOS extended
+// ACL) that used to live alongside this now lives in
+// [`crate::weights::mmap_trust`] -- see that module's doc comment for why:
+// it is not Q4-specific, and every non-Q4 loader (Q3, MoE-f16/f32,
+// `ExpertByteTable`) previously had to reach back into this Q4-named module
+// for it.
+// ---------------------------------------------------------------------------
+
+/// Validate that an on-disk Q4 tensor's header-declared `shape` exactly
+/// matches `expected` before the file is trusted as GPU-resident weight
+/// storage.
+///
+/// `mmap_q4_weight`'s `validate_q4_header_payload_bounds` call is a
+/// *self-consistency* check only: it confirms the header's own claimed
+/// payload size fits within the file, which a short-but-internally-
+/// consistent file (fewer rows than the config-derived expectation,
+/// correctly sized for that smaller row count) trivially satisfies.
+/// Nothing upstream of this call cross-checks the header's declared
+/// shape against the model config it is being loaded for. Every Q4
+/// tensor mmap'd for Metal dispatch — embed_tokens/lm_head, dense
+/// attention (q/k/v/o proj), GatedDeltaNet (in_proj_qkv/z, out_proj),
+/// and MLP (gate/up/down proj) — is later indexed by kernels using
+/// dimensions derived from `Qwen35Config`, not from the file itself; a
+/// malformed-but-self-consistent short tensor would let those
+/// config-derived offsets read past the mapped buffer (OOB GPU
+/// reads/driver faults/crash). This is the single comparison every
+/// `mmap_q4_weight` call site routes through so that guarantee holds
+/// identically for all of them.
+///
+/// Exact-match, not `>=`: a storage tensor with MORE rows/cols than
+/// expected is just as much a mismatched-checkpoint signal as fewer,
+/// and silently accepting it would let a wrong-config/wrong-checkpoint
+/// pairing through undetected.
+#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+pub(crate) fn validate_q4_tensor_shape(
+    header_shape: &[usize],
+    expected: &[usize],
+    label: &str,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    if header_shape != expected {
+        return Err(format!(
+            "failed to validate Q4 payload {}: {label} shape {header_shape:?} \
+             != expected shape {expected:?} -- a checkpoint whose declared \
+             shape disagrees with the config-derived expectation cannot be \
+             trusted for config-derived-offset-indexed GPU reads",
+            path.display(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod q4_mmap_guard_tests {
+    use super::*;
+
+    // CPU-only unit test for `validate_q4_tensor_shape` -- the single
+    // comparison every `mmap_q4_weight` call site (dense attention q/k/v/o
+    // proj, GatedDeltaNet in_proj_qkv/z/out_proj, dense and MoE MLP
+    // gate/up/down proj, embed_tokens, lm_head) now routes through with a
+    // mandatory config-derived expected shape. No `Device` needed -- this
+    // exercises the pure comparison, not the mmap.
+    #[test]
+    fn validate_q4_tensor_shape_rejects_any_mismatched_q4_tensor_shape() {
+        let path = std::path::Path::new("/nonexistent/does-not-need-to-exist.q4");
+
+        // Self-consistent but wrong shape for a config-derived
+        // expectation (e.g. a q_proj tensor quantized against the
+        // wrong hidden_size).
+        let result = validate_q4_tensor_shape(&[512, 768], &[512, 1024], "q_proj.weight", path);
+        assert!(
+            result.is_err(),
+            "a header shape that disagrees with the config-derived expected shape \
+             must be rejected"
+        );
+        let msg = result.expect_err("checked is_err above");
+        assert!(
+            msg.contains("q_proj.weight")
+                && msg.contains("[512, 768]")
+                && msg.contains("[512, 1024]"),
+            "error must name the tensor label and both the found and expected \
+             shapes; got: {msg}"
+        );
+
+        // Exact match must be accepted.
+        assert!(
+            validate_q4_tensor_shape(&[512, 1024], &[512, 1024], "q_proj.weight", path).is_ok(),
+            "an exactly-matching shape must be accepted"
+        );
+
+        // MORE rows than expected is just as much a mismatch as fewer --
+        // exact-match, not `>=`.
+        assert!(
+            validate_q4_tensor_shape(&[513, 1024], &[512, 1024], "q_proj.weight", path).is_err(),
+            "a shape with MORE rows than expected must still be rejected \
+             (exact match, not >=)"
+        );
+    }
+
+    // The mode/uid + macOS extended-ACL trust-boundary predicate and its
+    // regression tests moved to `crate::weights::mmap_trust` (#1037) -- see
+    // that module's `mmap_file_trust_boundary_issue_fires_on_...`,
+    // `reject_if_mmap_file_trust_boundary_weak_fails_closed_on_writable_file`,
+    // and `macos_acl_regression_tests` submodule.
+
+    // Regression test for #1037: every mmap loader in the
+    // `Q4WeightBuf`/`Q3WeightBuf`/MoE-f16/MoE-f32 family re-validates
+    // `validate_q4_header_payload_bounds`/`validate_q3_header_payload_bounds`
+    // against the pre-map `stat` length, and then again post-map via
+    // `crate::weights::mmap_trust::verify_mmap_target_unchanged`'s real fstat
+    // recheck on the still-open fd -- not a recheck against `mmap.len()`,
+    // which only echoes the length `memmap2` requested via its own internal
+    // fstat *before* mapping and so can never disagree with a stat taken
+    // moments earlier. This test proves the device-free half of the
+    // underlying invariant directly (no `Device`, no metal-gpu feature, no
+    // mmap needed to demonstrate it): validate a self-consistent Q4/Q3 file
+    // against its original length (passes), then truncate the underlying
+    // file in place (`File::set_len`, simulating a race that lands between
+    // an earlier `stat()` and a later length check) and re-validate against
+    // the file's *current* length (must fail) -- the same fail-closed shape
+    // `verify_mmap_target_unchanged`'s fd-bound fstat comparison relies on.
+    #[test]
+    fn header_payload_bounds_fail_closed_after_truncation_race() {
+        use crate::weights::q3_weights::{
+            quantize_f32_to_q3, read_q3_header, save_q3_file, validate_q3_header_payload_bounds,
+        };
+        use crate::weights::q4_weights::{
+            quantize_f32_to_q4, read_q4_header, save_q4_file, validate_q4_header_payload_bounds,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir create");
+
+        // Q4 side (covers `mmap_q4_weight`, `load_q4_mmap_dequant_f16`,
+        // `load_q4_mmap_dequant_f32`, all of which validate via
+        // `validate_q4_header_payload_bounds`).
+        let q4_path = tmp.path().join("truncation_race.q4");
+        let numel = 64usize;
+        let tensor =
+            quantize_f32_to_q4(&vec![0.1f32; numel], &[numel]).expect("quantize q4 fixture");
+        save_q4_file(&q4_path, &tensor).expect("save q4 fixture");
+
+        let q4_file = std::fs::File::open(&q4_path).expect("open q4 fixture");
+        let q4_header = read_q4_header(&q4_file).expect("parse q4 header");
+        let q4_original_len = q4_file.metadata().expect("stat q4 fixture").len();
+        assert!(
+            validate_q4_header_payload_bounds(&q4_header, q4_original_len, &q4_path).is_ok(),
+            "a freshly-written, untruncated q4 fixture must validate against its own length"
+        );
+
+        // Simulate a writer truncating the file in the window between an
+        // earlier `stat()` (which produced `q4_original_len`) and a later
+        // length check: shrink the file below its Q4 block payload. `File`
+        // must be write-opened for `set_len` -- the read-only handle used
+        // for header parsing above cannot truncate.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&q4_path)
+            .expect("reopen q4 fixture for truncation")
+            .set_len(q4_header.payload_offset + 4)
+            .expect("truncate q4 fixture in place");
+        let q4_truncated_len = std::fs::metadata(&q4_path)
+            .expect("re-stat truncated q4 fixture")
+            .len();
+        assert_eq!(
+            q4_truncated_len,
+            q4_header.payload_offset + 4,
+            "sanity: the truncated file must actually be short"
+        );
+        assert!(
+            validate_q4_header_payload_bounds(&q4_header, q4_truncated_len, &q4_path).is_err(),
+            "validating against the CURRENT (post-truncation) length must fail closed -- \
+             this is the shape every Q4 mmap loader's post-map fstat recheck relies on, \
+             instead of a stale pre-truncation stat length"
+        );
+
+        // Q3 side (covers `mmap_q3_weight`, which validates via
+        // `validate_q3_header_payload_bounds`).
+        let q3_path = tmp.path().join("truncation_race.q3");
+        let q3_tensor =
+            quantize_f32_to_q3(&vec![0.1f32; numel], &[numel]).expect("quantize q3 fixture");
+        save_q3_file(&q3_path, &q3_tensor).expect("save q3 fixture");
+
+        let mut q3_file = std::fs::File::open(&q3_path).expect("open q3 fixture");
+        let q3_header = read_q3_header(&mut q3_file).expect("parse q3 header");
+        let q3_original_len = q3_file.metadata().expect("stat q3 fixture").len();
+        assert!(
+            validate_q3_header_payload_bounds(&q3_header, q3_original_len, &q3_path).is_ok(),
+            "a freshly-written, untruncated q3 fixture must validate against its own length"
+        );
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&q3_path)
+            .expect("reopen q3 fixture for truncation")
+            .set_len(q3_header.payload_offset + 4)
+            .expect("truncate q3 fixture in place");
+        let q3_truncated_len = std::fs::metadata(&q3_path)
+            .expect("re-stat truncated q3 fixture")
+            .len();
+        assert_eq!(
+            q3_truncated_len,
+            q3_header.payload_offset + 4,
+            "sanity: the truncated file must actually be short"
+        );
+        assert!(
+            validate_q3_header_payload_bounds(&q3_header, q3_truncated_len, &q3_path).is_err(),
+            "validating against the CURRENT (post-truncation) length must fail closed -- \
+             this is the shape `mmap_q3_weight`'s post-map fstat recheck relies on, \
+             instead of a stale pre-truncation stat length"
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     use super::GdnStateTrafficScope;
@@ -1056,6 +1282,10 @@ mod inner {
         GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficShape,
     };
     use super::{MtpLoadErr, MtpTensorSource, resolve_mtp_norm, resolve_mtp_projection};
+    // Device-free Q4 mmap trust-boundary + shape validation (#1037) lives
+    // at the file top level (module-scope, above `mod inner`) so it and its
+    // unit tests compile and run without the `metal-gpu` feature at all.
+    use super::validate_q4_tensor_shape;
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
     #[cfg(debug_assertions)]
@@ -1071,6 +1301,7 @@ mod inner {
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
     use crate::vision::multimodal::Qwen35VisionRequest;
+    use crate::weights::mmap_trust::{open_trusted_mmap_file, verify_mmap_target_unchanged};
     use crate::weights::q4_weights::quantize_row_q4_0;
     use metal::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1159,24 +1390,69 @@ mod inner {
     /// [`Q4WeightBuf`] so the pages remain valid for the lifetime of the buffer.
     ///
     /// # Safety invariant
-    /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
-    /// modified while the process is running.
+    /// The mapping is opened `PROT_READ`-only, but the underlying mapping
+    /// type (`memmap2::MmapOptions::map` on Unix) is `MAP_SHARED`, not
+    /// `MAP_PRIVATE`: a write to the file through a *different* fd -- by
+    /// this process or another -- is visible through these pages, because
+    /// `MAP_SHARED` maps the file's own pages rather than a copy-on-write
+    /// private copy. `PROT_READ`-only prevents *this* mapping from writing
+    /// through it, but does not, and cannot, prevent the pages from
+    /// observing a write made elsewhere. The model files must not be
+    /// modified while the process is running; the trust-boundary gate this
+    /// function routes through removes write access for every foreign
+    /// principal it can, and the residual same-UID / retained-writable-fd
+    /// risk this leaves is documented in `crate::weights::mmap_trust`'s
+    /// "Trust-boundary scope" doc comment.
+    ///
+    /// `expected_shape` validates the header-declared `shape` against a
+    /// config-derived expectation on the *same* file identity that backs
+    /// the mmap -- i.e. the header this function already read from `file`
+    /// before mapping it, not a prior independent open of `path`. This is
+    /// mandatory for every caller (not optional) so a pathname swap
+    /// between an earlier validate-open and this mmap-open cannot slip an
+    /// undersized-but-self-consistent file past the check: there is no
+    /// earlier open to swap around, because validation and mapping now
+    /// share one `File`. See `validate_q4_tensor_shape` for why
+    /// `validate_q4_header_payload_bounds` alone does not catch a short
+    /// checkpoint with a correctly-sized-for-its-own-row-count payload.
     #[cfg(feature = "metal-gpu")]
     fn mmap_q4_weight(
         device: &Device,
         path: &std::path::Path,
         label: &str,
+        expected_shape: &[usize],
     ) -> Result<Q4WeightBuf, String> {
         use crate::weights::q4_weights::{read_q4_header, validate_q4_header_payload_bounds};
 
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        // Trust-boundary note (in-place mmap mutation, #1037):
+        // `open_trusted_mmap_file` opens `path` regular-file-only,
+        // non-blocking (closing the FIFO/device open-time DoS),
+        // and `O_NOFOLLOW` (closing final-path-component symlink
+        // substitution -- a symlink planted at `path` itself is rejected at
+        // open() before any check below runs; this does NOT cover a symlink
+        // in a parent directory, see that function's doc comment for the
+        // exact scope), and runs the mode/uid/ACL trust gate on the fd
+        // before returning it. Every check below this point (shape, payload
+        // bounds) only inspects the bytes visible at *validation* time; a
+        // Q4 file is subsequently mapped read-only and handed to the GPU
+        // no-copy, so a principal who can mutate the underlying inode's
+        // bytes in place after validation (but before or while the GPU
+        // reads them) bypasses every check here. The trust gate removes the
+        // write access a truncate-after-validate race depends on, and
+        // `verify_mmap_target_unchanged` further below closes the remaining
+        // stat-to-mmap truncation window with a real post-map fstat, not a
+        // recheck against `mmap.len()` (see that function's doc comment for
+        // why the latter detects nothing). None of these checks copy the
+        // (multi-GiB) Q4 payload into owned storage -- that would defeat the
+        // zero-copy mmap this function exists for; see
+        // `crate::weights::mmap_trust`'s "Trust-boundary scope" doc comment
+        // for the same-UID-mutation and retained-writable-fd limitations
+        // that follow from that choice.
+        let (file, metadata) = open_trusted_mmap_file(path)?;
         let header = read_q4_header(&file)
             .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-        let file_len = file
-            .metadata()
-            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-            .len();
+        validate_q4_tensor_shape(&header.shape, expected_shape, label, path)?;
+        let file_len = metadata.len();
         // Fail closed on a truncated/malformed Q4 file *before* the mmap is
         // handed to the GPU: unlike the CPU sibling (`load_q4_file`), which
         // fails via `read_exact` short of the block payload, this no-copy
@@ -1187,6 +1463,11 @@ mod inner {
             .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
             .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        // Post-map integrity recheck (#1037) -- fstats the same fd
+        // again and compares against `metadata`, the pre-map stat, catching
+        // a truncate-or-replace race that landed in the validate-then-map
+        // window. See `verify_mmap_target_unchanged`'s doc comment.
+        verify_mmap_target_unchanged(&file, &metadata, path)?;
 
         // The mmap pointer is page-aligned (guaranteed by the OS).  We create the Metal
         // buffer over the *whole* file so the pointer alignment requirement of
@@ -1252,17 +1533,23 @@ mod inner {
     /// Open `path`, mmap the whole file, and register it as a Metal no-copy
     /// `StorageModeShared` buffer holding a Q3 tensor — mirrors [`mmap_q4_weight`].
     ///
-    /// Fails closed on two independent conditions before the mmap ever reaches
-    /// the GPU: `tensor_name` must name an MLP gate/up/down projection (see
-    /// [`crate::weights::q3_weights::validate_q3_mlp_role`]), and the file's
-    /// declared header must not claim a payload larger than the file actually
-    /// holds (see `validate_q3_header_payload_bounds`) — the same truncation
-    /// hazard `mmap_q4_weight` guards against, since this path never reads the
-    /// payload bytes itself.
+    /// Fails closed on every condition [`mmap_q4_weight`] does, before the mmap
+    /// ever reaches the GPU: the format-neutral open+trust-boundary gate
+    /// (regular-file/O_NONBLOCK/O_NOFOLLOW, mode/uid, and macOS extended
+    /// ACL, [`crate::weights::mmap_trust::open_trusted_mmap_file`]),
+    /// `tensor_name` must name an MLP gate/up/down
+    /// projection (see [`crate::weights::q3_weights::validate_q3_mlp_role`]),
+    /// and the file's declared header must not claim a payload larger than
+    /// the file actually holds -- checked once against the pre-map `stat`
+    /// length, then again via a real post-map fstat recheck
+    /// (`verify_mmap_target_unchanged`), closing the same stat-vs-mmap
+    /// truncation TOCTOU window `mmap_q4_weight` closes (#1037) -- since
+    /// this path never reads the payload bytes itself.
     ///
     /// # Safety invariant
-    /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
-    /// modified while the process is running.
+    /// The mapping is `PROT_READ`-only but `MAP_SHARED`, not `MAP_PRIVATE`
+    /// -- see [`mmap_q4_weight`]'s doc comment for what that implies. The
+    /// model files must not be modified while the process is running.
     ///
     /// Not yet called from live checkpoint loading — see w3_stage2_report.md
     /// "what shipped" for the scope decision (proven end-to-end by this
@@ -1279,23 +1566,27 @@ mod inner {
 
         validate_q3_mlp_role(tensor_name).map_err(|e| e.to_string())?;
 
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        // See `mmap_q4_weight`'s trust-boundary note: `open_trusted_mmap_file`
+        // folds the open, regular-file/O_NONBLOCK/O_NOFOLLOW guard,
+        // and mode/uid/ACL trust gate into one fd-bound call.
+        let (mut file, metadata) = open_trusted_mmap_file(path)?;
         let header = crate::weights::q3_weights::read_q3_header(&mut file)
             .map_err(|e| format!("failed to parse Q3 header {}: {e}", path.display()))?;
-        let file_len = file
-            .metadata()
-            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-            .len();
+        let file_len = metadata.len();
         crate::weights::q3_weights::validate_q3_header_payload_bounds(&header, file_len, path)
             .map_err(|e| format!("failed to validate Q3 payload {}: {e}", path.display()))?;
         // SAFETY: `mmap`'s read-only-mmap invariant is documented above
-        // (`# Safety invariant`): the file is opened read-only and mapped
-        // `MAP_PRIVATE`, and the caller must not mutate the on-disk file
-        // while this process runs — the same invariant `mmap_q4_weight`
-        // relies on for its no-copy Metal buffer.
+        // (`# Safety invariant`): the file is opened `PROT_READ`-only and
+        // mapped `MAP_SHARED` (not `MAP_PRIVATE`), and the caller must not
+        // mutate the on-disk file while this process runs — the same
+        // invariant `mmap_q4_weight` relies on for its no-copy Metal
+        // buffer.
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
             .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        // Post-map integrity recheck (#1037) -- see
+        // `verify_mmap_target_unchanged`'s doc comment for why this replaces
+        // a `mmap.len()`-based recheck.
+        verify_mmap_target_unchanged(&file, &metadata, path)?;
 
         let buf = device.new_buffer_with_bytes_no_copy(
             mmap.as_ptr().cast(),
@@ -14126,11 +14417,11 @@ mod inner {
 
             // Budget forcing: resolve the </think> token id once before the loops.
             // Only paid when reasoning_budget is Some; None path is a single branch.
-            let think_close_id = if gen_cfg.reasoning_budget.is_some() {
-                tokenizer.special_token_id("</think>")
-            } else {
-                None
-            };
+            let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
+                tokenizer,
+                gen_cfg.reasoning_budget,
+                cfg.vocab_size,
+            )?;
 
             // Checked independently of `on_token`: a client that disconnected
             // between dequeue and here must not pay for the (potentially large,
@@ -14548,13 +14839,29 @@ mod inner {
             buf
         }
 
-        /// Load raw Q4 block bytes from a `.q4` file (strips the file header).
+        /// Load raw Q4 block bytes from a `.q4` file (strips the file header),
+        /// validating the header's declared `shape` (loaded by `load_q4_file`
+        /// as `Q4Tensor::shape`) exactly against `expected_shape` before
+        /// returning -- release-mode fallible, mirroring
+        /// `validate_q4_tensor_shape`'s guarantee for callers (fused-MLP
+        /// gate/up proj, GDN qkv/z CPU-fallback concat) that never construct
+        /// a `Q4WeightBuf` from an mmap. Exact shape, not element count: a
+        /// self-consistent but *transposed* tensor (e.g. `[hidden,
+        /// intermediate]` where `[intermediate, hidden]` is expected) has
+        /// the same element count as the correctly-shaped tensor and would
+        /// pass a numel-only check, then feed `make_fused_q4_buf` and,
+        /// downstream, a config-sized GEMM dispatch with the wrong layout.
         ///
-        /// Returns the `Q4Block` bytes and the `original_len` (for validation).
-        fn load_q4_raw_bytes(path: &std::path::Path) -> Result<(Vec<u8>, usize), String> {
+        /// Returns the `Q4Block` bytes.
+        fn load_q4_raw_bytes(
+            path: &std::path::Path,
+            label: &str,
+            expected_shape: &[usize],
+        ) -> Result<Vec<u8>, String> {
             use crate::weights::q4_weights::load_q4_file;
             let tensor = load_q4_file(path)
                 .map_err(|e| format!("failed to load Q4 file {}: {e}", path.display()))?;
+            validate_q4_tensor_shape(&tensor.shape, expected_shape, label, path)?;
             let n_blocks = tensor.blocks.len();
             // Re-serialise the blocks into raw bytes (20 bytes each, Q4Block is
             // #[repr(C)] with scale + bias + 16 packed nibbles).
@@ -14564,7 +14871,7 @@ mod inner {
                 std::slice::from_raw_parts(tensor.blocks.as_ptr().cast::<u8>(), n_blocks * 20)
                     .to_vec()
             };
-            Ok((raw, tensor.original_len))
+            Ok(raw)
         }
 
         /// Mmap a `.q4` file and dequantize its payload directly into an f16
@@ -14598,6 +14905,13 @@ mod inner {
         /// violate that unsafe function's buffer-size invariant (mirrors the
         /// shape check `resolve_mtp_projection`/
         /// `resolve_mtp_norm` already apply to MTP tensors above).
+        ///
+        /// Also mirrors [`mmap_q4_weight`]'s other two guards (#1037, the
+        /// MoE sibling sites previously missing them): the trust-boundary
+        /// gate (`open_trusted_mmap_file`, before the header is even parsed)
+        /// and a post-map `verify_mmap_target_unchanged` fstat recheck on the
+        /// still-open fd, closing the same truncate-between-stat-and-mmap
+        /// TOCTOU window for MoE routed-expert files.
         fn load_q4_mmap_dequant_f16(
             device: &Device,
             path: &std::path::Path,
@@ -14607,30 +14921,24 @@ mod inner {
             use crate::weights::q4_weights::{
                 q4_f16_to_f32, q4_f32_to_f16, read_q4_header, validate_q4_header_payload_bounds,
             };
-            let file = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            // See `mmap_q4_weight`'s trust-boundary note: `open_trusted_mmap_file`
+            // folds the open, regular-file/O_NONBLOCK guard, and
+            // mode/uid/ACL trust gate into one fd-bound call.
+            let (file, metadata) = open_trusted_mmap_file(path)?;
             let header = read_q4_header(&file)
                 .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-            if header.shape != expected_shape {
-                return Err(format!(
-                    "{}: MoE tensor has shape {:?}, expected {expected_shape:?} — refusing to \
-                     load (a mismatched/transposed weight file has the same element count but \
-                     a different layout, which would silently corrupt or overrun the GPU MoE \
-                     dispatch instead of failing to load)",
-                    path.display(),
-                    header.shape
-                ));
-            }
-            let file_len = file
-                .metadata()
-                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-                .len();
+            validate_q4_tensor_shape(&header.shape, expected_shape, label, path)?;
+            let file_len = metadata.len();
             validate_q4_header_payload_bounds(&header, file_len, path)
                 .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
             // SAFETY: read-only mmap of a file this process does not mutate
             // while running (same invariant as `mmap_q4_weight`).
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
                 .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            // Post-map integrity recheck (#1037) -- see
+            // `verify_mmap_target_unchanged`'s doc comment for why this
+            // replaces a `mmap.len()`-based recheck.
+            verify_mmap_target_unchanged(&file, &metadata, path)?;
             let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
                 format!(
                     "{}: payload_offset {} beyond mapped length {}",
@@ -14669,7 +14977,9 @@ mod inner {
         ///
         /// `expected_shape` is validated the same way and at the same point as
         /// in [`Self::load_q4_mmap_dequant_f16`]: before
-        /// mmap/allocation, against the raw header only.
+        /// mmap/allocation, against the raw header only. Same trust-boundary
+        /// gate + post-map length recheck as `load_q4_mmap_dequant_f16`
+        /// (#1037).
         fn load_q4_mmap_dequant_f32(
             device: &Device,
             path: &std::path::Path,
@@ -14679,30 +14989,24 @@ mod inner {
             use crate::weights::q4_weights::{
                 dequantize_row_q4_0, read_q4_header, validate_q4_header_payload_bounds,
             };
-            let file = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            // See `mmap_q4_weight`'s trust-boundary note: `open_trusted_mmap_file`
+            // folds the open, regular-file/O_NONBLOCK guard, and
+            // mode/uid/ACL trust gate into one fd-bound call.
+            let (file, metadata) = open_trusted_mmap_file(path)?;
             let header = read_q4_header(&file)
                 .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-            if header.shape != expected_shape {
-                return Err(format!(
-                    "{}: MoE tensor has shape {:?}, expected {expected_shape:?} - refusing to \
-                     load (a mismatched/transposed weight file has the same element count but \
-                     a different layout, which would silently corrupt or overrun the GPU MoE \
-                     dispatch instead of failing to load)",
-                    path.display(),
-                    header.shape
-                ));
-            }
-            let file_len = file
-                .metadata()
-                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-                .len();
+            validate_q4_tensor_shape(&header.shape, expected_shape, label, path)?;
+            let file_len = metadata.len();
             validate_q4_header_payload_bounds(&header, file_len, path)
                 .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
             // SAFETY: read-only mmap of a file this process does not mutate
             // while running (same invariant as `mmap_q4_weight`).
             let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
                 .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            // Post-map integrity recheck (#1037) -- see
+            // `verify_mmap_target_unchanged`'s doc comment for why this
+            // replaces a `mmap.len()`-based recheck.
+            verify_mmap_target_unchanged(&file, &metadata, path)?;
             let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
                 format!(
                     "{}: payload_offset {} beyond mapped length {}",
@@ -15334,20 +15638,24 @@ mod inner {
             // Helper: mmap a Q4 file and create a Metal no-copy buffer.
             // Zero CPU copies — GPU pages fault lazily from mmap'd file.
             // ----------------------------------------------------------------
-            let load_q4_buf = |name: &str, label: &str| -> Result<Q4WeightBuf, String> {
+            let load_q4_buf = |name: &str,
+                               label: &str,
+                               expected_shape: &[usize]|
+             -> Result<Q4WeightBuf, String> {
                 let t = std::time::Instant::now();
                 let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                let result = mmap_q4_weight(&device, &path, label);
+                let result = mmap_q4_weight(&device, &path, label, expected_shape);
                 dur_c_cell.set(dur_c_cell.get() + t.elapsed());
                 result
             };
-            let load_q4_raw_timed = |name: &str| -> Result<(Vec<u8>, usize), String> {
-                let t = std::time::Instant::now();
-                let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                let result = Self::load_q4_raw_bytes(&path);
-                dur_c_cell.set(dur_c_cell.get() + t.elapsed());
-                result
-            };
+            let load_q4_raw_timed =
+                |name: &str, expected_shape: &[usize]| -> Result<Vec<u8>, String> {
+                    let t = std::time::Instant::now();
+                    let path = Self::q4_tensor_path(q4_dir, name, "q4");
+                    let result = Self::load_q4_raw_bytes(&path, name, expected_shape);
+                    dur_c_cell.set(dur_c_cell.get() + t.elapsed());
+                    result
+                };
             let make_fused_q4_buf = |gate_raw: &[u8], up_raw: &[u8], label: &str| -> Q4WeightBuf {
                 let combined_size = gate_raw.len() + up_raw.len();
                 let buf =
@@ -15476,13 +15784,14 @@ mod inner {
                         // `mlp.{gate,up,down}_proj.weight` files do not exist for this layer.
                         Self::load_moe_ffn_q4(&device, q4_dir, cfg, &prefix, i)?
                     } else {
-                        let (gate_raw, gate_len) =
-                            load_q4_raw_timed(&format!("{prefix}.mlp.gate_proj.weight"))?;
-                        let (up_raw, up_len) =
-                            load_q4_raw_timed(&format!("{prefix}.mlp.up_proj.weight"))?;
-                        debug_assert_eq!(gate_len, cfg.intermediate_size * cfg.hidden_size);
-                        debug_assert_eq!(up_len, cfg.intermediate_size * cfg.hidden_size);
-                        debug_assert_eq!(up_raw.len(), gate_raw.len());
+                        let gate_raw = load_q4_raw_timed(
+                            &format!("{prefix}.mlp.gate_proj.weight"),
+                            &[inter, hidden],
+                        )?;
+                        let up_raw = load_q4_raw_timed(
+                            &format!("{prefix}.mlp.up_proj.weight"),
+                            &[inter, hidden],
+                        )?;
                         MetalFfnWeights::Dense {
                             gate_up_proj: make_fused_q4_buf(
                                 &gate_raw,
@@ -15492,6 +15801,7 @@ mod inner {
                             down_proj: load_q4_buf(
                                 &format!("{prefix}.mlp.down_proj.weight"),
                                 &format!("L{i}.down.q4"),
+                                &[hidden, inter],
                             )?,
                         }
                     },
@@ -15502,18 +15812,22 @@ mod inner {
                         q_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.q_proj.weight"),
                             &format!("L{i}.full.q.q4"),
+                            &[2 * q_dim, hidden],
                         )?,
                         k_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.k_proj.weight"),
                             &format!("L{i}.full.k.q4"),
+                            &[kv_dim, hidden],
                         )?,
                         v_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.v_proj.weight"),
                             &format!("L{i}.full.v.q4"),
+                            &[kv_dim, hidden],
                         )?,
                         o_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.o_proj.weight"),
                             &format!("L{i}.full.o.q4"),
+                            &[hidden, q_dim],
                         )?,
                         // q_norm and k_norm are norm.weight → stored as .f16
                         q_norm: load_f16_buf_f32(
@@ -15529,25 +15843,32 @@ mod inner {
                     // in_proj_b and in_proj_a are quantized on disk (ends_with _proj_b.weight /
                     // _proj_a.weight → Q4), but in new() they become f16 Metal buffers for the
                     // CPU GDN recurrence path.  Load Q4 → dequantize → f16 Metal buffer.
-                    let load_q4_as_f16_buf = |name: &str, label: &str| -> Result<Buffer, String> {
+                    let load_q4_as_f16_buf = |name: &str,
+                                              label: &str,
+                                              expected_shape: &[usize]|
+                     -> Result<Buffer, String> {
                         let t = std::time::Instant::now();
                         let path = Self::q4_tensor_path(q4_dir, name, "q4");
                         let tensor = load_q4_file(&path).map_err(|e| {
                             format!("failed to load Q4 file {}: {e}", path.display())
                         })?;
+                        validate_q4_tensor_shape(&tensor.shape, expected_shape, name, &path)?;
                         let buf = Self::make_buffer_f16_from_q4(&device, &tensor, label);
                         dur_b_cell.set(dur_b_cell.get() + t.elapsed());
                         Ok(buf)
                     };
+                    let num_vh = cfg.linear_num_value_heads();
 
                     MetalLayerAttnWeights::Linear(MetalGdnLayerWeights {
                         in_proj_qkv: load_q4_buf(
                             &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
                             &format!("L{i}.gdn.qkv.q4"),
+                            &[qkv_dim, hidden],
                         )?,
                         in_proj_z: load_q4_buf(
                             &format!("{prefix}.linear_attn.in_proj_z.weight"),
                             &format!("L{i}.gdn.z.q4"),
+                            &[output_dim, hidden],
                         )?,
                         in_proj_qkvz: {
                             let t_qkvz = std::time::Instant::now();
@@ -15556,6 +15877,7 @@ mod inner {
                                     &device,
                                     &merged_path,
                                     &format!("L{i}.gdn.qkvz.q4"),
+                                    &[qkv_dim + output_dim, hidden],
                                 )?,
                                 _ => {
                                     // Fallback: model dir is read-only — CPU concat path
@@ -15570,8 +15892,16 @@ mod inner {
                                         &format!("{pfx}.linear_attn.in_proj_z.weight"),
                                         "q4",
                                     );
-                                    let (mut raw, _) = Self::load_q4_raw_bytes(&qkv_p)?;
-                                    let (z_raw, _) = Self::load_q4_raw_bytes(&z_p)?;
+                                    let mut raw = Self::load_q4_raw_bytes(
+                                        &qkv_p,
+                                        &format!("{pfx}.linear_attn.in_proj_qkv.weight"),
+                                        &[qkv_dim, hidden],
+                                    )?;
+                                    let z_raw = Self::load_q4_raw_bytes(
+                                        &z_p,
+                                        &format!("{pfx}.linear_attn.in_proj_z.weight"),
+                                        &[output_dim, hidden],
+                                    )?;
                                     raw.extend_from_slice(&z_raw);
                                     Q4WeightBuf::from_buffer(Self::make_buffer_from_q4_raw(
                                         &device,
@@ -15587,10 +15917,12 @@ mod inner {
                         in_proj_b: load_q4_as_f16_buf(
                             &format!("{prefix}.linear_attn.in_proj_b.weight"),
                             &format!("L{i}.gdn.b.f16"),
+                            &[num_vh, hidden],
                         )?,
                         in_proj_a: load_q4_as_f16_buf(
                             &format!("{prefix}.linear_attn.in_proj_a.weight"),
                             &format!("L{i}.gdn.a.f16"),
+                            &[num_vh, hidden],
                         )?,
                         // Small scalars: f32 Metal buffers (CPU-read in GDN recurrence)
                         a_log: load_f16_buf_f32(
@@ -15612,6 +15944,7 @@ mod inner {
                         out_proj: load_q4_buf(
                             &format!("{prefix}.linear_attn.out_proj.weight"),
                             &format!("L{i}.gdn.out.q4"),
+                            &[hidden, output_dim],
                         )?,
                     })
                 };
@@ -15630,12 +15963,34 @@ mod inner {
             let embed_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
             let embed_tensor = load_q4_file(&embed_path)
                 .map_err(|e| format!("failed to load embed_tokens Q4 file: {e}"))?;
+            // Reject a checkpoint whose declared row count disagrees with
+            // cfg.vocab_size before it is trusted for token-id-indexed
+            // lookups -- see `validate_q4_tensor_shape` doc comment for why
+            // `validate_q4_header_payload_bounds` alone (invoked inside
+            // `mmap_q4_weight` below) does not catch this.
+            validate_q4_tensor_shape(
+                &embed_tensor.shape,
+                &[cfg.vocab_size, cfg.hidden_size],
+                "embed_tokens.weight",
+                &embed_path,
+            )?;
             // f16 buffer for CPU embedding lookup
             let embed_tokens =
                 Self::make_buffer_f16_from_q4(&device, &embed_tensor, "embed_tokens.f16");
-            // Q4 buffer for GPU logits GEMV — mmap no-copy
+            // Q4 buffer for GPU logits GEMV — mmap no-copy. This reopens
+            // `embed_q4_path` by pathname rather than reusing the `File`
+            // behind `embed_tensor` above, so it cannot inherit that
+            // earlier validation: a writer could swap in a different
+            // self-consistent file between the two opens. `mmap_q4_weight`
+            // is therefore given its own `expected_shape`, which re-validates
+            // against the header it reads from the exact `File` it maps.
             let embed_q4_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
-            let embed_tokens_q8 = mmap_q4_weight(&device, &embed_q4_path, "embed_tokens.q4")?;
+            let embed_tokens_q8 = mmap_q4_weight(
+                &device,
+                &embed_q4_path,
+                "embed_tokens.q4",
+                &[cfg.vocab_size, cfg.hidden_size],
+            )?;
 
             // ----------------------------------------------------------------
             // final_norm: stored as .f16 (it's a norm.weight tensor)
@@ -15656,7 +16011,18 @@ mod inner {
             // ----------------------------------------------------------------
             let embed_tokens_q8 = if !cfg.tie_word_embeddings {
                 let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
-                mmap_q4_weight(&device, &lm_head_path, "lm_head.q4")?
+                // lm_head has no separate `load_q4_file` call producing a
+                // `Q4Tensor` with a `.shape` field to check (unlike
+                // embed_tokens above) -- it goes straight to the no-copy mmap
+                // buffer. `mmap_q4_weight`'s `expected_shape` reads the header
+                // and maps the file from the same `File`, so there is no
+                // earlier independent open for a pathname swap to target.
+                mmap_q4_weight(
+                    &device,
+                    &lm_head_path,
+                    "lm_head.q4",
+                    &[cfg.vocab_size, cfg.hidden_size],
+                )?
             } else {
                 embed_tokens_q8
             };
@@ -16276,7 +16642,19 @@ mod inner {
             tokenizer
                 .special_token_id("<|im_end|>")
                 .hash(&mut tok_hasher);
-            tokenizer.special_token_id("</think>").hash(&mut tok_hasher);
+            // Tokenizer identity only -- resolved unconditionally regardless
+            // of whether *this* request has an active reasoning budget.
+            // reasoning_budget is a generation-time policy choice, not a
+            // prefix-defining input: two requests with identical prompts and
+            // tokenizer state must hash to the same fingerprint whether or
+            // not either one sets a budget, so a turn that happens to omit
+            // (or vary) reasoning_budget can still reuse the other's cached
+            // prefix instead of forcing FullRefill. The close-marker
+            // VALIDATION that a budget is actually enforceable still runs
+            // separately, per-request, in `resolve_reasoning_close_token`.
+            tokenizer
+                .token_id_for_content(crate::model::qwen35::REASONING_CLOSE_MARKER)
+                .hash(&mut tok_hasher);
             let tokenizer_fingerprint = tok_hasher.finish();
 
             let adapter_id = match &self.lora {
@@ -16820,6 +17198,37 @@ mod inner {
                 self.plan_prefix_request(&prompt_ids, &plan)?;
             }
 
+            // Budget forcing: validate the </think> token id here too,
+            // before `_inner` is even called -- same reasoning as the
+            // suffix-plan preflight immediately above (#835) and the
+            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
+            // above that (PR #787). `_inner` resolves this again (defense
+            // in depth, mirroring the suffix-plan double-check), but only
+            // THIS early return -- before the destructive `match` below
+            // runs `restore_cross_turn_prefix` or `reset_state()` --
+            // guarantees a missing/out-of-range </think> token never
+            // destroys a valid pre-existing cross-turn entry the request
+            // never touched.
+            //
+            // Gated on `max_new_tokens > 0`, same as the suffix-plan
+            // preflight above (#1037): `_inner`'s own zero-budget guard
+            // (below, before its `resolve_reasoning_close_token` call) is
+            // unreachable-before-return for a zero-token request, so an
+            // unconditional resolve here disagreed with every other
+            // generation path (plain CPU `generate()`, non-cached-prefix
+            // Metal `generate_streaming()`) -- both short-circuit
+            // `max_new_tokens == 0` to a zero-token `StopReason::Length`
+            // BEFORE resolving the close marker, so a `reasoning_budget`
+            // set alongside `max_new_tokens == 0` succeeds there even with
+            // a missing/invalid `</think>` marker, but errored here.
+            if gen_cfg.max_new_tokens > 0 {
+                crate::model::qwen35::resolve_reasoning_close_token(
+                    tokenizer,
+                    gen_cfg.reasoning_budget,
+                    self.engine.config.vocab_size,
+                )?;
+            }
+
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
                 prompt_ids,
@@ -16945,6 +17354,23 @@ mod inner {
             // caller getting the wrapper's guard conditions right.
             self.plan_prefix_request(&prompt_ids, &plan)?;
 
+            // Budget forcing: resolve the </think> token id BEFORE the match
+            // below runs `restore_cross_turn_prefix` (which `take()`s the
+            // cache slot's entry) or `reset_state()` -- same reasoning as
+            // the suffix validation immediately above (#835), extended to
+            // this check: a missing or out-of-range </think> token must be
+            // rejected before any live state or cache entry is touched, or
+            // a rejected request would destroy a valid pre-existing prefix
+            // cache it never used. This also keeps the earlier property
+            // that its `?` propagates before the should_cancel check below,
+            // so a cancelled-but-invalid-budget request is rejected instead
+            // of returning Ok(Interrupt).
+            let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
+                tokenizer,
+                gen_cfg.reasoning_budget,
+                cfg.vocab_size,
+            )?;
+
             // The consumed entry (ExactAppend / ReplayFromCheckpoint) is
             // carried to the end-of-generation save so its checkpoint ring
             // and boundary snapshot survive across turns (#590).
@@ -17029,12 +17455,6 @@ mod inner {
             }
 
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
-
-            let think_close_id = if gen_cfg.reasoning_budget.is_some() {
-                tokenizer.special_token_id("</think>")
-            } else {
-                None
-            };
 
             // The one line that differs structurally from `generate_streaming`:
             // prefill only the divergent suffix, at its true absolute position.
@@ -20307,7 +20727,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("write original_len");
             file.flush().expect("flush q4 header");
 
-            let result = mmap_q4_weight(&device, &path, "truncated-payload-proof");
+            let result = mmap_q4_weight(&device, &path, "truncated-payload-proof", &[64]);
 
             assert!(
                 result.is_err(),
@@ -20337,7 +20757,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             file.write_all(&[0u8; 19]).expect("write short payload");
             file.flush().expect("flush truncated payload");
 
-            let result = mmap_q4_weight(&device, &path, "one-byte-short-proof");
+            let result = mmap_q4_weight(&device, &path, "one-byte-short-proof", &[32]);
 
             assert!(
                 result.is_err(),
@@ -20369,7 +20789,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             crate::weights::q4_weights::save_q4_file(&path, &tensor)
                 .expect("save well-formed q4 file");
 
-            let result = mmap_q4_weight(&device, &path, "full-payload-accept");
+            let result = mmap_q4_weight(&device, &path, "full-payload-accept", &[64]);
 
             assert!(
                 result.is_ok(),
@@ -20377,6 +20797,169 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 result.err()
             );
         }
+
+        // Regression test for #1037 (TOCTOU): the
+        // embedding/lm_head Q4 loaders used to validate shape
+        // against a config-derived expectation by opening the file once
+        // (`load_q4_file` or a manual `read_q4_header` call), then had
+        // `mmap_q4_weight` *reopen the same pathname* for the actual mmap --
+        // a local writer could swap in a different, self-consistent-but-
+        // undersized file between those two opens, and the shape check would
+        // never see the file that was actually mapped. `mmap_q4_weight`'s
+        // `expected_shape` parameter closes that window by validating the
+        // header it reads from the exact `File` it goes on to mmap -- there
+        // is no earlier independent open left for a swap to target.
+        #[test]
+        fn mmap_q4_weight_shape_check_rejects_undersized_file_before_mmap() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+
+            let (cfg, _weights) = tiny_metal_qwen35_fixture();
+
+            // Half `cfg.vocab_size` rows -- internally self-consistent
+            // (shape product == original_len, payload fully written), so
+            // `validate_q4_header_payload_bounds` alone would accept it.
+            let short_rows = cfg.vocab_size / 2;
+            let n_elems = short_rows * cfg.hidden_size;
+            let n_blocks = n_elems.div_ceil(32);
+            let tensor = crate::weights::q4_weights::Q4Tensor {
+                blocks: vec![
+                    crate::weights::q4_weights::Q4Block {
+                        scale: 0,
+                        bias: 0,
+                        packed: [0u8; 16],
+                    };
+                    n_blocks
+                ],
+                shape: vec![short_rows, cfg.hidden_size],
+                original_len: n_elems,
+            };
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("undersized_embed.q4");
+            crate::weights::q4_weights::save_q4_file(&path, &tensor)
+                .expect("save self-consistent undersized q4 file");
+
+            let result = mmap_q4_weight(
+                &device,
+                &path,
+                "undersized-embed-proof",
+                &[cfg.vocab_size, cfg.hidden_size],
+            );
+
+            assert!(
+                result.is_err(),
+                "mmap_q4_weight must reject a shape [{short_rows}, {}] file against \
+                 cfg.vocab_size={} *before* the mmap is created, even though the file \
+                 is fully self-consistent for its own (smaller) row count",
+                cfg.hidden_size,
+                cfg.vocab_size
+            );
+            // `Q4WeightBuf` (the `Ok` type) does not implement `Debug`, so
+            // `expect_err` (which requires `T: Debug`) does not apply here;
+            // go through `Option::expect` instead (mirrors the precedent
+            // at `blend_lora_layer_data`'s non-`Debug` `Ok` type below).
+            #[allow(clippy::err_expect)]
+            let msg = result.err().expect("checked is_err above");
+            assert!(
+                msg.contains("shape") && msg.contains("expected shape"),
+                "error must name the shape mismatch, not a generic mmap/payload failure; \
+                 got: {msg}"
+            );
+        }
+
+        // `validate_q4_tensor_shape`'s own unit test
+        // (`validate_q4_tensor_shape_rejects_any_mismatched_q4_tensor_shape`)
+        // now lives in the device-free `q4_mmap_guard_tests` module at file
+        // scope (#1037) alongside the function itself, so it compiles and
+        // runs under the default (non-metal-gpu) CPU test configuration.
+
+        // Regression test for #1037 (class-shaped): `load_q4_raw_bytes`
+        // (the loader for the dense-MLP `gate_proj`/`up_proj` fused-buffer path
+        // and the GDN qkv/z CPU-fallback concat path -- neither ever constructs
+        // a `Q4WeightBuf` from an mmap, so `validate_q4_tensor_shape` cannot be
+        // applied via `mmap_q4_weight`) previously validated only via
+        // `validate_q4_raw_element_count`, an element-count/numel comparison.
+        // A TRANSPOSED tensor -- `[hidden, intermediate]` on disk where
+        // `[intermediate, hidden]` is expected -- has the identical element
+        // count as the correctly-shaped tensor, so the numel check alone would
+        // have accepted it and let its bytes feed a config-sized GEMM dispatch
+        // with the wrong layout. `load_q4_raw_bytes` now routes through
+        // `validate_q4_tensor_shape` against the on-disk `Q4Tensor::shape`
+        // instead, which distinguishes `[768, 512]` from `[512, 768]` even
+        // though both have 393216 elements. No `Device` needed --
+        // `load_q4_raw_bytes` takes no `Device` parameter, only real file I/O
+        // against a tempdir.
+        #[test]
+        fn load_q4_raw_bytes_rejects_transposed_same_numel_shape() {
+            let tmp = tempfile::tempdir().expect("tempdir create");
+
+            // [768, 512] and [512, 768] have the same element count
+            // (393216) but are not the same tensor -- a transposed weight
+            // file silently swapped in for the correctly-shaped one.
+            let transposed_shape = [768usize, 512usize];
+            let expected_shape = [512usize, 768usize];
+            let numel: usize = transposed_shape.iter().product();
+            let data = vec![0.1f32; numel];
+            let tensor = crate::weights::q4_weights::quantize_f32_to_q4(&data, &transposed_shape)
+                .expect("quantize transposed fixture");
+            let path = tmp.path().join("transposed_gate_proj.q4");
+            crate::weights::q4_weights::save_q4_file(&path, &tensor)
+                .expect("save transposed .q4 fixture");
+
+            let result =
+                MetalQwen35State::load_q4_raw_bytes(&path, "gate_proj.weight", &expected_shape);
+            assert!(
+                result.is_err(),
+                "load_q4_raw_bytes must reject a self-consistent but transposed \
+                 tensor even though its element count matches the expected shape's \
+                 product exactly"
+            );
+            let msg = result.expect_err("checked is_err above");
+            assert!(
+                msg.contains("gate_proj.weight")
+                    && msg.contains("[768, 512]")
+                    && msg.contains("[512, 768]"),
+                "error must name the tensor label and both the found (transposed) \
+                 and expected shapes; got: {msg}"
+            );
+
+            // A correctly-shaped file must still be accepted (and its raw
+            // block bytes returned intact).
+            let good_numel: usize = expected_shape.iter().product();
+            let good_tensor = crate::weights::q4_weights::quantize_f32_to_q4(
+                &vec![0.1f32; good_numel],
+                &expected_shape,
+            )
+            .expect("quantize correctly-shaped fixture");
+            let good_path = tmp.path().join("correct_gate_proj.q4");
+            crate::weights::q4_weights::save_q4_file(&good_path, &good_tensor)
+                .expect("save correctly-shaped .q4 fixture");
+            let good_result = MetalQwen35State::load_q4_raw_bytes(
+                &good_path,
+                "gate_proj.weight",
+                &expected_shape,
+            );
+            assert!(
+                good_result.is_ok(),
+                "a correctly-shaped tensor must be accepted: {:?}",
+                good_result.err()
+            );
+            let expected_byte_len = good_numel.div_ceil(32) * 20;
+            assert_eq!(
+                good_result.expect("checked is_ok above").len(),
+                expected_byte_len,
+                "returned raw bytes must cover every Q4 block (20 bytes each)"
+            );
+        }
+
+        // The mode/uid + macOS extended-ACL trust-boundary predicate's unit
+        // tests (`mmap_file_trust_boundary_issue_fires_on_...`,
+        // `reject_if_mmap_file_trust_boundary_weak_fails_closed_on_writable_file`,
+        // `extended_acl_write_grant_is_rejected_even_when_mode_and_uid_pass`)
+        // live in the device-free `crate::weights::mmap_trust` module
+        // alongside the functions themselves (#1037), so they compile and
+        // run under the default (non-metal-gpu) CPU test configuration.
 
         // -------------------------------------------------------------------
         // Q3 MLP-only weight format (ADR-072 P1, #420 Stage 2): loader
@@ -21062,10 +21645,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 &[hidden],
             );
+            // q_proj is fused Q + gate_z (interleaved), [2*q_dim, hidden] --
+            // see `MetalFullLayerWeights::q_proj`'s doc comment and the
+            // `load_q4_buf` call site in `from_q4_dir`. Not `[q_dim, hidden]`.
             write_tiny_q4_fixture(
                 dir,
                 &format!("{prefix}.self_attn.q_proj.weight"),
-                &[q_dim, hidden],
+                &[2 * q_dim, hidden],
             );
             write_tiny_q4_fixture(
                 dir,
@@ -21168,6 +21754,83 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 1,
                 hidden,
                 |_| 0.5,
+            );
+        }
+
+        // Regression test for #1037 (a related failure mode):
+        // `write_synthetic_moe_checkpoint`'s `q_proj` fixture used to
+        // write `[q_dim, hidden]`, stale after production `q_proj` became
+        // fused Q+gate_z at `[2*q_dim, hidden]` -- 8 of the 14 Device-gated
+        // `from_q4_dir` tests below failed on that shape mismatch *before*
+        // their intended assertions, and because those tests are Device-gated
+        // (`Device::system_default()` early-return), the CPU-only leg never
+        // executed them to catch it. This test loads the fixture's actual
+        // on-disk `q_proj` bytes (no `Device` needed -- `load_q4_file` +
+        // `validate_q4_tensor_shape` are pure file I/O and comparison) and
+        // runs them through the identical `[2*q_dim, hidden]` shape
+        // validation `from_q4_dir`'s `load_q4_buf` applies via
+        // `mmap_q4_weight`, proving fixture and loader agree without a live
+        // Device. Every other tensor `write_synthetic_moe_checkpoint` writes
+        // (embed_tokens, k/v/o_proj, q/k_norm, MoE router/gate_up/down/
+        // shared_expert*) was checked against its `from_q4_dir` call site
+        // above and already matched -- q_proj was the only one that had
+        // drifted.
+        //
+        // The fixture's on-disk `q_proj` shape must match the fused
+        // `[2*q_dim, hidden]` shape `from_q4_dir`'s validation expects, not
+        // the unfused `[q_dim, hidden]`.
+        #[test]
+        fn write_synthetic_moe_checkpoint_q_proj_matches_fused_shape_validation() {
+            let cfg = synthetic_moe_test_config();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+
+            let q_dim = cfg.full_q_dim();
+            let hidden = cfg.hidden_size;
+            let prefix = "model.language_model.layers.0";
+            let q_proj_path = MetalQwen35State::q4_tensor_path(
+                dir,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                "q4",
+            );
+            let tensor = crate::weights::q4_weights::load_q4_file(&q_proj_path)
+                .expect("load q_proj fixture written by write_synthetic_moe_checkpoint");
+
+            assert!(
+                validate_q4_tensor_shape(
+                    &tensor.shape,
+                    &[2 * q_dim, hidden],
+                    "self_attn.q_proj.weight",
+                    &q_proj_path,
+                )
+                .is_ok(),
+                "write_synthetic_moe_checkpoint's q_proj fixture (shape {:?}) must match \
+                 the production fused [2*q_dim, hidden] = [{}, {hidden}] shape the loader \
+                 validates",
+                tensor.shape,
+                2 * q_dim,
+            );
+
+            // Guard against a regression back to the stale pre-fix
+            // [q_dim, hidden] shape: that must fail the same validation,
+            // proving this test catches the drift.
+            assert!(
+                validate_q4_tensor_shape(
+                    &[q_dim, hidden],
+                    &[2 * q_dim, hidden],
+                    "self_attn.q_proj.weight",
+                    &q_proj_path,
+                )
+                .is_err(),
+                "the stale unfused [q_dim, hidden] shape must be rejected by the same \
+                 validation the fixture now satisfies"
             );
         }
 
@@ -23035,6 +23698,130 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 err.contains("shape"),
                 "error must name the shape mismatch so it's diagnosable, got: {err}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // `mmap_q4_weight`'s `validate_q4_header_payload_bounds` call only
+        // checks that a Q4 file is internally self-consistent (payload
+        // physically present for its own declared shape) — it never
+        // cross-checks the declared row count against `cfg.vocab_size`. A
+        // structurally valid but SHORT `embed_tokens.weight.q4` /
+        // `lm_head.weight.q4` (fewer rows than `cfg.vocab_size`) would
+        // therefore load, and the unsafe CPU-side embedding lookup
+        // (`embed_tokens.contents().add(token_id * hidden)`) would read past
+        // the mapped buffer for any `token_id` in `[declared_rows,
+        // cfg.vocab_size)` — including a `</think>` close-marker id that
+        // `resolve_reasoning_close_token`'s `cfg.vocab_size`-only bound
+        // considers perfectly in range. These two tests are regression
+        // coverage: a short embedding table and a short lm_head table must
+        // both make `from_q4_dir` return an `Err` before any embedding
+        // lookup can run, not just before `forward_step`. No Metal kernel is
+        // dispatched by either test -- `from_q4_dir` fails inside the loader
+        // itself, before the forward pass.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn from_q4_dir_rejects_short_embedding_table() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            assert!(
+                cfg.tie_word_embeddings,
+                "fixture must be tied so embed_tokens.weight is the only lookup table"
+            );
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+
+            // Overwrite embed_tokens.weight with a self-consistent but SHORT
+            // table: shape `[vocab_size - 1, hidden]` instead of the
+            // required `[vocab_size, hidden]` -- `validate_q4_header_payload_bounds`
+            // alone would accept it (its own declared payload is physically
+            // present), but it is not the shape the loaded config requires.
+            write_tiny_q4_fixture_per_row(
+                dir,
+                "model.language_model.embed_tokens.weight",
+                cfg.vocab_size - 1,
+                cfg.hidden_size,
+                |_| 0.42,
+            );
+
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let Err(err) = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16) else {
+                panic!(
+                    "from_q4_dir must reject a short embed_tokens.weight table before any \
+                     embedding lookup, not silently permit an out-of-bounds read for a \
+                     token id past the table's actual row count"
+                );
+            };
+            assert!(
+                err.contains("expected shape") && err.contains("embed_tokens"),
+                "error must name the shape mismatch and the rejected tensor so it's \
+                 diagnosable, got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_short_lm_head_table() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let mut cfg = synthetic_moe_test_config();
+            cfg.tie_word_embeddings = false; // untied: lm_head.weight is the logits table
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            // write_synthetic_moe_checkpoint only writes embed_tokens (the
+            // tied-config tensor name); the untied lm_head.weight artifact
+            // must be supplied separately, matching the on-disk contract
+            // `from_q4_dir_rejects_untied_config_without_lm_head_artifact`
+            // exercises. Full correct shape first...
+            write_tiny_q4_fixture_per_row(
+                dir,
+                "lm_head.weight",
+                cfg.vocab_size,
+                cfg.hidden_size,
+                |_| 0.24,
+            );
+            // ...then overwritten with a short table, same regression as
+            // the embed_tokens test above but for the untied logits path.
+            write_tiny_q4_fixture_per_row(
+                dir,
+                "lm_head.weight",
+                cfg.vocab_size - 1,
+                cfg.hidden_size,
+                |_| 0.24,
+            );
+
+            let tokenizer_path = std::path::Path::new("/dev/null");
+            let Err(err) = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16) else {
+                panic!(
+                    "from_q4_dir must reject a short lm_head.weight table before any \
+                     token-id-indexed GEMV, not silently permit an out-of-bounds mmap read"
+                );
+            };
+            assert!(
+                err.contains("expected shape") && err.contains("lm_head"),
+                "error must name the shape mismatch and the rejected tensor so it's \
+                 diagnosable, got: {err}"
             );
         }
 
@@ -32417,13 +33204,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             cfg.eos_token_id = u32::MAX;
 
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
-            // max_cache_len=128 = this fixture's max_position_embeddings ceiling;
-            // four short turns of ChatML-formatted history (role words + content)
-            // stay well under it (~70 tokens at the last turn).
+            // max_cache_len=128 = this fixture's max_position_embeddings ceiling.
+            // format_chat_template's ChatML framing carries a large fixed
+            // per-message overhead under this single-char vocab tokenizer
+            // (role words and special tokens dominate over the 1-2 char
+            // content), so the turn count here is deliberately two, not
+            // more: measured prompt token counts are 51 (turn 1) and 92
+            // (turn 2), both comfortably under the 128-token ceiling even
+            // after the decode budget; a third turn measured at 132 prompt
+            // tokens, already over the ceiling before decode is added.
             let mut cached_state =
                 MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
 
-            let user_turns = ["a", "bc", "d", "ef"];
+            let user_turns = ["a", "bc"];
             let mut history: Vec<ChatMessage> = vec![ChatMessage::system("")];
             let mut saw_exact_append = false;
 
@@ -33401,6 +34194,303 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(
                 turn3.output.token_ids, reference_out.token_ids,
                 "post-cancel generation must still match full re-prefill exactly"
+            );
+        }
+
+        /// Regression test for #1037: `generate_streaming_with_prefix_cache_and_cancel`
+        /// must resolve and validate the `</think>` close-marker id *before* an
+        /// immediate `should_cancel() == true` can return `Ok(Interrupt)` --
+        /// mirroring `generate_streaming_with_cancel`'s existing ordering. An
+        /// active reasoning budget whose `</think>` marker is unresolvable
+        /// (missing from the tokenizer, case a) or out-of-range for the model's
+        /// vocab (case b) must surface as a typed `InvalidInput` error, never a
+        /// silent `Ok(Interrupt)`.
+        ///
+        /// `think_close_id` must resolve above the early `should_cancel()`
+        /// return in `generate_streaming_with_prefix_cache_and_cancel_inner`,
+        /// so both assertions below require `Err`, never `Ok(Interrupt)`.
+        /// This test is `metal-gpu`-gated and does not run in a CPU-only
+        /// environment.
+        #[test]
+        fn cached_generate_cancelled_with_active_budget_fails_closed_on_unresolvable_close_marker()
+        {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            // (a) missing: `single_char_vocab_tokenizer` has no `</think>` token.
+            {
+                let tokenizer = single_char_vocab_tokenizer();
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+                let mut gen_cfg = cross_turn_test_gen_cfg(11, 3);
+                gen_cfg.reasoning_budget = Some(1);
+
+                let result = state.generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || true,
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Err(crate::error::InferenceError::InvalidInput(ref message))
+                            if message.contains("</think>") && message.contains("reasoning_budget")
+                    ),
+                    "a cancelled cached generation with an active reasoning budget and no \
+                     resolvable </think> marker must fail closed with InvalidInput, not \
+                     Ok(Interrupt); got {result:?}"
+                );
+            }
+
+            // (b) out-of-range: `</think>` resolves to id 32, >= cfg.vocab_size (32).
+            {
+                let mut vocab: std::collections::HashMap<String, u32> =
+                    std::collections::HashMap::new();
+                for i in 0u32..32 {
+                    let byte = if i < 26 {
+                        b'a' + i as u8
+                    } else {
+                        b'A' + (i - 26) as u8
+                    };
+                    vocab.insert((byte as char).to_string(), i);
+                }
+                vocab.insert("</think>".to_string(), 32);
+                let tokenizer =
+                    crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+                        .expect("out-of-range-</think> tokenizer must build");
+
+                let mut state =
+                    MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+                let mut gen_cfg = cross_turn_test_gen_cfg(13, 3);
+                gen_cfg.reasoning_budget = Some(1);
+
+                let result = state.generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "a",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || true,
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Err(crate::error::InferenceError::InvalidInput(ref message))
+                            if message.contains("vocab")
+                    ),
+                    "a cancelled cached generation with an active reasoning budget and an \
+                     out-of-range </think> marker must fail closed with InvalidInput, not \
+                     Ok(Interrupt); got {result:?}"
+                );
+            }
+        }
+
+        /// #1037: `generate_streaming_with_prefix_cache_and_cancel_inner`
+        /// resolves and validates the `</think>` close marker *after*
+        /// `restore_cross_turn_prefix`/`reset_state` has already mutated
+        /// cache/session state for the current request. Before this fix, a
+        /// rejection there reached the wrapper's destructive `Err` arm
+        /// exactly like any other `_inner` error and evicted a valid
+        /// pre-existing entry the request never used. The wrapper now
+        /// resolves the close marker itself before calling `_inner` at all
+        /// (mirroring the existing suffix-plan preflight, #835), so this
+        /// class of rejection returns before `_inner` -- and its
+        /// destructive `match` -- ever runs.
+        ///
+        /// The `resolve_reasoning_close_token` preflight call in
+        /// `generate_streaming_with_prefix_cache_and_cancel` runs before
+        /// `_inner`, so turn 2's rejection never reaches the wrapper's
+        /// destructive `Err` arm and turn 1's entry survives -- turn 3 below
+        /// observes a reused prefix, not `reused_tokens == 0` / `FullRefill`.
+        #[test]
+        fn cached_generate_reject_at_close_marker_preserves_pre_existing_entry() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+
+            // Turn 1: establish a saved, reusable entry on the DEFAULT slot.
+            let turn1 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(31, 2),
+                    |_, _| true,
+                    || false,
+                )
+                .expect("turn 1 must succeed");
+            let mut conv = "ab".to_string();
+            conv.push_str(&turn1.output.text);
+
+            // Turn 2: same slot, an active reasoning budget the tokenizer
+            // cannot satisfy (`single_char_vocab_tokenizer` has no
+            // `</think>` token) -- must be rejected before touching
+            // cache/session state.
+            let mut bad_gen_cfg = cross_turn_test_gen_cfg(31, 2);
+            bad_gen_cfg.reasoning_budget = Some(1);
+            let turn2 = state.generate_streaming_with_prefix_cache_and_cancel(
+                slot_id,
+                &conv,
+                &tokenizer,
+                &bad_gen_cfg,
+                |_, _| true,
+                || false,
+            );
+            assert!(
+                matches!(
+                    turn2,
+                    Err(crate::error::InferenceError::InvalidInput(ref message))
+                        if message.contains("</think>") && message.contains("reasoning_budget")
+                ),
+                "turn 2 must fail closed on the unresolvable </think> marker; got {turn2:?}"
+            );
+
+            // Turn 3: continuation of turn 1's own conversation, with a new
+            // suffix character appended so the reconstructed prompt is
+            // strictly longer than turn 1's cached entry --
+            // `plan_prefix_reuse` requires `new_prompt_ids.len() > shared`
+            // for `ExactAppend` (an exact-length replay of the cached
+            // prompt is `FullRefill` by design). If turn 2's rejection had
+            // destroyed turn 1's entry, this would fall back to FullRefill
+            // (reused_tokens == 0); the fix preserves it instead.
+            let turn3_prompt = format!("{conv}c");
+            let turn3 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &turn3_prompt,
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(31, 2),
+                    |_, _| true,
+                    || false,
+                )
+                .expect("turn 3 must succeed");
+            assert_eq!(
+                turn3.cache.reused_tokens,
+                conv.len(),
+                "a rejected turn 2 must not destroy turn 1's valid pre-existing \
+                 cross-turn entry -- turn 3 (continuing turn 1's conversation \
+                 plus a new suffix token) must exact-append onto the full \
+                 shared prefix, not fall back to FullRefill; got {:?}",
+                turn3.cache
+            );
+            assert_eq!(
+                turn3.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "turn 3 must exact-append onto turn 1's preserved entry"
+            );
+        }
+
+        /// Regression test for #1037: `reasoning_budget` must not be
+        /// part of the cross-turn prefix-cache identity
+        /// (`tokenizer_fingerprint`). Before this fix, `cross_turn_metadata`
+        /// hashed the `</think>` marker id only when the *current* request's
+        /// `reasoning_budget` was `Some(budget > 0)`, and hashed a fixed
+        /// `None::<u32>` sentinel otherwise -- so a turn with no budget
+        /// followed by a turn with one (identical prompt/tokenizer
+        /// otherwise) produced two different fingerprints and forced
+        /// `FullRefill`, discarding a perfectly reusable prefix. This test
+        /// continues turn 1's own conversation in turn 2 with an active
+        /// (valid, resolvable) reasoning budget and asserts the prefix is
+        /// still reused.
+        ///
+        /// Reintroducing the `reasoning_budget`-gated branch in
+        /// `cross_turn_metadata`'s `tokenizer_fingerprint` computation makes
+        /// turn 2 below observe `reused_tokens == 0` / `FullRefill` instead
+        /// of a reused prefix.
+        #[test]
+        fn cross_turn_cache_reused_when_only_reasoning_budget_changes() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            // Same 32-entry single-char vocab as `single_char_vocab_tokenizer`,
+            // but with id 31 ('F' there) repurposed as a resolvable, in-range
+            // `</think>` marker so an active reasoning budget validates.
+            let mut vocab: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            for i in 0u32..31 {
+                let byte = if i < 26 {
+                    b'a' + i as u8
+                } else {
+                    b'A' + (i - 26) as u8
+                };
+                vocab.insert((byte as char).to_string(), i);
+            }
+            vocab.insert("</think>".to_string(), 31);
+            let tokenizer =
+                crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
+                    .expect("resolvable-</think> tokenizer must build");
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+
+            // Turn 1: no reasoning budget.
+            let turn1 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(37, 2),
+                    |_, _| true,
+                    || false,
+                )
+                .expect("turn 1 must succeed");
+            let mut conv = "ab".to_string();
+            conv.push_str(&turn1.output.text);
+
+            // Turn 2: continuation of the SAME conversation, differing from
+            // turn 1 only in that `reasoning_budget` is now `Some(1)`, plus
+            // a new suffix character so the reconstructed prompt is
+            // strictly longer than turn 1's cached entry --
+            // `plan_prefix_reuse` requires `new_prompt_ids.len() > shared`
+            // for `ExactAppend` (an exact-length replay of the cached
+            // prompt is `FullRefill` by design).
+            let mut gen_cfg2 = cross_turn_test_gen_cfg(37, 2);
+            gen_cfg2.reasoning_budget = Some(1);
+            let turn2_prompt = format!("{conv}c");
+            let turn2 = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &turn2_prompt,
+                    &tokenizer,
+                    &gen_cfg2,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("turn 2 must succeed");
+
+            assert_eq!(
+                turn2.cache.reused_tokens,
+                conv.len(),
+                "turning reasoning_budget on for an otherwise-identical \
+                 continuation must not force FullRefill; got {:?}",
+                turn2.cache
+            );
+            assert_eq!(
+                turn2.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "turn 2 must exact-append onto turn 1's entry despite the \
+                 reasoning_budget change"
             );
         }
 

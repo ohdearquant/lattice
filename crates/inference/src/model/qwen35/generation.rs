@@ -14,6 +14,7 @@ use crate::model::qwen35_config::{
 };
 use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
+use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
 
 /// Test-only toggle forcing the pre-delegation serial prefill path
@@ -117,6 +118,19 @@ impl Qwen35Model {
         // generation). Mirrors the pattern in crate::generate::generate.
         let mut grammar_state: Option<GrammarState> =
             gen_cfg.grammar.as_ref().map(|g| g.initial_state());
+
+        // Budget forcing: resolve and validate the </think> token id up front,
+        // before any early-success return below (grammar-blocked-at-step-0,
+        // grammar-advance failure, first-token EOS/stop) can return Ok without
+        // ever having confirmed an active reasoning budget is enforceable.
+        // Mirrors the Metal `generate_streaming_with_cancel` placement (see
+        // `MetalQwen35State`), which resolves this before its own
+        // should_cancel/prefill/grammar/EOS checks for the same reason.
+        let think_close_id = resolve_reasoning_close_token(
+            &self.tokenizer,
+            gen_cfg.reasoning_budget,
+            cfg.vocab_size,
+        )?;
 
         let mut generated_ids: Vec<u32> = Vec::with_capacity(effective_new);
         let mut all_ids = prompt_ids.clone();
@@ -239,17 +253,11 @@ impl Qwen35Model {
         generated_ids.push(next_id);
         all_ids.push(next_id);
 
-        // Budget forcing: resolve </think> once and seed thinking_closed from the
+        // think_close_id was already resolved and validated above, before the
+        // grammar/EOS early-return paths. Seeds thinking_closed from the
         // prefill token so budget=1 works. Mirrors generate_streaming exactly;
         // disabled (reasoning_budget=None) → None/false → no-op, byte-identical to
-        // pre-feature behaviour (e2e-parity pinned). special_token_id resolves
-        // </think> via the added-token map (special=false markers are present
-        // there — distinct from the id_to_token detok path).
-        let think_close_id = if gen_cfg.reasoning_budget.is_some() {
-            self.tokenizer.special_token_id("</think>")
-        } else {
-            None
-        };
+        // pre-feature behaviour (e2e-parity pinned).
         // `DecodePolicy::init` (PR #787) constructs
         // the policy AND records this prefill-derived first token's logprob
         // in the same call -- replaces the freestanding `record_logprob(...)`
@@ -541,6 +549,20 @@ impl Qwen35Model {
         let mut grammar_state: Option<GrammarState> =
             gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
+        // Budget forcing: resolve and validate the </think> token id up front,
+        // before any early-success return below (should_cancel, grammar-
+        // blocked-at-step-0, grammar-advance failure, first-token EOS/stop)
+        // can return Ok without ever having confirmed an active reasoning
+        // budget is enforceable. Mirrors the Metal
+        // `generate_streaming_with_cancel` placement (see `MetalQwen35State`),
+        // which resolves this before its own
+        // should_cancel/prefill/grammar/EOS checks for the same reason.
+        let think_close_id = resolve_reasoning_close_token(
+            &self.tokenizer,
+            gen_cfg.reasoning_budget,
+            cfg.vocab_size,
+        )?;
+
         let mut generated_ids: Vec<u32> = Vec::with_capacity(effective_new);
         let mut all_ids = prompt_ids.clone();
         // Empty `Vec` costs no heap allocation until pushed to, so this is
@@ -616,6 +638,16 @@ impl Qwen35Model {
         scratch.ensure_capacity(cfg, prompt_len);
         scratch.logits[..cfg.vocab_size].copy_from_slice(&prefill_logits);
 
+        // Prefill logits are ready -- the true prefill/decode boundary.
+        // Fired here, immediately, before the cancellation check and grammar
+        // masking below: both of those can return early (a post-prefill
+        // disconnect, or a step-0 grammar block with no legal first token),
+        // and prefill itself already completed by this point regardless of
+        // what either of those checks decides, so a caller observing raw
+        // events must still see prefill end even on those early-return
+        // paths -- not just on the eventual-first-token path.
+        on_raw_event(RawGenEvent::PrefillEnd);
+
         // The prefill call itself cannot be interrupted mid-flight, so this
         // is the earliest point a disconnect that happened *during* prefill
         // can be observed -- before paying for grammar masking or sampling
@@ -647,13 +679,6 @@ impl Qwen35Model {
                 ));
             }
         }
-
-        // Prefill logits are ready and the first token has not been sampled
-        // yet -- the true prefill/decode boundary.
-        // Fired unconditionally here (not gated on the eventual grammar/EOS
-        // outcome below), since prefill itself always completed by this
-        // point regardless of what the first sampled token turns out to be.
-        on_raw_event(RawGenEvent::PrefillEnd);
 
         // Test-only seam: stamp "first sample
         // entered" right at the point sampling actually begins, so a test can
@@ -698,6 +723,13 @@ impl Qwen35Model {
             });
         }
 
+        // think_close_id was already resolved and validated above, before the
+        // should_cancel/grammar/EOS early-return paths -- seeds the
+        // thinking_closed state from the prefill token so budget=1 works, and
+        // (unchanged from the prior fix) is bound before the token is
+        // committed to `generated_ids` or emitted to the streaming observer
+        // below, so a resolution failure would return Err without ever having
+        // sent a RawToken event for this generation.
         generated_ids.push(next_id);
         all_ids.push(next_id);
         // Raw-token event for the prefill-derived first token, fired from the
@@ -707,14 +739,6 @@ impl Qwen35Model {
         on_raw_event(RawGenEvent::RawToken {
             index: generated_ids.len(),
         });
-
-        // Budget forcing setup: resolve the </think> token id once and seed
-        // the thinking_closed state from the prefill token so budget=1 works.
-        let think_close_id = if gen_cfg.reasoning_budget.is_some() {
-            self.tokenizer.special_token_id("</think>")
-        } else {
-            None
-        };
         // `DecodePolicy::init` (PR #787) constructs
         // the policy AND records this prefill-derived first token's logprob
         // in the same call -- replaces the freestanding `record_logprob(...)`
@@ -1402,9 +1426,9 @@ impl DecodePolicy {
     /// once for the *other* four constituent methods (see the struct-level
     /// doc comment above).
     ///
-    /// `think_close_id` is resolved by the caller (`tokenizer.special_token_id("</think>")`
-    /// when `gen_cfg.reasoning_budget.is_some()`, `None` otherwise) since each backend
-    /// reaches its tokenizer differently. `first_emitted_id` / `first_generated_len` seed
+    /// `think_close_id` is resolved by the caller with [`resolve_reasoning_close_token`]
+    /// since each backend reaches its tokenizer differently. `first_emitted_id` /
+    /// `first_generated_len` seed
     /// `thinking_closed` / `reasoning_end_len` from the token already sampled and pushed
     /// before the decode loop starts (the prefill-derived first token), covering the
     /// `reasoning_budget == 1` edge case exactly as the six duplicated call sites did.
@@ -2302,6 +2326,54 @@ pub(crate) fn check_reasoning_budget_not_set(
         ));
     }
     Ok(())
+}
+
+/// The reasoning-close marker every s1/thinking-budget path resolves
+/// against: the shared generation resolver below, and the cross-turn KV
+/// cache fingerprint (`MetalQwen35State::generate_streaming`'s
+/// `tokenizer_fingerprint` hash), which must key on the same marker the
+/// close-token resolver validates so cache reuse and budget enforcement
+/// never disagree about which tokenizer content they mean by "the reasoning
+/// close marker".
+pub(crate) const REASONING_CLOSE_MARKER: &str = "</think>";
+
+/// Resolve the closing marker required to enforce an active reasoning budget.
+///
+/// Exact token-content lookup covers both base-vocabulary entries and added
+/// tokens regardless of their `special` flag. An active budget fails closed if
+/// the tokenizer has no representable `</think>` marker, or if the resolved id
+/// is outside `vocab_size` (a mismatched or malicious tokenizer can declare
+/// `</think>` in its base vocabulary at an id the loaded model has no
+/// embedding/logit row for) -- the id is later forced into decoding, and
+/// `forward_step` only asserts on out-of-range ids rather than returning a
+/// typed error, so this is the one place that can fail closed instead.
+pub(crate) fn resolve_reasoning_close_token(
+    tokenizer: &BpeTokenizer,
+    reasoning_budget: Option<usize>,
+    vocab_size: usize,
+) -> Result<Option<u32>, InferenceError> {
+    if !matches!(reasoning_budget, Some(budget) if budget > 0) {
+        return Ok(None);
+    }
+
+    let token_id = tokenizer
+        .token_id_for_content(REASONING_CLOSE_MARKER)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "reasoning_budget cannot be enforced because the tokenizer has no </think> token"
+                    .into(),
+            )
+        })?;
+
+    if (token_id as usize) >= vocab_size {
+        return Err(InferenceError::InvalidInput(format!(
+            "reasoning_budget cannot be enforced because the tokenizer's </think> \
+             token id {token_id} is out of range for the model vocabulary \
+             (vocab_size {vocab_size})"
+        )));
+    }
+
+    Ok(Some(token_id))
 }
 
 /// Sibling guard to [`check_reasoning_budget_not_set`] (PR #787): fails
@@ -3332,9 +3404,8 @@ mod tests {
     }
 
     // Same tiny zero-weight model, but the tokenizer carries `</think>` as added
-    // token id 7 so `special_token_id("</think>")` resolves and reasoning-budget
-    // forcing can fire. `special:false` still makes it queryable — any added token
-    // (regardless of the special flag) is inserted into the tokenizer's lookup.
+    // token id 7 so reasoning-budget forcing can fire. The marker is deliberately
+    // `special:false` to cover content-based added-token resolution.
     fn build_tiny_thinking_model() -> Qwen35Model {
         build_tiny_zero_model_tok(
             r#"{
@@ -3349,6 +3420,270 @@ mod tests {
     "vocab":{"<unk>":0,"a":1,"b":2,"c":3,"d":4,"e":5," ":6},"merges":[]}
 }"#,
         )
+    }
+
+    /// Resolving `</think>` only through the tokenizer's special-token table
+    /// leaves this base-vocabulary marker undiscovered and makes the
+    /// resolver return an error instead of token 7.
+    #[test]
+    fn reasoning_budget_resolves_close_marker_by_token_content() {
+        use std::collections::HashMap;
+
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(
+            HashMap::from([("</think>".to_string(), 7)]),
+            Vec::new(),
+        )
+        .expect("base-vocabulary tokenizer must load");
+        assert_eq!(tokenizer.special_token_id("</think>"), None);
+        assert_eq!(
+            resolve_reasoning_close_token(&tokenizer, Some(1), 97)
+                .expect("base-vocabulary marker must resolve"),
+            Some(7)
+        );
+    }
+
+    /// Accepting an unresolved closing marker returns an unbudgeted `Ok`
+    /// output, so this typed-error assertion fails.
+    #[test]
+    fn reasoning_budget_rejects_tokenizer_without_close_marker() {
+        let model = build_tiny_zero_model();
+        let result = model.generate(
+            "a",
+            &GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                enable_thinking: true,
+                reasoning_budget: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("</think>") && message.contains("reasoning_budget")
+            ),
+            "an unenforceable reasoning budget must fail with a descriptive InvalidInput; got {result:?}"
+        );
+    }
+
+    /// Security regression (out-of-range `</think>` id): a mismatched or
+    /// malicious tokenizer can declare `</think>` in its base vocabulary at an
+    /// id the loaded model has no embedding/logit row for. `forward_step`
+    /// only `assert!`s on an out-of-range `token_id` (a release panic, i.e. a
+    /// process-crashing DoS), so the resolver -- the one place upstream of
+    /// every forced-decode call site -- must reject it with a typed error
+    /// instead of ever returning it.
+    ///
+    /// The `vocab_size` bound check must reject id 7 with `Err`, not resolve
+    /// it as `Ok(Some(7))`.
+    #[test]
+    fn reasoning_budget_rejects_close_marker_id_at_or_beyond_vocab_size() {
+        use std::collections::HashMap;
+
+        let tokenizer = BpeTokenizer::from_vocab_and_merges(
+            HashMap::from([("</think>".to_string(), 7)]),
+            Vec::new(),
+        )
+        .expect("base-vocabulary tokenizer must load");
+
+        // vocab_size = 7 means valid ids are 0..=6; the resolved id (7) is
+        // out of range.
+        let result = resolve_reasoning_close_token(&tokenizer, Some(1), 7);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(ref message)) if message.contains("vocab")),
+            "a </think> id >= vocab_size must be rejected as InvalidInput before \
+             it can be forced into decoding, got {result:?}"
+        );
+
+        // Sanity: the identical id resolves once vocab_size actually covers it.
+        assert_eq!(
+            resolve_reasoning_close_token(&tokenizer, Some(1), 8)
+                .expect("in-range marker must resolve"),
+            Some(7)
+        );
+    }
+
+    /// Correctness regression (early-success bypass, CPU `generate`): an
+    /// active reasoning budget with no resolvable `</think>` marker must
+    /// fail closed even when the very first sampled token is itself a stop
+    /// token -- `should_stop_token`'s early `Ok` return must not be reached
+    /// before budget validation runs.
+    ///
+    /// Mechanism: `build_tiny_zero_model` always greedy-samples token 0 (see
+    /// `eos_token_id_override_forces_continuation_past_matching_stop_token`);
+    /// pointing `eos_token_id` at 0 makes `should_stop_token` true on that
+    /// very first sampled token, so this exercises the first-token-EOS
+    /// early-return path specifically, not the decode loop.
+    ///
+    /// `think_close_id` must resolve before the `should_stop_token` check
+    /// runs, so this returns `Err`, not `Ok(GenerateOutput { stopped: true,
+    /// stop_reason: Eos, .. })`.
+    #[test]
+    fn reasoning_budget_bypass_blocked_on_first_token_eos() {
+        let mut model = build_tiny_zero_model();
+        model.config_mut().eos_token_id = 0;
+        let result = model.generate(
+            "a",
+            &GenerateConfig {
+                max_new_tokens: 5,
+                temperature: 0.0,
+                enable_thinking: true,
+                reasoning_budget: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("</think>") && message.contains("reasoning_budget")
+            ),
+            "an active reasoning budget with no resolvable </think> marker must fail \
+             closed even when the very first sampled token is a stop token (the \
+             first-token-EOS early-success path must not bypass budget validation); \
+             got {result:?}"
+        );
+    }
+
+    /// Correctness regression (early-success bypass, CPU `generate`):
+    /// sibling of the test above for the grammar early-return path -- an
+    /// active reasoning budget with no resolvable `</think>` marker must
+    /// fail closed even when the grammar's `advance()` rejects the first
+    /// sampled token (the `StopReason::Grammar` early `Ok` return in
+    /// `stop_reason_grammar_on_advance_false`).
+    ///
+    /// `think_close_id` must resolve before the grammar early-return, so
+    /// this returns `Err`, not `Ok(GenerateOutput { stop_reason:
+    /// Some(StopReason::Grammar), .. })`.
+    #[test]
+    fn reasoning_budget_bypass_blocked_on_grammar_advance_false() {
+        use crate::grammar::{GrammarEngine, GrammarSpec};
+        use std::sync::Arc;
+
+        let model = build_tiny_zero_model();
+
+        // Same vocab-size-1 setup as stop_reason_grammar_on_advance_false:
+        // mask_logits blocks token 0, greedy picks token 1, advance(1)
+        // returns false (1 >= grammar vocab_size 1).
+        let spec = GrammarSpec::Gbnf("root ::= \"x\"\n".to_string());
+        let vocab = vec![b"t".to_vec()];
+        let engine =
+            Arc::new(GrammarEngine::new(&spec, vocab).expect("single-token grammar compiles"));
+
+        let result = model.generate(
+            "a",
+            &GenerateConfig {
+                max_new_tokens: 5,
+                temperature: 0.0,
+                enable_thinking: true,
+                reasoning_budget: Some(1),
+                grammar: Some(engine),
+                stop_token_ids: vec![],
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("</think>") && message.contains("reasoning_budget")
+            ),
+            "an active reasoning budget with no resolvable </think> marker must fail \
+             closed even when the grammar's advance() rejects the first sampled token \
+             (the grammar early-success path must not bypass budget validation); \
+             got {result:?}"
+        );
+    }
+
+    /// Streaming sibling of `reasoning_budget_bypass_blocked_on_first_token_eos`:
+    /// the same bypass, exercised through `generate_streaming_with_observer`
+    /// rather than `generate`, since the two functions duplicate this
+    /// control flow independently (see the module doc comment on
+    /// `generate_streaming`).
+    ///
+    /// `generate_streaming_with_observer` duplicates the reorder
+    /// independently of `generate`, so this test isolates the streaming
+    /// copy: it must return `Err` on its own ordering, not by relying on
+    /// `generate`'s ordering to cover it.
+    #[test]
+    fn reasoning_budget_bypass_blocked_on_first_token_eos_streaming() {
+        let mut model = build_tiny_zero_model();
+        model.config_mut().eos_token_id = 0;
+        let result = model.generate_streaming_with_observer(
+            "a",
+            &GenerateConfig {
+                max_new_tokens: 5,
+                temperature: 0.0,
+                enable_thinking: true,
+                reasoning_budget: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            },
+            |_delta| true,
+            || false,
+            |_evt| {},
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("</think>") && message.contains("reasoning_budget")
+            ),
+            "generate_streaming_with_observer must also fail closed on first-token-EOS \
+             with an active, unenforceable reasoning budget; got {result:?}"
+        );
+    }
+
+    /// Correctness regression (streaming observer contract): a generation
+    /// that fails because it cannot resolve the reasoning-close marker must
+    /// not have already emitted a `RawToken` event for the prefill-derived
+    /// first token. The observer contract (see
+    /// [`Qwen35Model::generate_streaming_with_observer`]) promises `RawToken`
+    /// events only for tokens that end up in the returned
+    /// `Ok(GenerateOutput)`; a caller that counts `RawToken` events as
+    /// committed generated tokens must never see one for a generation that
+    /// returns `Err`.
+    ///
+    /// `think_close_id` must resolve before the prefill-derived token is
+    /// pushed and its `RawToken` event fired, so the `Err` path here
+    /// observes no `RawToken` event.
+    #[test]
+    fn raw_observer_emits_no_raw_token_when_close_marker_resolution_fails() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            enable_thinking: true,
+            reasoning_budget: Some(1),
+            ..Default::default()
+        };
+        let events = std::cell::RefCell::new(Vec::<RawGenEvent>::new());
+        let result = model.generate_streaming_with_observer(
+            "a",
+            &gen_cfg,
+            |_delta| true,
+            || false,
+            |evt| events.borrow_mut().push(evt),
+        );
+
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "generation must fail closed when the tokenizer has no </think> marker, got {result:?}"
+        );
+        let events = events.into_inner();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RawGenEvent::RawToken { .. })),
+            "no RawToken may be emitted on a path that then returns Err: {events:?}"
+        );
     }
 
     /// COMBINED grammar × reasoning-budget path: when the s1 budget forces `</think>`

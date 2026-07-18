@@ -467,6 +467,43 @@ impl BpeTokenizer {
         self.inner.special_tokens.get(name).copied()
     }
 
+    /// Look up a token ID by its exact rendered spelling (e.g. `"</think>"`,
+    /// `"<|im_end|>"`), not by decoded/detokenized text. `content` must match
+    /// the literal token string as it appears in the tokenizer's vocabulary or
+    /// added-tokens table -- it is never partial text, a text fragment
+    /// containing the token plus surrounding characters, or output that has
+    /// passed through [`Self::token_for_id`] / decoding.
+    ///
+    /// Lookup precedence (first match wins):
+    /// 1. `special_tokens` -- the fast-path table for tokens marked
+    ///    `special: true` in `tokenizer.json` (e.g. `<|im_end|>`).
+    /// 2. `vocab` -- the base BPE vocabulary (a `</think>`-style marker can
+    ///    live here if the tokenizer declares it as an ordinary vocab entry
+    ///    rather than a `special_tokens` entry or an added token).
+    /// 3. `added_render` -- added tokens with `special: false` (e.g.
+    ///    `<think>`/`</think>`, `<tool_call>`, FIM markers); this tier is an
+    ///    O(added_render.len()) linear scan, the only one of the three.
+    ///
+    /// This is the single resolution path for the `</think>` reasoning-close
+    /// marker: [`crate::model::qwen35::resolve_reasoning_close_token`] (the
+    /// actual generation-time validation, shared by the CPU and Metal decode
+    /// loops) and the Metal cross-turn prefix-cache fingerprint
+    /// (`cross_turn_metadata`) both call this directly rather than each
+    /// owning a separate cached/uncached copy of the lookup.
+    pub(crate) fn token_id_for_content(&self, content: &str) -> Option<u32> {
+        self.inner
+            .special_tokens
+            .get(content)
+            .or_else(|| self.inner.vocab.get(content))
+            .copied()
+            .or_else(|| {
+                self.inner
+                    .added_render
+                    .iter()
+                    .find_map(|(&id, token)| (token == content).then_some(id))
+            })
+    }
+
     /// **Unstable**: return the byte representation of every model token ID.
     ///
     /// `vocab_bytes(vocab_size)?[i]` is the byte sequence that token `i` decodes
@@ -1735,6 +1772,9 @@ mod tests {
             DEFAULT_BPE_MAX_SEQ_LEN,
         )
         .expect("construct tokenizer with rendered added tokens");
+
+        assert_eq!(tokenizer.special_token_id("</think>"), None);
+        assert_eq!(tokenizer.token_id_for_content("</think>"), Some(100));
 
         // special=false added tokens render verbatim (byte-level decode is identity
         // for printable ASCII).
