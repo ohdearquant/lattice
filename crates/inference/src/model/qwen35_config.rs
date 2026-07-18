@@ -52,6 +52,17 @@ pub const MAX_VOCAB_SIZE: usize = 4_000_000;
 /// carry while leaving 8x headroom for future architectures.
 pub const MAX_HEAD_DIM: usize = 2048;
 
+/// Upper bound on `num_experts` accepted from `config.json` for MoE variants.
+///
+/// `num_experts` comes from an untrusted checkpoint directory and drives
+/// `ForwardScratch::ensure_capacity`'s unconditional `resize(&mut self.router_logits,
+/// cfg.num_experts.unwrap_or(0))` on every forward pass. A zero-sized checkpoint tensor
+/// satisfies shape checks trivially (0 elements), so nothing else catches an inflated
+/// value before that resize. Real Qwen3.5/3.6 MoE configs route across 8-256 experts;
+/// 4096 rejects any config a real checkpoint would never carry while leaving well over an
+/// order of magnitude of headroom for future architectures.
+pub const MAX_NUM_EXPERTS: usize = 4096;
+
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -780,6 +791,38 @@ impl Qwen35Config {
                 cfg.head_dim
             )));
         }
+        // A global config-level budget, independent of layer mix: an all-linear-attention
+        // config never loads a full-attention layer's tensors, so it never reaches the
+        // loader's per-layer full-attention dimension checks -- yet
+        // `ForwardScratch::ensure_capacity` unconditionally computes `full_q_dim()`,
+        // `full_kv_dim()`, and `2 * q_dim` for every config during generation. Validate the
+        // same products here, globally, so an all-linear config cannot smuggle overflowing
+        // attention geometry past load.
+        let full_q_dim = cfg
+            .num_attention_heads
+            .checked_mul(cfg.head_dim)
+            .ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "invalid Qwen config.json: full-attention q_dim overflows usize: \
+                 num_attention_heads ({}) * head_dim ({})",
+                    cfg.num_attention_heads, cfg.head_dim
+                ))
+            })?;
+        full_q_dim.checked_mul(2).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "invalid Qwen config.json: full-attention 2*q_dim scratch multiplication \
+                 overflows usize: q_dim ({full_q_dim})"
+            ))
+        })?;
+        cfg.num_key_value_heads
+            .checked_mul(cfg.head_dim)
+            .ok_or_else(|| {
+                InferenceError::Inference(format!(
+                    "invalid Qwen config.json: full-attention kv_dim overflows usize: \
+                 num_key_value_heads ({}) * head_dim ({})",
+                    cfg.num_key_value_heads, cfg.head_dim
+                ))
+            })?;
         if cfg.num_hidden_layers == 0 {
             return Err(InferenceError::Inference(
                 "invalid Qwen config.json: num_hidden_layers must be > 0".to_string(),
@@ -847,6 +890,39 @@ impl Qwen35Config {
         // `model.visual.*` tensors instead of failing closed.
         if let Some(vision_cfg) = &cfg.vision_config {
             vision_cfg.validate()?;
+        }
+        // MoE routing dimensions come from an untrusted checkpoint directory and drive
+        // `ForwardScratch::ensure_capacity`'s unconditional `resize(&mut self.router_logits,
+        // cfg.num_experts.unwrap_or(0))` and `router_selected.resize(cfg.num_experts_per_tok
+        // .unwrap_or(0), ..)` on every forward pass. A zero-element tensor satisfies shape
+        // checks trivially, so nothing else catches an inflated `num_experts` /
+        // `num_experts_per_tok` before those resizes run. Gate on presence so dense
+        // (non-MoE) configs, which leave both fields `None`, are unaffected.
+        if let Some(num_experts) = cfg.num_experts {
+            if num_experts == 0 {
+                return Err(InferenceError::Inference(
+                    "invalid Qwen config.json: num_experts must be > 0".to_string(),
+                ));
+            }
+            if num_experts > MAX_NUM_EXPERTS {
+                return Err(InferenceError::Inference(format!(
+                    "invalid Qwen config.json: num_experts ({num_experts}) exceeds \
+                     MAX_NUM_EXPERTS ({MAX_NUM_EXPERTS})"
+                )));
+            }
+            if let Some(num_experts_per_tok) = cfg.num_experts_per_tok {
+                if num_experts_per_tok == 0 {
+                    return Err(InferenceError::Inference(
+                        "invalid Qwen config.json: num_experts_per_tok must be > 0".to_string(),
+                    ));
+                }
+                if num_experts_per_tok > num_experts {
+                    return Err(InferenceError::Inference(format!(
+                        "invalid Qwen config.json: num_experts_per_tok \
+                         ({num_experts_per_tok}) must not exceed num_experts ({num_experts})"
+                    )));
+                }
+            }
         }
 
         Ok(cfg)
@@ -1786,6 +1862,156 @@ mod tests {
         assert!(
             Qwen35Config::from_config_json_str(&json).is_ok(),
             "head_dim == MAX_HEAD_DIM must be accepted for an all-linear-attention config"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // full-attention geometry global overflow bound (config-level budget,
+    // independent of layer mix)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// An all-linear-attention layer mix never loads full-attention tensors, so it never
+    /// reaches the loader's per-layer full-attention `q_dim` checks -- yet
+    /// `ForwardScratch::ensure_capacity` unconditionally computes `full_q_dim()` and
+    /// `2 * q_dim` for every config during generation. `num_attention_heads * head_dim`
+    /// must be rejected at parse time even when no full-attention layer is present.
+    #[test]
+    fn test_full_q_dim_overflow_rejected_all_linear_config() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": 2, "num_attention_heads": {},
+                "num_key_value_heads": 1, "num_hidden_layers": 2,
+                "layer_types": ["linear_attention", "linear_attention"]}}}}"#,
+            usize::MAX
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "num_attention_heads * head_dim overflow must yield an InferenceError even for \
+                 an all-linear-attention config",
+            )
+            .to_string();
+        assert!(
+            err.contains("q_dim") && err.contains("overflows"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// Same bypass as above, but driven through `num_key_value_heads` instead of
+    /// `num_attention_heads`. `num_attention_heads` must remain a multiple of
+    /// `num_key_value_heads` (an earlier guard), so both are set to `usize::MAX` here --
+    /// this still proves the KV-dimension geometry is bound by the same global check, since
+    /// `full_kv_dim` shares `head_dim` with `full_q_dim` and neither guard can be bypassed by
+    /// routing the overflow through the KV head count instead of the Q head count.
+    #[test]
+    fn test_full_kv_dim_overflow_rejected_all_linear_config() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": 2, "num_attention_heads": {max},
+                "num_key_value_heads": {max}, "num_hidden_layers": 2,
+                "layer_types": ["linear_attention", "linear_attention"]}}}}"#,
+            max = usize::MAX
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "num_key_value_heads * head_dim overflow must yield an InferenceError even for \
+                 an all-linear-attention config",
+            )
+            .to_string();
+        assert!(err.contains("overflows"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn test_full_attention_geometry_accepted_full_attention_config() {
+        // A real full-attention-carrying config (the default MoE preset) must still load.
+        assert!(
+            Qwen35Config::from_config_json_str("{}").is_ok(),
+            "a valid full-attention-carrying config must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_full_attention_geometry_accepted_all_linear_config() {
+        let json = r#"{"text_config": {"num_hidden_layers": 2,
+            "layer_types": ["linear_attention", "linear_attention"]}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "a valid all-linear-attention config must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // MoE dimension bounds (num_experts / num_experts_per_tok)
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_moe_num_experts_zero_errors() {
+        let json = r#"{"text_config": {"num_experts": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("num_experts: 0 must yield an InferenceError")
+            .to_string();
+        assert!(err.contains("num_experts"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn test_moe_num_experts_per_tok_zero_errors() {
+        let json = r#"{"text_config": {"num_experts": 4, "num_experts_per_tok": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("num_experts_per_tok: 0 must yield an InferenceError")
+            .to_string();
+        assert!(
+            err.contains("num_experts_per_tok"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_moe_num_experts_per_tok_over_num_experts_errors() {
+        let json = r#"{"text_config": {"num_experts": 8, "num_experts_per_tok": 9}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("num_experts_per_tok > num_experts must yield an InferenceError")
+            .to_string();
+        assert!(
+            err.contains("num_experts_per_tok") && err.contains("num_experts"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// A tiny zero-sized checkpoint can set `num_experts` to an extreme value; downstream,
+    /// `ForwardScratch::ensure_capacity` unconditionally resizes `router_logits` to
+    /// `num_experts`, so this must be bound at parse time.
+    #[test]
+    fn test_moe_num_experts_over_max_errors() {
+        let json = format!(
+            r#"{{"text_config": {{"num_experts": {}, "num_experts_per_tok": 1}}}}"#,
+            MAX_NUM_EXPERTS + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("num_experts above MAX_NUM_EXPERTS must yield an InferenceError")
+            .to_string();
+        assert!(
+            err.contains("num_experts") && err.contains("MAX_NUM_EXPERTS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_moe_valid_config_accepted() {
+        let json = r#"{"text_config": {"num_experts": 256, "num_experts_per_tok": 8}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "a valid MoE config must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_moe_dense_config_unaffected() {
+        // A dense (non-MoE) checkpoint leaves both MoE fields absent from config.json;
+        // represent that explicitly with `null` so the struct-level `#[serde(default)]`
+        // fallback (which pulls from the MoE preset) does not mask the dense case.
+        let json = r#"{"text_config": {"num_experts": null, "num_experts_per_tok": null,
+            "num_hidden_layers": 2,
+            "layer_types": ["linear_attention", "linear_attention"]}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "a dense config with no MoE fields must be unaffected by the MoE dimension checks"
         );
     }
 
