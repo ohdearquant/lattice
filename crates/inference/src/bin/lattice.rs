@@ -542,7 +542,13 @@ mod doctor {
             }
             let mut merged = HashMap::new();
             for shard_name in shard_names {
-                let shard_path = dir.join(&shard_name);
+                let shard_path = lattice_inference::weights::resolve_shard_path(dir, &shard_name)
+                    .map_err(|e| {
+                    format!(
+                        "shard '{shard_name}' referenced by {} is invalid: {e}",
+                        index_path.display()
+                    )
+                })?;
                 if !shard_path.exists() {
                     return Err(format!(
                         "shard '{shard_name}' referenced by {} not found in {}",
@@ -743,8 +749,9 @@ mod doctor {
             let mut present_names: BTreeSet<String> = BTreeSet::new();
             let mut has_mtp_tensors = false;
             for entry in &entries {
-                let file_path = dir.join(&entry.file);
-                match std::fs::metadata(&file_path) {
+                let resolved = lattice_inference::weights::resolve_shard_path(dir, &entry.file)
+                    .and_then(|file_path| std::fs::metadata(&file_path).map_err(Into::into));
+                match resolved {
                     Ok(meta) => {
                         total_bytes +=
                             q4_resident_bytes(&entry.name, meta.len(), cfg.tie_word_embeddings);

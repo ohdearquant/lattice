@@ -19,7 +19,7 @@ use std::path::Path;
 use crate::error::InferenceError;
 use crate::model::qwen35_config::VisionModelConfig;
 use crate::quant::q4_manifest;
-use crate::weights::f32_weights::{ShardedSafetensors, TensorSource};
+use crate::weights::f32_weights::{ShardedSafetensors, TensorSource, resolve_contained_path};
 use crate::weights::q4_weights::{dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file};
 
 /// One ViT transformer block's real tensors (`model.visual.blocks.{i}.*`).
@@ -241,7 +241,13 @@ fn load_from_q4_dir(
                 entry.name,
             )));
         }
-        let file_path = model_dir.join(&entry.file);
+        let file_path = resolve_contained_path(model_dir, &entry.file).map_err(|e| {
+            InferenceError::InvalidSafetensors(format!(
+                "quantize_index.json entry {} in {}: {e}",
+                entry.name,
+                model_dir.display()
+            ))
+        })?;
         let (data, shape) = if entry.quantized.unwrap_or(false) {
             let q4 = load_q4_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
@@ -790,6 +796,129 @@ mod tests {
             }
             other => panic!("expected InferenceError::Inference, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn q4_manifest_rejects_absolute_entry_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.q4");
+        let data: Vec<f64> = vec![0.25_f64; 4];
+        let q4 =
+            crate::weights::q4_weights::quantize_f64_to_q4(&data, &[4]).expect("quantize succeeds");
+        crate::weights::q4_weights::save_q4_file(&outside_file, &q4)
+            .expect("test setup: write outside q4 file");
+
+        let abs = outside_file.to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!(r#"[{{"name":"model.visual.test","file":"{abs}","quantized":true}}]"#),
+        )
+        .expect("test setup: write manifest");
+
+        let cfg = tiny_vision_cfg();
+        // Without containment on `entry.file`, this join would discard `model_dir`
+        // and load `outside_file` directly instead of erroring.
+        let err = load_qwen35_vision_weights(tmp.path(), &cfg)
+            .expect_err("an absolute quantize_index.json entry.file must be rejected");
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn q4_manifest_rejects_parent_traversal_entry_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside_dir = tmp.path().parent().expect("temp dir has a parent");
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("invariant: system time is after UNIX_EPOCH")
+            .as_nanos();
+        let outside_name = format!("lattice_q4_traversal_outside_{unique}.q4");
+        let outside_file = outside_dir.join(&outside_name);
+        let data: Vec<f64> = vec![0.25_f64; 4];
+        let q4 =
+            crate::weights::q4_weights::quantize_f64_to_q4(&data, &[4]).expect("quantize succeeds");
+        crate::weights::q4_weights::save_q4_file(&outside_file, &q4)
+            .expect("test setup: write outside q4 file");
+
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!(
+                r#"[{{"name":"model.visual.test","file":"../{outside_name}","quantized":true}}]"#
+            ),
+        )
+        .expect("test setup: write manifest");
+
+        let cfg = tiny_vision_cfg();
+        let err = load_qwen35_vision_weights(tmp.path(), &cfg)
+            .expect_err("a parent-traversal quantize_index.json entry.file must be rejected");
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_file(&outside_file).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn q4_manifest_rejects_symlink_entry_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.q4");
+        let data: Vec<f64> = vec![0.25_f64; 4];
+        let q4 =
+            crate::weights::q4_weights::quantize_f64_to_q4(&data, &[4]).expect("quantize succeeds");
+        crate::weights::q4_weights::save_q4_file(&outside_file, &q4)
+            .expect("test setup: write outside q4 file");
+
+        let link_name = "linked.q4";
+        std::os::unix::fs::symlink(&outside_file, tmp.path().join(link_name))
+            .expect("test setup: create symlink entry");
+
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!(r#"[{{"name":"model.visual.test","file":"{link_name}","quantized":true}}]"#),
+        )
+        .expect("test setup: write manifest");
+
+        let cfg = tiny_vision_cfg();
+        // A lexically valid `entry.file` that is a symlink escaping `model_dir`
+        // must be rejected the same way an absolute or `..` path is.
+        let err = load_qwen35_vision_weights(tmp.path(), &cfg)
+            .expect_err("a symlink quantize_index.json entry.file must be rejected");
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn q4_manifest_accepts_legitimate_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_vision_cfg();
+        let shapes = tiny_expected_shapes();
+
+        let mut manifest_entries = Vec::new();
+        for (i, (name, shape)) in shapes.iter().enumerate() {
+            let numel: usize = shape.iter().product();
+            let values = vec![0.5f32; numel];
+            let file_name = format!("t{i}.f16");
+            write_khf1_f16_file(&tmp.path().join(&file_name), shape, &values);
+            manifest_entries.push(format!(
+                r#"{{"name":"{name}","file":"{file_name}","quantized":false}}"#
+            ));
+        }
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!("[{}]", manifest_entries.join(",")),
+        )
+        .expect("test setup: write manifest");
+
+        load_qwen35_vision_weights(tmp.path(), &cfg)
+            .expect("a manifest of legitimate in-directory entries must load");
     }
 
     #[test]

@@ -47,7 +47,9 @@ use memmap2::Mmap;
 use serde_json::Value;
 
 use crate::error::InferenceError;
-use crate::weights::f32_weights::parse_index;
+use crate::weights::f32_weights::{
+    SafetensorsTensorLayout, parse_index, resolve_contained_path, validate_safetensors_layout,
+};
 
 /// On-disk storage dtype of a tensor.
 ///
@@ -110,55 +112,11 @@ struct Shard {
 /// per-tensor validation alone would miss.
 struct ParsedEntry {
     name: String,
+    dtype: String,
+    shape: Vec<usize>,
     start: usize,
     end: usize,
-    /// `Some` for F32/F16/BF16; `None` for any other SafeTensors dtype.
-    /// `None` entries are still kept in the contiguity check but never
-    /// appear in `Shard::headers`.
-    header: Option<TensorHeader>,
-}
-
-/// Bits per element for every standard SafeTensors dtype name. The
-/// bit-size variant (rather than bytes) is required because the format
-/// admits sub-byte dtypes: `F4` stores 4 bits per element, and
-/// `F6_E2M3` / `F6_E3M2` store 6 bits.
-///
-/// Returns `None` for any unrecognized dtype string. The caller MUST
-/// reject unknown dtypes rather than treat them as opaque, since they
-/// indicate either a newer SafeTensors revision the reader has not yet
-/// been updated for or a corrupted header.
-///
-/// Strictness note: the official `safetensors` Rust crate rejects
-/// unknown/invalid dtype metadata outright, and this reader follows
-/// that strict contract. Lattice's runtime weights parser
-/// ([`crate::weights::f32_weights::SafetensorsFile`]'s `parse_tensor_meta`)
-/// was more permissive prior to lattice#800 — it mapped unknown dtypes to
-/// `Ok(None)` and silently skipped the entry. As of lattice#800 it also
-/// rejects a genuinely unrecognized dtype string at parse time and tracks
-/// known-but-unsupported whole-byte dtypes (I64, BOOL, ...) structurally
-/// instead of dropping them, matching this reader's strictness for those
-/// cases. The two parsers still diverge on sub-byte dtypes (`F4`,
-/// `F6_E2M3`, `F6_E3M2`): this reader's bit-size table represents them
-/// exactly, while the runtime parser's whole-byte extent model treats them
-/// as unrecognized. Unifying the two parsers (not just their strictness) is
-/// a separate concern, tracked by the native Q4/KHF1 validation-unification
-/// and QuaRot/offline-quantizer routing issues in the lattice#800 cluster.
-///
-/// Table mirrors `Dtype::bitsize()` in the official `safetensors` Rust
-/// crate. Kept inline rather than depending on `safetensors` to match
-/// the hand-roll pattern of [`crate::weights::f32_weights`] (which also
-/// parses safetensors headers directly). When upstream adds a dtype,
-/// add it here and to the dtype-coverage regression tests.
-fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
-    match dtype_str {
-        "F4" => Some(4),
-        "F6_E2M3" | "F6_E3M2" => Some(6),
-        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" => Some(8),
-        "I16" | "U16" | "F16" | "BF16" => Some(16),
-        "I32" | "U32" | "F32" => Some(32),
-        "I64" | "U64" | "F64" | "C64" => Some(64),
-        _ => None,
-    }
+    source_dtype: Option<SourceDType>,
 }
 
 impl Shard {
@@ -246,13 +204,16 @@ impl Shard {
                 })?
                 .iter()
                 .map(|v| {
-                    v.as_u64()
-                        .ok_or_else(|| {
-                            InferenceError::InvalidSafetensors(format!(
-                                "tensor {name}: shape dim is not u64"
-                            ))
-                        })
-                        .map(|x| x as usize)
+                    let dim = v.as_u64().ok_or_else(|| {
+                        InferenceError::InvalidSafetensors(format!(
+                            "tensor {name}: shape dim is not u64"
+                        ))
+                    })?;
+                    usize::try_from(dim).map_err(|_| {
+                        InferenceError::InvalidSafetensors(format!(
+                            "tensor {name}: shape dim {dim} exceeds usize"
+                        ))
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -274,109 +235,65 @@ impl Shard {
                 InferenceError::InvalidSafetensors(format!(
                     "tensor {name}: data_offsets[0] is not u64"
                 ))
-            })? as usize;
+            })?;
+            let start = usize::try_from(start).map_err(|_| {
+                InferenceError::InvalidSafetensors(format!(
+                    "tensor {name}: data_offsets[0] exceeds usize"
+                ))
+            })?;
             let end = offsets[1].as_u64().ok_or_else(|| {
                 InferenceError::InvalidSafetensors(format!(
                     "tensor {name}: data_offsets[1] is not u64"
                 ))
-            })? as usize;
-
-            if start > end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: invalid data_offsets [{start}, {end})"
-                )));
-            }
-            if end > data_len {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: data_offsets end={end} past data_len={data_len}"
-                )));
-            }
-
-            let numel = shape.iter().try_fold(1usize, |acc, &dim| {
-                acc.checked_mul(dim).ok_or_else(|| {
-                    InferenceError::InvalidSafetensors(format!(
-                        "tensor {name}: shape {shape:?} overflows usize"
-                    ))
-                })
             })?;
-            let bits = safetensors_bits_per_elem(dtype_str).ok_or_else(|| {
+            let end = usize::try_from(end).map_err(|_| {
                 InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: unrecognized SafeTensors dtype {dtype_str:?}"
+                    "tensor {name}: data_offsets[1] exceeds usize"
                 ))
             })?;
-            let total_bits = numel.checked_mul(bits).ok_or_else(|| {
-                InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: bit length overflows usize"
-                ))
-            })?;
-            if total_bits % 8 != 0 {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: sub-byte dtype {dtype_str} with shape {shape:?} \
-                     produces {total_bits} bits, which is not byte-aligned"
-                )));
-            }
-            let expected = total_bits / 8;
-            let actual = end - start;
-            if actual != expected {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: byte length mismatch for {dtype_str} {shape:?}: \
-                     expected {expected}, got {actual}"
-                )));
-            }
-
-            let header = SourceDType::from_header_str(dtype_str).map(|dtype| TensorHeader {
-                dtype,
-                shape,
-                start,
-                end,
-            });
 
             parsed.push(ParsedEntry {
                 name: name.clone(),
+                dtype: dtype_str.to_string(),
+                shape,
                 start,
                 end,
-                header,
+                source_dtype: SourceDType::from_header_str(dtype_str),
             });
         }
 
-        // Phase 2: validate that all tensor byte ranges are sorted,
-        // disjoint, contiguous from offset 0, and exhaust the data
-        // section. This mirrors the official `safetensors` crate
-        // validation rules — without it, a corrupted checkpoint could
-        // silently alias two tensor names to the same byte range (e.g.
-        // both `a` and `b` pointing at `[0, 4)`), or hide leading /
-        // trailing padding, and the converter would rotate or quantize
-        // bytes that the runtime would never load.
-        parsed.sort_by_key(|p| (p.start, p.end));
-        let mut prev_end = 0usize;
-        for p in &parsed {
-            if p.start != prev_end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "{}: data_offsets non-contiguous at tensor {}: \
-                     expected start={prev_end}, got [{}, {})",
-                    path.display(),
-                    p.name,
-                    p.start,
-                    p.end,
-                )));
+        validate_safetensors_layout(
+            parsed.iter().map(|entry| SafetensorsTensorLayout {
+                name: &entry.name,
+                dtype: &entry.dtype,
+                shape: &entry.shape,
+                start: entry.start,
+                end: entry.end,
+            }),
+            data_len,
+        )
+        .map_err(|error| match error {
+            InferenceError::InvalidSafetensors(message) => {
+                InferenceError::InvalidSafetensors(format!("{}: {message}", path.display()))
             }
-            prev_end = p.end;
-        }
-        if prev_end != data_len {
-            return Err(InferenceError::InvalidSafetensors(format!(
-                "{}: data section is {data_len} bytes but tensors cover {prev_end} bytes \
-                 (trailing or missing payload)",
-                path.display(),
-            )));
-        }
+            other => other,
+        })?;
 
-        // Phase 3: expose only supported-dtype tensors via the read API.
+        // Phase 2: expose only supported-dtype tensors via the read API.
         // Unsupported entries already had their offsets validated above
         // and their bytes accounted for in the contiguity check.
         let mut headers = HashMap::with_capacity(parsed.len());
         for p in parsed {
-            if let Some(header) = p.header {
-                headers.insert(p.name, header);
+            if let Some(dtype) = p.source_dtype {
+                headers.insert(
+                    p.name,
+                    TensorHeader {
+                        dtype,
+                        shape: p.shape,
+                        start: p.start,
+                        end: p.end,
+                    },
+                );
             }
         }
 
@@ -478,7 +395,8 @@ impl QuarotTensorReader {
                 if shards.contains_key(shard_file) {
                     continue;
                 }
-                let shard = Shard::open(&model_dir.join(shard_file))?;
+                let shard_path = resolve_contained_path(model_dir, shard_file)?;
+                let shard = Shard::open(&shard_path)?;
                 shards.insert(shard_file.clone(), shard);
             }
             Ok(Self {
@@ -891,6 +809,69 @@ mod tests {
         // Re-reading the same tensor exercises the cached-shard path.
         let (a_again, _) = reader.read_tensor_f64("a.weight").unwrap();
         assert_eq!(a_again, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn sharded_open_rejects_parent_traversal_shard_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_vals: Vec<f32> = vec![42.0];
+        write_safetensors(
+            &outside.path().join("secret.safetensors"),
+            &[("secret", FixtureDType::F32, vec![1], &outside_vals)],
+        );
+
+        let outside_name = outside
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let traversal_shard = format!("../{outside_name}/secret.safetensors");
+
+        let index = serde_json::json!({
+            "weight_map": { "a.weight": traversal_shard },
+        });
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let err = QuarotTensorReader::open(dir.path())
+            .expect_err("shard filename with a parent-directory component must be rejected");
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sharded_open_rejects_absolute_shard_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_vals: Vec<f32> = vec![42.0];
+        let outside_file = outside.path().join("secret.safetensors");
+        write_safetensors(
+            &outside_file,
+            &[("secret", FixtureDType::F32, vec![1], &outside_vals)],
+        );
+
+        let index = serde_json::json!({
+            "weight_map": { "a.weight": outside_file.to_string_lossy() },
+        });
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let err = QuarotTensorReader::open(dir.path())
+            .expect_err("an absolute shard path must be rejected");
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

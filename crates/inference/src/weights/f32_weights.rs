@@ -3,7 +3,7 @@ use crate::error::InferenceError;
 use memmap2::Mmap;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -19,19 +19,10 @@ enum DType {
     /// via `get_f32_tensor` (lattice#800).
     Other {
         label: &'static str,
-        size_bytes: usize,
     },
 }
 
 impl DType {
-    fn size_bytes(self) -> usize {
-        match self {
-            Self::F32 => 4,
-            Self::F16 | Self::BF16 => 2,
-            Self::Other { size_bytes, .. } => size_bytes,
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             Self::F32 => "F32",
@@ -42,6 +33,204 @@ impl DType {
     }
 }
 
+pub(crate) struct SafetensorsTensorLayout<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) dtype: &'a str,
+    pub(crate) shape: &'a [usize],
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+fn safetensors_dtype(dtype: &str) -> Option<(&'static str, usize)> {
+    Some(match dtype {
+        "F4" => ("F4", 4),
+        "F6_E2M3" => ("F6_E2M3", 6),
+        "F6_E3M2" => ("F6_E3M2", 6),
+        "BOOL" => ("BOOL", 8),
+        "U8" => ("U8", 8),
+        "I8" => ("I8", 8),
+        "F8_E4M3" => ("F8_E4M3", 8),
+        "F8_E5M2" => ("F8_E5M2", 8),
+        "F8_E8M0" => ("F8_E8M0", 8),
+        "F8_E4M3FNUZ" => ("F8_E4M3FNUZ", 8),
+        "F8_E5M2FNUZ" => ("F8_E5M2FNUZ", 8),
+        "I16" => ("I16", 16),
+        "U16" => ("U16", 16),
+        "F16" => ("F16", 16),
+        "BF16" => ("BF16", 16),
+        "I32" => ("I32", 32),
+        "U32" => ("U32", 32),
+        "F32" => ("F32", 32),
+        "I64" => ("I64", 64),
+        "U64" => ("U64", 64),
+        "F64" => ("F64", 64),
+        "C64" => ("C64", 64),
+        _ => return None,
+    })
+}
+
+pub(crate) fn validate_safetensors_layout<'a>(
+    tensors: impl IntoIterator<Item = SafetensorsTensorLayout<'a>>,
+    data_len: usize,
+) -> Result<(), InferenceError> {
+    let mut ranges = Vec::new();
+    for tensor in tensors {
+        if tensor.start > tensor.end {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "tensor {} has invalid offsets [{}, {})",
+                tensor.name, tensor.start, tensor.end
+            )));
+        }
+        if tensor.end > data_len {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "tensor {} points past data section: end={}, data_len={data_len}",
+                tensor.name, tensor.end
+            )));
+        }
+
+        let numel = tensor.shape.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(dim).ok_or_else(|| {
+                InferenceError::InvalidSafetensors(format!(
+                    "tensor {} shape {:?} overflows usize",
+                    tensor.name, tensor.shape
+                ))
+            })
+        })?;
+        let (_, bits_per_elem) = safetensors_dtype(tensor.dtype).ok_or_else(|| {
+            InferenceError::InvalidSafetensors(format!(
+                "tensor {} has unrecognized SafeTensors dtype {:?}",
+                tensor.name, tensor.dtype
+            ))
+        })?;
+        let total_bits = numel.checked_mul(bits_per_elem).ok_or_else(|| {
+            InferenceError::InvalidSafetensors(format!(
+                "tensor {} bit length overflows usize",
+                tensor.name
+            ))
+        })?;
+        if total_bits % 8 != 0 {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "tensor {} sub-byte dtype {} with shape {:?} produces {total_bits} bits, which is \
+                 not byte-aligned",
+                tensor.name, tensor.dtype, tensor.shape
+            )));
+        }
+        let expected = total_bits / 8;
+        let actual = tensor.end - tensor.start;
+        if actual != expected {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "tensor {} byte length mismatch for dtype {} and shape {:?}: expected \
+                 {expected}, got {actual}",
+                tensor.name, tensor.dtype, tensor.shape
+            )));
+        }
+
+        ranges.push((tensor.start, tensor.end, tensor.name));
+    }
+
+    ranges.sort_unstable();
+    let mut previous_end = 0usize;
+    for (start, end, name) in ranges {
+        if start != previous_end {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "tensor {name} has non-contiguous data offsets: expected start={previous_end}, \
+                 got [{start}, {end})"
+            )));
+        }
+        previous_end = end;
+    }
+    if previous_end != data_len {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "data section is {data_len} bytes but tensors cover {previous_end} bytes (trailing or \
+             missing payload)"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Reject a shard filename that would escape the model directory when
+/// joined onto it.
+///
+/// Shard filenames come from `model.safetensors.index.json`'s `weight_map`,
+/// which is untrusted checkpoint content, not a value this crate controls.
+/// Joining an unchecked value onto the model directory lets an absolute
+/// path or a `..` component redirect the reader to any file the process
+/// can read, outside the checkpoint. Every call site that joins an
+/// index-derived shard name onto a directory must validate it with this
+/// function first.
+pub(crate) fn validate_shard_relative_path(name: &str) -> Result<(), InferenceError> {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "shard filename {name:?} is absolute; must be relative to the checkpoint directory"
+        )));
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "shard filename {name:?} contains a parent-directory (..) component"
+                )));
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "shard filename {name:?} contains a root or prefix component"
+                )));
+            }
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+        }
+    }
+    Ok(())
+}
+
+/// Resolve an untrusted, checkpoint-supplied relative path onto `model_dir`
+/// and require the result to stay inside it, defeating symlink escapes in
+/// addition to the lexical `..`/absolute-path escapes
+/// [`validate_shard_relative_path`] already rejects.
+///
+/// Lexical validation alone is not sufficient: a shard name can pass every
+/// lexical check (no `..`, not absolute) yet still be a symlink that
+/// resolves outside the model directory, letting `File::open` disclose any
+/// file the process can read. This function canonicalizes both the model
+/// directory and the joined candidate — which follows symlinks and resolves
+/// `..` components — and requires the canonical candidate to be contained in
+/// the canonical root via [`Path::starts_with`] (a component-wise check, not
+/// a string prefix, so `/model` cannot match a sibling `/model-evil`).
+/// Canonicalizing both sides also normalizes platform path aliasing (e.g.
+/// macOS's `/tmp` → `/private/tmp` symlink).
+///
+/// An absolute `untrusted` value replaces `model_dir` entirely under
+/// `Path::join`'s semantics; canonicalizing the result and checking
+/// containment rejects it the same way as a symlink or `..` escape, so one
+/// check covers all three attack shapes.
+///
+/// If the candidate does not exist, this returns the same
+/// [`InferenceError::InvalidSafetensors`] "failed to open" shape that
+/// [`SafetensorsFile::open`] already returns for a missing shard, so callers
+/// do not observe a new error shape for the ordinary missing-file case.
+pub(crate) fn resolve_contained_path(
+    model_dir: &Path,
+    untrusted: &str,
+) -> Result<PathBuf, InferenceError> {
+    let candidate = model_dir.join(untrusted);
+    let canonical_root = fs::canonicalize(model_dir).map_err(|e| {
+        InferenceError::InvalidSafetensors(format!(
+            "failed to canonicalize model directory {}: {e}",
+            model_dir.display()
+        ))
+    })?;
+    let canonical_candidate = fs::canonicalize(&candidate).map_err(|e| {
+        InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", candidate.display()))
+    })?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "path {untrusted:?} escapes the checkpoint directory"
+        )));
+    }
+    Ok(canonical_candidate)
+}
+
 /// Resolve a safetensors header `dtype` string to a [`DType`], including
 /// non-float dtypes (tracked via `DType::Other` so extent validation still
 /// covers them). Returns `None` only for a string this crate has never
@@ -49,73 +238,12 @@ impl DType {
 /// unrecognized dtype's byte width is unknowable and extent validation
 /// cannot proceed (lattice#800).
 fn dtype_from_str(s: &str) -> Option<DType> {
-    Some(match s {
+    let (label, _) = safetensors_dtype(s)?;
+    Some(match label {
         "F32" => DType::F32,
         "F16" => DType::F16,
         "BF16" => DType::BF16,
-        "F64" => DType::Other {
-            label: "F64",
-            size_bytes: 8,
-        },
-        "I64" => DType::Other {
-            label: "I64",
-            size_bytes: 8,
-        },
-        "U64" => DType::Other {
-            label: "U64",
-            size_bytes: 8,
-        },
-        "I32" => DType::Other {
-            label: "I32",
-            size_bytes: 4,
-        },
-        "U32" => DType::Other {
-            label: "U32",
-            size_bytes: 4,
-        },
-        "I16" => DType::Other {
-            label: "I16",
-            size_bytes: 2,
-        },
-        "U16" => DType::Other {
-            label: "U16",
-            size_bytes: 2,
-        },
-        "I8" => DType::Other {
-            label: "I8",
-            size_bytes: 1,
-        },
-        "U8" => DType::Other {
-            label: "U8",
-            size_bytes: 1,
-        },
-        "BOOL" => DType::Other {
-            label: "BOOL",
-            size_bytes: 1,
-        },
-        "F8_E4M3" => DType::Other {
-            label: "F8_E4M3",
-            size_bytes: 1,
-        },
-        "F8_E5M2" => DType::Other {
-            label: "F8_E5M2",
-            size_bytes: 1,
-        },
-        "F8_E8M0" => DType::Other {
-            label: "F8_E8M0",
-            size_bytes: 1,
-        },
-        "C64" => DType::Other {
-            label: "C64",
-            size_bytes: 8,
-        },
-        // Sub-byte dtypes (F4: 4 bits/elem, F6_E2M3 / F6_E3M2: 6 bits/elem)
-        // do not fit this crate's whole-byte-per-element extent model and
-        // are treated as unrecognized here; see
-        // `crate::quant::quarot::io::safetensors_bits_per_elem` for the
-        // bit-level table used by the QuaRot converter, which does support
-        // sub-byte dtypes.
-        _ => return None,
+        _ => DType::Other { label },
     })
 }
 
@@ -325,63 +453,16 @@ impl SafetensorsFile {
         let tensors = parse_safetensors_header(header)?;
 
         let data_len = bytes.len() - data_offset;
-        for (name, meta) in &tensors {
-            if meta.start > meta.end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} has invalid offsets [{}, {})",
-                    meta.start, meta.end
-                )));
-            }
-            if meta.end > data_len {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} points past data section: end={}, data_len={}",
-                    meta.end, data_len
-                )));
-            }
-            let numel = meta.shape.iter().try_fold(1usize, |acc, &dim| {
-                acc.checked_mul(dim).ok_or_else(|| {
-                    InferenceError::InvalidSafetensors(format!(
-                        "tensor {name} shape {:?} overflows usize",
-                        meta.shape
-                    ))
-                })
-            })?;
-            let expected = numel.checked_mul(meta.dtype.size_bytes()).ok_or_else(|| {
-                InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} byte length overflows usize"
-                ))
-            })?;
-            let actual = meta.end - meta.start;
-            if actual != expected {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} byte length mismatch for dtype {} and shape {:?}: \
-                     expected {expected}, got {actual}",
-                    meta.dtype.name(),
-                    meta.shape
-                )));
-            }
-        }
-
-        let mut ranges: Vec<_> = tensors
-            .iter()
-            .map(|(name, meta)| (meta.start, meta.end, name.as_str()))
-            .collect();
-        ranges.sort_unstable();
-        let mut previous_end = 0usize;
-        for &(start, end, name) in &ranges {
-            if start != previous_end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} has non-contiguous data offsets: expected start={previous_end}, \
-                     got [{start}, {end})"
-                )));
-            }
-            previous_end = end;
-        }
-        if previous_end != data_len {
-            return Err(InferenceError::InvalidSafetensors(format!(
-                "data section is {data_len} bytes but tensors cover {previous_end} bytes"
-            )));
-        }
+        validate_safetensors_layout(
+            tensors.iter().map(|(name, meta)| SafetensorsTensorLayout {
+                name,
+                dtype: meta.dtype.name(),
+                shape: &meta.shape,
+                start: meta.start,
+                end: meta.end,
+            }),
+            data_len,
+        )?;
 
         Ok(Self {
             data,
@@ -1072,9 +1153,15 @@ impl TensorSource for SafetensorsFile {
     }
 }
 
-/// Lazy-opening reader for sharded safetensors checkpoints.
+/// Reader for sharded safetensors checkpoints.
 ///
-/// Opens shard files on demand (first access) to avoid mapping 26 files upfront.
+/// `open_index` maps and format-validates every unique shard's header up
+/// front — matching `QuarotTensorReader`'s eager contract so a malformed
+/// shard is rejected at open time even if none of its tensors are ever
+/// requested. This only touches header bytes (mmap + JSON parse); tensor
+/// *data* stays lazily materialized on first `get_f32_tensor_owned` access,
+/// so the memory profile for large checkpoints (e.g. 26-shard Qwen3.6) is
+/// unchanged from the previous lazy-shard design.
 #[derive(Debug)]
 pub struct ShardedSafetensors {
     root: PathBuf,
@@ -1103,6 +1190,21 @@ pub fn resolve_shard(
     Ok(PathBuf::from(shard_file))
 }
 
+/// Validate an index-derived shard filename and resolve it onto `root`,
+/// rejecting the result if it escapes `root` once symlinks and `..`
+/// components are resolved.
+///
+/// This is the crate-public entry point for the containment policy
+/// enforced by [`resolve_contained_path`], for callers outside
+/// `lattice-inference` (e.g. `lattice-embed`) that need to resolve a
+/// `weight_map` value onto a model directory. Every caller that joins a
+/// `weight_map`/shard-index-derived filename onto a directory — in this
+/// crate or a downstream one — must go through this function (or
+/// `resolve_contained_path` directly, in-crate) before the join, not after.
+pub fn resolve_shard_path(root: &Path, shard_file: &str) -> Result<PathBuf, InferenceError> {
+    resolve_contained_path(root, shard_file)
+}
+
 /// Eagerly load all tensors from a sharded checkpoint into an owned map.
 ///
 /// Groups tensor names by shard file to open each shard file exactly once.
@@ -1122,7 +1224,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
-        let shard_path = model_dir.join(&shard_file);
+        let shard_path = resolve_contained_path(model_dir, &shard_file)?;
         let shard = SafetensorsFile::open(&shard_path)?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
@@ -1139,18 +1241,53 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
     Ok(tensors)
 }
 
+/// Cap on the number of distinct shard files a single manifest may name in
+/// [`ShardedSafetensors::open_index`].
+///
+/// `open_index` eagerly mmaps every unique shard the index names so
+/// `has_tensor`/`tensor_shape` never need a subsequent disk hit. That means
+/// the number of live mmaps at construction time is entirely
+/// manifest-controlled: a crafted `model.safetensors.index.json` naming many
+/// distinct, individually valid (containment-checked) shard filenames can
+/// exhaust address space or file descriptors purely at init, before any
+/// tensor is requested. The largest known real-world sharded checkpoints
+/// split into low hundreds of shards; this cap sits an order of magnitude
+/// above that so no legitimate checkpoint is affected while bounding the
+/// worst case.
+const MAX_SHARDED_MANIFEST_SHARDS: usize = 4096;
+
 impl ShardedSafetensors {
-    /// Parse `model.safetensors.index.json` and set up the lazy shard reader.
+    /// Parse `model.safetensors.index.json` and eagerly format-validate
+    /// every unique shard it references.
     pub fn open_index(index_path: &Path) -> Result<Self, InferenceError> {
         let root = index_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let index = parse_index(&root)?;
+
+        let unique_shards: std::collections::BTreeSet<&String> =
+            index.weight_map.values().collect();
+        if unique_shards.len() > MAX_SHARDED_MANIFEST_SHARDS {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "model.safetensors.index.json in {} names {} distinct shards, exceeding the \
+                 {MAX_SHARDED_MANIFEST_SHARDS}-shard cap enforced at load time",
+                root.display(),
+                unique_shards.len(),
+            )));
+        }
+
+        let mut shards: HashMap<String, SafetensorsFile> = HashMap::new();
+        for shard_file in unique_shards {
+            let shard_path = resolve_contained_path(&root, shard_file)?;
+            let shard = SafetensorsFile::open(&shard_path)?;
+            shards.insert(shard_file.clone(), shard);
+        }
+
         Ok(Self {
             root,
             index,
-            shards: HashMap::new(),
+            shards,
         })
     }
 
@@ -1166,7 +1303,8 @@ impl ShardedSafetensors {
             .weight_map
             .get(tensor_name)
             .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-        Ok((self.root.join(shard_file), tensor_name.to_string()))
+        let shard_path = resolve_contained_path(&self.root, shard_file)?;
+        Ok((shard_path, tensor_name.to_string()))
     }
 
     fn shard_file_for(&self, name: &str) -> Result<String, InferenceError> {
@@ -1177,9 +1315,13 @@ impl ShardedSafetensors {
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
     }
 
+    // `open_index` eagerly resolves and opens every distinct shard the
+    // manifest names, so by the time `self` exists every key `shard_file_for`
+    // can return is already present in `self.shards` — the lazy-open branch
+    // below is unreachable in practice but kept as a defensive fallback.
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
-            let shard_path = self.root.join(shard_file);
+            let shard_path = resolve_contained_path(&self.root, shard_file)?;
             let shard = SafetensorsFile::open(&shard_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
@@ -1972,6 +2114,27 @@ mod tests {
         ))
     }
 
+    fn write_raw_safetensors(path: &Path, header: &str, data: &[u8]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(data);
+        let mut file = File::create(path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+    }
+
+    fn assert_raw_open_error(name: &str, header: &str, data: &[u8], expected: &str) {
+        let path = temp_path(name);
+        write_raw_safetensors(&path, header, data);
+        let err = SafetensorsFile::open(&path).expect_err("invalid layout must fail at open");
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?} in error, got: {err}"
+        );
+        fs::remove_file(path).ok();
+    }
+
     #[test]
     fn test_parse_small_safetensors_file() {
         let path = temp_path("lattice_weights_test");
@@ -2099,6 +2262,112 @@ mod tests {
         );
 
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_rejects_leading_data_hole() {
+        assert_raw_open_error(
+            "lattice_weights_leading_hole",
+            r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}}"#,
+            &[0; 8],
+            "non-contiguous",
+        );
+    }
+
+    #[test]
+    fn test_rejects_internal_data_hole() {
+        assert_raw_open_error(
+            "lattice_weights_internal_hole",
+            r#"{"a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"b":{"dtype":"F32","shape":[1],"data_offsets":[8,12]}}"#,
+            &[0; 12],
+            "non-contiguous",
+        );
+    }
+
+    #[test]
+    fn test_rejects_trailing_payload() {
+        assert_raw_open_error(
+            "lattice_weights_trailing_payload",
+            r#"{"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            &[0; 8],
+            "data section",
+        );
+    }
+
+    #[test]
+    fn test_unsupported_dtype_still_participates_in_layout_validation() {
+        assert_raw_open_error(
+            "lattice_weights_unsupported_dtype_hole",
+            r#"{"w":{"dtype":"I64","shape":[1],"data_offsets":[4,12]}}"#,
+            &[0; 12],
+            "non-contiguous",
+        );
+    }
+
+    #[test]
+    fn test_rejects_f8_byte_length_mismatch() {
+        assert_raw_open_error(
+            "lattice_weights_f8_bad_length",
+            r#"{"w":{"dtype":"F8_E8M0","shape":[2],"data_offsets":[0,1]}}"#,
+            &[0],
+            "byte length mismatch",
+        );
+    }
+
+    #[test]
+    fn test_rejects_c64_byte_length_mismatch() {
+        assert_raw_open_error(
+            "lattice_weights_c64_bad_length",
+            r#"{"w":{"dtype":"C64","shape":[1],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+            "byte length mismatch",
+        );
+    }
+
+    #[test]
+    fn test_rejects_non_byte_aligned_sub_byte_tensor() {
+        assert_raw_open_error(
+            "lattice_weights_f4_unaligned",
+            r#"{"w":{"dtype":"F4","shape":[3],"data_offsets":[0,2]}}"#,
+            &[0; 2],
+            "not byte-aligned",
+        );
+    }
+
+    #[test]
+    fn test_rejects_f6_byte_length_mismatch() {
+        assert_raw_open_error(
+            "lattice_weights_f6_bad_length",
+            r#"{"w":{"dtype":"F6_E2M3","shape":[4],"data_offsets":[0,2]}}"#,
+            &[0; 2],
+            "byte length mismatch",
+        );
+    }
+
+    #[test]
+    fn test_accepts_byte_aligned_sub_byte_tensors() {
+        let path = temp_path("lattice_weights_sub_byte_valid");
+        let header = r#"{"f4":{"dtype":"F4","shape":[2],"data_offsets":[0,1]},"f6":{"dtype":"F6_E3M2","shape":[4],"data_offsets":[1,4]}}"#;
+        write_raw_safetensors(&path, header, &[0; 4]);
+
+        let file = SafetensorsFile::open(&path).expect("valid sub-byte layout must open");
+        assert!(file.has_tensor("f4"));
+        assert!(file.has_tensor("f6"));
+
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_accepts_fnuz_f8_tensors() {
+        let path = temp_path("lattice_weights_fnuz_f8_valid");
+        let header = r#"{"e4":{"dtype":"F8_E4M3FNUZ","shape":[1],"data_offsets":[0,1]},"e5":{"dtype":"F8_E5M2FNUZ","shape":[1],"data_offsets":[1,2]}}"#;
+        write_raw_safetensors(&path, header, &[0; 2]);
+
+        let file = SafetensorsFile::open(&path).expect("valid FNUZ F8 layout must open");
+        assert!(file.has_tensor("e4"));
+        assert!(file.has_tensor("e5"));
+
+        fs::remove_file(path).ok();
     }
 
     /// Write a single raw tensor entry (arbitrary dtype/bytes) to a fresh
@@ -2534,6 +2803,170 @@ mod tests {
         assert!(
             result.is_err(),
             "load_sharded must return Err when indexed shard file is absent"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_sharded_rejects_parent_traversal_shard_name() {
+        let dir = temp_dir("lattice_shard_traversal_test");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("invariant: system time is after UNIX_EPOCH")
+            .as_nanos();
+        let outside_name = format!("lattice_shard_traversal_outside_{unique}.safetensors");
+        let outside = dir
+            .parent()
+            .expect("temp dir has a parent")
+            .join(&outside_name);
+        write_single_f32_tensor(&outside, "secret", &[9.0]);
+
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            format!(r#"{{"weight_map":{{"tensor.a":"../{outside_name}"}}}}"#),
+        )
+        .expect("test setup: write index");
+
+        // Without the shard-path guard this join would resolve outside
+        // `dir` and open `outside` successfully instead of erroring.
+        let err = load_sharded(&dir)
+            .expect_err("shard filename with a parent-directory component must be rejected");
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&outside).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_sharded_rejects_absolute_shard_path() {
+        let dir = temp_dir("lattice_shard_absolute_test");
+        let outside_dir = temp_dir("lattice_shard_absolute_outside");
+        let outside_file = outside_dir.join("model-00001-of-00001.safetensors");
+        write_single_f32_tensor(&outside_file, "secret", &[9.0]);
+
+        let index_path = dir.join("model.safetensors.index.json");
+        let abs = outside_file.to_string_lossy().replace('\\', "\\\\");
+        fs::write(
+            &index_path,
+            format!(r#"{{"weight_map":{{"tensor.a":"{abs}"}}}}"#),
+        )
+        .expect("test setup: write index");
+
+        // Without the shard-path guard this join would discard `dir` and
+        // open `outside_file` directly instead of erroring.
+        let err = load_sharded(&dir).expect_err("an absolute shard path must be rejected");
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&outside_dir).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_load_sharded_rejects_symlink_shard_escape() {
+        let dir = temp_dir("lattice_shard_symlink_test");
+        let outside_dir = temp_dir("lattice_shard_symlink_outside");
+        let outside_file = outside_dir.join("secret.safetensors");
+        write_single_f32_tensor(&outside_file, "secret", &[9.0]);
+
+        // A shard filename that is lexically valid (no `..`, not absolute)
+        // but is actually a symlink resolving outside `dir`.
+        let symlink_name = "model-00001-of-00001.safetensors";
+        std::os::unix::fs::symlink(&outside_file, dir.join(symlink_name))
+            .expect("test setup: create symlink shard");
+
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            format!(r#"{{"weight_map":{{"tensor.a":"{symlink_name}"}}}}"#),
+        )
+        .expect("test setup: write index");
+
+        // Lexical validation alone would accept `symlink_name` (no `..`, not
+        // absolute) and `File::open` would happily follow the symlink,
+        // disclosing `outside_file`'s contents. Containment must reject it.
+        let err = load_sharded(&dir).expect_err(
+            "a shard filename that is a symlink escaping the model dir must be rejected",
+        );
+        assert!(
+            err.to_string().contains("escapes the checkpoint directory"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&outside_dir).ok();
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_open_index_rejects_manifest_exceeding_shard_cap() {
+        let dir = temp_dir("lattice_shard_cap_test");
+        let mut weight_map = String::from("{");
+        for i in 0..=MAX_SHARDED_MANIFEST_SHARDS {
+            if i > 0 {
+                weight_map.push(',');
+            }
+            weight_map.push_str(&format!(r#""tensor.{i}":"shard-{i}.safetensors""#));
+        }
+        weight_map.push('}');
+
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(&index_path, format!(r#"{{"weight_map":{weight_map}}}"#))
+            .expect("test setup: write index");
+
+        // None of the `MAX_SHARDED_MANIFEST_SHARDS + 1` shard files are
+        // ever created on disk: the cap must reject the manifest before
+        // `open_index` attempts to resolve or mmap a single one of them.
+        let err = ShardedSafetensors::open_index(&index_path)
+            .expect_err("a manifest naming more than the shard cap must be rejected");
+        assert!(
+            err.to_string().contains("exceeding"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_sharded_safetensors_open_index_rejects_malformed_unaccessed_shard() {
+        let dir = temp_dir("lattice_malformed_shard_test");
+        let shard_a = dir.join("model-00001-of-00002.safetensors");
+        let shard_b = dir.join("model-00002-of-00002.safetensors");
+        write_single_f32_tensor(&shard_a, "tensor.a", &[1.0, 2.0]);
+
+        // Shard b's header declares tensor.b as 3 f32 (12 bytes) but the
+        // data_offsets only span 8 bytes — a malformed layout that
+        // `validate_safetensors_layout` rejects. `tensor.b` is never
+        // requested by this test.
+        let header = r#"{"tensor.b":{"dtype":"F32","shape":[3],"data_offsets":[0,8]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 8]);
+        fs::write(&shard_b, &bytes).expect("test setup: write malformed shard b");
+
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            r#"{"weight_map":{"tensor.a":"model-00001-of-00002.safetensors","tensor.b":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
+
+        // Before the fix, `open_index` left shards unopened and this call
+        // would succeed even though shard_b is malformed, because nothing
+        // here ever calls `get_f32_tensor_owned("tensor.b")`.
+        let result = ShardedSafetensors::open_index(&index_path);
+        assert!(
+            result.is_err(),
+            "open_index must eagerly reject a malformed shard even when none of its \
+             tensors are ever requested, matching the QuaRot reader's eager contract"
         );
 
         fs::remove_dir_all(&dir).ok();
