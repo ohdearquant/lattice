@@ -6822,22 +6822,6 @@ mod inner {
             }
         }
 
-        /// Batched single-command-buffer prefill for a contiguous token slice starting
-        /// at absolute position `start_pos`.
-        ///
-        /// Writes full-attention K/V rows `start_pos..start_pos+n` and advances GDN
-        /// recurrent state in the session GPU buffers. Called by `forward_prefill_impl`
-        /// once per chunk; for `n ≤ max_prefill` it IS the entire prefill (one command
-        /// buffer, all 24 layers, final logits).
-        ///
-        /// `emit_logits` gates ONLY the terminal RMSNorm, lm_head, MTP-capture/readback,
-        /// and top-k tail, which is purely terminal (it does not feed the residual
-        /// stream, KV cache, or GDN recurrent state — those are fully advanced by the
-        /// per-layer loop above it). When `false`, the layer command buffer for this
-        /// chunk still commits and `set_position` still advances; only the wasted tail
-        /// work (and its GPU readback) is skipped. Callers with an intermediate chunk of
-        /// a chunked, last-token-only (`!all_positions`) prefill — whose tail output is
-        /// always discarded — pass `false`; every other caller passes `true`.
         fn copy_prefill_embeddings(&self, token_ids: &[u32], hidden: usize) {
             // SAFETY: embed_tokens is StorageModeShared f16 with no GPU work in flight;
             // callers validate every token id before reaching the prefill schedulers.
@@ -7293,6 +7277,42 @@ mod inner {
             self.encode_prefill_dense_mlp(enc, common_w, &self.session.activations.ffn_out, cfg, m);
         }
 
+        /// Every active layer's FFN must be dense (`MetalFfnWeights::Dense`) for the
+        /// batched (M>1 GEMM) prefill schedulers — `encode_prefill_dense_mlp` panics
+        /// on `MetalFfnWeights::Moe`. Called before any embedding copy, command
+        /// buffer, or per-layer encode so an unsupported config is rejected with zero
+        /// state mutation instead of panicking mid-encode after earlier layers'
+        /// GDN/KV work has already been recorded (or, for schedulers that split
+        /// encoding across multiple command buffers, already committed to the GPU).
+        fn assert_batched_prefill_dense_only(&self) {
+            let has_moe_layer = self
+                .engine
+                .layer_weights
+                .iter()
+                .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)));
+            assert!(
+                !has_moe_layer,
+                "batched prefill does not support MoE layers (M>1 GEMM path); \
+                 use decode-mode forward_step for MoE models instead"
+            );
+        }
+
+        /// Batched single-command-buffer prefill for a contiguous token slice starting
+        /// at absolute position `start_pos`.
+        ///
+        /// Writes full-attention K/V rows `start_pos..start_pos+n` and advances GDN
+        /// recurrent state in the session GPU buffers. Called by `forward_prefill_impl`
+        /// once per chunk; for `n ≤ max_prefill` it IS the entire prefill (one command
+        /// buffer, all 24 layers, final logits).
+        ///
+        /// `emit_logits` gates ONLY the terminal RMSNorm, lm_head, MTP-capture/readback,
+        /// and top-k tail, which is purely terminal (it does not feed the residual
+        /// stream, KV cache, or GDN recurrent state — those are fully advanced by the
+        /// per-layer loop above it). When `false`, the layer command buffer for this
+        /// chunk still commits and `set_position` still advances; only the wasted tail
+        /// work (and its GPU readback) is skipped. Callers with an intermediate chunk of
+        /// a chunked, last-token-only (`!all_positions`) prefill — whose tail output is
+        /// always discarded — pass `false`; every other caller passes `true`.
         fn forward_prefill_batched_chunk(
             &mut self,
             token_ids: &[u32],
@@ -7311,6 +7331,7 @@ mod inner {
                 "prefill chunk start_pos={start_pos} + n={n} exceeds max_cache_len {}",
                 self.session.kv_cache.max_cache_len
             );
+            self.assert_batched_prefill_dense_only();
             let cfg = self.engine.config.clone();
             let m = n as u32;
             let hidden = cfg.hidden_size;
@@ -7637,6 +7658,7 @@ mod inner {
                 "prefill chunk start_pos={start_pos} + n={n} exceeds max_cache_len {}",
                 self.session.kv_cache.max_cache_len
             );
+            self.assert_batched_prefill_dense_only();
             let cfg = self.engine.config.clone();
             let m = n as u32;
             let hidden = cfg.hidden_size;
@@ -24427,6 +24449,158 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 ],
             };
             (cfg, weights)
+        }
+
+        /// Single full-attention MoE layer — batched prefill does not support MoE
+        /// (`assert_batched_prefill_dense_only`), so this is the minimal fixture for
+        /// exercising the up-front rejection path before any state mutation.
+        fn tiny_moe_prefill_fixture() -> (Qwen35Config, ModelWeights) {
+            use crate::model::qwen35::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert};
+
+            let hidden = 512usize;
+            let vocab = 32usize;
+            let num_experts = 2usize;
+            let top_k = 1usize;
+            let inter = 16usize;
+            let s_inter = 16usize;
+            let cfg = Qwen35Config {
+                hidden_size: hidden,
+                num_hidden_layers: 1,
+                vocab_size: vocab,
+                intermediate_size: 64,
+                rms_norm_eps: 1e-6,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                head_dim: 256,
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: 0.25,
+                rope_parameters: None,
+                linear_num_key_heads: 1,
+                linear_num_value_heads: Some(1),
+                linear_key_head_dim: 16,
+                linear_value_head_dim: 16,
+                linear_conv_kernel_dim: 4,
+                num_experts: Some(num_experts),
+                num_experts_per_tok: Some(top_k),
+                moe_intermediate_size: Some(inter),
+                shared_expert_intermediate_size: Some(s_inter),
+                output_router_logits: false,
+                router_aux_loss_coef: None,
+                tie_word_embeddings: true,
+                mtp_num_hidden_layers: 0,
+                mtp_use_dedicated_embeddings: false,
+                full_attention_interval: 1,
+                layer_types: vec![LayerType::FullAttention],
+                layer_mask: vec![true],
+                eos_token_id: (vocab - 1) as u32,
+                max_position_embeddings: 64,
+                quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+            };
+
+            let full = AttentionWeights::Full(FullAttentionLayerWeights {
+                q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
+                k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
+                v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
+                o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+                q_norm: vec![1.0; cfg.head_dim],
+                k_norm: vec![1.0; cfg.head_dim],
+            });
+
+            let router =
+                MoeRouter::new(vec![0.0; num_experts * hidden], num_experts, top_k, hidden)
+                    .expect("moe router fixture shape");
+            let experts = RoutedExperts::new(
+                vec![0.0; num_experts * 2 * inter * hidden],
+                vec![0.0; num_experts * hidden * inter],
+                num_experts,
+                hidden,
+                inter,
+            )
+            .expect("moe routed experts fixture shape");
+            let shared_expert = SharedExpert::new(
+                vec![0.0; s_inter * hidden],
+                vec![0.0; s_inter * hidden],
+                vec![0.0; hidden * s_inter],
+                vec![0.0; hidden],
+                hidden,
+                s_inter,
+            )
+            .expect("moe shared expert fixture shape");
+
+            let common = CommonLayerWeights {
+                input_layernorm: vec![1.0; hidden],
+                post_attention_layernorm: vec![1.0; hidden],
+                ffn: FeedForwardWeights::Moe(MoeLayerWeights {
+                    router,
+                    experts,
+                    shared_expert,
+                }),
+            };
+
+            // Non-zero so a wrongly-ordered guard (embedding copy running before
+            // the MoE rejection) is observable as a mutated `activations.hidden`.
+            let mut embed = vec![0.0f32; vocab * hidden];
+            for tok in 0..vocab {
+                embed[tok * hidden] = if tok % 2 == 0 { 1.0 } else { -1.0 };
+            }
+
+            let weights = ModelWeights {
+                embed_tokens: embed,
+                lm_head: None,
+                final_norm: vec![1.0; hidden],
+                layers: vec![(full, common)],
+            };
+            (cfg, weights)
+        }
+
+        /// Regression test: batched prefill on an unsupported (MoE) config must
+        /// reject before any state mutation, so a retry after the failure observes
+        /// exactly the same clean session state — not a partially-encoded one.
+        /// `assert_batched_prefill_dense_only` runs before the embedding copy, the
+        /// command buffer, and any recurrent/KV encode, so `session.position` and
+        /// `activations.hidden` (non-zero embedding rows would prove the copy ran)
+        /// must stay untouched across repeated failed attempts.
+        #[test]
+        fn forward_prefill_batched_chunk_rejects_moe_before_any_state_mutation() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("moe prefill fixture must construct");
+
+            let initial_position = state.session.position;
+            let tokens = [1u32, 3, 5];
+
+            for attempt in 0..2 {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.forward_prefill_batched_chunk(&tokens, 0, true, true)
+                }));
+                assert!(
+                    result.is_err(),
+                    "attempt {attempt}: unsupported-MoE batched prefill must fail cleanly, \
+                     not silently produce logits"
+                );
+                assert_eq!(
+                    state.session.position, initial_position,
+                    "attempt {attempt}: session position must be unchanged by a rejected prefill"
+                );
+                // SAFETY: StorageModeShared, read-only; the guard panics before a
+                // command buffer is ever created, so there is no GPU work in flight.
+                let hidden_after =
+                    unsafe { read_buffer(&state.session.activations.hidden, cfg.hidden_size) };
+                assert!(
+                    hidden_after.iter().all(|&v| v == 0.0),
+                    "attempt {attempt}: embedding copy must not run before the MoE guard \
+                     fires (activations.hidden should stay zero-initialized)"
+                );
+            }
         }
 
         #[cfg(feature = "bench-internals")]
