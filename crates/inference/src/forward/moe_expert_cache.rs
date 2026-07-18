@@ -279,26 +279,11 @@ impl ExpertByteTable {
     /// writes; it is re-verified here, not just assumed, via the
     /// block-alignment check below.
     fn open(path: &Path, expected_shape: &[usize]) -> Result<Self, String> {
-        use crate::weights::q4_weights::{read_q4_header, validate_q4_header_payload_bounds};
+        use crate::weights::q4_weights::validate_q4_file;
 
-        let file = std::fs::File::open(path)
+        let mut file = std::fs::File::open(path)
             .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        let header = read_q4_header(&file)
-            .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-        if header.shape != expected_shape {
-            return Err(format!(
-                "{}: MoE expert-cache tensor has shape {:?}, expected {expected_shape:?} — \
-                 refusing to build a lazy per-expert byte table over a mismatched/transposed \
-                 layout (same hazard the eager `load_q4_mmap_dequant_f16` path guards against)",
-                path.display(),
-                header.shape
-            ));
-        }
-        let file_len = file
-            .metadata()
-            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-            .len();
-        validate_q4_header_payload_bounds(&header, file_len, path)
+        let header = validate_q4_file(&mut file, path, Some(expected_shape))
             .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
 
         let num_experts = expected_shape[0];

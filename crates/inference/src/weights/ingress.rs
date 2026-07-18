@@ -9,14 +9,14 @@
 //! route through immediately before a tensor view escapes to a caller, so
 //! the same class of gap cannot silently reopen at the next loader.
 //!
-//! Safetensors F32/F16/BF16 normalize to `f32` by the time they reach this
+//! Safetensors F32/F16/BF16 and native KHF1 normalize to `f32` before this
 //! seam (`SafetensorsFile::get_f32_tensor` widens F16/BF16 before
-//! returning). In-memory Q8 construction validates its decoded f32 source
-//! before quantization and its derived Q8 data/scales before returning, so
-//! the seam covers the conversion boundary as a whole. Other payload forms
-//! named in lattice#800 — raw safetensors F32/F16/BF16 bytes, decoded F64,
-//! and native Q4 blocks/bytes — are added as those loaders start calling
-//! into this seam.
+//! returning); native Q4 files stream their block metadata through it
+//! without materializing an additional payload copy. In-memory Q8
+//! construction validates its decoded f32 source before quantization and
+//! its derived Q8 data/scales before returning, so the seam covers the
+//! conversion boundary as a whole. Other payload forms named in
+//! lattice#800 are added as their loaders start calling into this seam.
 
 use crate::error::InferenceError;
 
@@ -30,10 +30,11 @@ pub(crate) struct IngestedTensor<'a> {
     source: &'a str,
     tensor_name: &'a str,
     shape: &'a [usize],
+    expected_shape: Option<&'a [usize]>,
     payload: IngestPayload<'a>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum IngestPayload<'a> {
     /// Already widened to `f32`. `dtype_label` names the *source* dtype
     /// ("F32", "F16", "BF16") for error messages — the slice itself is
@@ -45,6 +46,18 @@ enum IngestPayload<'a> {
     },
     /// Derived Q8 data and per-row scales.
     Q8 { data: &'a [i8], scales: &'a [f32] },
+    NativeQ4 {
+        original_len: usize,
+        block_count: usize,
+    },
+    NativeQ4Block(Q4BlockMetadata),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Q4BlockMetadata {
+    index: usize,
+    scale_bits: u16,
+    bias_bits: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,15 +75,6 @@ impl IngressErrorKind {
     }
 }
 
-impl IngestPayload<'_> {
-    fn geometry_error(&self, message: String) -> InferenceError {
-        match self {
-            Self::DecodedF32 { error_kind, .. } => error_kind.error(message),
-            Self::Q8 { .. } => InferenceError::InvalidInput(message),
-        }
-    }
-}
-
 impl<'a> IngestedTensor<'a> {
     /// Wrap an already f32-widened tensor slice for validation.
     pub(crate) fn decoded_f32(
@@ -84,6 +88,7 @@ impl<'a> IngestedTensor<'a> {
             source,
             tensor_name,
             shape,
+            expected_shape: None,
             payload: IngestPayload::DecodedF32 {
                 values,
                 dtype_label,
@@ -103,6 +108,7 @@ impl<'a> IngestedTensor<'a> {
             source,
             tensor_name,
             shape,
+            expected_shape: None,
             payload: IngestPayload::DecodedF32 {
                 values,
                 dtype_label: "F32",
@@ -123,9 +129,70 @@ impl<'a> IngestedTensor<'a> {
             source,
             tensor_name,
             shape,
+            expected_shape: None,
             payload: IngestPayload::Q8 { data, scales },
         }
     }
+
+    /// Wrap native Q4 layout and optional per-block metadata for validation.
+    pub(crate) fn native_q4(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        original_len: usize,
+        block_count: usize,
+    ) -> Self {
+        Self {
+            source,
+            tensor_name,
+            shape,
+            expected_shape: None,
+            payload: IngestPayload::NativeQ4 {
+                original_len,
+                block_count,
+            },
+        }
+    }
+
+    /// Wrap one native Q4 block's serialized metadata for validation.
+    pub(crate) fn native_q4_block(
+        source: &'a str,
+        tensor_name: &'a str,
+        index: usize,
+        scale_bits: u16,
+        bias_bits: u16,
+    ) -> Self {
+        Self {
+            source,
+            tensor_name,
+            shape: &[],
+            expected_shape: None,
+            payload: IngestPayload::NativeQ4Block(Q4BlockMetadata {
+                index,
+                scale_bits,
+                bias_bits,
+            }),
+        }
+    }
+
+    /// Require the declared tensor shape to match model-config geometry.
+    pub(crate) fn with_expected_shape(mut self, expected_shape: &'a [usize]) -> Self {
+        self.expected_shape = Some(expected_shape);
+        self
+    }
+}
+
+fn checked_shape_numel(tensor: &IngestedTensor<'_>) -> Result<usize, InferenceError> {
+    tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| {
+            InferenceError::InvalidSafetensors(format!(
+                "{}: tensor {} shape {:?} overflows usize element count",
+                tensor.source, tensor.tensor_name, tensor.shape,
+            ))
+        })
 }
 
 /// Validate one ingested tensor at the exact point its bytes become trusted
@@ -139,17 +206,14 @@ impl<'a> IngestedTensor<'a> {
 /// label, tensor name, dtype, shape, and (for a finite-value failure) the
 /// first offending element index.
 pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(), InferenceError> {
-    let numel = tensor
-        .shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| {
-            let message = format!(
-                "{}: tensor {} shape {:?} overflows usize element count",
-                tensor.source, tensor.tensor_name, tensor.shape,
-            );
-            tensor.payload.geometry_error(message)
-        })?;
+    if let Some(expected_shape) = tensor.expected_shape
+        && tensor.shape != expected_shape
+    {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "{}: tensor {} has shape {:?}, expected {:?}",
+            tensor.source, tensor.tensor_name, tensor.shape, expected_shape,
+        )));
+    }
 
     match tensor.payload {
         IngestPayload::DecodedF32 {
@@ -157,10 +221,11 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
             dtype_label,
             error_kind,
         } => {
+            let numel = checked_shape_numel(&tensor)?;
             if values.len() != numel {
                 return Err(error_kind.error(format!(
                     "{}: tensor {} ({dtype_label}) decoded element count {} does not match \
-                     shape {:?} (expected {numel})",
+                     shape {:?} (shape product {numel})",
                     tensor.source,
                     tensor.tensor_name,
                     values.len(),
@@ -183,6 +248,7 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                     tensor.source, tensor.tensor_name, tensor.shape,
                 )));
             }
+            let numel = checked_shape_numel(&tensor)?;
             if data.len() != numel {
                 return Err(InferenceError::InvalidInput(format!(
                     "{}: tensor {} (Q8) data element count {} does not match shape {:?} \
@@ -232,6 +298,46 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                     "{}: tensor {} (Q8) has non-positive scale {scale} at row {row} of \
                      {expected_scales} (shape {:?})",
                     tensor.source, tensor.tensor_name, tensor.shape,
+                )));
+            }
+            Ok(())
+        }
+        IngestPayload::NativeQ4 {
+            original_len,
+            block_count,
+        } => {
+            let numel = checked_shape_numel(&tensor)?;
+            if original_len != numel {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: tensor {} (Q4) original_len {original_len} does not match shape {:?} \
+                     (expected {numel})",
+                    tensor.source, tensor.tensor_name, tensor.shape,
+                )));
+            }
+            let expected_blocks = original_len.div_ceil(32);
+            if block_count != expected_blocks {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: tensor {} (Q4) block count {block_count} does not match original_len \
+                     {original_len} (expected {expected_blocks})",
+                    tensor.source, tensor.tensor_name,
+                )));
+            }
+            Ok(())
+        }
+        IngestPayload::NativeQ4Block(metadata) => {
+            let scale = super::half_bits::f16_bits_to_f32(metadata.scale_bits);
+            let bias = super::half_bits::f16_bits_to_f32(metadata.bias_bits);
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: tensor {} (Q4) block {} has invalid scale {scale}; scale must be \
+                     finite and strictly positive",
+                    tensor.source, tensor.tensor_name, metadata.index,
+                )));
+            }
+            if !bias.is_finite() {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: tensor {} (Q4) block {} has non-finite bias {bias}",
+                    tensor.source, tensor.tensor_name, metadata.index,
                 )));
             }
             Ok(())
