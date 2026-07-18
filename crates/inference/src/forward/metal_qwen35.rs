@@ -6187,9 +6187,11 @@ mod inner {
         /// Qwen3.5 vision (ADR-069 Metal MP3): same REPLACE-injection contract as
         /// [`Self::forward_step_injected`], plus a per-token interleaved-axis
         /// M-RoPE cos/sin row for the six GQA layers (see
-        /// `forward_step_inner_impl`'s `mrope_cos_sin` doc). Used for image-pad
-        /// prefill positions, where `injected_embedding` and `mrope_cos_sin` are
-        /// both `Some`.
+        /// `forward_step_inner_impl`'s `mrope_cos_sin` doc). Production image-pad prefill now
+        /// calls [`Self::forward_step_injected_mrope_with_head`] instead (it needs the
+        /// `emit_head` gate); this always-emit form is retained because unit tests exercise the
+        /// injection+M-RoPE contract without needing the gate.
+        #[allow(dead_code)]
         fn forward_step_injected_mrope(
             &mut self,
             embedding: &[f32],
@@ -6202,6 +6204,30 @@ mod inner {
                 position,
                 false,
                 false,
+                GdnStateTrafficScope::Decode,
+                Some(embedding),
+                mrope_cos_sin,
+            )
+            .logits
+        }
+
+        /// Same contract as [`Self::forward_step_injected_mrope`], with an `emit_head` gate:
+        /// pass `false` for a multimodal prefill position that is not the prompt's last
+        /// position (see [`Self::forward_step_mrope_with_head`]'s doc comment).
+        fn forward_step_injected_mrope_with_head(
+            &mut self,
+            embedding: &[f32],
+            position: usize,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+            emit_head: bool,
+        ) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner_impl_with_head(
+                0,
+                position,
+                false,
+                false,
+                emit_head,
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 mrope_cos_sin,
@@ -6234,6 +6260,32 @@ mod inner {
             .logits
         }
 
+        /// Same contract as [`Self::forward_step_mrope`], with an `emit_head` gate: pass
+        /// `false` for a multimodal prefill position that is not the prompt's last position --
+        /// the RMSNorm/lm_head/[vocab_size] readback tail is unobservable for any position
+        /// whose logits are never sampled, so skipping it changes no output (see
+        /// [`Self::forward_step_inner_impl_with_head`]'s doc comment for why this is safe).
+        fn forward_step_mrope_with_head(
+            &mut self,
+            token_id: u32,
+            position: usize,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+            emit_head: bool,
+        ) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner_impl_with_head(
+                token_id,
+                position,
+                false,
+                false,
+                emit_head,
+                GdnStateTrafficScope::Decode,
+                None,
+                mrope_cos_sin,
+            )
+            .logits
+        }
+
         /// `mrope_cos_sin`, when supplied (Qwen3.5 vision M-RoPE, ADR-069 MP3),
         /// replaces the six GQA layers' 1-D `engine.rope_cos`/`rope_sin` table
         /// lookup (keyed by `position`) with this caller-supplied interleaved-axis
@@ -6247,6 +6299,39 @@ mod inner {
             position: usize,
             capture_hidden: bool,
             skip_logits_readback: bool,
+            _traffic_scope: GdnStateTrafficScope,
+            injected_embedding: Option<&[f32]>,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+        ) -> MetalStepOutput {
+            self.forward_step_inner_impl_with_head(
+                token_id,
+                position,
+                capture_hidden,
+                skip_logits_readback,
+                true,
+                _traffic_scope,
+                injected_embedding,
+                mrope_cos_sin,
+            )
+        }
+
+        /// Same as [`Self::forward_step_inner_impl`], with an added `emit_head` gate: when
+        /// `false`, skips the terminal RMSNorm/lm_head/[`Self::encode_final_head`]/readback
+        /// tail entirely (only the per-layer GQA/GDN/MLP work runs, which is what advances the
+        /// KV cache and GDN recurrent state). Mirrors the batched chunked-prefill path's
+        /// `emit_logits` gate (`forward_prefill_batched_chunk`, `!emit_logits` branch): that
+        /// tail feeds only `self.session.activations.logits`/`pre_final_hidden`, both
+        /// step-local scratch buffers overwritten at the start of the next step, so omitting it
+        /// for a non-final multimodal prefill position cannot change the residual stream, KV
+        /// cache, or GDN state the next position's step depends on.
+        #[allow(clippy::too_many_arguments)]
+        fn forward_step_inner_impl_with_head(
+            &mut self,
+            token_id: u32,
+            position: usize,
+            capture_hidden: bool,
+            skip_logits_readback: bool,
+            emit_head: bool,
             _traffic_scope: GdnStateTrafficScope,
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
@@ -6447,8 +6532,11 @@ mod inner {
                     &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
                 };
                 let head_enc = head_cmd.new_compute_command_encoder();
-                let topk_which_inner =
-                    self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling);
+                let topk_which_inner = if emit_head {
+                    self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling)
+                } else {
+                    None
+                };
                 head_enc.end_encoding();
                 let t_gpu = std::time::Instant::now();
                 head_cmd.commit();
@@ -6524,7 +6612,9 @@ mod inner {
                 }
 
                 // SAFETY: GPU completed (wait_until_completed called above for head_cmd).
-                let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                let pre_final_hidden = if emit_head
+                    && (capture_hidden || self.session.mtp.is_some())
+                {
                     let h =
                         unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                     self.session.last_pre_final_hidden = h.clone();
@@ -6533,7 +6623,7 @@ mod inner {
                     Vec::new()
                 };
 
-                let logits = if skip_logits_readback {
+                let logits = if !emit_head || skip_logits_readback {
                     vec![]
                 } else if let Some(which) = topk_which_inner {
                     let k = self.session.compact_topk;
@@ -6605,8 +6695,16 @@ mod inner {
                 }
             } // end layer loop
 
-            let topk_which =
-                self.encode_final_head(enc, &cfg, capture_hidden, &mut prof, profiling);
+            // `emit_head=false` (non-final multimodal prefill position): the per-layer loop
+            // above has already fully advanced the residual stream, KV cache, and GDN
+            // recurrent state, so the RMSNorm/lm_head/top-k tail below is pure waste here --
+            // skip encoding it and commit only the layer work, mirroring
+            // `forward_prefill_batched_chunk`'s `!emit_logits` branch.
+            let topk_which = if emit_head {
+                self.encode_final_head(enc, &cfg, capture_hidden, &mut prof, profiling)
+            } else {
+                None
+            };
 
             // Single submit for entire forward pass + optional top-k.
             enc.end_encoding();
@@ -6665,9 +6763,11 @@ mod inner {
                 );
             }
 
-            // Read back pre-final hidden when requested (for MTP input).
+            // Read back pre-final hidden when requested (for MTP input). Gated on `emit_head`
+            // too: when `emit_head` is false, `encode_final_head`'s own pre-final-hidden copy
+            // never ran, so the buffer holds a stale value from a prior step.
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
-            let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+            let pre_final_hidden = if emit_head && (capture_hidden || self.session.mtp.is_some()) {
                 let h = unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                 self.session.last_pre_final_hidden = h.clone();
                 h
@@ -6675,7 +6775,7 @@ mod inner {
                 Vec::new()
             };
 
-            let logits = if skip_logits_readback {
+            let logits = if !emit_head || skip_logits_readback {
                 vec![]
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
@@ -10181,6 +10281,14 @@ mod inner {
                 } else {
                     None
                 };
+                // Only the LAST prefill position's logits are ever read (`sample_token` below
+                // draws the first generated token from `last_logits` after this loop exits) --
+                // every earlier position's RMSNorm/lm_head/[vocab_size] readback is computed
+                // and immediately discarded when `last_logits` is overwritten by the next
+                // iteration. `emit_head` skips that tail for every non-final position; the
+                // per-layer work that advances the KV cache and GDN recurrent state still runs
+                // unconditionally (see `forward_step_inner_impl_with_head`'s doc comment).
+                let emit_head = pos == prompt_len - 1;
                 if has_image && token_id == request.image_token_id {
                     let start = visual_row * request.decoder_hidden_size;
                     let end = start + request.decoder_hidden_size;
@@ -10194,9 +10302,11 @@ mod inner {
                         )));
                     }
                     visual_row += 1;
-                    last_logits = self.forward_step_injected_mrope(row, pos, cos_sin);
+                    last_logits =
+                        self.forward_step_injected_mrope_with_head(row, pos, cos_sin, emit_head);
                 } else {
-                    last_logits = self.forward_step_mrope(token_id, pos, cos_sin);
+                    last_logits =
+                        self.forward_step_mrope_with_head(token_id, pos, cos_sin, emit_head);
                 }
             }
 
@@ -26875,6 +26985,109 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// PR #1021 review round 7 major finding: the multimodal prefill loop computed the
+        /// terminal RMSNorm/lm_head/[vocab_size] readback for every prompt position even
+        /// though only the final position's logits are ever sampled. `emit_head=false` (see
+        /// `forward_step_inner_impl_with_head`'s doc comment) skips that tail for every
+        /// non-final position while the per-layer GQA/GDN/MLP work -- the only work that feeds
+        /// the residual stream, KV cache, or GDN recurrent state -- still runs unconditionally.
+        ///
+        /// State/logit-equivalence proof: a "skip" run (`emit_head = pos ==
+        /// last_pos`, exactly `generate_multimodal_vision`'s own prefill loop logic) and a
+        /// "reference" run (`emit_head = true` on every position, the pre-fix behavior) against
+        /// the same real checkpoint and prompt must produce (a) byte-identical final-prefill
+        /// logits and (b) identical post-prefill state -- probed by taking one more decode step
+        /// on each state afterward (mirroring `generate_multimodal_vision_impl`'s own decode-step
+        /// cos/sin construction) and comparing THOSE logits too, since any KV-cache or GDN-state
+        /// divergence introduced during prefill would change the very next step's attention/
+        /// recurrence output. Equivalence holds in both directions: forcing the "skip" run's
+        /// `emit_head` to `true` everywhere (i.e. reverting the optimization) makes it identical
+        /// to the reference run by construction, so the comparison still passes.
+        ///
+        /// Mutation-sensitive: changing the skip run's predicate so the FINAL position is also
+        /// skipped (`emit_head = pos == last_pos && false`, i.e. never true) makes
+        /// `last_logits_skip` come back empty (`vec![]`, `encode_final_head`'s tail never ran)
+        /// while `last_logits_ref` stays the full `[vocab_size]` vector -- the length-equality
+        /// assertion below fails immediately. Verified locally: applying that predicate change
+        /// makes this test panic (`left: 0, right: 151936`-shaped mismatch), reverting restores
+        /// a pass.
+        #[test]
+        fn multimodal_prefill_emit_head_skip_preserves_final_logits_and_state() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "multimodal_prefill_emit_head_skip_preserves_final_logits_and_state",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let request = vision_gate_fixture(&cfg, 0.015);
+            let (positions, tables) = request
+                .build_mrope_tables(&cfg)
+                .expect("fixture request builds M-RoPE tables");
+            let last_pos = request.input_ids.len() - 1;
+
+            let run = |emit_head_for: &dyn Fn(usize) -> bool| {
+                let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                    .expect("real-checkpoint state");
+                state.reset_state();
+                let mut visual_row = 0usize;
+                let mut last_logits = Vec::new();
+                for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                    let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
+                    let emit_head = emit_head_for(pos);
+                    if token_id == request.image_token_id {
+                        let start = visual_row * request.decoder_hidden_size;
+                        let end = start + request.decoder_hidden_size;
+                        let row = &request.post_merger_rows[start..end];
+                        visual_row += 1;
+                        last_logits = state
+                            .forward_step_injected_mrope_with_head(row, pos, cos_sin, emit_head);
+                    } else {
+                        last_logits =
+                            state.forward_step_mrope_with_head(token_id, pos, cos_sin, emit_head);
+                    }
+                }
+                // Post-prefill state probe: one more decode step, same construction
+                // `generate_multimodal_vision_impl`'s decode loop uses.
+                let decode_axis = crate::vision::qwen35_mrope::decode_position(
+                    request.input_ids.len(),
+                    positions.rope_delta,
+                )
+                .expect("decode_position must succeed for this fixture");
+                let (decode_cos, decode_sin) = request
+                    .build_decode_cos_sin(&cfg, decode_axis)
+                    .expect("build_decode_cos_sin must succeed for this fixture");
+                let probe_logits = state.forward_step_mrope(
+                    /* arbitrary next token id */ 13,
+                    request.input_ids.len(),
+                    Some((decode_cos.as_slice(), decode_sin.as_slice())),
+                );
+                (last_logits, probe_logits)
+            };
+
+            // Skip run: exactly `generate_multimodal_vision_impl`'s own prefill loop logic.
+            let (last_logits_skip, probe_skip) = run(&|pos| pos == last_pos);
+            // Reference run: emit the full head every position (pre-fix behavior).
+            let (last_logits_ref, probe_ref) = run(&|_pos| true);
+
+            assert_eq!(
+                last_logits_skip.len(),
+                last_logits_ref.len(),
+                "skip run's final-position logits must be the full [vocab_size] vector, not \
+                 empty -- the final position must never be skipped"
+            );
+            assert_eq!(
+                last_logits_skip, last_logits_ref,
+                "skip run's final-prefill logits must be byte-identical to the reference run's"
+            );
+            assert_eq!(
+                probe_skip, probe_ref,
+                "post-prefill KV/GDN state must be identical between the skip and reference \
+                 runs -- observed indirectly via one more decode step's logits"
+            );
+        }
+
         /// Qwen3.5 vision (ADR-069 Metal MP3 gate, test 3/4 — text-only
         /// bit-identity): a text-only request through `generate_multimodal_vision`
         /// (no image runs) must produce bit-identical logits/tokens to the plain
@@ -28001,19 +28214,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// acquire the same path.
         ///
         /// Acquisition order is mutex-then-file, so at most one thread per
-        /// process ever contends the file lock. The file lock is polled with
-        /// `try_lock` so a wedged holder surfaces as a clear panic after a
-        /// generous timeout instead of a silent infinite hang.
+        /// process ever contends the file lock. The file lock protocol itself
+        /// (path, timeout, poll interval) lives only in
+        /// [`crate::serve::gpu_test_lock`], the canonical implementation --
+        /// this wrapper adds only the in-process mutex layer on top, which
+        /// `serve::gpu_test_lock` does not need (it has no other in-process
+        /// caller to serialize against).
         struct GpuTestGuard {
             _process: std::sync::MutexGuard<'static, ()>,
-            // Held for the guard's lifetime; dropping the File closes the fd,
-            // which releases the flock.
-            _machine: std::fs::File,
+            _machine: crate::serve::gpu_test_lock::GpuTestLockGuard,
         }
-
-        const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-        const GPU_MACHINE_LOCK_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(30 * 60);
 
         fn gpu_test_lock() -> GpuTestGuard {
             use std::sync::Mutex;
@@ -28021,39 +28231,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let process = GPU_LOCK
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(GPU_MACHINE_LOCK_PATH)
-                .unwrap_or_else(|e| {
-                    panic!("gpu_test_lock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}")
-                });
-            let deadline = std::time::Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
-            loop {
-                match file.try_lock() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        if std::time::Instant::now() >= deadline {
-                            panic!(
-                                "gpu_test_lock: another process has held \
-                                 {GPU_MACHINE_LOCK_PATH} for over {}s — a Metal \
-                                 test run elsewhere on this machine is wedged or \
-                                 genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
-                                GPU_MACHINE_LOCK_TIMEOUT.as_secs()
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(std::fs::TryLockError::Error(e)) => {
-                        panic!("gpu_test_lock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
-                    }
-                }
-            }
+            let machine = crate::serve::gpu_test_lock::gpu_test_lock();
             GpuTestGuard {
                 _process: process,
-                _machine: file,
+                _machine: machine,
             }
         }
 
