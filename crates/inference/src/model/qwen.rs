@@ -672,6 +672,25 @@ fn causal_softmax_row(row: &mut [f32], qi: usize, scale: f32) {
     crate::attention::softmax_row::finalize_row(row, sum);
 }
 
+fn effective_context_len(
+    config: &QwenConfig,
+    inference_config: &ModelInferenceConfig,
+    tokenizer_max_seq_len: usize,
+) -> Result<usize, InferenceError> {
+    let max_context = config
+        .max_position_embeddings
+        .min(inference_config.rope_table_max_seq_len)
+        .min(tokenizer_max_seq_len);
+    if max_context == 0 {
+        return Err(InferenceError::InvalidInput(format!(
+            "Qwen effective context must be non-zero: max_position_embeddings={}, \
+             rope_table_max_seq_len={}, tokenizer_max_seq_len={tokenizer_max_seq_len}",
+            config.max_position_embeddings, inference_config.rope_table_max_seq_len
+        )));
+    }
+    Ok(max_context)
+}
+
 impl QwenModel {
     /// **Unstable**: load Qwen3 model from a local directory; path convention may change.
     ///
@@ -698,7 +717,9 @@ impl QwenModel {
             )));
         };
 
-        let gpu_max_seq_len = inference_config.gpu_max_seq_len;
+        let max_context =
+            effective_context_len(&config, &inference_config, tokenizer.max_seq_len())?;
+        let gpu_max_seq_len = inference_config.gpu_max_seq_len.min(max_context);
 
         if model_path.exists() {
             // --- Single-file path (original behaviour) ---
@@ -738,10 +759,7 @@ impl QwenModel {
             // explicitly drops `weights` before `_storage`, independent of field order.
             let weights: QwenWeights<'static> = unsafe { std::mem::transmute(weights_tmp) };
 
-            let rope_max = config
-                .max_position_embeddings
-                .min(inference_config.rope_table_max_seq_len);
-            let rope = RopeTable::new(config.head_dim, rope_max, config.rope_theta);
+            let rope = RopeTable::new(config.head_dim, max_context, config.rope_theta);
 
             Ok(Self {
                 config,
@@ -798,10 +816,7 @@ impl QwenModel {
             // `_storage`, independent of field declaration order.
             let weights: QwenWeights<'static> = weights_tmp;
 
-            let rope_max = config
-                .max_position_embeddings
-                .min(inference_config.rope_table_max_seq_len);
-            let rope = RopeTable::new(config.head_dim, rope_max, config.rope_theta);
+            let rope = RopeTable::new(config.head_dim, max_context, config.rope_theta);
 
             Ok(Self {
                 config,
@@ -936,7 +951,7 @@ impl QwenModel {
         Ok(count)
     }
 
-    fn tokenize_for_embedding(&self, text: &str) -> (Vec<u32>, usize) {
+    fn tokenize_for_embedding(&self, text: &str) -> Result<(Vec<u32>, usize), InferenceError> {
         let input = self.tokenizer.tokenize(text);
         let max_len = self.tokenizer.max_seq_len();
         let mut ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
@@ -955,7 +970,13 @@ impl QwenModel {
         }
 
         let seq_len = ids.len();
-        (ids, seq_len)
+        let rope_capacity = self.rope.max_positions();
+        if seq_len > rope_capacity {
+            return Err(InferenceError::InvalidInput(format!(
+                "Qwen input length {seq_len} exceeds RoPE capacity {rope_capacity}"
+            )));
+        }
+        Ok((ids, seq_len))
     }
 
     /// Encode a single text into an embedding vector.
@@ -964,7 +985,7 @@ impl QwenModel {
     /// return the cached embedding in <1us instead of running the ~100ms
     /// forward pass.
     pub fn encode(&self, text: &str) -> Result<Vec<f32>, InferenceError> {
-        let (ids, seq_len) = self.tokenize_for_embedding(text);
+        let (ids, seq_len) = self.tokenize_for_embedding(text)?;
 
         // Cache lookup by hash of token IDs.
         let key = hash_token_ids(&ids);
@@ -1014,7 +1035,7 @@ impl QwenModel {
     /// Used for early-exit analysis: find the shallowest layer that produces good embeddings.
     /// Returns Vec of (layer_index, embedding) — layer 0 is after the first transformer layer.
     pub fn encode_all_layers(&self, text: &str) -> Result<Vec<Vec<f32>>, InferenceError> {
-        let (ids, seq_len) = self.tokenize_for_embedding(text);
+        let (ids, seq_len) = self.tokenize_for_embedding(text)?;
         let hidden_size = self.config.hidden_size;
         let dim = self.dimensions();
 
@@ -1258,7 +1279,7 @@ impl QwenModel {
         let mut outputs = Vec::with_capacity(texts.len());
 
         for text in texts {
-            let (ids, seq_len) = self.tokenize_for_embedding(text);
+            let (ids, seq_len) = self.tokenize_for_embedding(text)?;
             let hidden_states = self.forward(&ids, seq_len);
 
             let attention_mask = vec![1u32; seq_len];
@@ -1291,7 +1312,7 @@ impl QwenModel {
         let mut timings = ProfileTimings::default();
 
         let t = Instant::now();
-        let (ids, seq_len) = self.tokenize_for_embedding(text);
+        let (ids, seq_len) = self.tokenize_for_embedding(text)?;
         timings.tokenize_us = t.elapsed().as_micros() as u64;
 
         let (hidden_states, layer_timings) = self.forward_profiled(&ids, seq_len, &mut timings);
@@ -2230,6 +2251,11 @@ fn parse_qwen_config(path: &Path) -> Result<QwenConfig, InferenceError> {
     // head_dim may be explicit in config, or inferred from hidden_size / num_heads.
     let head_dim =
         extract_json_usize(&text, "head_dim").unwrap_or(hidden_size / num_attention_heads);
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
+        return Err(InferenceError::InvalidInput(format!(
+            "config.json: head_dim ({head_dim}) must be non-zero and even for RoPE"
+        )));
+    }
 
     Ok(QwenConfig {
         vocab_size: get("vocab_size")?,
@@ -2367,6 +2393,44 @@ mod tests {
             parse_qwen_config(&cfg_ok).is_ok(),
             "divisible config must still parse"
         );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_parse_config_rejects_invalid_rope_head_dim() {
+        let tmp = std::env::temp_dir().join("lattice_test_invalid_qwen_head_dim");
+        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        for (name, head_dim) in [("zero", 0), ("odd", 3)] {
+            let path = tmp.join(format!("{name}.json"));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"vocab_size":8,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":{head_dim},"intermediate_size":4,"max_position_embeddings":8}}"#
+                ),
+            )
+            .unwrap();
+
+            let err = parse_qwen_config(&path).unwrap_err();
+            assert!(
+                matches!(err, InferenceError::InvalidInput(_)),
+                "head_dim={head_dim} must be rejected as InvalidInput; got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("head_dim"),
+                "error must identify head_dim; got {err}"
+            );
+        }
+
+        let valid = tmp.join("valid.json");
+        std::fs::write(
+            &valid,
+            r#"{"vocab_size":8,"hidden_size":4,"num_hidden_layers":1,"num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,"intermediate_size":4,"max_position_embeddings":8}"#,
+        )
+        .unwrap();
+        assert!(parse_qwen_config(&valid).is_ok());
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -3168,6 +3232,30 @@ mod tests {
         }
     }
 
+    struct TwoTokenTokenizer;
+    impl Tokenizer for TwoTokenTokenizer {
+        fn tokenize(&self, _text: &str) -> crate::tokenizer::common::TokenizedInput {
+            crate::tokenizer::common::TokenizedInput {
+                input_ids: vec![0, 1],
+                attention_mask: vec![1, 1],
+                token_type_ids: vec![0, 0],
+                real_length: 2,
+            }
+        }
+
+        fn tokenize_batch(&self, texts: &[&str]) -> Vec<crate::tokenizer::common::TokenizedInput> {
+            texts.iter().map(|text| self.tokenize(text)).collect()
+        }
+
+        fn vocab_size(&self) -> usize {
+            2
+        }
+
+        fn max_seq_len(&self) -> usize {
+            2
+        }
+    }
+
     /// Build a `QwenModel` fixture with no real transformer weights — just
     /// enough to exercise the public `cache_load`/`cache_save` contract,
     /// which only touch `inference_config`, `cache`, and `dimensions()`
@@ -3226,6 +3314,48 @@ mod tests {
             weights: ManuallyDrop::new(weights),
             _storage: ManuallyDrop::new(SafetensorsStorage::Sharded(Box::new(storage))),
         }
+    }
+
+    fn build_rope_capacity_test_model() -> QwenModel {
+        static EMBED_TOKENS: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+        static NORM_WEIGHT: [f32; 2] = [1.0, 1.0];
+
+        let mut model = build_cache_test_model(
+            ModelInferenceConfig {
+                eos_token_id: 1,
+                rope_table_max_seq_len: 1,
+                ..Default::default()
+            },
+            2,
+        );
+        model.tokenizer = Box::new(TwoTokenTokenizer);
+        model.weights = ManuallyDrop::new(QwenWeights {
+            embed_tokens: crate::weights::Tensor2D {
+                data: &EMBED_TOKENS,
+                rows: 2,
+                cols: 2,
+            },
+            norm_weight: crate::weights::Tensor1D {
+                data: &NORM_WEIGHT,
+                len: 2,
+            },
+            layers: Vec::new(),
+        });
+        model
+    }
+
+    #[test]
+    fn qwen_encode_rejects_input_beyond_rope_capacity() {
+        let model = build_rope_capacity_test_model();
+        let err = model
+            .encode("two tokens")
+            .expect_err("two tokens must exceed the one-position RoPE table");
+        assert!(matches!(err, InferenceError::InvalidInput(_)));
+        let message = err.to_string();
+        assert!(
+            message.contains("2") && message.contains("1"),
+            "error must identify the admitted length and RoPE capacity; got {message}"
+        );
     }
 
     #[test]

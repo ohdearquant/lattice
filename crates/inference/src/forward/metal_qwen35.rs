@@ -6686,16 +6686,62 @@ mod inner {
             }
         }
 
+        fn check_forward_step_capacity(
+            &self,
+            position: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            let max_cache_len = self.session.kv_cache.max_cache_len;
+            if position >= max_cache_len {
+                return Err(InferenceError::InvalidInput(format!(
+                    "forward_step: position {position} exceeds max position {}",
+                    max_cache_len - 1
+                )));
+            }
+            if self.session.kv_cache.seq_len >= max_cache_len {
+                return Err(InferenceError::InvalidInput(format!(
+                    "forward_step: KV cache is full at {} tokens (max_cache_len {max_cache_len})",
+                    self.session.kv_cache.seq_len
+                )));
+            }
+            Ok(())
+        }
+
+        /// **Unstable**: fallible single-token forward step; kernel dispatch strategy evolving.
+        ///
+        /// Run a single token through the full model. Returns logits [vocab_size].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU dispatch
+        /// when `position` or the next KV-cache row is outside the session capacity.
+        pub fn try_forward_step(
+            &mut self,
+            token_id: u32,
+            position: usize,
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            self.check_forward_step_capacity(position)?;
+            self.cross_turn_prefix_cache.clear();
+            Ok(self
+                .forward_step_inner(
+                    token_id,
+                    position,
+                    false,
+                    crate::forward::signpost::Scope::NotDecode,
+                )
+                .logits)
+        }
+
         /// **Unstable**: single-token forward step; kernel dispatch strategy evolving.
         ///
         /// Run a single token through the full model. Returns logits [vocab_size].
         ///
         /// # Panics
         ///
-        /// Panics if `token_id >= vocab_size`. The check is O(1) and runs before any
-        /// GPU dispatch. The tokenizer-bounded generate path never triggers this; it
-        /// can only be reached by a library consumer calling the raw entry point with
-        /// an out-of-vocabulary id.
+        /// Panics if `token_id >= vocab_size`, or if `position` or the next
+        /// KV-cache row exceeds the session capacity. Use [`Self::try_forward_step`]
+        /// to receive a typed capacity error. These checks run before GPU dispatch.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -6711,21 +6757,19 @@ mod inner {
         /// so this clear is a no-op there — the cache-aware path never has a
         /// live entry saved while it is still generating.
         pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
-            self.cross_turn_prefix_cache.clear();
             // General-purpose raw entry point: reused for prompt prefill (a
             // token-at-a-time loop, e.g. `forward_prefill_impl`,
             // `forward_prefill_from`, multimodal prefill) as well as by
             // external library consumers calling it directly, so it cannot
             // assume decode scope. The production autoregressive decode
             // loops call `forward_step_decode` instead (below), which is
-            // `Scope::Decode`.
-            self.forward_step_inner(
-                token_id,
-                position,
-                false,
-                crate::forward::signpost::Scope::NotDecode,
-            )
-            .logits
+            // `Scope::Decode`. Delegates to `try_forward_step` so this path
+            // gets the same before-dispatch capacity validation as external
+            // callers of the fallible API.
+            match self.try_forward_step(token_id, position) {
+                Ok(logits) => logits,
+                Err(error) => panic!("{error}"),
+            }
         }
 
         /// Same contract as [`Self::forward_step`], for the production
@@ -16153,15 +16197,15 @@ mod inner {
                         .into(),
                 ));
             }
+            if token_ids.len() == 1 {
+                return self.try_forward_step(token_ids[0], start_pos);
+            }
             if start_pos + token_ids.len() > self.session.kv_cache.max_cache_len {
                 return Err(InferenceError::InvalidInput(format!(
                     "forward_prefill_from: start_pos {start_pos} + len {} exceeds max_cache_len {}",
                     token_ids.len(),
                     self.session.kv_cache.max_cache_len
                 )));
-            }
-            if token_ids.len() == 1 {
-                return Ok(self.forward_step(token_ids[0], start_pos));
             }
             if self.lora.is_some() {
                 if all_positions {
@@ -19638,6 +19682,35 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 max_abs_diff < 1e-4,
                 "golden first-10 logits changed: actual={actual:?} expected={expected:?} max_abs_diff={max_abs_diff}"
             );
+        }
+
+        #[test]
+        fn forward_step_rejects_position_and_cache_capacity_before_dispatch() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 1)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            let err = state
+                .try_forward_step(1, 1)
+                .expect_err("position at max_cache_len must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+
+            let err = state
+                .forward_prefill_from(&[1], 1, false)
+                .expect_err("one-token suffix at max_cache_len must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+
+            state.session.kv_cache.seq_len = 1;
+            let err = state
+                .try_forward_step(1, 0)
+                .expect_err("a full KV cache must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 1);
         }
 
         #[test]
@@ -37405,8 +37478,22 @@ impl MetalQwen35State {
     }
 
     /// **Unstable**: Metal single-token forward step stub.
-    pub fn forward_step(&mut self, _token_id: u32, _position: usize) -> Vec<f32> {
-        Vec::new()
+    pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+        match self.try_forward_step(token_id, position) {
+            Ok(logits) => logits,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// **Unstable**: fallible Metal single-token forward step stub.
+    pub fn try_forward_step(
+        &mut self,
+        _token_id: u32,
+        _position: usize,
+    ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
     }
 
     /// **Unstable**: Metal generate stub; always errors without metal-gpu feature.
