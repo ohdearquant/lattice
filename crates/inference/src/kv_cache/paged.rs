@@ -11,7 +11,8 @@
 //!
 //! Page layout per page:
 //!   `[num_layers, 2 (K+V), page_size, kv_dim]`
-//!   Stored as a flat `Vec<f32>` of size `num_layers * 2 * page_size * kv_dim`.
+//!   Stored as either f32 values or symmetric Q8 values with one scale per
+//!   K/V token vector.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -24,6 +25,17 @@ use crate::error::InferenceError;
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
+
+/// **Unstable**: element format used by paged KV storage.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CacheType {
+    /// Store every KV element as an f32 value.
+    #[default]
+    F32,
+    /// Store each KV token vector as symmetric int8 values with one f32 scale.
+    /// The scale is `max(abs(vector)) / 127`, and zero vectors use scale `1`.
+    Q8,
+}
 
 /// **Unstable**: paged KV cache configuration; vLLM-inspired, under active design.
 #[derive(Debug, Clone)]
@@ -73,6 +85,23 @@ impl PagedKVCacheConfig {
             .ok_or_else(|| {
                 InferenceError::InvalidInput(format!(
                     "num_layers ({}) * 2 * page_size ({}) * kv_dim ({kv_dim}) overflows usize",
+                    self.num_layers, self.page_size
+                ))
+            })
+    }
+
+    #[inline]
+    fn q8_scales_per_page(&self) -> usize {
+        self.num_layers * 2 * self.page_size
+    }
+
+    fn try_q8_scales_per_page(&self) -> Result<usize, InferenceError> {
+        self.num_layers
+            .checked_mul(2)
+            .and_then(|n| n.checked_mul(self.page_size))
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "num_layers ({}) * 2 * page_size ({}) overflows usize",
                     self.num_layers, self.page_size
                 ))
             })
@@ -256,6 +285,225 @@ impl PagePool {
     }
 }
 
+#[derive(Debug)]
+struct Q8PagePool {
+    data: Vec<i8>,
+    scales: Vec<f32>,
+    free_list: Vec<usize>,
+    max_pages: usize,
+    values_per_page: usize,
+    scales_per_page: usize,
+}
+
+impl Q8PagePool {
+    fn new(max_pages: usize, values_per_page: usize, scales_per_page: usize) -> Self {
+        Self {
+            data: vec![0; max_pages * values_per_page],
+            scales: vec![1.0; max_pages * scales_per_page],
+            free_list: (0..max_pages).rev().collect(),
+            max_pages,
+            values_per_page,
+            scales_per_page,
+        }
+    }
+
+    fn try_new(
+        max_pages: usize,
+        values_per_page: usize,
+        scales_per_page: usize,
+    ) -> Result<Self, InferenceError> {
+        let data_len = max_pages.checked_mul(values_per_page).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "max_pages ({max_pages}) * Q8 values_per_page ({values_per_page}) overflows usize"
+            ))
+        })?;
+        if data_len > isize::MAX as usize {
+            return Err(InferenceError::InvalidInput(format!(
+                "Q8 page data allocation ({data_len} bytes) exceeds isize::MAX"
+            )));
+        }
+
+        let scales_len = max_pages.checked_mul(scales_per_page).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "max_pages ({max_pages}) * Q8 scales_per_page ({scales_per_page}) overflows usize"
+            ))
+        })?;
+        let scales_bytes = scales_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "Q8 page scale allocation ({scales_len} * {}) exceeds isize::MAX",
+                    std::mem::size_of::<f32>()
+                ))
+            })?;
+        let _ = scales_bytes;
+
+        let free_list_bytes = max_pages
+            .checked_mul(std::mem::size_of::<usize>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "Q8 free-list allocation ({max_pages} * {}) exceeds isize::MAX",
+                    std::mem::size_of::<usize>()
+                ))
+            })?;
+        let _ = free_list_bytes;
+
+        Ok(Self {
+            data: vec![0; data_len],
+            scales: vec![1.0; scales_len],
+            free_list: (0..max_pages).rev().collect(),
+            max_pages,
+            values_per_page,
+            scales_per_page,
+        })
+    }
+
+    fn alloc(&mut self) -> Option<usize> {
+        self.free_list.pop()
+    }
+
+    fn free(&mut self, page_idx: usize) {
+        debug_assert!(page_idx < self.max_pages);
+        self.free_list.push(page_idx);
+    }
+
+    fn free_count(&self) -> usize {
+        self.free_list.len()
+    }
+
+    fn allocated_count(&self) -> usize {
+        self.max_pages - self.free_list.len()
+    }
+
+    fn store_vector(
+        &mut self,
+        page_idx: usize,
+        value_offset: usize,
+        scale_offset: usize,
+        values: &[f32],
+    ) {
+        let abs_max = values.iter().fold(0.0f32, |max, &value| {
+            assert!(value.is_finite(), "Q8 KV input must be finite");
+            max.max(value.abs())
+        });
+        let scale = if abs_max == 0.0 { 1.0 } else { abs_max / 127.0 };
+        let value_base = page_idx * self.values_per_page + value_offset;
+        let scale_idx = page_idx * self.scales_per_page + scale_offset;
+        self.scales[scale_idx] = scale;
+        for (&value, quantized) in values
+            .iter()
+            .zip(&mut self.data[value_base..value_base + values.len()])
+        {
+            *quantized = (value / scale).round().clamp(-127.0, 127.0) as i8;
+        }
+    }
+
+    fn gather_vector(
+        &self,
+        page_idx: usize,
+        value_offset: usize,
+        scale_offset: usize,
+        dst: &mut [f32],
+    ) {
+        let value_base = page_idx * self.values_per_page + value_offset;
+        let scale = self.scales[page_idx * self.scales_per_page + scale_offset];
+        for (&quantized, value) in self.data[value_base..value_base + dst.len()]
+            .iter()
+            .zip(dst)
+        {
+            *value = f32::from(quantized) * scale;
+        }
+    }
+
+    fn clear_page(&mut self, page_idx: usize) {
+        let value_base = page_idx * self.values_per_page;
+        self.data[value_base..value_base + self.values_per_page].fill(0);
+        let scale_base = page_idx * self.scales_per_page;
+        self.scales[scale_base..scale_base + self.scales_per_page].fill(1.0);
+    }
+
+    fn bytes_per_page(&self) -> usize {
+        self.values_per_page + self.scales_per_page * std::mem::size_of::<f32>()
+    }
+}
+
+#[derive(Debug)]
+enum PagedPagePool {
+    F32(PagePool),
+    Q8(Q8PagePool),
+}
+
+impl PagedPagePool {
+    fn cache_type(&self) -> CacheType {
+        match self {
+            Self::F32(_) => CacheType::F32,
+            Self::Q8(_) => CacheType::Q8,
+        }
+    }
+
+    fn alloc(&mut self) -> Option<usize> {
+        match self {
+            Self::F32(pool) => pool.alloc(),
+            Self::Q8(pool) => pool.alloc(),
+        }
+    }
+
+    fn free(&mut self, page_idx: usize) {
+        match self {
+            Self::F32(pool) => pool.free(page_idx),
+            Self::Q8(pool) => pool.free(page_idx),
+        }
+    }
+
+    fn free_count(&self) -> usize {
+        match self {
+            Self::F32(pool) => pool.free_count(),
+            Self::Q8(pool) => pool.free_count(),
+        }
+    }
+
+    fn allocated_count(&self) -> usize {
+        match self {
+            Self::F32(pool) => pool.allocated_count(),
+            Self::Q8(pool) => pool.allocated_count(),
+        }
+    }
+
+    fn f32_page(&self, page_idx: usize) -> Result<&[f32], InferenceError> {
+        match self {
+            Self::F32(pool) => Ok(pool.page_data(page_idx)),
+            Self::Q8(_) => Err(InferenceError::PrefixCache(
+                "prefix sharing requires f32 paged KV storage".into(),
+            )),
+        }
+    }
+
+    fn f32_page_mut(&mut self, page_idx: usize) -> Result<&mut [f32], InferenceError> {
+        match self {
+            Self::F32(pool) => Ok(pool.page_data_mut(page_idx)),
+            Self::Q8(_) => Err(InferenceError::PrefixCache(
+                "prefix sharing requires f32 paged KV storage".into(),
+            )),
+        }
+    }
+
+    fn clear_page(&mut self, page_idx: usize) {
+        match self {
+            Self::F32(pool) => pool.page_data_mut(page_idx).fill(0.0),
+            Self::Q8(pool) => pool.clear_page(page_idx),
+        }
+    }
+
+    fn bytes_per_page(&self) -> usize {
+        match self {
+            Self::F32(pool) => pool.floats_per_page * std::mem::size_of::<f32>(),
+            Self::Q8(pool) => pool.bytes_per_page(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Page Table
 // ---------------------------------------------------------------------------
@@ -372,7 +620,7 @@ impl PageTable {
 /// can be added by managing multiple page tables externally.
 #[derive(Debug)]
 pub struct PagedKVCache {
-    pool: PagePool,
+    pool: PagedPagePool,
     table: PageTable,
     config: PagedKVCacheConfig,
     /// Optional shared prefix cache injected by the caller/session.
@@ -385,13 +633,82 @@ pub struct PagedKVCache {
 impl PagedKVCache {
     /// **Unstable**: create a new paged KV cache without prefix sharing.
     pub fn new(config: PagedKVCacheConfig) -> Self {
-        Self::with_prefix_cache(config, None)
+        Self::with_cache_type(config, CacheType::F32)
     }
 
     /// **Unstable**: fallible constructor — returns `InvalidInput` on overflow
     /// instead of panicking or silently allocating a wrong-sized pool.
     pub fn try_new(config: PagedKVCacheConfig) -> Result<Self, InferenceError> {
-        Self::try_with_prefix_cache(config, None)
+        Self::try_with_cache_type(config, CacheType::F32)
+    }
+
+    /// **Unstable**: create a paged KV cache using the selected storage format.
+    ///
+    /// Q8 uses symmetric per-token-vector quantization and does not enable
+    /// prefix sharing. Use [`PagedKVCache::with_prefix_cache`] for an f32 cache
+    /// with prefix reuse.
+    ///
+    /// # Panics
+    ///
+    /// Panics if page geometry overflows or `page_size` is zero. Use
+    /// [`PagedKVCache::try_with_cache_type`] for checked geometry.
+    pub fn with_cache_type(config: PagedKVCacheConfig, cache_type: CacheType) -> Self {
+        match cache_type {
+            CacheType::F32 => Self::with_prefix_cache(config, None),
+            CacheType::Q8 => {
+                assert!(
+                    config.page_size > 0,
+                    "PagedKVCacheConfig.page_size must be non-zero"
+                );
+                let values_per_page = config.floats_per_page();
+                let scales_per_page = config.q8_scales_per_page();
+                let pool = PagedPagePool::Q8(Q8PagePool::new(
+                    config.max_pages,
+                    values_per_page,
+                    scales_per_page,
+                ));
+                let table = PageTable::new(config.page_size);
+                Self {
+                    pool,
+                    table,
+                    config,
+                    prefix_cache: None,
+                    lru_order: VecDeque::new(),
+                }
+            }
+        }
+    }
+
+    /// **Unstable**: fallible storage-format constructor.
+    pub fn try_with_cache_type(
+        config: PagedKVCacheConfig,
+        cache_type: CacheType,
+    ) -> Result<Self, InferenceError> {
+        match cache_type {
+            CacheType::F32 => Self::try_with_prefix_cache(config, None),
+            CacheType::Q8 => {
+                if config.page_size == 0 {
+                    return Err(InferenceError::InvalidInput(
+                        "PagedKVCacheConfig.page_size must be non-zero".into(),
+                    ));
+                }
+                let values_per_page = config.try_floats_per_page()?;
+                let scales_per_page = config.try_q8_scales_per_page()?;
+                let pool = PagedPagePool::Q8(Q8PagePool::try_new(
+                    config.max_pages,
+                    values_per_page,
+                    scales_per_page,
+                )?);
+                let table = PageTable::new(config.page_size);
+                Ok(Self {
+                    pool,
+                    table,
+                    config,
+                    prefix_cache: None,
+                    lru_order: VecDeque::new(),
+                })
+            }
+        }
     }
 
     /// **Unstable**: fallible constructor with optional prefix sharing.
@@ -450,7 +767,7 @@ impl PagedKVCache {
             let _ = prefix_page_bytes;
         }
 
-        let pool = PagePool::try_new(config.max_pages, fpp)?;
+        let pool = PagedPagePool::F32(PagePool::try_new(config.max_pages, fpp)?);
         let table = PageTable::new(config.page_size);
         Ok(Self {
             pool,
@@ -482,7 +799,7 @@ impl PagedKVCache {
             "PagedKVCacheConfig.page_size must be non-zero"
         );
         let fpp = config.floats_per_page();
-        let pool = PagePool::new(config.max_pages, fpp);
+        let pool = PagedPagePool::F32(PagePool::new(config.max_pages, fpp));
         let table = PageTable::new(config.page_size);
         Self {
             pool,
@@ -599,7 +916,7 @@ impl PagedKVCache {
                     self.pool.free_count()
                 )));
             };
-            self.pool.page_data_mut(phys).fill(0.0);
+            self.pool.f32_page_mut(phys)?.fill(0.0);
             owned_pages.push(phys);
         }
 
@@ -610,7 +927,7 @@ impl PagedKVCache {
             let dst_offset = token_pos % self.config.page_size;
 
             let src_page = entry.pages[src_page_idx].as_slice();
-            let dst_page = self.pool.page_data_mut(owned_pages[dst_page_idx]);
+            let dst_page = self.pool.f32_page_mut(owned_pages[dst_page_idx])?;
             Self::copy_token_between_page_layouts(
                 src_page,
                 entry.prefix_page_size,
@@ -677,7 +994,7 @@ impl PagedKVCache {
 
             for token_pos in start..end {
                 let (src_phys, src_offset) = self.table.resolve(token_pos);
-                let src_page = self.pool.page_data(src_phys);
+                let src_page = self.pool.f32_page(src_phys)?;
                 let dst_offset = token_pos - start;
                 Self::copy_token_between_page_layouts(
                     src_page,
@@ -777,15 +1094,21 @@ impl PagedKVCache {
         self.pool.free_count()
     }
 
+    /// **Unstable**: element format used by this cache's page storage.
+    pub fn cache_type(&self) -> CacheType {
+        self.pool.cache_type()
+    }
+
     /// **Unstable**: append a single token's K and V for a specific layer.
     ///
     /// Automatically allocates new pages as needed.
     ///
     /// # Panics
     ///
-    /// Panics if `layer`/slice-length preconditions are violated, or if
-    /// `EvictionPolicy::Lru` would need to grow the page table past
-    /// `max_pages` (i.e. the sequence has exceeded `max_tokens()`). Sliding
+    /// Panics if `layer`/slice-length preconditions are violated, Q8 input
+    /// contains a non-finite value, or `EvictionPolicy::Lru` would need to grow
+    /// the page table past `max_pages` (i.e. the sequence has exceeded
+    /// `max_tokens()`). Sliding
     /// the window past capacity is not yet supported (see issue #337):
     /// evicting the oldest page and re-pushing it is net-zero on
     /// `num_pages()`, so without this guard the growth loop below would
@@ -822,15 +1145,24 @@ impl PagedKVCache {
         // Update LRU.
         self.touch_page(phys_page);
 
-        // Compute offset into page data.
-        // Page layout: [num_layers, 2, page_size, kv_dim]
-        let page_data = self.pool.page_data_mut(phys_page);
+        // Page layout: [num_layers, 2, page_size, kv_dim].
         let layer_stride = 2 * page_size * kv_dim;
         let k_base = layer * layer_stride + offset * kv_dim;
         let v_base = layer * layer_stride + page_size * kv_dim + offset * kv_dim;
-
-        page_data[k_base..k_base + kv_dim].copy_from_slice(k_token);
-        page_data[v_base..v_base + kv_dim].copy_from_slice(v_token);
+        match &mut self.pool {
+            PagedPagePool::F32(pool) => {
+                let page_data = pool.page_data_mut(phys_page);
+                page_data[k_base..k_base + kv_dim].copy_from_slice(k_token);
+                page_data[v_base..v_base + kv_dim].copy_from_slice(v_token);
+            }
+            PagedPagePool::Q8(pool) => {
+                let scale_layer_stride = 2 * page_size;
+                let k_scale = layer * scale_layer_stride + offset;
+                let v_scale = layer * scale_layer_stride + page_size + offset;
+                pool.store_vector(phys_page, k_base, k_scale, k_token);
+                pool.store_vector(phys_page, v_base, v_scale, v_token);
+            }
+        }
     }
 
     /// **Unstable**: advance sequence length by 1 (call after appending to all layers).
@@ -843,43 +1175,53 @@ impl PagedKVCache {
     ///
     /// Writes into `dst` which must have length `seq_len * kv_dim`.
     pub fn gather_k(&self, layer: usize, dst: &mut [f32]) {
-        let seq_len = self.table.seq_len();
-        let kv_dim = self.config.kv_dim();
-        let page_size = self.config.page_size;
-        assert_eq!(dst.len(), seq_len * kv_dim);
-
-        let layer_stride = 2 * page_size * kv_dim;
-        let mut pos = 0usize;
-        while pos < seq_len {
-            let (phys_page, offset) = self.table.resolve(pos);
-            let run_len = (page_size - offset).min(seq_len - pos);
-            let len = run_len * kv_dim;
-            let page_data = self.pool.page_data(phys_page);
-            let src_base = layer * layer_stride + offset * kv_dim;
-            let dst_base = pos * kv_dim;
-            dst[dst_base..dst_base + len].copy_from_slice(&page_data[src_base..src_base + len]);
-            pos += run_len;
-        }
+        self.gather(layer, false, dst);
     }
 
     /// **Unstable**: read V values for a given layer across the full sequence.
     pub fn gather_v(&self, layer: usize, dst: &mut [f32]) {
+        self.gather(layer, true, dst);
+    }
+
+    fn gather(&self, layer: usize, value_cache: bool, dst: &mut [f32]) {
         let seq_len = self.table.seq_len();
         let kv_dim = self.config.kv_dim();
         let page_size = self.config.page_size;
         assert_eq!(dst.len(), seq_len * kv_dim);
+        let value_offset = usize::from(value_cache) * page_size;
 
-        let layer_stride = 2 * page_size * kv_dim;
-        let mut pos = 0usize;
-        while pos < seq_len {
-            let (phys_page, offset) = self.table.resolve(pos);
-            let run_len = (page_size - offset).min(seq_len - pos);
-            let len = run_len * kv_dim;
-            let page_data = self.pool.page_data(phys_page);
-            let src_base = layer * layer_stride + page_size * kv_dim + offset * kv_dim;
-            let dst_base = pos * kv_dim;
-            dst[dst_base..dst_base + len].copy_from_slice(&page_data[src_base..src_base + len]);
-            pos += run_len;
+        match &self.pool {
+            PagedPagePool::F32(pool) => {
+                let layer_stride = 2 * page_size * kv_dim;
+                let mut pos = 0usize;
+                while pos < seq_len {
+                    let (phys_page, offset) = self.table.resolve(pos);
+                    let run_len = (page_size - offset).min(seq_len - pos);
+                    let len = run_len * kv_dim;
+                    let page_data = pool.page_data(phys_page);
+                    let src_base = layer * layer_stride + (value_offset + offset) * kv_dim;
+                    let dst_base = pos * kv_dim;
+                    dst[dst_base..dst_base + len]
+                        .copy_from_slice(&page_data[src_base..src_base + len]);
+                    pos += run_len;
+                }
+            }
+            PagedPagePool::Q8(pool) => {
+                let layer_stride = 2 * page_size * kv_dim;
+                let scale_layer_stride = 2 * page_size;
+                for pos in 0..seq_len {
+                    let (phys_page, offset) = self.table.resolve(pos);
+                    let src_base = layer * layer_stride + (value_offset + offset) * kv_dim;
+                    let scale_offset = layer * scale_layer_stride + value_offset + offset;
+                    let dst_base = pos * kv_dim;
+                    pool.gather_vector(
+                        phys_page,
+                        src_base,
+                        scale_offset,
+                        &mut dst[dst_base..dst_base + kv_dim],
+                    );
+                }
+            }
         }
     }
 
@@ -894,12 +1236,12 @@ impl PagedKVCache {
 
     /// **Unstable**: total memory usage in bytes (pool capacity, not just allocated).
     pub fn total_memory_bytes(&self) -> usize {
-        self.config.total_bytes()
+        self.config.max_pages * self.pool.bytes_per_page()
     }
 
     /// **Unstable**: memory used by allocated pages in bytes.
     pub fn used_memory_bytes(&self) -> usize {
-        self.pool.allocated_count() * self.config.bytes_per_page()
+        self.pool.allocated_count() * self.pool.bytes_per_page()
     }
 
     // --- Internal ---
@@ -935,9 +1277,7 @@ impl PagedKVCache {
             .expect("invariant: page table has an LRU page when pool is exhausted");
         debug_assert_eq!(removed, evicted);
 
-        // Zero the page data before reuse for safety.
-        let fpp = self.config.floats_per_page();
-        self.pool.page_data_mut(evicted)[..fpp].fill(0.0);
+        self.pool.clear_page(evicted);
         evicted
     }
 
@@ -1124,6 +1464,7 @@ mod tests {
         let config = make_config(4);
         let kv_dim = config.kv_dim(); // 2 * 4 = 8
         let mut cache = PagedKVCache::new(config);
+        assert_eq!(cache.cache_type(), CacheType::F32);
 
         // Append 3 tokens.
         for step in 0..3u32 {
@@ -1159,6 +1500,80 @@ mod tests {
         cache.gather_v(1, &mut v_buf);
         assert_eq!(k_buf[0], 1.0); // marker = 0*10 + 1 = 1
         assert_eq!(v_buf[0], 1.5);
+    }
+
+    #[test]
+    fn paged_q8_append_gather_roundtrip() {
+        let config = make_config(4);
+        let kv_dim = config.kv_dim();
+        let values_per_page = config.num_layers * 2 * config.page_size * kv_dim;
+        let scales_per_page = config.num_layers * 2 * config.page_size;
+        let expected_bytes_per_page = values_per_page + scales_per_page * size_of::<f32>();
+        let expected_total_bytes = config.max_pages * expected_bytes_per_page;
+        assert!(expected_total_bytes < config.total_bytes());
+        let mut cache = PagedKVCache::try_with_cache_type(config, CacheType::Q8)
+            .expect("valid Q8 config must succeed");
+        let mut expected_k = vec![Vec::new(); 2];
+        let mut expected_v = vec![Vec::new(); 2];
+
+        for step in 0..6 {
+            for layer in 0..2 {
+                let k: Vec<f32> = (0..kv_dim)
+                    .map(|i| {
+                        let magnitude =
+                            0.37 * (step + 1) as f32 + 0.11 * (layer + 1) as f32 + 0.073 * i as f32;
+                        if (step + layer + i) % 2 == 0 {
+                            magnitude
+                        } else {
+                            -magnitude
+                        }
+                    })
+                    .collect();
+                let v: Vec<f32> = k.iter().map(|value| value * -0.61 + 0.19).collect();
+                expected_k[layer].extend_from_slice(&k);
+                expected_v[layer].extend_from_slice(&v);
+                cache.append_kv_layer(layer, &k, &v);
+            }
+            cache.advance();
+        }
+
+        assert_eq!(cache.cache_type(), CacheType::Q8);
+        assert_eq!(cache.total_memory_bytes(), expected_total_bytes);
+        assert_eq!(cache.num_pages(), 2);
+        assert_eq!(cache.used_memory_bytes(), 2 * expected_bytes_per_page);
+
+        let mut observed_quantization_error = false;
+        for layer in 0..2 {
+            let mut gathered_k = vec![0.0; 6 * kv_dim];
+            let mut gathered_v = vec![0.0; 6 * kv_dim];
+            cache.gather_k(layer, &mut gathered_k);
+            cache.gather_v(layer, &mut gathered_v);
+
+            for (expected, actual) in [
+                (&expected_k[layer], &gathered_k),
+                (&expected_v[layer], &gathered_v),
+            ] {
+                for (expected_token, actual_token) in expected
+                    .chunks_exact(kv_dim)
+                    .zip(actual.chunks_exact(kv_dim))
+                {
+                    let abs_max = expected_token
+                        .iter()
+                        .fold(0.0f32, |max, value| max.max(value.abs()));
+                    let tolerance = abs_max / 254.0 + f32::EPSILON * abs_max;
+                    for (&expected_value, &actual_value) in expected_token.iter().zip(actual_token)
+                    {
+                        let error = (expected_value - actual_value).abs();
+                        assert!(
+                            error <= tolerance,
+                            "Q8 round-trip error {error} exceeds {tolerance}"
+                        );
+                        observed_quantization_error |= error > f32::EPSILON;
+                    }
+                }
+            }
+        }
+        assert!(observed_quantization_error);
     }
 
     #[test]
