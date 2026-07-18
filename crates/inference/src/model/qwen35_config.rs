@@ -32,6 +32,26 @@ pub const QWEN3_NEWLINE_TOKEN_ID: u32 = 198;
 /// leaving generous headroom for future architectures.
 pub const MAX_HIDDEN_LAYERS: usize = 512;
 
+/// Upper bound on `vocab_size` accepted from `config.json`.
+///
+/// `vocab_size` comes from an untrusted checkpoint directory and drives the logits buffer
+/// allocation (`resize(&mut self.logits, cfg.vocab_size)` in the decode cache) on every
+/// forward pass. Real Qwen3.5/3.6 tokenizers are 151K-262K entries; 4,000,000 rejects any
+/// config a real checkpoint would never carry (including a zero-byte-embedding attack that
+/// pairs a huge declared vocab with an empty tensor) while leaving over an order of
+/// magnitude of headroom for future tokenizers.
+pub const MAX_VOCAB_SIZE: usize = 4_000_000;
+
+/// Upper bound on `head_dim` accepted from `config.json`.
+///
+/// `head_dim` comes from an untrusted checkpoint directory and sizes the RoPE table
+/// (`RopeTable::new` allocates `max_seq_len * head_dim / 2` entries) independent of layer
+/// mix — an all-linear-attention config never calls `checked_full_q_dim`, so this is the
+/// only guard standing between an attacker-controlled `head_dim` and that allocation. Real
+/// Qwen3.5/3.6 head dims are 64-256; 2048 rejects any config a real checkpoint would never
+/// carry while leaving 8x headroom for future architectures.
+pub const MAX_HEAD_DIM: usize = 2048;
+
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -254,10 +274,11 @@ pub struct Qwen35Config {
     /// Every Nth layer is full attention (4 = [lin, lin, lin, full]).
     pub full_attention_interval: usize,
     /// Precomputed per-layer type, length = num_hidden_layers.
+    #[serde(deserialize_with = "deserialize_bounded_vec")]
     pub layer_types: Vec<LayerType>,
     /// Per-layer active mask; `true` = active, `false` = pruned (identity skip).
     /// Length must equal `num_hidden_layers`. Defaults to all-true (no pruning).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bounded_vec")]
     pub layer_mask: Vec<bool>,
 
     // --- Generation ---
@@ -288,6 +309,54 @@ pub struct Qwen35Config {
     /// Token id closing a vision content span.
     #[serde(default)]
     pub vision_end_token_id: Option<u32>,
+}
+
+/// Deserializes a JSON array into `Vec<T>`, erroring once more than `MAX_HIDDEN_LAYERS`
+/// elements have been pulled from the input. `layer_types` and `layer_mask` are per-layer
+/// arrays that a valid config sizes to `num_hidden_layers <= MAX_HIDDEN_LAYERS`, but the
+/// `MAX_HIDDEN_LAYERS` guard in `from_config_json_str` runs *after* serde has already
+/// deserialized these fields — an attacker-controlled config.json carrying an
+/// oversized array would otherwise allocate it in full before that guard ever runs. Erring
+/// at `MAX_HIDDEN_LAYERS + 1` elements instead of allocating and checking `.len()` afterward
+/// is what keeps the Vec itself from ever growing past the cap.
+fn deserialize_bounded_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T> serde::de::Visitor<'de> for BoundedVecVisitor<T>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a sequence of at most {MAX_HIDDEN_LAYERS} elements")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut vec = Vec::new();
+            while vec.len() < MAX_HIDDEN_LAYERS {
+                match seq.next_element()? {
+                    Some(elem) => vec.push(elem),
+                    None => return Ok(vec),
+                }
+            }
+            if seq.next_element::<T>()?.is_some() {
+                return Err(serde::de::Error::custom(format!(
+                    "sequence exceeds MAX_HIDDEN_LAYERS ({MAX_HIDDEN_LAYERS}) elements"
+                )));
+            }
+            Ok(vec)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor(std::marker::PhantomData))
 }
 
 fn default_tie_word_embeddings() -> bool {
@@ -660,6 +729,23 @@ impl Qwen35Config {
         // partial RoPE, `linear_conv_kernel_dim - 1` in the GatedDeltaNet conv buffer).
         // Surface them as typed errors at this single load-time choke point rather than as a
         // panic deep in the forward pass. Presets satisfy all of these by construction.
+        //
+        // `hidden_size == 0` combined with an unbounded `vocab_size` lets a checkpoint declare
+        // `embed_tokens` as `[huge_vocab, 0]` — a zero-byte tensor that passes shape checks
+        // (0 columns, so no actual data to validate) and then drives an enormous `logits`
+        // allocation (`resize(&mut self.logits, cfg.vocab_size)`) on first inference.
+        if cfg.hidden_size == 0 {
+            return Err(InferenceError::Inference(
+                "invalid Qwen config.json: hidden_size must be > 0".to_string(),
+            ));
+        }
+        if cfg.vocab_size == 0 || cfg.vocab_size > MAX_VOCAB_SIZE {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: vocab_size ({}) must be > 0 and <= MAX_VOCAB_SIZE \
+                 ({MAX_VOCAB_SIZE})",
+                cfg.vocab_size
+            )));
+        }
         if cfg.num_attention_heads == 0 {
             return Err(InferenceError::Inference(
                 "invalid Qwen config.json: num_attention_heads must be > 0".to_string(),
@@ -684,6 +770,15 @@ impl Qwen35Config {
             return Err(InferenceError::Inference(
                 "invalid Qwen config.json: head_dim must be > 0".to_string(),
             ));
+        }
+        // A config-level budget independent of layer mix: an all-linear-attention config
+        // never calls `checked_full_q_dim` (full-attention Q projection sizing), so this is
+        // the only guard bounding `RopeTable::new`'s `max_seq_len * head_dim / 2` allocation.
+        if cfg.head_dim > MAX_HEAD_DIM {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: head_dim ({}) exceeds MAX_HEAD_DIM ({MAX_HEAD_DIM})",
+                cfg.head_dim
+            )));
         }
         if cfg.num_hidden_layers == 0 {
             return Err(InferenceError::Inference(
@@ -1546,6 +1641,154 @@ mod tests {
         );
     }
 
+    // ──────────────────────────────────────────────────────────────────────
+    // Bounded layer_types / layer_mask deserialization
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// `layer_types` sized past `MAX_HIDDEN_LAYERS` must be rejected during
+    /// deserialization itself -- before the post-parse `num_hidden_layers` guard runs.
+    /// `num_hidden_layers` is deliberately left at its default (40, well under the cap)
+    /// so an `Err` here can only come from the bounded-seq deserializer, not the
+    /// separate `num_hidden_layers > MAX_HIDDEN_LAYERS` check.
+    #[test]
+    fn test_layer_types_array_over_max_hidden_layers_rejected_at_deserialize() {
+        let elems = vec!["\"linear_attention\""; MAX_HIDDEN_LAYERS + 1].join(",");
+        let json = format!(r#"{{"text_config": {{"layer_types": [{elems}]}}}}"#);
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "a layer_types array of MAX_HIDDEN_LAYERS+1 elements must be rejected \
+                 during deserialization, not allocated in full",
+            )
+            .to_string();
+        assert!(
+            err.contains("MAX_HIDDEN_LAYERS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_layer_types_in_bounds_array_accepted() {
+        let json = r#"{"text_config": {"num_hidden_layers": 3, "full_attention_interval": 4,
+            "layer_types": ["linear_attention", "linear_attention", "linear_attention"]}}"#;
+        let cfg = Qwen35Config::from_config_json_str(json)
+            .expect("an in-bounds layer_types array must be accepted");
+        assert_eq!(cfg.layer_types.len(), 3);
+    }
+
+    /// Same DoS vector as above for `layer_mask`, the sibling per-layer array.
+    #[test]
+    fn test_layer_mask_array_over_max_hidden_layers_rejected_at_deserialize() {
+        let elems = vec!["true"; MAX_HIDDEN_LAYERS + 1].join(",");
+        let json = format!(r#"{{"text_config": {{"layer_mask": [{elems}]}}}}"#);
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "a layer_mask array of MAX_HIDDEN_LAYERS+1 elements must be rejected \
+                 during deserialization, not allocated in full",
+            )
+            .to_string();
+        assert!(
+            err.contains("MAX_HIDDEN_LAYERS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_layer_mask_in_bounds_array_accepted() {
+        let json = r#"{"text_config": {"num_hidden_layers": 3, "full_attention_interval": 4,
+            "layer_mask": [true, false, true]}}"#;
+        let cfg = Qwen35Config::from_config_json_str(json)
+            .expect("an in-bounds layer_mask array must be accepted");
+        assert_eq!(cfg.layer_mask, vec![true, false, true]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // hidden_size / vocab_size bounds
+    // ──────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hidden_size_zero_errors() {
+        let json = r#"{"text_config": {"hidden_size": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("hidden_size: 0 must yield an InferenceError")
+            .to_string();
+        assert!(err.contains("hidden_size"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn test_vocab_size_zero_errors() {
+        let json = r#"{"text_config": {"vocab_size": 0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("vocab_size: 0 must yield an InferenceError")
+            .to_string();
+        assert!(err.contains("vocab_size"), "wrong guard fired: {err}");
+    }
+
+    /// A checkpoint declaring `embed_tokens` as `[huge_vocab, 0]` (zero-byte tensor,
+    /// passes shape checks) must be rejected at config-parse time via `MAX_VOCAB_SIZE`,
+    /// before the `logits` buffer resize (`cache.rs`) sees this value.
+    #[test]
+    fn test_vocab_size_over_max_errors() {
+        let json = format!(
+            r#"{{"text_config": {{"vocab_size": {}}}}}"#,
+            MAX_VOCAB_SIZE + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("vocab_size above MAX_VOCAB_SIZE must yield an InferenceError")
+            .to_string();
+        assert!(
+            err.contains("vocab_size") && err.contains("MAX_VOCAB_SIZE"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_vocab_size_at_max_accepted() {
+        let json = format!(r#"{{"text_config": {{"vocab_size": {MAX_VOCAB_SIZE}}}}}"#);
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "vocab_size == MAX_VOCAB_SIZE must be accepted"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // head_dim bound (config-level budget, independent of layer mix)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// An all-linear-attention layer mix never calls `checked_full_q_dim` (the
+    /// full-attention Q projection sizing check), so `MAX_HEAD_DIM` must fire on its
+    /// own to bound `RopeTable::new`'s allocation regardless of layer mix.
+    #[test]
+    fn test_head_dim_over_max_rejected_all_linear_config() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": {}, "num_hidden_layers": 2,
+                "layer_types": ["linear_attention", "linear_attention"]}}}}"#,
+            MAX_HEAD_DIM + 1
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err(
+                "head_dim above MAX_HEAD_DIM must yield an InferenceError even for an \
+                 all-linear-attention config",
+            )
+            .to_string();
+        assert!(
+            err.contains("head_dim") && err.contains("MAX_HEAD_DIM"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn test_head_dim_at_max_accepted_all_linear_config() {
+        let json = format!(
+            r#"{{"text_config": {{"head_dim": {MAX_HEAD_DIM}, "num_hidden_layers": 2,
+                "partial_rotary_factor": 0.25,
+                "layer_types": ["linear_attention", "linear_attention"]}}}}"#
+        );
+        assert!(
+            Qwen35Config::from_config_json_str(&json).is_ok(),
+            "head_dim == MAX_HEAD_DIM must be accepted for an all-linear-attention config"
+        );
+    }
+
     #[test]
     fn test_zero_linear_conv_kernel_dim_errors() {
         // `linear_conv_kernel_dim - 1` underflows usize (panics in debug, wraps to a ~16 EiB
@@ -1661,19 +1904,26 @@ mod tests {
 
     #[test]
     fn test_rope_dim_exceeds_head_dim_via_f32_rounding_errors() {
-        // Mutation contract: removing the `rope_dim > cfg.head_dim` guard must make this
-        // test FAIL (the call returns Ok instead of Err).
+        // Originally exercised the `rope_dim > cfg.head_dim` guard's f32-rounding edge case:
+        // rope_dim() casts head_dim through f32, and head_dim=16_777_219 (2^24 + 3) -- above
+        // f32's exact-integer range -- rounds UP to 16_777_220, so partial_rotary_factor=1.0
+        // (which keeps rope_dim <= head_dim in real arithmetic) still yields rope_dim >
+        // head_dim after the cast.
         //
-        // partial_rotary_factor=1.0 keeps rope_dim <= head_dim in real arithmetic, but
-        // rope_dim() casts head_dim through f32: head_dim=16_777_219 (2^24 + 3) rounds UP to
-        // 16_777_220, so rope_dim=16_777_220 > head_dim. That value is even and >= 2, so it
-        // slips the lower-bound/parity guard and would index head_vec[rope_dim/2 + i] one past
-        // the head_dim-length slice in apply_partial_rope. Fail closed at parse time.
+        // `MAX_HEAD_DIM` (2048) now rejects this head_dim before rope_dim is even computed --
+        // and since 2048 is far below f32's 2^24 exact-integer boundary, the rounding artifact
+        // this test targeted is no longer reachable through any head_dim MAX_HEAD_DIM admits.
+        // The `rope_dim > cfg.head_dim` line stays in place as defense-in-depth (e.g. against
+        // a future MAX_HEAD_DIM increase); at this input, both guards independently reject, so
+        // this test alone can't isolate either one's mutation sensitivity --
+        // `test_head_dim_over_max_rejected_all_linear_config` covers `MAX_HEAD_DIM` in
+        // isolation (head_dim just above the cap, with a `partial_rotary_factor` too small to
+        // also trip the rope_dim guard).
         let json = r#"{"text_config": {"head_dim": 16777219, "partial_rotary_factor": 1.0}}"#;
         let err = Qwen35Config::from_config_json_str(json)
-            .expect_err("rope_dim > head_dim (f32 rounding) must yield an InferenceError, not OOB")
+            .expect_err("head_dim=16_777_219 must yield an InferenceError, not OOB")
             .to_string();
-        assert!(err.contains("rope_dim"), "wrong guard fired: {err}");
+        assert!(err.contains("head_dim"), "wrong guard fired: {err}");
     }
 
     #[test]
