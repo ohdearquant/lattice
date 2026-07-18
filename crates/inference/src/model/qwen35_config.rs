@@ -100,6 +100,20 @@ pub(crate) const MAX_FULL_ATTENTION_DIM: usize = 1_048_576;
 /// leaves roughly 60x headroom above the largest observed real value.
 pub(crate) const MAX_INTERMEDIATE_SIZE: usize = 1_048_576;
 
+/// Upper bound, in bytes, on a single dense-FFN gate/up/down projection tensor
+/// (`hidden_size * intermediate_size * 4`) accepted from `config.json` (FIX 8).
+///
+/// [`MAX_HIDDEN_SIZE`] and [`MAX_INTERMEDIATE_SIZE`] bound each factor independently at
+/// 1,048,576; `load_dense_ffn_weights` (`model/qwen35/loading.rs`) materializes
+/// `gate_proj`/`up_proj`/`down_proj` as owned `Vec<f32>` of exactly `hidden_size *
+/// intermediate_size` elements each -- a config with both factors near their individual
+/// caps (and `vocab_size = 1`, satisfying [`MAX_EMBEDDING_BYTES`] trivially) passes both
+/// scalar checks while requiring ~4 TiB per tensor. Real Qwen3.5/3.6 dense presets top out
+/// around `hidden_size = 8192` * `intermediate_size = 17408` (~570 MiB); 4 GiB
+/// (4_294_967_296) leaves roughly 7x headroom above that while rejecting the
+/// terabyte-scale hostile case by several orders of magnitude.
+pub(crate) const MAX_DENSE_FFN_TENSOR_BYTES: u128 = 4_294_967_296;
+
 /// Upper bound on `VisionModelConfig::depth` accepted from `config.json`.
 ///
 /// The vision checkpoint loader mints ~12 tensor-name `String`s per ViT block *before* any
@@ -294,6 +308,23 @@ pub(crate) const MAX_CONV_KERNEL_DIM: usize = 512;
 /// architectures.
 pub(crate) const MAX_GDN_CONV_BUFFER_SIZE: usize = 16_777_216;
 
+/// Upper bound, in bytes, on the AGGREGATE of every linear-attention layer's persistent
+/// GatedDeltaNet recurrent state (`s_matrices` + `conv_buffer`, `GatedDeltaNetState::new`,
+/// `attention/gdn.rs`) across the whole model, accepted from `config.json`.
+///
+/// [`MAX_GDN_STATE_SIZE`] and [`MAX_GDN_CONV_BUFFER_SIZE`] bound one layer's state; neither
+/// multiplies by [`Qwen35Config::num_linear_attention_layers`]. `generation.rs` (both
+/// `generate` and `generate_streaming`) allocates one `GatedDeltaNetState` per linear layer
+/// up front, before the first token: `(0..num_linear).map(|_| GatedDeltaNetState::new(cfg))`.
+/// A config with `num_hidden_layers` near [`MAX_HIDDEN_LAYERS`], every layer typed
+/// linear-attention, and per-layer state near the individual caps passes both of those
+/// guards while the aggregate still reaches tens of gigabytes before any token is generated.
+/// Real Qwen3.5/3.6 GDN configs (worst preset: `qwen36_27b`, ~40 linear layers, per-layer
+/// state+conv ~3.2 MiB) sum to roughly 128 MiB; 4 GiB (4_294_967_296) leaves roughly 32x
+/// headroom above that while rejecting the multi-hundred-gigabyte hostile case (512 layers *
+/// per-layer caps) by more than an order of magnitude.
+pub(crate) const MAX_GDN_CROSS_LAYER_STATE_BYTES: u128 = 4_294_967_296;
+
 /// Upper bound, in bytes, on the Metal RoPE cos/sin table pair accepted from `config.json`.
 ///
 /// `build_rope_interleaved` (`forward/metal_qwen35.rs`) allocates two `Vec<f32>` of
@@ -368,6 +399,36 @@ pub(crate) const MAX_VISION_IN_CHANNELS: usize = 256;
 /// rejecting the multi-terabyte hostile case by several orders of magnitude.
 pub(crate) const MAX_VISION_TENSOR_BYTES: u128 = 536_870_912;
 
+/// Upper bound, in bytes, on `config.json` accepted from a checkpoint directory (FIX 5).
+///
+/// `from_config_json` / `from_config_json_validated` (both independent `read_to_string`
+/// call sites) previously materialized the entire file into a `String` with no size limit,
+/// and `serde_json`'s `#[serde(default)]`/passthrough deserialization accepts unknown
+/// fields rather than rejecting them -- so an arbitrarily large ignored top-level field
+/// (e.g. a multi-gigabyte junk string under an unused key) exhausts memory before any
+/// bounded field-level validation in `validate()` ever runs. Real Qwen3.5/3.6 `config.json`
+/// files, including ones with a nested `vision_config`, are well under 100 KiB; 8 MiB
+/// (8,388,608) leaves nearly two orders of magnitude of headroom while rejecting the
+/// unbounded case.
+pub(crate) const MAX_CONFIG_JSON_BYTES: u64 = 8_388_608;
+
+/// Read `config.json` into a `String`, rejecting an oversized file before it is
+/// materialized. See [`MAX_CONFIG_JSON_BYTES`] docs. Checks the file's metadata length
+/// (not the OS-buffered read itself) so the size-cap fires before `read_to_string`
+/// allocates a same-sized buffer -- admission-order applies to file parsing, not just
+/// tensor bytes (mirrors the safetensors index cap in `weights/f32_weights.rs`).
+fn read_config_json_bounded(path: &Path) -> Result<String, InferenceError> {
+    let file_len = std::fs::metadata(path).map_err(InferenceError::Io)?.len();
+    if file_len > MAX_CONFIG_JSON_BYTES {
+        return Err(InferenceError::Inference(format!(
+            "config.json at {} is {file_len} bytes, exceeding MAX_CONFIG_JSON_BYTES \
+             ({MAX_CONFIG_JSON_BYTES})",
+            path.display()
+        )));
+    }
+    std::fs::read_to_string(path).map_err(InferenceError::Io)
+}
+
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -418,6 +479,14 @@ pub struct VisionModelConfig {
     /// DeepStack visual layer indexes; empty for checkpoints that don't use DeepStack fusion.
     #[serde(default, deserialize_with = "deserialize_deepstack_visual_indexes")]
     pub deepstack_visual_indexes: Vec<usize>,
+    /// ViT MLP intermediate (hidden) dimension. FIX 16: previously left unparsed (ADR-069
+    /// S1) and the loader hardcoded `4 * hidden_size` instead -- official Qwen3.5-VL vision
+    /// towers use `hidden_size = 1152`, `intermediate_size = 4304` (not `4 * 1152 =
+    /// 4608`), so the hardcoded assumption rejects real checkpoints. `None` (field absent
+    /// from `config.json`) falls back to `4 * hidden_size`, matching HF default semantics
+    /// for architectures that omit an explicit vision MLP width.
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
 }
 
 impl VisionModelConfig {
@@ -574,6 +643,23 @@ impl VisionModelConfig {
                 )));
             }
         }
+        // FIX 16: `intermediate_size`, when present, replaces the `4 * hidden_size`
+        // fallback as the vision MLP width -- bound it the same way as the text decoder's
+        // `intermediate_size` (`MAX_INTERMEDIATE_SIZE`), since it drives the same class of
+        // MLP-tensor allocation in `checked_derived_sizes` below.
+        if let Some(vision_intermediate_size) = self.intermediate_size {
+            if vision_intermediate_size == 0 {
+                return Err(InferenceError::Inference(
+                    "invalid vision_config: intermediate_size must be > 0 when present".to_string(),
+                ));
+            }
+            if vision_intermediate_size > MAX_INTERMEDIATE_SIZE {
+                return Err(InferenceError::Inference(format!(
+                    "invalid vision_config: intermediate_size ({vision_intermediate_size}) \
+                     exceeds MAX_INTERMEDIATE_SIZE ({MAX_INTERMEDIATE_SIZE})"
+                )));
+            }
+        }
         self.checked_derived_sizes()?;
         Ok(())
     }
@@ -604,7 +690,12 @@ impl VisionModelConfig {
         };
         let qkv_out = self.hidden_size.checked_mul(3).ok_or_else(overflow)?;
         budget(qkv_out, "qkv_out")?;
-        let mlp_intermediate = self.hidden_size.checked_mul(4).ok_or_else(overflow)?;
+        // FIX 16: use the parsed `intermediate_size` when present rather than always
+        // assuming `4 * hidden_size` -- see the field's docs.
+        let mlp_intermediate = match self.intermediate_size {
+            Some(v) => v,
+            None => self.hidden_size.checked_mul(4).ok_or_else(overflow)?,
+        };
         budget(mlp_intermediate, "mlp_intermediate")?;
         let merge_in = self
             .spatial_merge_size
@@ -1218,7 +1309,7 @@ impl Qwen35Config {
 
     /// Parse a HF config.json (which may wrap fields inside `text_config`).
     pub fn from_config_json(path: &Path) -> Result<Self, InferenceError> {
-        let json = std::fs::read_to_string(path).map_err(InferenceError::Io)?;
+        let json = read_config_json_bounded(path)?;
         Self::from_config_json_str(&json)
     }
 
@@ -1227,7 +1318,7 @@ impl Qwen35Config {
     pub fn from_config_json_validated(
         path: &Path,
     ) -> Result<ValidatedQwen35Config, InferenceError> {
-        let json = std::fs::read_to_string(path).map_err(InferenceError::Io)?;
+        let json = read_config_json_bounded(path)?;
         Self::from_config_json_str_validated(&json)
     }
 
@@ -1415,6 +1506,27 @@ impl Qwen35Config {
                 cfg.intermediate_size
             )));
         }
+        // FIX 8: `MAX_HIDDEN_SIZE` and `MAX_INTERMEDIATE_SIZE` above bound each factor
+        // independently; `load_dense_ffn_weights` (`model/qwen35/loading.rs`) materializes
+        // gate/up/down projection tensors sized by their product, which neither per-factor
+        // cap bounds. Gated on `!cfg.is_moe()` -- the loader only ever calls
+        // `load_dense_ffn_weights` for a non-MoE config (`loading.rs`'s `is_moe()` branch),
+        // so a MoE config's `intermediate_size` (which still exists on the struct but
+        // drives a different, already-bounded, `MAX_INTERMEDIATE_SIZE`-capped expert path)
+        // must not be double-bounded by a materialization site it never reaches. See
+        // `MAX_DENSE_FFN_TENSOR_BYTES` docs.
+        if !cfg.is_moe() {
+            let dense_ffn_tensor_bytes =
+                cfg.hidden_size as u128 * cfg.intermediate_size as u128 * 4;
+            if dense_ffn_tensor_bytes > MAX_DENSE_FFN_TENSOR_BYTES {
+                return Err(InferenceError::Inference(format!(
+                    "invalid Qwen config.json: dense FFN tensor size \
+                     ({dense_ffn_tensor_bytes} bytes) exceeds MAX_DENSE_FFN_TENSOR_BYTES \
+                     ({MAX_DENSE_FFN_TENSOR_BYTES}): hidden_size ({}) * intermediate_size ({})",
+                    cfg.hidden_size, cfg.intermediate_size
+                )));
+            }
+        }
         if cfg.num_attention_heads == 0 {
             return Err(InferenceError::Inference(
                 "invalid Qwen config.json: num_attention_heads must be > 0".to_string(),
@@ -1536,6 +1648,17 @@ impl Qwen35Config {
                 "invalid Qwen config.json: linear_conv_kernel_dim ({}) exceeds \
                  MAX_CONV_KERNEL_DIM ({MAX_CONV_KERNEL_DIM})",
                 cfg.linear_conv_kernel_dim
+            )));
+        }
+        // FIX 15: RMSNorm computes `sqrt(mean(x^2) + eps)` and divides by it; a non-positive
+        // (including `-0.0`) or non-finite `rms_norm_eps` drives that sqrt/division to
+        // `NaN`, silently corrupting every layer's output with no error signal, since
+        // neither is a panic -- the same correctness-not-allocation dimension (B) as
+        // `rope_theta` below. Real Qwen3.5/3.6 presets use `1e-6`.
+        if !(cfg.rms_norm_eps.is_finite() && cfg.rms_norm_eps > 0.0) {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: rms_norm_eps ({}) must be finite and > 0.0",
+                cfg.rms_norm_eps
             )));
         }
         // `RopeTable::new` (`rope.rs`) computes `freq = 1.0 / theta.powf(...)` for every
@@ -1817,6 +1940,23 @@ impl Qwen35Config {
                 "invalid Qwen config.json: GatedDeltaNet conv buffer size \
                  ({gdn_conv_buffer_size}) exceeds MAX_GDN_CONV_BUFFER_SIZE \
                  ({MAX_GDN_CONV_BUFFER_SIZE})"
+            )));
+        }
+        // FIX 9+14: `MAX_GDN_STATE_SIZE` / `MAX_GDN_CONV_BUFFER_SIZE` above bound one
+        // layer's persistent GatedDeltaNet state; neither multiplies by
+        // `num_linear_attention_layers()`. `generation.rs` allocates one
+        // `GatedDeltaNetState` (s_matrices + conv_buffer) per linear-attention layer
+        // before the first token -- bound the aggregate across all layers. See
+        // `MAX_GDN_CROSS_LAYER_STATE_BYTES` docs.
+        let num_linear_layers = cfg.num_linear_attention_layers() as u128;
+        let per_layer_state_bytes = (gdn_state_size as u128 + gdn_conv_buffer_size as u128) * 4;
+        let cross_layer_state_bytes = per_layer_state_bytes * num_linear_layers;
+        if cross_layer_state_bytes > MAX_GDN_CROSS_LAYER_STATE_BYTES {
+            return Err(InferenceError::Inference(format!(
+                "invalid Qwen config.json: aggregate GatedDeltaNet cross-layer state size \
+                 ({cross_layer_state_bytes} bytes) exceeds MAX_GDN_CROSS_LAYER_STATE_BYTES \
+                 ({MAX_GDN_CROSS_LAYER_STATE_BYTES}): per-layer state ({per_layer_state_bytes} \
+                 bytes) * num_linear_attention_layers ({num_linear_layers})"
             )));
         }
         // `RopeParams::mrope_section` is bounded at deserialize time
@@ -3142,8 +3282,13 @@ mod tests {
 
     #[test]
     fn test_intermediate_size_at_max_accepted() {
-        let json =
-            format!(r#"{{"text_config": {{"intermediate_size": {MAX_INTERMEDIATE_SIZE}}}}}"#);
+        // hidden_size pinned to 1 (FIX 8: intermediate_size alone at MAX_INTERMEDIATE_SIZE,
+        // paired with the preset's own default hidden_size, would otherwise breach the new
+        // MAX_DENSE_FFN_TENSOR_BYTES product budget -- this test is about the per-field
+        // intermediate_size cap in isolation, not the product budget covered separately).
+        let json = format!(
+            r#"{{"text_config": {{"intermediate_size": {MAX_INTERMEDIATE_SIZE}, "hidden_size": 1}}}}"#
+        );
         assert!(
             Qwen35Config::from_config_json_str(&json).is_ok(),
             "intermediate_size == MAX_INTERMEDIATE_SIZE must be accepted"
@@ -4157,6 +4302,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn from_model_dir_rejects_oversized_config_json_before_read_to_string() {
+        // FIX 5 regression: an oversized config.json must be rejected via the file's
+        // metadata length, before `read_to_string` materializes it.
+        let tmp = tempfile::tempdir().unwrap();
+        let oversized = "x".repeat(MAX_CONFIG_JSON_BYTES as usize + 1);
+        std::fs::write(tmp.path().join("config.json"), oversized).unwrap();
+
+        let err = Qwen35Config::from_model_dir(tmp.path())
+            .expect_err("an oversized config.json must be rejected");
+        assert!(
+            err.to_string().contains("MAX_CONFIG_JSON_BYTES"),
+            "wrong guard fired: {err}"
+        );
+
+        // The validated sibling (`from_model_dir_validated` -> `from_config_json_validated`)
+        // is an independent `read_to_string` call site (FIX 5 sibling-invocation-path) and
+        // must be bounded the same way.
+        let err_validated = Qwen35Config::from_model_dir_validated(tmp.path())
+            .expect_err("an oversized config.json must be rejected via the validated sibling");
+        assert!(
+            err_validated.to_string().contains("MAX_CONFIG_JSON_BYTES"),
+            "wrong guard fired: {err_validated}"
+        );
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // GatedDeltaNet state-matrix three-factor budget (MAX_GDN_STATE_SIZE)
     // ──────────────────────────────────────────────────────────────────────
@@ -4254,9 +4425,13 @@ mod tests {
         // hidden_size alone (with vocab_size at its own realistic-preset value) does not
         // reach MAX_EMBEDDING_BYTES -- unlike the vision "_at_max" cases below, the text
         // embedding budget is generous enough (32 GiB) to keep this at-max-in-isolation case
-        // accepted. See MAX_EMBEDDING_BYTES docs.
-        let json =
-            format!(r#"{{"text_config": {{"hidden_size": {MAX_HIDDEN_SIZE}, "vocab_size": 1}}}}"#);
+        // accepted. See MAX_EMBEDDING_BYTES docs. intermediate_size is pinned to 1 (FIX 8:
+        // hidden_size alone at MAX_HIDDEN_SIZE, paired with the preset's own default
+        // intermediate_size, would otherwise breach the new MAX_DENSE_FFN_TENSOR_BYTES
+        // product budget -- this test is about the per-field hidden_size cap in isolation).
+        let json = format!(
+            r#"{{"text_config": {{"hidden_size": {MAX_HIDDEN_SIZE}, "vocab_size": 1, "intermediate_size": 1}}}}"#
+        );
         assert!(
             Qwen35Config::from_config_json_str(&json).is_ok(),
             "hidden_size == MAX_HIDDEN_SIZE must be accepted when paired with a small vocab_size"
@@ -5115,6 +5290,61 @@ mod tests {
         );
     }
 
+    // ── FIX 15: rms_norm_eps must be finite and positive ────────────────────────────
+
+    #[test]
+    fn parser_rejects_zero_rms_norm_eps() {
+        let json = r#"{"text_config": {"rms_norm_eps": 0.0}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("rms_norm_eps: 0.0 must yield an InferenceError, not NaN propagation")
+            .to_string();
+        assert!(err.contains("rms_norm_eps"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn parser_rejects_negative_rms_norm_eps() {
+        let json = r#"{"text_config": {"rms_norm_eps": -1e-6}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("negative rms_norm_eps must yield an InferenceError")
+            .to_string();
+        assert!(err.contains("rms_norm_eps"), "wrong guard fired: {err}");
+    }
+
+    // Note: NaN/Infinity are not JSON literals (see the rope_theta note above for the same
+    // reason) -- exercise the `is_finite()` half by constructing `Qwen35Config` directly
+    // and calling `validate()`, matching the defense-in-depth precedent for `rope_theta`.
+
+    #[test]
+    fn parser_rejects_nan_rms_norm_eps() {
+        let mut cfg = Qwen35Config::qwen35_2b();
+        cfg.rms_norm_eps = f32::NAN;
+        let err = cfg
+            .validate()
+            .expect_err("NaN rms_norm_eps must yield an InferenceError")
+            .to_string();
+        assert!(err.contains("rms_norm_eps"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn parser_rejects_infinite_rms_norm_eps() {
+        let mut cfg = Qwen35Config::qwen35_2b();
+        cfg.rms_norm_eps = f32::INFINITY;
+        let err = cfg
+            .validate()
+            .expect_err("infinite rms_norm_eps must yield an InferenceError")
+            .to_string();
+        assert!(err.contains("rms_norm_eps"), "wrong guard fired: {err}");
+    }
+
+    #[test]
+    fn parser_accepts_realistic_rms_norm_eps() {
+        let json = r#"{"text_config": {"rms_norm_eps": 0.000001}}"#;
+        assert!(
+            Qwen35Config::from_config_json_str(json).is_ok(),
+            "realistic rms_norm_eps (1e-6) must be accepted"
+        );
+    }
+
     #[test]
     fn parser_rejects_linear_num_value_heads_over_max() {
         let value_heads = MAX_LINEAR_NUM_VALUE_HEADS + 1;
@@ -5304,6 +5534,45 @@ mod tests {
         );
     }
 
+    // ── FIX 9+14: aggregate GDN cross-layer persistent-state budget ─────────────────
+
+    #[test]
+    fn parser_rejects_hostile_gdn_cross_layer_state_aggregate() {
+        // Hostile geometry: every per-layer/per-buffer guard (MAX_GDN_STATE_SIZE,
+        // MAX_GDN_CONV_BUFFER_SIZE, MAX_GDN_CHUNK_SCRATCH_BYTES, MAX_GDN_SESSION_BYTES)
+        // passes individually, but 512 linear-attention layers (MAX_HIDDEN_LAYERS) each
+        // allocating this per-layer state blow past MAX_GDN_CROSS_LAYER_STATE_BYTES --
+        // `generation.rs` allocates one `GatedDeltaNetState` per linear layer up front,
+        // before the first token.
+        let json = r#"{"text_config": {
+            "num_hidden_layers": 512,
+            "full_attention_interval": 999999,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 700,
+            "linear_conv_kernel_dim": 4
+        }}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("hostile 512-linear-layer GDN cross-layer aggregate must be rejected")
+            .to_string();
+        assert!(
+            err.contains("MAX_GDN_CROSS_LAYER_STATE_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_realistic_gdn_cross_layer_state_aggregate() {
+        // qwen36_27b's real linear-layer count and per-layer GDN state must stay well
+        // inside MAX_GDN_CROSS_LAYER_STATE_BYTES.
+        let cfg = Qwen35Config::qwen36_27b();
+        assert!(
+            cfg.validate().is_ok(),
+            "realistic qwen36_27b GDN cross-layer aggregate must be accepted"
+        );
+    }
+
     // ── CLASS A3: materialization-site byte budgets ─────────────────────────────────
 
     #[test]
@@ -5326,6 +5595,39 @@ mod tests {
         assert!(
             cfg.validate().is_ok(),
             "realistic embedding product must be accepted"
+        );
+    }
+
+    // ── FIX 8: dense-FFN gate/up/down product budget ────────────────────────────────
+
+    #[test]
+    fn parser_rejects_hostile_dense_ffn_product() {
+        // hidden_size and intermediate_size both at their individual per-field caps
+        // (MAX_HIDDEN_SIZE, MAX_INTERMEDIATE_SIZE) pass those guards independently; their
+        // product (~4 TiB per dense FFN tensor) does not until MAX_DENSE_FFN_TENSOR_BYTES
+        // exists. vocab_size=1 keeps MAX_EMBEDDING_BYTES trivially satisfied so that
+        // guard doesn't fire first. The default preset (`text_config` omitted fields fall
+        // back to `qwen36_35b_a3b`, a MoE config) is MoE, and the dense-FFN budget is
+        // gated on `!is_moe()`, so the four MoE-indicator fields are explicitly nulled to
+        // exercise the dense (non-MoE) load path this guard actually protects.
+        let json = format!(
+            r#"{{"text_config": {{"vocab_size": 1, "hidden_size": {MAX_HIDDEN_SIZE}, "intermediate_size": {MAX_INTERMEDIATE_SIZE}, "num_experts": null, "num_experts_per_tok": null, "moe_intermediate_size": null, "shared_expert_intermediate_size": null}}}}"#
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("hostile dense FFN product must be rejected before materialization")
+            .to_string();
+        assert!(
+            err.contains("MAX_DENSE_FFN_TENSOR_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_realistic_dense_ffn_product() {
+        let cfg = Qwen35Config::qwen35_2b();
+        assert!(
+            cfg.validate().is_ok(),
+            "realistic dense FFN product must be accepted"
         );
     }
 

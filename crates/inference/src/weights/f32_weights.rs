@@ -270,14 +270,20 @@ impl SafetensorsFile {
         let file = File::open(path).map_err(|e| {
             InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
         })?;
+        Self::from_open_file(file, path.display().to_string())
+    }
 
+    /// Parse a safetensors file from an already-open [`File`] (FIX 7 fd-bind: the caller
+    /// has already verified this fd's identity via
+    /// [`open_contained_manifest_file`]; never reopen by path after that check).
+    pub(crate) fn from_open_file(file: File, display_path: String) -> Result<Self, InferenceError> {
         // SAFETY: The file descriptor remains alive until the mmap is created,
         // and the returned Mmap owns the mapping independently of the File.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {}: {e}", path.display()))
+            InferenceError::InvalidSafetensors(format!("failed to mmap {display_path}: {e}"))
         })?;
 
-        Self::from_backing(SafetensorsBacking::Mapped(mmap), path.display().to_string())
+        Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
     }
 
     /// **Unstable**: parse a safetensors file already resident in memory.
@@ -973,6 +979,27 @@ pub struct ShardedQwenBacking {
 // Sharded safetensors index + TensorSource trait
 // ---------------------------------------------------------------------------
 
+/// Upper bound, in bytes, on `model.safetensors.index.json` accepted from a checkpoint
+/// directory (FIX 6).
+///
+/// `parse_index` previously `read_to_string`'d the entire file with no size limit before
+/// any bounded validation ran. Real sharded Qwen3.5/3.6 checkpoints (up to ~26 shards,
+/// tens of thousands of tensor names) produce index files on the order of a few MiB; 64
+/// MiB (67,108,864) leaves roughly an order of magnitude of headroom while rejecting an
+/// unbounded ignored-field or oversized `weight_map` from exhausting memory before parse.
+pub(crate) const MAX_SAFETENSORS_INDEX_BYTES: u64 = 67_108_864;
+
+/// Upper bound on the number of entries in `SafetensorsIndex::weight_map` accepted from a
+/// checkpoint directory (FIX 6).
+///
+/// Enforced incrementally inside [`deserialize_weight_map_no_duplicates`]'s visitor --
+/// admission fires before a further entry is inserted into the owned `HashMap`, not after
+/// the whole map has already collapsed. Real Qwen3.5/3.6 sharded checkpoints (including the
+/// 256-expert MoE 35B preset) carry on the order of tens of thousands of tensor names;
+/// 1,000,000 leaves well over an order of magnitude of headroom while rejecting an
+/// unbounded entry count.
+pub(crate) const MAX_WEIGHT_MAP_ENTRIES: usize = 1_000_000;
+
 /// Parsed `model.safetensors.index.json` from a HuggingFace sharded checkpoint.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SafetensorsIndex {
@@ -1010,8 +1037,18 @@ where
         where
             A: serde::de::MapAccess<'de>,
         {
-            let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            // Cap the initial reservation independent of the (attacker-controlled)
+            // declared `size_hint`, then reject before a further entry is inserted once
+            // over budget -- bounding growth during the parse itself rather than after
+            // the map has already fully materialized. See `MAX_WEIGHT_MAP_ENTRIES` docs.
+            let reserve = map.size_hint().unwrap_or(0).min(MAX_WEIGHT_MAP_ENTRIES);
+            let mut out = HashMap::with_capacity(reserve);
             while let Some((name, shard)) = map.next_entry::<String, String>()? {
+                if out.len() >= MAX_WEIGHT_MAP_ENTRIES {
+                    return Err(serde::de::Error::custom(format!(
+                        "weight_map exceeds MAX_WEIGHT_MAP_ENTRIES ({MAX_WEIGHT_MAP_ENTRIES})"
+                    )));
+                }
                 if out.insert(name.clone(), shard).is_some() {
                     return Err(serde::de::Error::custom(format!(
                         "duplicate tensor name in weight_map: {name}"
@@ -1078,6 +1115,9 @@ impl TensorSource for SafetensorsFile {
 #[derive(Debug)]
 pub struct ShardedSafetensors {
     root: PathBuf,
+    /// Canonicalized once at `open_index` time and reused by every subsequent
+    /// `open_shard` call, rather than re-canonicalizing `root` per shard access.
+    canon_root: PathBuf,
     index: SafetensorsIndex,
     shards: HashMap<String, SafetensorsFile>,
 }
@@ -1085,6 +1125,19 @@ pub struct ShardedSafetensors {
 /// Parse `model.safetensors.index.json` from a model directory.
 pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError> {
     let index_path = model_dir.join("model.safetensors.index.json");
+    // FIX 6: check the file's metadata length before `read_to_string` materializes a
+    // same-sized buffer -- admission-order applies to file parsing, not just tensor
+    // bytes. See `MAX_SAFETENSORS_INDEX_BYTES` docs.
+    let file_len = std::fs::metadata(&index_path)
+        .map_err(InferenceError::Io)?
+        .len();
+    if file_len > MAX_SAFETENSORS_INDEX_BYTES {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "{} is {file_len} bytes, exceeding MAX_SAFETENSORS_INDEX_BYTES \
+             ({MAX_SAFETENSORS_INDEX_BYTES})",
+            index_path.display()
+        )));
+    }
     let json = std::fs::read_to_string(&index_path).map_err(InferenceError::Io)?;
     serde_json::from_str(&json).map_err(|e| {
         InferenceError::InvalidSafetensors(format!("failed to parse {}: {e}", index_path.display()))
@@ -1126,6 +1179,79 @@ pub(crate) fn contain_manifest_path(
     Ok(canon_candidate)
 }
 
+/// Canonicalize `model_root` once. Callers that resolve many manifest entries against the
+/// same root (e.g. the 153-tensor vision checkpoint loop in `vision/checkpoint.rs`) must
+/// canonicalize once and reuse the result via [`open_contained_manifest_file`], rather than
+/// re-canonicalizing per entry (FIX 7 perf-minor fold).
+pub(crate) fn canonicalize_model_root(model_root: &Path) -> Result<PathBuf, InferenceError> {
+    model_root.canonicalize().map_err(InferenceError::Io)
+}
+
+/// Open `entry_name` (joined onto `model_root`) exactly once, verifying the OPENED file
+/// descriptor's real path is contained within `canon_root` (pre-canonicalized by the
+/// caller via [`canonicalize_model_root`]) -- and returns that open [`File`] for the
+/// caller to read from directly.
+///
+/// FIX 7: [`contain_manifest_path`] alone canonicalizes+validates a path, then leaves the
+/// caller to reopen it separately by that same path -- a concurrent attacker can swap the
+/// file/symlink between the check and the reopen (TOCTOU). This function closes that
+/// window by opening the candidate first and verifying the identity of the fd that was
+/// actually opened, not the path that was checked. Never reopen the path this returns;
+/// read from the returned `File`.
+pub(crate) fn open_contained_manifest_file(
+    model_root: &Path,
+    canon_root: &Path,
+    entry_name: &str,
+) -> Result<(File, PathBuf), InferenceError> {
+    if Path::new(entry_name).is_absolute() {
+        return Err(InferenceError::Inference(format!(
+            "manifest entry {entry_name:?} must be a path relative to the model directory, \
+             not absolute"
+        )));
+    }
+    let candidate = model_root.join(entry_name);
+    let file = File::open(&candidate).map_err(|e| {
+        InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", candidate.display()))
+    })?;
+    let real_path = real_path_of_open_file(&file, &candidate)?;
+    if !real_path.starts_with(canon_root) {
+        return Err(InferenceError::Inference(format!(
+            "manifest entry {entry_name:?} escapes model root {} (resolved to {})",
+            model_root.display(),
+            real_path.display()
+        )));
+    }
+    Ok((file, real_path))
+}
+
+/// Resolve the real on-disk path of an already-open file descriptor.
+///
+/// On macOS, uses `fcntl(fd, F_GETPATH, buf)` -- the fd-identity source of truth, immune
+/// to a path swap that happens after `open()` returns. On other platforms (no portable
+/// fd-to-path syscall in `std`), falls back to canonicalizing the path that was passed to
+/// `open()`; this is a narrower, best-effort check that does not close the TOCTOU window
+/// as completely as the macOS path, matching this crate's macOS-primary target (Metal GPU,
+/// e2e-parity CI runners).
+#[cfg(target_os = "macos")]
+fn real_path_of_open_file(file: &File, _candidate: &Path) -> Result<PathBuf, InferenceError> {
+    use std::os::unix::io::AsRawFd;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if ret == -1 {
+        return Err(InferenceError::Io(std::io::Error::last_os_error()));
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = std::str::from_utf8(&buf[..len]).map_err(|_| {
+        InferenceError::Inference("F_GETPATH returned a non-UTF-8 path".to_string())
+    })?;
+    Ok(PathBuf::from(s))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_path_of_open_file(_file: &File, candidate: &Path) -> Result<PathBuf, InferenceError> {
+    candidate.canonicalize().map_err(InferenceError::Io)
+}
+
 /// Resolve a tensor name to its shard path, contained within `model_dir`.
 pub fn resolve_shard(
     index: &SafetensorsIndex,
@@ -1146,6 +1272,7 @@ pub fn resolve_shard(
 /// for lower peak memory during model loading.
 pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, InferenceError> {
     let index = parse_index(model_dir)?;
+    let canon_root = canonicalize_model_root(model_dir)?;
     let mut by_shard: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
 
@@ -1158,8 +1285,8 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
-        let shard_path = contain_manifest_path(model_dir, &shard_file)?;
-        let shard = SafetensorsFile::open(&shard_path)?;
+        let (file, real_path) = open_contained_manifest_file(model_dir, &canon_root, &shard_file)?;
+        let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
             tensors.insert(
@@ -1183,8 +1310,10 @@ impl ShardedSafetensors {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let index = parse_index(&root)?;
+        let canon_root = canonicalize_model_root(&root)?;
         Ok(Self {
             root,
+            canon_root,
             index,
             shards: HashMap::new(),
         })
@@ -1216,8 +1345,9 @@ impl ShardedSafetensors {
 
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
-            let shard_path = contain_manifest_path(&self.root, shard_file)?;
-            let shard = SafetensorsFile::open(&shard_path)?;
+            let (file, real_path) =
+                open_contained_manifest_file(&self.root, &self.canon_root, shard_file)?;
+            let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
             self.shards.insert(shard_file.to_string(), shard);
         }
         self.shards.get(shard_file).ok_or_else(|| {
@@ -2736,6 +2866,103 @@ mod tests {
                 .canonicalize()
                 .expect("test setup: canonicalize shard")
         );
+    }
+
+    #[test]
+    fn parse_index_rejects_oversized_index_file() {
+        // FIX 6 regression: an oversized model.safetensors.index.json must be rejected
+        // via the file's metadata length, before `read_to_string` materializes it.
+        let root = temp_dir("lattice_index_oversized");
+        let oversized = format!(
+            r#"{{"metadata":{{}},"weight_map":{{}}, "pad":"{}"}}"#,
+            "x".repeat(MAX_SAFETENSORS_INDEX_BYTES as usize + 1)
+        );
+        fs::write(root.join("model.safetensors.index.json"), oversized)
+            .expect("test setup: write oversized index");
+        let err = parse_index(&root).expect_err("an oversized safetensors index must be rejected");
+        assert!(
+            err.to_string().contains("MAX_SAFETENSORS_INDEX_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_weight_map_over_entry_cap() {
+        // FIX 6 regression: `weight_map` entry count must be capped incrementally during
+        // deserialization -- before the whole map collapses into an owned `HashMap`.
+        // MAX_WEIGHT_MAP_ENTRIES + 1 raw members, each mapping to the same short shard
+        // name, must be rejected.
+        let mut entries = String::with_capacity((MAX_WEIGHT_MAP_ENTRIES + 1) * 24);
+        for i in 0..=MAX_WEIGHT_MAP_ENTRIES {
+            if i > 0 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(r#""t{i}":"s""#));
+        }
+        let json = format!(r#"{{"metadata":{{}},"weight_map":{{{entries}}}}}"#);
+        let err = serde_json::from_str::<SafetensorsIndex>(&json)
+            .expect_err("weight_map over MAX_WEIGHT_MAP_ENTRIES must be rejected");
+        assert!(
+            err.to_string().contains("MAX_WEIGHT_MAP_ENTRIES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_accepts_weight_map_at_entry_cap() {
+        // A weight_map with exactly MAX_WEIGHT_MAP_ENTRIES entries must be accepted --
+        // this is a boundary test, not a realistic-checkpoint test (real checkpoints use
+        // far fewer entries; see `parse_index`'s doc comment).
+        let mut entries = String::with_capacity(MAX_WEIGHT_MAP_ENTRIES * 24);
+        for i in 0..MAX_WEIGHT_MAP_ENTRIES {
+            if i > 0 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(r#""t{i}":"s""#));
+        }
+        let json = format!(r#"{{"metadata":{{}},"weight_map":{{{entries}}}}}"#);
+        let index: SafetensorsIndex = serde_json::from_str(&json)
+            .expect("weight_map at exactly MAX_WEIGHT_MAP_ENTRIES must be accepted");
+        assert_eq!(index.weight_map.len(), MAX_WEIGHT_MAP_ENTRIES);
+    }
+
+    #[test]
+    fn open_contained_manifest_file_rejects_symlink_escaping_root() {
+        // FIX 7 regression: a manifest entry that resolves (via a symlink) outside the
+        // canonicalized model root must be rejected by the fd-bind check -- the OPENED
+        // fd's real path (F_GETPATH on macOS), not the path that was joined before
+        // opening, is what gets compared against `canon_root`.
+        let root = temp_dir("lattice_fdbind_escape_root");
+        let outside = root.parent().expect("temp dir has a parent").join(format!(
+            "lattice_fdbind_escape_target_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&outside, b"secret").expect("test setup: write escape target");
+
+        #[cfg(unix)]
+        {
+            let link = root.join("shard.safetensors");
+            std::os::unix::fs::symlink(&outside, &link).expect("test setup: create symlink");
+
+            let canon_root = canonicalize_model_root(&root).expect("canonicalize root");
+            let result = open_contained_manifest_file(&root, &canon_root, "shard.safetensors");
+
+            fs::remove_file(&outside).ok();
+
+            let err = result.expect_err("a symlink escaping model_root must be rejected");
+            assert!(
+                matches!(err, InferenceError::Inference(ref msg) if msg.contains("escapes")),
+                "wrong error: {err:?}"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            fs::remove_file(&outside).ok();
+        }
     }
 
     #[test]

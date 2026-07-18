@@ -706,8 +706,17 @@ pub(crate) fn validate_q4_header_payload_bounds(
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
 pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
+    let f = std::fs::File::open(path)?;
+    load_q4_from_open_file(f)
+}
+
+/// Parse a [`Q4Tensor`] from an already-open `.q4` file (FIX 7 fd-bind: callers that
+/// resolved this file through [`crate::weights::f32_weights::open_contained_manifest_file`]
+/// must read from that opened fd, not reopen by path -- see that function's docs).
+pub(crate) fn load_q4_from_open_file(
+    mut f: std::fs::File,
+) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
     let file_len = f.metadata()?.len();
 
     let mut magic = [0u8; 4];
@@ -796,19 +805,27 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
 pub fn load_f16_tensor_file(
     path: &std::path::Path,
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+    let f = std::fs::File::open(path)?;
+    load_f16_tensor_from_open_file(f, &path.display().to_string())
+}
+
+/// Parse an f32 tensor from an already-open `.f16` file (FIX 7 fd-bind: callers that
+/// resolved this file through [`crate::weights::f32_weights::open_contained_manifest_file`]
+/// must read from that opened fd, not reopen by path -- see that function's docs).
+/// `display_path` is used only for error messages.
+pub(crate) fn load_f16_tensor_from_open_file(
+    mut f: std::fs::File,
+    display_path: &str,
+) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
     let file_len = f.metadata()?.len();
 
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != b"KHF1" {
-        return Err(format!(
-            "invalid magic at {}: expected KHF1, got {:?}",
-            path.display(),
-            magic
-        )
-        .into());
+        return Err(
+            format!("invalid magic at {display_path}: expected KHF1, got {magic:?}").into(),
+        );
     }
 
     let mut b4 = [0u8; 4];
