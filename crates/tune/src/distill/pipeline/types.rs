@@ -10,36 +10,124 @@ use uuid::Uuid;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// Result of labeling a single example
-#[derive(Debug, Clone)]
+/// Provenance of a labeling result: did it come from the configured teacher,
+/// or from the opt-in deterministic simulation path?
+///
+/// [`DistillationPipeline::to_training_examples`](super::DistillationPipeline::to_training_examples)
+/// uses this to keep simulated labels from being attributed to the real teacher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum LabelSource {
+    /// Produced by the configured teacher.
+    #[default]
+    Teacher,
+    /// Produced by the deterministic `simulated-teacher` path. Never a real
+    /// teacher's output.
+    Simulated,
+}
+
+/// Capability proving a [`LabelingResult`] was produced by this crate's own
+/// teacher-provider path, not fabricated by an external caller.
+///
+/// `TeacherAuth` has a private field and no public constructor, so code
+/// outside `lattice_tune` can never obtain one — and [`LabelingResult::success`]
+/// requires one to construct a `Teacher`-sourced result. This closes the gap
+/// a private `source` field alone leaves open: without an unforgeable token
+/// gating the constructor itself, any caller could still mint a `Teacher`
+/// result through the public API with arbitrary labels and confidence.
+#[derive(Debug, Clone, Copy)]
+pub struct TeacherAuth(());
+
+impl TeacherAuth {
+    /// Mint a new capability. Only reachable from within this crate — the
+    /// live teacher-provider path is the intended (future) caller. Unused in
+    /// production code today because [`DistillationPipeline::label_single`](super::DistillationPipeline::label_single)
+    /// fails closed rather than calling a live teacher; tests exercise it in
+    /// the meantime.
+    #[allow(dead_code)]
+    pub(crate) fn new() -> Self {
+        Self(())
+    }
+}
+
+/// Result of labeling a single example.
+///
+/// Every field that [`Self::is_success`], [`Self::source`], or
+/// [`super::DistillationPipeline::to_training_examples`] reads is private:
+/// the only ways to reach a value are [`Self::success`], [`Self::simulated`],
+/// and [`Self::failure`]. There is no public setter, so a caller cannot
+/// mutate a failed result into an accepted one (clearing `error` and
+/// swapping in `labels`) or otherwise disagree with the state a constructor
+/// established:
+///
+/// ```compile_fail
+/// # use lattice_tune::LabelingResult;
+/// # use uuid::Uuid;
+/// let mut result = LabelingResult::failure(Uuid::new_v4(), "boom", 0);
+/// result.error = None; // private field — does not compile
+/// ```
+///
+/// `LabelingResult` implements `Serialize` but deliberately never
+/// `Deserialize`. A deserialized payload cannot be authenticated as having
+/// come from the configured teacher, so there is no path — silent or
+/// otherwise — from untrusted bytes back to this type; the only route is to
+/// call [`Self::success`], [`Self::simulated`], or [`Self::failure`] again,
+/// in-process:
+///
+/// ```compile_fail
+/// # use lattice_tune::LabelingResult;
+/// let _: LabelingResult = serde_json::from_str("{}").unwrap();
+/// ```
+///
+/// A caller outside this crate also cannot mint a `Teacher`-sourced result
+/// at all: [`Self::success`] requires a [`TeacherAuth`] token, and
+/// `TeacherAuth` has no public constructor. There is no `TeacherAuth` value
+/// an external caller can pass, so the call site itself does not compile:
+///
+/// ```compile_fail
+/// # use lattice_tune::{IntentLabels, LabelingResult};
+/// # use uuid::Uuid;
+/// let _ = LabelingResult::success(Uuid::new_v4(), IntentLabels::default(), 0.99, 0);
+/// ```
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct LabelingResult {
     /// Original example ID
     pub example_id: Uuid,
 
     /// Generated labels
-    pub labels: IntentLabels,
+    labels: IntentLabels,
 
-    /// Confidence score from teacher
-    pub confidence: f32,
+    /// Confidence score, from either the teacher or the simulated path —
+    /// see [`Self::source`] for which one produced this result.
+    confidence: f32,
 
-    /// Raw response from teacher (for debugging)
-    pub raw_response: Option<String>,
+    /// Raw response, for debugging — populated for teacher results; absent
+    /// for simulated results, which never call the teacher.
+    raw_response: Option<String>,
 
     /// Error message if labeling failed
-    pub error: Option<String>,
+    error: Option<String>,
 
     /// Latency in milliseconds
-    pub latency_ms: u64,
+    latency_ms: u64,
+
+    /// Where this result's labels came from.
+    ///
+    /// Visibility is intentionally narrower than the other fields: provenance
+    /// must only ever be set by [`LabelingResult::success`] or
+    /// [`LabelingResult::simulated`] at construction time, never mutated
+    /// afterward. Read it via [`Self::source`].
+    pub(super) source: LabelSource,
 }
 
 impl LabelingResult {
-    /// Create a successful result
-    pub fn success(
+    fn new_success(
         example_id: Uuid,
         labels: IntentLabels,
         confidence: f32,
         latency_ms: u64,
+        source: LabelSource,
     ) -> Self {
         Self {
             example_id,
@@ -48,7 +136,47 @@ impl LabelingResult {
             raw_response: None,
             error: None,
             latency_ms,
+            source,
         }
+    }
+
+    /// Create a successful result attributed to the configured teacher.
+    ///
+    /// Requires a [`TeacherAuth`] token, which only this crate's own
+    /// teacher-provider path can construct — an external caller cannot
+    /// obtain one, so this constructor cannot be used to fabricate
+    /// `Teacher`-sourced labels.
+    pub fn success(
+        example_id: Uuid,
+        labels: IntentLabels,
+        confidence: f32,
+        latency_ms: u64,
+        _auth: TeacherAuth,
+    ) -> Self {
+        Self::new_success(
+            example_id,
+            labels,
+            confidence,
+            latency_ms,
+            LabelSource::Teacher,
+        )
+    }
+
+    /// Create a successful result from the deterministic simulation path.
+    /// Never attributable to the configured teacher.
+    pub fn simulated(
+        example_id: Uuid,
+        labels: IntentLabels,
+        confidence: f32,
+        latency_ms: u64,
+    ) -> Self {
+        Self::new_success(
+            example_id,
+            labels,
+            confidence,
+            latency_ms,
+            LabelSource::Simulated,
+        )
     }
 
     /// Create a failed result
@@ -60,12 +188,47 @@ impl LabelingResult {
             raw_response: None,
             error: Some(error.into()),
             latency_ms,
+            source: LabelSource::Teacher,
         }
     }
 
     /// Check if labeling succeeded
     pub fn is_success(&self) -> bool {
         self.error.is_none()
+    }
+
+    /// Where this result's labels came from. `source` itself is not settable
+    /// from outside this module — provenance is fixed at construction by
+    /// [`Self::success`] or [`Self::simulated`].
+    pub fn source(&self) -> LabelSource {
+        self.source
+    }
+
+    /// Generated labels.
+    pub fn labels(&self) -> &IntentLabels {
+        &self.labels
+    }
+
+    /// Confidence score, from either the teacher or the simulated path —
+    /// see [`Self::source`] for which one produced this result.
+    pub fn confidence(&self) -> f32 {
+        self.confidence
+    }
+
+    /// Raw response, for debugging — populated for teacher results; absent
+    /// for simulated results, which never call the teacher.
+    pub fn raw_response(&self) -> Option<&str> {
+        self.raw_response.as_deref()
+    }
+
+    /// Error message if labeling failed.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Latency in milliseconds.
+    pub fn latency_ms(&self) -> u64 {
+        self.latency_ms
     }
 
     /// Set raw response

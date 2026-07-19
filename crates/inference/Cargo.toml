@@ -280,6 +280,10 @@ name = "topk_readback"
 harness = false
 
 [[bench]]
+name = "quarot_hadamard_bench"
+harness = false
+
+[[bench]]
 name = "decode_attn_bench"
 harness = false
 required-features = ["f16"]

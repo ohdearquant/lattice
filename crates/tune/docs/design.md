@@ -109,10 +109,13 @@ results. [distill.md](distill.md) defines result conversion; [data.md](data.md)
 defines the vector and six-label contract.
 
 At present `DistillationPipeline` is a placeholder teacher integration. It
-formats and bounds a prompt, creates simulated labels, and maintains
-statistics; it makes no HTTP request and does not read an API-key environment
-variable. A deployment should supply a real provider client before relying on
-this route to generate labels.
+fails closed when live teacher transport is unavailable; deterministic fixed
+labels require the non-default `simulated-teacher` feature and explicitly named
+simulation methods. Those methods do not format or bound a prompt — they never
+inspect the example's content at all — and maintain statistics; the pipeline
+makes no HTTP request and does not read an API-key environment variable. A
+deployment should supply a real provider client before relying on this route
+to generate labels.
 
 ## Lifecycle 2: train and register a model
 

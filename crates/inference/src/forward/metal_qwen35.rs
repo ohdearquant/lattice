@@ -16065,9 +16065,13 @@ mod inner {
             // (`quarot_rotation_seed`) for backwards compatibility with artifacts
             // produced before the contract was formalized. #504 remaining slice 2:
             // a *present but malformed* index is a hard error (fail-closed) — only
-            // a genuinely absent index falls back.
-            let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir)
-                .map_err(|e| format!("from_q4_dir: {e}"))?;
+            // a genuinely absent index falls back. A well-formed `V1Online` index
+            // is *also* rejected here (this is the only load path into
+            // `MetalQwen35State`, Metal being the only forward implementation) — see
+            // `read_quarot_seed_from_index`'s doc comment.
+            let index_seed =
+                crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir, cfg)
+                    .map_err(|e| format!("from_q4_dir: {e}"))?;
             let quarot_seed_opt = index_seed.or(cfg.quarot_rotation_seed);
             let is_quarot = quarot_seed_opt.is_some();
 
