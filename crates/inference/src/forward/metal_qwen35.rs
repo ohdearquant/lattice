@@ -35325,10 +35325,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         //    generation as GrammarConstraintBlocked; the first #1064 fix
         //    probed only at the loop top, which no zero-iteration or
         //    final-iteration run ever reaches, misreporting those as Length.
-        //    Mutation sensitivity: reverting the post-initial-advance
+        //    Each check is load-bearing: removing the post-initial-advance
         //    recording fails the `max_one_token` tests below (Length, not
-        //    Grammar); reverting a post-advance in-loop check fails that
-        //    path's `final_token` test the same way; reverting the loop-top
+        //    Grammar); removing a post-advance in-loop check fails that
+        //    path's `final_token` test the same way; removing the loop-top
         //    `if stopped` break restores the GrammarConstraintBlocked
         //    misclassification in the `max_new_tokens: 2` completion tests.
         //
@@ -35337,9 +35337,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         //    grammar requires a byte no token can supply: the state is NOT
         //    complete and the next mask blocks all 32 tokens. That must remain
         //    a hard `GrammarConstraintBlocked` error via the decode-loop
-        //    `has_finite_logit` guard. Mutation sensitivity: reverting that
-        //    guard lets the sampler's non-finite-max short-circuit silently
-        //    return a token instead of failing.
+        //    `has_finite_logit` guard; without that guard the sampler's
+        //    non-finite-max short-circuit silently returns a token instead
+        //    of failing.
         //
         // The dead-end fixture needs `max_new_tokens: 2` so the loop actually
         // reaches the decode iteration after the prefill-derived token; with
