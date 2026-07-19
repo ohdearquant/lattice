@@ -158,10 +158,15 @@ jobs:
         run: cargo build --release --bin qwen35_generate -p lattice-inference --features f16
 
       # Step 5: run parity check (HF first = warm machine, then lattice)
+      # HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE make any attempted Hub resolution
+      # fail hard instead of silently succeeding, proving the reference load
+      # stays confined to the already-provisioned local snapshot.
       - name: Run e2e parity check
         run: python3 scripts/e2e_parity_check.py
         env:
           E2E_REPORT_PATH: parity-report.md
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
 
       # Step 6: post results as PR comment
       - name: Post parity report
@@ -267,6 +272,9 @@ jobs:
       - name: Build lattice Metal binary
         run: cargo build --release --bin chat_metal -p lattice-inference --features "f16,metal-gpu"
 
+      # HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE make any attempted Hub resolution
+      # fail hard instead of silently succeeding, proving the reference load
+      # stays confined to the already-provisioned local snapshot.
       - name: Run Metal attention/KV parity check
         run: python3 scripts/e2e_parity_check.py --backend metal
         env:
@@ -274,6 +282,8 @@ jobs:
           LATTICE_METAL_PATH_PROOF: '1'
           E2E_MAX_TOKENS: '4'
           E2E_REPORT_PATH: metal-parity-report.md
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
 
       - name: Ensure Metal report exists
         if: always()

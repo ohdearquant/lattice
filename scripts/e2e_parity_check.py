@@ -21,8 +21,9 @@ Env vars:
   LATTICE_BIN             path to the lattice binary under test (default:
                            target/release/qwen35_generate for --backend cpu,
                            target/release/chat_metal for --backend metal)
-  LATTICE_MODEL_DIR       path to model weights (default: ~/.lattice/models/qwen3.5-0.8b)
-  HF_MODEL_ID             HuggingFace model ID (default: Qwen/Qwen3.5-0.8B)
+  LATTICE_MODEL_DIR       path to model weights (default: ~/.lattice/models/qwen3.5-0.8b);
+                          also the source of the HF reference load (local files only,
+                          no Hub fetch)
   E2E_MAX_TOKENS          tokens to generate per prompt (default: 15)
   E2E_REPORT_PATH         write markdown report here (optional)
   LATTICE_METAL_PATH_PROOF  set to "1" so chat_metal emits the
@@ -216,8 +217,6 @@ METAL_EXPECTED_DIVERGENCE: dict[str, str] = {
 
 MAX_TOKENS = int(os.environ.get("E2E_MAX_TOKENS", "15"))
 
-HF_MODEL_ID = os.environ.get("HF_MODEL_ID", "Qwen/Qwen3.5-0.8B")
-
 # LATTICE_BIN default depends on --backend (chat_metal for metal, qwen35_generate
 # for cpu), but argparse only runs inside main(). An explicit LATTICE_BIN env var
 # always wins; module import time sets a provisional cpu-shaped default so any
@@ -240,12 +239,20 @@ def run_hf_reference(prompt: str, max_tokens: int) -> dict:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if not hasattr(run_hf_reference, "_model"):
+        if not os.path.isdir(MODEL_DIR):
+            raise RuntimeError(
+                f"reference model snapshot not found at {MODEL_DIR}; "
+                "provision it before running this script (no network fallback)"
+            )
         t0 = time.time()
         run_hf_reference._tokenizer = AutoTokenizer.from_pretrained(
-            HF_MODEL_ID, trust_remote_code=True
+            MODEL_DIR, trust_remote_code=False, local_files_only=True
         )
         run_hf_reference._model = AutoModelForCausalLM.from_pretrained(
-            HF_MODEL_ID, dtype=torch.float32, trust_remote_code=True
+            MODEL_DIR,
+            dtype=torch.float32,
+            trust_remote_code=False,
+            local_files_only=True,
         )
         run_hf_reference._model.eval()
         print(f"[hf] model loaded in {time.time() - t0:.1f}s", file=sys.stderr)
