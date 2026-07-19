@@ -445,6 +445,10 @@ def run_selftest() -> int:
             "int8_batch_cosine",
             "int4_cosine_distance",
             "simd_batch_cosine_non_normalized_query",
+            "simd_normalized_cosine_fast_path",
+            "int8_raw_dot_product",
+            "simd_batch_cosine_normalized_query",
+            "int8_vs_float32_cosine",
         })
         if not helper.exists():
             failures.append(f"allowlist-handoff: shell helper missing at {helper}")
@@ -482,6 +486,10 @@ def run_selftest() -> int:
                 "int8_batch_cosine/float32_simd/100: benchmark\n"
                 "int4_cosine_distance/int4/768: benchmark\n"
                 "simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c: benchmark\n"
+                "simd_normalized_cosine_fast_path/cosine_full/768: benchmark\n"
+                "int8_raw_dot_product/dot_product_i8_raw/128: benchmark\n"
+                "simd_batch_cosine_normalized_query/pair_loop_dot/1024d_64c: benchmark\n"
+                "int8_vs_float32_cosine/float32_simd/1024: benchmark\n"
             )
             proc = subprocess.run(
                 ["bash", str(helper), str(listing_file)],

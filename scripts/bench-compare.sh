@@ -16,14 +16,16 @@
 #   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
 #
-# lattice#714: five of the lattice-embed bench targets' groups
+# lattice#714: nine of the lattice-embed bench targets' groups
 # (simd_dot_product, simd_cosine_similarity, int8_batch_cosine,
-# int4_cosine_distance, simd_batch_cosine_non_normalized_query) are confirmed
+# int4_cosine_distance, simd_batch_cosine_non_normalized_query,
+# simd_normalized_cosine_fast_path, int8_raw_dot_product,
+# simd_batch_cosine_normalized_query, int8_vs_float32_cosine) are confirmed
 # noise-dominated in --quick mode by same-toolchain A/A reproductions on
 # identical refs (the original pair: FAIL/WARN sign flipped across dozens of
-# entries run to run; the 2026-07-13 additions: confirmed-CI FAIL rows inside
-# exclusive bench windows with DISJOINT failing groups across two same-commit
-# runs). In --quick mode (the default), only those named groups are
+# entries run to run; the 2026-07-13 and 2026-07-19 additions: confirmed-CI
+# FAIL rows inside exclusive bench windows with DISJOINT failing groups
+# across two same-commit runs each). In --quick mode (the default), only those named groups are
 # measured and reported but excluded from the FAIL/WARN gate and exit code —
 # see the "informational" section of the report and INFO_GROUPS_ALLOWLIST
 # below. Every other group in the target, including any added later, gates

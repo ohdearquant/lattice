@@ -36,6 +36,18 @@ INFO_GROUPS_ALLOWLIST=(
   "int8_batch_cosine"
   "int4_cosine_distance"
   "simd_batch_cosine_non_normalized_query"
+  # Added 2026-07-19: two further same-commit A/A runs on origin/main
+  # (e1000d3108), quick mode, each inside an exclusive bench window on an
+  # otherwise idle machine, produced confirmed-CI gating FAIL rows
+  # (+8.4% to +11.5%) in these four groups — again with DISJOINT failing
+  # groups across the two runs (run 1: the first three; run 2:
+  # int8_vs_float32_cosine alone), while every inference group and every
+  # non-listed embed group stayed clean. Evidence tables in the PR that
+  # added these entries.
+  "simd_normalized_cosine_fast_path"
+  "int8_raw_dot_product"
+  "simd_batch_cosine_normalized_query"
+  "int8_vs_float32_cosine"
 )
 
 if [ "${1:-}" = "--print-allowlist" ]; then
