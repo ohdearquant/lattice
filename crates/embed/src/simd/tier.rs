@@ -248,9 +248,14 @@ impl PreparedQueryWithMeta {
 }
 
 /// Returns `true` when the squared norm of `v` is within 1e-4 of 1.0.
+///
+/// Uses the SIMD-dispatched [`dot_product`] for the self-dot rather than a plain
+/// scalar reduction: on a hot per-candidate path this check runs alongside an
+/// already-SIMD `dot_product(q, s)`, and a scalar accumulator here made the guard
+/// several times more expensive than the multiply it was guarding.
 #[inline]
 pub fn is_unit_norm(v: &[f32]) -> bool {
-    let sq: f32 = v.iter().map(|x| x * x).sum();
+    let sq = dot_product(v, v);
     (sq - 1.0).abs() < 1e-4
 }
 
