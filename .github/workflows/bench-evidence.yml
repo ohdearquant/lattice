@@ -8,18 +8,21 @@ name: bench evidence
 # confidence intervals disjoint at every size, undetected for four days because
 # nothing enforced the rule.
 #
-# This gate checks that the disposition EXISTS and says something. It does not judge
-# whether the numbers are real; a workflow cannot, and pretending otherwise would
-# trade a visible gap for an invisible one. Reviewers judge quality; this makes an
-# absent disposition impossible.
+# Trusted-enforcement shape. This runs as pull_request_target, so the workflow
+# definition and the checker script both come from the BASE branch, never the PR's
+# tree — a PR cannot edit this job (or scripts/bench_disposition_check.sh) to exit 0
+# and forge the named check. It checks out only the base ref and runs no code from the
+# PR: the PR body and file list are read through the GitHub API, and the body is piped
+# as inert text to the base-controlled checker. Nothing from the PR executes here, so
+# pull_request_target's usual "untrusted code with a write token" hazard does not apply.
 #
-# Change detection uses the GitHub API, not a script from the PR checkout: a gate that
-# runs PR-controlled code to decide whether the gate runs is a fail-open, since a PR
-# could rewrite that script to report no perf-sensitive paths. Nothing from the PR's
-# tree executes here.
+# This gate checks that the disposition EXISTS and says something. It does not judge
+# whether the numbers are real; a workflow cannot, and pretending otherwise would trade
+# a visible gap for an invisible one. Reviewers judge quality; this makes an absent
+# disposition impossible.
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
     # `edited` is required: the body is the artifact under test, so a description fixed
     # after the fact must be re-evaluated rather than needing an empty push to clear.
@@ -28,13 +31,12 @@ on:
     branches: [main]
     types: [checks_requested]
 
-# One gate job reports the required status context on both pull_request and merge_group,
-# mirroring e2e-parity.yml: the same context name reports on the PR and in the merge
-# queue, so branch protection can require it in one place. Body edits can fire rapidly;
-# supersede a PR's own in-flight runs, but never a queued merge_group check.
+# One gate job reports the required status context on both pull_request_target and
+# merge_group under the same name, mirroring e2e-parity.yml, so branch protection can
+# require it in one place. Supersede a PR's own in-flight runs; never a queued check.
 concurrency:
   group: bench-evidence-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 permissions:
   contents: read
@@ -45,7 +47,14 @@ jobs:
     name: bench-compare disposition present
     runs-on: ubuntu-latest
     steps:
-      - name: check the PR description
+      - name: Check out the base ref (trusted) for the checker script
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Enforce bench-compare disposition
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT: ${{ github.event_name }}
@@ -54,19 +63,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # merge_group carries no PR body; the pull_request-time gate already enforced
-          # the disposition, so there is nothing to re-check in the queue. Pass.
-          if [ "$EVENT" != "pull_request" ]; then
-            echo "event=$EVENT: bench evidence enforced at pull_request time; nothing to check here."
+          # merge_group carries no PR body; the pull_request_target-time gate already
+          # enforced the disposition, so there is nothing to re-check in the queue. The
+          # same context name still reports here so a required check stays green.
+          if [ "$EVENT" != "pull_request_target" ]; then
+            echo "event=$EVENT: bench evidence enforced at PR time; nothing to check here."
             exit 0
           fi
 
+          if [ ! -f scripts/bench_disposition_check.sh ]; then
+            echo "::error::scripts/bench_disposition_check.sh is missing from the base ref."
+            echo "Rebase this PR on current main so the base carries the checker."
+            exit 1
+          fi
+
           # Changed files from the API (base-controlled, computed by GitHub from the
-          # diff), never from a checked-out script the PR could edit. ADR-058 covers the
-          # whole of crates/inference and crates/embed, not just their src/ dirs: a
-          # Cargo.toml opt-level or dependency bump, or a benches/ change, moves
-          # performance too. A doc-only change under those crates satisfies the gate
-          # with a one-line "no source change, N/A" disposition.
+          # diff), never from a checked-out PR script. ADR-058 covers the whole of
+          # crates/inference and crates/embed, not just their src/ dirs: a Cargo.toml
+          # opt-level or dependency bump, or a benches/ change, moves performance too. A
+          # doc-only change under those crates satisfies the gate with a one-line N/A.
           CHANGED=$(gh api "repos/${REPO}/pulls/${PR}/files" --paginate -q '.[].filename')
           echo "Changed files:"
           echo "$CHANGED"
@@ -78,54 +93,4 @@ jobs:
           echo "→ perf-sensitive crate changed: bench-compare disposition REQUIRED (ADR-058)."
 
           BODY=$(gh api "repos/${REPO}/pulls/${PR}" -q '.body // ""')
-
-          # grep, not ${VAR//pat/}: bash pattern substitution is pathological on large
-          # bodies (a 41 KB description hung for minutes in testing).
-          if ! printf '%s' "$BODY" | grep -q '[^[:space:]]'; then
-            echo "::error::This PR changes crates/inference or crates/embed and has an empty description. ADR-058 requires a bench-compare disposition."
-            exit 1
-          fi
-
-          # The section opener must be a MARKDOWN HEADING containing "bench-compare",
-          # not any prose line mentioning it: otherwise a Summary sentence like "run
-          # make bench-compare" opens the section and the real disposition heading is
-          # never checked. tolower(), not IGNORECASE: IGNORECASE is a gawk extension;
-          # mawk (the Ubuntu runner default) accepts the assignment and ignores it, so
-          # the match would silently become case-sensitive. Terminate only on a heading
-          # at the same or shallower depth than the opener, so a "### Round 1" under
-          # "## bench-compare" counts as section content.
-          SECTION=$(printf '%s' "$BODY" | awk '
-            function level(s) { if (match(s, /^#{1,6}[[:space:]]/)) { return RLENGTH - 1 } return 0 }
-            {
-              lv = level($0)
-              if (found && lv > 0 && lv <= start_lv) { exit }
-              if (!found && lv > 0 && tolower($0) ~ /bench-?compare/) { found = 1; start_lv = lv }
-              if (found) { print }
-            }
-          ')
-
-          if ! printf '%s' "$SECTION" | grep -q '[^[:space:]]'; then
-            echo "::error::No bench-compare disposition heading found in the PR description."
-            echo ""
-            echo "ADR-058: every PR touching crates/inference or crates/embed carries before/after numbers."
-            echo "Put them under a heading, e.g.  ## bench-compare disposition"
-            echo "Run:  make bench-compare BENCH_GROUPS_INFERENCE=... BENCH_GROUPS_EMBED=..."
-            echo "and paste the table. If nothing moved, say so with the p-values. If the change is"
-            echo "compiled out of the bench build, name the cfg gate and the bench feature set and"
-            echo "state that base and head bench binaries have identical effective source."
-            exit 1
-          fi
-
-          # Strip the heading line itself before measuring, so a bare "## bench-compare"
-          # with nothing under it cannot satisfy the gate.
-          CONTENT=$(printf '%s' "$SECTION" | tail -n +2 | tr -d '[:space:]')
-          if [ "${#CONTENT}" -lt 80 ]; then
-            echo "::error::The bench-compare section is present but essentially empty (${#CONTENT} chars of content)."
-            echo ""
-            echo "State the actual disposition: an A/B table, an explicit no-change result with"
-            echo "p-values, or the structural argument for why the diff is compiled out of the"
-            echo "bench binaries."
-            exit 1
-          fi
-
-          echo "bench-compare disposition present (${#CONTENT} chars of content)."
+          printf '%s' "$BODY" | bash scripts/bench_disposition_check.sh
