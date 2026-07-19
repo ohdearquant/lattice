@@ -9434,8 +9434,21 @@ mod inner {
                 engine.mask_logits(gs, &mut prefill_logits);
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: prompt_len,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: Some(StopReason::Grammar),
+                            token_logprobs: vec![],
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -9577,6 +9590,18 @@ mod inner {
             let mut stopped = false;
             let mut stop_reason = StopReason::Length;
             for _ in 1..gen_cfg.max_new_tokens {
+                // A grammar state that is complete with no legal continuation is
+                // a successful stop. Checked before the forward step, mirroring
+                // the CPU paths: past this point mask_logits would block every
+                // token and the all-blocked guard below would misreport the
+                // completed generation as GrammarConstraintBlocked (#1064).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -14420,8 +14445,21 @@ mod inner {
                 engine.mask_logits(gs, &mut prefill_logits);
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: prompt_len,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: Some(StopReason::Grammar),
+                            token_logprobs: vec![],
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -14575,6 +14613,18 @@ mod inner {
                 if should_cancel() {
                     stopped_by_caller = true;
                     stop_reason = StopReason::Interrupt;
+                    break;
+                }
+                // A grammar state that is complete with no legal continuation is
+                // a successful stop. Checked before the forward step, mirroring
+                // the CPU paths: past this point mask_logits would block every
+                // token and the all-blocked guard below would misreport the
+                // completed generation as GrammarConstraintBlocked (#1064).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
                     break;
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -17324,8 +17374,30 @@ mod inner {
                 engine.mask_logits(gs, &mut prefill_logits);
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(CachedGenerateOutput {
+                            output: GenerateOutput {
+                                text: String::new(),
+                                token_ids: vec![],
+                                prompt_tokens: prompt_len,
+                                generated_tokens: 0,
+                                stopped: true,
+                                stop_reason: Some(StopReason::Grammar),
+                                token_logprobs: vec![],
+                            },
+                            cache: CrossTurnCacheStats {
+                                slot_id,
+                                prompt_tokens: prompt_len,
+                                reused_tokens: plan.reusable_len,
+                                prefetched_tokens: plan.suffix_len,
+                                mode: plan.mode,
+                            },
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -17520,6 +17592,18 @@ mod inner {
                 if should_cancel() {
                     stopped_by_caller = true;
                     stop_reason = StopReason::Interrupt;
+                    break;
+                }
+                // A grammar state that is complete with no legal continuation is
+                // a successful stop. Checked before the forward step, mirroring
+                // the CPU paths: past this point mask_logits would block every
+                // token and the all-blocked guard below would misreport the
+                // completed generation as GrammarConstraintBlocked (#1064).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
                     break;
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -35151,36 +35235,41 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // -----------------------------------------------------------------------
-        // Grammar fail-closed DECODE-LOOP integration tests (#611)
+        // Grammar DECODE-LOOP integration tests (#611 fail-closed + #1064
+        // completion-is-success)
         //
         // The three tests above only reach the post-prefill masking site: their
-        // fixture blocks every vocab entry from step 0, so `has_finite_logit`
-        // never survives long enough to exercise the second, structurally
-        // identical guard a few lines below in the decode loop of each function
-        // (`generate` :10502, `generate_streaming_with_cancel` :14821,
-        // `generate_streaming_with_prefix_cache_inner` :16975). Reverting any one
-        // of those three decode-loop guards left the three tests above green.
+        // fixture blocks every vocab entry from step 0. The decode loop of each
+        // function (`generate`, `generate_streaming_with_cancel`,
+        // `generate_streaming_with_prefix_cache_inner`) carries two distinct
+        // grammar contracts, each pinned by its own fixture below:
         //
-        // Fixture: a real (non-empty) single-byte vocab table plus the GBNF
-        // grammar `root ::= "a"`. Token id 0 in `single_char_vocab_tokenizer` is
-        // `'a'`, so the initial-state mask allows exactly that one token and
-        // blocks the other 31. After `'a'` is sampled and the grammar state
-        // advances past it, the PDA stack is empty AND `complete == true`
-        // (`GrammarState::can_accept_more()` is `false`), so the *next* mask
-        // blocks all 32 tokens — the fixed point this test targets is one step
-        // later than the prefill-blocked fixture above. `max_new_tokens: 2`
-        // is required so the loop actually reaches the decode iteration that
-        // hits the second mask; with `max_new_tokens: 1` the function would
-        // return successfully after the prefill token and never reach the
-        // decode-loop guard at all.
+        // 1. COMPLETION (#1064): GBNF `root ::= "a"`. Token id 0 in
+        //    `single_char_vocab_tokenizer` is `'a'`; after `'a'` is sampled and
+        //    the grammar advances past it, the state is complete with no legal
+        //    continuation (`is_complete_without_continuation` is true). That is
+        //    a SUCCESSFUL stop: the loop-top completion check must return the
+        //    generated text with `stopped: true` / `StopReason::Grammar`,
+        //    exactly like the CPU paths. Before #1064 the Metal loops missed
+        //    this check, ran one more mask (all 32 logits blocked), and
+        //    misreported the completed generation as GrammarConstraintBlocked.
+        //    Mutation sensitivity: reverting the loop-top completion check at
+        //    the corresponding site restores exactly that misclassification and
+        //    each Ok(...) assertion below fails with the typed error.
         //
-        // Mutation sensitivity: reverting the decode-loop `has_finite_logit`
-        // guard at the corresponding site leaves the all-`NEG_INFINITY` second
-        // mask in place, and the sampler's non-finite-max short-circuit then
-        // silently returns a token instead of failing — each assertion below
-        // fails instead of passing. Verified by temporarily reverse-applying
-        // the guard at each site (`touch`-ing the file so cargo rebuilds) and
-        // re-running these three tests; restored afterward.
+        // 2. DEAD END (#611): GBNF `root ::= "a" "!"`. `'!'` is not in the
+        //    32-entry vocab (`'a'..='z'`, `'A'..='F'`), so after `'a'` the
+        //    grammar requires a byte no token can supply: the state is NOT
+        //    complete and the next mask blocks all 32 tokens. That must remain
+        //    a hard `GrammarConstraintBlocked` error via the decode-loop
+        //    `has_finite_logit` guard. Mutation sensitivity: reverting that
+        //    guard lets the sampler's non-finite-max short-circuit silently
+        //    return a token instead of failing.
+        //
+        // Both fixtures need `max_new_tokens: 2` so the loop actually reaches
+        // the decode iteration after the prefill-derived token; with
+        // `max_new_tokens: 1` the function returns at the cap and exercises
+        // neither site.
 
         /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
         /// order (`'a'..='z'` then `'A'..='F'`), so a `GrammarEngine` built
@@ -35199,10 +35288,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .collect()
         }
 
-        /// #611: `generate`'s DECODE-LOOP grammar-masking site
-        /// (:10502) must fail closed too, not just the post-prefill site.
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate`, not a constraint failure.
         #[test]
-        fn generate_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+        fn generate_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -35213,7 +35302,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -35245,21 +35333,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
-            assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard once the second step's mask blocks every \
-                 continuation; got {result:?}"
+            let output = result.expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "a",
+                "the completing token must be in the output text"
             );
+            assert_eq!(output.generated_tokens, 1);
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
         }
 
-        /// #611: `generate_streaming`'s DECODE-LOOP grammar-masking
-        /// site (`generate_streaming_with_cancel` :14821) must fail closed
-        /// too. Also asserts `on_token` is invoked at most once — the
-        /// fail-open bug this closes would otherwise emit a bogus second
-        /// token to the caller instead of erroring.
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate_streaming`, and the completing token's delta
+        /// reaches `on_token` exactly once.
         #[test]
-        fn generate_streaming_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+        fn generate_streaming_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -35270,7 +35358,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -35302,31 +35389,28 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let mut on_token_calls = 0u32;
-            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+            let mut streamed = String::new();
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
                 on_token_calls += 1;
+                streamed.push_str(delta);
                 true
             });
 
-            assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard via generate_streaming(); got {result:?}"
+            let output = result.expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(output.text, "a");
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(
+                on_token_calls, 1,
+                "exactly the completing token's delta reaches on_token"
             );
-            assert!(
-                on_token_calls <= 1,
-                "the decode-loop guard must fire before a second (bogus) token \
-                 ever reaches on_token; got {on_token_calls} calls"
-            );
+            assert_eq!(streamed, "a");
         }
 
-        /// #611: `generate_streaming_with_prefix_cache`'s
-        /// DECODE-LOOP grammar-masking site (inside
-        /// `generate_streaming_with_prefix_cache_inner` :16975) must fail
-        /// closed too, AND the public wrapper's error path must not save a
-        /// cache entry the decode-loop failure invalidated.
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate_streaming_with_prefix_cache` too.
         #[test]
-        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_blocking_second_token()
-         {
+        fn generate_streaming_with_prefix_cache_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -35337,7 +35421,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -35377,11 +35460,192 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 |_, _| true,
             );
 
+            let output = result
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "a");
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// #611: a grammar that dead-ends mid-document (`root ::= "a" "!"`,
+        /// with `'!'` absent from the vocab) must still fail closed at
+        /// `generate`'s decode-loop `has_finite_logit` guard: the state is not
+        /// complete, so the all-blocked mask is a real constraint failure.
+        #[test]
+        fn generate_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
             assert!(
                 matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard via generate_streaming_with_prefix_cache(); \
-                 got {result:?}"
+                "a grammar whose only continuation byte has no vocab token must \
+                 fail closed at the decode-loop guard; got {result:?}"
+            );
+        }
+
+        /// #611: the same mid-document dead end must fail closed via
+        /// `generate_streaming` as well, with at most the first (legal) token
+        /// reaching `on_token`.
+        #[test]
+        fn generate_streaming_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let mut on_token_calls = 0u32;
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                on_token_calls += 1;
+                true
+            });
+
+            assert!(
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
+                "a mid-document grammar dead end must fail closed via \
+                 generate_streaming(); got {result:?}"
+            );
+            assert!(
+                on_token_calls <= 1,
+                "the decode-loop guard must fire before a second (bogus) token \
+                 ever reaches on_token; got {on_token_calls} calls"
+            );
+        }
+
+        /// #611: the same mid-document dead end must fail closed via
+        /// `generate_streaming_with_prefix_cache`, and the error path must not
+        /// leave a cache entry behind.
+        #[test]
+        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
+                "a mid-document grammar dead end must fail closed via \
+                 generate_streaming_with_prefix_cache(); got {result:?}"
             );
             assert!(
                 state.cross_turn_prefix_cache.entry.is_none(),
