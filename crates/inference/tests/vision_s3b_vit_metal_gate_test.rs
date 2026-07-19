@@ -97,6 +97,7 @@ mod gated {
             num_position_embeddings: 2304,
             in_channels: 3,
             deepstack_visual_indexes: vec![],
+            intermediate_size: None,
         }
     }
 

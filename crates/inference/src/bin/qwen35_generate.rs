@@ -298,18 +298,10 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
         return 1;
     }
 
-    // Force continuation past EOS / configured stop-token ids so this trial
-    // always decodes the exact requested token count. `GenerateConfig` is a
-    // plain public-literal struct with a `Default` impl -- a dedicated
-    // request-scoped field there would be `constructible_struct_adds_field`
-    // under `cargo-semver-checks` (a semver-major break); overriding the
-    // model's own post-load `eos_token_id` instead (via `config_mut`, the
-    // idiom this crate's own test suite already uses) plus
-    // `stop_token_ids: vec![]` below achieves the identical effect through
-    // `should_stop_token` (the single shared stop predicate every CPU/Metal
-    // decode loop calls) without adding any new public surface to
-    // `GenerateConfig`.
-    model.config_mut().eos_token_id = u32::MAX;
+    // Force continuation past EOS so this trial always decodes the exact requested
+    // token count: override the model's post-load `eos_token_id` to a value no real
+    // token can match, paired with `stop_token_ids: vec![]` below.
+    model.set_eos_token_id(u32::MAX);
 
     // The deterministic profile (DESIGN.md section 2 "initial inference
     // profile"): greedy, EOS disabled (forced fixed-length decode),

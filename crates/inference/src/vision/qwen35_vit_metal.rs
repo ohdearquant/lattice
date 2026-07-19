@@ -352,6 +352,7 @@ mod tests {
             num_position_embeddings: 16,
             in_channels: 1,
             deepstack_visual_indexes: vec![],
+            intermediate_size: None,
         }
     }
 

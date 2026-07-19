@@ -84,6 +84,12 @@ tokenizers = { version = "0.22", optional = true, default-features = false, feat
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 lattice-fann = { version = "0.7.0", path = "../fann", optional = true }
 
+# fd-bind path containment (F_GETPATH) for the manifest-driven checkpoint loaders --
+# closes the canonicalize-then-reopen TOCTOU window; see `weights/f32_weights.rs`'s
+# `open_contained_manifest_file`. macOS-only: F_GETPATH is a Darwin/BSD `fcntl` command.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [[bin]]
 name = "lattice"
 path = "src/bin/lattice.rs"

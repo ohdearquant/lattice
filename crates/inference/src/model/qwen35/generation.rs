@@ -3180,7 +3180,7 @@ mod tests {
         );
     }
 
-    /// `Qwen35Model::config_mut().eos_token_id = u32::MAX` combined with
+    /// `Qwen35Model::set_eos_token_id().eos_token_id = u32::MAX` combined with
     /// `GenerateConfig::stop_token_ids: vec![]` (the flagship CPU/Metal
     /// benchmark determinism knob -- `qwen35_generate --emit-phase-events`,
     /// PR #882) must force continuation past a token that would otherwise
@@ -3197,12 +3197,12 @@ mod tests {
     /// setter) does not incur.
     ///
     /// Two-phase design (baseline, then override), both driven through
-    /// `config_mut()`: `build_tiny_zero_model` always greedy-samples token 0
+    /// `set_eos_token_id()`: `build_tiny_zero_model` always greedy-samples token 0
     /// from this all-zero-logit fixture (see the sibling comment on
     /// `stop_reason_eos_on_first_stop_token`), so phase 1 first points the
-    /// model's own `eos_token_id` AT 0 via `config_mut()` and confirms that
+    /// model's own `eos_token_id` AT 0 via `set_eos_token_id()` and confirms that
     /// alone stops generation immediately (`StopReason::Eos`, 0 tokens
-    /// emitted) -- this is itself mutation-sensitive to `config_mut()`
+    /// emitted) -- this is itself mutation-sensitive to `set_eos_token_id()`
     /// returning a real reference into
     /// `Qwen35Model`'s private `config` field rather than, say, a detached
     /// clone: a detached clone would leave the real `eos_token_id` at its
@@ -3222,7 +3222,7 @@ mod tests {
 
         // Phase 1 (baseline): point eos_token_id at the always-sampled
         // token 0 -- must stop after exactly 1 token.
-        model.config_mut().eos_token_id = 0;
+        model.set_eos_token_id(0);
         let baseline = model
             .generate("a", &gen_cfg)
             .expect("baseline generate must succeed");
@@ -3231,7 +3231,7 @@ mod tests {
             Some(StopReason::Eos),
             "sanity: eos_token_id = 0 must stop generation on the first greedy-sampled \
              token (this fixture always samples token 0); got {:?} -- if this fails, \
-             config_mut() is not reaching the real config should_stop_token reads",
+             set_eos_token_id() is not reaching the real config should_stop_token reads",
             baseline.stop_reason
         );
         assert_eq!(
@@ -3245,7 +3245,7 @@ mod tests {
 
         // Phase 2 (the benchmark override): push eos_token_id out of the
         // reachable vocab range -- the same config now runs to max_new_tokens.
-        model.config_mut().eos_token_id = u32::MAX;
+        model.set_eos_token_id(u32::MAX);
         let result = model
             .generate("a", &gen_cfg)
             .expect("eos-override generate must succeed");
@@ -3279,7 +3279,7 @@ mod tests {
             should_stop_token(&model.config, &base_cfg, original_eos_token_id),
             "sanity: without the override, the model's own eos_token_id must stop generation"
         );
-        model.config_mut().eos_token_id = u32::MAX;
+        model.set_eos_token_id(u32::MAX);
         assert!(
             !should_stop_token(&model.config, &base_cfg, original_eos_token_id),
             "eos_token_id override must suppress a match against the model's original \
