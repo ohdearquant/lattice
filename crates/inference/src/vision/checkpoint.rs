@@ -241,7 +241,9 @@ fn load_from_q4_dir(
                 entry.name,
             )));
         }
-        let file_path = model_dir.join(&entry.file);
+        // Manifest-declared file names are untrusted checkpoint content;
+        // containment-check before reading (#1069).
+        let file_path = crate::weights::contained_shard_path(model_dir, &entry.file)?;
         let (data, shape) = if entry.quantized.unwrap_or(false) {
             let q4 = load_q4_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
@@ -692,6 +694,36 @@ mod tests {
         .expect("test setup: write manifest");
 
         assert_fc2_shape_mismatch(load_qwen35_vision_weights(tmp.path(), &cfg));
+    }
+
+    /// #1069: quantize_index.json file entries are untrusted checkpoint
+    /// content; an entry escaping the model directory must be rejected
+    /// before its file is read.
+    #[test]
+    fn q4_manifest_entry_escaping_model_dir_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        std::fs::create_dir_all(&model_dir).expect("test setup");
+        // A structurally valid q4 file OUTSIDE the model dir — containment,
+        // not file validity, must be what rejects the entry.
+        let data = vec![0.25_f64; 4];
+        let q4 = crate::weights::q4_weights::quantize_f64_to_q4(&data, &[2, 2])
+            .expect("quantize succeeds");
+        crate::weights::q4_weights::save_q4_file(&tmp.path().join("evil.q4"), &q4)
+            .expect("test setup: write q4 file");
+        std::fs::write(
+            model_dir.join("quantize_index.json"),
+            r#"[{"name":"model.visual.evil","file":"../evil.q4","quantized":true}]"#,
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(&model_dir, &tiny_vision_cfg())
+            .expect_err("escaping manifest entry must be rejected");
+        assert!(
+            err.to_string()
+                .contains("must stay within the model directory"),
+            "unexpected error: {err}"
+        );
     }
 
     fn write_khf1_f16_file(path: &Path, shape: &[usize], values: &[f32]) {
