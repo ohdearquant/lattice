@@ -580,8 +580,14 @@ jobs:
   # any CI job before this issue's step-2 migrations landed; this closes
   # that gap for all of them at once rather than repeating the same
   # omission per migrated script.)
-  bench-decode-harness-tests:
-    name: bench-decode-harness-tests
+  # The job/check name says "unit-tests (no engine)" on purpose: a green
+  # check here proves harness plumbing and parameter transcription ONLY.
+  # No benchmark runs, no engine binary executes, no throughput number is
+  # produced or validated by this job — reading it as bench evidence is
+  # exactly the misread its old name ("bench-decode-harness-tests")
+  # invited on the #813 migration PRs.
+  decode-harness-unit-tests:
+    name: decode-harness-unit-tests (no engine)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
