@@ -49,7 +49,7 @@ model library from a single window. To build and install it, follow the step-by-
 | Grammar decoding       | Constrained output via a pushdown automaton. OpenAI string-level stop sequences.                                                                                                                                                                                                                                     |
 | MRL support            | Matryoshka truncation for Qwen3-Embedding models (output dimension >= 32).                                                                                                                                                                                                                                           |
 | LRU cache              | `CachedEmbeddingService` with sharded in-memory cache and hit/miss stats.                                                                                                                                                                                                                                            |
-| Knowledge distillation | Train small models from Claude/GPT/Gemini teacher soft labels via `lattice-tune`.                                                                                                                                                                                                                                    |
+| Knowledge distillation | Distillation pipeline in `lattice-tune`: teacher-label schema, batching, and stats. Live Claude/GPT/Gemini teacher transport is not yet wired; labeling fails closed rather than simulating (a deterministic simulated-teacher path exists behind a non-default feature for tests).                                     |
 | Optimal transport      | Sinkhorn-Knopp solver for embedding drift detection via `lattice-transport`.                                                                                                                                                                                                                                         |
 
 ---
@@ -66,12 +66,17 @@ but the stored values predate it and have not been re-measured). Tracking:
 [`docs/bench_results/`](docs/bench_results/) with provenance annotations.
 
 To measure on your own hardware: `./scripts/bench_context_scaling.sh`. It reports
-**decode-only** rates: steady-state token generation speed with prompt prefill and one-time
-model load excluded. Per-token decode latency is fit as `t = intercept + slope * ctx` across
-several context lengths (the "slope method") and reported as `1000 / t` at each, where context
-is the number of tokens already in the KV cache when the measured token is decoded. The
-wall-clock speed you observe in an interactive chat is lower than these numbers, because it
-also includes prefill of the whole prompt (see "Why throughput falls with context" below).
+**decode-only** marginal rates: for each context length `C` it times a short `N1 = 8`-token
+baseline generation and a `C`-token generation from the same fixed prompt, then reports
+`(C - 8) / (T(C) - T(8))` tokens/s — the average marginal decode rate over the `[8, C]`
+window, aggregated as the median of N runs (default 5). Prompt prefill cancels in the
+subtraction. Model load is kept out of the measured window per engine as follows: the Lattice
+leg times `generate()` after an in-process load, the MLX leg gets an explicit 4-token warmup,
+and the Ollama leg relies on the median across runs to shed a cold first request (its API's
+`total_duration` includes load time, so a single-run invocation can still include it —
+a known harness limitation noted in [#1060](https://github.com/ohdearquant/lattice/issues/1060)).
+The wall-clock speed you observe in an interactive chat is lower than these numbers, because
+it also includes prefill of the whole prompt (see "Why throughput falls with context" below).
 
 ### Why throughput falls with context
 
