@@ -311,7 +311,15 @@ pub fn try_approximate_dot_product_prepared(
     approximate_dot_product_prepared(query, stored)
 }
 
-/// Computes prepared cosine distance, using the `Full` unit-norm fast path when asserted.
+/// Computes prepared cosine distance; hints are accepted but do not select a
+/// separate code path.
+///
+/// The former `Full` unit-norm "fast path" (skip norm division when both sides
+/// assert unit norm) was measurably slower than the general path it guarded:
+/// verifying the stored side's norm plus the query dot takes two O(d) passes,
+/// while [`cosine_similarity`] computes the dot and both norms in one fused
+/// pass. With the guard it was also a correctness risk, trusting release-time
+/// hints. Delegating unconditionally is both the fastest and the safest shape.
 ///
 /// Returns [`EmbedError::TierMismatch`] for a tier mismatch.
 /// See [`docs/simd.md`](../../docs/simd.md#prepared-queries-and-tier-matching) for hint semantics.
@@ -319,16 +327,8 @@ pub fn try_approximate_dot_product_prepared(
 pub fn approximate_cosine_distance_prepared_with_meta(
     meta: &PreparedQueryWithMeta,
     stored: &QuantizedData,
-    stored_norm: NormalizationHint,
+    _stored_norm: NormalizationHint,
 ) -> Result<f32> {
-    if meta.norm == NormalizationHint::Unit
-        && stored_norm == NormalizationHint::Unit
-        && let (PreparedQuery::Full(q), QuantizedData::Full(s)) = (&meta.query, stored)
-        && is_unit_norm(s)
-    {
-        let dot = dot_product(q, s);
-        return Ok(1.0 - dot.clamp(-1.0, 1.0));
-    }
     approximate_cosine_distance_prepared(&meta.query, stored)
 }
 
