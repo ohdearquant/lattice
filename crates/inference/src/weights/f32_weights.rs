@@ -1096,12 +1096,24 @@ pub struct ShardedSafetensors {
 /// above the model directory, and no filesystem state is consulted,
 /// leaving no check-to-open window to race.
 ///
+/// # Threat model
+///
+/// Manifest STRINGS are untrusted; the local FILESYSTEM is trusted.
 /// Symlinks are deliberately followed at open time, matching peer loaders
 /// (HF transformers, candle, llama.cpp). The HuggingFace hub cache stores
 /// snapshots as symlink farms (`snapshots/<rev>/x.safetensors ->
 /// ../../blobs/<sha>`) and lattice loads those directories directly;
 /// resolving symlinks and requiring the resolved target to stay beneath
-/// the model directory would reject every hub-cache checkpoint.
+/// the model directory — or refusing to follow symlinks at all — would
+/// reject every hub-cache checkpoint (pinned by
+/// `sharded_loader_follows_hub_cache_snapshot_layout`, which fails under
+/// exactly such a policy). A symlink planted inside the model directory
+/// is therefore honored by design: an actor who can write the model
+/// directory already controls every byte the loader reads, so blocking
+/// links there defends nothing, and archive-extraction tools are the
+/// correct place to refuse hostile symlinks. Do not "re-harden" this
+/// helper to resolve or reject symlinks without revisiting that decision
+/// trail (#1069, #1072).
 pub fn contained_shard_path(model_dir: &Path, shard_file: &str) -> Result<PathBuf, InferenceError> {
     let rel = Path::new(shard_file);
     if rel.as_os_str().is_empty() {
