@@ -56,24 +56,26 @@ model library from a single window. To build and install it, follow the step-by-
 
 ## Benchmarks
 
-Measured on Apple M2 Max, Qwen3.5-0.8B. Greedy decoding, median of 5 runs.
+The cross-engine decode throughput table previously published here (Lattice vs Ollama vs MLX
+at several context lengths) is withdrawn until a multi-session baseline program replaces it.
+Two reasons: the published rates came from single-session runs on one machine, and the shell
+pipeline that derived them truncated intermediate precision (that pipeline has since been
+replaced by `scripts/bench_decode_harness.py`, [#938](https://github.com/ohdearquant/lattice/pull/938),
+but the stored values predate it and have not been re-measured). Tracking:
+[#1060](https://github.com/ohdearquant/lattice/issues/1060). The raw measurements remain in
+[`docs/bench_results/`](docs/bench_results/) with provenance annotations.
 
-These are **decode-only** rates: steady-state token generation speed with prompt prefill and
-one-time model load excluded. Per-token decode latency is fit as `t = intercept + slope * ctx`
-across several context lengths (the "slope method") and reported as `1000 / t` at each. `Context`
-is the number of tokens already in the KV cache when the measured token is decoded. The wall-clock
-speed you observe in an interactive chat is lower than these numbers, because it also includes
-prefill of the whole prompt (see "Why throughput falls with context" below).
-
-| Context | Lattice (Q8, f16 head) | Ollama (Q8_0) | MLX (Q8 g64, AMX) | Lattice vs Ollama |
-| ------- | ---------------------- | ------------- | ----------------- | ----------------- |
-| 64 tok  | **187 tok/s**          | 93            | 265               | 2.0x              |
-| 128 tok | **171 tok/s**          | 92            | 263               | 1.9x              |
-| 256 tok | **146 tok/s**          | 88            | 260               | 1.6x              |
+To measure on your own hardware: `./scripts/bench_context_scaling.sh`. It reports
+**decode-only** rates: steady-state token generation speed with prompt prefill and one-time
+model load excluded. Per-token decode latency is fit as `t = intercept + slope * ctx` across
+several context lengths (the "slope method") and reported as `1000 / t` at each, where context
+is the number of tokens already in the KV cache when the measured token is decoded. The
+wall-clock speed you observe in an interactive chat is lower than these numbers, because it
+also includes prefill of the whole prompt (see "Why throughput falls with context" below).
 
 ### Why throughput falls with context
 
-Decode slows as context grows (187 → 171 → 146 tok/s above) because every generated token attends
+Decode slows as context grows because every generated token attends
 over the entire KV cache:
 
 - The grouped-query attention (GQA) layers do work proportional to context length on each token: the
@@ -91,7 +93,7 @@ see [`docs/cross-turn-cache.md`](docs/cross-turn-cache.md)); a request whose his
 append onto the retained state still falls back to a full re-prefill.
 
 MLX uses Apple's private MPS/AMX matrix engines. Lattice uses the public Metal compute API,
-the same tier as Ollama. MLX decodes faster than Lattice at raw throughput. Lattice's edge is
+the same tier as Ollama. Lattice's edge is
 portability (pure Rust, zero Python, zero framework) plus capabilities neither Ollama nor MLX
 provide for this model family:
 
@@ -101,8 +103,10 @@ provide for this model family:
 | Q4 + LoRA inference                 | yes     | no  | no     |
 | Pure Rust, zero Python or framework | yes     | no  | no     |
 
-PPL benchmark (wikitext-2, from `docs/bench_results/perplexity.tsv`): Lattice q4 19.27, q4-QuaRot 19.95 (2048 tokens); MLX q8 15.82, q4 18.18 (2041 tokens). Reproduce:
-`./scripts/bench_context_scaling.sh`
+PPL benchmark (wikitext-2, from [`docs/bench_results/perplexity.tsv`](docs/bench_results/perplexity.tsv),
+regenerated 2026-07-07): Lattice q4 16.59, q4-QuaRot 19.01 (2048 tokens); MLX q8 15.82, q4 18.18
+(2041 tokens, carried from a prior reference run — see the TSV's provenance comments). Reproduce:
+`./scripts/bench_quality.sh`
 
 ---
 
@@ -543,7 +547,7 @@ cargo bench --package lattice-embed
 cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode
 ```
 
-### Context scaling (Qwen3.5-0.8B vs Ollama vs MLX)
+### Context scaling (Qwen3.5-0.8B)
 
 ```bash
 ./scripts/bench_context_scaling.sh
