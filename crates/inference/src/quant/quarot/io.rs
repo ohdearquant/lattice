@@ -50,7 +50,7 @@ use crate::error::InferenceError;
 use crate::model::qwen35::qwen_layer_tensor_prefix;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
-use crate::weights::f32_weights::{contained_shard_path, parse_index};
+use crate::weights::{contained_shard_path, parse_index};
 
 /// On-disk storage dtype of a tensor.
 ///
@@ -1697,7 +1697,10 @@ mod tests {
         let err = QuarotTensorReader::open(&model_dir).unwrap_err();
         match err {
             InferenceError::InvalidSafetensors(msg) => {
-                assert!(msg.contains("outside the model directory"), "got: {msg}");
+                assert!(
+                    msg.contains("must stay within the model directory"),
+                    "got: {msg}"
+                );
             }
             other => panic!("expected InvalidSafetensors, got {other:?}"),
         }

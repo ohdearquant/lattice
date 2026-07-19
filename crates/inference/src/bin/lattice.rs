@@ -542,17 +542,18 @@ mod doctor {
             }
             let mut merged = HashMap::new();
             for shard_name in shard_names {
-                if !dir.join(&shard_name).exists() {
+                // Index-declared shard names are untrusted checkpoint content;
+                // resolve once through the shared containment helper, then
+                // report missing files against the resolved path (#1069).
+                let shard_path = lattice_inference::weights::contained_shard_path(dir, &shard_name)
+                    .map_err(|e| e.to_string())?;
+                if !shard_path.exists() {
                     return Err(format!(
                         "shard '{shard_name}' referenced by {} not found in {}",
                         index_path.display(),
                         dir.display()
                     ));
                 }
-                // Index-declared shard names are untrusted checkpoint content;
-                // containment-check before opening (#1069).
-                let shard_path = lattice_inference::weights::contained_shard_path(dir, &shard_name)
-                    .map_err(|e| e.to_string())?;
                 merged.extend(read_safetensors_header(&shard_path)?);
             }
             merged
@@ -746,7 +747,20 @@ mod doctor {
             let mut present_names: BTreeSet<String> = BTreeSet::new();
             let mut has_mtp_tensors = false;
             for entry in &entries {
-                let file_path = dir.join(&entry.file);
+                // Manifest-declared file names are untrusted checkpoint
+                // content; the same lexical containment the loaders apply
+                // gates the doctor's readiness accounting, so an entry the
+                // loader would reject is never counted present (#1069).
+                let Ok(file_path) =
+                    lattice_inference::weights::contained_shard_path(dir, &entry.file)
+                else {
+                    missing_tensors.push(format!(
+                        "{} (listed in quantize_index.json as '{}', \
+                         path escapes the model directory)",
+                        entry.name, entry.file
+                    ));
+                    continue;
+                };
                 match std::fs::metadata(&file_path) {
                     Ok(meta) => {
                         total_bytes +=

@@ -408,7 +408,7 @@ fn fold_weight_file_into_hasher(
     // Index-declared shard names are untrusted checkpoint content (#1069);
     // a containment failure degrades to the config-only derivation via this
     // function's existing error path, same as any other unreadable shard.
-    let path = crate::weights::f32_weights::contained_shard_path(dir, file_name)
+    let path = crate::weights::contained_shard_path(dir, file_name)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
     let mut file = std::io::BufReader::new(std::fs::File::open(&path)?);
     let len = file.get_ref().metadata()?.len();

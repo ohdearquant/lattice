@@ -1088,40 +1088,46 @@ pub struct ShardedSafetensors {
 /// Shard names come from checkpoint-controlled JSON (`model.safetensors.
 /// index.json` or a quantized-checkpoint manifest), so they are untrusted
 /// input: an absolute entry replaces `model_dir` entirely in `Path::join`,
-/// and `..` components or a symlinked entry can address files outside the
-/// checkpoint — turning a malicious model directory into an
-/// open-arbitrary-readable-file primitive (#1069). Both sides are
-/// canonicalized (resolving symlinks), the shard must remain beneath the
-/// canonicalized model directory, and the canonicalized path is returned so
-/// callers open exactly the path that was checked.
+/// and `..` components address files outside the checkpoint — turning a
+/// malicious model directory into an open-arbitrary-readable-file
+/// primitive (#1069). The validation is purely lexical — absolute paths
+/// and any parent-directory (or Windows prefix/root) component are
+/// rejected before the join — so an index entry cannot address anything
+/// above the model directory, and no filesystem state is consulted,
+/// leaving no check-to-open window to race.
 ///
-/// Scope: this guards malicious checkpoint *content* on a quiescent
-/// filesystem. It does not defend against a concurrent local attacker
-/// re-pointing directory components between this check and the caller's
-/// open; that threat requires fd-relative resolution the loaders do not
-/// need for static model directories.
+/// Symlinks are deliberately followed at open time, matching peer loaders
+/// (HF transformers, candle, llama.cpp). The HuggingFace hub cache stores
+/// snapshots as symlink farms (`snapshots/<rev>/x.safetensors ->
+/// ../../blobs/<sha>`) and lattice loads those directories directly;
+/// resolving symlinks and requiring the resolved target to stay beneath
+/// the model directory would reject every hub-cache checkpoint.
 pub fn contained_shard_path(model_dir: &Path, shard_file: &str) -> Result<PathBuf, InferenceError> {
-    let dir = model_dir.canonicalize().map_err(|e| {
-        InferenceError::InvalidSafetensors(format!(
-            "cannot canonicalize model directory {}: {e}",
-            model_dir.display()
-        ))
-    })?;
-    let candidate = model_dir.join(shard_file);
-    let resolved = candidate.canonicalize().map_err(|e| {
-        InferenceError::InvalidSafetensors(format!(
-            "shard entry {shard_file:?}: cannot resolve {}: {e}",
-            candidate.display()
-        ))
-    })?;
-    if !resolved.starts_with(&dir) {
+    let rel = Path::new(shard_file);
+    if rel.as_os_str().is_empty() {
+        return Err(InferenceError::InvalidSafetensors(
+            "shard entry is empty; index entries must name a file within the model directory"
+                .to_string(),
+        ));
+    }
+    if rel.is_absolute() {
         return Err(InferenceError::InvalidSafetensors(format!(
-            "shard entry {shard_file:?} resolves to {}, outside the model directory {}",
-            resolved.display(),
-            dir.display()
+            "shard entry {shard_file:?} is an absolute path; \
+             index entries must stay within the model directory"
         )));
     }
-    Ok(resolved)
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "shard entry {shard_file:?} escapes the model directory; \
+                     index entries must stay within the model directory"
+                )));
+            }
+        }
+    }
+    Ok(model_dir.join(rel))
 }
 
 /// Parse `model.safetensors.index.json` from a model directory.
@@ -2558,7 +2564,8 @@ mod tests {
             "unexpected error kind: {err}"
         );
         assert!(
-            err.to_string().contains("outside the model directory"),
+            err.to_string()
+                .contains("must stay within the model directory"),
             "unexpected error: {err}"
         );
 
@@ -2578,7 +2585,8 @@ mod tests {
         let err = contained_shard_path(&dir, "../secret.bin")
             .expect_err("parent traversal must be rejected");
         assert!(
-            err.to_string().contains("outside the model directory"),
+            err.to_string()
+                .contains("must stay within the model directory"),
             "unexpected error: {err}"
         );
         assert!(
@@ -2589,25 +2597,37 @@ mod tests {
         fs::remove_dir_all(&outer).ok();
     }
 
-    /// #1069: a symlink inside the model directory pointing outside it must
-    /// be rejected — canonicalization resolves the link before the
-    /// containment check.
+    /// The HuggingFace hub cache stores snapshots as symlink farms:
+    /// `snapshots/<rev>/model.safetensors -> ../../blobs/<sha>`. Lattice
+    /// loads those directories directly (the e2e workflows point the
+    /// engine at `snapshot_download()` output), so index-entry validation
+    /// must stay lexical — a policy that resolved symlinks and required
+    /// the target beneath the model directory would reject every
+    /// hub-cache checkpoint. This pins the layout end-to-end through
+    /// `load_sharded`.
     #[cfg(unix)]
     #[test]
-    fn contained_shard_path_rejects_symlink_escape() {
-        let outer = temp_dir("lattice_containment_symlink_test");
-        let dir = outer.join("model");
+    fn sharded_loader_follows_hub_cache_snapshot_layout() {
+        let outer = temp_dir("lattice_containment_hub_layout_test");
+        let blobs = outer.join("blobs");
+        let dir = outer.join("snapshots").join("rev");
+        fs::create_dir_all(&blobs).expect("test setup");
         fs::create_dir_all(&dir).expect("test setup");
-        let target = outer.join("outside.safetensors");
-        fs::write(&target, b"x").expect("test setup");
-        std::os::unix::fs::symlink(&target, dir.join("link.safetensors")).expect("test setup");
+        write_single_f32_tensor(&blobs.join("blob-sha"), "tensor.a", &[1.0, 2.0]);
+        std::os::unix::fs::symlink(
+            Path::new("../../blobs/blob-sha"),
+            dir.join("model.safetensors"),
+        )
+        .expect("test setup");
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"metadata": {}, "weight_map": {"tensor.a": "model.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
 
-        let err = contained_shard_path(&dir, "link.safetensors")
-            .expect_err("symlink escaping the model dir must be rejected");
-        assert!(
-            err.to_string().contains("outside the model directory"),
-            "unexpected error: {err}"
-        );
+        let tensors =
+            load_sharded(&dir).expect("hub-cache snapshot layout must load through the symlink");
+        assert_eq!(tensors["tensor.a"].data, vec![1.0, 2.0]);
 
         fs::remove_dir_all(&outer).ok();
     }
@@ -2631,7 +2651,8 @@ mod tests {
 
         let err = load_sharded(&dir).expect_err("load_sharded must reject the escaping entry");
         assert!(
-            err.to_string().contains("outside the model directory"),
+            err.to_string()
+                .contains("must stay within the model directory"),
             "unexpected error: {err}"
         );
 
@@ -2641,14 +2662,16 @@ mod tests {
             .get_f32_tensor_owned("tensor.a")
             .expect_err("lazy loader must reject the escaping entry at access time");
         assert!(
-            err.to_string().contains("outside the model directory"),
+            err.to_string()
+                .contains("must stay within the model directory"),
             "unexpected error: {err}"
         );
         let err = st
             .resolve_weight("tensor.a")
             .expect_err("resolve_weight must reject the escaping entry");
         assert!(
-            err.to_string().contains("outside the model directory"),
+            err.to_string()
+                .contains("must stay within the model directory"),
             "unexpected error: {err}"
         );
 
