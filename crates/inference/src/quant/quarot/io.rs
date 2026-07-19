@@ -50,7 +50,7 @@ use crate::error::InferenceError;
 use crate::model::qwen35::qwen_layer_tensor_prefix;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
-use crate::weights::f32_weights::parse_index;
+use crate::weights::f32_weights::{contained_shard_path, parse_index};
 
 /// On-disk storage dtype of a tensor.
 ///
@@ -849,7 +849,9 @@ impl QuarotTensorReader {
                 if shards.contains_key(shard_file) {
                     continue;
                 }
-                let shard = Shard::open(&model_dir.join(shard_file))?;
+                // Index-declared shard names are untrusted checkpoint content;
+                // containment-check before mapping (#1069).
+                let shard = Shard::open(&contained_shard_path(model_dir, shard_file)?)?;
                 shards.insert(shard_file.clone(), shard);
             }
             Ok(Self {
@@ -1668,6 +1670,37 @@ mod tests {
         assert_eq!(reader.tensor_names(), vec!["other.weight".to_string()]);
         let err = reader.read_tensor_f64("required.weight").unwrap_err();
         assert!(matches!(err, InferenceError::MissingTensor(_)));
+    }
+
+    /// #1069: a weight_map entry that escapes the model directory (here via
+    /// `..` traversal to a structurally valid shard outside it) must be
+    /// rejected at open time, before anything is memory-mapped.
+    #[test]
+    fn sharded_index_entry_escaping_model_dir_is_rejected() {
+        let outer = tempfile::tempdir().unwrap();
+        let model_dir = outer.path().join("model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        write_safetensors(
+            &outer.path().join("evil.safetensors"),
+            &[("t.weight", FixtureDType::F32, vec![1], &[1.0])],
+        );
+        let index = serde_json::json!({
+            "metadata": {"total_size": 4usize},
+            "weight_map": {"t.weight": "../evil.safetensors"},
+        });
+        std::fs::write(
+            model_dir.join("model.safetensors.index.json"),
+            serde_json::to_string(&index).unwrap(),
+        )
+        .unwrap();
+
+        let err = QuarotTensorReader::open(&model_dir).unwrap_err();
+        match err {
+            InferenceError::InvalidSafetensors(msg) => {
+                assert!(msg.contains("outside the model directory"), "got: {msg}");
+            }
+            other => panic!("expected InvalidSafetensors, got {other:?}"),
+        }
     }
 
     /// Index declares `required.weight` in a shard that DOES contain a

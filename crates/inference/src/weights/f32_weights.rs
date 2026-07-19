@@ -1082,6 +1082,48 @@ pub struct ShardedSafetensors {
     shards: HashMap<String, SafetensorsFile>,
 }
 
+/// Resolve an index-declared shard file name beneath `model_dir`, rejecting
+/// entries that escape the model directory.
+///
+/// Shard names come from checkpoint-controlled JSON (`model.safetensors.
+/// index.json` or a quantized-checkpoint manifest), so they are untrusted
+/// input: an absolute entry replaces `model_dir` entirely in `Path::join`,
+/// and `..` components or a symlinked entry can address files outside the
+/// checkpoint — turning a malicious model directory into an
+/// open-arbitrary-readable-file primitive (#1069). Both sides are
+/// canonicalized (resolving symlinks), the shard must remain beneath the
+/// canonicalized model directory, and the canonicalized path is returned so
+/// callers open exactly the path that was checked.
+///
+/// Scope: this guards malicious checkpoint *content* on a quiescent
+/// filesystem. It does not defend against a concurrent local attacker
+/// re-pointing directory components between this check and the caller's
+/// open; that threat requires fd-relative resolution the loaders do not
+/// need for static model directories.
+pub fn contained_shard_path(model_dir: &Path, shard_file: &str) -> Result<PathBuf, InferenceError> {
+    let dir = model_dir.canonicalize().map_err(|e| {
+        InferenceError::InvalidSafetensors(format!(
+            "cannot canonicalize model directory {}: {e}",
+            model_dir.display()
+        ))
+    })?;
+    let candidate = model_dir.join(shard_file);
+    let resolved = candidate.canonicalize().map_err(|e| {
+        InferenceError::InvalidSafetensors(format!(
+            "shard entry {shard_file:?}: cannot resolve {}: {e}",
+            candidate.display()
+        ))
+    })?;
+    if !resolved.starts_with(&dir) {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "shard entry {shard_file:?} resolves to {}, outside the model directory {}",
+            resolved.display(),
+            dir.display()
+        )));
+    }
+    Ok(resolved)
+}
+
 /// Parse `model.safetensors.index.json` from a model directory.
 pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError> {
     let index_path = model_dir.join("model.safetensors.index.json");
@@ -1122,7 +1164,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
-        let shard_path = model_dir.join(&shard_file);
+        let shard_path = contained_shard_path(model_dir, &shard_file)?;
         let shard = SafetensorsFile::open(&shard_path)?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
@@ -1166,7 +1208,10 @@ impl ShardedSafetensors {
             .weight_map
             .get(tensor_name)
             .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-        Ok((self.root.join(shard_file), tensor_name.to_string()))
+        Ok((
+            contained_shard_path(&self.root, shard_file)?,
+            tensor_name.to_string(),
+        ))
     }
 
     fn shard_file_for(&self, name: &str) -> Result<String, InferenceError> {
@@ -1179,7 +1224,7 @@ impl ShardedSafetensors {
 
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
-            let shard_path = self.root.join(shard_file);
+            let shard_path = contained_shard_path(&self.root, shard_file)?;
             let shard = SafetensorsFile::open(&shard_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
@@ -2474,6 +2519,140 @@ mod tests {
         assert_eq!(tb.shape, vec![3]);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1069: index-declared shard names are untrusted checkpoint content.
+    /// Plain names and subdirectory names beneath the model directory
+    /// resolve; anything that escapes the directory is rejected.
+    #[test]
+    fn contained_shard_path_accepts_entries_beneath_model_dir() {
+        let dir = temp_dir("lattice_containment_ok_test");
+        fs::write(dir.join("shard.safetensors"), b"x").expect("test setup");
+        fs::create_dir_all(dir.join("sub")).expect("test setup");
+        fs::write(dir.join("sub").join("nested.safetensors"), b"x").expect("test setup");
+
+        let plain = contained_shard_path(&dir, "shard.safetensors").expect("plain name resolves");
+        assert_eq!(
+            plain.file_name().unwrap().to_string_lossy(),
+            "shard.safetensors"
+        );
+        contained_shard_path(&dir, "sub/nested.safetensors")
+            .expect("subdirectory entry beneath the model dir resolves");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1069: an absolute index entry replaces the model directory entirely
+    /// in `Path::join`; it must be rejected even when the target exists.
+    #[test]
+    fn contained_shard_path_rejects_absolute_entry() {
+        let dir = temp_dir("lattice_containment_abs_test");
+        let outside = temp_dir("lattice_containment_abs_outside");
+        let target = outside.join("outside.safetensors");
+        fs::write(&target, b"x").expect("test setup");
+
+        let err = contained_shard_path(&dir, &target.to_string_lossy())
+            .expect_err("absolute entry must be rejected");
+        assert!(
+            matches!(err, InferenceError::InvalidSafetensors(_)),
+            "unexpected error kind: {err}"
+        );
+        assert!(
+            err.to_string().contains("outside the model directory"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    /// #1069: `..` components must not address files outside the model
+    /// directory, whether or not the target exists.
+    #[test]
+    fn contained_shard_path_rejects_parent_traversal() {
+        let outer = temp_dir("lattice_containment_dotdot_test");
+        let dir = outer.join("model");
+        fs::create_dir_all(&dir).expect("test setup");
+        fs::write(outer.join("secret.bin"), b"x").expect("test setup");
+
+        let err = contained_shard_path(&dir, "../secret.bin")
+            .expect_err("parent traversal must be rejected");
+        assert!(
+            err.to_string().contains("outside the model directory"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            contained_shard_path(&dir, "../nonexistent.bin").is_err(),
+            "traversal to a missing target must also fail"
+        );
+
+        fs::remove_dir_all(&outer).ok();
+    }
+
+    /// #1069: a symlink inside the model directory pointing outside it must
+    /// be rejected — canonicalization resolves the link before the
+    /// containment check.
+    #[cfg(unix)]
+    #[test]
+    fn contained_shard_path_rejects_symlink_escape() {
+        let outer = temp_dir("lattice_containment_symlink_test");
+        let dir = outer.join("model");
+        fs::create_dir_all(&dir).expect("test setup");
+        let target = outer.join("outside.safetensors");
+        fs::write(&target, b"x").expect("test setup");
+        std::os::unix::fs::symlink(&target, dir.join("link.safetensors")).expect("test setup");
+
+        let err = contained_shard_path(&dir, "link.safetensors")
+            .expect_err("symlink escaping the model dir must be rejected");
+        assert!(
+            err.to_string().contains("outside the model directory"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&outer).ok();
+    }
+
+    /// #1069 end-to-end: a sharded index whose weight_map entry escapes the
+    /// model directory fails to load through both sharded loaders.
+    #[test]
+    fn sharded_loaders_reject_escaping_index_entry() {
+        let outer = temp_dir("lattice_containment_loader_test");
+        let dir = outer.join("model");
+        fs::create_dir_all(&dir).expect("test setup");
+        // A structurally valid shard OUTSIDE the model dir — containment,
+        // not file validity, must be what rejects it.
+        let evil = outer.join("evil.safetensors");
+        write_single_f32_tensor(&evil, "tensor.a", &[1.0, 2.0]);
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"metadata": {}, "weight_map": {"tensor.a": "../evil.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
+
+        let err = load_sharded(&dir).expect_err("load_sharded must reject the escaping entry");
+        assert!(
+            err.to_string().contains("outside the model directory"),
+            "unexpected error: {err}"
+        );
+
+        let index_path = dir.join("model.safetensors.index.json");
+        let mut st = ShardedSafetensors::open_index(&index_path).expect("index itself parses");
+        let err = st
+            .get_f32_tensor_owned("tensor.a")
+            .expect_err("lazy loader must reject the escaping entry at access time");
+        assert!(
+            err.to_string().contains("outside the model directory"),
+            "unexpected error: {err}"
+        );
+        let err = st
+            .resolve_weight("tensor.a")
+            .expect_err("resolve_weight must reject the escaping entry");
+        assert!(
+            err.to_string().contains("outside the model directory"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&outer).ok();
     }
 
     #[test]

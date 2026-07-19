@@ -542,14 +542,17 @@ mod doctor {
             }
             let mut merged = HashMap::new();
             for shard_name in shard_names {
-                let shard_path = dir.join(&shard_name);
-                if !shard_path.exists() {
+                if !dir.join(&shard_name).exists() {
                     return Err(format!(
                         "shard '{shard_name}' referenced by {} not found in {}",
                         index_path.display(),
                         dir.display()
                     ));
                 }
+                // Index-declared shard names are untrusted checkpoint content;
+                // containment-check before opening (#1069).
+                let shard_path = lattice_inference::weights::contained_shard_path(dir, &shard_name)
+                    .map_err(|e| e.to_string())?;
                 merged.extend(read_safetensors_header(&shard_path)?);
             }
             merged
