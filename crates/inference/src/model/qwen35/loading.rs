@@ -77,6 +77,19 @@ fn load_owned_tensor_checked<T: TensorSource + ?Sized>(
     name: &str,
     expected: &[usize],
 ) -> Result<Vec<f32>, InferenceError> {
+    // Check the header-declared shape before materializing tensor data: a source
+    // that cannot report a shape up front returns None and falls through to the
+    // post-load check below, but any source that can answer rejects a mismatch
+    // before the (potentially huge) allocation and copy happen.
+    if let Some(declared) = source.tensor_shape(name)?
+        && declared != expected
+    {
+        return Err(InferenceError::ShapeMismatch {
+            name: name.to_string(),
+            expected: expected.to_vec(),
+            actual: declared,
+        });
+    }
     let (data, shape) = source.get_f32_tensor_owned(name)?;
     if shape != expected {
         return Err(InferenceError::ShapeMismatch {
@@ -102,6 +115,11 @@ fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
     })?;
     let moe_inter = cfg.moe_intermediate_size();
     let shared_inter = cfg.shared_expert_intermediate_size();
+    let gate_up_rows = moe_inter.checked_mul(2).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "moe_intermediate_size {moe_inter} overflows usize when doubled for gate_up_proj shape"
+        ))
+    })?;
 
     let router = MoeRouter::new(
         load_owned_tensor_checked(
@@ -118,7 +136,7 @@ fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
         load_owned_tensor_checked(
             source,
             &format!("{prefix}.mlp.experts.gate_up_proj"),
-            &[num_experts, 2 * moe_inter, hidden],
+            &[num_experts, gate_up_rows, hidden],
         )?,
         load_owned_tensor_checked(
             source,
@@ -457,6 +475,33 @@ mod tests {
         }
     }
 
+    /// A mock tensor source that counts calls to `get_f32_tensor_owned`, so a test can
+    /// assert a shape mismatch is caught from the header-declared shape without ever
+    /// copying the tensor's data.
+    struct CountingTensorSource {
+        tensors: std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>,
+        materialize_calls: std::cell::Cell<usize>,
+    }
+
+    impl TensorSource for CountingTensorSource {
+        fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+            Ok(self.tensors.contains_key(name))
+        }
+        fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, s)| s.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.materialize_calls.set(self.materialize_calls.get() + 1);
+            self.tensors
+                .get(name)
+                .map(|(d, s)| (d.clone(), s.clone()))
+                .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
     impl TensorSource for NullTensorSource {
         fn has_tensor(&mut self, _name: &str) -> Result<bool, InferenceError> {
             Ok(false)
@@ -609,6 +654,28 @@ mod tests {
     }
 
     #[test]
+    fn shape_mismatch_rejected_before_tensor_data_is_materialized() {
+        let mut src = CountingTensorSource {
+            tensors: [("t".to_string(), (vec![0.0f32; 4], vec![4, 1]))]
+                .into_iter()
+                .collect(),
+            materialize_calls: std::cell::Cell::new(0),
+        };
+
+        let result = load_owned_tensor_checked(&mut src, "t", &[1, 4]);
+
+        assert!(
+            matches!(result, Err(InferenceError::ShapeMismatch { .. })),
+            "expected ShapeMismatch, got {result:?}"
+        );
+        assert_eq!(
+            src.materialize_calls.get(),
+            0,
+            "a declared-shape mismatch must be rejected before the tensor data is copied"
+        );
+    }
+
+    #[test]
     fn moe_missing_num_experts_returns_err_not_panic() {
         let mut cfg = Qwen35Config::qwen36_35b_a3b();
         cfg.num_experts = None;
@@ -643,6 +710,37 @@ mod tests {
             }
             Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
             Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn moe_gate_up_shape_overflow_returns_err_not_panic() {
+        let mut cfg = Qwen35Config::qwen36_35b_a3b();
+        cfg.num_experts = Some(256);
+        cfg.num_experts_per_tok = Some(8);
+        cfg.moe_intermediate_size = Some(usize::MAX);
+        let hidden = cfg.hidden_size;
+        // The router's gate.weight is present and correctly shaped so the loader
+        // actually reaches the overflowing gate_up_proj shape computation instead of
+        // failing earlier on a missing tensor.
+        let mut src = MockTensorSource {
+            tensors: [(
+                "layers.0.mlp.gate.weight".to_string(),
+                (vec![0.0f32; 256 * hidden], vec![256, hidden]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let result = load_moe_ffn_weights(&mut src, &cfg, "layers.0", hidden);
+        match result {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("moe_intermediate_size"),
+                    "message should name the field: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
+            Ok(_) => panic!("expected Err for overflowing moe_intermediate_size, got Ok"),
         }
     }
 
