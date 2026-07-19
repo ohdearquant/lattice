@@ -202,7 +202,7 @@ let hook: Box<dyn LoraHook> = Box::new(adapter.clone());
 qwen_model.set_lora(hook);
 
 // BERT/cross-encoder — pass hook per call (D1, this ADR)
-let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter);
+let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter)?;
 ```
 
 ### Alternatives Considered

@@ -4,6 +4,11 @@
 //! `(alpha / rank) * B @ (A @ x)` to a base projection. The adapter constructor
 //! rejects non-finite alpha values; a zero rank has an effective scale of zero.
 //!
+//! Module names: full-attention (GQA) `"q_proj"`, `"k_proj"`, `"v_proj"`, `"o_proj"`;
+//! linear-attention (GDN) `"in_proj_qkv"`, `"in_proj_z"`, `"in_proj_b"`, `"in_proj_a"`,
+//! `"out_proj"`; MLP `"gate_proj"`, `"up_proj"`, `"down_proj"`; BERT `"query"`, `"key"`,
+//! `"value"`, `"attn_output"`, `"ffn_intermediate"`, `"ffn_output"`.
+//!
 //! See `docs/lora-core.md` for the training, blending, and manifest design.
 
 mod apply;
@@ -228,32 +233,43 @@ impl LoraAdapter {
         &mut self.layers
     }
 
+    /// Look up the layer for `(layer_idx, module)`, if any.
+    ///
+    /// Called once per hooked row (see
+    /// `lattice_inference::lora_hook::apply_lora_rows`), so this scans the
+    /// layer map with a borrowed `&str` instead of hashing an owned
+    /// `(usize, String)` key — allocating a `String` per row here would
+    /// dominate the hot path long before the scan itself could. The map is
+    /// bounded by `num_layers * target_modules.len()`, so the scan stays
+    /// cheap. Both [`Self::apply`] and [`Self::has_adapter`] route through
+    /// this one lookup so they can never disagree on what counts as present.
+    fn find_layer(&self, layer_idx: usize, module: &str) -> Option<&LoraLayer> {
+        self.layers()
+            .iter()
+            .find(|((idx, m), _)| *idx == layer_idx && m == module)
+            .map(|(_, layer)| layer)
+    }
+
     /// Add this adapter's correction to one projection output in place.
     /// A missing `(layer_idx, module)` layer is a no-op; slices must match its shape.
     /// See [`docs/lora-core.md`](../../docs/lora-core.md#adapter-representation-and-inference) for the matrix layout.
-    ///
-    /// This is called once per hooked row (see
-    /// `lattice_inference::lora_hook::apply_lora_rows`), so the lookup
-    /// below scans the layer map with a borrowed `&str` instead of hashing
-    /// an owned `(usize, String)` key — allocating a `String` per row here
-    /// would dominate the hot path long before the scan itself could. The
-    /// map is bounded by `num_layers * target_modules.len()`, so the scan
-    /// stays cheap.
     pub fn apply(&self, layer_idx: usize, module: &str, x: &[f32], base_output: &mut [f32]) {
-        let lora_layer = self
-            .layers()
-            .iter()
-            .find(|((idx, m), _)| *idx == layer_idx && m == module)
-            .map(|(_, layer)| layer);
-        if let Some(lora_layer) = lora_layer {
+        if let Some(lora_layer) = self.find_layer(layer_idx, module) {
             let scale = self.config().scale();
             apply_lora(lora_layer, scale, x, base_output);
         }
     }
 
     /// Check if the adapter has weights for a specific layer and module.
+    ///
+    /// An untrained placeholder layer (both `a` and `b` empty — see
+    /// [`Self::new`]) is present in the map but reports `false` here: it
+    /// carries no correction for `apply` to add, so callers that use this to
+    /// skip per-row dispatch (e.g. `apply_lora_rows`) don't pay for a layer
+    /// that would only ever no-op.
     pub fn has_adapter(&self, layer_idx: usize, module: &str) -> bool {
-        self.layers().contains_key(&(layer_idx, module.to_string()))
+        self.find_layer(layer_idx, module)
+            .is_some_and(|layer| !(layer.a.is_empty() && layer.b.is_empty()))
     }
 
     /// Return the number of adapted projection layers.
@@ -340,8 +356,8 @@ impl LoraAdapter {
     /// Validate adapter dimensions against a BERT cross-encoder model's
     /// geometry.
     ///
-    /// Returns the first invalid layer, module, or projection-shape
-    /// mismatch. Call it before hooked BERT scoring (see
+    /// Returns the first invalid layer, module, projection-shape, or
+    /// oversized-rank mismatch. Call it before hooked BERT scoring (see
     /// [`lattice_inference::model::cross_encoder::CrossEncoderModel::score_with_hook`],
     /// which validates through the [`LoraHook`](lattice_inference::lora_hook::LoraHook)
     /// trait object below) — this is the BERT counterpart to
@@ -349,7 +365,12 @@ impl LoraAdapter {
     ///
     /// Per-layer `a`/`b` buffer lengths are not re-checked here for the same
     /// reason as `validate_against`: [`Self::new`] already rejects any layer
-    /// whose buffers don't match its own `rank`/`d_in`/`d_out`.
+    /// whose buffers don't match its own `rank`/`d_in`/`d_out`. Rank IS
+    /// checked here (against `min(d_in, d_out)`, the largest non-redundant
+    /// value for a two-factor product): unlike the buffer-length invariant,
+    /// this bound doesn't hold for every `LoraAdapter` in general (a blended
+    /// adapter's concatenated rank can legitimately exceed it), so it's
+    /// enforced at this BERT-scoring gate instead of at construction.
     pub fn validate_against_bert(
         &self,
         num_hidden_layers: usize,
@@ -380,6 +401,26 @@ impl LoraAdapter {
                     "LoRA adapter dims mismatch for layer {layer_idx} module '{module}': \
                      adapter has (d_in={}, d_out={}) but BERT model expects (d_in={expected_d_in}, d_out={expected_d_out})",
                     layer.d_in, layer.d_out
+                )));
+            }
+
+            // `B @ A` has rank at most `min(d_in, d_out)` no matter how the
+            // factors are padded, so a rank above that bound adds only
+            // wasted `apply_lora` compute (extra multiply-adds per hooked
+            // row) with zero extra expressiveness — the adapter is exactly
+            // representable at `rank = min(d_in, d_out)`. Bounded here
+            // rather than in `Self::new`: a blended adapter's concatenated
+            // rank can legitimately exceed this per-layer bound (the
+            // combined factorization is over-complete but its matrix rank
+            // stays bounded), so the constraint only holds for a single
+            // untrusted adapter about to be hooked into BERT scoring, not
+            // for `LoraAdapter` construction in general.
+            let rank_bound = expected_d_in.min(expected_d_out);
+            if layer.rank > rank_bound {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA layer {layer_idx} module '{module}': rank {} exceeds min(d_in={expected_d_in}, \
+                     d_out={expected_d_out})={rank_bound}",
+                    layer.rank
                 )));
             }
         }
@@ -1168,6 +1209,108 @@ mod tests {
             assert!(
                 LoraAdapter::new(config, layers).is_ok(),
                 "a placeholder layer with both factors empty must still construct"
+            );
+        }
+
+        /// A rank above `min(d_in, d_out)` is representationally redundant
+        /// (`B @ A` cannot exceed that rank no matter how the factors are
+        /// padded): the adapter still constructs (buffers are
+        /// self-consistent with its own declared rank/d_in/d_out), but
+        /// `validate_against_bert` — the gate every BERT adapter passes
+        /// through before it can be hooked into scoring — must refuse it.
+        /// `HIDDEN_SIZE` is 384, so the bound here is 384; this uses a rank
+        /// one above it, so the only thing that can reject it is the bound
+        /// itself.
+        #[test]
+        fn test_validate_against_bert_rejects_rank_above_min_d_in_d_out() {
+            let rank = HIDDEN_SIZE + 1;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, "query".to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * HIDDEN_SIZE],
+                    b: vec![0.0; HIDDEN_SIZE * rank],
+                    d_in: HIDDEN_SIZE,
+                    d_out: HIDDEN_SIZE,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["query".to_string()],
+            };
+            let adapter =
+                LoraAdapter::new(config, layers).expect("buffers match the declared rank");
+            let err = adapter
+                .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                .expect_err("rank above min(d_in, d_out) must be rejected");
+            assert!(
+                err.to_string().contains("exceeds min(d_in"),
+                "expected the rank-bound rejection, got: {err}"
+            );
+        }
+
+        /// A rank exactly at the bound (`min(d_in, d_out)`) is the largest
+        /// non-redundant value and must still pass.
+        #[test]
+        fn test_validate_against_bert_accepts_rank_at_min_d_in_d_out_bound() {
+            let rank = HIDDEN_SIZE;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, "query".to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * HIDDEN_SIZE],
+                    b: vec![0.0; HIDDEN_SIZE * rank],
+                    d_in: HIDDEN_SIZE,
+                    d_out: HIDDEN_SIZE,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["query".to_string()],
+            };
+            let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
+            assert!(
+                adapter
+                    .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                    .is_ok(),
+                "rank exactly at min(d_in, d_out) must be accepted"
+            );
+        }
+
+        /// An empty placeholder layer (see
+        /// `test_new_accepts_fully_empty_placeholder_layer`) is present in
+        /// the map but carries no correction; `has_adapter` (and the
+        /// `LoraHook::is_active` delegate `apply_lora_rows` uses to skip
+        /// per-row dispatch) must report it as inactive rather than
+        /// present-but-inert.
+        #[test]
+        fn test_has_adapter_false_for_empty_placeholder_layer() {
+            let rank = 4;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, "query".to_string()),
+                LoraLayer {
+                    a: vec![],
+                    b: vec![],
+                    d_in: HIDDEN_SIZE,
+                    d_out: HIDDEN_SIZE,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["query".to_string()],
+            };
+            let adapter =
+                LoraAdapter::new(config, layers).expect("placeholder layer must construct");
+            assert!(
+                !adapter.has_adapter(0, "query"),
+                "an empty placeholder layer must not report as active"
             );
         }
     }
