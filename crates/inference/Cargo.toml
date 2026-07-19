@@ -21,7 +21,7 @@ default = ["std", "download", "serve"]
 # keep including `lattice_serve` without needing an extra flag. Library
 # consumers building with `default-features = false` no longer pull an HTTP
 # server into their dependency tree (the lib itself never uses it).
-serve = ["dep:axum", "dep:tokio", "dep:futures"]
+serve = ["dep:axum", "dep:tokio", "dep:futures", "dep:mime", "dep:http-body-util"]
 std = []
 f16 = []
 metal-gpu = ["dep:metal", "dep:objc"]
@@ -63,6 +63,12 @@ thiserror.workspace = true
 tracing.workspace = true
 clap = { workspace = true }
 axum = { workspace = true, optional = true }
+mime = { workspace = true, optional = true }
+# Distinguishes a request-body length-limit rejection (`LengthLimitError`)
+# from any other body-buffering failure in the `serve` HTTP handlers.
+# Already an axum 0.8 transitive dependency at the same version; this makes
+# it a direct dependency so production handler code can downcast against it.
+http-body-util = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 ureq = { version = "2", features = ["tls"], optional = true }
@@ -214,13 +220,6 @@ approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
-# Partial-body polling (`BodyExt::frame`) for the `lattice.rs` HTTP-level
-# client-disconnect test (ADR-080 C2): axum's own
-# `to_bytes` reads to EOF or errors past a byte cap, neither of which lets a
-# test read N real SSE frames then drop the body mid-stream to simulate a
-# disconnect. Already an axum 0.8 transitive dependency at the same version;
-# this just makes it a direct dev-dependency so test code can `use` it.
-http-body-util = { workspace = true }
 # Drives real HTTP requests (built from `CHAT_COMPLETIONS_PARITY_CASES`
 # fixture bodies) through each binary's `Router` via `ServiceExt::oneshot`
 # for the cross-binary parity table (ADR-080 C2).
