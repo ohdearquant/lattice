@@ -1,65 +1,45 @@
 #!/usr/bin/env bash
-# bench-informational-groups.sh — the shell-side half of lattice#714's
-# quick-mode informational-groups contract.
+# bench-informational-groups.sh — shell side of the quick-mode informational
+# demotion (lattice#714; target-level policy per lattice#1060, 2026-07-19).
 #
-# Given Criterion `--list` output (a file path as $1, or stdin when no arg is
-# given), print the intersection of the fixed, reviewed allowlist below with
-# the top-level group names actually present in that listing — one name per
-# line, sorted.
+# The set of demoted bench targets lives in ONE validated manifest:
+# scripts/lib/bench-quick-informational-targets.txt. Given a target key
+# (`<crate>:<bench-target>`) and that target's Criterion `--list` output (a
+# file path as $2, or stdin), this script prints the group names to treat
+# as informational in QUICK mode: ALL of the listing's top-level groups
+# when the target is in the manifest, nothing otherwise. Deriving the
+# group set from the listing is deliberate under target-level semantics —
+# the demotion covers the target, so a group added to a demoted target
+# later is informational by policy, while every other target stays gated
+# because its key is absent from the manifest.
 #
-# scripts/bench-compare.sh invokes this file for the real run so the exact
-# same array and intersection logic feeds the gate. scripts/perf-bench-gate.py
-# --selftest invokes this script two ways: with --print-allowlist (dump the
-# raw array, no listing) so the Python-side expected set is compared against
-# the ACTUAL array — a name added only here, or only there, fails the
-# selftest — and as the intersection subprocess against a controlled listing
-# so the production code path is exercised end-to-end. An earlier fixture
-# kept its own hardcoded copy of this list in Python and never exercised
-# this file at all; extracting the logic here closed that.
+# scripts/bench-compare.sh invokes this file for production runs.
+# scripts/perf-bench-gate.py --selftest invokes the same file three ways:
+# `--print-targets` (compare the manifest against the reviewed
+# expectation, so a manifest-only or expectation-only edit fails), a
+# demoted-target probe (all listing groups emitted), and a
+# non-demoted-target probe (nothing emitted — the cross-target guarantee).
+# INFO_TARGETS_MANIFEST overrides the manifest path for those controlled
+# probes; production never sets it.
 #
-# Adding a group to the allowlist requires the same kind of same-toolchain
-# A/A quantitative evidence that justified every current entry (see scripts/
-# bench-compare.sh's "Quick-mode informational-groups" comment), reviewed in
-# a PR — never derived automatically from `--list`, which would silently
-# exempt every future group added to the target.
+# FULL mode (`bench-compare.sh --full`, nightly perf lane) ignores this
+# mechanism entirely and gates every group of every target.
 set -euo pipefail
 
-INFO_GROUPS_ALLOWLIST=(
-  "simd_dot_product"
-  "simd_cosine_similarity"
-  # Added 2026-07-13: two same-commit A/A runs, each inside an exclusive
-  # machine-wide bench window (/tmp/lion-bench-window.lock), still produced
-  # confirmed-CI FAIL rows (>7%) in these embed micro-groups — with DISJOINT
-  # failing groups across the two runs, the signature of a noise floor above
-  # the quick-mode gate rather than a regression. Evidence tables in the PR
-  # that added these entries.
-  "int8_batch_cosine"
-  "int4_cosine_distance"
-  "simd_batch_cosine_non_normalized_query"
-  # Added 2026-07-19: two further same-commit A/A runs on origin/main
-  # (e1000d3108), quick mode, each inside an exclusive bench window on an
-  # otherwise idle machine, produced confirmed-CI gating FAIL rows
-  # (+8.4% to +11.5%) in these four groups — again with DISJOINT failing
-  # groups across the two runs (run 1: the first three; run 2:
-  # int8_vs_float32_cosine alone), while every inference group and every
-  # non-listed embed group stayed clean. Evidence tables in the PR that
-  # added these entries.
-  "simd_normalized_cosine_fast_path"
-  "int8_raw_dot_product"
-  "simd_batch_cosine_normalized_query"
-  "int8_vs_float32_cosine"
-)
+MANIFEST="${INFO_TARGETS_MANIFEST:-$(dirname "$0")/bench-quick-informational-targets.txt}"
 
-if [ "${1:-}" = "--print-allowlist" ]; then
-  printf '%s\n' "${INFO_GROUPS_ALLOWLIST[@]}" | sort
+manifest_targets() {
+  sed 's/#.*//' "$MANIFEST" | awk 'NF { print $1 }' | sort
+}
+
+if [ "${1:-}" = "--print-targets" ]; then
+  manifest_targets
   exit 0
 fi
 
-input="${1:-/dev/stdin}"
-listed_groups=$(awk -F/ '/: benchmark$/{print $1}' "$input" | sort -u)
+target="${1:?usage: bench-informational-groups.sh <crate>:<bench-target> [listing-file] (or --print-targets)}"
+input="${2:-/dev/stdin}"
 
-for grp in "${INFO_GROUPS_ALLOWLIST[@]}"; do
-  if grep -qxF "$grp" <<< "$listed_groups"; then
-    echo "$grp"
-  fi
-done
+if manifest_targets | grep -qxF "$target"; then
+  awk -F/ '/: benchmark$/{print $1}' "$input" | sort -u
+fi
