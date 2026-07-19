@@ -1,0 +1,129 @@
+name: bench evidence
+
+# ADR-058 requires every PR touching crates/inference/ or crates/embed/ to carry a
+# bench-compare disposition in its description. That requirement was convention-only
+# until now. A PR adding one line to the cosine fast path (`&& is_unit_norm(s)`, an
+# O(d) recomputation per stored candidate) merged with a description containing no
+# bench section at all, and cost 7x on simd_prepared_query_normalized_cosine:
+# 96,278 ns -> 682,838 ns at d=1024, confidence intervals disjoint at every size,
+# undetected for four days because nothing enforced the rule.
+#
+# This gate checks that the disposition EXISTS and says something. It deliberately
+# does not judge whether the numbers are real or the argument is sound — a workflow
+# cannot do that, and pretending otherwise would trade a visible gap for an invisible
+# one. Reviewers judge quality; this gate makes silence impossible.
+
+on:
+  pull_request:
+    # `edited` is required, not optional: the body is the artifact under test, so a
+    # description fixed after the fact must be re-evaluated. Without it an author
+    # would have to push an empty commit to clear the gate.
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  changes:
+    name: detect perf surface
+    runs-on: ubuntu-latest
+    outputs:
+      perf: ${{ steps.filter.outputs.perf }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          CHANGED=$(./scripts/ci-changed-files.sh)
+          echo "Changed files:"
+          echo "$CHANGED"
+          # here-string, not `echo | grep -q`: -q exits at the first match, echo takes
+          # SIGPIPE, and under pipefail the pipeline reports 141, so the else branch
+          # would skip the gate on large diffs. e2e-parity.yml already hit that
+          # fail-open once; do not reintroduce it here.
+          if grep -E '^crates/(inference|embed)/src/' <<<"$CHANGED" >/dev/null; then
+            echo "perf=true" >> "$GITHUB_OUTPUT"
+            echo "→ perf-sensitive source changed: bench evidence REQUIRED (ADR-058)"
+          else
+            echo "perf=false" >> "$GITHUB_OUTPUT"
+            echo "→ no crates/{inference,embed}/src change: bench evidence not required"
+          fi
+
+  evidence:
+    name: bench-compare disposition present
+    needs: changes
+    if: needs.changes.outputs.perf == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: check the PR description
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Read the body from the API rather than the event payload: on `edited` the
+          # payload carries the pre-edit body, so trusting it would evaluate a stale
+          # description and could pass a PR whose evidence was just deleted.
+          BODY=$(gh api "repos/${REPO}/pulls/${PR}" -q '.body // ""')
+
+          # grep, not ${VAR//pat/}: bash pattern substitution goes pathological on
+          # large bodies — a 41 KB description hung for minutes in local testing.
+          if ! printf '%s' "$BODY" | grep -q '[^[:space:]]'; then
+            echo "::error::This PR changes crates/inference/src or crates/embed/src and has an empty description. ADR-058 requires a bench-compare disposition."
+            exit 1
+          fi
+
+          # Isolate the disposition section.
+          #
+          # tolower(), not IGNORECASE: IGNORECASE is a gawk extension. BSD awk and
+          # mawk (the Ubuntu runner default) accept the assignment and ignore it, so
+          # the match would silently become case-sensitive and reject a section
+          # titled "Bench-Compare".
+          #
+          # Terminate only on a heading at the same or shallower depth than the one
+          # that opened the section: a "### Round 1" under "## bench-compare" is
+          # section content, not its end. Exiting on any heading captured the title
+          # line alone and failed PRs that did supply full numbers.
+          SECTION=$(printf '%s' "$BODY" | awk '
+            function level(s) { if (match(s, /^#{1,6}[[:space:]]/)) { return RLENGTH - 1 } return 0 }
+            {
+              lv = level($0)
+              if (found && lv > 0 && lv <= start_lv) { exit }
+              if (!found && tolower($0) ~ /bench-?compare/) { found = 1; start_lv = (lv > 0 ? lv : 6) }
+              if (found) { print }
+            }
+          ')
+
+          if ! printf '%s' "$SECTION" | grep -q '[^[:space:]]'; then
+            echo "::error::No bench-compare disposition found in the PR description."
+            echo ""
+            echo "ADR-058: every PR touching crates/inference/ or crates/embed/ carries before/after numbers."
+            echo "Run:  make bench-compare BENCH_GROUPS_INFERENCE=... BENCH_GROUPS_EMBED=..."
+            echo "and paste the table. If nothing moved, say so explicitly with the p-values."
+            echo "If the change is compiled out of the bench build, name the cfg gate and the"
+            echo "bench build's feature set, and state that base and head binaries have identical"
+            echo "effective source."
+            exit 1
+          fi
+
+          # Strip the heading itself before measuring, so a bare "## bench-compare"
+          # with nothing under it cannot satisfy the gate.
+          CONTENT=$(printf '%s' "$SECTION" | tail -n +2 | tr -d '[:space:]')
+          if [ "${#CONTENT}" -lt 80 ]; then
+            echo "::error::The bench-compare section is present but essentially empty (${#CONTENT} chars of content)."
+            echo ""
+            echo "State the actual disposition: an A/B table, an explicit no-change result with"
+            echo "p-values, or the structural argument for why the diff is compiled out of the"
+            echo "bench binaries."
+            exit 1
+          fi
+
+          echo "bench-compare disposition present (${#CONTENT} chars of content)."
