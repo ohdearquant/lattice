@@ -9589,17 +9589,25 @@ mod inner {
             // Autoregressive decode
             let mut stopped = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (max_new_tokens == 1) cannot
+            // fall through to Length (#1064 follow-up).
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
             for _ in 1..gen_cfg.max_new_tokens {
-                // A grammar state that is complete with no legal continuation is
-                // a successful stop. Checked before the forward step, mirroring
-                // the CPU paths: past this point mask_logits would block every
-                // token and the all-blocked guard below would misreport the
-                // completed generation as GrammarConstraintBlocked (#1064).
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
-                    && engine.is_complete_without_continuation(gs)
-                {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
                     break;
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -9666,6 +9674,19 @@ mod inner {
                         stop_reason = StopReason::Eos;
                         break;
                     }
+                }
+
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
                 }
 
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -14600,11 +14621,32 @@ mod inner {
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (effective cap 1: unbudgeted or
+            // zero-budget max_new_tokens == 1) cannot fall through to Length
+            // (#1064 follow-up).
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
 
             // Autoregressive decode with streaming.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = policy.cap();
             for _ in 1..cap {
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
+                    break;
+                }
                 // Checked before any per-step GPU work, independent of whether this
                 // iteration's delta ends up non-empty -- closes the gap where a run
                 // of tokens decoding to an incomplete UTF-8 tail (a multi-token
@@ -14613,18 +14655,6 @@ mod inner {
                 if should_cancel() {
                     stopped_by_caller = true;
                     stop_reason = StopReason::Interrupt;
-                    break;
-                }
-                // A grammar state that is complete with no legal continuation is
-                // a successful stop. Checked before the forward step, mirroring
-                // the CPU paths: past this point mask_logits would block every
-                // token and the all-blocked guard below would misreport the
-                // completed generation as GrammarConstraintBlocked (#1064).
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
-                    && engine.is_complete_without_continuation(gs)
-                {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
                     break;
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -14727,6 +14757,18 @@ mod inner {
                     } => (token_id, answer_budget_exhausted),
                 };
                 last_pushed_id = next_id;
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -17578,9 +17620,31 @@ mod inner {
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (effective cap 1) cannot fall
+            // through to Length (#1064 follow-up). The completing token was
+            // never forwarded (`stopped` skips the silent step below), so the
+            // saved cross-turn prefix stays consistent with live KV state.
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
 
             let cap = policy.cap();
             for _ in 1..cap {
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
+                    break;
+                }
                 // Checked before any per-step GPU work, independent of whether
                 // this iteration's delta ends up non-empty — mirrors
                 // `generate_streaming_with_cancel`'s decode-loop check and
@@ -17592,18 +17656,6 @@ mod inner {
                 if should_cancel() {
                     stopped_by_caller = true;
                     stop_reason = StopReason::Interrupt;
-                    break;
-                }
-                // A grammar state that is complete with no legal continuation is
-                // a successful stop. Checked before the forward step, mirroring
-                // the CPU paths: past this point mask_logits would block every
-                // token and the all-blocked guard below would misreport the
-                // completed generation as GrammarConstraintBlocked (#1064).
-                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
-                    && engine.is_complete_without_continuation(gs)
-                {
-                    stopped = true;
-                    stop_reason = StopReason::Grammar;
                     break;
                 }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -17699,6 +17751,18 @@ mod inner {
                     } => (token_id, answer_budget_exhausted),
                 };
                 last_pushed_id = next_id;
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -35248,14 +35312,25 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         //    `single_char_vocab_tokenizer` is `'a'`; after `'a'` is sampled and
         //    the grammar advances past it, the state is complete with no legal
         //    continuation (`is_complete_without_continuation` is true). That is
-        //    a SUCCESSFUL stop: the loop-top completion check must return the
-        //    generated text with `stopped: true` / `StopReason::Grammar`,
-        //    exactly like the CPU paths. Before #1064 the Metal loops missed
-        //    this check, ran one more mask (all 32 logits blocked), and
-        //    misreported the completed generation as GrammarConstraintBlocked.
-        //    Mutation sensitivity: reverting the loop-top completion check at
-        //    the corresponding site restores exactly that misclassification and
-        //    each Ok(...) assertion below fails with the typed error.
+        //    a SUCCESSFUL stop: the generated text must come back with
+        //    `stopped: true` / `StopReason::Grammar`, exactly like the CPU
+        //    paths. Each path checks completion at two sites, mirroring the
+        //    CPU `grammar_complete` / `grammar_complete_without_continuation`
+        //    placement: recorded immediately after the INITIAL advance (so a
+        //    zero-iteration decode loop — `max_new_tokens: 1` — cannot fall
+        //    through to Length) and re-checked after every IN-LOOP advance (so
+        //    completion on the final allowed token cannot either). Before
+        //    #1064 the Metal loops missed completion entirely, ran one more
+        //    mask (all 32 logits blocked), and misreported the completed
+        //    generation as GrammarConstraintBlocked; the first #1064 fix
+        //    probed only at the loop top, which no zero-iteration or
+        //    final-iteration run ever reaches, misreporting those as Length.
+        //    Mutation sensitivity: reverting the post-initial-advance
+        //    recording fails the `max_one_token` tests below (Length, not
+        //    Grammar); reverting a post-advance in-loop check fails that
+        //    path's `final_token` test the same way; reverting the loop-top
+        //    `if stopped` break restores the GrammarConstraintBlocked
+        //    misclassification in the `max_new_tokens: 2` completion tests.
         //
         // 2. DEAD END (#611): GBNF `root ::= "a" "!"`. `'!'` is not in the
         //    32-entry vocab (`'a'..='z'`, `'A'..='F'`), so after `'a'` the
@@ -35266,10 +35341,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         //    guard lets the sampler's non-finite-max short-circuit silently
         //    return a token instead of failing.
         //
-        // Both fixtures need `max_new_tokens: 2` so the loop actually reaches
-        // the decode iteration after the prefill-derived token; with
-        // `max_new_tokens: 1` the function returns at the cap and exercises
-        // neither site.
+        // The dead-end fixture needs `max_new_tokens: 2` so the loop actually
+        // reaches the decode iteration after the prefill-derived token; with
+        // `max_new_tokens: 1` the function returns at the cap and never masks
+        // a second step. The completion fixtures deliberately run at BOTH
+        // caps: `max_new_tokens: 2` pins the loop-top break, and
+        // `max_new_tokens: 1` pins the post-initial-advance recording that a
+        // zero-iteration loop depends on. `root ::= "a" "a"` at
+        // `max_new_tokens: 2` pins the in-loop post-advance check (completion
+        // lands exactly on the final allowed token).
 
         /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
         /// order (`'a'..='z'` then `'A'..='F'`), so a `GrammarEngine` built
@@ -35286,6 +35366,38 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     vec![byte]
                 })
                 .collect()
+        }
+
+        /// Greedy grammar-constrained `GenerateConfig` over the single-char
+        /// vocab: `gbnf` and the token cap vary per test, everything else is
+        /// the shared deterministic-decode baseline the tests above use.
+        fn single_char_grammar_cfg(
+            gbnf: &str,
+            max_new_tokens: usize,
+        ) -> crate::model::qwen35_config::GenerateConfig {
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use std::sync::Arc;
+
+            let spec = GrammarSpec::Gbnf(gbnf.to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+            crate::model::qwen35_config::GenerateConfig {
+                max_new_tokens,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            }
         }
 
         /// #1064: a grammar that completes after one token is a successful
@@ -35465,6 +35577,236 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .output;
             assert_eq!(output.text, "a");
             assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// One-token regression (#1064 follow-up): with `max_new_tokens: 1`
+        /// the decode loop runs zero iterations, so only the
+        /// post-initial-advance completion recording can classify the stop.
+        /// Before the fix `generate` fell through to `stopped: false` /
+        /// `StopReason::Length` for a grammar its only token had completed.
+        #[test]
+        fn generate_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let output = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "a",
+                "the completing token must be in the output text"
+            );
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// One-token regression (#1064 follow-up) via `generate_streaming`:
+        /// the completing token's delta must still reach `on_token` exactly
+        /// once, and the stop must classify as Grammar, not Length.
+        #[test]
+        fn generate_streaming_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let mut on_token_calls = 0u32;
+            let mut streamed = String::new();
+            let output = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    on_token_calls += 1;
+                    streamed.push_str(delta);
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error");
+
+            assert_eq!(output.text, "a");
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(
+                on_token_calls, 1,
+                "exactly the completing token's delta reaches on_token"
+            );
+            assert_eq!(streamed, "a");
+        }
+
+        /// One-token regression (#1064 follow-up) via
+        /// `generate_streaming_with_prefix_cache`.
+        #[test]
+        fn generate_streaming_with_prefix_cache_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let output = state
+                .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "a");
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// Final-token regression (#1064 follow-up): `root ::= "a" "a"` at
+        /// `max_new_tokens: 2` completes on the decode loop's LAST allowed
+        /// iteration, so no following loop top exists and only the in-loop
+        /// post-advance completion check can classify the stop. Before the
+        /// fix `generate` exited by count and misreported Length.
+        #[test]
+        fn generate_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let output = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "aa",
+                "both grammar-forced tokens must be in the output text"
+            );
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// Final-token regression (#1064 follow-up) via `generate_streaming`.
+        #[test]
+        fn generate_streaming_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let mut streamed = String::new();
+            let output = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    streamed.push_str(delta);
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error");
+
+            assert_eq!(output.text, "aa");
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(streamed, "aa");
+        }
+
+        /// Final-token regression (#1064 follow-up) via
+        /// `generate_streaming_with_prefix_cache`.
+        #[test]
+        fn generate_streaming_with_prefix_cache_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let output = state
+                .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "aa");
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
             assert_eq!(output.stop_reason, Some(StopReason::Grammar));
         }
 
