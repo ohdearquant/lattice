@@ -519,6 +519,17 @@ impl MetalWorker {
                     // falls back to `PrefixReuseMode::FullRefill` whenever
                     // they diverge, so correctness never depends on
                     // distinguishing clients.
+                    //
+                    // DEPLOYMENT ASSUMPTION, stated because it is currently
+                    // true only by the accident that no multi-tenant consumer
+                    // exists: this path assumes a single tenant, or clients
+                    // that mutually trust one another. Reuse-versus-refill is
+                    // externally visible as latency, so while no request can
+                    // read another's content, a client CAN observe that some
+                    // other request recently shared a prefix with its own.
+                    // A shared inference endpoint serving mutually distrusting
+                    // clients must key the slot per tenant via
+                    // `CrossTurnSlotId::new`, not inherit `DEFAULT`.
                     let cached = state.generate_streaming_with_prefix_cache_and_cancel(
                         CrossTurnSlotId::DEFAULT,
                         &prompt,
