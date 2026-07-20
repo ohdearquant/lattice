@@ -609,6 +609,11 @@ jobs:
         run: python3 tests/test_bench_decode_adapters_q4_apples.py -v
       - name: python3 tests/test_bench_decode_adapters_context_scaling.py
         run: python3 tests/test_bench_decode_adapters_context_scaling.py -v
+      # bench-compare's Spotlight-exclusion guard. Same "harness plumbing only"
+      # scope as the steps above: it asserts the guard's exit codes and the
+      # bench-compare.sh call site, and runs no benchmark.
+      - name: bash scripts/ensure-noindex-marker-selftest.sh
+        run: bash scripts/ensure-noindex-marker-selftest.sh
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is
