@@ -350,11 +350,11 @@ jobs:
   # Embedding-drift gate: re-embeds the 5 frozen BGE-small corpus texts and
   # asserts max per-vector (1 - cosine) < 1e-3 vs the committed baseline.
   #
-  # Runs on macos-latest (arm64) to exercise the NEON normalise path that
-  # crates/embed/src/simd/ dispatches on aarch64.  A geometry regression on
-  # AVX2/x86_64 would also be caught here on the runner's scalar fallback, but
-  # the primary reason for macOS is to match the NEON path that production
-  # lattice deployments use.
+  # Runs on ubuntu-24.04-arm (aarch64) to exercise the NEON normalise path that
+  # crates/embed/src/simd/ dispatches on aarch64, the same ISA path that
+  # production lattice deployments use. Relocated from macos-latest (also
+  # aarch64) to cut the shared macOS-runner queue tax; NEON coverage is
+  # identical on aarch64 Linux.
   #
   # Model provisioning: the bge-small-en-v1.5 weights (~130 MB) are downloaded
   # via `cargo run ... --bin embed -- --download-only`, then cached per-run by
@@ -374,7 +374,7 @@ jobs:
     name: embed drift gate
     needs: changes
     if: needs.changes.outputs.engine == 'true'
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -421,7 +421,7 @@ jobs:
     name: wasm embedding parity gate
     needs: changes
     if: needs.changes.outputs.engine == 'true'
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -500,7 +500,7 @@ jobs:
     name: wasm SIMD128 kernel parity gate
     needs: changes
     if: needs.changes.outputs.engine == 'true'
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
