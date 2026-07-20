@@ -544,14 +544,84 @@ def run_selftest() -> int:
                             "manifest-handoff: inference group rms_norm did not gate"
                         )
 
+        # Composed-path collision guard. The two probes above show the
+        # helper is target-aware in isolation, but bench-compare.sh used to
+        # concatenate every target's helper output into one flat file with
+        # no target attribution — a group name demoted for one target
+        # silently exempted an identically-named group produced by a
+        # different, gated target. This drives the resolver
+        # (scripts/lib/resolve-informational-groups.sh) with a fabricated
+        # listing where the demoted target's groups include `rms_norm`,
+        # which also appears in the gated target's listing, and asserts
+        # the collision gates instead of staying informational.
+        resolver = Path(__file__).resolve().parent / "lib" / "resolve-informational-groups.sh"
+        if not resolver.exists():
+            failures.append(f"collision-guard: resolver missing at {resolver}")
+        else:
+            collision_dir = root / "collision-listing"
+            collision_dir.mkdir(parents=True, exist_ok=True)
+            embed_listing = collision_dir / "embed-list.txt"
+            embed_listing.write_text(
+                "simd_dot_product/scalar/384: benchmark\n"
+                "simd_normalize/scalar/384: benchmark\n"
+                "rms_norm/scalar/384: benchmark\n"  # fabricated bare-name collision
+            )
+            inference_listing = collision_dir / "inference-list.txt"
+            inference_listing.write_text(
+                "rms_norm/4096: benchmark\n"
+                "gelu/4096: benchmark\n"
+            )
+
+            def list_groups(listing_path: Path) -> str:
+                proc = subprocess.run(
+                    ["bash", str(helper), "--list-groups", str(listing_path)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                return proc.stdout
+
+            demoted_groups_file = collision_dir / "demoted.txt"
+            demoted_groups_file.write_text(list_groups(embed_listing))
+            gated_groups_file = collision_dir / "gated.txt"
+            gated_groups_file.write_text(list_groups(inference_listing))
+
+            resolve_proc = subprocess.run(
+                ["bash", str(resolver),
+                 str(demoted_groups_file), "lattice-embed:simd",
+                 str(gated_groups_file), "lattice-inference:elementwise_cpu_bench"],
+                capture_output=True, text=True, timeout=30,
+            )
+            resolved = frozenset(
+                ln.strip() for ln in resolve_proc.stdout.splitlines() if ln.strip()
+            )
+            if resolve_proc.returncode != 0:
+                failures.append(
+                    f"collision-guard: resolver exited {resolve_proc.returncode}: "
+                    f"{resolve_proc.stderr}"
+                )
+            if "rms_norm" in resolved:
+                failures.append(
+                    "collision-guard: rms_norm (demoted+gated collision) leaked "
+                    "into the informational set instead of gating"
+                )
+            if "rms_norm" not in resolve_proc.stderr or "lattice-embed:simd" not in resolve_proc.stderr:
+                failures.append(
+                    "collision-guard: no stderr warning naming the colliding "
+                    "group and both targets"
+                )
+            if not {"simd_dot_product", "simd_normalize"}.issubset(resolved):
+                failures.append(
+                    "collision-guard: non-colliding demoted groups lost "
+                    "informational status — resolver over-suppressed"
+                )
+
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)
     if failures:
         print(f"SELFTEST: FAIL ({len(failures)} failure(s))")
         return 1
     print("SELFTEST: PASS — base/, compare-base/, orphan-warn, named-wins-over-stale-base, "
-          "multi-sibling-refusal, and manifest-handoff (demoted target informational, "
-          "non-demoted target gated) all correct")
+          "multi-sibling-refusal, manifest-handoff (demoted target informational, "
+          "non-demoted target gated), and composed-path collision-guard all correct")
     return 0
 
 

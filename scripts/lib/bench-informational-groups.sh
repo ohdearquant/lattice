@@ -37,7 +37,16 @@ if [ "${1:-}" = "--print-targets" ]; then
   exit 0
 fi
 
-target="${1:?usage: bench-informational-groups.sh <crate>:<bench-target> [listing-file] (or --print-targets)}"
+if [ "${1:-}" = "--list-groups" ]; then
+  # Unconditional group extraction, no manifest check — used by
+  # resolve-informational-groups.sh to see every target's groups
+  # (both demoted and gated) before deciding what stays informational.
+  input="${2:-/dev/stdin}"
+  awk -F/ '/: benchmark$/{print $1}' "$input" | sort -u
+  exit 0
+fi
+
+target="${1:?usage: bench-informational-groups.sh <crate>:<bench-target> [listing-file] (or --print-targets|--list-groups)}"
 input="${2:-/dev/stdin}"
 
 if manifest_targets | grep -qxF "$target"; then

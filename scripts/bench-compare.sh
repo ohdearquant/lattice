@@ -137,26 +137,60 @@ fi
 # under target semantics — the demotion covers the target, so a group
 # added to a demoted target later is informational by policy, while every
 # non-demoted target stays gated because its key is absent from the
-# manifest. The helper lives in its own file (rather than inline here) so
-# scripts/perf-bench-gate.py --selftest can run the exact same shell code
-# against a controlled listing and catch a shell-only regression, not
-# just a Python-classifier one. --full skips this block entirely: every
-# group of every target gates at full resolution.
+# manifest.
+#
+# Criterion group names are bare strings once they leave the helper, with
+# no target attribution — so before folding a demoted target's groups into
+# the flat informational set, resolve-informational-groups.sh checks them
+# against every gated target's own listing and drops (gates) any name that
+# collides, warning loudly on stderr. This is the composed-path guard: a
+# group demoted for lattice-embed:simd must never silently exempt an
+# identically-named lattice-inference group from the gate.
+#
+# Both the helper and the resolver live in scripts/lib/ (rather than inline
+# here) so scripts/perf-bench-gate.py --selftest can run the exact same
+# shell code against controlled listings and catch a shell-only
+# regression, not just a Python-classifier one. --full skips this block
+# entirely: every group of every target gates at full resolution.
 INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
 rm -f "$INFO_GROUPS_FILE"
 if [ -n "$QUICK_FLAGS" ]; then
   (
     cd "$HEAD_DIR"
+    DEMOTED_GROUPS_FILE="$REPO/.cache/bench-compare-demoted-groups.txt"
+    GATED_GROUPS_FILE="$REPO/.cache/bench-compare-gated-groups.txt"
+    : > "$DEMOTED_GROUPS_FILE"
+    : > "$GATED_GROUPS_FILE"
+    DEMOTED_TARGETS=""
+    GATED_TARGETS=""
+
     # --list reflects both the built binary and any BENCH_GROUPS_* filter
-    # already applied. Both targets consult the same manifest through the
-    # same helper call, so demoting another target someday is a manifest
-    # edit (plus the selftest expectation), not a change here.
-    {
-      cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null \
-        | "$REPO/scripts/lib/bench-informational-groups.sh" "lattice-embed:$BENCHES_EMBED" || true
-      cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --list 2>/dev/null \
-        | "$REPO/scripts/lib/bench-informational-groups.sh" "lattice-inference:$BENCHES_INFERENCE" || true
-    } > "$INFO_GROUPS_FILE"
+    # already applied. Every target's groups go into the demoted-set file
+    # or the gated-set file depending on manifest membership; the resolver
+    # then reconciles the two before anything is treated as informational.
+    route_target_groups() {
+      local target="$1" listing="$2"
+      if "$REPO/scripts/lib/bench-informational-groups.sh" --print-targets | grep -qxF "$target"; then
+        "$REPO/scripts/lib/bench-informational-groups.sh" --list-groups "$listing" >> "$DEMOTED_GROUPS_FILE"
+        DEMOTED_TARGETS="${DEMOTED_TARGETS:+$DEMOTED_TARGETS,}$target"
+      else
+        "$REPO/scripts/lib/bench-informational-groups.sh" --list-groups "$listing" >> "$GATED_GROUPS_FILE"
+        GATED_TARGETS="${GATED_TARGETS:+$GATED_TARGETS,}$target"
+      fi
+    }
+
+    EMBED_LISTING="$REPO/.cache/bench-compare-embed-list.txt"
+    cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null > "$EMBED_LISTING" || true
+    route_target_groups "lattice-embed:$BENCHES_EMBED" "$EMBED_LISTING"
+
+    INFERENCE_LISTING="$REPO/.cache/bench-compare-inference-list.txt"
+    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --list 2>/dev/null > "$INFERENCE_LISTING" || true
+    route_target_groups "lattice-inference:$BENCHES_INFERENCE" "$INFERENCE_LISTING"
+
+    "$REPO/scripts/lib/resolve-informational-groups.sh" \
+      "$DEMOTED_GROUPS_FILE" "${DEMOTED_TARGETS:-none}" \
+      "$GATED_GROUPS_FILE" "${GATED_TARGETS:-none}" \
+      > "$INFO_GROUPS_FILE"
   )
 fi
 
