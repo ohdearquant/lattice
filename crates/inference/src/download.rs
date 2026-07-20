@@ -45,15 +45,22 @@ fn ensure_model_files_inner(
         )));
     }
 
-    #[cfg(not(feature = "download"))]
+    // Downloads are unavailable when the `download` feature is off, and also on
+    // wasm32 even with the feature on: inference gates its ureq/rustls/ring stack
+    // to non-wasm targets (Cargo.toml), so the fetch path below is compiled out
+    // there. This complementary gate is what makes a wasm consumer that forwards
+    // `lattice-inference/download` resolve download-free instead of failing.
+    #[cfg(not(all(feature = "download", not(target_arch = "wasm32"))))]
     {
         return Err(InferenceError::ModelNotFound(format!(
-            "model files not found at {} and the download feature is disabled",
+            "model files not found at {} and automatic download is unavailable in this \
+             build (the `download` feature is off, or this is a wasm target). Pre-fetch \
+             the model files into the cache.",
             model_dir.display()
         )));
     }
 
-    #[cfg(feature = "download")]
+    #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
     {
         std::fs::create_dir_all(&model_dir)?;
 
@@ -113,7 +120,7 @@ fn canonical_model_name(model_name: &str) -> Result<&str, InferenceError> {
     }
 }
 
-#[cfg(feature = "download")]
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn verify_checksums(model_name: &str, model_dir: &Path) -> Result<(), InferenceError> {
     let expected = expected_checksums(model_name);
 
@@ -141,7 +148,7 @@ fn verify_checksums(model_name: &str, model_dir: &Path) -> Result<(), InferenceE
     Ok(())
 }
 
-#[cfg(feature = "download")]
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn verify_file_checksum(path: &Path, expected: &str) -> Result<(), InferenceError> {
     let actual = sha256_hex(path)?;
     if actual != expected {
@@ -155,14 +162,14 @@ fn verify_file_checksum(path: &Path, expected: &str) -> Result<(), InferenceErro
     Ok(())
 }
 
-#[cfg(feature = "download")]
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 struct ExpectedChecksums {
     model_safetensors: Option<&'static str>,
     /// vocab.txt for WordPiece models (BGE), tokenizer.json for SentencePiece models (E5).
     tokenizer: Option<(&'static str, &'static str)>, // (filename, sha256)
 }
 
-#[cfg(feature = "download")]
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn expected_checksums(model_name: &str) -> ExpectedChecksums {
     match model_name {
         // model.safetensors SHA-256 from the Hugging Face LFS pointer.
@@ -237,7 +244,7 @@ fn expected_checksums(model_name: &str) -> ExpectedChecksums {
     }
 }
 
-#[cfg(feature = "download")]
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
     use std::io::Write;
 
@@ -256,7 +263,7 @@ fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
     Ok(())
 }
 
-#[cfg(feature = "download")]
+#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn sha256_hex(path: &Path) -> Result<String, InferenceError> {
     use sha2::{Digest, Sha256};
     use std::io::Read;

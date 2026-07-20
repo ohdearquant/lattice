@@ -48,9 +48,11 @@ tracing = "0.1"
 # wasm32-unknown-unknown, ring's build script does not cross-compile to
 # aarch64-unknown-linux-gnu under a zig toolchain, and the embedding compute path
 # uses neither. The native `embed` binary re-enables first-use model downloads
-# through this crate's own `download` feature (in `default`); wasm/edge builds
-# pass `--no-default-features --features {wasm,native}` to leave ring out.
-# See issue #1095.
+# through this crate's own `download` feature (in `default`), which forwards
+# `lattice-inference/download`. That forward is wasm-safe because inference gates
+# its own ureq/download stack to non-wasm targets, so a plain `--features wasm`
+# build stays download-free; edge/cross builds drop it with
+# `--no-default-features --features native`. See issue #1095.
 lattice-inference = { version = "0.7.0", path = "../inference", optional = true, default-features = false, features = [
     "std",
     "f16",
@@ -106,12 +108,15 @@ serde_json = { workspace = true }
 default = ["native", "download"]
 native = ["dep:lattice-inference"]
 # First-use model downloads for the native `embed` binary (its `--download-only`
-# flag and the implicit fetch inside `BertModel::from_pretrained`). Forwards to
-# `lattice-inference/download` (ureq -> rustls -> ring). In `default` so a plain
-# `cargo run -p lattice-embed --bin embed` keeps downloading models; wasm/edge
-# builds pass `--no-default-features --features {wasm,native}` to leave it (and
-# ring, which does not compile to wasm32 or cross to aarch64) out. See #1095.
-download = ["lattice-inference/download"]
+# flag and the implicit fetch inside `BertModel::from_pretrained`). Implies
+# `native` (downloads need the inference compute dep) and forwards
+# `lattice-inference/download`. In `default`, so a plain native
+# `cargo run -p lattice-embed --bin embed` keeps downloading models. It is safe on
+# wasm even when `default` is active: inference gates its ureq/download stack to
+# non-wasm targets, so a plain `--features wasm` build resolves download-free.
+# Edge/cross builds still drop it with `--no-default-features --features native`
+# (ring does not cross-compile to aarch64 under zig). See #1095.
+download = ["native", "lattice-inference/download"]
 # wasm-bindgen JS bindings (`LatticeEmbedder`) for building a browser-loadable
 # `.wasm` module. Only meaningful together with `native` (it wraps
 # `lattice_inference::BertModel`); the `wasm-bindgen`/`console_error_panic_hook`

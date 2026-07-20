@@ -8,9 +8,11 @@ lattice-embed = { git = "https://github.com/ohdearquant/lattice" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-The default feature set (`native`) pulls in `lattice-inference` and enables the download
-feature, so the first call will fetch the model weights from HuggingFace if they are not
-already cached.
+The default feature set (`native` + `download`) pulls in `lattice-inference` and enables
+model downloads, so the first call will fetch the model weights from HuggingFace if they
+are not already cached. `native` is the embedding compute API and `download` adds the HTTP
+fetcher; to build without the fetcher (a wasm target, or a cross-compile where its TLS
+stack will not build) use `--no-default-features --features native`.
 
 ## Generate an Embedding
 

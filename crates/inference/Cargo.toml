@@ -71,7 +71,8 @@ mime = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
-ureq = { version = "2", features = ["tls"], optional = true }
+# `ureq` (the `download` feature's HTTP client) is declared in the non-wasm
+# `[target]` table below, not here -- see the rationale there.
 sha2.workspace = true
 rusqlite = { workspace = true, optional = true }
 metal = { version = "0.33", optional = true }
@@ -213,6 +214,17 @@ required-features = ["f16", "metal-gpu"]
 [[example]]
 name = "bench_gdn_state"
 required-features = ["f16", "metal-gpu", "gdn-state-counters"]
+
+# `download` (ureq -> rustls -> ring) is gated to non-wasm targets. ring does not
+# build for wasm32-unknown-unknown, and its build script does not cross-compile to
+# aarch64-unknown-linux-gnu under a zig toolchain. Declaring `ureq` here rather than
+# as an unconditional optional dependency makes the `download` feature a no-op on
+# wasm: a consumer that forwards `lattice-inference/download` on a wasm build then
+# resolves download-free instead of failing to compile ureq. The `download`-gated
+# code in download.rs is correspondingly `not(target_arch = "wasm32")`-gated, so on
+# wasm the "downloads unavailable" path is what compiles. See issue #1095.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "2", features = ["tls"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
