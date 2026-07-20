@@ -825,16 +825,15 @@ fn bench_squared_euclidean_fast_path(c: &mut Criterion) {
 // ROUND 3: PREPARED QUERY NORMALIZED COSINE BENCHMARKS (H1 batch baseline)
 // ============================================================================
 
-/// Prepared normalized-cosine batch path (Round 3, Hypothesis 1 — REFUTED).
+/// Prepared normalized-cosine batch path: parity check against the fused meta path.
 ///
 /// Measures `approximate_cosine_distance_prepared` on `QuantizedData::Full` unit
 /// vectors at [384, 768, 1024] dims (1000 stored vectors), against
-/// `approximate_cosine_distance_prepared_with_meta` on the same corpus. The
-/// original hypothesis (a unit-norm hint path routing to bare dot product beats
-/// full cosine by >=15%) is refuted by this bench: verifying the stored norm
-/// costs an extra O(d) pass, while `cosine_similarity` fuses dot and norms in
-/// one pass. `_with_meta` now delegates to the fused path, so these two groups
-/// are expected to measure AT PARITY; a gap between them is a regression.
+/// `approximate_cosine_distance_prepared_with_meta` on the same corpus. A unit-norm
+/// hint path that routes to bare dot product does not beat full cosine: verifying the
+/// stored norm costs an extra O(d) pass, while `cosine_similarity` fuses dot and norms
+/// in one pass. `_with_meta` delegates to the fused path, so these two groups are
+/// expected to measure AT PARITY; a gap between them is a regression.
 fn bench_prepared_query_normalized_cosine(c: &mut Criterion) {
     const BENCH_DIMS: [usize; 3] = [384, 768, 1024];
     const STORED_COUNT: usize = 1000;
