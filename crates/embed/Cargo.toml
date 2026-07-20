@@ -54,8 +54,21 @@ tracing = "0.1"
 # or needed for the embedding compute path.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["sync", "rt"] }
-# Embedding generation (native, pure Rust)
-lattice-inference = { version = "0.7.0", path = "../inference", optional = true, features = ["f16"] }
+# Embedding generation (native, pure Rust). Trimmed to the CPU compute path for
+# the same reason the wasm table below is: this crate uses `BertPooling`,
+# `BpeTokenizer`, `weights::{SafetensorsFile, parse_index}`, `forward::cpu_f*`,
+# and `vision::*`, and nothing at all from `download` (ureq) or `serve` (axum).
+# Carrying them cost a cross-compile: `download` pulls ureq -> rustls -> ring,
+# whose build script does not cross to aarch64-unknown-linux-gnu with a zig
+# toolchain, so `cargo check -p lattice-embed --target aarch64-unknown-linux-gnu`
+# failed while `lattice-inference` itself built clean. Edge targets receive
+# models over scp; they have no use for an HTTP downloader or a serving stack.
+# Feature unification still turns both back on for any build that genuinely
+# wants them, so this only trims the case where embed is built on its own.
+lattice-inference = { version = "0.7.0", path = "../inference", optional = true, default-features = false, features = [
+    "std",
+    "f16",
+] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.0", default-features = false, features = ["sync", "rt"] }
