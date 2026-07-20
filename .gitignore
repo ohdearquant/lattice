@@ -2,6 +2,9 @@
 /target
 debug
 
+# bench-compare scratch: full worktree checkouts + their target dirs, multi-GB
+/.cache/
+
 # Cargo
 **/*.rs.bk
 Cargo.lock
