@@ -49,7 +49,7 @@ use std::sync::OnceLock;
 /// **Unstable**: SIMD dispatch internals; fields may be added as new ISAs are supported.
 ///
 /// SIMD configuration with runtime feature detection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimdConfig {
     /// **Unstable**: AVX-512F support available (x86_64).
     pub avx512f_enabled: bool,
