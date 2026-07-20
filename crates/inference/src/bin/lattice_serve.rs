@@ -1992,7 +1992,7 @@ mod imp {
         let mut cfg = build_cfg(&validated);
         // Wire the compiled grammar into the worker config (design note
         // §"End-to-end execution", step 4) and force `enable_thinking` off
-        // for strict requests regardless of server defaults (sign-off Q5):
+        // for strict requests regardless of server defaults:
         // the grammar masks from the first decode token, so thinking
         // tokens are unsampleable under it and a think-then-constrain flow
         // is out of scope for v0.
@@ -2410,7 +2410,7 @@ mod imp {
                         .into_response();
                     }
                     WorkerEvent::ConstraintBlocked(message) => {
-                        // Structured-output v0 (design note, sign-off Q4): a
+                        // Structured-output v0 (design note): a
                         // strict request's generation failure is reported
                         // with the `blocked_constraint` machine code instead
                         // of the generic `internal_error`. This used to be
@@ -3717,7 +3717,7 @@ mod imp {
 
         /// Route test (design note §"Serve and backend integration", item
         /// 1): an admitted strict request's worker job carries
-        /// `grammar.is_some()`, `enable_thinking == false` (sign-off Q5),
+        /// `grammar.is_some()`, `enable_thinking == false`,
         /// and the successful response carries `constraint_applied` --
         /// asserted from a real, compiled `GrammarEngine`, not a stub, so a
         /// route that merely returns schema-shaped JSON without actually
@@ -3883,7 +3883,7 @@ mod imp {
             assert_eq!(code, "internal_error");
         }
 
-        /// Sign-off Q4: `stopped == false` (length/KV-window exhaustion)
+        /// `stopped == false` (length/KV-window exhaustion)
         /// on a structured request must surface as HTTP 500
         /// `length_limit`, never HTTP 200 with truncated JSON.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
