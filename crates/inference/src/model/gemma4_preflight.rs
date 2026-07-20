@@ -238,7 +238,7 @@ pub fn preflight_check(
         }
     }
 
-    // Exhaustiveness (ADR-082 Amendment 1 / review finding 3): every
+    // Exhaustiveness (ADR-082 Amendment 1): every
     // supplied language-model tensor must have been consumed above, either
     // by loading or by the shared-KV tolerate-and-skip category. A name
     // that matches neither -- an extra, misspelled, or otherwise unexpected

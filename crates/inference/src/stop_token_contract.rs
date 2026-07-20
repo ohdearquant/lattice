@@ -44,7 +44,7 @@
 //!
 //! Entry 11 (`generate_multimodal`) has its own independent sampling loop —
 //! it does not call `generate`/`generate_streaming` internally — and was
-//! missing from this manifest until the PR #632 review flagged it as
+//! missing from this manifest until PR #632 added it as
 //! an unguarded sibling-invocation path (#613's own warning pattern). Its
 //! loop already used the EXCLUDE contract (checks `is_stop` before pushing
 //! at every termination point: first-token sample, KV-full break, and the

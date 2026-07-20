@@ -115,9 +115,8 @@ pub enum WorkerEvent {
     /// candidate token (#611), distinct from [`WorkerEvent::Failed`] at the
     /// type level so a caller offering structured-output admission can
     /// report its dedicated `blocked_constraint` HTTP machine code without
-    /// pattern-matching the message text (round-1 structured-output-v0
-    /// review, medium finding 2: a backend wording change must not be able
-    /// to silently degrade that code to `internal_error`). Carries the
+    /// pattern-matching the message text (a backend wording change must not
+    /// be able to silently degrade that code to `internal_error`). Carries the
     /// underlying error message for server-side logging only.
     ConstraintBlocked(String),
     /// The job was skipped before any prompt work started because the

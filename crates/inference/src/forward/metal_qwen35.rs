@@ -1224,7 +1224,7 @@ mod inner {
         ///
         /// Mirrors `Q4WeightBuf::from_buffer` for API-shape parity; unused
         /// until a non-mmap Q3 construction path (e.g. concatenated MoE-style
-        /// upload) exists — see w3_stage2_report.md "what shipped" for scope.
+        /// upload) exists.
         #[allow(dead_code)]
         fn from_buffer(buffer: Buffer) -> Self {
             Q3WeightBuf {
@@ -1237,8 +1237,7 @@ mod inner {
         /// Wrap a no-copy Metal buffer backed by `mmap` with a non-zero payload offset.
         ///
         /// Exercised today only by [`mmap_q3_weight`] and its tests; live
-        /// checkpoint loading does not yet route MLP tensors through it (see
-        /// w3_stage2_report.md "what shipped" for the scope decision).
+        /// checkpoint loading does not yet route MLP tensors through it.
         #[allow(dead_code)]
         fn from_mmap(buffer: Buffer, payload_offset: u64, mmap: memmap2::Mmap) -> Self {
             Q3WeightBuf {
@@ -1264,8 +1263,7 @@ mod inner {
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
     /// modified while the process is running.
     ///
-    /// Not yet called from live checkpoint loading — see w3_stage2_report.md
-    /// "what shipped" for the scope decision (proven end-to-end by this
+    /// Not yet called from live checkpoint loading (proven end-to-end by this
     /// module's `mmap_q3_weight_*` tests instead).
     #[cfg(feature = "metal-gpu")]
     #[allow(dead_code)]
@@ -12558,7 +12556,7 @@ mod inner {
         /// # Panics
         /// Panics if `k` is zero or not a multiple of 32 (a caller
         /// programming error, not a runtime/capability condition).
-        #[allow(dead_code)] // wired to real MLP dispatch is deferred past Stage 2 — see w3_stage2_report.md
+        #[allow(dead_code)] // wiring to real MLP dispatch is deferred past Stage 2
         fn dispatch_gemm_q3(
             &self,
             enc: &ComputeCommandEncoderRef,
@@ -14156,8 +14154,8 @@ mod inner {
     /// per-step token pick: opens the `decode.sample` interval, then routes
     /// to the compact-candidate or full-logits sampler.
     ///
-    /// Centralizes what was five independent copy-pasted call sites (round-3
-    /// review finding: two of the five -- the multimodal decode loops --
+    /// Centralizes what was five independent copy-pasted call sites: two of
+    /// the five -- the multimodal decode loops --
     /// had already drifted to call `sample_token` directly, with neither the
     /// interval nor the compact-route policy the other three loops apply).
     /// `compact` is `Some(candidates)` for the GPU-top-k route (mirrors the
@@ -17952,7 +17950,7 @@ mod inner {
         };
         use crate::model::qwen35_config::LayerType;
 
-        // Mutation-sensitive regression for round-4 finding 1: five decode
+        // Mutation-sensitive: five decode
         // loops used to copy-paste their own `decode.sample` interval +
         // compact/full-logits routing, and two of the five (the multimodal
         // decode loops) had already drifted to call `sample_token` directly
@@ -17960,7 +17958,7 @@ mod inner {
         // shared call site; these two source-level checks guard both halves
         // of that invariant without depending on a live Instruments/xctrace
         // tool session (which real FFI emission would require to observe).
-        // See fix-round-4 report for the mutation run against this pair.
+        // Each check fails if the shared call site regresses.
         #[test]
         fn sample_decode_traced_opens_the_decode_sample_interval() {
             let src = include_str!("metal_qwen35.rs");
@@ -17993,8 +17991,7 @@ mod inner {
                 .find("    mod tests {")
                 .expect("mod tests must exist in this file");
             let production_src = &src[..production_end];
-            // One definition + five call sites (round-4 finding-1 table: the
-            // fix-round-4 report enumerates each by function and line).
+            // One definition + five call sites, each enumerable by function and line.
             let count = production_src.matches("sample_decode_traced(").count();
             assert_eq!(
                 count, 6,
@@ -21082,8 +21079,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // Shape E: M=16,N=1024,K=3584 — Qwen3.5-0.8B's down-projection
             //   depth (`intermediate_size=3584`, dispatch uses
             //   `K=intermediate` — metal_qwen35.rs:5112), 112 `BK=32`
-            //   iterations — the deepest Q3-eligible production MLP shape,
-            //   round-2 review finding 2.
+            //   iterations — the deepest Q3-eligible production MLP shape.
             //
             // `max_abs_diff` is the same NaN-honest helper used by the Q4 twin
             // below (`gemm_q4_tiled_vs_naive_numeric_differential`) — a
@@ -21151,11 +21147,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 envelope.push((m, n, k, max_diff));
             }
 
-            // Bound derived from the measured envelope above (see
-            // w3_fix_r2_report.md for the full table), not a hand-waved
+            // Bound derived from the measured envelope above, not a hand-waved
             // constant: the largest observed shape (M=16 N=1024 K=3584, the
-            // Qwen3.5-0.8B down-projection depth — 112 `BK=32` iterations,
-            // round-2 review finding 2) measured max|gpu-ref| ~= 1.946e-2;
+            // Qwen3.5-0.8B down-projection depth — 112 `BK=32` iterations)
+            // measured max|gpu-ref| ~= 1.946e-2;
             // 0.037 is ~1.9x that. The headroom covers cross-device variation
             // (different Apple Silicon generations accumulate the f16
             // X/W-staging + f32-reduction residual slightly differently) and
@@ -21176,8 +21171,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Mutation-sensitivity test for the differential comparison itself
-        /// (round-1 review finding 2): corrupt a packed block's `scale` field
+        /// Mutation-sensitivity test for the differential comparison itself:
+        /// corrupt a packed block's `scale` field
         /// to an IEEE-754 f16 NaN bit pattern so the GPU kernel's dequantized
         /// weight — and therefore its GEMM output — is NaN, then prove the
         /// NaN-honest comparison fails loudly instead of silently reading as
@@ -21186,7 +21181,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// mutation-sensitive, the same way the pack/unpack mutation tests
         /// prove the kernel is.
         ///
-        /// Round-2 review finding 1: `#[should_panic(expected = "is not
+        /// `#[should_panic(expected = "is not
         /// finite")]` could not distinguish "the Apple7 dispatch ran and the
         /// NaN-honest comparison caught it" from "no Apple7 device, so this
         /// branch panicked with an unrelated message that happened to also
@@ -22187,7 +22182,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// disarmed, and the collector must stay disarmed rather than
         /// silently self-arming on first use.
         ///
-        /// Mutation check (documented for the reviewer to exercise, not
+        /// Mutation check (documented as a manual check, not
         /// compiled in): replacing `encode_moe_ffn`'s `if let Some(trace) =
         /// c.borrow_mut().as_mut() { trace.push(..) }` guard with an
         /// unconditional `c.borrow_mut().get_or_insert_with(Vec::new).push(..)`
@@ -22249,7 +22244,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// through `encode_mlp_block` into `encode_moe_ffn`. Also exercises
         /// `dump_moe_routing_trace_jsonl`'s round-trip.
         ///
-        /// Mutation check (documented for the reviewer to exercise, not
+        /// Mutation check (documented as a manual check, not
         /// compiled in): commenting out the `trace.push(MoeRoutingTraceRecord
         /// { .. })` call inside `encode_moe_ffn`'s `MOE_ROUTING_TRACE.with(..)`
         /// block makes this test fail — `take_moe_routing_trace()` returns an
@@ -22936,7 +22931,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Ordering proof (adversarial-review Finding 1): `encode_moe_ffn`'s
+        /// Ordering proof: `encode_moe_ffn`'s
         /// routed-expert dequant work must genuinely overlap Step 2's
         /// shared-expert GEMV encoding, not just fan out across rayon
         /// before Step 2 starts and then block in front of it. Proven
@@ -23029,7 +23024,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Failure-isolation proof (adversarial-review Finding 2): a dequant
+        /// Failure-isolation proof: a dequant
         /// task panicking after `plan_prefetch` already committed its
         /// slot's ownership bookkeeping must not let a later token read
         /// stale/never-written bytes out of that slot.
@@ -23217,8 +23212,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Direct Stage-1-equivalence regression (adversarial-review
-        /// Finding 3): the `plan_prefetch` + dequant + `apply_prefetch_results`
+        /// Direct Stage-1-equivalence regression: the `plan_prefetch` + dequant + `apply_prefetch_results`
         /// path must leave a cache in EXACTLY the same bookkeeping state
         /// (`slot_owner`, `expert_to_slot`, `slot_touched`, `slot_ready`,
         /// LRU order, hit/miss/eviction counters) as calling `resolve()`
@@ -25755,11 +25749,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // ===================================================================
-        // Tester suite (issue #171): mutation-sensitive correctness tests for
-        // the lm_head two-stage block-top-k path. See
-        // ../architect/design_spec.md (Test Plan) and
-        // ../implementer/impl_notes.md. Results + mutation-sensitivity
-        // evidence: ../tester/test_report.md.
+        // Mutation-sensitive correctness tests for
+        // the lm_head two-stage block-top-k path (issue #171).
         // ===================================================================
 
         /// Pure unit test for the route gate (no GPU). Design-spec "Routing
@@ -25895,7 +25886,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             idx
         }
 
-        /// Adversarial distribution from `design_spec.md` Test Plan §3: every
+        /// Adversarial distribution: every
         /// global top-K token clusters inside ONE Stage-1 tile. Proves Stage 1
         /// emits a true per-tile top-`local_k`, not merely a per-tile argmax
         /// or an approximate/truncated local ranking — a distribution where
@@ -26036,16 +26027,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Bypass-sensitive production-path test (design_spec.md Test Plan
-        /// §6): poisons the persistent logits buffer with a sentinel bit
+        /// Bypass-sensitive production-path test: poisons the persistent
+        /// logits buffer with a sentinel bit
         /// pattern, runs the compact greedy route, and asserts the sentinel
         /// survives untouched — proving the full `[vocab_size]` GEMV never
         /// wrote to it, i.e. Stage 1/Stage 2 actually ran instead of the
         /// full-logit path silently computing everything and discarding the
         /// extra values.
         ///
-        /// MUTATION-SENSITIVE: see test_report.md for the reverse-apply
-        /// proof — disabling the Stage-1/2 early return in
+        /// MUTATION-SENSITIVE: disabling the Stage-1/2 early return in
         /// `encode_final_head` (forcing every route through the full-logit
         /// GEMV) flips both the sentinel-buffer assertion below AND the
         /// `out.is_empty()` assertion.
@@ -26287,8 +26277,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Acceptance test #1 (task order item 7 / design_spec.md Test Plan
-        /// §4): greedy token agreement 100% vs. the full-logit path on
+        /// Acceptance test: greedy token agreement 100% vs. the full-logit path on
         /// \>=10,000 positions using the real Qwen3.5-0.8B checkpoint.
         /// Overridable via `LATTICE_TEST_GREEDY_POSITIONS` for fast local
         /// iteration; defaults to 10,000 to satisfy the acceptance gate. KV
@@ -27527,8 +27516,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Acceptance test #2 (task order item 7 / design_spec.md Test Plan
-        /// §5): top-k SET agreement 100% for K in {8,16,40,64} vs. the
+        /// Acceptance test: top-k SET agreement 100% for K in {8,16,40,64} vs. the
         /// full-logit CPU oracle, on real checkpoint positions (the
         /// clustered-tile adversarial case is covered separately by
         /// `lm_head_block_topk_clustered_single_tile_set_agreement`).
@@ -29767,7 +29755,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// old `Ok` shape would additionally have `stop_reason: None`, the
         /// invariant-violating result #856 fixes).
         ///
-        /// PR #915 review feedback (fix 4): honors
+        /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
         /// test, so a required Metal CI leg fails loud on a missing device
         /// instead of silently passing without ever exercising the guard.
@@ -29920,7 +29908,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// through prefill and sampling instead of erroring, so
         /// `result.is_err()` fails.
         ///
-        /// PR #915 review feedback (fix 4): honors
+        /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
         /// test, so a required Metal CI leg fails loud on a missing device
         /// instead of silently passing without ever exercising the guard.
@@ -34639,7 +34627,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// (`generate_streaming_with_prefix_cache_and_cancel`), before
         /// `_inner` is ever called.
         ///
-        /// PR #915 review feedback (fix 3): a fresh-state / `entry ==
+        /// A fresh-state / `entry ==
         /// None` assertion alone does not exercise the property that
         /// motivated putting the guard in the wrapper rather than
         /// `_inner` -- a *warmed* slot survives the rejection, because the
@@ -34650,10 +34638,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// assert both the exact error and that the pre-existing entry is
         /// unchanged afterward.
         ///
-        /// PR #915 review, second pass: the first version of this
-        /// test only compared `generic.token_ids` while claiming
+        /// Comparing only `generic.token_ids` does not prove
         /// "byte-identical" survival; `MetalCrossTurnPrefixEntry` also
-        /// carries `gdn_snapshot` and sparse `checkpoints`. This version
+        /// carries `gdn_snapshot` and sparse `checkpoints`. This test
         /// compares every field: `generic` (`kv_cache::CrossTurnPrefixEntry`,
         /// which derives `PartialEq`/`Eq` over `slot_id`, `metadata`,
         /// `token_ids`, `represented_len`, the `kv` handle -- itself a
@@ -37640,7 +37627,7 @@ impl MetalQwen35State {
 
     /// **Unstable**: Metal generate stub; always errors without metal-gpu feature.
     ///
-    /// #856 follow-up (PR #915 review, first pass): this used to
+    /// #856 follow-up: this used to
     /// return an unconditional `Ok(GenerateOutput { .. })` with empty
     /// text/tokens for *every* prompt, including non-empty ones. Because
     /// `MetalQwen35State` is a public unit struct on this cfg (directly

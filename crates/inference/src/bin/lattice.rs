@@ -5655,9 +5655,8 @@ mod serve {
             /// this asserts the frame's actual JSON payload shape: real code
             /// path yields `finish_reason: null` + a string `delta.content`;
             /// the mutated path yields a non-null `finish_reason` and no
-            /// `content`, and the second `assert!` fails. Verified by
-            /// reverting that exact line and re-running: see the PR body's
-            /// mutation log.
+            /// `content`, and the second `assert!` fails, so this test fails
+            /// if the disconnect-stops-generation behavior regresses.
             #[tokio::test]
             async fn chat_completions_streaming_disconnect_stops_generation() {
                 let req = ChatCompletionRequest {
