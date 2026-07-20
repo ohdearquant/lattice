@@ -376,9 +376,14 @@ jobs:
       # #611 (medium): the three tests above only reach
       # the post-prefill masking site (their fixture blocks every vocab entry
       # from step 0), so removing a DECODE-LOOP `has_finite_logit` guard left
-      # them green. These three companion tests use a grammar that allows
-      # exactly one token then blocks every continuation, so they exercise
-      # the second, decode-loop guard site in each of the three functions.
+      # them green. These three companion tests use a grammar that dead-ends
+      # mid-document (a required continuation byte absent from the vocab), so
+      # they exercise the second, decode-loop guard site in each of the three
+      # functions. (#1064 renamed these from
+      # `fails_closed_on_grammar_blocking_second_token`: that name's fixture
+      # actually tested a grammar completing on its second token, which is a
+      # successful stop, not a fail-closed case — see
+      # `*_completed_grammar_is_success` below.)
       - name: inference — Metal grammar fail-closed decode-loop gate (macOS only)
         if: runner.os == 'macOS'
         env:
@@ -386,7 +391,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-grammar-failclosed-decode-test.log"
-          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_grammar_blocking_second_token -- --nocapture 2>&1 | tee "$log"
+          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_grammar_dead_end -- --nocapture 2>&1 | tee "$log"
           grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # Issue #252 (#238 follow-up): the f16 KV-cache Metal path (opt-in via
       # LATTICE_KV_F16) had no automated test. GitHub's hosted macos-latest
@@ -580,8 +585,14 @@ jobs:
   # any CI job before this issue's step-2 migrations landed; this closes
   # that gap for all of them at once rather than repeating the same
   # omission per migrated script.)
-  bench-decode-harness-tests:
-    name: bench-decode-harness-tests
+  # The job/check name says "unit-tests (no engine)" on purpose: a green
+  # check here proves harness plumbing and parameter transcription ONLY.
+  # No benchmark runs, no engine binary executes, no throughput number is
+  # produced or validated by this job — reading it as bench evidence is
+  # exactly the misread its old name ("bench-decode-harness-tests")
+  # invited on the #813 migration PRs.
+  decode-harness-unit-tests:
+    name: decode-harness-unit-tests (no engine)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

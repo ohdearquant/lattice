@@ -57,7 +57,7 @@ class _FakeAdapter:
         )
 
 
-class ProfileParameterEquivalenceTest(unittest.TestCase):
+class ProfileParameterTranscriptionTest(unittest.TestCase):
     """bench_q4_apples.sh: N1=32, N2=256, RUNS=5, no lattice/ollama warmup,
     mlx warms once at 8 tokens (same call shape as apples_to_apples_q4, but
     this is that script's own separate reimplementation, migrated on its
@@ -98,7 +98,7 @@ class ProfileParameterEquivalenceTest(unittest.TestCase):
         self.assertEqual(groups["mlx"].model, "qwen3.5-0.8b")
 
 
-class CallScheduleEquivalenceTest(unittest.TestCase):
+class CallScheduleContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _, cls.profiles = harness.load_profiles_file(DEFAULT_PROFILES_FILE)

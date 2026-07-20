@@ -35,15 +35,7 @@ impl QuantizationParams {
     /// Handles edge cases: empty vectors, NaN, Inf, near-zero vectors.
     pub fn from_vector(vector: &[f32]) -> Self {
         // Single pass over finite values to handle NaN/Inf gracefully.
-        let mut min_val = f32::INFINITY;
-        let mut max_val = f32::NEG_INFINITY;
-
-        for &v in vector {
-            if v.is_finite() {
-                min_val = min_val.min(v);
-                max_val = max_val.max(v);
-            }
-        }
+        let (mut min_val, mut max_val) = minmax_finite(vector);
 
         // Handle edge case: empty or all non-finite.
         if !min_val.is_finite() || !max_val.is_finite() {
@@ -68,6 +60,67 @@ impl QuantizationParams {
             max_val,
         }
     }
+}
+
+/// Minimum and maximum over the finite lanes of `v`, in one pass.
+///
+/// Non-finite lanes are skipped. An empty or all-non-finite input yields
+/// `(+inf, -inf)` so the caller's reset branch fires.
+///
+/// Explicit NEON kernel with a scalar fallback rather than a plain guarded
+/// loop: the auto-vectorized form of this reduction was demoted to scalar
+/// code by an unrelated codegen-unit reshuffle (+48% on per-call int8
+/// quantization at 1024 dims), so the hot path must not depend on the
+/// auto-vectorizer's mood.
+fn minmax_finite(v: &[f32]) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if simd_config().neon_enabled {
+            // SAFETY: NEON confirmed available at runtime.
+            return unsafe { minmax_finite_neon(v) };
+        }
+    }
+    minmax_finite_scalar(v)
+}
+
+fn minmax_finite_scalar(v: &[f32]) -> (f32, f32) {
+    let mut min_val = f32::INFINITY;
+    let mut max_val = f32::NEG_INFINITY;
+    for &x in v {
+        if x.is_finite() {
+            min_val = min_val.min(x);
+            max_val = max_val.max(x);
+        }
+    }
+    (min_val, max_val)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn minmax_finite_neon(v: &[f32]) -> (f32, f32) {
+    let chunks = v.len() / 4;
+    let inf = unsafe { vdupq_n_f32(f32::INFINITY) };
+    let neg_inf = unsafe { vdupq_n_f32(f32::NEG_INFINITY) };
+    let mut vmin = inf;
+    let mut vmax = neg_inf;
+    for i in 0..chunks {
+        // SAFETY: `i * 4 + 3 < v.len()` by the chunk bound.
+        let x = unsafe { vld1q_f32(v.as_ptr().add(i * 4)) };
+        unsafe {
+            // `|x| < +inf` holds exactly for finite lanes (false for NaN, ±inf),
+            // so masked lanes contribute identity elements, same as skipping.
+            let finite = vcaltq_f32(x, inf);
+            vmin = vminq_f32(vmin, vbslq_f32(finite, x, inf));
+            vmax = vmaxq_f32(vmax, vbslq_f32(finite, x, neg_inf));
+        }
+    }
+    let (mut min_val, mut max_val) = unsafe { (vminvq_f32(vmin), vmaxvq_f32(vmax)) };
+    for &x in &v[chunks * 4..] {
+        if x.is_finite() {
+            min_val = min_val.min(x);
+            max_val = max_val.max(x);
+        }
+    }
+    (min_val, max_val)
 }
 
 /// **Unstable**: INT8 quantized vector; struct layout and invariants may change.

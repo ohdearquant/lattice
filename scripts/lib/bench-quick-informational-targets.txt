@@ -1,0 +1,30 @@
+# bench-quick-informational-targets.txt — the single validated manifest for
+# quick-mode informational demotion (lattice#714; target-level policy per
+# lattice#1060, 2026-07-19).
+#
+# Format: one `<crate>:<bench-target>` key per line; `#` starts a comment.
+# scripts/lib/bench-informational-groups.sh (the production shell path) and
+# scripts/perf-bench-gate.py --selftest (the validator) both read THIS file.
+# There is no other copy of the demoted-target set anywhere.
+#
+# Semantics: in QUICK mode, every Criterion group of a listed target is
+# reported informationally — fully measured, rendered in the report's
+# informational section and the all-measurements table, excluded only from
+# the gating verdict and exit code. FULL mode (`scripts/bench-compare.sh
+# --full`, nightly perf lane) gates every group of every target regardless
+# of this manifest. Targets not listed here gate normally in both modes.
+#
+# Demoting a target requires same-toolchain, same-commit A/A evidence in an
+# exclusive bench window, reviewed in a PR that edits this file.
+#
+# lattice-embed:simd — demoted 2026-07-19. Evidence: repeated same-commit
+# A/A quick-mode runs in exclusive machine-wide bench windows (2026-07-13
+# idle-machine calibration; 2026-07-19 twice on origin/main e1000d3108)
+# produced confirmed-CI FAIL rows (+8% to +17%, 95% CIs) on identical
+# binaries, with DISJOINT failing groups across runs — machine-level noise
+# above quick-mode resolution, not signal. 9 of the target's ~23 groups had
+# individually accumulated that evidence before the target-level decision;
+# per-group allowlisting was converging on the whole target one PR at a
+# time while implying the unlisted groups were reliable at quick
+# resolution, which the disjoint-failure signature disproves.
+lattice-embed:simd

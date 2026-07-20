@@ -1,19 +1,21 @@
 engine	context_tokens	slope_tok_s	t1_ms	t2_ms	runs
-# PROVENANCE (2026-07-19): single-session snapshot, one machine (Apple M2 Max), 5 runs per
-#   point, Qwen3.5-0.8B greedy decode. The slope_tok_s values were derived by the
-#   pre-migration shell pipeline whose intermediate arithmetic truncated precision (#1060);
-#   that pipeline was replaced by scripts/bench_decode_harness.py (#938), but these stored
-#   values predate the replacement and have NOT been re-measured. Withdrawn from the README
-#   cross-engine table pending the multi-session baseline program (#1060). Kept here as the
-#   raw record; regenerate with ./scripts/bench_context_scaling.sh.
+# PROVENANCE (2026-07-20): single-session snapshot, one machine (Apple M2 Max), 5 runs per
+#   point, Qwen3.5-0.8B greedy decode. The original slope_tok_s values were derived by a
+#   pre-migration shell pipeline whose intermediate arithmetic truncated precision (#1060),
+#   inflating lattice/ollama by up to 19%; that pipeline was replaced by
+#   scripts/bench_decode_harness.py (#938). The lattice/ollama rows below are recomputed
+#   exactly from the same t1_ms/t2_ms raw timings (#1066) — mlx used a separate, unaffected
+#   derivation path. Still withdrawn from the README cross-engine table pending the
+#   multi-session baseline program (#1060), since these remain a single-session snapshot.
+#   Kept here as the raw record; regenerate with ./scripts/bench_context_scaling.sh.
 # Parser note: comment lines stay below the header row and contain no tab characters —
 #   bench_context_scaling_chart.py skips line 1 unconditionally and any line with <3 fields.
-lattice	64	186.6	128.015	485.782	5
-lattice	128	171.4	128.015	903.384	5
-lattice	256	145.8	128.015	1835.163	5
-ollama	64	93.3	260.753	904.003	5
-ollama	128	92.3	260.753	1647.699	5
-ollama	256	88.5	260.753	3136.075	5
+lattice	64	156.5	128.015	485.782	5
+lattice	128	154.8	128.015	903.384	5
+lattice	256	145.3	128.015	1835.163	5
+ollama	64	87.1	260.753	904.003	5
+ollama	128	86.5	260.753	1647.699	5
+ollama	256	86.3	260.753	3136.075	5
 mlx	64	265.0	176.520	387.818	5
 mlx	128	262.6	176.520	633.547	5
 mlx	256	260.2	176.520	1129.591	5

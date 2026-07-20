@@ -408,8 +408,11 @@ fn bench_reference_decode(c: &mut Criterion) {
         const HEAD_DIM: u32 = 256;
 
         let Some(device) = Device::system_default() else {
-            eprintln!("[decode_attn_bench] No Metal device — skipping reference benchmarks");
-            return;
+            eprintln!(
+                "[decode_attn_bench] FATAL: no Metal device — this bench cannot measure \
+                 anything on this machine; failing instead of producing an empty run"
+            );
+            std::process::exit(1);
         };
         let queue = device.new_command_queue();
 
@@ -515,7 +518,7 @@ fn bench_reference_decode(c: &mut Criterion) {
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _ = c;
+    fail_wrong_build(c);
 }
 
 fn bench_flash_decode(c: &mut Criterion) {
@@ -528,8 +531,11 @@ fn bench_flash_decode(c: &mut Criterion) {
         const DIRECT_THRESHOLD: u32 = 512;
 
         let Some(device) = Device::system_default() else {
-            eprintln!("[decode_attn_bench] No Metal device — skipping flash benchmarks");
-            return;
+            eprintln!(
+                "[decode_attn_bench] FATAL: no Metal device — this bench cannot measure \
+                 anything on this machine; failing instead of producing an empty run"
+            );
+            std::process::exit(1);
         };
         let queue = device.new_command_queue();
 
@@ -692,7 +698,20 @@ fn bench_flash_decode(c: &mut Criterion) {
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _ = c;
+    fail_wrong_build(c);
+}
+
+/// This bench binary is Metal-only: on a build without `metal-gpu` every group
+/// is compiled out and the run exits green having measured nothing, which
+/// silently corrupts A/B comparisons that point at it. Fail instead.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+fn fail_wrong_build(_c: &mut Criterion) {
+    eprintln!(
+        "[decode_attn_bench] FATAL: built without macOS + `metal-gpu`, so no benchmark \
+         in this binary can run. Rebuild with: cargo bench -p lattice-inference \
+         --bench decode_attn_bench --features f16,metal-gpu"
+    );
+    std::process::exit(1);
 }
 
 criterion_group!(benches, bench_reference_decode, bench_flash_decode);

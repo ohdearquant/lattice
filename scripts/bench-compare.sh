@@ -16,18 +16,24 @@
 #   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
 #
-# lattice#714: five of the lattice-embed bench targets' groups
-# (simd_dot_product, simd_cosine_similarity, int8_batch_cosine,
-# int4_cosine_distance, simd_batch_cosine_non_normalized_query) are confirmed
-# noise-dominated in --quick mode by same-toolchain A/A reproductions on
-# identical refs (the original pair: FAIL/WARN sign flipped across dozens of
-# entries run to run; the 2026-07-13 additions: confirmed-CI FAIL rows inside
-# exclusive bench windows with DISJOINT failing groups across two same-commit
-# runs). In --quick mode (the default), only those named groups are
-# measured and reported but excluded from the FAIL/WARN gate and exit code —
-# see the "informational" section of the report and INFO_GROUPS_ALLOWLIST
-# below. Every other group in the target, including any added later, gates
-# normally. --full mode gates every group normally regardless.
+# lattice#714 / lattice#1060: the lattice-embed `simd` bench TARGET is
+# informational in --quick mode (the default). Same-toolchain, same-commit
+# A/A reproductions in exclusive bench windows repeatedly produced
+# confirmed-CI FAIL rows (+8% to +17%, 95% CIs) on identical binaries with
+# DISJOINT failing groups across runs — machine-level noise above
+# quick-mode resolution, so per-group exemptions were a treadmill. Demoted
+# targets are named in ONE validated manifest,
+# scripts/lib/bench-quick-informational-targets.txt (validated by
+# scripts/perf-bench-gate.py --selftest); their groups are still fully
+# measured and rendered — the informational section plus the
+# all-measurements table record every number — but excluded from the
+# FAIL/WARN gate and exit code. Every non-demoted target (all of
+# lattice-inference) gates normally in --quick.
+#
+# --full remains the gate for EVERY group of every target: quick mode is a
+# PR-side direction/magnitude screen, and full-resolution simd gating rides
+# the scheduled nightly perf lane (a --full run on current main), so the
+# demotion is a resolution split, not a coverage hole.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -121,38 +127,70 @@ fi
   cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
 )
 
-# --- Quick-mode informational-groups (lattice#714) ---
-# Fixed, reviewed allowlist of the issue-evidenced noisy groups only — NOT a
-# target-wide dump. Every entry carries same-toolchain A/A evidence on
-# identical refs in --quick mode (lattice#714's original reproduction for
-# the first two; isolated bench-window A/A runs for the 2026-07-13
-# additions); no other group in that target has that evidence, so no other
-# group is exempted here. The
-# allowlist itself and the intersection-with-the-real-listing logic live in
-# scripts/lib/bench-informational-groups.sh, invoked below — kept in its own
-# file (rather than inline here) so scripts/perf-bench-gate.py --selftest can
-# run the exact same shell code against a controlled listing and catch a
-# shell-only regression, not just a Python-classifier one.
-# This list is embed-`simd`-specific: names are matched against the Criterion
-# top-level group name only (scripts/perf-bench-gate.py), so it must never be
-# extended with a name that could collide with a `lattice-inference` group —
-# if that ever becomes a concern, namespace by target (e.g. "embed:<group>")
-# on both sides of the handoff instead of trusting name uniqueness. Adding a
-# group requires the same kind of same-toolchain A/A quantitative evidence
-# that justified every current entry, reviewed in a PR — never derived
-# automatically from `--list`, which would silently exempt every future
-# group added to the target.
+# --- Quick-mode informational demotion (lattice#714 / lattice#1060) ---
+# Target-level policy: the demoted-target set lives in ONE validated
+# manifest, scripts/lib/bench-quick-informational-targets.txt. For each
+# bench target this script ran, the helper below is given the target key
+# (`<crate>:<bench-target>`) and that target's Criterion `--list` output;
+# it prints every top-level group of a demoted target and nothing for any
+# other target. Deriving the group set from the listing is deliberate
+# under target semantics — the demotion covers the target, so a group
+# added to a demoted target later is informational by policy, while every
+# non-demoted target stays gated because its key is absent from the
+# manifest.
+#
+# Criterion group names are bare strings once they leave the helper, with
+# no target attribution — so before folding a demoted target's groups into
+# the flat informational set, resolve-informational-groups.sh checks them
+# against every gated target's own listing and drops (gates) any name that
+# collides, warning loudly on stderr. This is the composed-path guard: a
+# group demoted for lattice-embed:simd must never silently exempt an
+# identically-named lattice-inference group from the gate.
+#
+# Both the helper and the resolver live in scripts/lib/ (rather than inline
+# here) so scripts/perf-bench-gate.py --selftest can run the exact same
+# shell code against controlled listings and catch a shell-only
+# regression, not just a Python-classifier one. --full skips this block
+# entirely: every group of every target gates at full resolution.
 INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
 rm -f "$INFO_GROUPS_FILE"
-if [ -n "$QUICK_FLAGS" ] && [ "$BENCHES_EMBED" = "simd" ]; then
+if [ -n "$QUICK_FLAGS" ]; then
   (
     cd "$HEAD_DIR"
-    # --list reflects both the built binary and any BENCH_GROUPS_EMBED filter
-    # already applied; the helper intersects it against the fixed allowlist
-    # so a stale or renamed allowlist entry fails closed (never gates) rather
-    # than silently no-op'ing into "everything is informational."
-    cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null \
-      | "$REPO/scripts/lib/bench-informational-groups.sh" > "$INFO_GROUPS_FILE"
+    DEMOTED_GROUPS_FILE="$REPO/.cache/bench-compare-demoted-groups.txt"
+    GATED_GROUPS_FILE="$REPO/.cache/bench-compare-gated-groups.txt"
+    : > "$DEMOTED_GROUPS_FILE"
+    : > "$GATED_GROUPS_FILE"
+    DEMOTED_TARGETS=""
+    GATED_TARGETS=""
+
+    # --list reflects both the built binary and any BENCH_GROUPS_* filter
+    # already applied. Every target's groups go into the demoted-set file
+    # or the gated-set file depending on manifest membership; the resolver
+    # then reconciles the two before anything is treated as informational.
+    route_target_groups() {
+      local target="$1" listing="$2"
+      if "$REPO/scripts/lib/bench-informational-groups.sh" --print-targets | grep -qxF "$target"; then
+        "$REPO/scripts/lib/bench-informational-groups.sh" --list-groups "$listing" >> "$DEMOTED_GROUPS_FILE"
+        DEMOTED_TARGETS="${DEMOTED_TARGETS:+$DEMOTED_TARGETS,}$target"
+      else
+        "$REPO/scripts/lib/bench-informational-groups.sh" --list-groups "$listing" >> "$GATED_GROUPS_FILE"
+        GATED_TARGETS="${GATED_TARGETS:+$GATED_TARGETS,}$target"
+      fi
+    }
+
+    EMBED_LISTING="$REPO/.cache/bench-compare-embed-list.txt"
+    cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null > "$EMBED_LISTING" || true
+    route_target_groups "lattice-embed:$BENCHES_EMBED" "$EMBED_LISTING"
+
+    INFERENCE_LISTING="$REPO/.cache/bench-compare-inference-list.txt"
+    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --list 2>/dev/null > "$INFERENCE_LISTING" || true
+    route_target_groups "lattice-inference:$BENCHES_INFERENCE" "$INFERENCE_LISTING"
+
+    "$REPO/scripts/lib/resolve-informational-groups.sh" \
+      "$DEMOTED_GROUPS_FILE" "${DEMOTED_TARGETS:-none}" \
+      "$GATED_GROUPS_FILE" "${GATED_TARGETS:-none}" \
+      > "$INFO_GROUPS_FILE"
   )
 fi
 
