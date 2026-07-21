@@ -23,9 +23,12 @@
 # probes; production never sets it.
 #
 # FULL mode (`bench-compare.sh --full`, or `make bench-gate`) ignores this
-# mechanism entirely and evaluates every group of every target. Those paths
-# are run manually/locally today; no automated CI lane runs full mode on main
-# yet (#1105 tracks it).
+# mechanism entirely: every group those paths bench gates, with no demotion.
+# Both bench the same two targets rather than the workspace's full bench set,
+# and --full additionally honors bench-compare.sh's BENCH_GROUPS_* filters.
+# Both are manual/local today. bench-update.yml is the one automated
+# full-resolution job on main, and it collects baselines without comparing,
+# gating, or alerting (#1105 tracks the missing gate lane).
 set -euo pipefail
 
 MANIFEST="${INFO_TARGETS_MANIFEST:-$(dirname "$0")/bench-quick-informational-targets.txt}"

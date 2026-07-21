@@ -27,18 +27,25 @@
 # scripts/perf-bench-gate.py --selftest); their groups are still fully
 # measured and rendered — the informational section plus the
 # all-measurements table record every number — but excluded from the
-# FAIL/WARN gate and exit code. Every non-demoted target (all of
-# lattice-inference) gates normally in --quick.
+# FAIL/WARN gate and exit code. Every non-demoted target this script benches
+# (the lattice-inference one) gates normally in --quick.
 #
-# --full evaluates EVERY group of every target at full resolution, simd
-# included: quick mode is a PR-side direction/magnitude screen, and a --full
-# run resolves simd tightly enough to gate. That full-resolution path is
-# available on demand — `make bench-gate` (this HEAD vs the perf-baselines
-# branch) and `bench-compare.sh --full` (an A/B) both run it. What does NOT
-# exist yet is an automated job that runs it on main and alerts on a
-# regression; until #1105 lands that detection lane, the quick-mode demotion
-# is covered only by manual/local full-mode runs, not by CI. Do not read
-# this comment as a claim that an automated lane already catches simd.
+# --full applies no informational demotion: every group it benches gates,
+# simd included, because full resolution is tight enough to gate simd on.
+# Two caveats keep that from meaning "everything is covered".
+#
+# Scope: this script benches two targets, not the workspace's full bench set
+# — lattice-inference:$BENCHES_INFERENCE (default elementwise_cpu_bench) and
+# lattice-embed:simd. The optional BENCH_GROUPS_* filters above narrow it
+# further, so a filtered --full run gates only the selected groups of those
+# two. `make bench-gate` runs the same two targets unfiltered against the
+# perf-baselines branch.
+#
+# Automation: bench-update.yml does run those targets at full resolution on
+# main weekly, but only to COLLECT baselines — it never compares against a
+# prior baseline, never invokes perf-bench-gate.py, and never fails or
+# alerts. No automated full-mode GATE exists yet (#1105 tracks it), so a
+# demoted target's full-resolution coverage today comes from manual runs.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
