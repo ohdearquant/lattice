@@ -39,11 +39,41 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 
-# Parse --full flag
-if [ "${1:-}" = "--full" ]; then
-  QUICK_FLAGS=""  # 100 samples, ~15 min total
-  shift
-fi
+# Parse flags. Both are optional and order-independent; the first non-flag
+# argument begins the positional BASE/HEAD pair.
+#
+# --fail-on-regression exists because this script is a REPORTER by default: the
+# gate invocation at the bottom ends in `|| true`, so a confirmed regression is
+# rendered in the report while the script still exits 0. That is correct for a
+# human reading an A/B, and completely wrong for an automated lane, where a
+# green exit beside a printed FAIL means the job passes on a real regression.
+# Opt in to propagate the gate's exit code instead. Default behavior is
+# unchanged so existing callers keep their current semantics.
+FAIL_ON_REGRESSION=0
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --full)
+      QUICK_FLAGS=""  # 100 samples, ~15 min total
+      shift
+      ;;
+    --fail-on-regression)
+      FAIL_ON_REGRESSION=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "bench-compare.sh: unknown flag '$1'" >&2
+      echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 BASE_REF="${1:-origin/main}"
 HEAD_REF="${2:-HEAD}"
@@ -211,9 +241,27 @@ GATE_ARGS=(--baseline-name compare-base)
 if [ -s "$INFO_GROUPS_FILE" ]; then
   GATE_ARGS+=(--informational-groups-file "$INFO_GROUPS_FILE")
 fi
+GATE_RC=0
+GATE_RAN=0
 if [ -d "$HEAD_DIR/target/criterion" ]; then
-  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || true
+  GATE_RAN=1
+  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || GATE_RC=$?
 fi
 
 echo ""
 echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
+
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  # Absence of criterion output is a broken measurement, not a pass. Reporting
+  # success here would be the same defect this flag exists to remove: a green
+  # exit standing in for evidence that was never produced.
+  if [ "$GATE_RAN" = "0" ]; then
+    echo "bench-compare: --fail-on-regression set but no criterion output at" \
+         "$HEAD_DIR/target/criterion — the A/B did not produce measurements." >&2
+    exit 1
+  fi
+  if [ "$GATE_RC" -ne 0 ]; then
+    echo "bench-compare: gate reported a confirmed regression (exit $GATE_RC)." >&2
+    exit "$GATE_RC"
+  fi
+fi

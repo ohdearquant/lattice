@@ -1,0 +1,183 @@
+name: perf post-merge detection (informational)
+#
+# WHAT THIS IS, AND WHAT IT IS NOT (lattice#1105).
+#
+# Quick-mode PR benching demotes `lattice-embed:simd` to informational, because
+# repeated same-commit A/A runs produced confirmed-CI FAIL rows on identical
+# binaries: machine noise above quick-mode resolution, not signal. That demotion
+# is correct, but for a while three source comments claimed a "scheduled nightly
+# perf lane" covered the demoted groups at full resolution. No such job existed,
+# so those groups were gated in NEITHER mode. This workflow is that missing lane.
+#
+# It DETECTS, it does not GATE a merge. It runs AFTER a commit lands on main, so
+# by construction it cannot block the merge that introduced a regression. The
+# alert is the failed run. Do NOT add this to branch protection's required
+# checks: a post-merge job can never be satisfied pre-merge, and adding it would
+# wedge the merge queue rather than protect it.
+#
+# RESOLUTION CEILING, stated up front so this is not mistaken for fine-grained
+# coverage: GitHub-hosted runners are shared and noisy. This lane reliably
+# catches GROSS regressions (roughly the >=15% class, the magnitude that
+# motivated ADR-058's workflow in the first place). It does NOT resolve
+# sub-few-percent changes — the same noise floor that made quick-mode simd
+# unreliable applies here. A green run means "no gross regression detected", not
+# "performance is unchanged". Tightening this to sub-few-percent resolution
+# requires a dedicated quiet runner and is tracked separately; do not read the
+# absence of a FAIL as evidence of a small change's absence.
+#
+# WHY AN A/B AGAINST THE PARENT rather than against the perf-baselines branch:
+# bench-update.yml rewrites perf-baselines on every perf-path push to main, so a
+# regression can be absorbed into the baseline before any scheduled job compares
+# against it. Benching the merged commit against its own parent, both built and
+# run in the same job on the same runner, compares before that ratchet and
+# removes cross-run baseline drift. Merges are squashed, so the parent is the
+# previous main tip and the diff under test is exactly one PR.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/inference/src/forward/cpu/**'
+      - 'crates/inference/src/attention/**'
+      - 'crates/inference/benches/elementwise_cpu_bench.rs'
+      - 'crates/inference/Cargo.toml'
+      - 'crates/embed/src/simd/**'
+      - 'crates/embed/benches/simd.rs'
+      - 'crates/embed/Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/bench-compare.sh'
+      - 'scripts/perf-bench-gate.py'
+      - 'scripts/lib/bench-informational-groups.sh'
+      - 'scripts/lib/bench-quick-informational-targets.txt'
+      - '.github/workflows/perf-postmerge-gate.yml'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Base ref for the A/B (default: the parent commit)'
+        required: false
+        default: ''
+      head_ref:
+        description: 'Head ref for the A/B (default: HEAD)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # One post-merge A/B at a time per arch. Timing runs must not overlap each
+  # other on a shared runner pool, and a superseded run's numbers are of no
+  # interest once a newer commit has landed.
+  group: perf-postmerge-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  postmerge-ab:
+    name: post-merge A/B (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            arch: aarch64-linux
+    steps:
+      - name: Checkout with history
+        uses: actions/checkout@v4
+        with:
+          # bench-compare.sh creates a detached worktree at the base ref, so the
+          # base commit must actually be present. A shallow clone silently has
+          # no parent and the resolve step below would fail closed.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: perf-postmerge-${{ matrix.arch }}
+
+      - name: Resolve the A/B endpoints
+        id: refs
+        env:
+          IN_BASE: ${{ github.event.inputs.base_ref }}
+          IN_HEAD: ${{ github.event.inputs.head_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          HEAD_REF="${IN_HEAD:-HEAD}"
+          HEAD_SHA=$(git rev-parse "$HEAD_REF")
+
+          if [ -n "$IN_BASE" ]; then
+            BASE_SHA=$(git rev-parse "$IN_BASE")
+          elif [ -n "${EVENT_BEFORE:-}" ] \
+               && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
+            BASE_SHA=$(git rev-parse "$EVENT_BEFORE")
+          else
+            # Force-push, branch creation, or an unavailable before-SHA. Fall
+            # back to the first parent, which for a squashed merge is the
+            # previous main tip.
+            BASE_SHA=$(git rev-parse "${HEAD_SHA}^")
+          fi
+
+          # Fail closed on a degenerate pair rather than measuring a commit
+          # against itself and reporting the resulting silence as a pass.
+          if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+            echo "base and head resolve to the same commit ($BASE_SHA); nothing to compare" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"; then
+            echo "base $BASE_SHA is not an ancestor of head $HEAD_SHA" >&2
+            exit 1
+          fi
+
+          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "A/B endpoints: $BASE_SHA -> $HEAD_SHA"
+
+      - name: Declare scope and resolution ceiling
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          {
+            echo "### perf post-merge A/B (${{ matrix.arch }})"
+            echo
+            echo "\`$BASE\` -> \`$HEAD\`, full-mode Criterion, every group of every"
+            echo "target gated (the quick-mode informational demotion does not apply"
+            echo "in full mode)."
+            echo
+            echo "**Scope.** This lane DETECTS post-merge; it cannot gate the merge"
+            echo "that introduced a regression, and it is not a required check."
+            echo
+            echo "**Resolution ceiling.** Hosted runners are shared and noisy. This"
+            echo "reliably catches gross regressions (roughly the >=15% class). It"
+            echo "does NOT resolve sub-few-percent changes. A green run means \"no"
+            echo "gross regression detected\", NOT \"performance is unchanged\"."
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Full-mode A/B, failing on a confirmed regression
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          scripts/bench-compare.sh --full --fail-on-regression "$BASE" "$HEAD"
+
+      - name: Record the outcome honestly
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "No gross regression detected (see ceiling above)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "FAILED: a confirmed regression, or the A/B did not produce measurements." >> "$GITHUB_STEP_SUMMARY"
+            echo "Read the gate report in the step log before reverting: confirm the" >> "$GITHUB_STEP_SUMMARY"
+            echo "flagged groups are reachable from the merged diff." >> "$GITHUB_STEP_SUMMARY"
+          fi
