@@ -24,8 +24,8 @@ use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_inference::vision::checkpoint::{Qwen35VisionWeights, load_qwen35_vision_weights};
 use lattice_inference::vision::embed_image_from_bytes_f16;
-use lattice_inference::weights::SafetensorsFile;
 use lattice_inference::weights::f16_weights::{F16ModelWeights, load_f16_weights};
+use lattice_inference::weights::{SafetensorsFile, contained_shard_path};
 use std::path::Path;
 
 pub use lattice_inference::forward::cpu_f16::PoolingStrategy;
@@ -202,7 +202,16 @@ fn resolve_single_shard(model_dir: &Path) -> Result<std::path::PathBuf> {
     shards.sort_unstable();
     shards.dedup();
     match shards.as_slice() {
-        [one] => Ok(model_dir.join(one)),
+        // Index-declared shard names are untrusted checkpoint content;
+        // containment-check before the join (#1069). Without this an entry of
+        // `../` or an absolute path addresses a file outside the checkpoint,
+        // and the caller opens whatever it resolves to.
+        [one] => contained_shard_path(model_dir, one).map_err(|e| {
+            EmbedError::ModelInitialization(format!(
+                "{}: {e}",
+                model_dir.join("model.safetensors.index.json").display()
+            ))
+        }),
         [] => Err(EmbedError::ModelInitialization(format!(
             "empty weight_map in {}",
             model_dir.join("model.safetensors.index.json").display()
@@ -612,6 +621,67 @@ mod tests {
         let err = resolve_single_shard(tmp.path()).expect_err("multi-shard must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("sharded across 2 files"), "got: {msg}");
+    }
+
+    /// #1069's threat model reaches this crate too: index entries are
+    /// untrusted checkpoint content, and `Path::join` happily accepts both
+    /// `..` (walks out of the checkpoint) and an absolute path (replaces
+    /// `model_dir` entirely), after which `from_directory` opens whatever
+    /// the entry resolved to. `from_directory` is public API, so a hostile
+    /// checkpoint directory reaches it directly.
+    ///
+    /// Mutation-sensitive: reverting the resolution to a raw
+    /// `model_dir.join(one)` makes both cases return `Ok`, and both
+    /// `expect_err`s below fail.
+    #[test]
+    fn resolve_single_shard_rejects_index_entry_escaping_the_model_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"a":"../evil.safetensors"}}"#,
+        )
+        .expect("write index");
+
+        let err = resolve_single_shard(tmp.path())
+            .expect_err("a parent-traversal index entry must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes the model directory"),
+            "error must name the containment failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_single_shard_rejects_absolute_index_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"a":"/etc/passwd"}}"#,
+        )
+        .expect("write index");
+
+        let err =
+            resolve_single_shard(tmp.path()).expect_err("an absolute index entry must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absolute path"),
+            "error must name the containment failure, got: {msg}"
+        );
+    }
+
+    /// The containment check must not disturb the ordinary case: a plain
+    /// in-directory shard name still resolves to the file beside the index.
+    #[test]
+    fn resolve_single_shard_accepts_an_in_directory_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            r#"{"metadata":{},"weight_map":{"a":"only.safetensors","b":"only.safetensors"}}"#,
+        )
+        .expect("write index");
+
+        let resolved = resolve_single_shard(tmp.path()).expect("a contained entry must resolve");
+        assert_eq!(resolved, tmp.path().join("only.safetensors"));
     }
 
     #[test]
