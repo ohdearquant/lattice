@@ -16,6 +16,15 @@
 #   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
 #
+# VOCABULARY, because these four are separate and get conflated. A group is
+# MEASURED if the bench ran and produced numbers; REPORTED if those numbers
+# appear in the report; CLASSIFIED GATING (vs informational) if a regression
+# in it contributes to the report's FAIL verdict; and ENFORCED only if that
+# FAIL verdict reaches the caller as a non-zero exit status. Classification
+# is not enforcement: this script computes a verdict and then discards its
+# exit status, so it is REPORT-ONLY in both modes. `make bench-gate` is the
+# path that enforces. Use these words literally below.
+#
 # lattice#714 / lattice#1060: the lattice-embed `simd` bench TARGET is
 # informational in --quick mode (the default). Same-toolchain, same-commit
 # A/A reproductions in exclusive bench windows repeatedly produced
@@ -26,26 +35,34 @@
 # scripts/lib/bench-quick-informational-targets.txt (validated by
 # scripts/perf-bench-gate.py --selftest); their groups are still fully
 # measured and rendered — the informational section plus the
-# all-measurements table record every number — but excluded from the
-# FAIL/WARN gate and exit code. Every non-demoted target this script benches
-# (the lattice-inference one) gates normally in --quick.
+# all-measurements table record every number — but classified informational,
+# so they cannot produce a FAIL verdict. Every non-demoted target this script
+# benches (the lattice-inference one) is classified gating in --quick.
 #
-# --full applies no informational demotion: every group it benches gates,
-# simd included, because full resolution is tight enough to gate simd on.
-# Two caveats keep that from meaning "everything is covered".
+# --full applies no informational demotion: every group it benches is
+# classified gating, simd included, because full resolution is tight enough
+# to distinguish a real simd regression from machine noise. Three caveats
+# keep that from meaning "a regression cannot get past this".
+#
+# Enforcement: neither mode enforces. This script ends its gate invocation
+# with `|| true`, so a FAIL verdict is printed and then discarded, and the
+# script exits 0 either way. `make bench-gate` is the enforcing path: it runs
+# the same two default targets unfiltered against the perf-baselines branch
+# and returns perf-bench-gate.py's status directly.
 #
 # Scope: this script benches two targets, not the workspace's full bench set
 # — lattice-inference:$BENCHES_INFERENCE (default elementwise_cpu_bench) and
 # lattice-embed:simd. The optional BENCH_GROUPS_* filters above narrow it
-# further, so a filtered --full run gates only the selected groups of those
-# two. `make bench-gate` runs the same two targets unfiltered against the
-# perf-baselines branch.
+# further, so a filtered --full run classifies only the selected groups of
+# those two.
 #
 # Automation: bench-update.yml does run those targets at full resolution on
-# main weekly, but only to COLLECT baselines — it never compares against a
-# prior baseline, never invokes perf-bench-gate.py, and never fails or
-# alerts. No automated full-mode GATE exists yet (#1105 tracks it), so a
-# demoted target's full-resolution coverage today comes from manual runs.
+# main weekly, but only to collect baselines. It neither compares against a
+# prior baseline nor invokes perf-bench-gate.py nor takes any
+# regression-specific fail or alert action; its ordinary job steps can of
+# course still fail on their own errors. No automated full-mode regression
+# gate exists yet (#1105 tracks it), so a demoted target's full-resolution
+# regression coverage today comes from manual runs.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
