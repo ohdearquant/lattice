@@ -38,6 +38,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 
@@ -632,11 +633,17 @@ def main() -> int:
     # so it belongs here with the other setup validation and exits 2. Raising it
     # from the loader instead would surface as exit 1, which this script defines
     # as a parity failure, and would file a poisoned reference against lattice.
-    pickle_weights = sorted(Path(MODEL_DIR).glob("*.bin"))
+    # rglob, not glob: transformers resolves sharded and subfoldered weights, so
+    # a nested `.bin` is loadable and a non-recursive check would miss it. CI's
+    # provisioned snapshot is flat and the exact-set verifier would reject a
+    # subdirectory before this runs, but this script also runs by hand against
+    # directories nothing verified, and that is where the nested case lives.
+    pickle_weights = sorted(Path(MODEL_DIR).rglob("*.bin"))
     if pickle_weights:
         print(
             f"error: model dir {MODEL_DIR} contains pickle weight file(s) "
-            f"{[p.name for p in pickle_weights]}; only safetensors weights are "
+            f"{[str(p.relative_to(MODEL_DIR)) for p in pickle_weights]}; "
+            "only safetensors weights are "
             "trusted here (a .bin is a pickle and an arbitrary-execution vector "
             "at load time even with trust_remote_code=False)",
             file=sys.stderr,
@@ -656,7 +663,24 @@ def main() -> int:
         print(f"Prompt: {prompt[:60]}  (match_window={match_window})", file=sys.stderr)
 
         print("[hf] running reference...", file=sys.stderr)
-        hf_out = run_hf_reference(prompt, MAX_TOKENS)
+        # Anything that goes wrong producing the reference is a problem with the
+        # reference, not evidence about lattice. Letting it propagate would end
+        # the process on a traceback, and a traceback exits 1, which this script
+        # defines as a parity failure. That mislabels every reference-side fault
+        # (a snapshot that will not load, a transformers version that refuses
+        # it, a directory that disappeared after the preflight) as a lattice
+        # regression, which is the one conclusion this gate must never reach by
+        # accident.
+        try:
+            hf_out = run_hf_reference(prompt, MAX_TOKENS)
+        except Exception as e:  # noqa: BLE001 - deliberately broad, see above
+            print(
+                f"error: reference generation failed for prompt {prompt[:40]!r}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            traceback.print_exc(file=sys.stderr)
+            return 2
 
         print(f"[lattice-{backend}] running under test...", file=sys.stderr)
         lat_out = (
