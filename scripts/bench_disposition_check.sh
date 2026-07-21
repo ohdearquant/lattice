@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ADR-058 bench-compare disposition check.
+# bench-compare disposition check (enforces the CLAUDE.md contributor rule).
 #
 # Reads a PR description on stdin. Exit 0 = a substantive bench-compare
 # disposition is present; exit 1 = absent. Pure text processing, no network,
@@ -16,7 +16,7 @@ set -euo pipefail
 BODY=$(cat)
 
 if ! printf '%s' "$BODY" | grep -q '[^[:space:]]'; then
-  echo "empty description; ADR-058 requires a bench-compare disposition" >&2
+  echo "empty description; a bench-compare disposition is required" >&2
   exit 1
 fi
 
@@ -30,25 +30,54 @@ fi
 # A heading hidden inside a fenced code block or an HTML comment does NOT open
 # the section: a comment renders invisibly and a fence renders as literal code,
 # so counting either would let a PR satisfy a reviewer-facing gate with a
-# disposition no reviewer sees. Fence delimiters toggle a hidden state and are
-# themselves never headings; an HTML comment hides every line from its opening
-# <!-- through its closing -->. Content inside a fence that opens AFTER a visible
-# bench-compare heading still counts as section content, because a real bench
-# table is normally fenced; the hidden state suppresses only heading detection,
-# not membership in an already-open section.
+# disposition no reviewer sees. Comment state is resolved BEFORE fence state, so a
+# fence delimiter that appears inside a comment cannot leak into the fence tracker
+# and strand it open. Fences follow CommonMark: up to three leading spaces then a
+# run of at least three of the same character (backtick or tilde); a closer must
+# repeat the opener character, be at least as long, and carry nothing but trailing
+# whitespace, so a shorter or mismatched fence line inside a longer block stays
+# content instead of closing it early. Content inside a fence that opens AFTER a
+# visible bench-compare heading still counts as section content, because a real
+# bench table is normally fenced; the hidden state suppresses only heading
+# detection, not membership in an already-open section. Headings are ATX only (a
+# leading run of #); Setext underlines are not recognized.
 SECTION=$(printf '%s' "$BODY" | awk '
   function level(s) { if (match(s, /^#{1,6}[[:space:]]/)) { return RLENGTH - 1 } return 0 }
+  function lead_spaces(s,   n) { n = 0; while (substr(s, n + 1, 1) == " ") n++; return n }
+  function run_len(s, ch,   n) { n = 0; while (substr(s, n + 1, 1) == ch) n++; return n }
   {
     line = $0
-    if (line ~ /^[[:space:]]*(```|~~~)/) { in_fence = !in_fence; if (found) print line; next }
+
     was_in_comment = in_comment
     if (in_comment) { if (line ~ /-->/) in_comment = 0 }
     else if (line ~ /<!--/ && line !~ /-->/) { in_comment = 1 }
+
+    if (!was_in_comment && !in_comment) {
+      sp = lead_spaces(line)
+      if (sp <= 3) {
+        fbody = substr(line, sp + 1)
+        fch = substr(fbody, 1, 1)
+        if (fch == "`" || fch == "~") {
+          rl = run_len(fbody, fch)
+          if (rl >= 3) {
+            if (!in_fence) {
+              in_fence = 1; fence_char = fch; fence_len = rl
+              if (found) print line
+              next
+            } else if (fch == fence_char && rl >= fence_len) {
+              rest = substr(fbody, rl + 1); gsub(/[ \t]/, "", rest)
+              if (rest == "") { in_fence = 0; if (found) print line; next }
+            }
+          }
+        }
+      }
+    }
+
     hidden = (in_fence || was_in_comment)
     lv = hidden ? 0 : level(line)
     if (found && lv > 0 && lv <= start_lv) { exit }
     if (!found && lv > 0 && tolower(line) ~ /bench-?compare/) { found = 1; start_lv = lv }
-    if (found) { print line }
+    if (found) print line
   }
 ')
 
@@ -65,8 +94,8 @@ fi
 BODYTEXT=$(printf '%s' "$SECTION" | tail -n +2)
 CONTENT=$(printf '%s' "$BODYTEXT" | tr -d '[:space:]')
 
-# ADR-058's blessed minimal dispositions are legitimately terse and fall well
-# under a raw length floor: the no-change one-liner lattice/CLAUDE.md blesses
+# The blessed minimal dispositions are legitimately terse and fall well
+# under a raw length floor: the no-change one-liner CLAUDE.md blesses
 # ("bench-compare showed no change (p > 0.05 on all groups)."), the one-line
 # N/A this workflow's own comment promises for a doc-only change, and the
 # compiled-out cfg-gate proof. An 80-char floor rejects all three, making the

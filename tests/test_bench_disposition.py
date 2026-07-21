@@ -155,6 +155,53 @@ class BenchDispositionCheck(unittest.TestCase):
         )
         self.assertTrue(has_disposition(body))
 
+    def test_mismatched_fence_does_not_satisfy(self):
+        # A four-backtick fence is not closed by a three-backtick line (a closer
+        # must be at least as long as the opener), so the block stays open and the
+        # bench-compare heading inside it renders as code, not a disposition.
+        body = (
+            "## Summary\n"
+            "````text\n"
+            "innocent code\n"
+            "```\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "```\n"
+            "## End\nx"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_info_string_closer_does_not_satisfy(self):
+        # A fence line carrying an info string (```bench) is not a closing fence
+        # (a closer may carry only trailing whitespace), so the block stays open
+        # and the heading inside it stays hidden.
+        body = (
+            "## Summary\n"
+            "```\n"
+            "```bench\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "```\n"
+            "## End\nx"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_comment_with_fence_then_visible_heading_passes(self):
+        # A fence delimiter inside an HTML comment must not leak into fence state
+        # and hide a later real heading. Comment state is resolved before fence
+        # state, so the visible bench-compare heading after the comment opens the
+        # section normally (this failed before the ordering fix).
+        body = (
+            "## Summary\n"
+            "<!--\n"
+            "```\n"
+            "-->\n"
+            "## bench-compare disposition\n"
+            "A/B shows no change, p>0.05 on every group; nothing moved past eighty characters here yes.\n"
+            "## Test plan\ny"
+        )
+        self.assertTrue(has_disposition(body))
+
 
 if __name__ == "__main__":
     unittest.main()

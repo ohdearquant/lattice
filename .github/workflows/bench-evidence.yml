@@ -1,7 +1,11 @@
 name: bench evidence
 
-# ADR-058 requires every PR touching crates/inference/ or crates/embed/ to carry a
-# bench-compare disposition in its description. That requirement was convention-only.
+# The repo's contributor rule (CLAUDE.md) requires every PR touching crates/inference/
+# or crates/embed/ to carry a bench-compare disposition in its description. That
+# requirement was convention-only. (ADR-058 first raised CPU perf-regression tracking;
+# its automated bench-fail gate design was superseded by e2e-parity.yml, but the
+# disposition-in-the-description rule remains live in the contributor guide, and this
+# job enforces exactly that.)
 # A PR adding one line to the cosine fast path (`&& is_unit_norm(s)`, an O(d)
 # recomputation per stored candidate) merged with no bench section at all and cost 7x
 # on simd_prepared_query_normalized_cosine: 96,278 ns -> 682,838 ns at d=1024,
@@ -80,24 +84,37 @@ jobs:
             exit 1
           fi
 
-          # Changed files from the API (base-controlled, computed by GitHub from the
-          # diff), never from a checked-out PR script. Both the new path and, for a
-          # rename, the previous path are emitted (previous_filename // empty): a file
-          # renamed OUT of crates/inference or crates/embed still moved that crate's
-          # code, so the old path must be matched too, or the rename silently escapes
-          # the gate. ADR-058 covers the whole of crates/inference and crates/embed, not
-          # just their src/ dirs: a Cargo.toml opt-level or dependency bump, or a
-          # benches/ change, moves performance too. A doc-only change under those crates
-          # satisfies the gate with a one-line N/A.
-          CHANGED=$(gh api "repos/${REPO}/pulls/${PR}/files" --paginate -q '.[] | .filename, (.previous_filename // empty)')
-          echo "Changed files:"
-          echo "$CHANGED"
-
-          if ! grep -E '^crates/(inference|embed)/' <<<"$CHANGED" >/dev/null; then
-            echo "→ no crates/{inference,embed} change: bench evidence not required."
-            exit 0
-          fi
-          echo "→ perf-sensitive crate changed: bench-compare disposition REQUIRED (ADR-058)."
-
+          # The list-files endpoint is capped at 3000 files even with --paginate, so a
+          # PR larger than that can hide a crates/{inference,embed} path beyond the cap
+          # and read as out-of-scope. Take the authoritative total from the PR object and
+          # fail closed above the cap: when scope cannot be determined, require the
+          # disposition (a one-line N/A satisfies it). At or below the cap the file list
+          # is complete.
+          TOTAL_CHANGED=$(gh api "repos/${REPO}/pulls/${PR}" -q '.changed_files')
           BODY=$(gh api "repos/${REPO}/pulls/${PR}" -q '.body // ""')
+
+          if [ "$TOTAL_CHANGED" -le 3000 ]; then
+            # Changed files from the API (base-controlled, computed by GitHub from the
+            # diff), never from a checked-out PR script. Both the new path and, for a
+            # rename, the previous path are emitted (previous_filename // empty): a file
+            # renamed OUT of crates/inference or crates/embed still moved that crate's
+            # code, so the old path must be matched too, or the rename silently escapes
+            # the gate. The rule covers the whole of crates/inference and crates/embed,
+            # not just their src/ dirs: a Cargo.toml opt-level or dependency bump, or a
+            # benches/ change, moves performance too. A doc-only change under those crates
+            # satisfies the gate with a one-line N/A.
+            CHANGED=$(gh api "repos/${REPO}/pulls/${PR}/files" --paginate -q '.[] | .filename, (.previous_filename // empty)')
+            echo "Changed files ($TOTAL_CHANGED):"
+            echo "$CHANGED"
+
+            if ! grep -E '^crates/(inference|embed)/' <<<"$CHANGED" >/dev/null; then
+              echo "→ no crates/{inference,embed} change: bench evidence not required."
+              exit 0
+            fi
+            echo "→ perf-sensitive crate changed: bench-compare disposition REQUIRED."
+          else
+            echo "→ PR changes $TOTAL_CHANGED files, above the API's 3000-file list cap;"
+            echo "  scope cannot be determined, so a disposition is REQUIRED (fail closed)."
+          fi
+
           printf '%s' "$BODY" | bash scripts/bench_disposition_check.sh
