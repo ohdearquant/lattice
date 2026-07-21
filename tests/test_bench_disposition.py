@@ -71,6 +71,30 @@ class BenchDispositionCheck(unittest.TestCase):
         )
         self.assertTrue(has_disposition(body))
 
+    def test_canonical_no_change_line_passes(self):
+        # lattice/CLAUDE.md blesses this exact terse disposition for a PR that
+        # measured no change; it is ~47 stripped chars and must satisfy the gate
+        # via the no-change marker, not fail a raw length floor.
+        body = (
+            "## bench-compare disposition\n"
+            "bench-compare showed no change (p > 0.05 on all groups).\n"
+            "## Test plan\nx"
+        )
+        self.assertTrue(has_disposition(body))
+
+    def test_one_line_na_passes(self):
+        # The workflow comment promises a doc-only change satisfies the gate with
+        # a one-line N/A; that promise must actually hold.
+        body = (
+            "## bench-compare\nN/A — doc-only change, no code paths touched.\n## End\ny"
+        )
+        self.assertTrue(has_disposition(body))
+
+    def test_short_content_without_marker_fails(self):
+        # Guards the length floor: terse content with no disposition marker is
+        # still a bare-heading-in-spirit and must fail.
+        self.assertFalse(has_disposition("## bench-compare\nfoo bar baz\n## End\nx"))
+
 
 if __name__ == "__main__":
     unittest.main()

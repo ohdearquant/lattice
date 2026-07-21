@@ -43,10 +43,32 @@ if ! printf '%s' "$SECTION" | grep -q '[^[:space:]]'; then
 fi
 
 # Drop the heading line before measuring content, so a bare "## bench-compare"
-# with nothing beneath it cannot satisfy the gate.
-CONTENT=$(printf '%s' "$SECTION" | tail -n +2 | tr -d '[:space:]')
+# with nothing beneath it cannot satisfy the gate. Keep a spaced copy for
+# marker matching (markers like "no change" contain spaces) and a stripped
+# copy for the length floor.
+BODYTEXT=$(printf '%s' "$SECTION" | tail -n +2)
+CONTENT=$(printf '%s' "$BODYTEXT" | tr -d '[:space:]')
+
+# ADR-058's blessed minimal dispositions are legitimately terse and fall well
+# under a raw length floor: the no-change one-liner lattice/CLAUDE.md blesses
+# ("bench-compare showed no change (p > 0.05 on all groups)."), the one-line
+# N/A this workflow's own comment promises for a doc-only change, and the
+# compiled-out cfg-gate proof. An 80-char floor rejects all three, making the
+# standard's own canonical disposition unsatisfiable. Accept an explicit
+# disposition marker regardless of length; otherwise require enough content to
+# be a real numeric disposition rather than a bare heading. All markers are
+# multi-word phrases or contain "/", so none collides with an English word;
+# no \b is used, which keeps the regex portable across GNU grep (the CI runner)
+# and BSD grep (a local pre-PR run on macOS).
+MARKERS='n/a|not required|not applicable|no( measurable)? change|no perf(ormance)? change|compiled out|identical effective source'
+if printf '%s' "$BODYTEXT" | grep -qiE "$MARKERS"; then
+  echo "bench-compare disposition present (explicit disposition marker; ${#CONTENT} chars)"
+  exit 0
+fi
+
 if [ "${#CONTENT}" -lt 80 ]; then
   echo "bench-compare section present but essentially empty (${#CONTENT} chars of content)" >&2
+  echo "state the numbers, or an explicit disposition (no change / N/A / compiled out)" >&2
   exit 1
 fi
 
