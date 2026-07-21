@@ -245,20 +245,12 @@ def run_hf_reference(prompt: str, max_tokens: int) -> dict:
                 f"reference model snapshot not found at {MODEL_DIR}; "
                 "provision it before running this script (no network fallback)"
             )
-        # Defense-in-depth beyond trust_remote_code=False: that flag blocks
-        # remote *code* at load time, but a `.bin` weight file is a pickle
-        # and therefore still an RCE vector at load time (arbitrary
-        # __reduce__ execution), independent of trust_remote_code. Refuse to
-        # load if any legacy pickle weight file is present and force
-        # safetensors on the load call itself.
-        bin_files = sorted(Path(MODEL_DIR).glob("*.bin"))
-        if bin_files:
-            raise RuntimeError(
-                f"reference model snapshot at {MODEL_DIR} contains .bin weight "
-                f"file(s) {[str(p) for p in bin_files]}; only safetensors "
-                "weights are trusted here (a .bin is a pickle and an RCE "
-                "vector at load time even with trust_remote_code=False)"
-            )
+        # `use_safetensors=True` below is the enforcement at the load call:
+        # trust_remote_code=False blocks remote *code*, but a `.bin` weight file
+        # is a pickle and stays an arbitrary-execution vector at load time
+        # regardless of that flag. Refusing a snapshot that carries one at all
+        # happens in the preflight, where it can exit as a setup error instead
+        # of being mistaken for a parity failure.
         t0 = time.time()
         run_hf_reference._tokenizer = AutoTokenizer.from_pretrained(
             MODEL_DIR, trust_remote_code=False, local_files_only=True
@@ -635,6 +627,20 @@ def main() -> int:
         return 2
     if not os.path.isdir(MODEL_DIR):
         print(f"error: model dir not found at {MODEL_DIR}", file=sys.stderr)
+        return 2
+    # A reference snapshot carrying pickle weights is a provisioning problem,
+    # so it belongs here with the other setup validation and exits 2. Raising it
+    # from the loader instead would surface as exit 1, which this script defines
+    # as a parity failure, and would file a poisoned reference against lattice.
+    pickle_weights = sorted(Path(MODEL_DIR).glob("*.bin"))
+    if pickle_weights:
+        print(
+            f"error: model dir {MODEL_DIR} contains pickle weight file(s) "
+            f"{[p.name for p in pickle_weights]}; only safetensors weights are "
+            "trusted here (a .bin is a pickle and an arbitrary-execution vector "
+            "at load time even with trust_remote_code=False)",
+            file=sys.stderr,
+        )
         return 2
 
     try:
