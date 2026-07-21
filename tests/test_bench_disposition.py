@@ -230,13 +230,14 @@ class BenchDispositionCheck(unittest.TestCase):
         self.assertFalse(has_disposition(body))
 
     def test_div_block_heading_does_not_satisfy(self):
-        # A heading buried in a block-level <div> that opens at a block boundary (a
-        # blank line before it) renders as raw HTML, not a heading. The type-7
-        # HTML-block catch masks it to the next blank line. Content clears the
-        # length floor, so this proves masking, not a length failure. Exited 0
-        # before the catch existed.
+        # A heading buried in a block-level <div> renders as raw HTML, not a
+        # heading. <div> is a CommonMark type-6 block tag, and HTML block types 1 to
+        # 6 may interrupt a paragraph, so it masks unconditionally -- here directly
+        # under a prose line with no blank between, exactly the case a
+        # paragraph-interruption rule would have to get right. Content clears the
+        # length floor, so this proves masking, not a length failure.
         body = (
-            "## Summary\nx\n\n"
+            "## Summary\nx\n"
             "<div>\n"
             "## bench-compare disposition\n"
             "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
@@ -352,12 +353,12 @@ class BenchDispositionCheck(unittest.TestCase):
         self.assertFalse(has_disposition(body))
 
     def test_void_tag_after_prose_does_not_hide_disposition(self):
-        # CommonMark type-7 HTML blocks (a complete tag alone on a line) cannot
-        # interrupt a paragraph. A void tag such as <br> directly under a prose
-        # line is paragraph content, not a block, so the visible ATX heading below
-        # it opens the section. Treating the tag as an unconditional block masked
-        # the heading and wrongly rejected a real disposition (exit 1 before the
-        # paragraph-boundary fix).
+        # A void or inline tag alone on a line (here <br>) is a CommonMark type-7
+        # block. Type 7 is deliberately not tracked -- masking it correctly needs
+        # open-paragraph state a line-oriented shell parser cannot keep -- so it
+        # never masks and the visible ATX heading below it opens the section. This
+        # also pins the false-reject fix: once, treating <br> as an unconditional
+        # block masked a real disposition and rejected it (exit 1).
         body = (
             "Intro prose.\n"
             "<br>\n"
@@ -366,49 +367,61 @@ class BenchDispositionCheck(unittest.TestCase):
         )
         self.assertTrue(has_disposition(body))
 
-    def test_void_tag_at_document_start_hides_disposition(self):
-        # Control for the paragraph-boundary rule: the SAME void tag at the start
-        # of the body (no paragraph to interrupt) does start a type-7 block, which
-        # masks to the next blank line, so a heading directly under it is hidden and
-        # the gate fails. Content clears the length floor, proving masking, not a
-        # length failure. If the paragraph-boundary fix over-corrected and stopped
-        # masking here too, this would wrongly pass.
+    def test_void_tag_at_document_start_is_not_masked(self):
+        # Documented boundary: a bare type-7 tag (<br>) hiding a heading is NOT
+        # caught. Type 7 is the one HTML-block type that cannot interrupt a
+        # paragraph, and tracking that reliably across every other block construct
+        # is beyond a line-oriented shell parser. Wrapping a disposition behind a
+        # bare <br> takes a motivated author, outside this gate's honest-mistake
+        # threat model, so the heading below the tag still opens the section.
         body = (
             "<br>\n"
             "## bench-compare disposition\n"
             "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
         )
+        self.assertTrue(has_disposition(body))
+
+    def test_div_trailing_content_does_not_satisfy(self):
+        # A type-6 block tag may carry trailing content on its opening line
+        # (<div>text) and still start the block, so the heading beneath it is masked
+        # to the next blank line and does not render. Content clears the length
+        # floor, proving masking, not a length failure. Before the type-6 list this
+        # trailing-content form was unmasked and exited 0.
+        body = (
+            "<div>text\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+        )
         self.assertFalse(has_disposition(body))
 
-    def test_void_tag_after_masked_block_close_hides_disposition(self):
-        # A type-7 block may open at ANY block boundary, not only after a blank
-        # line. When a fenced/comment/raw/PI/declaration/CDATA block ends on its
-        # own non-blank terminator line, a following <br> still starts a type-7
-        # block that masks the heading beneath it, so the disposition does not
-        # render and the gate must reject. Tracking only "previous line blank"
-        # (rather than "a paragraph is open") let every one of these exit 0 after
-        # the terminator's non-blank line -- a fail-open the paragraph-state model
-        # closes. One representative per tracked masked region.
-        heading = "## bench-compare disposition"
-        filler = (
-            "one two three four five six seven eight nine ten eleven twelve "
-            "thirteen fourteen fifteen sixteen"
+    def test_type6_container_after_prose_masks(self):
+        # A type-6 container other than <div> (here <details>) opening directly
+        # under a prose line still masks, since types 1 to 6 interrupt paragraphs.
+        # The heading inside it renders as raw HTML, not a disposition. Guards the
+        # tag list beyond the single <div> case and the paragraph-interruption
+        # direction.
+        body = (
+            "Measured throughput across three context lengths.\n"
+            "<details>\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "</details>\n"
+            "## Test plan\ny"
         )
-        closers = [
-            ("```\ncode\n```", "fenced code block"),
-            ("<!--\ncomment\n-->", "HTML comment"),
-            ("<pre>\ncode\n</pre>", "raw <pre> block"),
-            ("<?\npi body\n?>", "processing instruction"),
-            ("<![CDATA[\ncdata body\n]]>", "CDATA section"),
-            ("<!DOCTYPE bench\ndecl body\n>", "declaration"),
-        ]
-        for block, label in closers:
-            with self.subTest(closer=label):
-                body = f"{block}\n<br>\n{heading}\n{filler}\n"
-                self.assertFalse(
-                    has_disposition(body),
-                    f"{label} close then <br> must mask the hidden heading",
-                )
+        self.assertFalse(has_disposition(body))
+
+    def test_type6_block_with_blank_then_heading_passes(self):
+        # A type-6 block ends at the next blank line. A real disposition heading
+        # separated from an earlier block-level tag by a blank line is outside the
+        # block and renders normally, so it must open the section. Guards the
+        # type-6 masker against over-reaching past its blank-line terminator.
+        body = (
+            "<section>\n"
+            "\n"
+            "## bench-compare disposition\n"
+            "A/B shows no change, p>0.05 on every group; nothing moved past eighty characters here yes.\n"
+        )
+        self.assertTrue(has_disposition(body))
 
 
 if __name__ == "__main__":

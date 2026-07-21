@@ -45,27 +45,28 @@ fi
 #   processing instr.  from <? to ?> (CommonMark HTML block type 3); raw.
 #   declaration        from <! and a letter (e.g. <!DOCTYPE) to > (type 4); raw.
 #   CDATA              from <![CDATA[ to ]]> (type 5); raw.
-#   other HTML block   a complete HTML tag ALONE on a line (only whitespace after
-#                      it) masks to the next blank line, the CommonMark type-7 end
-#                      condition. CommonMark forbids a type-7 block from interrupting
-#                      a paragraph, so it may open only where no paragraph is open: at
-#                      the start of the body, after a blank line, or right after another
-#                      block (a fence, comment, or raw HTML region) has closed on its
-#                      own terminator line. A paragraph is tracked as open while plain
-#                      prose lines run, so a tag alone on a line that continues prose is
-#                      inline paragraph content, not a block, and a heading after it
-#                      renders normally. It also applies only before the section opens,
-#                      so it can never swallow the heading that closes an already-open
-#                      section, and it requires real tag syntax after the name, so an
-#                      autolink such as <https://example.com> (a colon follows the name)
-#                      and inline HTML on a line with prose such as <span>note</span>
-#                      text are NOT masked. Two heading-hiding constructs are left
-#                      unmasked: a block tag carrying trailing content on its own
-#                      opening line (<div>text), and a block tag on a line that
-#                      interrupts a paragraph (a bare <div> directly under a run of
-#                      prose, no blank line between). Both take a motivated author;
-#                      hiding a disposition that way is implausible for an internal
-#                      gate, so they are documented boundaries rather than modeled.
+#   block-level HTML   a line beginning (indented at most three spaces) with an
+#                      open or close tag from the CommonMark type-6 block-tag list
+#                      (div, details, table, section, blockquote, ... the full set)
+#                      masks to the next blank line, the CommonMark type-6 end
+#                      condition. HTML block types 1 to 6 may interrupt a paragraph,
+#                      so this masks unconditionally: a bench-compare heading buried
+#                      in a block-level container does not render as a heading whether
+#                      the container opens at a block boundary or directly under a run
+#                      of prose, and trailing content on the opening line (<div>text)
+#                      is masked too.
+# CommonMark type-7 blocks -- any OTHER complete tag alone on a line, e.g. a void or
+# inline tag such as <br>, <hr>, <img>, <span> -- are deliberately NOT tracked. Type 7
+# is the one HTML-block type that cannot interrupt a paragraph, so masking it correctly
+# requires tracking open-paragraph state across every other block construct (fences,
+# comments, thematic breaks, Setext underlines, indented code, block quotes), which a
+# line-oriented shell parser cannot track reliably. The lone residual is a heading hidden directly
+# beneath such a tag; wrapping a disposition in a bare <br> takes a motivated author,
+# which is outside this gate's threat model (honest mistakes and lazy skips), so it is
+# a documented boundary rather than modeled. Because a non-type-6 tag alone on a line is
+# left unmasked, an autolink such as <https://example.com> and inline HTML on a prose
+# line such as <span>note</span> text still render normally and a heading after them
+# opens the section.
 # A trailing carriage return is stripped before any state transition, so a fence
 # or tag delimiter on a CRLF line still matches. Content inside a masked region
 # that opens AFTER a visible bench-compare heading still counts as section
@@ -78,12 +79,9 @@ SECTION=$(printf '%s' "$BODY" | awk '
     }
     return 0
   }
-  BEGIN { para_open = 0 }
   {
     line = $0
     sub(/\r$/, "", line)
-    pp = para_open
-    para_open = 0
 
     if (in_fence) {
       if (match(line, /^ {0,3}(`{3,}|~{3,})[ \t]*$/)) {
@@ -157,13 +155,13 @@ SECTION=$(printf '%s' "$BODY" | awk '
       if (found) print line
       next
     }
-    if (!found && !pp && match(tolower(line), "^ {0,3}</?[a-zA-Z][a-zA-Z0-9-]*([ \t]+[^>]*)?/?>[ \t]*$")) {
+    if (match(tolower(line), "^ {0,3}</?(address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h1|h2|h3|h4|h5|h6|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)([ \t/>]|$)")) {
       in_html_block = 1
+      if (found) print line
       next
     }
 
     lv = level(line)
-    if (lv == 0 && line !~ /^[ \t]*$/) para_open = 1
     if (found && lv > 0 && lv <= start_lv) { exit }
     if (!found && lv > 0 && tolower(line) ~ /bench-?compare/) { found = 1; start_lv = lv }
     if (found) print line
