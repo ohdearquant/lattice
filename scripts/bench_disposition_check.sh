@@ -56,11 +56,15 @@ CONTENT=$(printf '%s' "$BODYTEXT" | tr -d '[:space:]')
 # compiled-out cfg-gate proof. An 80-char floor rejects all three, making the
 # standard's own canonical disposition unsatisfiable. Accept an explicit
 # disposition marker regardless of length; otherwise require enough content to
-# be a real numeric disposition rather than a bare heading. All markers are
-# multi-word phrases or contain "/", so none collides with an English word;
-# no \b is used, which keeps the regex portable across GNU grep (the CI runner)
-# and BSD grep (a local pre-PR run on macOS).
-MARKERS='n/a|not required|not applicable|no( measurable)? change|no perf(ormance)? change|compiled out|identical effective source'
+# be a real numeric disposition rather than a bare heading. The whole marker
+# alternative is anchored on both sides by a portable word boundary
+# ([^[:alnum:]_], NOT the GNU-only \b) so a marker cannot fire as the prefix of
+# a longer word: unanchored "no change" matched inside "no changelog" and let a
+# body with no disposition pass (#1058 round-2 review). The boundary keeps the
+# expression portable across GNU grep (the CI runner) and BSD grep (a local
+# pre-PR run on macOS); grep -qi tests presence only, so consuming a boundary
+# char is harmless.
+MARKERS='(^|[^[:alnum:]_])(n/a|not required|not applicable|no( measurable)? change|no perf(ormance)? change|compiled out|identical effective source)($|[^[:alnum:]_])'
 if printf '%s' "$BODYTEXT" | grep -qiE "$MARKERS"; then
   echo "bench-compare disposition present (explicit disposition marker; ${#CONTENT} chars)"
   exit 0

@@ -95,6 +95,18 @@ class BenchDispositionCheck(unittest.TestCase):
         # still a bare-heading-in-spirit and must fail.
         self.assertFalse(has_disposition("## bench-compare\nfoo bar baz\n## End\nx"))
 
+    def test_marker_prefix_of_longer_word_does_not_satisfy(self):
+        # #1058 round-2 collision: an unanchored "no change" marker matched the
+        # prefix of "no changelog", letting a body with no disposition pass. The
+        # marker must be word-boundary anchored, so this body (no disposition,
+        # no N/A, under the length floor) must fail.
+        body = (
+            "## bench-compare disposition\n"
+            "There is no changelog entry because this PR updates documentation.\n"
+            "## Test plan\nx"
+        )
+        self.assertFalse(has_disposition(body))
+
 
 if __name__ == "__main__":
     unittest.main()
