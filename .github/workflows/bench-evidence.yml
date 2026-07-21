@@ -70,11 +70,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          # merge_group carries no PR body; the pull_request_target-time gate already
-          # enforced the disposition, so there is nothing to re-check in the queue. The
-          # same context name still reports here so a required check stays green.
+          # The disposition lives in the PR description, which is NOT part of the
+          # merge commit, so unlike e2e-parity (which re-runs its code parity test
+          # on the merge_group ref) this check has nothing to re-derive at queue
+          # time. It is enforced at PR time: a required check must pass before a PR
+          # can enter a merge queue, and the pull_request_target `edited` trigger
+          # re-runs this gate on every body change, so a missing disposition fails
+          # the PR run and keeps the PR out of the queue. Reporting the same context
+          # green on merge_group only prevents the required-check-that-never-reports-
+          # on-the-queue trap that would otherwise wedge the merge group. No merge
+          # queue is configured on this branch today; this path is defensive and
+          # matches e2e-parity's own merge_group handling.
           if [ "$EVENT" != "pull_request_target" ]; then
-            echo "event=$EVENT: bench evidence enforced at PR time; nothing to check here."
+            echo "event=$EVENT: disposition is a PR-description check enforced at PR time; merge-queue events report green to avoid wedging the queue."
             exit 0
           fi
 

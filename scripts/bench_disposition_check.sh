@@ -47,17 +47,23 @@ fi
 #   CDATA              from <![CDATA[ to ]]> (type 5); raw.
 #   other HTML block   a complete HTML tag ALONE on a line (only whitespace after
 #                      it) masks to the next blank line, the CommonMark type-7 end
-#                      condition. It applies only before the section opens, so it
-#                      can never swallow the heading that closes an already-open
-#                      section, and it requires real tag syntax after the name, so
-#                      an autolink such as <https://example.com> (a colon follows
-#                      the name) and inline HTML on a line with prose such as
-#                      <span>note</span> text are NOT masked, and a heading after
-#                      them renders normally. A block tag carrying trailing content
-#                      on its own opening line (<div>text) is the one heading-hiding
-#                      construct left unmasked; hiding a disposition that way is
-#                      implausible for an internal gate, so it is a documented
-#                      boundary rather than modeled.
+#                      condition. CommonMark forbids a type-7 block from interrupting
+#                      a paragraph, so this masks only at the start of the body or
+#                      after a blank line: a tag alone on a line that follows a
+#                      non-blank line is paragraph content, not a block, and a heading
+#                      after it renders normally. It also applies only before the
+#                      section opens, so it can never swallow the heading that closes
+#                      an already-open section, and it requires real tag syntax after
+#                      the name, so an autolink such as <https://example.com> (a colon
+#                      follows the name) and inline HTML on a line with prose such as
+#                      <span>note</span> text are NOT masked. Two heading-hiding
+#                      constructs are left unmasked: a block tag carrying trailing
+#                      content on its own opening line (<div>text), and a block tag on
+#                      a line that interrupts a paragraph (a bare <div> directly under
+#                      a non-blank prose line, no blank line between). Both take a
+#                      motivated author; hiding a disposition that way is implausible
+#                      for an internal gate, so they are documented boundaries rather
+#                      than modeled.
 # A trailing carriage return is stripped before any state transition, so a fence
 # or tag delimiter on a CRLF line still matches. Content inside a masked region
 # that opens AFTER a visible bench-compare heading still counts as section
@@ -70,9 +76,12 @@ SECTION=$(printf '%s' "$BODY" | awk '
     }
     return 0
   }
+  BEGIN { prev_blank = 1 }
   {
     line = $0
     sub(/\r$/, "", line)
+    pb = prev_blank
+    prev_blank = (line ~ /^[ \t]*$/)
 
     if (in_fence) {
       if (match(line, /^ {0,3}(`{3,}|~{3,})[ \t]*$/)) {
@@ -146,7 +155,7 @@ SECTION=$(printf '%s' "$BODY" | awk '
       if (found) print line
       next
     }
-    if (!found && match(tolower(line), "^ {0,3}</?[a-zA-Z][a-zA-Z0-9-]*([ \t]+[^>]*)?/?>[ \t]*$")) {
+    if (!found && pb && match(tolower(line), "^ {0,3}</?[a-zA-Z][a-zA-Z0-9-]*([ \t]+[^>]*)?/?>[ \t]*$")) {
       in_html_block = 1
       next
     }

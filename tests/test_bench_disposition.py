@@ -230,12 +230,13 @@ class BenchDispositionCheck(unittest.TestCase):
         self.assertFalse(has_disposition(body))
 
     def test_div_block_heading_does_not_satisfy(self):
-        # A heading buried in a block-level <div> (no blank line before the real
-        # content resumes) renders as raw HTML, not a heading. The conservative
-        # fail-closed HTML-block catch masks it. Content clears the length floor,
-        # so this proves masking, not a length failure. Exited 0 before the catch.
+        # A heading buried in a block-level <div> that opens at a block boundary (a
+        # blank line before it) renders as raw HTML, not a heading. The type-7
+        # HTML-block catch masks it to the next blank line. Content clears the
+        # length floor, so this proves masking, not a length failure. Exited 0
+        # before the catch existed.
         body = (
-            "## Summary\nx\n"
+            "## Summary\nx\n\n"
             "<div>\n"
             "## bench-compare disposition\n"
             "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
@@ -347,6 +348,35 @@ class BenchDispositionCheck(unittest.TestCase):
             "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
             ">\n"
             "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_void_tag_after_prose_does_not_hide_disposition(self):
+        # CommonMark type-7 HTML blocks (a complete tag alone on a line) cannot
+        # interrupt a paragraph. A void tag such as <br> directly under a prose
+        # line is paragraph content, not a block, so the visible ATX heading below
+        # it opens the section. Treating the tag as an unconditional block masked
+        # the heading and wrongly rejected a real disposition (exit 1 before the
+        # paragraph-boundary fix).
+        body = (
+            "Intro prose.\n"
+            "<br>\n"
+            "## bench-compare disposition\n"
+            "N/A\n"
+        )
+        self.assertTrue(has_disposition(body))
+
+    def test_void_tag_at_document_start_hides_disposition(self):
+        # Control for the paragraph-boundary rule: the SAME void tag at the start
+        # of the body (no paragraph to interrupt) does start a type-7 block, which
+        # masks to the next blank line, so a heading directly under it is hidden and
+        # the gate fails. Content clears the length floor, proving masking, not a
+        # length failure. If the paragraph-boundary fix over-corrected and stopped
+        # masking here too, this would wrongly pass.
+        body = (
+            "<br>\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
         )
         self.assertFalse(has_disposition(body))
 
