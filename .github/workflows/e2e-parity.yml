@@ -46,6 +46,15 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
+  # Full 40-hex commit SHA for Qwen/Qwen3.5-0.8B, pinned (never a tag/branch,
+  # which are mutable on the Hub). Obtained via
+  # `HfApi().model_info('Qwen/Qwen3.5-0.8B').sha` on 2026-07-21; matches the
+  # `main`-derived revision the parity baseline has always compared against
+  # (transformers==5.12.1 pin above predates this change and is unaffected).
+  # A revision bump must be paired with regenerating
+  # scripts/hf_manifests/qwen3.5-0.8b.json (see that file's `source` field)
+  # and re-verifying the parity baseline still holds.
+  QWEN35_08B_REVISION: '2fc06364715b967f1860aea9cf38778875588b17'
 
 jobs:
   # Decide whether the engine surface changed. Output drives both the expensive
@@ -117,7 +126,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          key: hf-qwen35-0.8b-${{ env.QWEN35_08B_REVISION }}
 
       # Step 1: install reference framework (HF transformers + torch CPU).
       # Pinned to the known-green reference set — the exact versions that
@@ -134,16 +143,22 @@ jobs:
         run: |
           python3 -c "
           from huggingface_hub import snapshot_download
-          path = snapshot_download('Qwen/Qwen3.5-0.8B')
+          path = snapshot_download('Qwen/Qwen3.5-0.8B', revision='${{ env.QWEN35_08B_REVISION }}')
           print(f'Model at: {path}')
           "
+
+      - name: Verify HF snapshot manifest (fail-closed integrity check)
+        run: |
+          python3 scripts/verify_hf_snapshot_manifest.py \
+            --snapshot-dir "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/${{ env.QWEN35_08B_REVISION }}" \
+            --manifest scripts/hf_manifests/qwen3.5-0.8b.json
 
       # Step 3: symlink model for lattice (expects flat dir with config.json + model.safetensors)
       - name: Setup lattice model dir
         run: |
           MODEL_CACHE=$(python3 -c "
           from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          print(snapshot_download('Qwen/Qwen3.5-0.8B', revision='${{ env.QWEN35_08B_REVISION }}'))
           ")
           mkdir -p ~/.lattice/models
           ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
@@ -241,7 +256,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          key: hf-qwen35-0.8b-${{ env.QWEN35_08B_REVISION }}
 
       - name: Install Python deps
         run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
@@ -250,15 +265,21 @@ jobs:
         run: |
           python3 -c "
           from huggingface_hub import snapshot_download
-          path = snapshot_download('Qwen/Qwen3.5-0.8B')
+          path = snapshot_download('Qwen/Qwen3.5-0.8B', revision='${{ env.QWEN35_08B_REVISION }}')
           print(f'Model at: {path}')
           "
+
+      - name: Verify HF snapshot manifest (fail-closed integrity check)
+        run: |
+          python3 scripts/verify_hf_snapshot_manifest.py \
+            --snapshot-dir "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/${{ env.QWEN35_08B_REVISION }}" \
+            --manifest scripts/hf_manifests/qwen3.5-0.8b.json
 
       - name: Setup lattice model dir
         run: |
           MODEL_CACHE=$(python3 -c "
           from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          print(snapshot_download('Qwen/Qwen3.5-0.8B', revision='${{ env.QWEN35_08B_REVISION }}'))
           ")
           mkdir -p ~/.lattice/models
           ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
@@ -568,7 +589,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          key: hf-qwen35-0.8b-${{ env.QWEN35_08B_REVISION }}
 
       # Only huggingface_hub is needed — lattice does the inference, so torch /
       # transformers (the reference framework) are not required for this gate.
@@ -579,14 +600,20 @@ jobs:
         run: |
           python3 -c "
           from huggingface_hub import snapshot_download
-          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
+          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\", revision=\"${{ env.QWEN35_08B_REVISION }}\")}')
           "
+
+      - name: Verify HF snapshot manifest (fail-closed integrity check)
+        run: |
+          python3 scripts/verify_hf_snapshot_manifest.py \
+            --snapshot-dir "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/${{ env.QWEN35_08B_REVISION }}" \
+            --manifest scripts/hf_manifests/qwen3.5-0.8b.json
 
       - name: Setup lattice model dir
         run: |
           MODEL_CACHE=$(python3 -c "
           from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          print(snapshot_download('Qwen/Qwen3.5-0.8B', revision='${{ env.QWEN35_08B_REVISION }}'))
           ")
           mkdir -p ~/.lattice/models
           ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
@@ -673,7 +700,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          key: hf-qwen35-0.8b-${{ env.QWEN35_08B_REVISION }}
 
       - name: Install Python deps
         run: pip install "huggingface_hub==1.20.1"
@@ -682,14 +709,20 @@ jobs:
         run: |
           python3 -c "
           from huggingface_hub import snapshot_download
-          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
+          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\", revision=\"${{ env.QWEN35_08B_REVISION }}\")}')
           "
+
+      - name: Verify HF snapshot manifest (fail-closed integrity check)
+        run: |
+          python3 scripts/verify_hf_snapshot_manifest.py \
+            --snapshot-dir "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/${{ env.QWEN35_08B_REVISION }}" \
+            --manifest scripts/hf_manifests/qwen3.5-0.8b.json
 
       - name: Setup lattice model dir
         run: |
           MODEL_CACHE=$(python3 -c "
           from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          print(snapshot_download('Qwen/Qwen3.5-0.8B', revision='${{ env.QWEN35_08B_REVISION }}'))
           ")
           mkdir -p ~/.lattice/models
           ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
@@ -835,7 +868,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          key: hf-qwen35-0.8b-${{ env.QWEN35_08B_REVISION }}
 
       - name: Install Python deps
         run: pip install "huggingface_hub==1.20.1"
@@ -844,14 +877,20 @@ jobs:
         run: |
           python3 -c "
           from huggingface_hub import snapshot_download
-          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
+          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\", revision=\"${{ env.QWEN35_08B_REVISION }}\")}')
           "
+
+      - name: Verify HF snapshot manifest (fail-closed integrity check)
+        run: |
+          python3 scripts/verify_hf_snapshot_manifest.py \
+            --snapshot-dir "$HOME/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/${{ env.QWEN35_08B_REVISION }}" \
+            --manifest scripts/hf_manifests/qwen3.5-0.8b.json
 
       - name: Setup lattice model dir
         run: |
           MODEL_CACHE=$(python3 -c "
           from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
+          print(snapshot_download('Qwen/Qwen3.5-0.8B', revision='${{ env.QWEN35_08B_REVISION }}'))
           ")
           mkdir -p ~/.lattice/models
           ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b

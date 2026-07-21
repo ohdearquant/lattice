@@ -38,6 +38,7 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 # Each entry is (prompt, match_window).
@@ -244,6 +245,20 @@ def run_hf_reference(prompt: str, max_tokens: int) -> dict:
                 f"reference model snapshot not found at {MODEL_DIR}; "
                 "provision it before running this script (no network fallback)"
             )
+        # Defense-in-depth beyond trust_remote_code=False: that flag blocks
+        # remote *code* at load time, but a `.bin` weight file is a pickle
+        # and therefore still an RCE vector at load time (arbitrary
+        # __reduce__ execution), independent of trust_remote_code. Refuse to
+        # load if any legacy pickle weight file is present and force
+        # safetensors on the load call itself.
+        bin_files = sorted(Path(MODEL_DIR).glob("*.bin"))
+        if bin_files:
+            raise RuntimeError(
+                f"reference model snapshot at {MODEL_DIR} contains .bin weight "
+                f"file(s) {[str(p) for p in bin_files]}; only safetensors "
+                "weights are trusted here (a .bin is a pickle and an RCE "
+                "vector at load time even with trust_remote_code=False)"
+            )
         t0 = time.time()
         run_hf_reference._tokenizer = AutoTokenizer.from_pretrained(
             MODEL_DIR, trust_remote_code=False, local_files_only=True
@@ -253,6 +268,7 @@ def run_hf_reference(prompt: str, max_tokens: int) -> dict:
             dtype=torch.float32,
             trust_remote_code=False,
             local_files_only=True,
+            use_safetensors=True,
         )
         run_hf_reference._model.eval()
         print(f"[hf] model loaded in {time.time() - t0:.1f}s", file=sys.stderr)
