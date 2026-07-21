@@ -22,8 +22,10 @@
 # INFO_TARGETS_MANIFEST overrides the manifest path for those controlled
 # probes; production never sets it.
 #
-# FULL mode (`bench-compare.sh --full`, nightly perf lane) ignores this
-# mechanism entirely and gates every group of every target.
+# FULL mode (`bench-compare.sh --full`, or `make bench-gate`) ignores this
+# mechanism entirely and evaluates every group of every target. Those paths
+# are run manually/locally today; no automated CI lane runs full mode on main
+# yet (#1105 tracks it).
 set -euo pipefail
 
 MANIFEST="${INFO_TARGETS_MANIFEST:-$(dirname "$0")/bench-quick-informational-targets.txt}"

@@ -30,10 +30,15 @@
 # FAIL/WARN gate and exit code. Every non-demoted target (all of
 # lattice-inference) gates normally in --quick.
 #
-# --full remains the gate for EVERY group of every target: quick mode is a
-# PR-side direction/magnitude screen, and full-resolution simd gating rides
-# the scheduled nightly perf lane (a --full run on current main), so the
-# demotion is a resolution split, not a coverage hole.
+# --full evaluates EVERY group of every target at full resolution, simd
+# included: quick mode is a PR-side direction/magnitude screen, and a --full
+# run resolves simd tightly enough to gate. That full-resolution path is
+# available on demand — `make bench-gate` (this HEAD vs the perf-baselines
+# branch) and `bench-compare.sh --full` (an A/B) both run it. What does NOT
+# exist yet is an automated job that runs it on main and alerts on a
+# regression; until #1105 lands that detection lane, the quick-mode demotion
+# is covered only by manual/local full-mode runs, not by CI. Do not read
+# this comment as a claim that an automated lane already catches simd.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

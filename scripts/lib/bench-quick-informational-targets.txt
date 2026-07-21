@@ -11,8 +11,12 @@
 # reported informationally — fully measured, rendered in the report's
 # informational section and the all-measurements table, excluded only from
 # the gating verdict and exit code. FULL mode (`scripts/bench-compare.sh
-# --full`, nightly perf lane) gates every group of every target regardless
-# of this manifest. Targets not listed here gate normally in both modes.
+# --full`, or `make bench-gate` against the perf-baselines branch) evaluates
+# every group of every target at full resolution regardless of this manifest.
+# Those full-mode paths are manual/local today; no automated CI job runs them
+# on main to alert on a regression, so a demoted target's only full-resolution
+# coverage is a manual run until #1105 lands the detection lane. Targets not
+# listed here gate normally in quick mode.
 #
 # Demoting a target requires same-toolchain, same-commit A/A evidence in an
 # exclusive bench window, reviewed in a PR that edits this file.
