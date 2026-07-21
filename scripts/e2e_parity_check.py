@@ -508,31 +508,58 @@ def run_lattice_metal(prompt: str, max_tokens: int) -> dict:
             print(f"[lattice-metal] malformed @@lattice event: {e}", file=sys.stderr)
             print(line, file=sys.stderr)
             return None
-        if ev.get("ev") != "gen_token":
-            continue
-        if ev.get("done"):
-            saw_done = True
-            # Same parser boundary as the CPU runner: json.loads accepts any
-            # JSON value for tok_s, so a string or object here raises rather
-            # than reading as a number.
-            try:
-                tok_per_sec = float(ev.get("tok_s", 0.0))
-            except (ValueError, TypeError) as e:
-                print(
-                    f"[lattice-metal] done event carries an unreadable tok_s: {e}",
-                    file=sys.stderr,
-                )
-                print(line, file=sys.stderr)
-                return None
-            continue
-        token_id = ev.get("token_id")
-        if not isinstance(token_id, int):
+
+        # Check the event's shape once, here, rather than defending each field
+        # where it is read. json.loads returns whatever JSON value the binary
+        # emitted, so `@@lattice []` is well-formed JSON and `ev.get` raises on
+        # it; typing every field afterwards means one more escape route per
+        # field added later. Everything below this point may assume a dict with
+        # correctly typed values, and a binary that emits anything else has
+        # failed to produce a usable result, which leaves as None like every
+        # other lattice failure.
+        if not isinstance(ev, dict):
             print(
-                f"[lattice-metal] gen_token event missing integer token_id: {ev}",
+                f"[lattice-metal] @@lattice event is not a JSON object: {ev!r}",
                 file=sys.stderr,
             )
             return None
-        gen_ids.append(token_id)
+        if ev.get("ev") != "gen_token":
+            continue
+
+        # bool is a subclass of int in Python, so `isinstance(True, int)` is
+        # true; the token_id check below rejects a boolean explicitly rather
+        # than silently accepting `true` as token 1.
+        bad_field = None
+        if "token_id" in ev and (
+            isinstance(ev["token_id"], bool) or not isinstance(ev["token_id"], int)
+        ):
+            bad_field = "token_id must be an integer"
+        elif "token" in ev and not isinstance(ev["token"], str):
+            bad_field = "token must be a string"
+        elif "tok_s" in ev and (
+            isinstance(ev["tok_s"], bool)
+            or not isinstance(ev["tok_s"], (int, float))
+        ):
+            bad_field = "tok_s must be a number"
+        if bad_field is not None:
+            print(
+                f"[lattice-metal] gen_token event is ill-typed ({bad_field}): {ev}",
+                file=sys.stderr,
+            )
+            print(line, file=sys.stderr)
+            return None
+
+        if ev.get("done"):
+            saw_done = True
+            tok_per_sec = float(ev.get("tok_s", 0.0))
+            continue
+        if "token_id" not in ev:
+            print(
+                f"[lattice-metal] gen_token event missing token_id: {ev}",
+                file=sys.stderr,
+            )
+            return None
+        gen_ids.append(ev["token_id"])
         text_parts.append(ev.get("token", ""))
 
     if not saw_done:
