@@ -25,9 +25,12 @@ fi
 # satisfy the gate. tolower(), not IGNORECASE (a gawk extension that mawk, the
 # Ubuntu runner default, silently ignores, turning the match case-sensitive).
 # The section runs until a heading at the same or shallower depth, so a
-# subheading under it counts as its content. Headings are ATX only (a run of one
-# to six #, indented at most three spaces per CommonMark); Setext underlines are
-# not recognized.
+# subheading under it counts as its content. Headings are ATX only and must begin
+# at column zero (a run of one to six # at the very start of the line). A heading
+# indented one to three spaces, a heading nested in a list item or block quote,
+# and a Setext underline are NOT recognized: the gate accepts only a top-level
+# disposition heading. A line-oriented parser cannot see list or block-quote
+# container prefixes, so nesting a disposition inside one is a documented boundary.
 #
 # A heading only opens the section when it actually renders as a heading. Several
 # constructs render it as something else, and each is tracked as a mutually
@@ -60,8 +63,8 @@ fi
 # is the one HTML-block type that cannot interrupt a paragraph, so masking it correctly
 # requires tracking open-paragraph state across every other block construct (fences,
 # comments, thematic breaks, Setext underlines, indented code, block quotes), which a
-# line-oriented shell parser cannot track reliably. The lone residual is a heading hidden directly
-# beneath such a tag; wrapping a disposition in a bare <br> takes a motivated author,
+# line-oriented shell parser cannot track reliably. Another documented boundary is a heading hidden
+# directly beneath such a tag; wrapping a disposition in a bare <br> takes a motivated author,
 # which is outside this gate's threat model (honest mistakes and lazy skips), so it is
 # a documented boundary rather than modeled. Because a non-type-6 tag alone on a line is
 # left unmasked, an autolink such as <https://example.com> and inline HTML on a prose
@@ -74,8 +77,8 @@ fi
 # detection, not membership in an already-open section.
 SECTION=$(printf '%s' "$BODY" | awk '
   function level(s,   m) {
-    if (match(s, /^ {0,3}#{1,6}([ \t]|$)/)) {
-      m = substr(s, 1, RLENGTH); sub(/^ +/, "", m); sub(/[ \t]*$/, "", m); return length(m)
+    if (match(s, /^#{1,6}([ \t]|$)/)) {
+      m = substr(s, 1, RLENGTH); sub(/[ \t]*$/, "", m); return length(m)
     }
     return 0
   }
@@ -135,8 +138,8 @@ SECTION=$(printf '%s' "$BODY" | awk '
       if (found) print line
       next
     }
-    if (line ~ /<!--/ && line !~ /-->/) {
-      in_comment = 1
+    if (match(line, /^ {0,3}<!--/)) {
+      if (index(line, "-->") == 0) in_comment = 1
       if (found) print line
       next
     }

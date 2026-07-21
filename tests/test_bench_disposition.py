@@ -277,14 +277,56 @@ class BenchDispositionCheck(unittest.TestCase):
         )
         self.assertTrue(has_disposition(body))
 
-    def test_indented_heading_passes(self):
-        # CommonMark allows an ATX heading to be indented up to three spaces. Such
-        # a heading is visible and must open the section. Before the indent fix
-        # the matcher required the # at column zero and exited 1.
+    def test_indented_heading_not_recognized(self):
+        # The gate accepts only a top-level heading at column zero. An ATX heading
+        # indented one to three spaces is ambiguous to a line-oriented parser (it
+        # may be a top-level heading or a heading nested in a list item), so it is
+        # deliberately NOT recognized. Authors put the disposition heading at column
+        # zero, as the gate's own guidance instructs.
         body = (
             "## Summary\n"
             "   ## bench-compare disposition\n"
             "N/A\n"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_list_item_heading_not_recognized(self):
+        # Documented boundary: a heading written as a list item (- ## heading)
+        # renders as a heading nested in a list, which a line-oriented parser cannot
+        # distinguish from surrounding list content. The gate requires a top-level
+        # column-zero heading, so a bulleted heading is not recognized; the author
+        # writes the disposition at the top level.
+        body = (
+            "- ## bench-compare disposition\n"
+            "  N/A\n"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_nested_heading_in_list_item_html_block_not_accepted(self):
+        # A heading indented inside a list item that also opens an HTML block
+        # (- <details>...) renders as raw HTML, not a heading, in CommonMark. The
+        # column-zero rule means the indented heading is not recognized, so this
+        # non-rendered heading cannot satisfy the gate. Content clears the length
+        # floor, proving the column-zero rule, not a length failure.
+        body = (
+            "- <details><summary>Bench evidence</summary>\n"
+            "  ## bench-compare disposition\n"
+            "  one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "  </details>\n"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_midline_comment_does_not_mask_following_heading(self):
+        # An HTML comment opener that is not at the line start (prose then <!-- on
+        # the same line) is inline content in CommonMark, not a type-2 HTML block,
+        # so it does not mask a following heading. The comment start is anchored to
+        # the line start; an unanchored match wrongly masked the visible heading
+        # below and rejected a real disposition.
+        body = (
+            "Intro prose <!-- reviewer template\n"
+            "## bench-compare disposition\n"
+            "N/A\n"
+            "-->\n"
         )
         self.assertTrue(has_disposition(body))
 
