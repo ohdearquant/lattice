@@ -368,9 +368,21 @@ def run_lattice(prompt: str, max_tokens: int) -> dict:
         print(stdout, file=sys.stderr)
         return None
 
-    gen_ids = [int(x.strip()) for x in token_match.group(1).split(",") if x.strip()]
-    gen_count = int(gen_match.group(1)) if gen_match else len(gen_ids)
-    tok_per_sec = float(speed_match.group(1)) if speed_match else (gen_count / elapsed if elapsed > 0 else 0)
+    # Parser boundary. A binary that exits 0 and then prints a field this cannot
+    # read has failed to produce a usable result, which is the same category as
+    # exiting non-zero, so it leaves as None and the run reports a lattice
+    # failure. Narrowed to the conversions malformed output actually raises: a
+    # launch-side OSError must still reach the entry point as the setup failure
+    # it is. The regexes are not sufficient protection here, since `[\d.]+`
+    # matches `1.2.3` and the token list is unconstrained.
+    try:
+        gen_ids = [int(x.strip()) for x in token_match.group(1).split(",") if x.strip()]
+        gen_count = int(gen_match.group(1)) if gen_match else len(gen_ids)
+        tok_per_sec = float(speed_match.group(1)) if speed_match else (gen_count / elapsed if elapsed > 0 else 0)
+    except (ValueError, TypeError) as e:
+        print(f"[lattice] unreadable output field: {e}", file=sys.stderr)
+        print(stdout, file=sys.stderr)
+        return None
 
     text_match = re.search(r"--- Generated Text ---\n(.*?)--- Stats ---", stdout, re.DOTALL)
     text = text_match.group(1).strip() if text_match else ""
@@ -500,7 +512,18 @@ def run_lattice_metal(prompt: str, max_tokens: int) -> dict:
             continue
         if ev.get("done"):
             saw_done = True
-            tok_per_sec = float(ev.get("tok_s", 0.0))
+            # Same parser boundary as the CPU runner: json.loads accepts any
+            # JSON value for tok_s, so a string or object here raises rather
+            # than reading as a number.
+            try:
+                tok_per_sec = float(ev.get("tok_s", 0.0))
+            except (ValueError, TypeError) as e:
+                print(
+                    f"[lattice-metal] done event carries an unreadable tok_s: {e}",
+                    file=sys.stderr,
+                )
+                print(line, file=sys.stderr)
+                return None
             continue
         token_id = ev.get("token_id")
         if not isinstance(token_id, int):
