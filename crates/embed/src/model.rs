@@ -214,6 +214,29 @@ impl EmbeddingModel {
         }
     }
 
+    /// **Stable**: byte length of this model's longest retrieval instruction.
+    ///
+    /// Zero for symmetric models, which take no prefix at all.
+    ///
+    /// Callers apply an instruction to caller-supplied text, so text that has
+    /// already been prepared is longer than what the caller passed by at most
+    /// this many bytes. Length guards that run on prepared text size themselves
+    /// with this; guards that run on caller text use [`MAX_TEXT_BYTES`] exactly.
+    ///
+    /// [`MAX_TEXT_BYTES`]: crate::service::MAX_TEXT_BYTES
+    #[inline]
+    pub const fn max_instruction_bytes(&self) -> usize {
+        let q = match self.query_instruction() {
+            Some(s) => s.len(),
+            None => 0,
+        };
+        let d = match self.document_instruction() {
+            Some(s) => s.len(),
+            None => 0,
+        };
+        if q > d { q } else { d }
+    }
+
     /// **Stable**: get the model identifier (HuggingFace ID or provider/model).
     #[inline]
     pub const fn model_id(&self) -> &'static str {
