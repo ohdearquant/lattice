@@ -151,9 +151,13 @@ jobs:
           {
             echo "### perf post-merge A/B (${{ matrix.arch }})"
             echo
-            echo "\`$BASE\` -> \`$HEAD\`, full-mode Criterion, every group of every"
-            echo "target gated (the quick-mode informational demotion does not apply"
-            echo "in full mode)."
+            echo "\`$BASE\` -> \`$HEAD\`, full-mode Criterion."
+            echo
+            echo "**Coverage.** Every group of the two benched targets"
+            echo "(\`lattice-inference:elementwise_cpu_bench\`, \`lattice-embed:simd\`)"
+            echo "gates: the quick-mode informational demotion does not apply in full"
+            echo "mode, and this job sets no \`BENCH_GROUPS_*\` filter. The workspace's"
+            echo "other bench targets are not run here."
             echo
             echo "**Scope.** This lane DETECTS post-merge; it cannot gate the merge"
             echo "that introduced a regression, and it is not a required check."
