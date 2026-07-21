@@ -781,4 +781,37 @@ mod simd_parity_tests {
             }
         }
     }
+
+    // FP-034: AVX-512 VNNI vs scalar parity for INT8 dot product.
+    // Gated on the `avx512` build feature: the VNNI kernel only compiles then.
+    // Runs only when the host advertises AVX-512F+BW+VNNI, matching the kernel's
+    // safety contract and SimdConfig::avx512vnni_enabled.
+    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    #[test]
+    fn test_i8_avx512vnni_scalar_parity() {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+        {
+            for dim in [7usize, 16, 64, 128, 384, 768] {
+                let a_q = QuantizedVector::from_f32(&gen_vec(dim, 600 + dim as u64));
+                let b_q = QuantizedVector::from_f32(&gen_vec(dim, 700 + dim as u64));
+
+                // SAFETY: AVX-512F+BW+VNNI verified above; slices have equal length from from_f32.
+                let vnni = unsafe { dot_product_i8_avx512vnni(&a_q.data, &b_q.data) };
+                let scalar: f32 = a_q
+                    .data
+                    .iter()
+                    .zip(b_q.data.iter())
+                    .map(|(&x, &y)| x as i32 * y as i32)
+                    .sum::<i32>() as f32;
+
+                let diff = (vnni - scalar).abs();
+                assert!(
+                    diff <= 1.0,
+                    "VNNI vs scalar i8 dot product dim={dim}: vnni={vnni} scalar={scalar} diff={diff}"
+                );
+            }
+        }
+    }
 }
