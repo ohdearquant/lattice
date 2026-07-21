@@ -616,6 +616,12 @@ jobs:
         run: bash scripts/ensure-noindex-marker-selftest.sh
       - name: python3 tests/test_bench_disposition.py
         run: python3 tests/test_bench_disposition.py -v
+      # perf-bench-gate's own fixture self-test. Same "harness plumbing only"
+      # scope: it fabricates Criterion trees and asserts the gate's exit codes
+      # (including the refusals that keep an automated lane from reading
+      # "nothing measured" as "nothing regressed"), and runs no benchmark.
+      - name: python3 scripts/perf-bench-gate.py --selftest
+        run: python3 scripts/perf-bench-gate.py --selftest
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is

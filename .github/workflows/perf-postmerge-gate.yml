@@ -45,9 +45,10 @@ on:
       - 'crates/embed/benches/simd.rs'
       - 'crates/embed/Cargo.toml'
       - 'Cargo.lock'
-      # Root Cargo.toml carries [profile.bench]; .cargo/ can carry rustflags.
-      # Either can change codegen for both bench targets without touching a
-      # single line of crate source, so both must trigger this lane.
+      # Root Cargo.toml can carry [profile.bench] (it does not today) and
+      # .cargo/ can carry rustflags. Either can change codegen for both bench
+      # targets without touching a single line of crate source, so both must
+      # trigger this lane.
       - 'Cargo.toml'
       - '.cargo/**'
       - 'scripts/bench-compare.sh'
@@ -188,28 +189,43 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Full-mode A/B, failing on a confirmed regression
+        id: ab
         env:
           BASE: ${{ steps.refs.outputs.base }}
           HEAD: ${{ steps.refs.outputs.head }}
         run: |
-          scripts/bench-compare.sh --full --fail-on-regression "$BASE" "$HEAD"
+          # Record the gate's OWN exit code before re-raising it. The summary
+          # below has to tell "confirmed regression" from "refused to certify",
+          # and job.status cannot: it only ever holds success/failure/cancelled,
+          # so every earlier failure (checkout, toolchain, endpoint resolution)
+          # would otherwise be reported to the reader as one of those two gate
+          # verdicts and point them at a revert for a run that never benched.
+          rc=0
+          scripts/bench-compare.sh --full --fail-on-regression "$BASE" "$HEAD" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Record the outcome honestly
         if: always()
         env:
           JOB_STATUS: ${{ job.status }}
+          AB_RC: ${{ steps.ab.outputs.rc }}
         run: |
           {
             if [ "$JOB_STATUS" = "success" ]; then
               echo "No gross regression detected (see ceiling above)."
+            elif [ "$AB_RC" = "1" ]; then
+              echo "FAILED, exit 1 — a confirmed regression. Check the flagged groups"
+              echo "are reachable from the merged diff, then revert or justify."
+            elif [ "$AB_RC" = "2" ]; then
+              echo "FAILED, exit 2 — the gate refused to certify this run: no"
+              echo "comparison data, a partial A/B, or nothing gating among the"
+              echo "results. Nothing was proven about performance either way."
+              echo "Fix the measurement and re-run; do NOT revert on this alone."
             else
-              echo "FAILED. Two different causes share this exit, and they call for"
-              echo "opposite responses, so read the step log before acting:"
-              echo
-              echo "- exit 1 — a confirmed regression. Check the flagged groups are"
-              echo "  reachable from the merged diff, then revert or justify."
-              echo "- exit 2 — the gate refused to certify: no comparison data, or"
-              echo "  nothing gating among the results. Nothing was proven about"
-              echo "  performance. Fix the measurement and re-run; do NOT revert."
+              echo "FAILED before or during the A/B, with no gate verdict recorded"
+              echo "(\`rc=$AB_RC\`). The benchmark comparison did not reach a"
+              echo "conclusion, so this says nothing about performance. Inspect the"
+              echo "failing step above; do NOT revert on this alone."
             fi
           } >> "$GITHUB_STEP_SUMMARY"

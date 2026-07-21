@@ -54,6 +54,7 @@ QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 # Opt in to propagate the gate's exit code instead. Default behavior is
 # unchanged so existing callers keep their current semantics.
 FAIL_ON_REGRESSION=0
+AFTER_DDASH=0
 while [ $# -gt 0 ]; do
   case "${1:-}" in
     --full)
@@ -65,6 +66,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --)
+      AFTER_DDASH=1
       shift
       break
       ;;
@@ -84,17 +86,25 @@ HEAD_REF="${2:-HEAD}"
 
 # Reject dash-led leftovers. Without this a misplaced flag becomes a ref and the
 # script benches against garbage, which is worse than refusing: it produces a
-# confident-looking A/B nobody asked for. `--` above opts out for real refs.
-for arg in "$@"; do
-  case "$arg" in
-    -*)
-      echo "bench-compare.sh: '$arg' looks like a flag but follows a positional" \
-           "argument; flags must precede BASE/HEAD (use -- for a literal ref)" >&2
-      echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
-      exit 2
-      ;;
-  esac
-done
+# confident-looking A/B nobody asked for.
+#
+# `--` opts out, and that opt-out has to be honored HERE, not just in the parser
+# above: the parser only shifts `--` away, so without this guard the very
+# arguments `--` was meant to protect land back in "$@" and are rejected by the
+# loop below. Advertising an escape hatch that the next ten lines then close is
+# worse than having none, because the diagnostic names it as the remedy.
+if [ "$AFTER_DDASH" = "0" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      -*)
+        echo "bench-compare.sh: '$arg' looks like a flag but follows a positional" \
+             "argument; flags must precede BASE/HEAD (use -- for a literal ref)" >&2
+        echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
 if [ "$#" -gt 2 ]; then
   echo "bench-compare.sh: too many positional arguments ($#); expected at most" \
        "BASE_REF and HEAD_REF" >&2
@@ -102,8 +112,8 @@ if [ "$#" -gt 2 ]; then
 fi
 
 # Resolve to short SHAs for display
-BASE_SHA=$(git -C "$REPO" rev-parse --short "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
-HEAD_SHA=$(git -C "$REPO" rev-parse --short "$HEAD_REF" 2>/dev/null || echo "$HEAD_REF")
+BASE_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
+HEAD_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$HEAD_REF" 2>/dev/null || echo "$HEAD_REF")
 
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
 
@@ -122,7 +132,7 @@ WT="$REPO/.cache/bench-compare-base"
 if [ -d "$WT" ]; then
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
 fi
-git -C "$REPO" worktree add --detach "$WT" "$BASE_REF" 2>&1 | tail -1
+git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_REF" 2>&1 | tail -1
 
 cleanup() {
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
@@ -139,19 +149,55 @@ BENCHES_EMBED="simd"
 BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
 
+# --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
+# `cargo bench ... | grep -E "time:" || true` discards cargo's status TWICE: a
+# pipeline reports its LAST command (grep), and `|| true` then resets
+# PIPESTATUS to 0. So a bench that failed to build or died mid-run looked
+# exactly like a bench that produced no matching lines, and the A/B continued
+# with half its measurements missing. Verified: after `p | grep x || true`,
+# ${PIPESTATUS[0]} reads 0 even when p exited 7.
+BENCH_RC=0
+run_bench() {
+  local filter="$1"; shift
+  BENCH_RC=0
+  { "$@" 2>&1 | grep -E "$filter"; BENCH_RC=${PIPESTATUS[0]}; } || true
+}
+
+# A partial A/B is not weaker evidence that nothing regressed, it is no
+# evidence: the target that failed is precisely the one nobody measured. Exit 2
+# (measurement broken) rather than 1 (confirmed regression) because the two ask
+# the reader for opposite responses. The reporter keeps its tolerant behavior.
+require_measured() {
+  local what="$1" rc="$2"
+  if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$rc" -ne 0 ]; then
+    echo "bench-compare: $what failed (exit $rc) — refusing to certify a partial A/B." >&2
+    exit 2
+  fi
+}
+
 # --- Build + bench base ---
 echo ""
 echo "--- Building + benching BASE ($BASE_SHA) ---"
+BASE_PHASE_RC=0
 (
   cd "$WT"
-  # Only bench what exists — some benches may not exist on older refs
+  # Only bench what exists — some benches may not exist on older refs. That
+  # tolerance is right for a human comparing against an old ref and wrong for
+  # the enforcing lane, where "absent" and "failed to compile" arrive on the
+  # same channel and one of them silently deletes half the comparison.
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
+    run_bench "time:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS
+    require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC"
   else
+    require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
-  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
-)
+  run_bench "time:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS
+  require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC"
+) || BASE_PHASE_RC=$?
+# `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
+# and re-raised here or the refusal above is itself swallowed.
+if [ "$BASE_PHASE_RC" -ne 0 ]; then exit "$BASE_PHASE_RC"; fi
 
 # --- Copy base criterion data to HEAD's target ---
 echo ""
@@ -165,7 +211,7 @@ else
   if [ -d "$HEAD_WT" ]; then
     git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
   fi
-  git -C "$REPO" worktree add --detach "$HEAD_WT" "$HEAD_REF" 2>&1 | tail -1
+  git -C "$REPO" worktree add --detach --end-of-options "$HEAD_WT" "$HEAD_REF" 2>&1 | tail -1
   HEAD_DIR="$HEAD_WT"
   # Update cleanup to also remove head worktree
   trap 'git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true; cleanup' EXIT
@@ -180,15 +226,20 @@ if [ -d "$WT/target/criterion" ]; then
   rsync -a "$WT/target/criterion/" "$HEAD_DIR/target/criterion/" 2>/dev/null || true
 fi
 
+HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
+    run_bench "time:|change:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS
+    require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC"
   else
+    require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
-)
+  run_bench "time:|change:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS
+  require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC"
+) || HEAD_PHASE_RC=$?
+if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
 
 # --- Quick-mode informational demotion (lattice#714 / lattice#1060) ---
 # Target-level policy: the demoted-target set lives in ONE validated

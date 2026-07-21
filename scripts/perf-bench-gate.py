@@ -659,6 +659,35 @@ def run_selftest() -> int:
             failures.append("require-measurements: an all-informational run was "
                             "certified — no gating comparison was judged")
 
+        # PARTIAL is the shape the first fix missed: asking whether ANY judgeable
+        # comparison exists passes a run where one target compared cleanly and the
+        # other produced an unresolvable baseline. The unmeasured target is exactly
+        # the one a green exit would be vouching for.
+        mixed_root = Path(td) / "mixed" / "criterion"
+        _fabricate_bench(mixed_root / "grp_ok" / "bench_ok", "compare-base")
+        mixed_orphan = mixed_root / "grp_bad" / "bench_orphan"
+        (mixed_orphan / "new").mkdir(parents=True)
+        (mixed_orphan / "new" / "estimates.json").write_text(
+            json.dumps({"mean": {"point_estimate": 100.0}}))
+        (mixed_orphan / "change").mkdir(parents=True)
+        (mixed_orphan / "change" / "estimates.json").write_text(json.dumps({
+            "mean": {"point_estimate": 0.10,
+                     "confidence_interval": {"lower_bound": 0.05, "upper_bound": 0.15}}
+        }))
+        mixed = _run(mixed_root, "--require-measurements")
+        if mixed.returncode != 2:
+            failures.append("require-measurements: a run with one judgeable and one "
+                            "unresolvable comparison exited "
+                            f"{mixed.returncode} — a partial A/B was certified")
+        if "bench_orphan" not in mixed.stderr:
+            failures.append("require-measurements: the partial-run refusal did not "
+                            "name the unjudged bench")
+        # Without the flag the same mixed root stays a pass: the reporter is
+        # allowed to render what it has.
+        if _run(mixed_root).returncode != 0:
+            failures.append("require-measurements: the mixed root without the flag "
+                            "must still exit 0 (reporter behavior changed)")
+
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)
     if failures:
@@ -666,7 +695,7 @@ def run_selftest() -> int:
         return 1
     print("SELFTEST: PASS — base/, compare-base/, orphan-warn, named-wins-over-stale-base, "
           "multi-sibling-refusal, manifest-handoff (demoted target informational, "
-          "non-demoted target gated), and composed-path collision-guard, and require-measurements (empty root, gating pass, all-informational refusal) all correct")
+          "non-demoted target gated), and composed-path collision-guard, and require-measurements (empty root, gating pass, all-informational refusal, partial-run refusal) all correct")
     return 0
 
 
@@ -720,10 +749,17 @@ def main() -> int:
         return 0
 
     results = []
+    unjudged = []
     for cf in change_files:
         r = parse_bench(cf, args.criterion_root, args.baseline_name)
         if r is not None:
             results.append(r)
+        else:
+            # parse_bench warns and returns None for both malformed data and an
+            # unresolvable baseline. Keep the file, not just the warning: the
+            # count of comparisons the run INTENDED is the only thing that makes
+            # a missing one visible downstream.
+            unjudged.append(cf)
 
     if not results:
         print("error: change files found but all failed to parse", file=sys.stderr)
@@ -736,6 +772,22 @@ def main() -> int:
         args.out.write_text(report)
 
     gating = [r for r in results if not r.is_informational(informational_groups)]
+
+    # Completeness, not existence. The first version of this guard asked whether
+    # ANY judgeable comparison existed, which passes a run where one target built
+    # a clean comparison and the other produced an unresolvable or malformed one:
+    # the failed target is exactly the one nobody measured, so a green exit is a
+    # claim about code that was never benched. Reconcile what the run intended
+    # (change files on disk) against what was actually judged.
+    if args.require_measurements and unjudged:
+        listed = ", ".join(str(cf.parent.parent.relative_to(args.criterion_root))
+                           for cf in unjudged[:5])
+        more = f" (+{len(unjudged) - 5} more)" if len(unjudged) > 5 else ""
+        print(f"error: --require-measurements set but {len(unjudged)} of "
+              f"{len(change_files)} comparison(s) could not be judged "
+              f"(unresolvable baseline or malformed data): {listed}{more}. A partial "
+              f"A/B is not evidence that nothing regressed.", file=sys.stderr)
+        return 2
 
     # Parsed results are not automatically judgeable results. If every parsed
     # result is informational, nothing in this run could have produced a FAIL,
