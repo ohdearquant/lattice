@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for scripts/bench_disposition_check.sh (the ADR-058 gate parser).
+"""Regression tests for scripts/bench_disposition_check.sh (the CLAUDE.md bench-compare gate parser).
 
 Each case pins a behaviour the gate must keep. The one that matters most is
 ``test_summary_prose_mention_does_not_satisfy``: a bench-compare mention in
@@ -196,6 +196,103 @@ class BenchDispositionCheck(unittest.TestCase):
             "<!--\n"
             "```\n"
             "-->\n"
+            "## bench-compare disposition\n"
+            "A/B shows no change, p>0.05 on every group; nothing moved past eighty characters here yes.\n"
+            "## Test plan\ny"
+        )
+        self.assertTrue(has_disposition(body))
+
+
+    def test_raw_html_pre_block_does_not_satisfy(self):
+        # A heading inside a <pre> raw HTML block renders as literal preformatted
+        # text, not a disposition. The content easily clears the length floor, so
+        # this proves the block is masked (heading not opened), not that content
+        # is too short. Before raw-HTML tracking this exited 0.
+        body = (
+            "<pre>\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "</pre>\n"
+            "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_raw_html_script_block_does_not_satisfy(self):
+        # Same class via <script>: raw contents, so a heading between the tags is
+        # not a rendered heading and must not open the section.
+        body = (
+            "<script>\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "</script>\n"
+            "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_div_block_heading_does_not_satisfy(self):
+        # A heading buried in a block-level <div> (no blank line before the real
+        # content resumes) renders as raw HTML, not a heading. The conservative
+        # fail-closed HTML-block catch masks it. Content clears the length floor,
+        # so this proves masking, not a length failure. Exited 0 before the catch.
+        body = (
+            "## Summary\nx\n"
+            "<div>\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "</div>\n"
+            "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_crlf_fenced_body_with_visible_heading_passes(self):
+        # GitHub PR bodies commonly use CRLF line endings. A trailing carriage
+        # return must be stripped before parsing, or the closing fence keeps a
+        # \r, the fence never closes, and the later visible heading is wrongly
+        # masked. Before CR normalization this exited 1 (a false reject).
+        body = (
+            "## Summary\r\n"
+            "```text\r\n"
+            "code\r\n"
+            "```\r\n"
+            "## bench-compare disposition\r\n"
+            "N/A\r\n"
+        )
+        self.assertTrue(has_disposition(body))
+
+    def test_comment_delimiter_inside_fence_then_visible_heading_passes(self):
+        # A <!-- inside an open fence is literal code, not a comment start. It
+        # must not transition comment state and strand the fence open, which would
+        # falsely reject the later visible heading. Masked regions are mutually
+        # exclusive: while fenced, only a matching closer is inspected. Before the
+        # ordered-state fix this exited 1.
+        body = (
+            "## Summary\n"
+            "```\n"
+            "<!-- literal code\n"
+            "```\n"
+            "## bench-compare disposition\n"
+            "N/A\n"
+        )
+        self.assertTrue(has_disposition(body))
+
+    def test_indented_heading_passes(self):
+        # CommonMark allows an ATX heading to be indented up to three spaces. Such
+        # a heading is visible and must open the section. Before the indent fix
+        # the matcher required the # at column zero and exited 1.
+        body = (
+            "## Summary\n"
+            "   ## bench-compare disposition\n"
+            "N/A\n"
+        )
+        self.assertTrue(has_disposition(body))
+
+    def test_autolink_line_start_does_not_hide_disposition(self):
+        # A content line beginning with an autolink (<https://...>) must not be
+        # mistaken for an HTML block and mask a following heading. The HTML-block
+        # catch requires a tag-name delimiter, and a colon follows the scheme, so
+        # the autolink is not taken for a block. This pins that false-reject guard.
+        body = (
+            "<https://example.com/raw-bench-data> is the source below.\n"
             "## bench-compare disposition\n"
             "A/B shows no change, p>0.05 on every group; nothing moved past eighty characters here yes.\n"
             "## Test plan\ny"

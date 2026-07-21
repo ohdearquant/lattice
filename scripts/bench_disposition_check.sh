@@ -23,58 +23,99 @@ fi
 # The section opener must be a Markdown heading containing "bench-compare", not
 # any prose mention: a Summary sentence like "run make bench-compare" must not
 # satisfy the gate. tolower(), not IGNORECASE (a gawk extension that mawk, the
-# Ubuntu runner default, silently ignores — turning the match case-sensitive).
+# Ubuntu runner default, silently ignores, turning the match case-sensitive).
 # The section runs until a heading at the same or shallower depth, so a
-# subheading under it counts as its content.
+# subheading under it counts as its content. Headings are ATX only (a run of one
+# to six #, indented at most three spaces per CommonMark); Setext underlines are
+# not recognized.
 #
-# A heading hidden inside a fenced code block or an HTML comment does NOT open
-# the section: a comment renders invisibly and a fence renders as literal code,
-# so counting either would let a PR satisfy a reviewer-facing gate with a
-# disposition no reviewer sees. Comment state is resolved BEFORE fence state, so a
-# fence delimiter that appears inside a comment cannot leak into the fence tracker
-# and strand it open. Fences follow CommonMark: up to three leading spaces then a
-# run of at least three of the same character (backtick or tilde); a closer must
-# repeat the opener character, be at least as long, and carry nothing but trailing
-# whitespace, so a shorter or mismatched fence line inside a longer block stays
-# content instead of closing it early. Content inside a fence that opens AFTER a
-# visible bench-compare heading still counts as section content, because a real
-# bench table is normally fenced; the hidden state suppresses only heading
-# detection, not membership in an already-open section. Headings are ATX only (a
-# leading run of #); Setext underlines are not recognized.
+# A heading only opens the section when it actually renders as a heading. Several
+# constructs render it as something else, and each is tracked as a mutually
+# exclusive "masked" region: while inside one, only that region's own terminator
+# is inspected, so a delimiter for a different region is literal text and cannot
+# desync the tracker.
+#   fenced code block  a run of at least three backticks or tildes (indented at
+#                      most three spaces); the closer must repeat the opener
+#                      character, be at least as long, and carry only trailing
+#                      whitespace, so a shorter or mismatched fence line stays
+#                      content. Renders as literal code.
+#   HTML comment       from <!-- to -->; renders invisibly.
+#   raw HTML block     <pre>, <script>, <style>, <textarea>; contents are raw
+#                      (not Markdown-parsed) until the matching close tag.
+#   other HTML block   a line that begins (before the section opens) with a
+#                      well-formed HTML tag masks to the next blank line, the
+#                      CommonMark end condition for a block-level tag. This is a
+#                      deliberately conservative, fail-closed catch for a heading
+#                      buried in block HTML such as <div>; it applies only before
+#                      a real heading is found, so it can never swallow the
+#                      heading that closes an already-open section. The tag match
+#                      requires a tag-name delimiter, so an autolink such as
+#                      <https://example.com> (a colon follows the name) is not
+#                      taken for a block and cannot hide a following heading.
+# A trailing carriage return is stripped before any state transition, so a fence
+# or tag delimiter on a CRLF line still matches. Content inside a masked region
+# that opens AFTER a visible bench-compare heading still counts as section
+# content, because a real bench table is often fenced; masking suppresses heading
+# detection, not membership in an already-open section.
 SECTION=$(printf '%s' "$BODY" | awk '
-  function level(s) { if (match(s, /^#{1,6}[[:space:]]/)) { return RLENGTH - 1 } return 0 }
-  function lead_spaces(s,   n) { n = 0; while (substr(s, n + 1, 1) == " ") n++; return n }
-  function run_len(s, ch,   n) { n = 0; while (substr(s, n + 1, 1) == ch) n++; return n }
+  function level(s,   m) {
+    if (match(s, /^ {0,3}#{1,6}([ \t]|$)/)) {
+      m = substr(s, 1, RLENGTH); sub(/^ +/, "", m); sub(/[ \t]*$/, "", m); return length(m)
+    }
+    return 0
+  }
   {
     line = $0
+    sub(/\r$/, "", line)
 
-    was_in_comment = in_comment
-    if (in_comment) { if (line ~ /-->/) in_comment = 0 }
-    else if (line ~ /<!--/ && line !~ /-->/) { in_comment = 1 }
-
-    if (!was_in_comment && !in_comment) {
-      sp = lead_spaces(line)
-      if (sp <= 3) {
-        fbody = substr(line, sp + 1)
-        fch = substr(fbody, 1, 1)
-        if (fch == "`" || fch == "~") {
-          rl = run_len(fbody, fch)
-          if (rl >= 3) {
-            if (!in_fence) {
-              in_fence = 1; fence_char = fch; fence_len = rl
-              if (found) print line
-              next
-            } else if (fch == fence_char && rl >= fence_len) {
-              rest = substr(fbody, rl + 1); gsub(/[ \t]/, "", rest)
-              if (rest == "") { in_fence = 0; if (found) print line; next }
-            }
-          }
-        }
+    if (in_fence) {
+      if (match(line, /^ {0,3}(`{3,}|~{3,})[ \t]*$/)) {
+        run = substr(line, RSTART, RLENGTH); sub(/^ +/, "", run); sub(/[ \t]+$/, "", run)
+        if (substr(run, 1, 1) == fence_char && length(run) >= fence_len) in_fence = 0
       }
+      if (found) print line
+      next
+    }
+    if (in_comment) {
+      if (line ~ /-->/) in_comment = 0
+      if (found) print line
+      next
+    }
+    if (in_raw_html) {
+      if (index(tolower(line), "</" html_tag ">") > 0) in_raw_html = 0
+      if (found) print line
+      next
+    }
+    if (in_html_block) {
+      if (line ~ /^[ \t]*$/) in_html_block = 0
+      if (found) print line
+      next
     }
 
-    hidden = (in_fence || was_in_comment)
-    lv = hidden ? 0 : level(line)
+    if (match(line, /^ {0,3}(`{3,}|~{3,})/)) {
+      run = substr(line, RSTART, RLENGTH); sub(/^ +/, "", run)
+      in_fence = 1; fence_char = substr(run, 1, 1); fence_len = length(run)
+      if (found) print line
+      next
+    }
+    if (match(tolower(line), "^ {0,3}<(pre|script|style|textarea)([ \t/>]|$)")) {
+      html_tag = substr(tolower(line), RSTART, RLENGTH)
+      sub(/^ *</, "", html_tag); sub(/[^a-z].*$/, "", html_tag)
+      if (index(tolower(line), "</" html_tag ">") == 0) in_raw_html = 1
+      if (found) print line
+      next
+    }
+    if (line ~ /<!--/ && line !~ /-->/) {
+      in_comment = 1
+      if (found) print line
+      next
+    }
+    if (!found && match(tolower(line), "^ {0,3}</?[a-zA-Z][a-zA-Z0-9-]*([ \t/>]|$)")) {
+      in_html_block = 1
+      next
+    }
+
+    lv = level(line)
     if (found && lv > 0 && lv <= start_lv) { exit }
     if (!found && lv > 0 && tolower(line) ~ /bench-?compare/) { found = 1; start_lv = lv }
     if (found) print line
