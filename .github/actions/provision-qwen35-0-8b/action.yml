@@ -40,10 +40,14 @@ runs:
     # " Paris." to " the capital of" while every pinned digest still matched.
     # So the directory has to be an exact set, not a superset.
     #
-    # Every file the pinned revision ships is listed, including ones no current
-    # caller reads. Once additions are in scope, the list doubles as the
-    # completeness allowlist, so leaving a legitimate file off it would either
-    # fail every run or force a hole in the exact-set check.
+    # Every file the pinned revision ships is listed, all thirteen, including
+    # ones no current caller reads. `snapshot_download` above passes neither
+    # allow_patterns nor ignore_patterns, so a clean run fetches the whole
+    # repository tree: the ten model files plus .gitattributes, LICENSE and
+    # README.md. Once additions are in scope the digest list doubles as the
+    # completeness allowlist, so omitting a legitimate file does not make the
+    # gate laxer, it makes it red on every ordinary run. Verified by fetching
+    # the pinned revision into a clean cache and listing what landed.
     #
     # Bash 3.2 compatible (macos-latest ships Bash 3.2, which has no
     # `declare -A`): a newline-delimited "<sha256>  <filename>" manifest piped
@@ -51,6 +55,14 @@ runs:
     # a missing file (non-zero exit, one FAILED line naming the file in both
     # cases), so no separate missing-file branch is needed. The completeness
     # check derives its allowlist from the same manifest so the two cannot drift.
+    #
+    # Completeness is deliberately not `ls | grep -vxF -f allowlist`. Directory
+    # entries are compared one NUL-delimited record at a time against exact
+    # string equality, because line-oriented tools cannot represent a filename
+    # that itself contains a newline: as a `grep -F` pattern such a name is read
+    # as several independent patterns, so an entry named "config.json\nconfig.json"
+    # matches an allowlisted name and slips through. `|| true` is likewise
+    # avoided, since it turns a failure of the checker into a clean result.
     - id: verify
       shell: bash
       env:
@@ -61,6 +73,9 @@ runs:
 
         MANIFEST="$(mktemp)"
         cat > "$MANIFEST" <<'HASHES'
+        34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930  .gitattributes
+        bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a  LICENSE
+        87a163af54f32fa608a0f8d3ac67945c53dd2b4a7c96740b3d7fdc28e8458864  README.md
         273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80  chat_template.jinja
         b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204  config.json
         a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d  merges.txt
@@ -76,16 +91,43 @@ runs:
         # Contents: every listed file is present and unmodified.
         shasum -a 256 -c "$MANIFEST"
 
-        # Completeness: nothing else is present. `ls -A` includes dotfiles, so a
-        # hidden addition fails too. The pinned huggingface_hub writes only the
-        # repository's own files here (checked against the version this workflow
-        # installs), so a surprise entry means the snapshot is not what was
-        # pinned, whichever way it got there.
+        # Completeness: nothing else is present. `find -print0` enumerates
+        # dotfiles and directories too, so a hidden or nested addition fails
+        # like any other. The pinned huggingface_hub writes only the
+        # repository's own files here, so a surprise entry means the snapshot
+        # is not what was pinned, whichever way it got there.
         EXPECTED="$(mktemp)"
-        awk '{ print $2 }' "$MANIFEST" > "$EXPECTED"
-        UNEXPECTED="$(ls -A | grep -vxF -f "$EXPECTED" || true)"
-        if [ -n "$UNEXPECTED" ]; then
-          echo "::error::provisioned snapshot contains entries that are not hash-verified: $(echo "$UNEXPECTED" | tr '\n' ' ')"
+        sed 's/^[0-9a-f]*  //' "$MANIFEST" > "$EXPECTED"
+
+        ALLOWED=()
+        while IFS= read -r name; do
+          [ -n "$name" ] && ALLOWED+=("$name")
+        done < "$EXPECTED"
+        if [ "${#ALLOWED[@]}" -eq 0 ]; then
+          echo "::error::allowlist parsed empty; refusing to treat that as nothing to check"
+          exit 1
+        fi
+
+        ACTUAL="$(mktemp)"
+        find . -mindepth 1 -maxdepth 1 -print0 > "$ACTUAL"
+
+        unverified=0
+        while IFS= read -r -d '' entry; do
+          entry="${entry#./}"
+          found=0
+          for allowed in "${ALLOWED[@]}"; do
+            if [ "$entry" = "$allowed" ]; then
+              found=1
+              break
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            printf '::error::provisioned snapshot contains an entry that is not hash-verified: %s\n' "$entry"
+            unverified=1
+          fi
+        done < "$ACTUAL"
+
+        if [ "$unverified" -ne 0 ]; then
           echo "Refusing to hand an unverified reference to the parity gate." >&2
           exit 1
         fi
