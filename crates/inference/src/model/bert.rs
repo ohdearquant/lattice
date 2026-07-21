@@ -185,6 +185,10 @@ pub struct BertModel {
 
 impl BertModel {
     /// **Stable**: load from a directory; primary construction path for `lattice-embed`.
+    ///
+    /// Every required weight passes the shared ingress validation seam before
+    /// `Self` is assembled. A validation failure returns an error and drops all
+    /// local loading state; callers cannot observe a partially built model.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
         let tokenizer = load_tokenizer(dir)?;
 
@@ -236,6 +240,9 @@ impl BertModel {
     /// fallback and no support for the legacy tokenizer formats
     /// (`vocab.json`+`merges.txt`, `vocab.txt`, `tokenizer.model`), both
     /// require a config and a `tokenizer.json` to be supplied explicitly.
+    /// As with [`from_directory`](Self::from_directory), all required weights
+    /// are validated before `Self` is assembled, so an error never exposes a
+    /// partially built model.
     pub fn from_bytes(
         weights_bytes: Vec<u8>,
         config_json: &str,

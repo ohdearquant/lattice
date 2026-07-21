@@ -126,11 +126,14 @@ struct TensorMeta {
     start: usize,
     end: usize,
     converted_f32: OnceLock<Box<[f32]>>,
-    /// Set once this tensor's decoded f32 values have passed
-    /// `ingress::validate_ingested_tensor`, so repeated access to the same
-    /// zero-copy F32 tensor does not rescan already-validated pages
-    /// (lattice#800 step 4).
-    validated: OnceLock<()>,
+    /// Populated once, via `get_or_init`, by this tensor's
+    /// `ingress::validate_ingested_tensor` outcome, so repeated access to the
+    /// same zero-copy F32 tensor does not rescan already-validated pages and
+    /// concurrent first access cannot run the scan twice (lattice#800 step
+    /// 4). `validate_ingested_tensor` only ever returns
+    /// `InferenceError::InvalidSafetensors`, so the cached error is carried
+    /// as its message and rewrapped on read.
+    validated: OnceLock<Result<(), String>>,
 }
 
 /// **Unstable**: 2D tensor view over memory-mapped safetensors data; field layout may change.
@@ -498,17 +501,25 @@ impl SafetensorsFile {
             }
         };
 
-        if meta.validated.get().is_none() {
+        // `get_or_init` runs its closure at most once even under concurrent
+        // first access: every caller blocks on the same in-flight init
+        // rather than racing separate `get()`-then-`set()` scans of the same
+        // tensor (the previous pattern let multiple callers observe
+        // `get().is_none()` and each redo the O(n) finite scan before one
+        // `set()` won).
+        let source = &self.source;
+        let shape = meta.shape.as_slice();
+        let dtype_name = meta.dtype.name();
+        match meta.validated.get_or_init(|| {
             crate::weights::ingress::validate_ingested_tensor(
                 crate::weights::ingress::IngestedTensor::decoded_f32(
-                    &self.source,
-                    name,
-                    meta.shape.as_slice(),
-                    meta.dtype.name(),
-                    slice,
+                    source, name, shape, dtype_name, slice,
                 ),
-            )?;
-            let _ = meta.validated.set(());
+            )
+            .map_err(|e| e.to_string())
+        }) {
+            Ok(()) => {}
+            Err(msg) => return Err(InferenceError::InvalidSafetensors(msg.clone())),
         }
 
         Ok((slice, meta.shape.as_slice()))

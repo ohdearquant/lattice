@@ -674,6 +674,11 @@ fn causal_softmax_row(row: &mut [f32], qi: usize, scale: f32) {
 
 impl QwenModel {
     /// **Unstable**: load Qwen3 model from a local directory; path convention may change.
+    ///
+    /// Single-file and sharded checkpoints validate every accessed tensor
+    /// before `Self` is assembled. If loading fails partway through the
+    /// checkpoint, local backing and fused-weight state are dropped and no
+    /// partially built model is returned.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
         let tokenizer = load_tokenizer(dir)?;
         let inference_config = ModelInferenceConfig::load(dir);

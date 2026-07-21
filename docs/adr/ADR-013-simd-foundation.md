@@ -30,7 +30,8 @@ lattice-embed already has:
 
 ## Decision
 
-**lattice-embed becomes the single source of truth for vector operations.**
+**lattice-embed becomes the single source of truth for embedding vector-distance and similarity
+operations.**
 
 ### Architecture
 
@@ -89,13 +90,40 @@ let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
 let dot = lattice_embed::simd::dot_product(a, b);
 ```
 
+### Scope boundary: transformer matrix kernels
+
+The foundation contract covers public operations over peer embedding vectors: dot product, cosine
+similarity, Euclidean distance, normalization, quantized-vector operations, and their batch
+variants. It does not cover transformer matrix multiplication or row kernels.
+
+In particular, `lattice_inference::forward::cpu::matmul_bt` is a GEMM-oriented row-pointer kernel
+with caller-proved matrix shapes and inference-specific runtime dispatch. Its non-macOS scalar
+fallback (`matmul_bt_scalar`) uses four accumulators for the general `m > 1` case, but the `1 x K`
+row case this ADR's synchronization test exercises (`m == 1`) dispatches to a dedicated
+`matmul_bt_scalar_m1` specialization with eight accumulators; on macOS, `matmul_bt`/`matmul_bt_scalar`
+are bypassed entirely in favor of Accelerate (`accelerate_matmul_bt`). `lattice_embed::simd::dot_product`
+is a stable public slice API with its own dispatch, an eight-accumulator AVX2 implementation, a
+384-dimension specialization, and batch-4 embedding workloads. Their operation contracts and tuning
+targets are intentionally distinct.
+
+`lattice-inference` must not depend on `lattice-embed` to reuse the embedding dot-product kernel.
+The `native` feature already makes `lattice-embed` depend downward on `lattice-inference`; reversing
+that edge would create a dependency cycle. The two kernels remain independently optimized.
+
+A native-feature integration test named
+`crates/embed/tests/inference_dot_product_parity.rs` is the synchronization alarm between the two
+implementations. It compares `dot_product` with a `1 x K` `matmul_bt` result over SIMD boundaries,
+the 384-element specialization, and cancellation-heavy finite inputs using scale-aware tolerances.
+That comparison detects observable drift but is not a correctness oracle; each crate's scalar
+equivalence and architecture-specific tests remain authoritative for its own kernel.
+
 ## Consequences
 
 ### Positive
 
-- **Single implementation**: No duplication, one place to optimize
-- **Consistent performance**: SIMD everywhere (7x speedup)
-- **Clear layering**: lattice-embed = compute, downstream crates = typed wrappers
+- **Single embedding-vector implementation**: No duplication in distance/similarity consumers, one place to optimize
+- **Consistent embedding performance**: SIMD across vector-distance consumers (7x speedup)
+- **Clear layering**: lattice-embed owns embedding-vector operations; lattice-inference owns transformer kernels
 - **Easier maintenance**: Bug fixes propagate automatically
 
 ### Negative
@@ -103,6 +131,7 @@ let dot = lattice_embed::simd::dot_product(a, b);
 - **New dependency**: Downstream scoring and retrieval crates depend on lattice-embed
 - **Migration work**: Update existing call sites
 - **Binary size**: lattice-embed SIMD variants (~50KB) in all dependents
+- **Independent kernel maintenance**: Transformer GEMM and embedding dot product need a differential sync alarm rather than shared code
 
 ### Neutral
 
@@ -113,9 +142,12 @@ let dot = lattice_embed::simd::dot_product(a, b);
 1. **lattice-embed**: Export SIMD ops via stable public API
 2. **Downstream scorer**: Add lattice-embed dependency, wrap SIMD ops
 3. **Downstream retrieval**: Add lattice-embed dependency, use SIMD in distance computation
-4. **Verification**: Ensure formal proofs still build, add SIMD golden tests
+4. **Verification**: Ensure formal proofs still build, add SIMD golden tests, and retain the
+   cross-crate `inference_dot_product_parity` sync alarm
 
 ## References
 
-- ADR-001-simd-strategy.md (runtime SIMD detection)
+- ADR-002-simd-dispatch.md (inference runtime SIMD detection)
 - benches/README.md (7x speedup measurements)
+- `crates/inference/src/forward/cpu/matmul.rs` (transformer GEMM row kernel)
+- `crates/embed/src/simd/dot_product.rs` (embedding-vector dot product)
