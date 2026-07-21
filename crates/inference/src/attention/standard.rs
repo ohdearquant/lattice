@@ -69,7 +69,7 @@ impl AttentionBuffers {
     /// Sum of every scratch buffer's element count. Used by
     /// `crate::attention::flash::estimate_materialized_attention_buffer_bytes`'s
     /// own test to keep that estimate honest against this struct's actual
-    /// field set (see PR #678 review finding 3).
+    /// field set (see PR #678).
     #[cfg(test)]
     pub(crate) fn total_scratch_len(&self) -> usize {
         self.q.len()

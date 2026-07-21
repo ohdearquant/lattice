@@ -23,6 +23,9 @@ pub mod error;
 pub mod lora;
 pub mod registry;
 pub mod train;
+#[cfg(feature = "train-backward")]
+#[doc(hidden)]
+pub mod train_support;
 
 // Re-exports for convenience
 pub use error::{Result, TuneError};
@@ -34,8 +37,8 @@ pub use data::{
 
 // Distill re-exports
 pub use distill::{
-    DistillationConfig, DistillationPipeline, DistillationStats, EndpointSecurity, LabelingResult,
-    TeacherConfig, TeacherConfigBuilder, TeacherProvider,
+    DistillationConfig, DistillationPipeline, DistillationStats, EndpointSecurity, LabelSource,
+    LabelingResult, TeacherAuth, TeacherConfig, TeacherConfigBuilder, TeacherProvider,
 };
 
 // Train re-exports
@@ -69,7 +72,7 @@ pub mod prelude {
         Batch, Dataset, DatasetConfig, DatasetStats, ExampleMetadata, IntentLabels, TrainingExample,
     };
     pub use crate::distill::{
-        DistillationConfig, DistillationPipeline, DistillationStats, EndpointSecurity,
+        DistillationConfig, DistillationPipeline, DistillationStats, EndpointSecurity, LabelSource,
         LabelingResult, TeacherConfig, TeacherProvider,
     };
     pub use crate::error::{Result, TuneError};
@@ -177,13 +180,12 @@ mod tests {
         // 4. Create pipeline
         let mut pipeline = DistillationPipeline::with_teacher(teacher).unwrap();
 
-        // 5. Label (placeholder)
-        let result = pipeline.label_single(&raw).unwrap();
-        assert!(result.is_success());
-        assert!(result.confidence > 0.0);
+        // 5. Labeling fails closed until a live teacher is configured
+        let error = pipeline.label_single(&raw).unwrap_err();
+        assert!(matches!(error, TuneError::TeacherApi(_)));
 
         // 6. Check stats
         let stats = pipeline.stats();
-        assert_eq!(stats.successful, 1);
+        assert_eq!(stats.successful, 0);
     }
 }

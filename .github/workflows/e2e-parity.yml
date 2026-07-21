@@ -19,6 +19,10 @@ on:
     paths:
       - 'crates/inference/src/**'
       - 'crates/embed/src/**'
+      - 'crates/tune/src/**'
+      - 'crates/tune/tests/**'
+      - 'crates/tune/Cargo.toml'
+      - '.github/workflows/e2e-parity.yml'
       - 'scripts/ci-changed-files.sh'
   schedule:
     - cron: '0 6 * * 1'  # weekly Monday 06:00 UTC
@@ -55,6 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       engine: ${{ steps.filter.outputs.engine }}
+      tune: ${{ steps.filter.outputs.tune }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,6 +72,7 @@ jobs:
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] || [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
+            echo "tune=true" >> "$GITHUB_OUTPUT"
             echo "→ $GITHUB_EVENT_NAME trigger: full parity suite REQUIRED"
             exit 0
           fi
@@ -81,13 +87,86 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
             echo "engine=false" >> "$GITHUB_OUTPUT"
             echo "→ no engine change: parity not required"
           fi
+          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
+            echo "tune=true" >> "$GITHUB_OUTPUT"
+            echo "→ tune training surface changed: layer-23 golden REQUIRED"
+          else
+            echo "tune=false" >> "$GITHUB_OUTPUT"
+            echo "→ no tune training change: layer-23 golden not required"
+          fi
+
+  layer23-golden:
+    name: layer-23 golden bridge
+    needs: changes
+    if: needs.changes.outputs.tune == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: layer23-golden-pip-${{ runner.os }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
+
+      - name: Install model downloader
+        run: pip install "huggingface_hub==1.20.1"
+
+      - name: Provision Qwen3.5-0.8B
+        id: provision
+        uses: ./.github/actions/provision-qwen35-0-8b
+
+      - name: Link lattice model dir
+        run: |
+          mkdir -p "$RUNNER_TEMP/lattice-models"
+          ln -sf "${{ steps.provision.outputs.model-dir }}" "$RUNNER_TEMP/lattice-models/qwen3.5-0.8b"
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: layer23-golden
+
+      - name: Run legacy-to-shared layer-23 bridge
+        env:
+          LATTICE_LAYER23_GOLDEN_GATE_ENFORCE: '1'
+          LATTICE_LAYER23_GOLDEN_REPORT: ${{ runner.temp }}/layer23-golden-report.txt
+          LATTICE_MODEL_DIR: ${{ runner.temp }}/lattice-models/qwen3.5-0.8b
+        run: |
+          cargo test --release -p lattice-tune \
+            --test layer23_golden_bridge \
+            --features train-backward \
+            -- --nocapture
+
+      - name: Upload layer-23 bridge report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: layer23-golden-${{ github.sha }}
+          path: ${{ runner.temp }}/layer23-golden-report.txt
+          if-no-files-found: error
 
   parity:
     name: e2e parity
@@ -117,7 +196,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       # Step 1: install reference framework (HF transformers + torch CPU).
       # Pinned to the known-green reference set — the exact versions that
@@ -129,24 +213,16 @@ jobs:
       - name: Install Python deps
         run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
 
-      # Step 2: download model if not cached
-      - name: Download Qwen3.5-0.8B weights
-        run: |
-          python3 -c "
-          from huggingface_hub import snapshot_download
-          path = snapshot_download('Qwen/Qwen3.5-0.8B')
-          print(f'Model at: {path}')
-          "
+      # Step 2: download + hash-verify model, then symlink for lattice
+      # (expects a flat dir with config.json + model.safetensors)
+      - name: Provision Qwen3.5-0.8B
+        id: provision
+        uses: ./.github/actions/provision-qwen35-0-8b
 
-      # Step 3: symlink model for lattice (expects flat dir with config.json + model.safetensors)
       - name: Setup lattice model dir
         run: |
-          MODEL_CACHE=$(python3 -c "
-          from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
-          ")
           mkdir -p ~/.lattice/models
-          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
       # Step 4: build lattice
       - uses: dtolnay/rust-toolchain@1.94.1
@@ -158,10 +234,15 @@ jobs:
         run: cargo build --release --bin qwen35_generate -p lattice-inference --features f16
 
       # Step 5: run parity check (HF first = warm machine, then lattice)
+      # The offline flags are belt to the script's local_files_only braces: any
+      # transformers path that still tries to resolve against the Hub fails
+      # loudly here instead of quietly fetching a reference nobody verified.
       - name: Run e2e parity check
         run: python3 scripts/e2e_parity_check.py
         env:
           E2E_REPORT_PATH: parity-report.md
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
 
       # Step 6: post results as PR comment
       - name: Post parity report
@@ -236,27 +317,24 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       - name: Install Python deps
         run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
 
-      - name: Download Qwen3.5-0.8B weights
-        run: |
-          python3 -c "
-          from huggingface_hub import snapshot_download
-          path = snapshot_download('Qwen/Qwen3.5-0.8B')
-          print(f'Model at: {path}')
-          "
+      - name: Provision Qwen3.5-0.8B
+        id: provision
+        uses: ./.github/actions/provision-qwen35-0-8b
 
       - name: Setup lattice model dir
         run: |
-          MODEL_CACHE=$(python3 -c "
-          from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
-          ")
           mkdir -p ~/.lattice/models
-          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
       - uses: dtolnay/rust-toolchain@1.94.1
 
@@ -274,6 +352,8 @@ jobs:
           LATTICE_METAL_PATH_PROOF: '1'
           E2E_MAX_TOKENS: '4'
           E2E_REPORT_PATH: metal-parity-report.md
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
 
       - name: Ensure Metal report exists
         if: always()
@@ -292,11 +372,11 @@ jobs:
   # Embedding-drift gate: re-embeds the 5 frozen BGE-small corpus texts and
   # asserts max per-vector (1 - cosine) < 1e-3 vs the committed baseline.
   #
-  # Runs on macos-latest (arm64) to exercise the NEON normalise path that
-  # crates/embed/src/simd/ dispatches on aarch64.  A geometry regression on
-  # AVX2/x86_64 would also be caught here on the runner's scalar fallback, but
-  # the primary reason for macOS is to match the NEON path that production
-  # lattice deployments use.
+  # Runs on ubuntu-24.04-arm (aarch64) to exercise the NEON normalise path that
+  # crates/embed/src/simd/ dispatches on aarch64, the same ISA path that
+  # production lattice deployments use. Relocated from macos-latest (also
+  # aarch64) to cut the shared macOS-runner queue tax; NEON coverage is
+  # identical on aarch64 Linux.
   #
   # Model provisioning: the bge-small-en-v1.5 weights (~130 MB) are downloaded
   # via `cargo run ... --bin embed -- --download-only`, then cached per-run by
@@ -316,7 +396,7 @@ jobs:
     name: embed drift gate
     needs: changes
     if: needs.changes.outputs.engine == 'true'
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -363,7 +443,7 @@ jobs:
     name: wasm embedding parity gate
     needs: changes
     if: needs.changes.outputs.engine == 'true'
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -442,7 +522,7 @@ jobs:
     name: wasm SIMD128 kernel parity gate
     needs: changes
     if: needs.changes.outputs.engine == 'true'
-    runs-on: macos-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -498,6 +578,36 @@ jobs:
   # or the build lacks macOS+metal-gpu — so a provisioning failure cannot
   # masquerade as a green gate. This is the same fail-closed shape as embed-drift.
   #
+  # The converter invocation below intentionally does NOT pass --tolerance,
+  # so it runs at the ADR-044 §"Step 3c contract" default of 1e-5 — the same
+  # value used by every non-CI invocation and by the canonical regen script
+  # (scripts/gen_quarot_q4_composed_golden.py, which never passes --tolerance
+  # either). assert_forward_equivalence_qwen35
+  # (crates/inference/src/quant/quarot/forward_equivalence.rs) gates the
+  # chain probe AND the per-tensor matrix-equivalence check against ONE
+  # shared threshold — there is no CLI flag to loosen one without loosening
+  # the other. An earlier revision of this job passed `--tolerance 16` to
+  # absorb a one-off hosted-runner excursion recorded in #1000 (chain probe
+  # max_abs_error=15.796389 on one attempt; identical rerun measured
+  # 7.461e-14; 86/86 runs on main over 7/04-7/15 were clean). That was wrong:
+  # 16 also loosens the per-tensor check, which exists specifically to catch
+  # per-tensor corruption the chain probe cannot see (k_proj, v_proj, the
+  # gate-z half of q_proj, in_proj_qkv/a/b — see the forward_equivalence
+  # module doc). At tolerance=16 a corruption like `k_proj[0] += 0.5` PASSES
+  # instead of refusing — forward_equivalence.rs's own
+  # `per_tensor_check_catches_single_element_perturbation_orthogonal_to_probe_vector`
+  # test proves that exact perturbation is refused at the correct 1e-5
+  # default. Loosening a correctness gate to make CI green is not
+  # acceptable even for a documented flake; #1000 remains open to root-cause
+  # the chain-probe excursion as a CI-environment issue (rerun-clean,
+  # non-reproducible on identical code), not to be papered over via a
+  # loosened shared tolerance. Splitting the chain probe from the per-tensor
+  # check onto independently configurable tolerances would require a
+  # Rust-level change (a second CLI flag threaded through
+  # ConversionOptions/ForwardEquivalenceConfig) — out of scope for this
+  # CI-config-only change; if the chain-probe flake recurs, that Rust change
+  # is the right follow-up, not a shared-tolerance bump here.
+  #
   # The committed JSON golden is NEVER regenerated by CI (the regen script refuses
   # to overwrite without --update-golden). Updating it is a reviewable source
   # change that must carry rationale + mutation evidence.
@@ -528,28 +638,26 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       # Only huggingface_hub is needed — lattice does the inference, so torch /
       # transformers (the reference framework) are not required for this gate.
       - name: Install Python deps
         run: pip install "huggingface_hub==1.20.1"
 
-      - name: Download Qwen3.5-0.8B weights
-        run: |
-          python3 -c "
-          from huggingface_hub import snapshot_download
-          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
-          "
+      - name: Provision Qwen3.5-0.8B
+        id: provision
+        uses: ./.github/actions/provision-qwen35-0-8b
 
       - name: Setup lattice model dir
         run: |
-          MODEL_CACHE=$(python3 -c "
-          from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
-          ")
           mkdir -p ~/.lattice/models
-          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
@@ -633,26 +741,24 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       - name: Install Python deps
         run: pip install "huggingface_hub==1.20.1"
 
-      - name: Download Qwen3.5-0.8B weights
-        run: |
-          python3 -c "
-          from huggingface_hub import snapshot_download
-          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
-          "
+      - name: Provision Qwen3.5-0.8B
+        id: provision
+        uses: ./.github/actions/provision-qwen35-0-8b
 
       - name: Setup lattice model dir
         run: |
-          MODEL_CACHE=$(python3 -c "
-          from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
-          ")
           mkdir -p ~/.lattice/models
-          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
@@ -795,26 +901,24 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       - name: Install Python deps
         run: pip install "huggingface_hub==1.20.1"
 
-      - name: Download Qwen3.5-0.8B weights
-        run: |
-          python3 -c "
-          from huggingface_hub import snapshot_download
-          print(f'Model at: {snapshot_download(\"Qwen/Qwen3.5-0.8B\")}')
-          "
+      - name: Provision Qwen3.5-0.8B
+        id: provision
+        uses: ./.github/actions/provision-qwen35-0-8b
 
       - name: Setup lattice model dir
         run: |
-          MODEL_CACHE=$(python3 -c "
-          from huggingface_hub import snapshot_download
-          print(snapshot_download('Qwen/Qwen3.5-0.8B'))
-          ")
           mkdir -p ~/.lattice/models
-          ln -sf "$MODEL_CACHE" ~/.lattice/models/qwen3.5-0.8b
+          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
@@ -873,6 +977,13 @@ jobs:
   # exactly that skip. q4-ppl-quality is now armed
   # (golden captured on run 28841919096) and gates the shipping Q4 tier for
   # regressions.
+  #
+  # layer23-golden is checked independently of the engine branch below: it is
+  # gated by needs.changes.outputs.tune, not .engine, so a tune-only PR (tune
+  # filter true, engine filter false) must still consume its result before the
+  # gate can pass. The check runs unconditionally, ahead of the engine
+  # short-circuit — otherwise a tune-only change would hit the "no engine
+  # change" early PASS and never evaluate the bridge job at all.
   parity-gate:
     name: parity-gate
     needs:
@@ -887,6 +998,7 @@ jobs:
         ppl-gate-selftest,
         q4-ppl-quality,
         metal-parity,
+        layer23-golden,
       ]
     if: always()
     runs-on: ubuntu-latest
@@ -895,6 +1007,7 @@ jobs:
         run: |
           CHANGES_RESULT="${{ needs.changes.result }}"
           ENGINE="${{ needs.changes.outputs.engine }}"
+          TUNE="${{ needs.changes.outputs.tune }}"
           PARITY_RESULT="${{ needs.parity.result }}"
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
           WASM_RESULT="${{ needs.wasm-parity.result }}"
@@ -904,10 +1017,15 @@ jobs:
           PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
           Q4PPL_RESULT="${{ needs.q4-ppl-quality.result }}"
           METAL_RESULT="${{ needs.metal-parity.result }}"
+          LAYER23_RESULT="${{ needs.layer23-golden.result }}"
           EVENT_NAME="${{ github.event_name }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT metal-parity=$METAL_RESULT event=$EVENT_NAME"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
+            exit 1
+          fi
+          if [ "$TUNE" = "true" ] && [ "$LAYER23_RESULT" != "success" ]; then
+            echo "::error::Tune training surface changed and the layer-23 golden bridge did not succeed (result=$LAYER23_RESULT)."
             exit 1
           fi
           if [ "$ENGINE" != "true" ]; then
