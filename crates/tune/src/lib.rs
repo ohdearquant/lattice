@@ -23,6 +23,9 @@ pub mod error;
 pub mod lora;
 pub mod registry;
 pub mod train;
+#[cfg(feature = "train-backward")]
+#[doc(hidden)]
+pub mod train_support;
 
 // Re-exports for convenience
 pub use error::{Result, TuneError};

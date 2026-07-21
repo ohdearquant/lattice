@@ -758,7 +758,7 @@ fn bench_full_logit_readback_metal(c: &mut Criterion) {
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _ = c;
+    skip_metal_gated(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -815,7 +815,7 @@ fn bench_compact_readback_metal(c: &mut Criterion) {
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _ = c;
+    skip_metal_gated(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +860,7 @@ fn bench_noop_command_buffer(c: &mut Criterion) {
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _ = c;
+    skip_metal_gated(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1252,7 +1252,7 @@ fn bench_metal_topk_dispatch_only(c: &mut Criterion) {
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _ = c;
+    skip_metal_gated(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,7 +1549,7 @@ fn bench_metal_topk_plus_readback(c: &mut Criterion) {
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _ = c;
+    skip_metal_gated(c);
 }
 
 // ---------------------------------------------------------------------------
@@ -2107,7 +2107,20 @@ fn bench_topk_parity(c: &mut Criterion) {
     }
 
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    let _ = c;
+    skip_metal_gated(c);
+}
+
+/// Metal-gated groups in this otherwise-CPU bench binary cannot run on a build
+/// without `metal-gpu`. Say so loudly instead of vanishing from the report:
+/// an absent group in an A/B table reads as "no change" when it is actually
+/// "not measured". (Not a hard failure — the CPU groups above must stay
+/// runnable on default builds.)
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+fn skip_metal_gated(_c: &mut Criterion) {
+    eprintln!(
+        "[topk_readback] SKIP: Metal-gated benchmark group compiled out (needs macOS + \
+         --features metal-gpu); its results are MISSING from this run, not unchanged"
+    );
 }
 
 // ---------------------------------------------------------------------------

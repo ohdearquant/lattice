@@ -5,7 +5,7 @@ decode-bench harness).
 No engine binary or network access is required to run this file: real
 adapters are exercised only through their pure parsing helpers
 (`parse_lattice_result_line`, `ollama_response_to_result`); the profile ->
-call-schedule equivalence is checked with the harness's own deterministic
+call-schedule contract is checked against the harness's own deterministic
 `_FakeAdapter`, matching `tests/test_bench_decode_harness.py`'s convention
 and the issue #813 gate: "Deterministic fake-adapter tests and raw-schema
 validation pass without any engine binary present."
@@ -75,12 +75,12 @@ class _FakeAdapter:
 
 
 # --------------------------------------------------------------------------
-# Profile parameter equivalence (the issue #813 gate: byte-for-byte
+# Profile parameter transcription (the issue #813 gate: byte-for-byte
 # equivalent window/repeats/warmup parameters vs the legacy script)
 # --------------------------------------------------------------------------
 
 
-class ProfileParameterEquivalenceTest(unittest.TestCase):
+class ProfileParameterTranscriptionTest(unittest.TestCase):
     """bench_apples_to_apples.sh: N1=32, N2=256, RUNS=5, no lattice/ollama
     warmup, mlx warms up once at 8 tokens -- see the script's own
     N1/N2/RUNS constants and its single pre-loop `generate(..., max_tokens=8,
@@ -156,11 +156,11 @@ class ProfileParameterEquivalenceTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# Call-schedule equivalence via fake adapters (no engine binary needed)
+# Call-schedule contract via fake adapters (no engine binary needed)
 # --------------------------------------------------------------------------
 
 
-class CallScheduleEquivalenceTest(unittest.TestCase):
+class CallScheduleContractTest(unittest.TestCase):
     """Runs the REAL shipped profiles through harness.run_profile with fake
     adapters, proving the produced call schedule matches
     bench_apples_to_apples.sh's loop structure exactly: lattice/ollama get

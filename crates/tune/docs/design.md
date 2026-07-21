@@ -389,33 +389,17 @@ to the real model's loss; no mismatch is treated as a harmless warning.
 
 ## train_grad_layer23
 
-`train_grad_layer23` adapts `q_proj` and `v_proj` in Qwen3.5's top GQA layer,
-layer 23. It captures the frozen prefix residual entering that layer and the
-RoPE tables once per sample. Every lower layer and every base weight remains
-frozen; only the four low-rank factors `(A_q, B_q, A_v, B_v)` are updated.
+`train_grad_layer23` is a deprecated compatibility command. It accepts the
+historical flag surface and maps it to the shared full driver with
+`first_layer = 23`, held-out evaluation disabled, and the historical fixed A
+initialization amplitude `0.02`. It emits the supported replacement,
+`train_grad_full --first-layer 23`, on every training invocation.
 
-For each completion source position, the materialized chain is:
-
-```text
-normed   = rms_norm(h_in, pre_attn_norm)
-attn_out = gated_GQA(normed; LoRA_q, LoRA_v)
-h_mid    = h_in + attn_out
-h_out    = h_mid + swiglu(rms_norm(h_mid, post_attn_norm))
-logits   = lm_head · rms_norm(h_out, final_norm)
-loss     = cross_entropy(logits, next_token)
-```
-
-The reverse pass crosses the head, final norm, FFN, residual, and GQA
-attention, then deliberately discards the gradient below layer 23 because the
-prefix is frozen. Layer and final RMSNorm weights are shifted as
-`1 + gamma` before calling helpers that expect ordinary weights. GQA q/k norm
-weights stay raw because its forward implementation applies that shift.
-
-Training starts with random A and zero B, so the initial adapter reproduces
-the base while B receives a nonzero first update. The zero-adapter TBV check
-therefore validates the entire layer-23-plus-head reconstruction. When saved,
-the adapter uses B as row-major `[d_out, rank]` and A as `[rank, d_in]`; gated
-`q_proj` has `d_out = 2 * q_dim`, covering both Q and gate rows.
+The compatibility command and `train_grad_full` share one forward, reverse,
+optimizer, TBV, and serialization implementation. The layer-23 golden bridge
+fixture records the removed trainer's one-step result, and the macOS gate
+compares the compatibility command's NLLs and every serialized A/B tensor
+against it before checking adapter reload and central differences.
 
 ## train_grad_full details
 

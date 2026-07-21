@@ -97,8 +97,8 @@ would make tape indexing or allocation unsafe:
 - `completion_start` must be in `1..tokens.len()`;
 - rank must be in `1..=512`;
 - steps must be at most `100_000`, and `max_seq_len` at most `8_192`;
-- `first_layer` must not exceed `TOP_LAYER` (`23`), and the model must contain
-  at least 24 layers because the loop indexes the inclusive range through 23.
+- the model must contain at least one layer, and `first_layer` must not exceed
+  its derived top index (`num_hidden_layers - 1`).
 
 The rank, step, and sequence caps are allocation and runtime safety bounds,
 not recommendations for model quality. The model's own context window remains
@@ -109,7 +109,7 @@ an independent limit.
 The model runs the prefix before `first_layer` through its normal frozen
 forward path. For each pair, the trainer captures the hidden state entering
 `first_layer` and obtains the RoPE cosine and sine tables for that sequence.
-It then materializes layers `first_layer..=23` as a tape.
+It then materializes layers `first_layer..=num_hidden_layers - 1` as a tape.
 
 Each materialized layer is classified as one of two mixer kinds:
 
@@ -444,9 +444,9 @@ for offline inspection but are weaker admission checks than live serving.
 
 `train_micro_lora` is deliberately bounded before it reads a model weight or
 allocates a tape buffer. It validates the caller's pairs against the model
-configuration, then materializes the inclusive suffix
-`first_layer..=TOP_LAYER` where `TOP_LAYER` is 23. Both endpoints must be
-valid model-layer indices: an invalid suffix would otherwise reach direct
+configuration, then derives the model's top layer and materializes the
+inclusive suffix `first_layer..=num_hidden_layers - 1`. Both endpoints must
+be valid model-layer indices: an invalid suffix would otherwise reach direct
 layer-weight indexing and panic.
 
 The public helper applies these policy caps:

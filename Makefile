@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
+.PHONY: check clippy test test-timing fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
 
 check:
 	cargo check --workspace
@@ -8,6 +8,14 @@ clippy:
 
 test:
 	cargo test --workspace
+
+# The suites carrying wall-clock regression checks (cached-SIMD-config lookup,
+# 1000-batch dot product, FANN inference). Those assertions are skipped when the
+# CI env var is set, because absolute-time bounds flake under shared-CI
+# scheduling contention. Run this on an idle host to exercise them for real.
+test-timing:
+	cargo test -p lattice-embed --test integration
+	cargo test -p lattice-fann --lib
 
 fmt:
 	cargo fmt --all

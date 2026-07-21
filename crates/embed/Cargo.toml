@@ -37,35 +37,44 @@ thiserror = { workspace = true }
 # Logging
 tracing = "0.1"
 
-# `tokio` and `lattice-inference` are split into target-specific tables below.
-# Reason: this workspace's `[workspace.dependencies] tokio` entry sets
-# `features = ["full"]`, and Cargo's workspace-dependency inheritance ADDS a
-# package's `features = [...]` on top of that base list rather than replacing
-# it, so `tokio = { workspace = true, features = ["sync", "rt"] }` still
-# resolves to the full feature set (verified via `cargo metadata`: the
-# resolved feature list is `["full", "sync", "rt"]`). `full` pulls in
-# `net`, which pulls in `mio`, which does not support wasm32-unknown-unknown.
-# A single unconditional `[dependencies]` entry can't avoid this because
-# Cargo unions features across every matching table for a given target, so
-# the only way to give wasm a trimmed `tokio` is to have no unconditional
-# entry at all: one table for wasm, one for everything else. The same
-# reasoning applies to `lattice-inference`, whose default features pull in
-# axum/ureq (HTTP serving + downloads), neither of which is wasm-compatible
-# or needed for the embedding compute path.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["sync", "rt"] }
-# Embedding generation (native, pure Rust)
-lattice-inference = { version = "0.7.0", path = "../inference", optional = true, features = ["f16"] }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1.0", default-features = false, features = ["sync", "rt"] }
-# Same crate, trimmed to the CPU compute path: `std` + `f16`, without
-# `download` (ureq) or `serve` (axum/tokio-net/mio), none of which compile to
-# wasm32-unknown-unknown.
+# Embedding generation, pure Rust. Unconditional (applies to every target):
+# after trimming to `default-features = false, features = ["std", "f16"]` the
+# feature set is identical on native and wasm, so there is nothing target-specific
+# left to split (contrast `tokio` below, which genuinely must stay split). `f16`
+# is mandatory, not cosmetic: without it the weight loader HARD-FAILS on every
+# F16/BF16 tensor (weights/f32_weights.rs returns InvalidSafetensors), so a
+# std-only build loads nothing real. `download` (ureq -> rustls -> ring) and
+# `serve` (axum) are deliberately OFF here: neither compiles to
+# wasm32-unknown-unknown, ring's build script does not cross-compile to
+# aarch64-unknown-linux-gnu under a zig toolchain, and the embedding compute path
+# uses neither. The native `embed` binary re-enables first-use model downloads
+# through this crate's own `download` feature (in `default`), which forwards
+# `lattice-inference/download`. That forward is wasm-safe because inference gates
+# its own ureq/download stack to non-wasm targets, so a plain `--features wasm`
+# build stays download-free; edge/cross builds drop it with
+# `--no-default-features --features native`. See issue #1095.
 lattice-inference = { version = "0.7.0", path = "../inference", optional = true, default-features = false, features = [
     "std",
     "f16",
 ] }
+
+# `tokio` stays split into target-specific tables below (unlike `lattice-inference`
+# above, whose feature set is now the same on every target). Reason: this
+# workspace's `[workspace.dependencies] tokio` entry sets `features = ["full"]`,
+# and Cargo's workspace-dependency inheritance ADDS a package's `features = [...]`
+# on top of that base list rather than replacing it, so
+# `tokio = { workspace = true, features = ["sync", "rt"] }` still resolves to the
+# full feature set (verified via `cargo metadata`: the resolved feature list is
+# `["full", "sync", "rt"]`). `full` pulls in `net`, which pulls in `mio`, which
+# does not support wasm32-unknown-unknown. A single unconditional `[dependencies]`
+# entry can't avoid this because Cargo unions features across every matching table
+# for a given target, so the only way to give wasm a trimmed `tokio` is to have no
+# unconditional entry at all: one table for wasm, one for everything else.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["sync", "rt"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.0", default-features = false, features = ["sync", "rt"] }
 # JS bindings for the `wasm` feature. Target-gated (this table only applies to
 # wasm32) AND feature-gated (`optional = true`, enabled only by the `wasm`
 # feature below), so a plain non-wasm feature build of this crate, native or
@@ -96,8 +105,18 @@ lattice-transport = { path = "../transport" }
 serde_json = { workspace = true }
 
 [features]
-default = ["native"]
+default = ["native", "download"]
 native = ["dep:lattice-inference"]
+# First-use model downloads for the native `embed` binary (its `--download-only`
+# flag and the implicit fetch inside `BertModel::from_pretrained`). Implies
+# `native` (downloads need the inference compute dep) and forwards
+# `lattice-inference/download`. In `default`, so a plain native
+# `cargo run -p lattice-embed --bin embed` keeps downloading models. It is safe on
+# wasm even when `default` is active: inference gates its ureq/download stack to
+# non-wasm targets, so a plain `--features wasm` build resolves download-free.
+# Edge/cross builds still drop it with `--no-default-features --features native`
+# (ring does not cross-compile to aarch64 under zig). See #1095.
+download = ["native", "lattice-inference/download"]
 # wasm-bindgen JS bindings (`LatticeEmbedder`) for building a browser-loadable
 # `.wasm` module. Only meaningful together with `native` (it wraps
 # `lattice_inference::BertModel`); the `wasm-bindgen`/`console_error_panic_hook`

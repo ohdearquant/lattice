@@ -83,6 +83,9 @@ mod tests {
             .unwrap();
 
         let input: Vec<f32> = (0..128).map(|i| i as f32 / 128.0).collect();
+        let output = network.forward(&input).unwrap();
+        assert_eq!(output.len(), 10);
+        assert!(output.iter().all(|value| value.is_finite()));
 
         for _ in 0..10 {
             network.forward(&input).unwrap();

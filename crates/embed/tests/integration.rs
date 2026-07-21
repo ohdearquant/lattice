@@ -211,7 +211,10 @@ fn test_simd_config_detect_consistent() {
 
 #[test]
 fn test_simd_config_cached() {
-    // simd_config() should return cached value quickly
+    let expected = simd_config();
+    let actual = simd_config();
+    assert_eq!(actual, expected);
+
     let start = std::time::Instant::now();
     for _ in 0..10000 {
         let _ = simd_config();
@@ -228,6 +231,21 @@ fn test_simd_config_cached() {
             elapsed
         );
     }
+}
+
+#[test]
+fn test_simd_config_full_equality_catches_field_diff() {
+    // Comparing the whole struct (rather than enumerating fields) must
+    // discriminate on every field, including ones added after this test
+    // was written.
+    let base = simd_config();
+    let mut mutated = base;
+    mutated.dotprod_enabled = !mutated.dotprod_enabled;
+
+    assert_ne!(
+        mutated, base,
+        "SimdConfig equality did not detect a differing field"
+    );
 }
 
 // ============================================================================
