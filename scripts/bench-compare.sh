@@ -39,8 +39,12 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 
-# Parse flags. Both are optional and order-independent; the first non-flag
-# argument begins the positional BASE/HEAD pair.
+# Parse flags. Both are optional and may appear in either order, but they must
+# precede the positional BASE/HEAD pair: the first non-flag argument ends flag
+# parsing. A flag written AFTER a ref is rejected rather than silently taken as
+# a ref — `bench-compare.sh HEAD~1 --full` used to resolve "--full" as HEAD_REF
+# and bench against nonsense. Use `--` to pass a ref that legitimately begins
+# with a dash.
 #
 # --fail-on-regression exists because this script is a REPORTER by default: the
 # gate invocation at the bottom ends in `|| true`, so a confirmed regression is
@@ -77,6 +81,25 @@ done
 
 BASE_REF="${1:-origin/main}"
 HEAD_REF="${2:-HEAD}"
+
+# Reject dash-led leftovers. Without this a misplaced flag becomes a ref and the
+# script benches against garbage, which is worse than refusing: it produces a
+# confident-looking A/B nobody asked for. `--` above opts out for real refs.
+for arg in "$@"; do
+  case "$arg" in
+    -*)
+      echo "bench-compare.sh: '$arg' looks like a flag but follows a positional" \
+           "argument; flags must precede BASE/HEAD (use -- for a literal ref)" >&2
+      echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
+      exit 2
+      ;;
+  esac
+done
+if [ "$#" -gt 2 ]; then
+  echo "bench-compare.sh: too many positional arguments ($#); expected at most" \
+       "BASE_REF and HEAD_REF" >&2
+  exit 2
+fi
 
 # Resolve to short SHAs for display
 BASE_SHA=$(git -C "$REPO" rev-parse --short "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
@@ -241,27 +264,35 @@ GATE_ARGS=(--baseline-name compare-base)
 if [ -s "$INFO_GROUPS_FILE" ]; then
   GATE_ARGS+=(--informational-groups-file "$INFO_GROUPS_FILE")
 fi
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  # Ask the gate to distinguish "nothing regressed" from "nothing was
+  # measured". It is the only party that can: it parses the comparisons and
+  # knows how many were judgeable. Testing for the criterion DIRECTORY here
+  # cannot work — this script creates that directory itself before benching.
+  GATE_ARGS+=(--require-measurements)
+fi
+
 GATE_RC=0
-GATE_RAN=0
 if [ -d "$HEAD_DIR/target/criterion" ]; then
-  GATE_RAN=1
   python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || GATE_RC=$?
+else
+  # Cannot happen via the normal path (the directory is created above), but a
+  # missing root must not read as a pass under --fail-on-regression.
+  GATE_RC=2
 fi
 
 echo ""
 echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
 
-if [ "$FAIL_ON_REGRESSION" = "1" ]; then
-  # Absence of criterion output is a broken measurement, not a pass. Reporting
-  # success here would be the same defect this flag exists to remove: a green
-  # exit standing in for evidence that was never produced.
-  if [ "$GATE_RAN" = "0" ]; then
-    echo "bench-compare: --fail-on-regression set but no criterion output at" \
-         "$HEAD_DIR/target/criterion — the A/B did not produce measurements." >&2
-    exit 1
-  fi
-  if [ "$GATE_RC" -ne 0 ]; then
+if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
+  # Exit 1 is a confirmed regression; exit 2 is the gate refusing to certify a
+  # run it could not judge (no comparison data, or nothing gating). Both must
+  # fail the caller: a green exit standing in for evidence that was never
+  # produced is the exact defect this flag exists to remove.
+  if [ "$GATE_RC" = "2" ]; then
+    echo "bench-compare: gate could not judge this run — no usable measurements." >&2
+  else
     echo "bench-compare: gate reported a confirmed regression (exit $GATE_RC)." >&2
-    exit "$GATE_RC"
   fi
+  exit "$GATE_RC"
 fi

@@ -45,10 +45,18 @@ on:
       - 'crates/embed/benches/simd.rs'
       - 'crates/embed/Cargo.toml'
       - 'Cargo.lock'
+      # Root Cargo.toml carries [profile.bench]; .cargo/ can carry rustflags.
+      # Either can change codegen for both bench targets without touching a
+      # single line of crate source, so both must trigger this lane.
+      - 'Cargo.toml'
+      - '.cargo/**'
       - 'scripts/bench-compare.sh'
       - 'scripts/perf-bench-gate.py'
+      # Helpers bench-compare.sh invokes: a change in them changes the run.
       - 'scripts/lib/bench-informational-groups.sh'
       - 'scripts/lib/bench-quick-informational-targets.txt'
+      - 'scripts/lib/resolve-informational-groups.sh'
+      - 'scripts/lib/ensure-noindex-marker.sh'
       - '.github/workflows/perf-postmerge-gate.yml'
   workflow_dispatch:
     inputs:
@@ -65,9 +73,20 @@ permissions:
   contents: read
 
 concurrency:
-  # One post-merge A/B at a time per arch. Timing runs must not overlap each
-  # other on a shared runner pool, and a superseded run's numbers are of no
-  # interest once a newer commit has landed.
+  # One post-merge A/B run at a time for this ref. The group is ref-scoped, NOT
+  # arch-scoped: the two matrix legs belong to the same run and use different
+  # runner pools, so they are free to proceed together.
+  #
+  # KNOWN GAP, stated rather than hidden: GitHub keeps only ONE pending run per
+  # concurrency group. If commits B and C land while a run is in flight, B's
+  # pending run is replaced by C's, and C compares against B (github.event.before),
+  # so a regression introduced by B sits in both arms of C's A/B and is invisible.
+  # Rapid-fire merges to main can therefore skip a commit's measurement entirely.
+  # Closing this needs a queue that retains runs, or comparing against the last
+  # SUCCESSFULLY MEASURED commit rather than the immediate parent; either is a
+  # follow-up. Until then, treat a quiet lane during a merge burst as unproven,
+  # not as evidence of no regression, and use workflow_dispatch with explicit
+  # base_ref/head_ref to measure a commit that was skipped.
   group: perf-postmerge-${{ github.ref }}
   cancel-in-progress: false
 
@@ -177,11 +196,20 @@ jobs:
 
       - name: Record the outcome honestly
         if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
         run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "No gross regression detected (see ceiling above)." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "FAILED: a confirmed regression, or the A/B did not produce measurements." >> "$GITHUB_STEP_SUMMARY"
-            echo "Read the gate report in the step log before reverting: confirm the" >> "$GITHUB_STEP_SUMMARY"
-            echo "flagged groups are reachable from the merged diff." >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            if [ "$JOB_STATUS" = "success" ]; then
+              echo "No gross regression detected (see ceiling above)."
+            else
+              echo "FAILED. Two different causes share this exit, and they call for"
+              echo "opposite responses, so read the step log before acting:"
+              echo
+              echo "- exit 1 — a confirmed regression. Check the flagged groups are"
+              echo "  reachable from the merged diff, then revert or justify."
+              echo "- exit 2 — the gate refused to certify: no comparison data, or"
+              echo "  nothing gating among the results. Nothing was proven about"
+              echo "  performance. Fix the measurement and re-run; do NOT revert."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
