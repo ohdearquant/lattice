@@ -156,11 +156,26 @@ BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
 # exactly like a bench that produced no matching lines, and the A/B continued
 # with half its measurements missing. Verified: after `p | grep x || true`,
 # ${PIPESTATUS[0]} reads 0 even when p exited 7.
+#
+# Cargo's exit status is necessary and not sufficient. A bench invocation whose
+# Criterion filter matches no benchmark exits 0 having measured nothing, and a
+# target that emits no Criterion output contributes no comparison for the gate
+# to reconcile — absence leaves no artifact to be found missing. So each
+# invocation also reports how many measurement lines it actually printed:
+# that is the only per-target evidence available at the point where the run's
+# INTENT is known. Downstream, `perf-bench-gate.py` sees a directory tree and
+# cannot know a second target was ever supposed to be in it.
 BENCH_RC=0
+BENCH_LINES=0
 run_bench() {
   local filter="$1"; shift
   BENCH_RC=0
-  { "$@" 2>&1 | grep -E "$filter"; BENCH_RC=${PIPESTATUS[0]}; } || true
+  BENCH_LINES=0
+  local matched
+  matched="$(mktemp)"
+  { "$@" 2>&1 | grep -E "$filter" | tee "$matched"; BENCH_RC=${PIPESTATUS[0]}; } || true
+  BENCH_LINES="$(wc -l < "$matched" | tr -d ' ')"
+  rm -f "$matched"
 }
 
 # A partial A/B is not weaker evidence that nothing regressed, it is no
@@ -168,9 +183,22 @@ run_bench() {
 # (measurement broken) rather than 1 (confirmed regression) because the two ask
 # the reader for opposite responses. The reporter keeps its tolerant behavior.
 require_measured() {
-  local what="$1" rc="$2"
-  if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$rc" -ne 0 ]; then
+  local what="$1" rc="$2" lines="${3:-}"
+  if [ "$FAIL_ON_REGRESSION" != "1" ]; then
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
     echo "bench-compare: $what failed (exit $rc) — refusing to certify a partial A/B." >&2
+    exit 2
+  fi
+  # An invocation that exits 0 having printed no measurement line ran no
+  # benchmark (a filter that matches nothing is the ordinary way to get here).
+  # Its target then produces no Criterion comparison at all, and a gate that
+  # reconciles comparisons found against comparisons judged cannot see it:
+  # there is nothing on disk to be missing. Caught here, where the target is
+  # still named, or not at all.
+  if [ -n "$lines" ] && [ "$lines" -eq 0 ]; then
+    echo "bench-compare: $what exited 0 but produced no measurements — refusing to certify a partial A/B." >&2
     exit 2
   fi
 }
@@ -187,13 +215,13 @@ BASE_PHASE_RC=0
   # same channel and one of them silently deletes half the comparison.
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
     run_bench "time:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS
-    require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC"
+    require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
   run_bench "time:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS
-  require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC"
+  require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_PHASE_RC=$?
 # `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
 # and re-raised here or the refusal above is itself swallowed.
@@ -231,13 +259,13 @@ HEAD_PHASE_RC=0
   cd "$HEAD_DIR"
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
     run_bench "time:|change:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS
-    require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC"
+    require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
   run_bench "time:|change:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS
-  require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC"
+  require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
 
