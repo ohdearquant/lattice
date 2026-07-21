@@ -1,0 +1,128 @@
+name: bench evidence
+
+# The repo's contributor rule (CLAUDE.md) requires every PR touching crates/inference/
+# or crates/embed/ to carry a bench-compare disposition in its description. That
+# requirement was convention-only. (ADR-058 first raised CPU perf-regression tracking;
+# its automated bench-fail gate design was superseded by e2e-parity.yml, but the
+# disposition-in-the-description rule remains live in the contributor guide, and this
+# job enforces exactly that.)
+# A PR adding one line to the cosine fast path (`&& is_unit_norm(s)`, an O(d)
+# recomputation per stored candidate) merged with no bench section at all and cost 7x
+# on simd_prepared_query_normalized_cosine: 96,278 ns -> 682,838 ns at d=1024,
+# confidence intervals disjoint at every size, undetected for four days because
+# nothing enforced the rule.
+#
+# Trusted-enforcement shape. This runs as pull_request_target, so the workflow
+# definition and the checker script both come from the BASE branch, never the PR's
+# tree. A PR cannot edit this job (or scripts/bench_disposition_check.sh) to exit 0
+# and forge the named check. It checks out only the base ref and runs no code from the
+# PR: the PR body and file list are read through the GitHub API, and the body is piped
+# as inert text to the base-controlled checker. Nothing from the PR executes here, so
+# pull_request_target's usual "untrusted code with a write token" hazard does not apply.
+#
+# This gate checks that the disposition EXISTS and says something. It does not judge
+# whether the numbers are real; a workflow cannot, and pretending otherwise would trade
+# a visible gap for an invisible one. Reviewers judge quality; this makes an absent
+# disposition impossible.
+
+on:
+  pull_request_target:
+    branches: [main]
+    # `edited` is required: the body is the artifact under test, so a description fixed
+    # after the fact must be re-evaluated rather than needing an empty push to clear.
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+  merge_group:
+    branches: [main]
+    types: [checks_requested]
+
+# One gate job reports the required status context on both pull_request_target and
+# merge_group under the same name, mirroring e2e-parity.yml, so branch protection can
+# require it in one place. Supersede a PR's own in-flight runs; never a queued check.
+concurrency:
+  group: bench-evidence-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  evidence:
+    name: bench-compare disposition present
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the base ref (trusted) for the checker script
+        if: github.event_name == 'pull_request_target'
+        # Pinned to a full commit SHA: this is a pull_request_target job, so a
+        # moved or compromised tag would run in the trusted context before the
+        # checker does. SHA is actions/checkout v4 (the v4 tag as of 2026-07-20).
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Enforce bench-compare disposition
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # The disposition lives in the PR description, which is NOT part of the
+          # merge commit, so unlike e2e-parity (which re-runs its code parity test
+          # on the merge_group ref) this check has nothing to re-derive at queue
+          # time. It is enforced at PR time: a required check must pass before a PR
+          # can enter a merge queue, and the pull_request_target `edited` trigger
+          # re-runs this gate on every body change, so a missing disposition fails
+          # the PR run and keeps the PR out of the queue. Reporting the same context
+          # green on merge_group only prevents the required-check-that-never-reports-
+          # on-the-queue trap that would otherwise wedge the merge group. No merge
+          # queue is configured on this branch today; this path is defensive and
+          # matches e2e-parity's own merge_group handling.
+          if [ "$EVENT" != "pull_request_target" ]; then
+            echo "event=$EVENT: disposition is a PR-description check enforced at PR time; merge-queue events report green to avoid wedging the queue."
+            exit 0
+          fi
+
+          if [ ! -f scripts/bench_disposition_check.sh ]; then
+            echo "::error::scripts/bench_disposition_check.sh is missing from the base ref."
+            echo "Rebase this PR on current main so the base carries the checker."
+            exit 1
+          fi
+
+          # The list-files endpoint is capped at 3000 files even with --paginate, so a
+          # PR larger than that can hide a crates/{inference,embed} path beyond the cap
+          # and read as out-of-scope. Take the authoritative total from the PR object and
+          # fail closed above the cap: when scope cannot be determined, require the
+          # disposition (a one-line N/A satisfies it). At or below the cap the file list
+          # is complete.
+          TOTAL_CHANGED=$(gh api "repos/${REPO}/pulls/${PR}" -q '.changed_files')
+          BODY=$(gh api "repos/${REPO}/pulls/${PR}" -q '.body // ""')
+
+          if [ "$TOTAL_CHANGED" -le 3000 ]; then
+            # Changed files from the API (base-controlled, computed by GitHub from the
+            # diff), never from a checked-out PR script. Both the new path and, for a
+            # rename, the previous path are emitted (previous_filename // empty): a file
+            # renamed OUT of crates/inference or crates/embed still moved that crate's
+            # code, so the old path must be matched too, or the rename silently escapes
+            # the gate. The rule covers the whole of crates/inference and crates/embed,
+            # not just their src/ dirs: a Cargo.toml opt-level or dependency bump, or a
+            # benches/ change, moves performance too. A doc-only change under those crates
+            # satisfies the gate with a one-line N/A.
+            CHANGED=$(gh api "repos/${REPO}/pulls/${PR}/files" --paginate -q '.[] | .filename, (.previous_filename // empty)')
+            echo "Changed files ($TOTAL_CHANGED):"
+            echo "$CHANGED"
+
+            if ! grep -E '^crates/(inference|embed)/' <<<"$CHANGED" >/dev/null; then
+              echo "→ no crates/{inference,embed} change: bench evidence not required."
+              exit 0
+            fi
+            echo "→ perf-sensitive crate changed: bench-compare disposition REQUIRED."
+          else
+            echo "→ PR changes $TOTAL_CHANGED files, above the API's 3000-file list cap;"
+            echo "  scope cannot be determined, so a disposition is REQUIRED (fail closed)."
+          fi
+
+          printf '%s' "$BODY" | bash scripts/bench_disposition_check.sh

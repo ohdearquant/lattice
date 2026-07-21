@@ -1344,8 +1344,8 @@ mod tests {
     /// always splits on word boundaries, so "a" and " b" land in different
     /// pieces and the cross-space merge can never fire, giving `[0, 1]`
     /// (the "a" and "Ġb" ids from separate pieces) instead. This is a
-    /// direct id-level proxy for the silent-wrong-ids failure mode a
-    /// review flagged for explicit `use_regex:false` metadata that fell
+    /// direct id-level proxy for the silent-wrong-ids failure mode when
+    /// explicit `use_regex:false` metadata falls
     /// through to the `Gpt4Regex` default unchecked.
     fn cross_space_merge_json(pre_tokenizer: &str) -> String {
         format!(

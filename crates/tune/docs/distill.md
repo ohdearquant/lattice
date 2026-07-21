@@ -10,10 +10,10 @@ the embedding-based `TrainingExample` values used by the rest of
 3. join successful labels with embeddings supplied by the caller.
 
 The module intentionally does not create embeddings. It also does **not**
-currently issue HTTP requests: `DistillationPipeline::label_single` formats a
-prompt but then returns a simulated label distribution. The configuration and
-result types define the intended integration boundary; callers must not treat
-the current pipeline as a live teacher client.
+currently issue HTTP requests: `DistillationPipeline::label_single` returns
+`TuneError::TeacherApi` instead of fabricating labels. Deterministic fixed labels
+are available only through the non-default `simulated-teacher` feature and the
+explicit `label_single_simulated` and `label_batch_simulated` methods.
 
 For the provider-selection decision and its alternatives, see
 [ADR-001: Multi-Provider Teacher Strategy](ADR-001-teacher-providers.md). The
@@ -26,9 +26,10 @@ the repository-wide ADR series.
 Raw text
   │
   ▼
-RawExample ──sanitize + format──► teacher prompt
-  │                                  │
-  │                                  └── current implementation: simulated result
+RawExample ──label_single────────► TeacherApi error (no live transport)
+  │
+  └──label_single_simulated─────► bounded prompt ──► fixed test labels
+         (`simulated-teacher` feature only)
   ▼
 LabelingResult ──successful only──► caller-provided embeddings
                                          │
@@ -225,7 +226,7 @@ threshold, no intermediate persistence, and a progress interval of 100.
 | ------------------- | ------: | -------------------------------------------------------------------------------------- |
 | `batch_size`        |      10 | Validated nonzero; not used to schedule the synchronous loop.                          |
 | `concurrency`       |       5 | Validated nonzero; not used to run parallel requests yet.                              |
-| `normalize_labels`  |    true | Applies `IntentLabels::softmax_normalize` to the simulated scores.                     |
+| `normalize_labels`  |    true | Applies `IntentLabels::softmax_normalize` to explicit simulated scores.                |
 | `min_confidence`    |    none | Rejects a result whose confidence is below the threshold.                              |
 | `save_intermediate` |   false | Stored only.                                                                           |
 | `output_dir`        |    none | `output_dir(...)` sets this and enables `save_intermediate`; no files are written yet. |
@@ -243,30 +244,25 @@ concurrency; when present, the confidence threshold must lie in `0.0..=1.0`.
 
 `DistillationPipeline::new` validates both the teacher and pipeline
 configuration, then starts with empty `DistillationStats`. `with_teacher` uses
-the default pipeline configuration. `label_single`:
+the default pipeline configuration. Because no live transport is configured,
+`label_single` returns `TuneError::TeacherApi` without creating labels or
+updating statistics.
 
-1. starts a latency timer and formats the raw prompt;
-2. currently creates fixed scores
-   `[0.4, 0.1, 0.3, 0.1, 0.05, 0.05]` instead of invoking a provider;
-3. applies softmax if requested;
-4. assigns a simulated confidence of `0.85`;
-5. rejects scores below `min_confidence`, when configured; otherwise records
-   a successful `LabelingResult` and updates statistics.
-
-Therefore, a threshold above `0.85` causes the current placeholder to return
-`TuneError::Validation`. On that direct error path the pipeline increments
-`stats.skipped` but does not increment `total_processed`; `label_batch` turns
-the error into a failed result and supplies that second accounting update.
+With the non-default `simulated-teacher` feature,
+`label_single_simulated` does not format a prompt or otherwise inspect the
+example's content — it creates fixed scores `[0.4, 0.1, 0.3, 0.1, 0.05,
+0.05]` independent of `raw`, optionally applies softmax, and assigns
+confidence `0.85`. A configured threshold above `0.85` returns
+`TuneError::Validation` and increments `stats.skipped`.
 
 ### A batch
 
-`label_batch` processes inputs synchronously in input order. It returns one
-`LabelingResult` per raw input, including failures. An error from
-`label_single` becomes `LabelingResult::failure(raw.id, error, 0)` and is
-included in the statistics. Failed results carry default all-zero labels,
-zero confidence, no raw response, and the error string. The optional raw
-response is currently populated only if code constructs a result with
-`with_raw_response`.
+`label_batch` processes inputs synchronously in input order. With no live
+transport configured, every item becomes `LabelingResult::failure(raw.id,
+error, 0)` and is included in the statistics. Failed results carry default
+all-zero labels, zero confidence, no raw response, and the error string.
+`label_batch_simulated`, when compiled, has the same accounting behavior but
+routes each input through `label_single_simulated`.
 
 ### Statistics
 
@@ -369,13 +365,11 @@ checksum to `verify_model_checksum`.
 
 ## DistillationPipeline::label_single
 
-`label_single` is deliberately a provider-shaped placeholder. It starts timing
-and materializes the bounded prompt, but it does not send the prompt, read the
-configured API-key environment variable, retry, or parse a response. Instead,
-it emits its fixed score vector, optionally softmax-normalizes it, assigns
-confidence `0.85`, and applies the configured confidence threshold.
+`label_single` is the live-provider boundary. Until provider transport is
+implemented, it fails closed with `TuneError::TeacherApi`; it does not send the
+prompt, read the configured API-key environment variable, retry, parse a
+response, or fall back to fixed labels.
 
-This preserves the eventual client boundary: a real implementation should
-replace only the simulated result with provider I/O and response validation,
-while retaining the prompt limits, label order, threshold behavior, and result
-accounting described above.
+The `simulated-teacher` feature is intended only for deterministic tests and
+examples. It exposes separately named methods so fixed output cannot be
+mistaken for a live teacher response.

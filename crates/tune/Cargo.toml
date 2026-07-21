@@ -28,6 +28,8 @@ sqlite = ["dep:rusqlite", "serde"]
 # Online adapter-selector refit from preference feedback (experimental, bench-gated).
 # Pulls in the lattice-fann training primitives (RLOO / EWC++) for gate updates.
 mixture = ["lattice-fann/online-router"]
+# Fixed labels for tests and examples. Never enables the default labeling path.
+simulated-teacher = []
 
 [dependencies]
 lattice-fann = { version = "0.7.0", path = "../fann" }
@@ -65,7 +67,7 @@ required-features = ["train-backward"]
 
 [[bin]]
 name = "train_grad_layer23"
-path = "src/bin/train_grad_layer23.rs"
+path = "src/bin/train_grad_layer23/main.rs"
 required-features = ["train-backward"]
 
 [[bin]]
@@ -76,6 +78,11 @@ required-features = ["train-backward"]
 [[test]]
 name = "bench_backward_737"
 path = "tests/bench_backward_737.rs"
+required-features = ["train-backward"]
+
+[[test]]
+name = "layer23_golden_bridge"
+path = "tests/layer23_golden_bridge.rs"
 required-features = ["train-backward"]
 
 [dev-dependencies]

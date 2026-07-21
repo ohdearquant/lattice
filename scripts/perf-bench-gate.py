@@ -416,133 +416,203 @@ def run_selftest() -> int:
         if "ℹ️" not in report or "grp_f/noisy_fail" not in report:
             failures.append("informational-groups: noisy FAIL not shown in informational section")
 
-        # lattice#714: the shell-side allowlist handoff, exercised end-to-
-        # end. An earlier fixture kept its own hardcoded `shell_allowlist`
-        # set instead of reading it from the actual shell code — a
-        # regression that added a group only to bench-compare.sh's array
-        # (e.g. simd_normalize) stayed invisible. Two probes against the
-        # real helper (scripts/lib/bench-informational-groups.sh, the same
-        # file bench-compare.sh invokes for production runs): first dump
-        # the raw array (--print-allowlist) and require it to equal the
-        # reviewed expectation set — this is what catches an array-only
-        # addition — then run the intersection against a controlled
-        # Criterion `--list`-shaped listing, feed its emitted file into
-        # the Python classifier, and assert the full
-        # pipeline: only the approved names come out of the shell step,
-        # and an unapproved embed group, an inference group, and a
-        # similarly-prefixed-but-distinct embed group all still gate.
+        # lattice#714 / lattice#1060: the shell-side manifest handoff,
+        # exercised end-to-end against the real helper and the real
+        # manifest (scripts/lib/bench-quick-informational-targets.txt) —
+        # the same files bench-compare.sh uses in production. Three
+        # probes: (1) --print-targets must equal the reviewed expectation
+        # set below, so a manifest-only or expectation-only edit fails
+        # the selftest; (2) a demoted target key must emit every group of
+        # a controlled listing (target-level semantics — including groups
+        # the old per-group allowlist never contained); (3) a non-demoted
+        # target key against the same listing must emit nothing — the
+        # cross-target guarantee that keeps inference gating intact.
+        # Probe 2's output then drives the Python classifier to prove
+        # embed FAILs land informational while an inference FAIL gates.
         helper = Path(__file__).resolve().parent / "lib" / "bench-informational-groups.sh"
-        # The reviewed allowlist, duplicated here on purpose: the selftest
-        # compares this set against the shell array itself (via
-        # --print-allowlist below), so a name added to only ONE side —
-        # shell array or this expectation — fails the selftest. The
-        # listing-intersection test alone cannot catch an array-only
-        # addition (a fixed listing never contains the new name, so the
-        # intersection output is unchanged).
-        approved_allowlist = frozenset({
-            "simd_dot_product",
-            "simd_cosine_similarity",
-            "int8_batch_cosine",
-            "int4_cosine_distance",
-            "simd_batch_cosine_non_normalized_query",
-        })
+        # The reviewed demoted-target set, duplicated here on purpose:
+        # the selftest compares this against the manifest itself (via
+        # --print-targets), so a target added to only ONE side —
+        # manifest or this expectation — fails the selftest.
+        approved_targets = frozenset({"lattice-embed:simd"})
         if not helper.exists():
-            failures.append(f"allowlist-handoff: shell helper missing at {helper}")
+            failures.append(f"manifest-handoff: shell helper missing at {helper}")
         else:
             raw_proc = subprocess.run(
-                ["bash", str(helper), "--print-allowlist"],
+                ["bash", str(helper), "--print-targets"],
                 capture_output=True, text=True, timeout=30,
             )
-            raw_array = frozenset(
+            raw_targets = frozenset(
                 ln.strip() for ln in raw_proc.stdout.splitlines() if ln.strip()
             )
             if raw_proc.returncode != 0:
                 failures.append(
-                    f"allowlist-handoff: --print-allowlist exited "
+                    f"manifest-handoff: --print-targets exited "
                     f"{raw_proc.returncode}: {raw_proc.stderr}"
                 )
-            elif raw_array != approved_allowlist:
+            elif raw_targets != approved_targets:
                 failures.append(
-                    "allowlist-handoff: shell array and selftest expectation "
-                    f"disagree — array-only: {sorted(raw_array - approved_allowlist)}, "
-                    f"expectation-only: {sorted(approved_allowlist - raw_array)}. "
-                    "Every allowlist change must update both sides in one PR."
+                    "manifest-handoff: manifest and selftest expectation "
+                    f"disagree — manifest-only: {sorted(raw_targets - approved_targets)}, "
+                    f"expectation-only: {sorted(approved_targets - raw_targets)}. "
+                    "Every demotion change must update both sides in one PR."
                 )
-            listing_dir = root / "allowlist-listing"
+            listing_dir = root / "manifest-listing"
             listing_dir.mkdir(parents=True, exist_ok=True)
             listing_file = listing_dir / "list.txt"
             listing_file.write_text(
                 "simd_dot_product/scalar/384: benchmark\n"
                 "simd_dot_product/simd/384: benchmark\n"
                 "simd_cosine_similarity/scalar/384: benchmark\n"
-                "simd_cosine_similarity/simd/384: benchmark\n"
                 "simd_normalize/scalar/384: benchmark\n"
                 "simd_dot_product_extra/scalar/384: benchmark\n"
-                "rms_norm/4096: benchmark\n"
-                "int8_batch_cosine/float32_simd/100: benchmark\n"
-                "int4_cosine_distance/int4/768: benchmark\n"
-                "simd_batch_cosine_non_normalized_query/pair_loop/1024d_64c: benchmark\n"
+                "int8_raw_dot_product/dot_product_i8_raw/128: benchmark\n"
             )
-            proc = subprocess.run(
-                ["bash", str(helper), str(listing_file)],
+            expected_groups = frozenset({
+                "simd_dot_product", "simd_cosine_similarity", "simd_normalize",
+                "simd_dot_product_extra", "int8_raw_dot_product",
+            })
+            demoted_proc = subprocess.run(
+                ["bash", str(helper), "lattice-embed:simd", str(listing_file)],
                 capture_output=True, text=True, timeout=30,
             )
             shell_emitted = frozenset(
-                ln.strip() for ln in proc.stdout.splitlines() if ln.strip()
+                ln.strip() for ln in demoted_proc.stdout.splitlines() if ln.strip()
             )
-            if proc.returncode != 0:
+            gated_proc = subprocess.run(
+                ["bash", str(helper), "lattice-inference:elementwise_cpu_bench",
+                 str(listing_file)],
+                capture_output=True, text=True, timeout=30,
+            )
+            gated_emitted = [ln for ln in gated_proc.stdout.splitlines() if ln.strip()]
+            if demoted_proc.returncode != 0:
                 failures.append(
-                    f"allowlist-handoff: shell helper exited {proc.returncode}: {proc.stderr}"
+                    f"manifest-handoff: demoted-target probe exited "
+                    f"{demoted_proc.returncode}: {demoted_proc.stderr}"
                 )
-            elif shell_emitted != approved_allowlist:
+            elif shell_emitted != expected_groups:
                 failures.append(
-                    "allowlist-handoff: shell helper emitted "
-                    f"{sorted(shell_emitted)}, expected the approved "
-                    "allowlist groups"
+                    "manifest-handoff: demoted target emitted "
+                    f"{sorted(shell_emitted)}, expected every listing group "
+                    f"{sorted(expected_groups)}"
+                )
+            elif gated_proc.returncode != 0:
+                failures.append(
+                    f"manifest-handoff: non-demoted-target probe exited "
+                    f"{gated_proc.returncode}: {gated_proc.stderr}"
+                )
+            elif gated_emitted:
+                failures.append(
+                    "manifest-handoff: non-demoted target emitted "
+                    f"{gated_emitted} — cross-target exemption leak"
                 )
             else:
-                allowlist_dir = root / "allowlist"
-                approved_a = allowlist_dir / "simd_dot_product" / "384"
-                _fabricate_bench(approved_a, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-                approved_b = allowlist_dir / "simd_cosine_similarity" / "384"
-                _fabricate_bench(approved_b, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-                unapproved_embed = allowlist_dir / "simd_normalize" / "384"
-                _fabricate_bench(unapproved_embed, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-                unapproved_extra = allowlist_dir / "simd_dot_product_extra" / "384"
-                _fabricate_bench(unapproved_extra, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-                unapproved_inference = allowlist_dir / "rms_norm" / "4096"
-                _fabricate_bench(unapproved_inference, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+                manifest_dir = root / "manifest"
+                emb_a = manifest_dir / "simd_dot_product" / "384"
+                _fabricate_bench(emb_a, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+                emb_b = manifest_dir / "simd_normalize" / "384"
+                _fabricate_bench(emb_b, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+                inf_c = manifest_dir / "rms_norm" / "4096"
+                _fabricate_bench(inf_c, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
 
-                allowlist_results: dict[str, BenchResult] = {}
-                for cf in find_change_files(allowlist_dir):
-                    r = parse_bench(cf, allowlist_dir, baseline_name="compare-base")
+                manifest_results: dict[str, BenchResult] = {}
+                for cf in find_change_files(manifest_dir):
+                    r = parse_bench(cf, manifest_dir, baseline_name="compare-base")
                     if r is not None:
-                        allowlist_results[r.name] = r
+                        manifest_results[r.name] = r
 
-                needed = {
-                    "simd_dot_product/384", "simd_cosine_similarity/384",
-                    "simd_normalize/384", "simd_dot_product_extra/384", "rms_norm/4096",
-                }
-                if not needed.issubset(allowlist_results):
-                    failures.append("allowlist-handoff fixture: not all benches parsed")
+                needed = {"simd_dot_product/384", "simd_normalize/384", "rms_norm/4096"}
+                if not needed.issubset(manifest_results):
+                    failures.append("manifest-handoff fixture: not all benches parsed")
                 else:
-                    allowlist_gated_fails = {
-                        r.name for r in allowlist_results.values()
+                    manifest_gated_fails = {
+                        r.name for r in manifest_results.values()
                         if r.verdict() == "FAIL" and not r.is_informational(shell_emitted)
                     }
-                    if "simd_dot_product/384" in allowlist_gated_fails:
-                        failures.append("allowlist-handoff: approved simd_dot_product leaked into gated fails")
-                    if "simd_cosine_similarity/384" in allowlist_gated_fails:
-                        failures.append("allowlist-handoff: approved simd_cosine_similarity leaked into gated fails")
-                    if "simd_normalize/384" not in allowlist_gated_fails:
-                        failures.append("allowlist-handoff: unapproved embed group simd_normalize did not gate")
-                    if "simd_dot_product_extra/384" not in allowlist_gated_fails:
+                    if "simd_dot_product/384" in manifest_gated_fails:
                         failures.append(
-                            "allowlist-handoff: unapproved simd_dot_product_extra "
-                            "did not gate (prefix/substring exemption leak)"
+                            "manifest-handoff: demoted simd_dot_product "
+                            "leaked into gated fails"
                         )
-                    if "rms_norm/4096" not in allowlist_gated_fails:
-                        failures.append("allowlist-handoff: inference group rms_norm did not gate")
+                    if "simd_normalize/384" in manifest_gated_fails:
+                        failures.append(
+                            "manifest-handoff: simd_normalize gated despite "
+                            "target-level demotion (listing-derivation broken)"
+                        )
+                    if "rms_norm/4096" not in manifest_gated_fails:
+                        failures.append(
+                            "manifest-handoff: inference group rms_norm did not gate"
+                        )
+
+        # Composed-path collision guard. The two probes above show the
+        # helper is target-aware in isolation, but bench-compare.sh used to
+        # concatenate every target's helper output into one flat file with
+        # no target attribution — a group name demoted for one target
+        # silently exempted an identically-named group produced by a
+        # different, gated target. This drives the resolver
+        # (scripts/lib/resolve-informational-groups.sh) with a fabricated
+        # listing where the demoted target's groups include `rms_norm`,
+        # which also appears in the gated target's listing, and asserts
+        # the collision gates instead of staying informational.
+        resolver = Path(__file__).resolve().parent / "lib" / "resolve-informational-groups.sh"
+        if not resolver.exists():
+            failures.append(f"collision-guard: resolver missing at {resolver}")
+        else:
+            collision_dir = root / "collision-listing"
+            collision_dir.mkdir(parents=True, exist_ok=True)
+            embed_listing = collision_dir / "embed-list.txt"
+            embed_listing.write_text(
+                "simd_dot_product/scalar/384: benchmark\n"
+                "simd_normalize/scalar/384: benchmark\n"
+                "rms_norm/scalar/384: benchmark\n"  # fabricated bare-name collision
+            )
+            inference_listing = collision_dir / "inference-list.txt"
+            inference_listing.write_text(
+                "rms_norm/4096: benchmark\n"
+                "gelu/4096: benchmark\n"
+            )
+
+            def list_groups(listing_path: Path) -> str:
+                proc = subprocess.run(
+                    ["bash", str(helper), "--list-groups", str(listing_path)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                return proc.stdout
+
+            demoted_groups_file = collision_dir / "demoted.txt"
+            demoted_groups_file.write_text(list_groups(embed_listing))
+            gated_groups_file = collision_dir / "gated.txt"
+            gated_groups_file.write_text(list_groups(inference_listing))
+
+            resolve_proc = subprocess.run(
+                ["bash", str(resolver),
+                 str(demoted_groups_file), "lattice-embed:simd",
+                 str(gated_groups_file), "lattice-inference:elementwise_cpu_bench"],
+                capture_output=True, text=True, timeout=30,
+            )
+            resolved = frozenset(
+                ln.strip() for ln in resolve_proc.stdout.splitlines() if ln.strip()
+            )
+            if resolve_proc.returncode != 0:
+                failures.append(
+                    f"collision-guard: resolver exited {resolve_proc.returncode}: "
+                    f"{resolve_proc.stderr}"
+                )
+            if "rms_norm" in resolved:
+                failures.append(
+                    "collision-guard: rms_norm (demoted+gated collision) leaked "
+                    "into the informational set instead of gating"
+                )
+            if "rms_norm" not in resolve_proc.stderr or "lattice-embed:simd" not in resolve_proc.stderr:
+                failures.append(
+                    "collision-guard: no stderr warning naming the colliding "
+                    "group and both targets"
+                )
+            if not {"simd_dot_product", "simd_normalize"}.issubset(resolved):
+                failures.append(
+                    "collision-guard: non-colliding demoted groups lost "
+                    "informational status — resolver over-suppressed"
+                )
 
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)
@@ -550,7 +620,8 @@ def run_selftest() -> int:
         print(f"SELFTEST: FAIL ({len(failures)} failure(s))")
         return 1
     print("SELFTEST: PASS — base/, compare-base/, orphan-warn, named-wins-over-stale-base, "
-          "and multi-sibling-refusal all correct")
+          "multi-sibling-refusal, manifest-handoff (demoted target informational, "
+          "non-demoted target gated), and composed-path collision-guard all correct")
     return 0
 
 

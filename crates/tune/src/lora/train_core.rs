@@ -608,6 +608,26 @@ fn position_nll(logits: &[f32], target: u32) -> f32 {
     (-log_prob) as f32
 }
 
+/// Positions the per-token FFN block must actually run for. Every layer's
+/// mixer output at every position feeds the *next* layer (causal attention
+/// keys/values, GDN recurrent state), so the FFN block — a pointwise
+/// transform that feeds nothing but its own layer's output — must still run
+/// at every position on every non-terminal layer. On the terminal layer,
+/// though, only `completion_range` positions are ever read back out (the
+/// head loop only computes logits there), so prompt positions' FFN output
+/// would be computed and immediately discarded: skip them.
+fn ffn_compute_range(
+    is_last_layer: bool,
+    seq: usize,
+    completion_range: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    if is_last_layer {
+        completion_range
+    } else {
+        0..seq
+    }
+}
+
 pub fn forward_full(
     ctx: &SeqCtx,
     layers: &[LayerW<'_>],
@@ -625,17 +645,38 @@ pub fn forward_full(
     let seq = ctx.seq_len;
     let mut h = ctx.h_in.clone();
     let mut layers_fwd: Vec<LayerFwd> = Vec::with_capacity(layers.len());
+    let num_layers = layers.len();
+    // Only the completion positions' post-stack hidden state is ever read
+    // (the head loop below indexes `h[t]` for `t` in this same range), so on
+    // the terminal layer the pointwise FFN block need not run over prompt
+    // positions — their output is computed and immediately discarded.
+    let completion_range = (ctx.completion_start - 1)..(ctx.seq_len - 1);
 
-    for lw in layers {
+    for (li, lw) in layers.iter().enumerate() {
+        let is_last_layer = li + 1 == num_layers;
         let h_layer_in = h.clone();
         let (normed_pre, inv_pre) = rmsnorm_seq(&h, &lw.pre_shift, hidden, seq, d.eps);
 
         let (mixer_out, mixer_cache) = match lw.kind {
             MixerKind::Gqa => {
-                let slot = lw.lora_slot.ok_or_else(|| {
-                    TuneError::Validation("GQA layer is missing a LoRA slot".to_string())
-                })?;
-                let lora = &loras[slot];
+                let (lora_a_q, lora_b_q, lora_a_v, lora_b_v, eff_rank, eff_scale) =
+                    match lw.lora_slot {
+                        Some(slot) => {
+                            let lora = &loras[slot];
+                            (
+                                Some(lora.a_q.as_slice()),
+                                Some(lora.b_q.as_slice()),
+                                Some(lora.a_v.as_slice()),
+                                Some(lora.b_v.as_slice()),
+                                rank,
+                                scale,
+                            )
+                        }
+                        // A layer above the trainable window: still runs
+                        // frozen so the forward pass covers the model's
+                        // full deployed suffix.
+                        None => (None, None, None, None, 0, 0.0),
+                    };
                 let (out, cache) = gqa_forward_with_cache(
                     &normed_pre,
                     lw.w_q,
@@ -644,12 +685,12 @@ pub fn forward_full(
                     lw.w_o,
                     lw.q_norm,
                     lw.k_norm,
-                    Some(&lora.a_q),
-                    Some(&lora.b_q),
-                    Some(&lora.a_v),
-                    Some(&lora.b_v),
-                    rank,
-                    scale,
+                    lora_a_q,
+                    lora_b_q,
+                    lora_a_v,
+                    lora_b_v,
+                    eff_rank,
+                    eff_scale,
                     seq,
                     hidden,
                     d.num_q_heads,
@@ -735,10 +776,10 @@ pub fn forward_full(
         }
 
         let (normed_ffn, inv_ffn) = rmsnorm_seq(&h_mid, &lw.post_shift, hidden, seq, d.eps);
-        let mut gate_pre = Vec::with_capacity(seq);
-        let mut up_pre = Vec::with_capacity(seq);
+        let mut gate_pre: Vec<Vec<f32>> = vec![Vec::new(); seq];
+        let mut up_pre: Vec<Vec<f32>> = vec![Vec::new(); seq];
         let mut h_next = h_mid.clone();
-        for t in 0..seq {
+        for t in ffn_compute_range(is_last_layer, seq, completion_range.clone()) {
             let (ffn_out, gp, up) = swiglu_forward(
                 &normed_ffn[t * hidden..(t + 1) * hidden],
                 lw.w_gate,
@@ -753,8 +794,8 @@ pub fn forward_full(
             {
                 *o += *f;
             }
-            gate_pre.push(gp);
-            up_pre.push(up);
+            gate_pre[t] = gp;
+            up_pre[t] = up;
         }
 
         layers_fwd.push(LayerFwd {
@@ -835,6 +876,16 @@ pub fn nll_and_grads(
         .map(|_| GdnLoraParams::zeros(rank, hidden, gdn_dims))
         .collect::<Result<Vec<_>>>()?;
 
+    let num_layers = layers.len();
+    // Mirrors `forward_full`'s terminal-layer FFN skip: the completion
+    // positions are exactly where the loss injects nonzero gradient into
+    // `d_h`, so on the last layer the FFN backward at prompt positions
+    // would multiply a structurally zero incoming gradient through.
+    let completion_range = match (fwd.positions.first(), fwd.positions.last()) {
+        (Some(first), Some(last)) => first.t..(last.t + 1),
+        _ => 0..0,
+    };
+
     let mut d_h = vec![0.0f32; seq * hidden];
     let mut nll_sum = 0.0f64;
     for p in &fwd.positions {
@@ -862,9 +913,10 @@ pub fn nll_and_grads(
     for li in (0..layers.len()).rev() {
         let lw = &layers[li];
         let lf = &fwd.layers[li];
+        let is_last_layer = li + 1 == num_layers;
 
         let mut d_h_mid = d_h.clone();
-        for t in 0..seq {
+        for t in ffn_compute_range(is_last_layer, seq, completion_range.clone()) {
             let d_ffn_out = &d_h[t * hidden..(t + 1) * hidden];
             let (d_normed_ffn, _dm) = swiglu_backward(
                 d_ffn_out,
@@ -889,32 +941,33 @@ pub fn nll_and_grads(
 
         let d_normed_pre: Vec<f32> = match &lf.mixer {
             MixerCache::Gqa(cache) => {
-                let slot = lw.lora_slot.ok_or_else(|| {
-                    TuneError::Validation("GQA layer missing LoRA slot in backward".to_string())
-                })?;
-                let lora = &loras[slot];
+                let (lora_a_q, lora_b_q, lora_a_v, lora_b_v, eff_rank, eff_scale) =
+                    match lw.lora_slot {
+                        Some(slot) => {
+                            let lora = &loras[slot];
+                            (
+                                Some(lora.a_q.as_slice()),
+                                Some(lora.b_q.as_slice()),
+                                Some(lora.a_v.as_slice()),
+                                Some(lora.b_v.as_slice()),
+                                rank,
+                                scale,
+                            )
+                        }
+                        None => (None, None, None, None, 0, 0.0),
+                    };
                 let g = gqa_backward(
-                    &d_h_mid,
-                    cache,
-                    lw.w_q,
-                    lw.w_k,
-                    lw.w_v,
-                    lw.w_o,
-                    lw.q_norm,
-                    lw.k_norm,
-                    Some(&lora.a_q),
-                    Some(&lora.b_q),
-                    Some(&lora.a_v),
-                    Some(&lora.b_v),
-                    rank,
-                    scale,
+                    &d_h_mid, cache, lw.w_q, lw.w_k, lw.w_v, lw.w_o, lw.q_norm, lw.k_norm,
+                    lora_a_q, lora_b_q, lora_a_v, lora_b_v, eff_rank, eff_scale,
                 );
-                grads[slot] = Grads {
-                    a_q: g.grad_a_q,
-                    b_q: g.grad_b_q,
-                    a_v: g.grad_a_v,
-                    b_v: g.grad_b_v,
-                };
+                if let Some(slot) = lw.lora_slot {
+                    grads[slot] = Grads {
+                        a_q: g.grad_a_q,
+                        b_q: g.grad_b_q,
+                        a_v: g.grad_a_v,
+                        b_v: g.grad_b_v,
+                    };
+                }
                 g.dx
             }
             MixerCache::Gdn(saved) => {
@@ -1267,7 +1320,7 @@ mod train_ctx_tests {
         assert!((train.scale() - 2.0).abs() < 1e-6); // alpha / rank = 16 / 8
     }
 
-    /// Mutation-sensitive: an out-of-range GQA slot layer (>= num_hidden_layers)
+    /// An out-of-range GQA slot layer (>= num_hidden_layers)
     /// must be rejected — without this guard the tape indexes
     /// `model.weights.layers[idx]` (or an equivalent slot array) out of bounds.
     #[test]
@@ -1288,7 +1341,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: a duplicate layer index within one slot list must
+    /// A duplicate layer index within one slot list must
     /// be rejected — two slots claiming the same layer would silently alias
     /// the same LoRA weights to two different gradient accumulators.
     #[test]
@@ -1309,7 +1362,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: a layer index claimed by both the GQA and GDN
+    /// A layer index claimed by both the GQA and GDN
     /// slot lists is a mixer-kind conflict — the same layer cannot be
     /// trained as both mixer kinds in one materialised tape. (Layer 19 is
     /// full-attention on the 0.8B preset, so this also exercises the
@@ -1383,7 +1436,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: this exact swap was unrejected pre-fix —
+    /// This exact swap was unrejected pre-fix —
     /// `gqa_layers = [20]` (actually GDN), `gdn_layers = [19]` (actually
     /// GQA) — both wrong, together. Must be rejected; before this fix
     /// `TrainCtx::try_new(...).is_ok()` on this input.
@@ -1423,7 +1476,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: non-finite alpha must be rejected before it can
+    /// Non-finite alpha must be rejected before it can
     /// propagate into `scale = alpha / rank` and poison every LoRA-scaled
     /// forward/backward computation with NaN/inf.
     #[test]
@@ -1446,7 +1499,7 @@ mod train_ctx_tests {
         }
     }
 
-    /// Mutation-sensitive: non-finite Adam hyperparameters (learning rate,
+    /// Non-finite Adam hyperparameters (learning rate,
     /// beta1, beta2, epsilon) must each be rejected — any one of them
     /// propagates NaN/inf into every optimizer step.
     #[test]
@@ -1472,7 +1525,7 @@ mod train_ctx_tests {
         }
     }
 
-    /// Mutation-sensitive: `Dims` built from a different model than
+    /// `Dims` built from a different model than
     /// `TapeGeometry.model` must be rejected — this is the geometry-
     /// consistency check the ten-argument signatures had no way to enforce.
     #[test]
@@ -1495,7 +1548,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: `GdnDims` built from a different model than
+    /// `GdnDims` built from a different model than
     /// `TapeGeometry.model` must be rejected, mirroring the `Dims` check.
     #[test]
     fn try_new_rejects_gdn_dims_model_mismatch() {
@@ -1517,7 +1570,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: NaN bypasses `(a - b).abs() > 1e-9` (NaN
+    /// NaN bypasses `(a - b).abs() > 1e-9` (NaN
     /// comparisons are always false), so a non-finite `Dims.eps` would
     /// silently pass the tolerance check and poison every RMSNorm call in
     /// the tape. The finite check ahead of the tolerance comparison must
@@ -1542,7 +1595,7 @@ mod train_ctx_tests {
         );
     }
 
-    /// Mutation-sensitive: same NaN-bypasses-tolerance hole as `Dims.eps`,
+    /// Same NaN-bypasses-tolerance hole as `Dims.eps`,
     /// for `GdnDims.scale` — a non-finite scale would poison every
     /// GatedDeltaNet forward/backward call in the tape.
     #[test]
@@ -1563,5 +1616,40 @@ mod train_ctx_tests {
             err.contains("scale"),
             "expected non-finite GdnDims.scale rejection; got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ffn_compute_range_tests {
+    use super::*;
+
+    /// Non-terminal layers must still run the FFN block at every position:
+    /// their output feeds the next layer's mixer (causal K/V, GDN state) at
+    /// every position, not just the completion positions.
+    #[test]
+    fn non_terminal_layer_uses_full_sequence() {
+        let range = ffn_compute_range(false, 10, 6..9);
+        assert_eq!(range, 0..10);
+    }
+
+    /// If the terminal-layer branch is dropped (or
+    /// inverted), the FFN block runs over the full prompt on the last layer
+    /// every step — a confirmed O(prompt_length) regression, since only the
+    /// completion positions' post-stack hidden state is ever read by the
+    /// head loop.
+    #[test]
+    fn terminal_layer_uses_completion_positions_only() {
+        let range = ffn_compute_range(true, 10, 6..9);
+        assert_eq!(range, 6..9);
+        assert_ne!(range, 0..10, "must not degrade to the full-sequence range");
+    }
+
+    #[test]
+    fn terminal_layer_with_single_completion_position() {
+        // A one-token completion (e.g. a 2-token pair) still only computes
+        // FFN for that single position, not the whole prompt.
+        let range = ffn_compute_range(true, 64, 62..63);
+        assert_eq!(range, 62..63);
+        assert_eq!(range.len(), 1);
     }
 }

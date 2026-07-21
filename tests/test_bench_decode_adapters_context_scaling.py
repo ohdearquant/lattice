@@ -74,7 +74,7 @@ class _SequencedNativeAdapter:
         )
 
 
-class ProfileParameterEquivalenceTest(unittest.TestCase):
+class ProfileParameterTranscriptionTest(unittest.TestCase):
     """bench_context_scaling.sh: N1=8 baseline, default CONTEXTS=(64 128
     256), RUNS=5, only mlx warms (4 tokens, once, before the whole loop)."""
 
@@ -104,7 +104,7 @@ class ProfileParameterEquivalenceTest(unittest.TestCase):
             self.assertEqual(group.quantization, "q8", group.name)
 
 
-class CallScheduleEquivalenceTest(unittest.TestCase):
+class CallScheduleContractTest(unittest.TestCase):
     """Proves the default (no measured_calls override) window-major replay
     of profile.windows reproduces "measure N1=8 once, then measure each
     context length in turn, reusing the N1 baseline for every slope" --
