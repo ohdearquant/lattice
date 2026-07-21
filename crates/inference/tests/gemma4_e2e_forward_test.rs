@@ -43,7 +43,7 @@ struct Top8 {
     values: Vec<f32>,
 }
 
-/// Sliding-window boundary coverage (review finding 3): each case is a
+/// Sliding-window boundary coverage: each case is a
 /// synthetic prompt of exactly `length` tokens, built by cycling the main
 /// golden's own (tokenizer-verified) prompt ids -- see
 /// `scripts/gemma4_stage5_e2e_golden.py`'s `BOUNDARY_LENGTHS` docs for why
@@ -341,7 +341,7 @@ fn boundary_golden_fixture_is_valid() {
     }
 }
 
-/// ADR-082 stage 5 review finding 3: real-checkpoint sliding-window
+/// ADR-082 stage 5: real-checkpoint sliding-window
 /// boundary coverage at prompt lengths 511/512/513, plus a decode step past
 /// the boundary (`greedy_tokens` in the fixture covers 2 new tokens).
 /// Same fail-closed contract as

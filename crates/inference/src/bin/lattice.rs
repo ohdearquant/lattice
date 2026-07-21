@@ -542,7 +542,11 @@ mod doctor {
             }
             let mut merged = HashMap::new();
             for shard_name in shard_names {
-                let shard_path = dir.join(&shard_name);
+                // Index-declared shard names are untrusted checkpoint content;
+                // resolve once through the shared containment helper, then
+                // report missing files against the resolved path (#1069).
+                let shard_path = lattice_inference::weights::contained_shard_path(dir, &shard_name)
+                    .map_err(|e| e.to_string())?;
                 if !shard_path.exists() {
                     return Err(format!(
                         "shard '{shard_name}' referenced by {} not found in {}",
@@ -743,7 +747,20 @@ mod doctor {
             let mut present_names: BTreeSet<String> = BTreeSet::new();
             let mut has_mtp_tensors = false;
             for entry in &entries {
-                let file_path = dir.join(&entry.file);
+                // Manifest-declared file names are untrusted checkpoint
+                // content; the same lexical containment the loaders apply
+                // gates the doctor's readiness accounting, so an entry the
+                // loader would reject is never counted present (#1069).
+                let Ok(file_path) =
+                    lattice_inference::weights::contained_shard_path(dir, &entry.file)
+                else {
+                    missing_tensors.push(format!(
+                        "{} (listed in quantize_index.json as '{}', \
+                         path escapes the model directory)",
+                        entry.name, entry.file
+                    ));
+                    continue;
+                };
                 match std::fs::metadata(&file_path) {
                     Ok(meta) => {
                         total_bytes +=
@@ -2497,7 +2514,6 @@ mod serve {
     use axum::{
         Json, Router,
         extract::{DefaultBodyLimit, State},
-        http::StatusCode,
         response::{
             IntoResponse, Response,
             sse::{Event, KeepAlive, Sse},
@@ -2508,15 +2524,26 @@ mod serve {
     use lattice_inference::Tokenizer;
     // `ChatMessage` and `format_chat_template` are CPU-available (#668): this
     // binary's own CPU (safetensors) serve path renders every request's
-    // ChatML prompt through them (`prepare_chat_request`, via
-    // `to_chat_messages`), the same shared renderer the Metal worker loop
-    // uses -- there is no second bespoke ChatML renderer in this file
-    // anymore.
+    // ChatML prompt through them (`prepare_chat_request`, via the shared
+    // `serve::contract::normalize_messages`), the same shared renderer the
+    // Metal worker loop uses -- there is no second bespoke ChatML renderer
+    // in this file anymore. `to_chat_messages` below is a `#[cfg(test)]`-only
+    // helper local to this binary's own tests, not part of that production
+    // path.
     use lattice_inference::forward::metal_qwen35::{ChatMessage, format_chat_template};
     #[cfg(feature = "metal-gpu")]
     use lattice_inference::model::qwen35_config::GenerateConfig;
     use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
-    use serde::{Deserialize, Serialize};
+    use lattice_inference::serve::contract::{
+        ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
+        ValidatedChatRequest as ContractValidatedChatRequest, normalize_request,
+        validate_context_window,
+    };
+    #[cfg(test)]
+    use lattice_inference::serve::contract::{
+        ContentPart, Message, MessageContent, ResponseFormat,
+    };
+    use serde::Serialize;
     use serde_json::Value;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2959,79 +2986,6 @@ mod serve {
     // Request / response types
     // -----------------------------------------------------------------------
 
-    /// OpenAI-compatible chat completions request.
-    ///
-    /// Known-but-unsupported fields (`tools`, `tool_choice`, `n > 1`,
-    /// `response_format` other than `"text"`) are parsed and explicitly
-    /// rejected with HTTP 400 rather than silently dropped. `logprobs` /
-    /// `top_logprobs` are supported on the non-streaming path only; combined
-    /// with `stream=true` they are also rejected (#585). `stop` is accepted
-    /// and parsed into string-level stop sequences. Unknown fields are
-    /// ignored by default (serde default).
-    #[derive(Deserialize)]
-    pub struct ChatCompletionRequest {
-        /// Required: must match the served model identifier.
-        pub model: String,
-        pub messages: Vec<Message>,
-        /// Generation token budget.  Use at most one of `max_tokens` /
-        /// `max_completion_tokens`; if both are present they must agree.
-        pub max_tokens: Option<usize>,
-        /// Alias for `max_tokens` (current OpenAI naming).
-        pub max_completion_tokens: Option<usize>,
-        pub temperature: Option<f32>,
-        /// Nucleus sampling probability mass.  Mapped into `GenerateConfig`.
-        pub top_p: Option<f32>,
-        /// SSE streaming — combined with `logprobs: true` this is rejected (#585).
-        pub stream: Option<bool>,
-        /// Stop sequences — a JSON string or array of strings (up to 4, non-empty).
-        /// Parsed by `parse_stop_strings`; null/absent → empty vec (no stops).
-        pub stop: Option<Value>,
-        /// Deterministic sampling seed.  Mapped into `GenerateConfig`.
-        pub seed: Option<u64>,
-        /// Response format constraint — only `"text"` is accepted.
-        pub response_format: Option<ResponseFormat>,
-        /// Tool definitions — not supported; rejected with 400.
-        pub tools: Option<Value>,
-        /// Tool choice — not supported; rejected with 400.
-        pub tool_choice: Option<Value>,
-        /// Return per-token log-probabilities for the sampled tokens. Requires
-        /// the non-streaming path — combined with `stream: true` this is
-        /// rejected with 400 (#585).
-        pub logprobs: Option<bool>,
-        /// Number of most-likely alternative tokens to return at each position
-        /// (0–20). Requires `logprobs: true`; validated by `validate_logprobs`.
-        pub top_logprobs: Option<usize>,
-        /// Number of completions — only `1` is accepted.
-        pub n: Option<usize>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct ResponseFormat {
-        pub r#type: String,
-    }
-
-    /// Message content: either a plain string or an array of content parts.
-    /// Non-text parts (image, audio, file) are rejected with HTTP 400.
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    pub enum MessageContent {
-        Text(String),
-        Parts(Vec<ContentPart>),
-    }
-
-    #[derive(Deserialize)]
-    pub struct ContentPart {
-        #[serde(rename = "type")]
-        pub kind: String,
-        pub text: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    pub struct Message {
-        pub role: String,
-        pub content: MessageContent,
-    }
-
     #[derive(Serialize)]
     pub struct ChatCompletionResponse {
         pub id: String,
@@ -3156,6 +3110,7 @@ mod serve {
 
     /// Resolve the effective `max_tokens`, rejecting zero, values above the
     /// server cap, and conflicting `max_tokens` / `max_completion_tokens`.
+    #[cfg(test)]
     fn validate_max_tokens(
         req_max: Option<usize>,
         req_max_completion: Option<usize>,
@@ -3193,27 +3148,15 @@ mod serve {
     }
 
     /// Validate `temperature` is in `[0.0, 2.0]`.
+    #[cfg(test)]
     fn validate_temperature(value: Option<f32>) -> Result<f32, ApiError> {
-        let temperature = value.unwrap_or(0.7);
-        if !(0.0..=2.0).contains(&temperature) {
-            return Err(ApiError::BadRequest {
-                message: "temperature must be between 0 and 2".to_string(),
-                code: "invalid_temperature",
-            });
-        }
-        Ok(temperature)
+        lattice_inference::serve::contract::validate_temperature(value.unwrap_or(0.7))
     }
 
     /// Validate `top_p` is in `(0.0, 1.0]`.
+    #[cfg(test)]
     fn validate_top_p(value: Option<f32>) -> Result<f32, ApiError> {
-        let top_p = value.unwrap_or(0.9);
-        if top_p <= 0.0 || top_p > 1.0 {
-            return Err(ApiError::BadRequest {
-                message: "top_p must be greater than 0 and at most 1".to_string(),
-                code: "invalid_top_p",
-            });
-        }
-        Ok(top_p)
+        lattice_inference::serve::contract::validate_top_p(value.unwrap_or(0.9))
     }
 
     /// Validate the `logprobs` / `top_logprobs` pair (#585) and resolve the
@@ -3225,6 +3168,7 @@ mod serve {
     /// - `logprobs: true`, `top_logprobs: Some(n)` with `0 <= n <= 20` → `Ok(Some(n))`.
     /// - `top_logprobs` set without `logprobs: true` → rejected (matches OpenAI).
     /// - `top_logprobs > 20` → rejected.
+    #[cfg(test)]
     fn validate_logprobs(
         logprobs: Option<bool>,
         top_logprobs: Option<usize>,
@@ -3260,59 +3204,9 @@ mod serve {
     /// - an array with more than 4 elements
     /// - any array element that is not a string
     /// - any stop string that is empty
+    #[cfg(test)]
     fn parse_stop_strings(stop: &Option<Value>) -> Result<Vec<String>, ApiError> {
-        match stop {
-            None => Ok(vec![]),
-            Some(Value::Null) => Ok(vec![]),
-            Some(Value::String(s)) => {
-                if s.is_empty() {
-                    return Err(ApiError::BadRequest {
-                        message: "stop string must not be empty".to_string(),
-                        code: "invalid_stop",
-                    });
-                }
-                Ok(vec![s.clone()])
-            }
-            Some(Value::Array(arr)) => {
-                if arr.is_empty() {
-                    return Err(ApiError::BadRequest {
-                        message: "stop array must not be empty".to_string(),
-                        code: "invalid_stop",
-                    });
-                }
-                if arr.len() > 4 {
-                    return Err(ApiError::BadRequest {
-                        message: format!("stop array has {} elements; maximum is 4", arr.len()),
-                        code: "invalid_stop",
-                    });
-                }
-                let mut out = Vec::with_capacity(arr.len());
-                for item in arr {
-                    match item {
-                        Value::String(s) => {
-                            if s.is_empty() {
-                                return Err(ApiError::BadRequest {
-                                    message: "stop string must not be empty".to_string(),
-                                    code: "invalid_stop",
-                                });
-                            }
-                            out.push(s.clone());
-                        }
-                        _ => {
-                            return Err(ApiError::BadRequest {
-                                message: "each element of stop must be a string".to_string(),
-                                code: "invalid_stop",
-                            });
-                        }
-                    }
-                }
-                Ok(out)
-            }
-            Some(_) => Err(ApiError::BadRequest {
-                message: "stop must be a string or array of strings".to_string(),
-                code: "invalid_stop",
-            }),
-        }
+        lattice_inference::serve::contract::parse_stop_strings(stop)
     }
 
     /// Reject OpenAI fields that are parsed but not yet implemented.
@@ -3321,6 +3215,7 @@ mod serve {
     /// and is intentionally NOT rejected here. `logprobs`/`top_logprobs` are
     /// implemented on the non-streaming path only (#585); combined with
     /// `stream: true` they are rejected below rather than silently ignored.
+    #[cfg(test)]
     fn reject_unsupported(req: &ChatCompletionRequest) -> Result<(), ApiError> {
         if req.tools.is_some() || req.tool_choice.is_some() {
             return Err(ApiError::BadRequest {
@@ -3358,97 +3253,16 @@ mod serve {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Extract a plain text string from a message content value.
-    /// Returns `Err` for non-text content parts (image, audio, file).
-    fn message_text(content: &MessageContent) -> Result<String, ApiError> {
-        match content {
-            MessageContent::Text(text) => Ok(text.clone()),
-            MessageContent::Parts(parts) => {
-                let mut out = String::new();
-                for part in parts {
-                    if part.kind == "image_url" {
-                        // #649: no vision tower exists yet — fail closed with
-                        // the same message lattice_serve uses, rather than
-                        // this server's generic "not supported" text.
-                        return Err(ApiError::BadRequest {
-                            message: "image input requires a vision-capable model".to_string(),
-                            code: "unsupported_feature",
-                        });
-                    }
-                    if part.kind != "text" {
-                        return Err(ApiError::BadRequest {
-                            message: format!(
-                                "content part type '{}' is not supported; only 'text' parts are accepted",
-                                part.kind
-                            ),
-                            code: "unsupported_feature",
-                        });
-                    }
-                    out.push_str(part.text.as_deref().unwrap_or(""));
-                }
-                Ok(out)
-            }
-        }
-    }
-
-    /// One of the three roles this server accepts on `POST /v1/chat/completions`.
-    ///
-    /// `to_chat_messages` (the sole ChatML-rendering path in this file, both
-    /// backends included as of #668) validates every role through
-    /// `ValidatedRole::parse` before rendering, so an invalid role is
-    /// rejected identically regardless of which backend eventually generates
-    /// from the resulting prompt.
-    enum ValidatedRole {
-        System,
-        User,
-        Assistant,
-    }
-
-    impl ValidatedRole {
-        /// `tool` and `developer` are rejected as `"unsupported_feature"`
-        /// (a real OpenAI role this server doesn't implement yet); any other
-        /// value is rejected as `"invalid_role"` (not an OpenAI chat role at
-        /// all).
-        fn parse(role: &str) -> Result<Self, ApiError> {
-            match role {
-                "system" => Ok(ValidatedRole::System),
-                "user" => Ok(ValidatedRole::User),
-                "assistant" => Ok(ValidatedRole::Assistant),
-                "tool" | "developer" => Err(ApiError::BadRequest {
-                    message: format!("role '{role}' is not supported by this server"),
-                    code: "unsupported_feature",
-                }),
-                other => Err(ApiError::BadRequest {
-                    message: format!(
-                        "unsupported role '{other}'; must be 'system', 'user', or 'assistant'"
-                    ),
-                    code: "invalid_role",
-                }),
-            }
-        }
-    }
-
-    /// Convert validated request messages into the engine's `ChatMessage`
-    /// list, then rendered into a ChatML prompt via the shared
-    /// `format_chat_template` (#661, relocated to a CPU-available module by
-    /// #668). Both the CPU (safetensors) and Metal serve paths in this file
-    /// now render through this single function -- there is no second
-    /// bespoke ChatML renderer here anymore. Applies the same role and
-    /// content-part validation regardless of backend (`ValidatedRole::parse`
-    /// and `message_text`), so a message list rejected for one backend is
-    /// rejected identically for the other.
+    /// `#[cfg(test)]`-only alias for this binary's own role/content-part
+    /// test fixtures below. Production requests go through
+    /// `serve::contract::normalize_messages` directly (`prepare_chat_request`,
+    /// then rendered via the shared `format_chat_template`, #661/#668); this
+    /// exercises that same shared validator rather than a local copy of its
+    /// role/content-part logic, so those tests cannot drift from production
+    /// behavior.
+    #[cfg(test)]
     fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> {
-        messages
-            .iter()
-            .map(|msg| {
-                let content = message_text(&msg.content)?;
-                Ok(match ValidatedRole::parse(&msg.role)? {
-                    ValidatedRole::System => ChatMessage::system(content),
-                    ValidatedRole::User => ChatMessage::user(content),
-                    ValidatedRole::Assistant => ChatMessage::assistant(content),
-                })
-            })
-            .collect()
+        lattice_inference::serve::contract::normalize_messages(messages)
     }
 
     // -----------------------------------------------------------------------
@@ -3556,134 +3370,59 @@ mod serve {
         ))
     }
 
-    /// Everything `chat_completions` must check about a request *before* it
-    /// touches the loaded model: unsupported-feature rejection, model-id
-    /// match, message-shape, sampling-parameter bounds, and prompt
-    /// rendering. Pulled out of the handler so the capability-matrix
-    /// fixtures (`mod tests`, below) can exercise this exact validation
-    /// cascade — including the `model_not_found` / empty-messages /
-    /// last-role checks that previously had no test coverage at all —
-    /// without constructing a real `ModelBackend`. No behavior change
-    /// versus the inline sequence this replaces.
-    ///
-    /// The context-window check and `stop`-sequence parsing are not part of
-    /// this function — see `prepare_chat_request`, which composes this with
-    /// both in the exact order the original inline cascade used.
-    #[derive(Debug)]
-    struct ValidatedChatRequest {
-        max_tokens: usize,
-        temperature: f32,
-        top_p: f32,
-        logprobs: Option<usize>,
-        prompt: String,
-    }
-
+    /// Test adapter for the shared normalization cascade without a real
+    /// context-window check. Production uses `prepare_chat_request`, which
+    /// supplies the prompt-aware check to the same shared function.
+    #[cfg(test)]
     fn validate_chat_request(
         req: &ChatCompletionRequest,
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
-    ) -> Result<ValidatedChatRequest, ApiError> {
-        // Reject unsupported OpenAI features before any further processing.
-        reject_unsupported(req)?;
-
-        // Validate that the caller targets the served model.
-        if req.model != model_id {
-            return Err(ApiError::BadRequest {
-                message: format!(
-                    "model '{}' is not loaded; this server serves '{}'",
-                    req.model, model_id
-                ),
-                code: "model_not_found",
-            });
-        }
-
-        if req.messages.is_empty() {
-            return Err(ApiError::BadRequest {
-                message: "messages must not be empty".to_string(),
-                code: "invalid_messages",
-            });
-        }
-
-        // Require the conversation to end with a user turn (Qwen ChatML constraint).
-        let last_role = req.messages.last().map(|m| m.role.as_str()).unwrap_or("");
-        if last_role != "user" {
-            return Err(ApiError::BadRequest {
-                message: "the last message must have role 'user'".to_string(),
-                code: "invalid_messages",
-            });
-        }
-
-        // Validate and resolve sampling parameters.
-        let max_tokens = validate_max_tokens(
-            req.max_tokens,
-            req.max_completion_tokens,
-            default_max_tokens,
-            max_tokens_cap,
+    ) -> Result<ContractValidatedChatRequest, ApiError> {
+        let defaults = GenerationDefaults {
+            max_tokens: default_max_tokens,
+            temperature: 0.7,
+            top_k: 50,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            reasoning_budget: None,
+        };
+        let (validated, ()) = normalize_request(
+            req,
+            defaults,
+            ServeProfile::lattice(model_id, max_tokens_cap),
+            |_, _| Ok(()),
         )?;
-        let temperature = validate_temperature(req.temperature)?;
-        let top_p = validate_top_p(req.top_p)?;
-        let logprobs = validate_logprobs(req.logprobs, req.top_logprobs)?;
-
-        // Render the full conversation into a ChatML prompt through the
-        // shared `format_chat_template` (#668).  Returns 400 for any
-        // unsupported role or content-part type encountered.
-        let prompt = format_chat_template(&to_chat_messages(&req.messages)?);
-
-        Ok(ValidatedChatRequest {
-            max_tokens,
-            temperature,
-            top_p,
-            logprobs,
-            prompt,
-        })
-    }
-
-    /// Reject prompts that would overflow the model's context window,
-    /// before entering the blocking generation path. This converts what
-    /// would otherwise be a panic inside `spawn_blocking` into a clean 400
-    /// response. Pulled out of `prepare_chat_request` as a pure function
-    /// (given already-computed token counts, not `state.model` itself)
-    /// purely so its precedence relative to `parse_stop_strings` is
-    /// directly testable; behavior is unchanged from the original inline
-    /// check.
-    fn check_context_window(
-        prompt_token_count: usize,
-        max_tokens: usize,
-        max_context: usize,
-    ) -> Result<(), ApiError> {
-        if prompt_token_count == 0 || prompt_token_count.saturating_add(max_tokens) > max_context {
-            return Err(ApiError::BadRequest {
-                message: format!(
-                    "prompt ({prompt_token_count} tokens) plus max_tokens ({max_tokens}) \
-                     exceeds model context window ({max_context})"
-                ),
-                code: "context_length_exceeded",
-            });
-        }
-        Ok(())
+        Ok(validated)
     }
 
     /// Output of the full pre-generation validation cascade, ready for
     /// `gen_cfg` construction.
     #[derive(Debug)]
     struct PreparedChatRequest {
+        messages: Vec<ChatMessage>,
         max_tokens: usize,
         temperature: f32,
         top_p: f32,
         logprobs: Option<usize>,
         prompt: String,
         stop_strings: Vec<String>,
+        seed: Option<u64>,
+        stream: bool,
     }
 
-    /// Composes `validate_chat_request`, the context-window preflight, and
-    /// `stop`-sequence parsing in the exact order the original inline
-    /// `chat_completions` cascade used: `stop` is validated *last*, after
-    /// both the served-model hard requirements and the context-window
-    /// check that guards against a panic in the blocking generation path.
-    /// A request that is both over-context and carries a malformed `stop`
-    /// field must fail with `context_length_exceeded`, not a stop-parsing
-    /// error — pinned by `cm_serve_context_window_checked_before_stop_parsing`.
+    /// Production entry point for the shared `normalize_request` cascade:
+    /// supplies the prompt-aware context-window check (rendering the chat
+    /// template, tokenizing it, then calling the shared
+    /// `validate_context_window`) as the `check_context` closure, in the
+    /// exact order the original inline `chat_completions` cascade used:
+    /// `stop` is validated *last*, after both the served-model hard
+    /// requirements and the context-window check that guards against a
+    /// panic in the blocking generation path. A request that is both
+    /// over-context and carries a malformed `stop` field must fail with
+    /// `context_length_exceeded`, not a stop-parsing error — pinned by
+    /// `cm_serve_context_window_checked_before_stop_parsing`.
     ///
     /// `tokenize_len`/`max_context` are threaded through as thunks (rather
     /// than a `&ModelBackend`) so this whole cascade — including the
@@ -3700,27 +3439,47 @@ mod serve {
         tokenize_len: impl FnOnce(&str) -> usize,
         max_context: impl FnOnce() -> usize,
     ) -> Result<PreparedChatRequest, ApiError> {
-        let ValidatedChatRequest {
+        let defaults = GenerationDefaults {
+            max_tokens: default_max_tokens,
+            temperature: 0.7,
+            top_k: 50,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            reasoning_budget: None,
+        };
+        let (validated, prompt) = normalize_request(
+            req,
+            defaults,
+            ServeProfile::lattice(model_id, max_tokens_cap),
+            |messages, max_tokens| {
+                let prompt = format_chat_template(messages);
+                let prompt_token_count = tokenize_len(&prompt);
+                validate_context_window(prompt_token_count, max_tokens, max_context())?;
+                Ok(prompt)
+            },
+        )?;
+        let ContractValidatedChatRequest {
+            messages,
             max_tokens,
             temperature,
             top_p,
             logprobs,
-            prompt,
-        } = validate_chat_request(req, model_id, default_max_tokens, max_tokens_cap)?;
-
-        let prompt_token_count = tokenize_len(&prompt);
-        let max_context = max_context();
-        check_context_window(prompt_token_count, max_tokens, max_context)?;
-
-        let stop_strings = parse_stop_strings(&req.stop)?;
+            stop_strings,
+            seed,
+            stream,
+            ..
+        } = validated;
 
         Ok(PreparedChatRequest {
+            messages,
             max_tokens,
             temperature,
             top_p,
             logprobs,
             prompt,
             stop_strings,
+            seed,
+            stream,
         })
     }
 
@@ -3773,33 +3532,100 @@ mod serve {
         });
     }
 
+    /// Axum route entry point. Takes the raw request body instead of
+    /// `Json<ChatCompletionRequest>` so `require_json_content_type` can run
+    /// against the raw headers before the body is read (see below). The
+    /// message-count bound is enforced inline during the single
+    /// `serde_json::from_slice::<ChatCompletionRequest>` parse below
+    /// (`serve::contract::deserialize_bounded_messages`), so a sub-body-cap
+    /// request built from tens of thousands of tiny messages is rejected
+    /// without materializing a `Vec<Message>` entry for each one -- there is
+    /// no separate raw-bytes pass over `messages` ahead of that parse.
+    ///
+    /// `to_bytes(.., REQUEST_BODY_LIMIT_BYTES)` enforces the same cap the
+    /// router's `DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES)` layer
+    /// already applies to the underlying body stream, so the existing 413
+    /// behavior below is unchanged.
+    ///
+    /// Switching from `Json` to a raw body also dropped `Json`'s own
+    /// Content-Type enforcement (a security gap: a body with a valid JSON
+    /// payload but `Content-Type: text/plain` -- or no `Content-Type` at
+    /// all -- previously got a free 415 from the `Json` extractor before
+    /// this handler ever ran). Restored via
+    /// [`lattice_inference::serve::require_json_content_type`], checked
+    /// against `headers` and the request rejected *before* the body is
+    /// read at all: unlike `Result<Bytes, BytesRejection>` (an axum
+    /// `FromRequest` extractor that fully buffers the body as part of
+    /// argument extraction, before this function body ever runs), taking
+    /// the raw `Body` here defers reading the body to the explicit
+    /// `to_bytes` call below, so an invalid-MIME request never pays the
+    /// buffering cost, mirroring `lattice_serve.rs`'s equivalent handler.
     pub async fn chat_completions(
         State(state): State<AppState>,
-        result: Result<Json<ChatCompletionRequest>, axum::extract::rejection::JsonRejection>,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Body,
     ) -> Result<Response, ApiError> {
-        // Surface JSON extraction failures as structured 400 responses.
-        // Log the raw parser message server-side; never forward it to clients.
-        let Json(req) = result.map_err(|rejection| {
-            if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-                ApiError::PayloadTooLarge {
-                    message: "request body exceeds 1 MiB limit".to_string(),
+        lattice_inference::serve::require_json_content_type(&headers)?;
+
+        // Surface a body-length-limit rejection as a structured 413
+        // response; any other body-buffering failure (e.g. a client
+        // disconnecting mid-stream) is not a size violation and gets the
+        // same non-413 invalid-body response as a malformed JSON body.
+        let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
+            .await
+            .map_err(|err| {
+                let is_length_limit = std::error::Error::source(&err)
+                    .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+                if is_length_limit {
+                    return ApiError::PayloadTooLarge {
+                        message: "request body exceeds 1 MiB limit".to_string(),
+                    };
                 }
-            } else {
-                eprintln!("invalid request body: {}", rejection.body_text());
+                eprintln!("invalid request body: {err}");
                 ApiError::BadRequest {
                     message: "invalid JSON request body".to_string(),
                     code: "invalid_request_body",
                 }
+            })?;
+
+        let req: ChatCompletionRequest = serde_json::from_slice(&bytes).map_err(|err| {
+            if lattice_inference::serve::contract::is_message_flood_error(&err) {
+                return ApiError::BadRequest {
+                    message: lattice_inference::serve::contract::message_flood_text(),
+                    code: "invalid_request_body",
+                };
+            }
+            eprintln!("invalid request body: {err}");
+            ApiError::BadRequest {
+                message: "invalid JSON request body".to_string(),
+                code: "invalid_request_body",
             }
         })?;
 
+        chat_completions_with_request(State(state), req).await
+    }
+
+    /// The full chat-completions cascade, taking an already-parsed request.
+    /// Split out of [`chat_completions`] so tests can construct a
+    /// `ChatCompletionRequest` directly (a Rust struct literal) without
+    /// round-tripping it through JSON bytes -- those tests exercise
+    /// generation/streaming behavior, not the raw-bytes preflight, which is
+    /// covered separately in `serve::contract`'s own tests and this
+    /// binary's router-level tests.
+    async fn chat_completions_with_request(
+        State(state): State<AppState>,
+        req: ChatCompletionRequest,
+    ) -> Result<Response, ApiError> {
         let PreparedChatRequest {
+            messages: _normalized_messages,
             max_tokens,
             temperature,
             top_p,
             logprobs,
             prompt,
             stop_strings,
+            seed,
+            stream,
         } = prepare_chat_request(
             &req,
             &state.model_id,
@@ -3813,20 +3639,22 @@ mod serve {
             max_new_tokens: max_tokens,
             temperature,
             top_p,
-            seed: req.seed,
+            seed,
             stop_strings,
             logprobs,
             ..Default::default()
         };
 
-        // Metal-only: the same validated messages as `prompt` above, in the
-        // engine's `ChatMessage` form. `prepare_chat_request` already ran
-        // `to_chat_messages` (via the shared renderer) over `req.messages`
-        // above and accepted it, so this second call over the identical
-        // input cannot fail here — the `?` exists for the type, not because
-        // failure is expected in practice.
+        // Metal-only: reuse the exact messages normalized alongside the CPU
+        // prompt, so role/content validation and allocation happen once.
         #[cfg(feature = "metal-gpu")]
-        let chat_messages = to_chat_messages(&req.messages)?;
+        let chat_messages = _normalized_messages;
+        // CPU-only builds never render `_normalized_messages` (the CPU
+        // closures below capture only `cpu_model`/`prompt`/`gen_cfg`) -- drop
+        // it here instead of letting it ride, unused, across the
+        // `spawn_blocking(...).await` that follows.
+        #[cfg(not(feature = "metal-gpu"))]
+        drop(_normalized_messages);
 
         let model = state.model.clone();
 
@@ -3838,7 +3666,7 @@ mod serve {
         let seq = state.request_counter.fetch_add(1, Ordering::Relaxed);
         let response_id = format!("chatcmpl-{created}-{seq}");
 
-        if req.stream == Some(true) {
+        if stream {
             // --- Streaming path ---
             //
             // `generate_streaming` is a synchronous blocking function.  We run it
@@ -4207,6 +4035,7 @@ mod serve {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use axum::http::StatusCode;
         use lattice_inference::forward::metal_qwen35::ChatRole;
 
         /// #832 checklist: "Add a Metal-feature test asserting an explicit
@@ -4659,12 +4488,15 @@ mod serve {
             // stream=true is now handled by the streaming path and must NOT be
             // rejected by reject_unsupported.
             let req = ChatCompletionRequest {
-                model: "m".to_string(),
+                model: Some("m".to_string()),
                 messages: vec![],
                 max_tokens: None,
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+                reasoning_budget: None,
                 stream: Some(true),
                 stop: None,
                 seed: None,
@@ -4765,12 +4597,15 @@ mod serve {
         #[test]
         fn reject_unsupported_n_gt_1() {
             let req = ChatCompletionRequest {
-                model: "m".to_string(),
+                model: Some("m".to_string()),
                 messages: vec![],
                 max_tokens: None,
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+                reasoning_budget: None,
                 stream: None,
                 stop: None,
                 seed: None,
@@ -4794,17 +4629,21 @@ mod serve {
         #[test]
         fn reject_unsupported_response_format_json() {
             let req = ChatCompletionRequest {
-                model: "m".to_string(),
+                model: Some("m".to_string()),
                 messages: vec![],
                 max_tokens: None,
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+                reasoning_budget: None,
                 stream: None,
                 stop: None,
                 seed: None,
                 response_format: Some(ResponseFormat {
                     r#type: "json_object".to_string(),
+                    json_schema: None,
                 }),
                 tools: None,
                 tool_choice: None,
@@ -4828,12 +4667,15 @@ mod serve {
 
         fn bare_req() -> ChatCompletionRequest {
             ChatCompletionRequest {
-                model: "m".to_string(),
+                model: Some("m".to_string()),
                 messages: vec![],
                 max_tokens: None,
                 max_completion_tokens: None,
                 temperature: None,
                 top_p: None,
+                top_k: None,
+                repetition_penalty: None,
+                reasoning_budget: None,
                 stream: None,
                 stop: None,
                 seed: None,
@@ -5016,6 +4858,7 @@ mod serve {
             let req = ChatCompletionRequest {
                 response_format: Some(ResponseFormat {
                     r#type: "text".to_string(),
+                    json_schema: None,
                 }),
                 ..bare_req()
             };
@@ -5114,13 +4957,11 @@ mod serve {
             let msgs = vec![Message {
                 role: "user".to_string(),
                 content: MessageContent::Parts(vec![
-                    ContentPart {
-                        kind: "text".to_string(),
-                        text: Some("hello".to_string()),
+                    ContentPart::Text {
+                        text: "hello".to_string(),
                     },
-                    ContentPart {
-                        kind: "text".to_string(),
-                        text: Some(" world".to_string()),
+                    ContentPart::Text {
+                        text: " world".to_string(),
                     },
                 ]),
             }];
@@ -5185,9 +5026,11 @@ mod serve {
         fn to_chat_messages_rejects_non_text_content_part() {
             let messages = vec![Message {
                 role: "user".to_string(),
-                content: MessageContent::Parts(vec![ContentPart {
-                    kind: "image_url".to_string(),
-                    text: None,
+                content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: lattice_inference::serve::contract::ImageUrl {
+                        url: "https://example.com/image.png".to_string(),
+                        detail: None,
+                    },
                 }]),
             }];
             let err = to_chat_messages(&messages).unwrap_err();
@@ -5292,37 +5135,47 @@ mod serve {
         }
 
         // -----------------------------------------------------------------------
-        // message_text helper
+        // message content normalization (via the shared normalize_messages,
+        // exercised here through the `to_chat_messages` alias)
         // -----------------------------------------------------------------------
 
         #[test]
         fn message_text_plain_string() {
-            let content = MessageContent::Text("hello".to_string());
-            assert_eq!(message_text(&content).unwrap(), "hello");
+            let messages = [Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("hello".to_string()),
+            }];
+            assert_eq!(to_chat_messages(&messages).unwrap()[0].content, "hello");
         }
 
         #[test]
         fn message_text_parts_concatenates() {
-            let content = MessageContent::Parts(vec![
-                ContentPart {
-                    kind: "text".to_string(),
-                    text: Some("foo".to_string()),
-                },
-                ContentPart {
-                    kind: "text".to_string(),
-                    text: Some("bar".to_string()),
-                },
-            ]);
-            assert_eq!(message_text(&content).unwrap(), "foobar");
+            let messages = [Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "foo".to_string(),
+                    },
+                    ContentPart::Text {
+                        text: "bar".to_string(),
+                    },
+                ]),
+            }];
+            assert_eq!(to_chat_messages(&messages).unwrap()[0].content, "foobar");
         }
 
         #[test]
         fn message_text_parts_rejects_image() {
-            let content = MessageContent::Parts(vec![ContentPart {
-                kind: "image_url".to_string(),
-                text: None,
-            }]);
-            let err = message_text(&content).unwrap_err();
+            let messages = [Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: lattice_inference::serve::contract::ImageUrl {
+                        url: "https://example.com/image.png".to_string(),
+                        detail: None,
+                    },
+                }]),
+            }];
+            let err = to_chat_messages(&messages).unwrap_err();
             match err {
                 ApiError::BadRequest { message, code } => {
                     assert_eq!(code, "unsupported_feature");
@@ -5334,11 +5187,13 @@ mod serve {
 
         #[test]
         fn message_text_parts_rejects_unknown_part_type() {
-            let content = MessageContent::Parts(vec![ContentPart {
-                kind: "file".to_string(),
-                text: None,
-            }]);
-            let err = message_text(&content).unwrap_err();
+            let messages = [Message {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![ContentPart::Unsupported {
+                    kind: "file".to_string(),
+                }]),
+            }];
+            let err = to_chat_messages(&messages).unwrap_err();
             match err {
                 ApiError::BadRequest { message, code } => {
                     assert_eq!(code, "unsupported_feature");
@@ -5569,7 +5424,7 @@ mod serve {
         #[test]
         fn cm_serve_model_mismatch_rejected() {
             let req = ChatCompletionRequest {
-                model: "some-other-model".to_string(),
+                model: Some("some-other-model".to_string()),
                 messages: vec![user_msg("hi")],
                 ..bare_req()
             };
@@ -5586,7 +5441,7 @@ mod serve {
         #[test]
         fn cm_serve_model_match_passes_model_check() {
             let req = ChatCompletionRequest {
-                model: "served-model".to_string(),
+                model: Some("served-model".to_string()),
                 messages: vec![user_msg("hi")],
                 ..bare_req()
             };
@@ -5596,7 +5451,7 @@ mod serve {
         #[test]
         fn cm_serve_empty_messages_rejected() {
             let req = ChatCompletionRequest {
-                model: "served-model".to_string(),
+                model: Some("served-model".to_string()),
                 messages: vec![],
                 ..bare_req()
             };
@@ -5613,7 +5468,7 @@ mod serve {
         #[test]
         fn cm_serve_last_message_not_user_rejected() {
             let req = ChatCompletionRequest {
-                model: "served-model".to_string(),
+                model: Some("served-model".to_string()),
                 messages: vec![
                     user_msg("hi"),
                     Message {
@@ -5640,7 +5495,7 @@ mod serve {
             // AND asks for `tools` must fail on the tools rejection, not the
             // model-mismatch check, so callers get the more specific error.
             let req = ChatCompletionRequest {
-                model: "some-other-model".to_string(),
+                model: Some("some-other-model".to_string()),
                 messages: vec![user_msg("hi")],
                 tools: Some(serde_json::json!([{"type": "function"}])),
                 ..bare_req()
@@ -5661,7 +5516,7 @@ mod serve {
             // resolves through to `PreparedChatRequest.stop_strings` — the
             // capability matrix's "supported" claim for `stop` on this surface.
             let req = ChatCompletionRequest {
-                model: "served-model".to_string(),
+                model: Some("served-model".to_string()),
                 messages: vec![user_msg("hi")],
                 stop: Some(serde_json::json!(["\n\n"])),
                 ..bare_req()
@@ -5689,7 +5544,7 @@ mod serve {
             // `prepare_chat_request`, not just to whether each sub-function
             // works in isolation.
             let req = ChatCompletionRequest {
-                model: "served-model".to_string(),
+                model: Some("served-model".to_string()),
                 messages: vec![user_msg("hi")],
                 stop: Some(serde_json::json!([])), // malformed: empty array is rejected
                 ..bare_req()
@@ -5710,7 +5565,7 @@ mod serve {
             // Full-cascade check backing the matrix's "supported, non-streaming
             // only" `logprobs`/`top_logprobs` claim for `lattice serve`.
             let req = ChatCompletionRequest {
-                model: "served-model".to_string(),
+                model: Some("served-model".to_string()),
                 messages: vec![user_msg("hi")],
                 logprobs: Some(true),
                 top_logprobs: Some(3),
@@ -5800,20 +5655,19 @@ mod serve {
             /// this asserts the frame's actual JSON payload shape: real code
             /// path yields `finish_reason: null` + a string `delta.content`;
             /// the mutated path yields a non-null `finish_reason` and no
-            /// `content`, and the second `assert!` fails. Verified by
-            /// reverting that exact line and re-running: see the PR body's
-            /// mutation log.
+            /// `content`, and the second `assert!` fails, so this test fails
+            /// if the disconnect-stops-generation behavior regresses.
             #[tokio::test]
             async fn chat_completions_streaming_disconnect_stops_generation() {
                 let req = ChatCompletionRequest {
-                    model: "test-model".to_string(),
+                    model: Some("test-model".to_string()),
                     messages: vec![user_msg("hi")],
                     max_tokens: Some(NEAR_MAX_CONTEXT_TOKENS),
                     stream: Some(true),
                     ..bare_req()
                 };
 
-                let response = chat_completions(State(tiny_state()), Ok(Json(req)))
+                let response = chat_completions_with_request(State(tiny_state()), req)
                     .await
                     .expect("streaming request must be accepted");
                 assert_eq!(response.status(), StatusCode::OK);
@@ -6028,14 +5882,14 @@ mod serve {
                     },
                 );
                 let req = ChatCompletionRequest {
-                    model: "test-model".to_string(),
+                    model: Some("test-model".to_string()),
                     messages: vec![user_msg("hi")],
                     max_tokens: Some(64),
                     stream: Some(true),
                     ..bare_req()
                 };
 
-                let response = chat_completions(State(state), Ok(Json(req)))
+                let response = chat_completions_with_request(State(state), req)
                     .await
                     .expect("streaming request must be accepted");
                 assert_eq!(response.status(), StatusCode::OK);
@@ -6161,13 +6015,13 @@ mod serve {
                 );
 
                 let req = ChatCompletionRequest {
-                    model: "test-model".to_string(),
+                    model: Some("test-model".to_string()),
                     messages: vec![user_msg("hi")],
                     max_tokens: Some(NEAR_MAX_CONTEXT_TOKENS),
                     stream: Some(true),
                     ..bare_req()
                 };
-                let response = chat_completions(State(state), Ok(Json(req)))
+                let response = chat_completions_with_request(State(state), req)
                     .await
                     .expect("streaming request must be accepted");
                 // `chat_completions` has now unconditionally returned, so an
@@ -6285,6 +6139,92 @@ mod serve {
                 let value: serde_json::Value =
                     serde_json::from_slice(&bytes).expect("error response must be JSON");
                 assert_eq!(value["error"]["code"], "context_length_exceeded");
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Message-flood bound: proves the fix at the real HTTP layer, not just
+        // at `serve::contract`'s own unit-test level -- the router's
+        // `chat_completions` entry point must reject a body with more than
+        // `MAX_MESSAGE_COUNT` tiny messages.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod message_flood {
+            use super::*;
+            use lattice_inference::serve::contract::MAX_MESSAGE_COUNT;
+            use tower::ServiceExt as _;
+
+            #[tokio::test]
+            async fn chat_completions_rejects_message_flood() {
+                // One more message than the bound, each as small as the wire
+                // format allows: comfortably under the 1 MiB body cap, but
+                // tens of thousands of entries. The message-count bound is
+                // enforced inline while `ChatCompletionRequest::messages`
+                // deserializes, so this never allocates a `Vec<Message>`
+                // entry per message before rejecting -- see this test's
+                // sibling unit tests in `serve::contract` for direct coverage
+                // of that deserializer.
+                let messages: Vec<String> = (0..MAX_MESSAGE_COUNT + 1)
+                    .map(|_| r#"{"role":"user","content":""}"#.to_string())
+                    .collect();
+                let body = format!(
+                    r#"{{"model":"test-model","messages":[{}]}}"#,
+                    messages.join(",")
+                );
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .expect("fixture request must build");
+                let response = router(tiny_state(64))
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("error response body must be readable");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("error response must be JSON");
+                assert_eq!(value["error"]["code"], "invalid_request_body");
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Content-Type precedence: an invalid-MIME request must be rejected by
+        // `require_json_content_type` before the body is ever read as JSON.
+        // -----------------------------------------------------------------------
+        #[cfg(feature = "test-utils")]
+        mod content_type_precedence {
+            use super::*;
+            use tower::ServiceExt as _;
+
+            /// A body that is not valid JSON at all. Combined with a
+            /// non-JSON `Content-Type`, this distinguishes ordering: if the
+            /// Content-Type guard runs first, the response is 415
+            /// `unsupported_media_type`; if it were reordered to run after
+            /// the body is parsed, this body would instead fail JSON
+            /// parsing first and surface as 400 `invalid_request_body`.
+            #[tokio::test]
+            async fn invalid_content_type_rejected_before_body_is_parsed() {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "text/plain")
+                    .body(axum::body::Body::from("this is not json"))
+                    .expect("fixture request must build");
+                let response = router(tiny_state(64))
+                    .oneshot(request)
+                    .await
+                    .expect("router must produce a response, not a transport error");
+                assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("error response body must be readable");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("error response must be JSON");
+                assert_eq!(value["error"]["code"], "unsupported_media_type");
             }
         }
 

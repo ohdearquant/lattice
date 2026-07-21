@@ -13,8 +13,9 @@ Knowledge distillation and training infrastructure for lattice neural models.
 
 `DistillationPipeline` and the CPU `TrainingLoop` currently provide orchestration
 placeholders, not end-to-end training. `DistillationPipeline::label_single` does
-not contact a teacher API; it returns a simulated label distribution and
-confidence. `TrainingLoop::train` drives batching, callbacks, metrics, early
+not contact a teacher API and fails closed with `TuneError::TeacherApi`. Fixed
+labels are available only through the non-default `simulated-teacher` feature and
+explicitly named simulation methods. `TrainingLoop::train` drives batching, callbacks, metrics, early
 stopping, and in-memory checkpoints, but its loss and accuracy are simulated and
 it does not update model weights. Do not treat either result as evidence of live
 teacher labeling or trained parameters.
@@ -185,9 +186,9 @@ let (train, validation) = dataset.split(0.8)?; // 20% for validation
 
 ## Distillation Pipeline
 
-This example exercises the current simulated response path. It validates the
-teacher configuration and formats the prompt, but it makes no HTTP request and
-does not read an API key.
+This example shows the default fail-closed behavior. The pipeline validates the
+teacher configuration, but it does not fabricate labels when live transport is
+unavailable.
 
 ```rust
 use lattice_tune::distill::{TeacherConfig, DistillationPipeline, RawExample};
@@ -204,15 +205,19 @@ let raw = RawExample::new(
     "What's the weather like?",
 );
 
-// Produce the placeholder's simulated labels
-let result = pipeline.label_single(&raw)?;
-println!("Simulated confidence: {}", result.confidence);
+let error = pipeline.label_single(&raw).unwrap_err();
+assert!(error.to_string().contains("not configured"));
 
 // Check statistics
 let stats = pipeline.stats();
-println!("Successful: {}", stats.successful);
+println!("Successful: {}", stats.successful); // 0
 println!("Failed: {}", stats.failed);
 ```
+
+Tests and examples that deliberately need fixed output can enable the
+`simulated-teacher` feature and call `label_single_simulated` or
+`label_batch_simulated`. These methods remain separate from the default live
+labeling methods even when the feature is enabled.
 
 ## Training
 
@@ -415,6 +420,10 @@ impl DistillationPipeline {
     pub fn with_teacher(config: TeacherConfig) -> Result<Self>;
     pub fn label_single(&mut self, example: &RawExample) -> Result<LabelingResult>;
     pub fn label_batch(&mut self, examples: &[RawExample]) -> Vec<LabelingResult>;
+    #[cfg(feature = "simulated-teacher")]
+    pub fn label_single_simulated(&mut self, example: &RawExample) -> Result<LabelingResult>;
+    #[cfg(feature = "simulated-teacher")]
+    pub fn label_batch_simulated(&mut self, examples: &[RawExample]) -> Vec<LabelingResult>;
     pub fn stats(&self) -> &DistillationStats;
 }
 ```

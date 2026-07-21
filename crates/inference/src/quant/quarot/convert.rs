@@ -35,7 +35,7 @@ use crate::quant::quarot::forward_equivalence::{
     ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_forward_equivalence_qwen35,
 };
 use crate::quant::quarot::hadamard::RandomizedHadamard;
-use crate::quant::quarot::io::QuarotTensorReader;
+use crate::quant::quarot::io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader};
 use crate::quant::quarot::lm_head::{
     materialize_lm_head_for_qwen35, qwen35_final_norm_fusion_target,
     untie_word_embeddings_in_config_json,
@@ -126,11 +126,31 @@ struct IndexEntry {
 /// lives next to the tensor index so a loader can recover it without parsing
 /// `config.json`. `quantize_index.json` from older builds (no `quarot_seed`)
 /// remains compatible — the field is `Option<u64>`.
+///
+/// `online` is the schema-of-record home for [`OnlineArtifactDescriptor`] —
+/// the ONE place a converter/loader reads or writes online-rotation
+/// metadata, closing the dual-schema gap between this wire format and the
+/// contract types in `io.rs`. `#[serde(default, ...)]` keeps every existing
+/// V0 manifest (which never had this field) byte-compatible: absent on disk
+/// deserializes to `None`, and `None` is never re-serialized back out.
+///
+/// `artifact_version` is a second, independent top-level signal carrying the
+/// same [`ArtifactVersion`] a real V1 writer stamps on its manifest. It is
+/// deliberately NOT read from `online.version` — `online` is optional and a
+/// truncated write, a corrupted copy, or a hand edit can drop or null it
+/// while leaving the rest of the manifest (including this field) intact.
+/// Keying version detection on `artifact_version` means that combination is
+/// caught as an incomplete V1 artifact rather than silently downgraded to
+/// V0. See [`read_quarot_seed_from_index`] for the load-time contract.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct QuantizeIndex {
     #[serde(skip_serializing_if = "Option::is_none")]
     quarot_seed: Option<u64>,
     tensors: Vec<IndexEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    online: Option<OnlineArtifactDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_version: Option<ArtifactVersion>,
 }
 
 /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
@@ -167,8 +187,43 @@ struct QuantizeIndex {
 /// checkpoint that was actually QuaRot-rotated, silently corrupting
 /// inference output instead of refusing to load (#630 end-to-end
 /// verification against the real qwen3.5-0.8b-q4 checkpoint).
+///
+/// When the object form carries an `online` [`OnlineArtifactDescriptor`]
+/// whose version is `V0Residual`, it is validated against `cfg`
+/// (`OnlineArtifactDescriptor::validate`) before this function returns — a
+/// manifest carrying a present-but-invalid online descriptor is rejected at
+/// load time, the same fail-closed treatment as a malformed `tensors`
+/// entry. A manifest with no `online` field (every V0 manifest, and any
+/// object-form manifest predating this field) skips this check entirely.
+///
+/// A `V1Online` descriptor is **always** rejected here (`Err`, not `Ok`),
+/// whether or not it is internally self-consistent — no forward path
+/// executes R3/R4 online rotations at runtime yet, so returning the seed
+/// for a V1 artifact would make `from_q4_dir` load it exactly like
+/// `V0Residual` and silently skip the counter-rotations its Q4 weights
+/// require, producing incorrect inference. This is the single load
+/// boundary every `read_quarot_seed_from_index` caller passes through; a
+/// `V1Online` artifact stays rejected until end-to-end runtime rotation
+/// support lands. Because that rejection is unconditional, the version
+/// check runs BEFORE `OnlineArtifactDescriptor::validate` rather than
+/// after: `validate`'s R3/R4 layer-scope and asymmetric-tensor-name checks
+/// are quadratic in attacker-controlled manifest content (declared layer
+/// count, declared tensor-name count), and there is no reason to run that
+/// scan on a descriptor this function refuses regardless of the outcome.
+///
+/// Version detection keys on the top-level `artifact_version` field, not on
+/// `online`'s presence: `online` is optional and defaulted, so a manifest
+/// with `artifact_version` absent (or `v0-residual`) but `online` present
+/// falls through to the same present-online validation above, while a
+/// manifest that declares `artifact_version: "v1-online-r3r4"` MUST carry a
+/// complete, valid `online` descriptor or is rejected outright — an absent
+/// or null `online` field on a manifest that declares itself V1 is treated
+/// as an incomplete/corrupted V1 artifact, never silently downgraded to V0.
 #[cfg(any(test, feature = "metal-gpu"))]
-pub(crate) fn read_quarot_seed_from_index(q4_dir: &Path) -> Result<Option<u64>, String> {
+pub(crate) fn read_quarot_seed_from_index(
+    q4_dir: &Path,
+    cfg: &Qwen35Config,
+) -> Result<Option<u64>, String> {
     let path = q4_dir.join("quantize_index.json");
     let Some(bytes) = crate::quant::q4_manifest::read_manifest_bytes_bounded(&path)? else {
         return Ok(None);
@@ -182,6 +237,55 @@ pub(crate) fn read_quarot_seed_from_index(q4_dir: &Path) -> Result<Option<u64>, 
     }
     let index: QuantizeIndex = serde_json::from_value(value)
         .map_err(|e| format!("{}: malformed quantize_index.json: {e}", path.display()))?;
+    if matches!(index.artifact_version, Some(ArtifactVersion::V1Online)) {
+        // The manifest declares itself V1 independently of whether `online`
+        // made it through intact. An absent or null `online` here is not a
+        // downgrade to V0 — it is an incomplete V1 artifact, and its Q4
+        // weights are already counter-rotated for R3/R4 with no recipe left
+        // to describe what to undo. Refuse rather than guess.
+        if index.online.is_none() {
+            return Err(format!(
+                "{}: artifact_version declares v1-online-r3r4 but the online \
+                 rotation descriptor is missing or null; refusing to load an \
+                 incomplete V1 artifact",
+                path.display()
+            ));
+        }
+        // This runtime rejects every V1Online artifact outright, whether or
+        // not its descriptor is internally self-consistent — no forward
+        // path executes R3/R4 online rotations yet. The version check is
+        // therefore resolved BEFORE `OnlineArtifactDescriptor::validate`
+        // runs: that call's R3/R4 layer-scope and asymmetric-tensor-name
+        // checks are O(layers^2 + tensor_names^2) over attacker-controlled
+        // manifest content (a small malicious config declaring many layers
+        // plus a matching V1 descriptor), and running them ahead of a
+        // rejection this runtime always issues would let that manifest
+        // drive the full quadratic scan before being refused.
+        return Err(format!(
+            "{}: this runtime does not yet execute V1 online rotation \
+             recipes; artifact requires R3/R4 runtime support",
+            path.display()
+        ));
+    }
+    if let Some(online) = &index.online {
+        // Same reject-before-validate ordering as above, for the
+        // `artifact_version` omitted/`V0Residual` but `online.version ==
+        // V1Online` case (a manifest whose top-level tag lags its embedded
+        // descriptor).
+        if matches!(online.version, ArtifactVersion::V1Online) {
+            return Err(format!(
+                "{}: this runtime does not yet execute V1 online rotation \
+                 recipes; artifact requires R3/R4 runtime support",
+                path.display()
+            ));
+        }
+        online.validate(Some(cfg)).map_err(|e| {
+            format!(
+                "{}: invalid online-artifact descriptor: {e}",
+                path.display()
+            )
+        })?;
+    }
     Ok(index.quarot_seed)
 }
 
@@ -544,6 +648,11 @@ pub fn convert_quarot_qwen35(
         let index_record = QuantizeIndex {
             quarot_seed: Some(opts.rotation_seed),
             tensors: index_entries,
+            // This converter only ever produces offline residual-rotation
+            // (V0) artifacts today — no online-rotation recipe is produced
+            // here yet.
+            online: None,
+            artifact_version: None,
         };
         let index_json = serde_json::to_string_pretty(&index_record).map_err(|e| {
             InferenceError::Inference(format!(
@@ -1492,10 +1601,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Path-layout refuses (review findings, Majors 1 + 2)
+    // Path-layout refuses
     // ------------------------------------------------------------------
 
-    /// Major 1: when input and output paths resolve to the same canonical
+    /// When input and output paths resolve to the same canonical
     /// path, the converter must refuse before any write would corrupt
     /// the source `config.json`.
     #[test]
@@ -1522,7 +1631,7 @@ mod tests {
         );
     }
 
-    /// Major 1 sibling: even when the two paths differ literally (e.g.,
+    /// Sibling case: even when the two paths differ literally (e.g.,
     /// trailing slash, symlink), canonicalization must still catch the
     /// equivalence.
     #[test]
@@ -1539,7 +1648,7 @@ mod tests {
         assert!(msg.contains("same path"), "unexpected error: {msg}");
     }
 
-    /// Major 2: a pre-existing non-empty output directory must trigger
+    /// A pre-existing non-empty output directory must trigger
     /// refusal before any conversion work, so a previously-written `.q4`
     /// artifact cannot survive a gate failure and be picked up by the
     /// runtime loader.
@@ -2266,7 +2375,7 @@ mod tests {
     fn read_quarot_seed_from_index_absent_file_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            read_quarot_seed_from_index(tmp.path()),
+            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
             Ok(None),
             "missing quantize_index.json must yield Ok(None), not an error"
         );
@@ -2277,7 +2386,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("quantize_index.json"), r#"{"tensors":[]}"#).unwrap();
         assert_eq!(
-            read_quarot_seed_from_index(tmp.path()),
+            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
             Ok(None),
             "index without quarot_seed key must yield Ok(None)"
         );
@@ -2298,7 +2407,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_quarot_seed_from_index(tmp.path()),
+            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
             Ok(None),
             "bare tensor-array quantize_index.json (plain quantize_q4 shape) must yield Ok(None)"
         );
@@ -2313,7 +2422,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_quarot_seed_from_index(tmp.path()),
+            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
             Ok(Some(13_258_600_446_175_248_384_u64)),
             "index with quarot_seed key must round-trip the u64 exactly"
         );
@@ -2328,7 +2437,7 @@ mod tests {
         // a checkpoint that actually needed one.
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("quantize_index.json"), "not json").unwrap();
-        let err = read_quarot_seed_from_index(tmp.path())
+        let err = read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b())
             .expect_err("malformed quantize_index.json must be rejected, not silently None");
         assert!(
             err.contains("malformed quantize_index.json"),
@@ -2353,7 +2462,7 @@ mod tests {
             r#"{"quarot_seed":42,"tensors":[{"name":"foo","file":"foo.q4"}]}"#,
         )
         .unwrap();
-        let err = read_quarot_seed_from_index(tmp.path()).expect_err(
+        let err = read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()).expect_err(
             "object-form manifest with an incomplete tensor entry must be rejected, \
              not silently accepted",
         );
@@ -2379,7 +2488,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_quarot_seed_from_index(tmp.path()),
+            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
             Ok(None),
             "a bare array with malformed entries still carries no rotation seed \
              and must yield Ok(None), not an error"
@@ -2397,7 +2506,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            read_quarot_seed_from_index(tmp.path()).is_err(),
+            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()).is_err(),
             "schema-shape mismatch (tensors not an array) must be rejected"
         );
     }
@@ -2413,7 +2522,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            read_quarot_seed_from_index(tmp.path()).is_err(),
+            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()).is_err(),
             "truncated quantize_index.json must be rejected"
         );
     }
@@ -2431,11 +2540,247 @@ mod tests {
         f.set_len(crate::quant::q4_manifest::MAX_QUANTIZE_INDEX_LEN + 1)
             .unwrap();
         drop(f);
-        let err = read_quarot_seed_from_index(tmp.path())
+        let err = read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b())
             .expect_err("oversized quantize_index.json must be rejected");
         assert!(
             err.contains("too large"),
             "error must name the size-cap failure; got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `QuantizeIndex::online`: the
+    // single serialized-manifest schema for `OnlineArtifactDescriptor`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn quantize_index_online_field_round_trips_through_json() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let r3 =
+            crate::quant::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+        let names: Vec<String> = (0..cfg.num_hidden_layers)
+            .filter(|&i| cfg.is_full_attention(i))
+            .map(|i| {
+                format!(
+                    "{}.self_attn.o_proj.weight",
+                    crate::model::qwen35::qwen_layer_tensor_prefix(i)
+                )
+            })
+            .collect();
+        let descriptor = OnlineArtifactDescriptor {
+            version: crate::quant::quarot::io::ArtifactVersion::V1Online,
+            online_rotations: vec![r3],
+            asymmetric_tensor_names: names,
+        };
+        let index = QuantizeIndex {
+            quarot_seed: Some(7),
+            tensors: vec![],
+            online: Some(descriptor.clone()),
+            artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+        };
+        let json = serde_json::to_string(&index).unwrap();
+        let round_tripped: QuantizeIndex = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.quarot_seed, Some(7));
+        assert_eq!(round_tripped.online, Some(descriptor));
+        assert_eq!(
+            round_tripped.artifact_version,
+            Some(crate::quant::quarot::io::ArtifactVersion::V1Online)
+        );
+    }
+
+    /// A well-formed, structurally
+    /// *valid* `V1Online` manifest must be rejected at load — not accepted,
+    /// and not silently treated as V0 (which is what
+    /// `read_quarot_seed_from_index` did before this fix: it validated the
+    /// descriptor, then discarded it and returned only `quarot_seed`).
+    #[test]
+    fn quantize_index_v1_online_manifest_is_rejected_at_load_not_silently_accepted() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let r3 =
+            crate::quant::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+        let names: Vec<String> = (0..cfg.num_hidden_layers)
+            .filter(|&i| cfg.is_full_attention(i))
+            .map(|i| {
+                format!(
+                    "{}.self_attn.o_proj.weight",
+                    crate::model::qwen35::qwen_layer_tensor_prefix(i)
+                )
+            })
+            .collect();
+        let descriptor = OnlineArtifactDescriptor {
+            version: crate::quant::quarot::io::ArtifactVersion::V1Online,
+            online_rotations: vec![r3],
+            asymmetric_tensor_names: names,
+        };
+        let index = QuantizeIndex {
+            quarot_seed: Some(7),
+            tensors: vec![],
+            online: Some(descriptor),
+            artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+        };
+        let json = serde_json::to_string(&index).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), &json).unwrap();
+        let err = read_quarot_seed_from_index(tmp.path(), &cfg).expect_err(
+            "a well-formed V1Online manifest must be rejected at load, not accepted as V0",
+        );
+        assert!(
+            err.contains("does not yet execute V1 online rotation recipes"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn quantize_index_without_online_field_parses_identically_to_v0() {
+        // Fixture matches `read_quarot_seed_from_index_finds_seed` above —
+        // a real V0 manifest with no `online` key at all. Byte-compatibility
+        // requirement: adding the field to the struct must not change how
+        // an existing V0 manifest parses.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"{"quarot_seed":13258600446175248384,"tensors":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
+            Ok(Some(13_258_600_446_175_248_384_u64)),
+            "a V0 manifest with no online field must parse exactly as before"
+        );
+    }
+
+    #[test]
+    fn quantize_index_with_invalid_online_descriptor_is_rejected_at_load() {
+        // An `online` descriptor whose asymmetric_tensor_names is empty is
+        // self-contradictory for a V1Online artifact with a real rotation.
+        // Since V1Online is rejected unconditionally (before
+        // `OnlineArtifactDescriptor::validate` runs — see the reject-first
+        // ordering in `read_quarot_seed_from_index`'s doc comment), the
+        // loader surfaces the same "not yet supported" refusal it gives any
+        // other V1Online manifest, not a `validate`-specific message; the
+        // manifest is still rejected either way.
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let r3 =
+            crate::quant::quarot::plan::OnlineRotationSpec::r3_full_attention(&cfg, 42, 8).unwrap();
+        let invalid_descriptor = OnlineArtifactDescriptor {
+            version: crate::quant::quarot::io::ArtifactVersion::V1Online,
+            online_rotations: vec![r3],
+            asymmetric_tensor_names: vec![],
+        };
+        let index = QuantizeIndex {
+            quarot_seed: Some(7),
+            tensors: vec![],
+            online: Some(invalid_descriptor),
+            artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+        };
+        let json = serde_json::to_string(&index).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), &json).unwrap();
+        let err = read_quarot_seed_from_index(tmp.path(), &cfg)
+            .expect_err("a manifest carrying an invalid online descriptor must be rejected");
+        assert!(
+            err.contains("does not yet execute V1 online rotation recipes"),
+            "got: {err}"
+        );
+    }
+
+    /// The reject-first ordering: a manifest declaring `artifact_version: v1-online-r3r4`
+    /// with a large, attacker-shaped `layer_scope` must be rejected without
+    /// running `OnlineArtifactDescriptor::validate`'s quadratic
+    /// layer/tensor-name scans. This does not (and cannot, without an
+    /// unbounded-time harness) prove the O(n^2) work is skipped by timing;
+    /// it instead drives the exact adversarial shape the review described
+    /// (many declared layers, a matching V1 manifest) through the real load
+    /// path and asserts the version-reject branch — not `validate` — is the
+    /// one that fires, by checking the error message is the unconditional
+    /// "not yet supported" refusal rather than any `validate`-produced
+    /// message (e.g. divisibility/coverage errors an out-of-range
+    /// `layer_scope` would otherwise trip).
+    #[test]
+    fn quantize_index_v1_online_large_layer_scope_is_rejected_without_running_validate() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        // An out-of-range, unsorted layer_scope that `OnlineRotationSpec`'s
+        // own field validation would refuse for reasons unrelated to size —
+        // if `validate` ran, it would fail loudly with THIS spec's own
+        // complaint, not the generic V1-unsupported refusal.
+        let adversarial_layers: Vec<usize> = (0..cfg.num_hidden_layers * 4).collect();
+        let r3 = crate::quant::quarot::plan::OnlineRotationSpec {
+            id: crate::quant::quarot::plan::RotationId::AttentionOutputR3,
+            side: crate::quant::quarot::plan::AbsorptionSide::InputSide,
+            seed: 42,
+            block_size: 8,
+            layer_scope: Some(adversarial_layers),
+        };
+        let descriptor = OnlineArtifactDescriptor {
+            version: crate::quant::quarot::io::ArtifactVersion::V1Online,
+            online_rotations: vec![r3],
+            asymmetric_tensor_names: vec![],
+        };
+        let index = QuantizeIndex {
+            quarot_seed: Some(7),
+            tensors: vec![],
+            online: Some(descriptor),
+            artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+        };
+        let json = serde_json::to_string(&index).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), &json).unwrap();
+        let err = read_quarot_seed_from_index(tmp.path(), &cfg)
+            .expect_err("an adversarially-shaped V1Online manifest must still be rejected");
+        assert!(
+            err.contains("does not yet execute V1 online rotation recipes"),
+            "expected the unconditional version-reject message (proving \
+             `validate`'s per-spec scan did not run and produce its own \
+             error instead), got: {err}"
+        );
+    }
+
+    /// Version detection must key on the top-level `artifact_version`
+    /// field, not on `online`'s presence — a manifest that declares
+    /// `artifact_version: "v1-online-r3r4"` but omits the `online` key
+    /// entirely (truncated write, corrupted copy, or a hand edit that
+    /// strips only the rotation recipe) must be rejected fail-closed, not
+    /// silently loaded as V0. Loading it as V0 would return the seed and
+    /// skip the R3/R4 recipe this artifact's Q4 weights require, producing
+    /// incorrect inference.
+    #[test]
+    fn quantize_index_v1_version_without_online_key_is_rejected_fail_closed() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"{"quarot_seed":7,"tensors":[],"artifact_version":"v1-online-r3r4"}"#,
+        )
+        .unwrap();
+        let err = read_quarot_seed_from_index(tmp.path(), &cfg).expect_err(
+            "a manifest declaring artifact_version v1-online-r3r4 with no online \
+             key must be rejected, not silently loaded as V0",
+        );
+        assert!(
+            err.contains("rotation descriptor is missing or null"),
+            "got: {err}"
+        );
+    }
+
+    /// Same bypass as above, via `"online": null` instead of an omitted
+    /// key — both are the same `Option::None` after deserialization, and
+    /// both must be rejected the same way.
+    #[test]
+    fn quantize_index_v1_version_with_null_online_is_rejected_fail_closed() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"{"quarot_seed":7,"tensors":[],"online":null,"artifact_version":"v1-online-r3r4"}"#,
+        )
+        .unwrap();
+        let err = read_quarot_seed_from_index(tmp.path(), &cfg).expect_err(
+            "a manifest declaring artifact_version v1-online-r3r4 with online \
+             explicitly null must be rejected, not silently loaded as V0",
+        );
+        assert!(
+            err.contains("rotation descriptor is missing or null"),
+            "got: {err}"
         );
     }
 }

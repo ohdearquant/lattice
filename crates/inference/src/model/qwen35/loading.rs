@@ -9,6 +9,17 @@ use crate::error::InferenceError;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::weights::TensorSource;
 
+/// Canonical per-layer tensor-name prefix for a Qwen3.5 checkpoint
+/// (`model.language_model.layers.{idx}`) — the single source of truth for
+/// this namespace. Anything deriving a layer's tensor names (this module's
+/// `qwen_required_tensor_names`, the QuaRot converter, the online-rotation
+/// artifact validator) must go through this function rather than
+/// re-deriving the prefix independently, so the namespace can't drift out
+/// of sync with the loader.
+pub fn qwen_layer_tensor_prefix(idx: usize) -> String {
+    format!("model.language_model.layers.{idx}")
+}
+
 /// Return the complete list of required tensor names for a given config.
 pub fn qwen_required_tensor_names(cfg: &Qwen35Config) -> Vec<String> {
     let mut names = Vec::new();
@@ -19,7 +30,7 @@ pub fn qwen_required_tensor_names(cfg: &Qwen35Config) -> Vec<String> {
     }
 
     for i in 0..cfg.num_hidden_layers {
-        let prefix = format!("model.language_model.layers.{i}");
+        let prefix = qwen_layer_tensor_prefix(i);
         names.push(format!("{prefix}.input_layernorm.weight"));
         names.push(format!("{prefix}.post_attention_layernorm.weight"));
 
@@ -394,7 +405,7 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
     let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
 
     for i in 0..cfg.num_hidden_layers {
-        let prefix = format!("model.language_model.layers.{i}");
+        let prefix = qwen_layer_tensor_prefix(i);
 
         let iln = load_owned_tensor_checked(
             source,
