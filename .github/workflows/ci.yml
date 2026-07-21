@@ -614,6 +614,8 @@ jobs:
       # bench-compare.sh call site, and runs no benchmark.
       - name: bash scripts/ensure-noindex-marker-selftest.sh
         run: bash scripts/ensure-noindex-marker-selftest.sh
+      - name: python3 tests/test_bench_disposition.py
+        run: python3 tests/test_bench_disposition.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is
