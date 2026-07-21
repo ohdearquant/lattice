@@ -380,6 +380,36 @@ class BenchDispositionCheck(unittest.TestCase):
         )
         self.assertFalse(has_disposition(body))
 
+    def test_void_tag_after_masked_block_close_hides_disposition(self):
+        # A type-7 block may open at ANY block boundary, not only after a blank
+        # line. When a fenced/comment/raw/PI/declaration/CDATA block ends on its
+        # own non-blank terminator line, a following <br> still starts a type-7
+        # block that masks the heading beneath it, so the disposition does not
+        # render and the gate must reject. Tracking only "previous line blank"
+        # (rather than "a paragraph is open") let every one of these exit 0 after
+        # the terminator's non-blank line -- a fail-open the paragraph-state model
+        # closes. One representative per tracked masked region.
+        heading = "## bench-compare disposition"
+        filler = (
+            "one two three four five six seven eight nine ten eleven twelve "
+            "thirteen fourteen fifteen sixteen"
+        )
+        closers = [
+            ("```\ncode\n```", "fenced code block"),
+            ("<!--\ncomment\n-->", "HTML comment"),
+            ("<pre>\ncode\n</pre>", "raw <pre> block"),
+            ("<?\npi body\n?>", "processing instruction"),
+            ("<![CDATA[\ncdata body\n]]>", "CDATA section"),
+            ("<!DOCTYPE bench\ndecl body\n>", "declaration"),
+        ]
+        for block, label in closers:
+            with self.subTest(closer=label):
+                body = f"{block}\n<br>\n{heading}\n{filler}\n"
+                self.assertFalse(
+                    has_disposition(body),
+                    f"{label} close then <br> must mask the hidden heading",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
