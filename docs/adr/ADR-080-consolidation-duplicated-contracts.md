@@ -56,12 +56,12 @@ defect** — the signature of a missing shared contract, not of intentional back
 
 ### Evidence summary (from the duplication maps)
 
-| cluster | nominal operations mapped | site counts (largest → smallest) | unfiled held findings (post-verification) | filed issues |
-|---|---|---|---|---|
-| attention-softmax | 6 | 6, 6, 4, 4, 3, 3 | 4 (CPU MHA -inf floor, Flash-causal NaN-key, differential/native-sparse hardening, Qwen3 secondary-loop duplication) | #739, #740, #741 |
-| http-serve | 6 | 3, 3, 3, 3, 2, 2 | 1 (unify endpoint/error contracts) | #744, #745, #746 |
-| sampling-decode | 6 | 10, 6, 4, 4, 4, 1 | 2 (canonical greedy-selection sharing; fail-closed generation controls on alternate CPU decode loops) | none |
-| matmul-gemm | 10 | 14, 7, 6, 5, 5, 5, 4, 4, 3, 1 | 5 (scaled-SGEMM FFI validation, standalone WGPU/Metal validation, BitNet release-active checks, SwiGLU short-activation rejection, oversized-input unification) | none |
+| cluster           | nominal operations mapped | site counts (largest → smallest) | unfiled held findings (post-verification)                                                                                                                       | filed issues     |
+| ----------------- | ------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| attention-softmax | 6                         | 6, 6, 4, 4, 3, 3                 | 4 (CPU MHA -inf floor, Flash-causal NaN-key, differential/native-sparse hardening, Qwen3 secondary-loop duplication)                                            | #739, #740, #741 |
+| http-serve        | 6                         | 3, 3, 3, 3, 2, 2                 | 1 (unify endpoint/error contracts)                                                                                                                              | #744, #745, #746 |
+| sampling-decode   | 6                         | 10, 6, 4, 4, 4, 1                | 2 (canonical greedy-selection sharing; fail-closed generation controls on alternate CPU decode loops)                                                           | none             |
+| matmul-gemm       | 10                        | 14, 7, 6, 5, 5, 5, 4, 4, 3, 1    | 5 (scaled-SGEMM FFI validation, standalone WGPU/Metal validation, BitNet release-active checks, SwiGLU short-activation rejection, oversized-input unification) | none             |
 
 12 unfiled held findings plus 6 filed issues (18 total) were confirmed against live source at the
 audited commit and re-checked against a commit 51 revisions later; none was a stale artifact of
@@ -83,15 +83,15 @@ checklists (18 findings total across the four clusters).
 
 **Consolidate within existing crates. Do not create a new crate.** Extract one small, checked,
 module-level helper per cluster inside `lattice-inference` (the crate that owns every site
-*selected for consolidation* in all four clusters). Keep every backend-specific kernel — CPU
+_selected for consolidation_ in all four clusters). Keep every backend-specific kernel — CPU
 scalar, CPU SIMD (NEON/AVX2), Metal, WGPU — as a separate implementation. The scalar/CPU
 implementation in each cluster is named the **numeric reference** ("formula oracle"): it is the
 specification other backends are checked against in parity tests, not itself replaced by a
 cross-backend abstraction.
 
 A new crate is justified only when a helper's canonical dependency-free logic is needed by two or
-more *crates* that do not already share a dependency edge. None of the four clusters meets that
-bar: attention-softmax, sampling-decode, and every matmul-gemm site *selected for consolidation*
+more _crates_ that do not already share a dependency edge. None of the four clusters meets that
+bar: attention-softmax, sampling-decode, and every matmul-gemm site _selected for consolidation_
 are intra-`lattice-inference`; http-serve spans two binaries (`lattice.rs`, `lattice_serve.rs`)
 that already live in the same crate. (The matmul-gemm survey also touched `lattice-fann`'s
 dense-layer GEMM and one delegating call site in `lattice-embed` — those are cross-crate,
@@ -134,7 +134,7 @@ takes row scores and returns the fail-closed normalized row per the contract abo
 variant (f32/f16/Q8/NEON), the Flash-causal tiled and fallback paths, the two Qwen3 secondary loops,
 and the three standalone-attention-variant sites call it instead of reimplementing row reduction.
 Metal and WGPU kernels stay separate GPU code but gain an explicit non-finite-row contract test
-that checks the *kernel output* against the same reference. The unselected legacy Metal
+that checks the _kernel output_ against the same reference. The unselected legacy Metal
 score/softmax kernel is deleted (dead code, not a live divergence to fix).
 
 **Resolves**: the four unfiled held findings for this cluster — exact zero for -inf-masked CPU MHA
@@ -180,12 +180,14 @@ the same "two independently-maintained request/response paths" root cause this c
 
 ### C3: Backend-neutral decode policy (sampling-decode)
 
-**Evidence.** The Qwen autoregressive decode-policy loop recurs across 10 sites:
+**Evidence.** The Qwen autoregressive decode-policy loop recurs across 9 sites:
 `model/qwen35/generation.rs` (both canonical CPU entry points), `forward/cpu_f16.rs`,
-`forward/cpu_q8.rs`, `forward/neon_forward.rs`, `forward/batch_prefill.rs`, and four
-`forward/metal_qwen35.rs` entry points (direct, streaming, MTP, multimodal-adjacent). #657 already
-fixed `stop_strings` propagation on four Metal decode loops (landed 2026-07-04, confirmed in
-re-verification at `0699e60cc`), narrowing but not closing the family.
+`forward/cpu_q8.rs`, `forward/neon_forward.rs`, and four `forward/metal_qwen35.rs` entry points
+(direct, streaming, MTP, multimodal-adjacent). #657 already fixed `stop_strings` propagation on
+four Metal decode loops (landed 2026-07-04, confirmed in re-verification at `0699e60cc`),
+narrowing but not closing the family. `forward/batch_prefill.rs` carried this cluster's only
+decode loop (`generate_with_batch_prefill`); that loop was removed as a dead, redundant
+duplicate (#807), so `batch_prefill.rs` is prefill-only and out of this cluster.
 
 **Divergence.** The two canonical CPU generation entry points apply the full `GenerateConfig`
 policy — `stop_strings` and reasoning-budget — and fail closed on unsupported grammar. The
@@ -308,7 +310,7 @@ benchmark binaries.
 ## What we are NOT doing
 
 - **No new crate.** Every extracted helper lands inside `lattice-inference`, the crate that already
-  owns every site *selected for consolidation* in all four clusters. A new crate would add a publish-order
+  owns every site _selected for consolidation_ in all four clusters. A new crate would add a publish-order
   dependency edge for zero cross-crate consumers.
 - **No cross-crate kernel unification.** `lattice-fann`'s dense-layer GEMM and
   `lattice-inference`'s attention/projection GEMMs stay independent implementations; only
@@ -389,7 +391,7 @@ widest span of call sites and the training/autodiff paths).
    Rejected. The audit explicitly found that CPU/SIMD/Metal/WGPU reduction-order and
    precision-staging differences (e.g. f32 vs half-tile staging in Q4 Metal kernels) are
    intentional performance/precision trade-offs, not defects. Only the argument-validation and
-   fail-closed-row *contracts* are duplicated and drifting; the arithmetic kernels themselves are
+   fail-closed-row _contracts_ are duplicated and drifting; the arithmetic kernels themselves are
    correctly backend-specific and are kept separate.
 
 4. **Do nothing beyond the individually-filed issues, and let periodic audits re-discover the same

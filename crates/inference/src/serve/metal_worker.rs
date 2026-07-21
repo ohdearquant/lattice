@@ -115,9 +115,8 @@ pub enum WorkerEvent {
     /// candidate token (#611), distinct from [`WorkerEvent::Failed`] at the
     /// type level so a caller offering structured-output admission can
     /// report its dedicated `blocked_constraint` HTTP machine code without
-    /// pattern-matching the message text (round-1 structured-output-v0
-    /// review, medium finding 2: a backend wording change must not be able
-    /// to silently degrade that code to `internal_error`). Carries the
+    /// pattern-matching the message text (a backend wording change must not
+    /// be able to silently degrade that code to `internal_error`). Carries the
     /// underlying error message for server-side logging only.
     ConstraintBlocked(String),
     /// The job was skipped before any prompt work started because the
@@ -520,6 +519,17 @@ impl MetalWorker {
                     // falls back to `PrefixReuseMode::FullRefill` whenever
                     // they diverge, so correctness never depends on
                     // distinguishing clients.
+                    //
+                    // DEPLOYMENT ASSUMPTION, stated because it is currently
+                    // true only by the accident that no multi-tenant consumer
+                    // exists: this path assumes a single tenant, or clients
+                    // that mutually trust one another. Reuse-versus-refill is
+                    // externally visible as latency, so while no request can
+                    // read another's content, a client CAN observe that some
+                    // other request recently shared a prefix with its own.
+                    // A shared inference endpoint serving mutually distrusting
+                    // clients must key the slot per tenant via
+                    // `CrossTurnSlotId::new`, not inherit `DEFAULT`.
                     let cached = state.generate_streaming_with_prefix_cache_and_cancel(
                         CrossTurnSlotId::DEFAULT,
                         &prompt,

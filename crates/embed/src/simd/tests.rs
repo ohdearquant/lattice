@@ -1042,3 +1042,29 @@ fn test_i8_dot_unrolled_matches_original() {
         );
     }
 }
+
+#[test]
+fn test_quantization_params_non_finite_lanes_are_skipped() {
+    // The branchless min/max scan must be exactly equivalent to skipping
+    // non-finite lanes: they contribute identity elements, never values.
+    let mut v = vec![0.5f32, -2.0, 3.0, 1.0];
+    v.push(f32::NAN);
+    v.push(f32::INFINITY);
+    v.push(f32::NEG_INFINITY);
+    let p = QuantizationParams::from_vector(&v);
+    assert_eq!(p.min_val, -2.0);
+    assert_eq!(p.max_val, 3.0);
+    assert_eq!(p.scale, 127.0 / 3.0);
+
+    // All-non-finite still resets to (0, 0) with unit scale.
+    let p = QuantizationParams::from_vector(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY]);
+    assert_eq!(p.min_val, 0.0);
+    assert_eq!(p.max_val, 0.0);
+    assert_eq!(p.scale, 1.0);
+
+    // Empty input takes the same reset path.
+    let p = QuantizationParams::from_vector(&[]);
+    assert_eq!(p.min_val, 0.0);
+    assert_eq!(p.max_val, 0.0);
+    assert_eq!(p.scale, 1.0);
+}

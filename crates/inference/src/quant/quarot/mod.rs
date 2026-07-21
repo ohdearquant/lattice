@@ -10,7 +10,10 @@ pub mod lm_head;
 pub mod lora;
 pub mod pipeline;
 pub mod plan;
+#[cfg(test)]
+mod r3_reference;
 pub mod rmsnorm_fusion;
 pub mod rotation;
 
-pub use io::{QuarotTensorReader, SourceDType};
+pub use io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader, SourceDType};
+pub use plan::{OnlineRotationSpec, OnlineTransformSite, RotationId};

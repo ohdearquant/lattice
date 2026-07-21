@@ -72,6 +72,11 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 # CLI + HTTP server (used by lattice binary)
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
+# MIME parsing for the chat-completions Content-Type guard (mirrors axum's
+# own `Json` extractor rule) -- already a transitive axum 0.8 dependency,
+# pinned here (same 0.3.17 the lockfile already resolves) so the direct
+# dependent controls its own version instead of relying on axum's.
+mime = "0.3"
 
 # Testing
 proptest = "1.0"

@@ -2190,9 +2190,9 @@ fn truncate_token_logprobs_to_retained_text(
 
 /// Returns true when `token_id` is EOS or is in the `stop_token_ids` list.
 ///
-/// `pub(crate)` — all callers (Q8, F16, NEON, batch-prefill generate paths) live
-/// within this crate. Keeping the function crate-private avoids leaking a
-/// low-level sampling helper as part of the public API.
+/// `pub(crate)` — all call sites live within this crate. Keeping the function
+/// crate-private avoids leaking a low-level sampling helper as part of the
+/// public API.
 pub(crate) fn should_stop_token(
     cfg: &Qwen35Config,
     gen_cfg: &GenerateConfig,
@@ -2213,7 +2213,6 @@ pub(crate) fn should_stop_token(
 /// - `generate_q8` (`forward/cpu_q8.rs`)
 /// - `generate_f16` (`forward/cpu_f16.rs`)
 /// - `generate_q8_neon` (`forward/neon_forward.rs`)
-/// - `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`)
 /// - `multimodal_generate_preflight` (`forward/metal_qwen35.rs`)
 ///
 /// The base CPU `generate()` / `generate_streaming()` paths in this module wire
@@ -2255,8 +2254,7 @@ pub(crate) fn check_logprobs_not_set(gen_cfg: &GenerateConfig) -> Result<(), Inf
 /// string-level stop matching into its decode loop.
 ///
 /// Callers: `generate_f16` (`forward/cpu_f16.rs`), `generate_q8`
-/// (`forward/cpu_q8.rs`), `generate_q8_neon` (`forward/neon_forward.rs`),
-/// `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`).
+/// (`forward/cpu_q8.rs`), `generate_q8_neon` (`forward/neon_forward.rs`).
 ///
 /// The base CPU `generate()` / `generate_streaming()` paths in this module,
 /// and the Metal `generate()` / `generate_streaming()` / `generate_multimodal`
@@ -3495,8 +3493,6 @@ mod tests {
     /// masking/sampling) lets generation fall through to sampling the first
     /// token, producing `generated_tokens > 0`, non-empty `text`, and at
     /// least one `on_token` callback -- failing all three assertions below.
-    /// Verified by reverting that exact guard and re-running: see the PR
-    /// body's mutation log.
     #[test]
     fn generate_streaming_with_cancel_true_after_prefill_returns_interrupt() {
         let model = build_tiny_zero_model();
@@ -3700,8 +3696,7 @@ mod tests {
     /// Removing any of the three `on_raw_event(RawGenEvent::RawToken { .. })`
     /// call sites (pre-loop first token, fast-path decode loop, stop-string
     /// decode loop) drops an index from the collected sequence, failing the
-    /// monotonic-range assertion. Verified by reverting the fix and
-    /// re-running: see the PR body's mutation log.
+    /// monotonic-range assertion.
     #[test]
     fn raw_observer_prefill_end_precedes_first_raw_token_monotonic_index() {
         let model = build_tiny_zero_model();
@@ -3795,7 +3790,7 @@ mod tests {
              the prefill-derived first token -- not merely before the RawToken callback, \
              which a PrefillEnd emitted after sampling (but before the RawToken push) would \
              also satisfy while silently including sampling time in the reported prefill \
-             interval (codex round-2 medium, PR #882)"
+             interval (#882)"
         );
     }
 

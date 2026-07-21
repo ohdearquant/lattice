@@ -1224,7 +1224,7 @@ mod inner {
         ///
         /// Mirrors `Q4WeightBuf::from_buffer` for API-shape parity; unused
         /// until a non-mmap Q3 construction path (e.g. concatenated MoE-style
-        /// upload) exists — see w3_stage2_report.md "what shipped" for scope.
+        /// upload) exists.
         #[allow(dead_code)]
         fn from_buffer(buffer: Buffer) -> Self {
             Q3WeightBuf {
@@ -1237,8 +1237,7 @@ mod inner {
         /// Wrap a no-copy Metal buffer backed by `mmap` with a non-zero payload offset.
         ///
         /// Exercised today only by [`mmap_q3_weight`] and its tests; live
-        /// checkpoint loading does not yet route MLP tensors through it (see
-        /// w3_stage2_report.md "what shipped" for the scope decision).
+        /// checkpoint loading does not yet route MLP tensors through it.
         #[allow(dead_code)]
         fn from_mmap(buffer: Buffer, payload_offset: u64, mmap: memmap2::Mmap) -> Self {
             Q3WeightBuf {
@@ -1264,8 +1263,7 @@ mod inner {
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
     /// modified while the process is running.
     ///
-    /// Not yet called from live checkpoint loading — see w3_stage2_report.md
-    /// "what shipped" for the scope decision (proven end-to-end by this
+    /// Not yet called from live checkpoint loading (proven end-to-end by this
     /// module's `mmap_q3_weight_*` tests instead).
     #[cfg(feature = "metal-gpu")]
     #[allow(dead_code)]
@@ -1621,6 +1619,14 @@ mod inner {
     struct MetalStepOutput {
         logits: Vec<f32>,
         pre_final_hidden: Vec<f32>,
+        // Kept alive by binding the returned struct (not discarding it),
+        // rather than dropping at the end of `forward_step_inner_impl`'s
+        // body — the zero-copy greedy path needs `decode.step` to span
+        // through its post-return logits scan (see
+        // `forward_step_greedy_argmax`); every other caller either drops
+        // this immediately (`.logits`, same timing as before) or holds a
+        // `Scope::NotDecode` no-op guard, which is a no-op to drop late.
+        _signpost_step: crate::forward::signpost::Interval,
     }
 
     struct MetalMtpForwardOutput {
@@ -4714,7 +4720,12 @@ mod inner {
                     GdnStateTrafficScope::MtpVerify,
                 );
                 #[cfg(not(feature = "gdn-state-counters"))]
-                let repair_out = self.forward_step_inner(repair_token, repair_pos, true);
+                let repair_out = self.forward_step_inner(
+                    repair_token,
+                    repair_pos,
+                    true,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 self.session.last_pre_final_hidden = repair_out.pre_final_hidden;
                 self.session.kv_cache.seq_len = seq_len;
             } else {
@@ -4763,7 +4774,12 @@ mod inner {
                     GdnStateTrafficScope::MtpVerify,
                 );
                 #[cfg(not(feature = "gdn-state-counters"))]
-                let out = self.forward_step_inner(token, start_pos + i, true);
+                let out = self.forward_step_inner(
+                    token,
+                    start_pos + i,
+                    true,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 self.checkpoint_gdn_to_slot(i + 1, GdnStateTrafficScope::MtpVerify)?;
                 all_logits.push(out.logits);
                 final_hidden = out.pre_final_hidden;
@@ -5977,6 +5993,7 @@ mod inner {
             token_id: u32,
             position: usize,
             capture_hidden: bool,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> MetalStepOutput {
             self.forward_step_inner_impl(
                 token_id,
@@ -5986,6 +6003,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 None,
+                signpost_scope,
             )
         }
 
@@ -6001,6 +6019,8 @@ mod inner {
             capture_hidden: bool,
             scope: GdnStateTrafficScope,
         ) -> MetalStepOutput {
+            // Both callers (repair replay, batched verifier) are MTP-verify
+            // work, never autoregressive decode — always `NotDecode`.
             self.forward_step_inner_impl(
                 token_id,
                 position,
@@ -6009,6 +6029,7 @@ mod inner {
                 scope,
                 None,
                 None,
+                crate::forward::signpost::Scope::NotDecode,
             )
         }
 
@@ -6031,6 +6052,7 @@ mod inner {
         #[allow(dead_code)] // exercised by injection-only unit tests, see doc comment
         fn forward_step_injected(&mut self, embedding: &[f32], position: usize) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
+            // Never reached on a production path (see doc comment) — always `NotDecode`.
             self.forward_step_inner_impl(
                 0,
                 position,
@@ -6039,6 +6061,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 None,
+                crate::forward::signpost::Scope::NotDecode,
             )
             .logits
         }
@@ -6054,6 +6077,7 @@ mod inner {
             embedding: &[f32],
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl(
@@ -6064,6 +6088,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 mrope_cos_sin,
+                signpost_scope,
             )
             .logits
         }
@@ -6079,6 +6104,7 @@ mod inner {
             token_id: u32,
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl(
@@ -6089,6 +6115,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 mrope_cos_sin,
+                signpost_scope,
             )
             .logits
         }
@@ -6109,7 +6136,12 @@ mod inner {
             _traffic_scope: GdnStateTrafficScope,
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> MetalStepOutput {
+            let _signpost_step = crate::forward::signpost::interval_in(
+                signpost_scope,
+                crate::forward::signpost::Label::DecodeStep,
+            );
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
 
@@ -6232,8 +6264,20 @@ mod inner {
                         linear_idx += 1;
                         layer_enc.end_encoding();
                         let t_mixer = std::time::Instant::now();
-                        layer_cmd.commit();
-                        layer_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            layer_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            layer_cmd.wait_until_completed();
+                        }
                         prof.gpu_gdn_mixer_us += t_mixer.elapsed().as_micros();
                         // MLP-only command buffer for this GDN layer.
                         let mlp_cmd = unsafe {
@@ -6252,8 +6296,20 @@ mod inner {
                         );
                         mlp_enc.end_encoding();
                         let t_mlp = std::time::Instant::now();
-                        mlp_cmd.commit();
-                        mlp_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            mlp_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            mlp_cmd.wait_until_completed();
+                        }
                         prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                     } else {
                         // Attn-only (no MLP): measures pure GQA attention cost.
@@ -6273,8 +6329,20 @@ mod inner {
                         full_idx += 1;
                         layer_enc.end_encoding();
                         let t_attn = std::time::Instant::now();
-                        layer_cmd.commit();
-                        layer_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            layer_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            layer_cmd.wait_until_completed();
+                        }
                         prof.gpu_gqa_attn_us += t_attn.elapsed().as_micros();
                         // MLP-only command buffer for this GQA layer.
                         let mlp_cmd = unsafe {
@@ -6293,8 +6361,20 @@ mod inner {
                         );
                         mlp_enc.end_encoding();
                         let t_mlp = std::time::Instant::now();
-                        mlp_cmd.commit();
-                        mlp_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            mlp_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            mlp_cmd.wait_until_completed();
+                        }
                         prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                     }
                     // Keep legacy aggregates for backward compat with existing tooling.
@@ -6310,8 +6390,20 @@ mod inner {
                     self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling);
                 head_enc.end_encoding();
                 let t_gpu = std::time::Instant::now();
-                head_cmd.commit();
-                head_cmd.wait_until_completed();
+                {
+                    let _signpost_commit = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeCbCommit,
+                    );
+                    head_cmd.commit();
+                }
+                {
+                    let _signpost_wait = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeCbWait,
+                    );
+                    head_cmd.wait_until_completed();
+                }
                 prof.gpu_lm_head_us += t_gpu.elapsed().as_micros();
 
                 let total_gpu_us = prof.gpu_gdn_mixer_us
@@ -6384,6 +6476,10 @@ mod inner {
 
                 // SAFETY: GPU completed (wait_until_completed called above for head_cmd).
                 let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     let h =
                         unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                     self.session.last_pre_final_hidden = h.clone();
@@ -6395,11 +6491,19 @@ mod inner {
                 let logits = if skip_logits_readback {
                     vec![]
                 } else if let Some(which) = topk_which_inner {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     let k = self.session.compact_topk;
                     let candidates = unsafe { self.read_topk_candidates(which, k) };
                     self.session.compact_result = candidates;
                     vec![]
                 } else {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
                 };
                 self.session.kv_cache.seq_len += 1;
@@ -6407,6 +6511,7 @@ mod inner {
                 return MetalStepOutput {
                     logits,
                     pre_final_hidden,
+                    _signpost_step,
                 };
             }
 
@@ -6469,8 +6574,20 @@ mod inner {
 
             // Single submit for entire forward pass + optional top-k.
             enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
+            {
+                let _signpost_commit = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeCbCommit,
+                );
+                cmd.commit();
+            }
+            {
+                let _signpost_wait = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeCbWait,
+                );
+                cmd.wait_until_completed();
+            }
 
             // Diagnostic: dump post-final-norm hidden state magnitudes for
             // divergence analysis vs MLX. Set LATTICE_HIDDEN_DUMP=path to enable.
@@ -6527,6 +6644,10 @@ mod inner {
             // Read back pre-final hidden when requested (for MTP input).
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
             let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 let h = unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                 self.session.last_pre_final_hidden = h.clone();
                 h
@@ -6539,6 +6660,10 @@ mod inner {
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
                 // SAFETY: GPU completed, buffers are StorageModeShared.
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 let k = self.session.compact_topk;
                 let candidates = unsafe { self.read_topk_candidates(which, k) };
                 self.session.compact_result = candidates;
@@ -6546,6 +6671,10 @@ mod inner {
             } else {
                 // Full path: read vocab_size f32 logits back to host.
                 // SAFETY: GPU completed, buffer is StorageModeShared.
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
             };
             self.session.kv_cache.seq_len += 1;
@@ -6553,6 +6682,7 @@ mod inner {
             MetalStepOutput {
                 logits,
                 pre_final_hidden,
+                _signpost_step,
             }
         }
 
@@ -6582,14 +6712,49 @@ mod inner {
         /// live entry saved while it is still generating.
         pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
-            self.forward_step_inner(token_id, position, false).logits
+            // General-purpose raw entry point: reused for prompt prefill (a
+            // token-at-a-time loop, e.g. `forward_prefill_impl`,
+            // `forward_prefill_from`, multimodal prefill) as well as by
+            // external library consumers calling it directly, so it cannot
+            // assume decode scope. The production autoregressive decode
+            // loops call `forward_step_decode` instead (below), which is
+            // `Scope::Decode`.
+            self.forward_step_inner(
+                token_id,
+                position,
+                false,
+                crate::forward::signpost::Scope::NotDecode,
+            )
+            .logits
+        }
+
+        /// Same contract as [`Self::forward_step`], for the production
+        /// autoregressive decode loops (`generate`, `generate_streaming*`,
+        /// `generate_streaming_with_prefix_cache*`) only — marks the
+        /// `decode.*` signpost interval `Scope::Decode` so it is not silent.
+        /// Not `pub`: external consumers get the general-purpose
+        /// `forward_step`, which stays `Scope::NotDecode` since it cannot
+        /// know whether the caller is decoding or prefilling.
+        fn forward_step_decode(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+            self.cross_turn_prefix_cache.clear();
+            self.forward_step_inner(
+                token_id,
+                position,
+                false,
+                crate::forward::signpost::Scope::Decode,
+            )
+            .logits
         }
 
         /// Zero-copy greedy argmax: run forward pass then scan GPU shared buffer
         /// directly for the argmax token ID, avoiding 993KB allocation+copy.
         fn forward_step_greedy_argmax(&mut self, token_id: u32, position: usize) -> u32 {
             let cfg = self.engine.config.clone();
-            self.forward_step_inner_impl(
+            // Binding (not discarding) the returned guard keeps `decode.step`
+            // alive through the host-read/argmax scan below, matching its
+            // documented span (through logits/top-k readback) — the scan is
+            // logically part of this step, not a separate one.
+            let _step_guard = self.forward_step_inner_impl(
                 token_id,
                 position,
                 false,
@@ -6597,8 +6762,18 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 None,
+                crate::forward::signpost::Scope::Decode,
             );
 
+            // Fused host read + greedy sample: this scan both reads the
+            // shared logits buffer off the GPU and picks the argmax token in
+            // the same pass (the whole point of the zero-copy path), so it
+            // carries both signpost labels for the span it covers.
+            let _signpost_host_read = crate::forward::signpost::interval(
+                crate::forward::signpost::Label::DecodeHostScalarRead,
+            );
+            let _signpost_sample =
+                crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample);
             // SAFETY: GPU completed (wait_until_completed called in forward_step_inner).
             // logits buffer is StorageModeShared — CPU can read it directly.
             unsafe {
@@ -8210,7 +8385,14 @@ mod inner {
                 }
                 if self.session.gdn_checkpoints.is_none() {
                     // Checkpoint pool not allocated — fall through to single-token decode.
-                    let logits = self.forward_step_inner(pending_token, pos, false).logits;
+                    let logits = self
+                        .forward_step_inner(
+                            pending_token,
+                            pos,
+                            false,
+                            crate::forward::signpost::Scope::Decode,
+                        )
+                        .logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
                     // Stop-token contract (#613): `next` is never appended when it is
@@ -8239,7 +8421,14 @@ mod inner {
                     .checkpoint_gdn_to_slot(0, GdnStateTrafficScope::Decode)
                     .is_err()
                 {
-                    let logits = self.forward_step_inner(pending_token, pos, false).logits;
+                    let logits = self
+                        .forward_step_inner(
+                            pending_token,
+                            pos,
+                            false,
+                            crate::forward::signpost::Scope::Decode,
+                        )
+                        .logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
                     // Stop-token contract (#613): `next` is never appended when it is
@@ -8573,8 +8762,21 @@ mod inner {
                 engine.mask_logits(gs, &mut prefill_logits);
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: prompt_len,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: Some(StopReason::Grammar),
+                            token_logprobs: vec![],
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -8715,7 +8917,27 @@ mod inner {
             // Autoregressive decode
             let mut stopped = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (max_new_tokens == 1) cannot
+            // fall through to Length (#1064 follow-up).
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
             for _ in 1..gen_cfg.max_new_tokens {
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -8728,10 +8950,13 @@ mod inner {
                 let next_id = if greedy_fast {
                     self.forward_step_greedy_argmax(last_token, pos)
                 } else {
-                    let mut step_logits = self.forward_step(last_token, pos);
+                    let mut step_logits = self.forward_step_decode(last_token, pos);
 
                     // Apply grammar masking before sampling (ADR-046).
                     if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                        let _signpost_grammar = crate::forward::signpost::interval(
+                            crate::forward::signpost::Label::DecodeGrammarMask,
+                        );
                         engine.mask_logits(gs, &mut step_logits);
                         // Fail closed if the grammar blocked every continuation,
                         // matching the CPU contract (#611).
@@ -8744,16 +8969,13 @@ mod inner {
                         }
                     }
 
-                    if use_compact {
-                        sample_from_candidates(
-                            &self.session.compact_result,
-                            gen_cfg,
-                            &all_ids,
-                            &mut rng_state,
-                        )
-                    } else {
-                        sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
-                    }
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
+                        gen_cfg,
+                        &all_ids,
+                        &mut rng_state,
+                    )
                 };
 
                 // Advance grammar state after sampling.
@@ -8780,6 +9002,19 @@ mod inner {
                         stop_reason = StopReason::Eos;
                         break;
                     }
+                }
+
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
                 }
 
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -9087,9 +9322,10 @@ mod inner {
                     stop_reason = StopReason::Eos;
                     break;
                 }
-                let step_logits = self.forward_step(last_token, pos);
+                let step_logits = self.forward_step_decode(last_token, pos);
                 pos += 1;
-                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
+                let next_id =
+                    sample_decode_traced(None, &step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
                     stop_reason = StopReason::Eos;
@@ -9334,9 +9570,19 @@ mod inner {
                         )));
                     }
                     visual_row += 1;
-                    last_logits = self.forward_step_injected_mrope(row, pos, cos_sin);
+                    last_logits = self.forward_step_injected_mrope(
+                        row,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 } else {
-                    last_logits = self.forward_step_mrope(token_id, pos, cos_sin);
+                    last_logits = self.forward_step_mrope(
+                        token_id,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
             }
 
@@ -9415,11 +9661,17 @@ mod inner {
                     None
                 };
 
-                let step_logits = self.forward_step_mrope(last_token, physical_pos, mrope_cos_sin);
+                let step_logits = self.forward_step_mrope(
+                    last_token,
+                    physical_pos,
+                    mrope_cos_sin,
+                    crate::forward::signpost::Scope::Decode,
+                );
                 if let Some(probe) = decode_logits_probe.as_deref_mut() {
                     probe.push(step_logits.clone());
                 }
-                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
+                let next_id =
+                    sample_decode_traced(None, &step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
                     stop_reason = StopReason::Eos;
@@ -11634,7 +11886,7 @@ mod inner {
         /// # Panics
         /// Panics if `k` is zero or not a multiple of 32 (a caller
         /// programming error, not a runtime/capability condition).
-        #[allow(dead_code)] // wired to real MLP dispatch is deferred past Stage 2 — see w3_stage2_report.md
+        #[allow(dead_code)] // wiring to real MLP dispatch is deferred past Stage 2
         fn dispatch_gemm_q3(
             &self,
             enc: &ComputeCommandEncoderRef,
@@ -13038,7 +13290,12 @@ mod inner {
                 // Process all tokens; capture pre-final hidden for the last one.
                 for (pos, &id) in token_ids.iter().enumerate() {
                     let is_last = pos == n - 1;
-                    let _ = self.forward_step_inner(id, pos, is_last);
+                    let _ = self.forward_step_inner(
+                        id,
+                        pos,
+                        is_last,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
 
                 // last_pre_final_hidden = post-last-active-layer hidden for the last token.
@@ -13221,6 +13478,34 @@ mod inner {
         rng_state: &mut u64,
     ) -> u32 {
         crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
+    }
+
+    /// Signpost-traced sampling shared by every autoregressive decode loop's
+    /// per-step token pick: opens the `decode.sample` interval, then routes
+    /// to the compact-candidate or full-logits sampler.
+    ///
+    /// Centralizes what was five independent copy-pasted call sites: two of
+    /// the five -- the multimodal decode loops --
+    /// had already drifted to call `sample_token` directly, with neither the
+    /// interval nor the compact-route policy the other three loops apply).
+    /// `compact` is `Some(candidates)` for the GPU-top-k route (mirrors the
+    /// `use_compact` branch every call site used to inline) and `None` for
+    /// callers with no compact route, which is the multimodal decode loops'
+    /// only case -- they gain `decode.sample` instrumentation as a side
+    /// effect of routing through here instead of `sample_token` directly.
+    fn sample_decode_traced(
+        compact: Option<&[crate::sampling::Candidate]>,
+        step_logits: &[f32],
+        cfg: &GenerateConfig,
+        previous_ids: &[u32],
+        rng_state: &mut u64,
+    ) -> u32 {
+        let _signpost_sample =
+            crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample);
+        match compact {
+            Some(candidates) => sample_from_candidates(candidates, cfg, previous_ids, rng_state),
+            None => sample_token(step_logits, cfg, previous_ids, rng_state),
+        }
     }
 
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
@@ -13509,8 +13794,21 @@ mod inner {
                 engine.mask_logits(gs, &mut prefill_logits);
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: prompt_len,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: Some(StopReason::Grammar),
+                            token_logprobs: vec![],
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -13651,11 +13949,32 @@ mod inner {
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (effective cap 1: unbudgeted or
+            // zero-budget max_new_tokens == 1) cannot fall through to Length
+            // (#1064 follow-up).
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
 
             // Autoregressive decode with streaming.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = policy.cap();
             for _ in 1..cap {
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
+                    break;
+                }
                 // Checked before any per-step GPU work, independent of whether this
                 // iteration's delta ends up non-empty -- closes the gap where a run
                 // of tokens decoding to an incomplete UTF-8 tail (a multi-token
@@ -13674,10 +13993,13 @@ mod inner {
                 let last_token = *all_ids
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
-                let mut step_logits = self.forward_step(last_token, pos);
+                let mut step_logits = self.forward_step_decode(last_token, pos);
 
                 // Apply grammar masking before sampling (ADR-046).
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    let _signpost_grammar = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeGrammarMask,
+                    );
                     engine.mask_logits(gs, &mut step_logits);
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
@@ -13690,15 +14012,14 @@ mod inner {
                     }
                 }
 
-                let sampled_id = if use_compact {
-                    sample_from_candidates(
-                        &self.session.compact_result,
+                let sampled_id = {
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
                         gen_cfg,
                         &all_ids,
                         &mut rng_state,
                     )
-                } else {
-                    sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
                 // One atomic per-step transition (ADR-080 C3, PR #787) --
@@ -13764,6 +14085,18 @@ mod inner {
                     } => (token_id, answer_budget_exhausted),
                 };
                 last_pushed_id = next_id;
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -15152,9 +15485,13 @@ mod inner {
             // (`quarot_rotation_seed`) for backwards compatibility with artifacts
             // produced before the contract was formalized. #504 remaining slice 2:
             // a *present but malformed* index is a hard error (fail-closed) — only
-            // a genuinely absent index falls back.
-            let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir)
-                .map_err(|e| format!("from_q4_dir: {e}"))?;
+            // a genuinely absent index falls back. A well-formed `V1Online` index
+            // is *also* rejected here (this is the only load path into
+            // `MetalQwen35State`, Metal being the only forward implementation) — see
+            // `read_quarot_seed_from_index`'s doc comment.
+            let index_seed =
+                crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir, cfg)
+                    .map_err(|e| format!("from_q4_dir: {e}"))?;
             let quarot_seed_opt = index_seed.or(cfg.quarot_rotation_seed);
             let is_quarot = quarot_seed_opt.is_some();
 
@@ -16407,8 +16744,30 @@ mod inner {
                 engine.mask_logits(gs, &mut prefill_logits);
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(CachedGenerateOutput {
+                            output: GenerateOutput {
+                                text: String::new(),
+                                token_ids: vec![],
+                                prompt_tokens: prompt_len,
+                                generated_tokens: 0,
+                                stopped: true,
+                                stop_reason: Some(StopReason::Grammar),
+                                token_logprobs: vec![],
+                            },
+                            cache: CrossTurnCacheStats {
+                                slot_id,
+                                prompt_tokens: prompt_len,
+                                reused_tokens: plan.reusable_len,
+                                prefetched_tokens: plan.suffix_len,
+                                mode: plan.mode,
+                            },
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -16589,9 +16948,31 @@ mod inner {
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (effective cap 1) cannot fall
+            // through to Length (#1064 follow-up). The completing token was
+            // never forwarded (`stopped` skips the silent step below), so the
+            // saved cross-turn prefix stays consistent with live KV state.
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
 
             let cap = policy.cap();
             for _ in 1..cap {
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
+                    break;
+                }
                 // Checked before any per-step GPU work, independent of whether
                 // this iteration's delta ends up non-empty — mirrors
                 // `generate_streaming_with_cancel`'s decode-loop check and
@@ -16613,9 +16994,12 @@ mod inner {
                 let last_token = *all_ids
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
-                let mut step_logits = self.forward_step(last_token, pos);
+                let mut step_logits = self.forward_step_decode(last_token, pos);
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
+                    let _signpost_grammar = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeGrammarMask,
+                    );
                     engine.mask_logits(gs, &mut step_logits);
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
@@ -16628,15 +17012,14 @@ mod inner {
                     }
                 }
 
-                let sampled_id = if use_compact {
-                    sample_from_candidates(
-                        &self.session.compact_result,
+                let sampled_id = {
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
                         gen_cfg,
                         &all_ids,
                         &mut rng_state,
                     )
-                } else {
-                    sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` or
@@ -16696,6 +17079,18 @@ mod inner {
                     } => (token_id, answer_budget_exhausted),
                 };
                 last_pushed_id = next_id;
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -16752,7 +17147,7 @@ mod inner {
                 if !generated_ids.is_empty() && !stopped && !stopped_by_caller {
                     let seq_len = self.session.kv_cache.seq_len;
                     if seq_len < self.session.kv_cache.max_cache_len {
-                        let _ = self.forward_step(last_pushed_id, seq_len);
+                        let _ = self.forward_step_decode(last_pushed_id, seq_len);
                     }
                     // else: KV is already full; the cache boundary stays one
                     // token short of `generated_ids` — still consistent, since
@@ -16884,6 +17279,58 @@ mod inner {
             CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, FullAttentionLayerWeights,
         };
         use crate::model::qwen35_config::LayerType;
+
+        // Mutation-sensitive: five decode
+        // loops used to copy-paste their own `decode.sample` interval +
+        // compact/full-logits routing, and two of the five (the multimodal
+        // decode loops) had already drifted to call `sample_token` directly
+        // with no interval at all. `sample_decode_traced` is now the single
+        // shared call site; these two source-level checks guard both halves
+        // of that invariant without depending on a live Instruments/xctrace
+        // tool session (which real FFI emission would require to observe).
+        // Each check fails if the shared call site regresses.
+        #[test]
+        fn sample_decode_traced_opens_the_decode_sample_interval() {
+            let src = include_str!("metal_qwen35.rs");
+            let start = src
+                .find("fn sample_decode_traced(")
+                .expect("sample_decode_traced must exist in this file");
+            let body_end = src[start..]
+                .find("\n    }\n")
+                .expect("sample_decode_traced's body must close with `\\n    }\\n`");
+            let body = &src[start..start + body_end];
+            assert!(
+                body.contains(
+                    "crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample)"
+                ),
+                "sample_decode_traced must open the decode.sample interval -- it is the \
+                 single call site all five decode loops now share; silently dropping this \
+                 line removes decode.sample instrumentation from every decode loop at once"
+            );
+        }
+
+        #[test]
+        fn all_five_decode_loops_call_sample_decode_traced() {
+            let src = include_str!("metal_qwen35.rs");
+            // Scope the search to production code, excluding `mod tests`
+            // itself -- this test's own source text contains the literal
+            // string `sample_decode_traced(` several times over (the
+            // `include_str!` search string, this function's name, etc.),
+            // which would otherwise self-count.
+            let production_end = src
+                .find("    mod tests {")
+                .expect("mod tests must exist in this file");
+            let production_src = &src[..production_end];
+            // One definition + five call sites, each enumerable by function and line.
+            let count = production_src.matches("sample_decode_traced(").count();
+            assert_eq!(
+                count, 6,
+                "expected sample_decode_traced's definition plus exactly 5 decode-loop \
+                 call sites; got {count} instead -- a decode loop likely reverted to \
+                 calling sample_token/sample_from_candidates directly, the exact drift \
+                 round 3's review caught in the two multimodal decode loops"
+            );
+        }
 
         /// #854: guards against a reintroduced manual copy of the RMS-norm
         /// reduction tree across qwen35.metal's seven RMS-norm-family kernels
@@ -19962,8 +20409,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // Shape E: M=16,N=1024,K=3584 — Qwen3.5-0.8B's down-projection
             //   depth (`intermediate_size=3584`, dispatch uses
             //   `K=intermediate` — metal_qwen35.rs:5112), 112 `BK=32`
-            //   iterations — the deepest Q3-eligible production MLP shape,
-            //   round-2 review finding 2.
+            //   iterations — the deepest Q3-eligible production MLP shape.
             //
             // `max_abs_diff` is the same NaN-honest helper used by the Q4 twin
             // below (`gemm_q4_tiled_vs_naive_numeric_differential`) — a
@@ -20031,11 +20477,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 envelope.push((m, n, k, max_diff));
             }
 
-            // Bound derived from the measured envelope above (see
-            // w3_fix_r2_report.md for the full table), not a hand-waved
+            // Bound derived from the measured envelope above, not a hand-waved
             // constant: the largest observed shape (M=16 N=1024 K=3584, the
-            // Qwen3.5-0.8B down-projection depth — 112 `BK=32` iterations,
-            // round-2 review finding 2) measured max|gpu-ref| ~= 1.946e-2;
+            // Qwen3.5-0.8B down-projection depth — 112 `BK=32` iterations)
+            // measured max|gpu-ref| ~= 1.946e-2;
             // 0.037 is ~1.9x that. The headroom covers cross-device variation
             // (different Apple Silicon generations accumulate the f16
             // X/W-staging + f32-reduction residual slightly differently) and
@@ -20056,8 +20501,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Mutation-sensitivity test for the differential comparison itself
-        /// (round-1 review finding 2): corrupt a packed block's `scale` field
+        /// Mutation-sensitivity test for the differential comparison itself:
+        /// corrupt a packed block's `scale` field
         /// to an IEEE-754 f16 NaN bit pattern so the GPU kernel's dequantized
         /// weight — and therefore its GEMM output — is NaN, then prove the
         /// NaN-honest comparison fails loudly instead of silently reading as
@@ -20066,7 +20511,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// mutation-sensitive, the same way the pack/unpack mutation tests
         /// prove the kernel is.
         ///
-        /// Round-2 review finding 1: `#[should_panic(expected = "is not
+        /// `#[should_panic(expected = "is not
         /// finite")]` could not distinguish "the Apple7 dispatch ran and the
         /// NaN-honest comparison caught it" from "no Apple7 device, so this
         /// branch panicked with an unrelated message that happened to also
@@ -21067,7 +21512,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// disarmed, and the collector must stay disarmed rather than
         /// silently self-arming on first use.
         ///
-        /// Mutation check (documented for the reviewer to exercise, not
+        /// Mutation check (documented as a manual check, not
         /// compiled in): replacing `encode_moe_ffn`'s `if let Some(trace) =
         /// c.borrow_mut().as_mut() { trace.push(..) }` guard with an
         /// unconditional `c.borrow_mut().get_or_insert_with(Vec::new).push(..)`
@@ -21129,7 +21574,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// through `encode_mlp_block` into `encode_moe_ffn`. Also exercises
         /// `dump_moe_routing_trace_jsonl`'s round-trip.
         ///
-        /// Mutation check (documented for the reviewer to exercise, not
+        /// Mutation check (documented as a manual check, not
         /// compiled in): commenting out the `trace.push(MoeRoutingTraceRecord
         /// { .. })` call inside `encode_moe_ffn`'s `MOE_ROUTING_TRACE.with(..)`
         /// block makes this test fail — `take_moe_routing_trace()` returns an
@@ -21816,7 +22261,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Ordering proof (adversarial-review Finding 1): `encode_moe_ffn`'s
+        /// Ordering proof: `encode_moe_ffn`'s
         /// routed-expert dequant work must genuinely overlap Step 2's
         /// shared-expert GEMV encoding, not just fan out across rayon
         /// before Step 2 starts and then block in front of it. Proven
@@ -21909,7 +22354,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Failure-isolation proof (adversarial-review Finding 2): a dequant
+        /// Failure-isolation proof: a dequant
         /// task panicking after `plan_prefetch` already committed its
         /// slot's ownership bookkeeping must not let a later token read
         /// stale/never-written bytes out of that slot.
@@ -22097,8 +22542,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Direct Stage-1-equivalence regression (adversarial-review
-        /// Finding 3): the `plan_prefetch` + dequant + `apply_prefetch_results`
+        /// Direct Stage-1-equivalence regression: the `plan_prefetch` + dequant + `apply_prefetch_results`
         /// path must leave a cache in EXACTLY the same bookkeeping state
         /// (`slot_owner`, `expert_to_slot`, `slot_touched`, `slot_ready`,
         /// LRU order, hit/miss/eviction counters) as calling `resolve()`
@@ -24946,11 +25390,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // ===================================================================
-        // Tester suite (issue #171): mutation-sensitive correctness tests for
-        // the lm_head two-stage block-top-k path. See
-        // ../architect/design_spec.md (Test Plan) and
-        // ../implementer/impl_notes.md. Results + mutation-sensitivity
-        // evidence: ../tester/test_report.md.
+        // Mutation-sensitive correctness tests for
+        // the lm_head two-stage block-top-k path (issue #171).
         // ===================================================================
 
         /// Pure unit test for the route gate (no GPU). Design-spec "Routing
@@ -25086,7 +25527,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             idx
         }
 
-        /// Adversarial distribution from `design_spec.md` Test Plan §3: every
+        /// Adversarial distribution: every
         /// global top-K token clusters inside ONE Stage-1 tile. Proves Stage 1
         /// emits a true per-tile top-`local_k`, not merely a per-tile argmax
         /// or an approximate/truncated local ranking — a distribution where
@@ -25227,16 +25668,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Bypass-sensitive production-path test (design_spec.md Test Plan
-        /// §6): poisons the persistent logits buffer with a sentinel bit
+        /// Bypass-sensitive production-path test: poisons the persistent
+        /// logits buffer with a sentinel bit
         /// pattern, runs the compact greedy route, and asserts the sentinel
         /// survives untouched — proving the full `[vocab_size]` GEMV never
         /// wrote to it, i.e. Stage 1/Stage 2 actually ran instead of the
         /// full-logit path silently computing everything and discarding the
         /// extra values.
         ///
-        /// MUTATION-SENSITIVE: see test_report.md for the reverse-apply
-        /// proof — disabling the Stage-1/2 early return in
+        /// MUTATION-SENSITIVE: disabling the Stage-1/2 early return in
         /// `encode_final_head` (forcing every route through the full-logit
         /// GEMV) flips both the sentinel-buffer assertion below AND the
         /// `out.is_empty()` assertion.
@@ -25478,8 +25918,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Acceptance test #1 (task order item 7 / design_spec.md Test Plan
-        /// §4): greedy token agreement 100% vs. the full-logit path on
+        /// Acceptance test: greedy token agreement 100% vs. the full-logit path on
         /// \>=10,000 positions using the real Qwen3.5-0.8B checkpoint.
         /// Overridable via `LATTICE_TEST_GREEDY_POSITIONS` for fast local
         /// iteration; defaults to 10,000 to satisfy the acceptance gate. KV
@@ -25930,6 +26369,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     GdnStateTrafficScope::Decode,
                     Some(&row),
                     None,
+                    crate::forward::signpost::Scope::NotDecode,
                 )
                 .logits;
 
@@ -25944,6 +26384,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     GdnStateTrafficScope::Decode,
                     Some(&row),
                     None,
+                    crate::forward::signpost::Scope::NotDecode,
                 )
                 .logits;
 
@@ -26052,9 +26493,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             prime(&mut state);
-            let logits_a = state.forward_step_injected_mrope(&row, 2, Some((&cos_a, &sin_a)));
+            let logits_a = state.forward_step_injected_mrope(
+                &row,
+                2,
+                Some((&cos_a, &sin_a)),
+                crate::forward::signpost::Scope::NotDecode,
+            );
             prime(&mut state);
-            let logits_b = state.forward_step_injected_mrope(&row, 2, Some((&cos_b, &sin_b)));
+            let logits_b = state.forward_step_injected_mrope(
+                &row,
+                2,
+                Some((&cos_b, &sin_b)),
+                crate::forward::signpost::Scope::NotDecode,
+            );
 
             let max_abs_diff = logits_a
                 .iter()
@@ -26116,9 +26567,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     let end = start + request.decoder_hidden_size;
                     let row = &request.post_merger_rows[start..end];
                     visual_row += 1;
-                    last_logits_real = state_real.forward_step_injected_mrope(row, pos, cos_sin);
+                    last_logits_real = state_real.forward_step_injected_mrope(
+                        row,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 } else {
-                    last_logits_real = state_real.forward_step_mrope(token_id, pos, cos_sin);
+                    last_logits_real = state_real.forward_step_mrope(
+                        token_id,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
             }
 
@@ -26263,7 +26724,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let mut bits_last = Vec::new();
             for (pos, &token_id) in input_ids.iter().enumerate() {
-                let a = state_mrope_none.forward_step_mrope(token_id, pos, None);
+                let a = state_mrope_none.forward_step_mrope(
+                    token_id,
+                    pos,
+                    None,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 let b = state_plain_bits.forward_step(token_id, pos);
                 assert_bits_equal(&a, &b, pos);
                 bits_last = a;
@@ -26278,7 +26744,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     physical_pos, state_plain_bits.session.kv_cache.seq_len,
                     "physical KV positions diverged before decode step {step}"
                 );
-                let a = state_mrope_none.forward_step_mrope(next_id, physical_pos, None);
+                let a = state_mrope_none.forward_step_mrope(
+                    next_id,
+                    physical_pos,
+                    None,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 let b = state_plain_bits.forward_step(next_id, physical_pos);
                 assert_bits_equal(&a, &b, input_ids.len() + step);
                 bits_last = a;
@@ -26429,9 +26900,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                         let end = start + request.decoder_hidden_size;
                         let row = &request.post_merger_rows[start..end];
                         visual_row += 1;
-                        last_logits = state.forward_step_injected_mrope(row, pos, cos_sin);
+                        last_logits = state.forward_step_injected_mrope(
+                            row,
+                            pos,
+                            cos_sin,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
                     } else {
-                        last_logits = state.forward_step_mrope(token_id, pos, cos_sin);
+                        last_logits = state.forward_step_mrope(
+                            token_id,
+                            pos,
+                            cos_sin,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
                     }
                 }
                 let mut all_ids = request.input_ids.clone();
@@ -26457,7 +26938,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 } else {
                     None
                 };
-                state.forward_step_mrope(first_id, physical_pos, cos_sin)
+                state.forward_step_mrope(
+                    first_id,
+                    physical_pos,
+                    cos_sin,
+                    crate::forward::signpost::Scope::NotDecode,
+                )
             };
 
             let logits_correct = manual_decode_logits(true);
@@ -26671,8 +27157,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Acceptance test #2 (task order item 7 / design_spec.md Test Plan
-        /// §5): top-k SET agreement 100% for K in {8,16,40,64} vs. the
+        /// Acceptance test: top-k SET agreement 100% for K in {8,16,40,64} vs. the
         /// full-logit CPU oracle, on real checkpoint positions (the
         /// clustered-tile adversarial case is covered separately by
         /// `lm_head_block_topk_clustered_single_tile_set_agreement`).
@@ -28911,7 +29396,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// old `Ok` shape would additionally have `stop_reason: None`, the
         /// invariant-violating result #856 fixes).
         ///
-        /// PR #915 review feedback (fix 4): honors
+        /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
         /// test, so a required Metal CI leg fails loud on a missing device
         /// instead of silently passing without ever exercising the guard.
@@ -29064,7 +29549,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// through prefill and sampling instead of erroring, so
         /// `result.is_err()` fails.
         ///
-        /// PR #915 review feedback (fix 4): honors
+        /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
         /// test, so a required Metal CI leg fails loud on a missing device
         /// instead of silently passing without ever exercising the guard.
@@ -33909,7 +34394,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// (`generate_streaming_with_prefix_cache_and_cancel`), before
         /// `_inner` is ever called.
         ///
-        /// PR #915 review feedback (fix 3): a fresh-state / `entry ==
+        /// A fresh-state / `entry ==
         /// None` assertion alone does not exercise the property that
         /// motivated putting the guard in the wrapper rather than
         /// `_inner` -- a *warmed* slot survives the rejection, because the
@@ -33920,10 +34405,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// assert both the exact error and that the pre-existing entry is
         /// unchanged afterward.
         ///
-        /// PR #915 review, second pass: the first version of this
-        /// test only compared `generic.token_ids` while claiming
+        /// Comparing only `generic.token_ids` does not prove
         /// "byte-identical" survival; `MetalCrossTurnPrefixEntry` also
-        /// carries `gdn_snapshot` and sparse `checkpoints`. This version
+        /// carries `gdn_snapshot` and sparse `checkpoints`. This test
         /// compares every field: `generic` (`kv_cache::CrossTurnPrefixEntry`,
         /// which derives `PartialEq`/`Eq` over `slot_id`, `metadata`,
         /// `token_ids`, `represented_len`, the `kv` handle -- itself a
@@ -34569,36 +35053,57 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // -----------------------------------------------------------------------
-        // Grammar fail-closed DECODE-LOOP integration tests (#611)
+        // Grammar DECODE-LOOP integration tests (#611 fail-closed + #1064
+        // completion-is-success)
         //
         // The three tests above only reach the post-prefill masking site: their
-        // fixture blocks every vocab entry from step 0, so `has_finite_logit`
-        // never survives long enough to exercise the second, structurally
-        // identical guard a few lines below in the decode loop of each function
-        // (`generate` :10502, `generate_streaming_with_cancel` :14821,
-        // `generate_streaming_with_prefix_cache_inner` :16975). Reverting any one
-        // of those three decode-loop guards left the three tests above green.
+        // fixture blocks every vocab entry from step 0. The decode loop of each
+        // function (`generate`, `generate_streaming_with_cancel`,
+        // `generate_streaming_with_prefix_cache_inner`) carries two distinct
+        // grammar contracts, each pinned by its own fixture below:
         //
-        // Fixture: a real (non-empty) single-byte vocab table plus the GBNF
-        // grammar `root ::= "a"`. Token id 0 in `single_char_vocab_tokenizer` is
-        // `'a'`, so the initial-state mask allows exactly that one token and
-        // blocks the other 31. After `'a'` is sampled and the grammar state
-        // advances past it, the PDA stack is empty AND `complete == true`
-        // (`GrammarState::can_accept_more()` is `false`), so the *next* mask
-        // blocks all 32 tokens — the fixed point this test targets is one step
-        // later than the prefill-blocked fixture above. `max_new_tokens: 2`
-        // is required so the loop actually reaches the decode iteration that
-        // hits the second mask; with `max_new_tokens: 1` the function would
-        // return successfully after the prefill token and never reach the
-        // decode-loop guard at all.
+        // 1. COMPLETION (#1064): GBNF `root ::= "a"`. Token id 0 in
+        //    `single_char_vocab_tokenizer` is `'a'`; after `'a'` is sampled and
+        //    the grammar advances past it, the state is complete with no legal
+        //    continuation (`is_complete_without_continuation` is true). That is
+        //    a SUCCESSFUL stop: the generated text must come back with
+        //    `stopped: true` / `StopReason::Grammar`, exactly like the CPU
+        //    paths. Each path checks completion at two sites, mirroring the
+        //    CPU `grammar_complete` / `grammar_complete_without_continuation`
+        //    placement: recorded immediately after the INITIAL advance (so a
+        //    zero-iteration decode loop — `max_new_tokens: 1` — cannot fall
+        //    through to Length) and re-checked after every IN-LOOP advance (so
+        //    completion on the final allowed token cannot either). Before
+        //    #1064 the Metal loops missed completion entirely, ran one more
+        //    mask (all 32 logits blocked), and misreported the completed
+        //    generation as GrammarConstraintBlocked; the first #1064 fix
+        //    probed only at the loop top, which no zero-iteration or
+        //    final-iteration run ever reaches, misreporting those as Length.
+        //    Each check is load-bearing: removing the post-initial-advance
+        //    recording fails the `max_one_token` tests below (Length, not
+        //    Grammar); removing a post-advance in-loop check fails that
+        //    path's `final_token` test the same way; removing the loop-top
+        //    `if stopped` break restores the GrammarConstraintBlocked
+        //    misclassification in the `max_new_tokens: 2` completion tests.
         //
-        // Mutation sensitivity: reverting the decode-loop `has_finite_logit`
-        // guard at the corresponding site leaves the all-`NEG_INFINITY` second
-        // mask in place, and the sampler's non-finite-max short-circuit then
-        // silently returns a token instead of failing — each assertion below
-        // fails instead of passing. Verified by temporarily reverse-applying
-        // the guard at each site (`touch`-ing the file so cargo rebuilds) and
-        // re-running these three tests; restored afterward.
+        // 2. DEAD END (#611): GBNF `root ::= "a" "!"`. `'!'` is not in the
+        //    32-entry vocab (`'a'..='z'`, `'A'..='F'`), so after `'a'` the
+        //    grammar requires a byte no token can supply: the state is NOT
+        //    complete and the next mask blocks all 32 tokens. That must remain
+        //    a hard `GrammarConstraintBlocked` error via the decode-loop
+        //    `has_finite_logit` guard; without that guard the sampler's
+        //    non-finite-max short-circuit silently returns a token instead
+        //    of failing.
+        //
+        // The dead-end fixture needs `max_new_tokens: 2` so the loop actually
+        // reaches the decode iteration after the prefill-derived token; with
+        // `max_new_tokens: 1` the function returns at the cap and never masks
+        // a second step. The completion fixtures deliberately run at BOTH
+        // caps: `max_new_tokens: 2` pins the loop-top break, and
+        // `max_new_tokens: 1` pins the post-initial-advance recording that a
+        // zero-iteration loop depends on. `root ::= "a" "a"` at
+        // `max_new_tokens: 2` pins the in-loop post-advance check (completion
+        // lands exactly on the final allowed token).
 
         /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
         /// order (`'a'..='z'` then `'A'..='F'`), so a `GrammarEngine` built
@@ -34617,10 +35122,42 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .collect()
         }
 
-        /// #611: `generate`'s DECODE-LOOP grammar-masking site
-        /// (:10502) must fail closed too, not just the post-prefill site.
+        /// Greedy grammar-constrained `GenerateConfig` over the single-char
+        /// vocab: `gbnf` and the token cap vary per test, everything else is
+        /// the shared deterministic-decode baseline the tests above use.
+        fn single_char_grammar_cfg(
+            gbnf: &str,
+            max_new_tokens: usize,
+        ) -> crate::model::qwen35_config::GenerateConfig {
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use std::sync::Arc;
+
+            let spec = GrammarSpec::Gbnf(gbnf.to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+            crate::model::qwen35_config::GenerateConfig {
+                max_new_tokens,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            }
+        }
+
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate`, not a constraint failure.
         #[test]
-        fn generate_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+        fn generate_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -34631,7 +35168,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -34663,21 +35199,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
-            assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard once the second step's mask blocks every \
-                 continuation; got {result:?}"
+            let output = result.expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "a",
+                "the completing token must be in the output text"
             );
+            assert_eq!(output.generated_tokens, 1);
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
         }
 
-        /// #611: `generate_streaming`'s DECODE-LOOP grammar-masking
-        /// site (`generate_streaming_with_cancel` :14821) must fail closed
-        /// too. Also asserts `on_token` is invoked at most once — the
-        /// fail-open bug this closes would otherwise emit a bogus second
-        /// token to the caller instead of erroring.
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate_streaming`, and the completing token's delta
+        /// reaches `on_token` exactly once.
         #[test]
-        fn generate_streaming_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+        fn generate_streaming_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -34688,7 +35224,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -34720,31 +35255,28 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let mut on_token_calls = 0u32;
-            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+            let mut streamed = String::new();
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
                 on_token_calls += 1;
+                streamed.push_str(delta);
                 true
             });
 
-            assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard via generate_streaming(); got {result:?}"
+            let output = result.expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(output.text, "a");
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(
+                on_token_calls, 1,
+                "exactly the completing token's delta reaches on_token"
             );
-            assert!(
-                on_token_calls <= 1,
-                "the decode-loop guard must fire before a second (bogus) token \
-                 ever reaches on_token; got {on_token_calls} calls"
-            );
+            assert_eq!(streamed, "a");
         }
 
-        /// #611: `generate_streaming_with_prefix_cache`'s
-        /// DECODE-LOOP grammar-masking site (inside
-        /// `generate_streaming_with_prefix_cache_inner` :16975) must fail
-        /// closed too, AND the public wrapper's error path must not save a
-        /// cache entry the decode-loop failure invalidated.
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate_streaming_with_prefix_cache` too.
         #[test]
-        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_blocking_second_token()
-         {
+        fn generate_streaming_with_prefix_cache_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -34755,7 +35287,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -34795,11 +35326,422 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 |_, _| true,
             );
 
+            let output = result
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "a");
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// One-token regression (#1064 follow-up): with `max_new_tokens: 1`
+        /// the decode loop runs zero iterations, so only the
+        /// post-initial-advance completion recording can classify the stop.
+        /// Before the fix `generate` fell through to `stopped: false` /
+        /// `StopReason::Length` for a grammar its only token had completed.
+        #[test]
+        fn generate_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let output = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "a",
+                "the completing token must be in the output text"
+            );
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// One-token regression (#1064 follow-up) via `generate_streaming`:
+        /// the completing token's delta must still reach `on_token` exactly
+        /// once, and the stop must classify as Grammar, not Length.
+        #[test]
+        fn generate_streaming_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let mut on_token_calls = 0u32;
+            let mut streamed = String::new();
+            let output = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    on_token_calls += 1;
+                    streamed.push_str(delta);
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error");
+
+            assert_eq!(output.text, "a");
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(
+                on_token_calls, 1,
+                "exactly the completing token's delta reaches on_token"
+            );
+            assert_eq!(streamed, "a");
+        }
+
+        /// One-token regression (#1064 follow-up) via
+        /// `generate_streaming_with_prefix_cache`.
+        #[test]
+        fn generate_streaming_with_prefix_cache_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let output = state
+                .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "a");
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// Final-token regression (#1064 follow-up): `root ::= "a" "a"` at
+        /// `max_new_tokens: 2` completes on the decode loop's LAST allowed
+        /// iteration, so no following loop top exists and only the in-loop
+        /// post-advance completion check can classify the stop. Before the
+        /// fix `generate` exited by count and misreported Length.
+        #[test]
+        fn generate_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let output = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "aa",
+                "both grammar-forced tokens must be in the output text"
+            );
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// Final-token regression (#1064 follow-up) via `generate_streaming`.
+        #[test]
+        fn generate_streaming_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let mut streamed = String::new();
+            let output = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    streamed.push_str(delta);
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error");
+
+            assert_eq!(output.text, "aa");
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(streamed, "aa");
+        }
+
+        /// Final-token regression (#1064 follow-up) via
+        /// `generate_streaming_with_prefix_cache`.
+        #[test]
+        fn generate_streaming_with_prefix_cache_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let output = state
+                .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "aa");
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// #611: a grammar that dead-ends mid-document (`root ::= "a" "!"`,
+        /// with `'!'` absent from the vocab) must still fail closed at
+        /// `generate`'s decode-loop `has_finite_logit` guard: the state is not
+        /// complete, so the all-blocked mask is a real constraint failure.
+        #[test]
+        fn generate_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
             assert!(
                 matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard via generate_streaming_with_prefix_cache(); \
-                 got {result:?}"
+                "a grammar whose only continuation byte has no vocab token must \
+                 fail closed at the decode-loop guard; got {result:?}"
+            );
+        }
+
+        /// #611: the same mid-document dead end must fail closed via
+        /// `generate_streaming` as well, with at most the first (legal) token
+        /// reaching `on_token`.
+        #[test]
+        fn generate_streaming_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let mut on_token_calls = 0u32;
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                on_token_calls += 1;
+                true
+            });
+
+            assert!(
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
+                "a mid-document grammar dead end must fail closed via \
+                 generate_streaming(); got {result:?}"
+            );
+            assert!(
+                on_token_calls <= 1,
+                "the decode-loop guard must fire before a second (bogus) token \
+                 ever reaches on_token; got {on_token_calls} calls"
+            );
+        }
+
+        /// #611: the same mid-document dead end must fail closed via
+        /// `generate_streaming_with_prefix_cache`, and the error path must not
+        /// leave a cache entry behind.
+        #[test]
+        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
+                "a mid-document grammar dead end must fail closed via \
+                 generate_streaming_with_prefix_cache(); got {result:?}"
             );
             assert!(
                 state.cross_turn_prefix_cache.entry.is_none(),
@@ -36452,7 +37394,7 @@ impl MetalQwen35State {
 
     /// **Unstable**: Metal generate stub; always errors without metal-gpu feature.
     ///
-    /// #856 follow-up (PR #915 review, first pass): this used to
+    /// #856 follow-up: this used to
     /// return an unconditional `Ok(GenerateOutput { .. })` with empty
     /// text/tokens for *every* prompt, including non-empty ones. Because
     /// `MetalQwen35State` is a public unit struct on this cfg (directly

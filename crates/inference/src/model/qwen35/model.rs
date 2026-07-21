@@ -242,6 +242,20 @@ impl Qwen35Model {
         ))
     }
 
+    /// **Unstable (train-backward)**: Number of layers actually present in the
+    /// loaded weight storage.
+    ///
+    /// [`Self::config_mut`] allows a caller to change `config.num_hidden_layers`
+    /// after load, independently of the weights this model was loaded with.
+    /// Callers deriving a layer range from `config().num_hidden_layers` must
+    /// check it against this value first — indexing past it inside
+    /// [`Self::gqa_layer_weights`]/[`Self::gdn_layer_weights`] panics rather
+    /// than returning `None`.
+    #[cfg(feature = "train-backward")]
+    pub fn loaded_layer_count(&self) -> usize {
+        self.weights.layers.len()
+    }
+
     /// **Unstable (train-backward)**: Return lm_head, final_norm, and embed slices.
     #[cfg(feature = "train-backward")]
     pub fn head_weights(&self) -> (&[f32], &[f32], &[f32]) {
