@@ -42,16 +42,22 @@ fi
 #   HTML comment       from <!-- to -->; renders invisibly.
 #   raw HTML block     <pre>, <script>, <style>, <textarea>; contents are raw
 #                      (not Markdown-parsed) until the matching close tag.
-#   other HTML block   a line that begins (before the section opens) with a
-#                      well-formed HTML tag masks to the next blank line, the
-#                      CommonMark end condition for a block-level tag. This is a
-#                      deliberately conservative, fail-closed catch for a heading
-#                      buried in block HTML such as <div>; it applies only before
-#                      a real heading is found, so it can never swallow the
-#                      heading that closes an already-open section. The tag match
-#                      requires a tag-name delimiter, so an autolink such as
-#                      <https://example.com> (a colon follows the name) is not
-#                      taken for a block and cannot hide a following heading.
+#   processing instr.  from <? to ?> (CommonMark HTML block type 3); raw.
+#   declaration        from <! and a letter (e.g. <!DOCTYPE) to > (type 4); raw.
+#   CDATA              from <![CDATA[ to ]]> (type 5); raw.
+#   other HTML block   a complete HTML tag ALONE on a line (only whitespace after
+#                      it) masks to the next blank line, the CommonMark type-7 end
+#                      condition. It applies only before the section opens, so it
+#                      can never swallow the heading that closes an already-open
+#                      section, and it requires real tag syntax after the name, so
+#                      an autolink such as <https://example.com> (a colon follows
+#                      the name) and inline HTML on a line with prose such as
+#                      <span>note</span> text are NOT masked, and a heading after
+#                      them renders normally. A block tag carrying trailing content
+#                      on its own opening line (<div>text) is the one heading-hiding
+#                      construct left unmasked; hiding a disposition that way is
+#                      implausible for an internal gate, so it is a documented
+#                      boundary rather than modeled.
 # A trailing carriage return is stripped before any state transition, so a fence
 # or tag delimiter on a CRLF line still matches. Content inside a masked region
 # that opens AFTER a visible bench-compare heading still counts as section
@@ -91,6 +97,21 @@ SECTION=$(printf '%s' "$BODY" | awk '
       if (found) print line
       next
     }
+    if (in_cdata) {
+      if (index(line, "]]>") > 0) in_cdata = 0
+      if (found) print line
+      next
+    }
+    if (in_decl) {
+      if (index(line, ">") > 0) in_decl = 0
+      if (found) print line
+      next
+    }
+    if (in_pi) {
+      if (index(line, "?>") > 0) in_pi = 0
+      if (found) print line
+      next
+    }
 
     if (match(line, /^ {0,3}(`{3,}|~{3,})/)) {
       run = substr(line, RSTART, RLENGTH); sub(/^ +/, "", run)
@@ -110,7 +131,22 @@ SECTION=$(printf '%s' "$BODY" | awk '
       if (found) print line
       next
     }
-    if (!found && match(tolower(line), "^ {0,3}</?[a-zA-Z][a-zA-Z0-9-]*([ \t/>]|$)")) {
+    if (match(line, /^ {0,3}<!\[CDATA\[/)) {
+      if (index(line, "]]>") == 0) in_cdata = 1
+      if (found) print line
+      next
+    }
+    if (match(line, /^ {0,3}<![a-zA-Z]/)) {
+      if (index(line, ">") == 0) in_decl = 1
+      if (found) print line
+      next
+    }
+    if (match(line, /^ {0,3}<\?/)) {
+      if (index(line, "?>") == 0) in_pi = 1
+      if (found) print line
+      next
+    }
+    if (!found && match(tolower(line), "^ {0,3}</?[a-zA-Z][a-zA-Z0-9-]*([ \t]+[^>]*)?/?>[ \t]*$")) {
       in_html_block = 1
       next
     }
@@ -146,7 +182,7 @@ CONTENT=$(printf '%s' "$BODYTEXT" | tr -d '[:space:]')
 # alternative is anchored on both sides by a portable word boundary
 # ([^[:alnum:]_], NOT the GNU-only \b) so a marker cannot fire as the prefix of
 # a longer word: unanchored "no change" matched inside "no changelog" and let a
-# body with no disposition pass (#1058 round-2 review). The boundary keeps the
+# body with no disposition pass. The boundary keeps the
 # expression portable across GNU grep (the CI runner) and BSD grep (a local
 # pre-PR run on macOS); grep -qi tests presence only, so consuming a boundary
 # char is harmless.

@@ -14,7 +14,7 @@ name: bench evidence
 #
 # Trusted-enforcement shape. This runs as pull_request_target, so the workflow
 # definition and the checker script both come from the BASE branch, never the PR's
-# tree — a PR cannot edit this job (or scripts/bench_disposition_check.sh) to exit 0
+# tree. A PR cannot edit this job (or scripts/bench_disposition_check.sh) to exit 0
 # and forge the named check. It checks out only the base ref and runs no code from the
 # PR: the PR body and file list are read through the GitHub API, and the body is piped
 # as inert text to the base-controlled checker. Nothing from the PR executes here, so

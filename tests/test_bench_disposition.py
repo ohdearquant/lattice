@@ -86,7 +86,7 @@ class BenchDispositionCheck(unittest.TestCase):
         # The workflow comment promises a doc-only change satisfies the gate with
         # a one-line N/A; that promise must actually hold.
         body = (
-            "## bench-compare\nN/A — doc-only change, no code paths touched.\n## End\ny"
+            "## bench-compare\nN/A, doc-only change, no code paths touched.\n## End\ny"
         )
         self.assertTrue(has_disposition(body))
 
@@ -96,7 +96,7 @@ class BenchDispositionCheck(unittest.TestCase):
         self.assertFalse(has_disposition("## bench-compare\nfoo bar baz\n## End\nx"))
 
     def test_marker_prefix_of_longer_word_does_not_satisfy(self):
-        # #1058 round-2 collision: an unanchored "no change" marker matched the
+        # Marker anchoring: an unanchored "no change" marker matched the
         # prefix of "no changelog", letting a body with no disposition pass. The
         # marker must be word-boundary anchored, so this body (no disposition,
         # no N/A, under the length floor) must fail.
@@ -298,6 +298,57 @@ class BenchDispositionCheck(unittest.TestCase):
             "## Test plan\ny"
         )
         self.assertTrue(has_disposition(body))
+
+
+    def test_inline_html_span_does_not_false_reject(self):
+        # An inline HTML element on a line with prose (a badge, link, or styled
+        # note at the start of a line) is paragraph content, not an HTML block:
+        # the tag is not alone on the line. The following ATX heading renders
+        # normally and must open the section. A too-broad HTML-block predicate
+        # masked this and wrongly rejected a visible disposition.
+        body = (
+            "<span>Measured on macOS.</span>\n"
+            "## bench-compare disposition\n"
+            "N/A\n"
+        )
+        self.assertTrue(has_disposition(body))
+
+    def test_processing_instruction_heading_does_not_satisfy(self):
+        # A heading inside a <? ... ?> processing instruction is a raw HTML block
+        # (CommonMark type 3) and does not render as a heading. Content clears the
+        # length floor, so this proves masking, not a length failure.
+        body = (
+            "<?\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "?>\n"
+            "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_cdata_heading_does_not_satisfy(self):
+        # A heading inside a <![CDATA[ ... ]]> block is raw (CommonMark type 5)
+        # and does not render as a heading.
+        body = (
+            "<![CDATA[\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            "]]>\n"
+            "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_declaration_heading_does_not_satisfy(self):
+        # A heading inside a <! ... > declaration is raw (CommonMark type 4) and
+        # does not render as a heading.
+        body = (
+            "<!DOCTYPE bench\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\n"
+            ">\n"
+            "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
 
 
 if __name__ == "__main__":
