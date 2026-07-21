@@ -32,6 +32,8 @@ fn cosine_kernel() -> CosineKernel {
     *COSINE_KERNEL.get_or_init(resolve_cosine_kernel)
 }
 
+// inline(never): out-of-line cold resolver keeps the OnceLock cached fast-path frameless (#1097).
+#[inline(never)]
 fn resolve_cosine_kernel() -> CosineKernel {
     let config = simd_config();
 

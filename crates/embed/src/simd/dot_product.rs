@@ -30,6 +30,8 @@ pub fn resolved_dot_product_kernel() -> DotKernel {
     *DOT_PRODUCT_KERNEL.get_or_init(resolve_dot_product_kernel)
 }
 
+// inline(never): out-of-line cold resolver keeps the OnceLock cached fast-path frameless (#1097).
+#[inline(never)]
 fn resolve_dot_product_kernel() -> DotKernel {
     let config = simd_config();
 
@@ -110,6 +112,8 @@ pub fn dot_product_batch4(
     resolved_dot_product_batch4_kernel()(query, c0, c1, c2, c3)
 }
 
+// inline(never): out-of-line cold resolver keeps the OnceLock cached fast-path frameless (#1097).
+#[inline(never)]
 fn resolve_dot_product_batch4_kernel() -> DotBatch4Kernel {
     let config = simd_config();
 

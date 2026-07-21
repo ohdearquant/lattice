@@ -580,6 +580,8 @@ pub fn resolved_i8_dot_kernel() -> I8DotKernel {
     *I8_DOT_KERNEL.get_or_init(resolve_i8_dot_kernel)
 }
 
+// inline(never): out-of-line cold resolver keeps the OnceLock cached fast-path frameless (#1097).
+#[inline(never)]
 fn resolve_i8_dot_kernel() -> I8DotKernel {
     let config = simd_config();
 
