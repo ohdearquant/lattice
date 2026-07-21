@@ -33,7 +33,8 @@ pub enum CacheType {
     #[default]
     F32,
     /// Store each KV token vector as symmetric int8 values with one f32 scale.
-    /// The scale is `max(abs(vector)) / 127`, and zero vectors use scale `1`.
+    /// The scale is `max(abs(vector)) / 127`, falling back to `max(abs(vector))`
+    /// when that quotient underflows to zero. Zero vectors use scale `1`.
     Q8,
 }
 
@@ -350,6 +351,34 @@ impl Q8PagePool {
             })?;
         let _ = free_list_bytes;
 
+        // The two allocation checks above both pass when max_pages is zero, so
+        // neither constrains the per-page geometry. `bytes_per_page` and
+        // `total_memory_bytes` still evaluate that geometry after construction,
+        // and this is the fallible constructor whose documented contract is to
+        // return InvalidInput rather than let arithmetic overflow. The F32 path
+        // gets the equivalent guarantee from `try_total_bytes`.
+        let scale_bytes_per_page = scales_per_page
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "Q8 scales_per_page ({scales_per_page}) * {} overflows usize",
+                    std::mem::size_of::<f32>()
+                ))
+            })?;
+        let bytes_per_page = values_per_page
+            .checked_add(scale_bytes_per_page)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "Q8 values_per_page ({values_per_page}) + scale bytes \
+                     ({scale_bytes_per_page}) overflows usize"
+                ))
+            })?;
+        max_pages.checked_mul(bytes_per_page).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "max_pages ({max_pages}) * Q8 bytes_per_page ({bytes_per_page}) overflows usize"
+            ))
+        })?;
+
         Ok(Self {
             data: vec![0; data_len],
             scales: vec![1.0; scales_len],
@@ -388,7 +417,20 @@ impl Q8PagePool {
             assert!(value.is_finite(), "Q8 KV input must be finite");
             max.max(value.abs())
         });
-        let scale = if abs_max == 0.0 { 1.0 } else { abs_max / 127.0 };
+        // `abs_max / 127.0` rounds to zero once abs_max falls below roughly
+        // 1.8e-43, which is representable but 127 times smaller than the
+        // smallest representable scale. Dividing by that zero yields infinity,
+        // clamps to 127, and reads the whole vector back as zero, so a nonzero
+        // input silently vanishes. Falling back to abs_max keeps the scale
+        // representable; the vector then quantizes onto {-1, 0, 1} with error
+        // bounded by abs_max / 2, which is the same relative accuracy the
+        // normal range gets.
+        let scale = if abs_max == 0.0 {
+            1.0
+        } else {
+            let scale = abs_max / 127.0;
+            if scale == 0.0 { abs_max } else { scale }
+        };
         let value_base = page_idx * self.values_per_page + value_offset;
         let scale_idx = page_idx * self.scales_per_page + scale_offset;
         self.scales[scale_idx] = scale;
@@ -1574,6 +1616,99 @@ mod tests {
             }
         }
         assert!(observed_quantization_error);
+    }
+
+    #[test]
+    fn paged_q8_preserves_subnormal_vectors() {
+        // `abs_max / 127.0` underflows to zero below roughly 1.8e-43, which
+        // made the store divide by zero and read the whole vector back as zero.
+        // These are valid finite inputs the Q8 contract accepts, so a nonzero
+        // input must come back nonzero.
+        let config = make_config(2);
+        let kv_dim = config.kv_dim();
+        let mut cache = PagedKVCache::try_with_cache_type(config, CacheType::Q8)
+            .expect("valid Q8 config must succeed");
+
+        let smallest = f32::from_bits(1);
+        let mut k = vec![0.0f32; kv_dim];
+        k[0] = smallest;
+        k[1] = -smallest;
+        let v: Vec<f32> = k.iter().map(|value| value * 4.0).collect();
+        assert!(k.iter().all(|value| value.is_finite()));
+        assert!(k[0] > 0.0 && k[1] < 0.0);
+
+        cache.append_kv_layer(0, &k, &v);
+        cache.append_kv_layer(1, &k, &v);
+        cache.advance();
+
+        let mut gathered_k = vec![0.0; kv_dim];
+        let mut gathered_v = vec![0.0; kv_dim];
+        cache.gather_k(0, &mut gathered_k);
+        cache.gather_v(0, &mut gathered_v);
+
+        assert!(
+            gathered_k[0] > 0.0,
+            "subnormal K vanished: {:?}",
+            &gathered_k[..2]
+        );
+        assert!(
+            gathered_k[1] < 0.0,
+            "subnormal K sign lost: {:?}",
+            &gathered_k[..2]
+        );
+        assert!(
+            gathered_v[0] > 0.0,
+            "subnormal V vanished: {:?}",
+            &gathered_v[..2]
+        );
+        assert!(gathered_k.iter().all(|value| value.is_finite()));
+        // The fallback scale is abs_max itself, so the surviving codes are
+        // {-1, 0, 1} and the error stays within half a step.
+        for (expected, actual) in k.iter().zip(&gathered_k) {
+            assert!((expected - actual).abs() <= smallest);
+        }
+    }
+
+    #[test]
+    fn paged_q8_try_rejects_overflowing_page_bytes() {
+        // Zero pages makes both backing allocations empty, so neither
+        // allocation check constrains the per-page geometry, while
+        // `bytes_per_page` still evaluates it. The fallible constructor
+        // promises InvalidInput rather than overflowing arithmetic, and the
+        // F32 path already delivers that through `try_total_bytes`.
+        let config = PagedKVCacheConfig {
+            page_size: 1,
+            max_pages: 0,
+            num_layers: 1,
+            num_kv_heads: (usize::MAX - 1) / 2,
+            head_dim: 1,
+            eviction: EvictionPolicy::None,
+        };
+        assert_eq!(config.try_floats_per_page().expect("fits"), usize::MAX - 1);
+
+        let err = PagedKVCache::try_with_cache_type(config.clone(), CacheType::Q8)
+            .expect_err("overflowing per-page byte count must be rejected");
+        assert!(
+            matches!(err, InferenceError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+        // The F32 branch is the behaviour being matched, not a second bug.
+        assert!(matches!(
+            PagedKVCache::try_with_cache_type(config, CacheType::F32),
+            Err(InferenceError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "Q8 KV input must be finite")]
+    fn paged_q8_rejects_non_finite_input() {
+        let config = make_config(2);
+        let kv_dim = config.kv_dim();
+        let mut cache = PagedKVCache::try_with_cache_type(config, CacheType::Q8)
+            .expect("valid Q8 config must succeed");
+        let mut k = vec![0.5f32; kv_dim];
+        k[kv_dim - 1] = f32::NAN;
+        cache.append_kv_layer(0, &k, &vec![0.5; kv_dim]);
     }
 
     #[test]
