@@ -132,11 +132,28 @@ jobs:
           EVENT_BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
+          # --verify --end-of-options on the two FREE-FORM inputs only.
+          # workflow_dispatch hands these straight from the user, and git accepts
+          # refnames beginning with a dash, so without the terminator a valid ref
+          # like `-perf-baseline-refresh` is read as an option.
+          #
+          # --verify is load-bearing, not decoration: `git rev-parse
+          # --end-of-options <ref>` ECHOES the literal string `--end-of-options`
+          # as an output line alongside the SHA, so command substitution would
+          # capture a two-line value and hand a corrupted ref downstream. Verified
+          # against a real dash-led branch. --verify selects the single-object
+          # output mode (as --short does in bench-compare.sh) and additionally
+          # fails closed on an unresolvable input instead of echoing it back.
+          #
+          # The two rev-parse calls below consume a github-supplied SHA and a
+          # derived SHA, which cannot take that shape, so they are deliberately
+          # left alone. bench-compare.sh protects its own four ref-consuming call
+          # sites; this step resolves these inputs before reaching the script.
           HEAD_REF="${IN_HEAD:-HEAD}"
-          HEAD_SHA=$(git rev-parse "$HEAD_REF")
+          HEAD_SHA=$(git rev-parse --verify --end-of-options "$HEAD_REF")
 
           if [ -n "$IN_BASE" ]; then
-            BASE_SHA=$(git rev-parse "$IN_BASE")
+            BASE_SHA=$(git rev-parse --verify --end-of-options "$IN_BASE")
           elif [ -n "${EVENT_BEFORE:-}" ] \
                && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
                && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then

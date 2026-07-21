@@ -618,7 +618,7 @@ def run_selftest() -> int:
                 )
 
     # --require-measurements: the lane must not read "nothing measured" as
-    # "nothing regressed" (#1105 review). bench-compare.sh creates the criterion
+    # "nothing regressed" (#1105). bench-compare.sh creates the criterion
     # directory itself before benching, and the cargo pipelines swallow bench
     # failures, so an EMPTY-but-present root is the realistic failure shape.
     with tempfile.TemporaryDirectory() as td:
