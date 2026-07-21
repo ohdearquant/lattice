@@ -6,6 +6,14 @@ generation output (token IDs) and reports speed.
 
 Exit codes: 0 = pass, 1 = parity failure, 2 = setup error.
 
+A lattice binary that exits non-zero, emits unparseable output, or never
+finishes is a lattice failure and exits 1 on both backends. It is not a setup
+error: reporting it as one tells whoever reads the run that their environment
+is broken when what actually broke is the thing under test. 2 is reserved for
+everything that stops this script from producing a comparison at all, which
+includes anything wrong with the reference side, since a bad reference is
+never evidence about lattice.
+
 Args:
   --backend {cpu,metal}  which lattice binary/path to exercise (default: cpu).
                           "cpu" runs qwen35_generate and parses its legacy text
@@ -330,9 +338,19 @@ def run_lattice(prompt: str, max_tokens: int) -> dict:
     ]
 
     t0 = time.time()
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=300
-    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        # Mirrors run_lattice_metal: a lattice binary that never finishes is a
+        # lattice failure, in the same category as one that exits non-zero, and
+        # both reach main() as a None result. Letting the exception escape here
+        # would classify it as a setup error, which tells whoever reads the run
+        # that their environment is broken when what actually broke is the thing
+        # under test.
+        print("[lattice] FAILED (timeout)", file=sys.stderr)
+        return None
     elapsed = time.time() - t0
 
     if result.returncode != 0:
