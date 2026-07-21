@@ -18,11 +18,12 @@
 # gating is not the same as being enforced: bench-compare.sh discards its
 # gate's exit status, so `make bench-gate` is the only path whose FAIL
 # verdict becomes a non-zero exit. Both are manual/local today.
-# bench-update.yml does run the same targets at full resolution on main
-# weekly, but only to collect baselines — it makes no prior-baseline
-# comparison and takes no regression-specific fail or alert action, so a
-# demoted target's full-resolution regression coverage is a manual run until
-# #1105 lands the gate lane. Targets not listed here are classified gating in
+# bench-update.yml runs the same targets at full resolution on main, on
+# perf-path pushes and weekly, and saves the baselines. It publishes
+# historical trend comparisons including a "Worst step-regression" headline,
+# but does not invoke perf-bench-gate.py or fail on a regression. So a demoted
+# target has automated full-resolution REPORTING; what it lacks until #1105
+# lands is enforcement. Targets not listed here are classified gating in
 # quick mode.
 #
 # Demoting a target requires same-toolchain, same-commit A/A evidence in an

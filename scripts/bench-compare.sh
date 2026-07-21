@@ -56,13 +56,15 @@
 # further, so a filtered --full run classifies only the selected groups of
 # those two.
 #
-# Automation: bench-update.yml does run those targets at full resolution on
-# main weekly, but only to collect baselines. It neither compares against a
-# prior baseline nor invokes perf-bench-gate.py nor takes any
-# regression-specific fail or alert action; its ordinary job steps can of
-# course still fail on their own errors. No automated full-mode regression
-# gate exists yet (#1105 tracks it), so a demoted target's full-resolution
-# regression coverage today comes from manual runs.
+# Automation: bench-update.yml runs those targets at full resolution on main
+# — on every push touching the perf paths (which include embed's simd source
+# and bench) and weekly by cron — and saves the baselines. It does not invoke
+# perf-bench-gate.py and takes no regression-specific fail or alert action;
+# its ordinary job steps can of course still fail on their own errors. It is
+# not silent about regressions either: its README generator compares each
+# snapshot against its predecessor and publishes a "Worst step-regression"
+# headline. So full-resolution automation today is regression REPORTING, and
+# what is missing is ENFORCEMENT (#1105 tracks that lane).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

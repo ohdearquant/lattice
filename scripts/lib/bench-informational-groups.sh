@@ -29,9 +29,11 @@
 # turns a FAIL verdict into a non-zero exit. Both bench the same two targets
 # rather than the workspace's full bench set, and --full additionally honors
 # bench-compare.sh's BENCH_GROUPS_* filters. Both are manual/local today.
-# bench-update.yml is the one automated full-resolution job on main; it
-# collects baselines without comparing against a prior one and takes no
-# regression-specific fail or alert action (#1105 tracks the missing lane).
+# bench-update.yml is the automated full-resolution job on main: it saves
+# baselines and publishes historical trend comparisons, including a "Worst
+# step-regression" headline. It does not invoke perf-bench-gate.py and takes
+# no regression-specific fail action, so it reports rather than enforces
+# (#1105 tracks the missing enforcement lane).
 set -euo pipefail
 
 MANIFEST="${INFO_TARGETS_MANIFEST:-$(dirname "$0")/bench-quick-informational-targets.txt}"
