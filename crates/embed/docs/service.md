@@ -267,11 +267,23 @@ order and represents the `Generic` role. `embed_one` is a one-item convenience c
 an internal error if an implementation violates that cardinality contract rather than fabricating
 an empty vector.
 
-`embed_query` and `embed_passage` obtain a model instruction, prefix every text when one exists,
-then delegate to `embed`. The defaults cannot create role-separated cache entries by themselves:
-that behavior comes from `CachedEmbeddingService` overriding those methods and supplying its
-`Query` or `Passage` role tag. `EmbeddingRole::Generic` also has its own tag, so all three wrapper
-entry points receive distinct cache keys even when their resulting text is identical.
+`embed_with_role` is the single role entry point: it validates the caller's text against the
+published cap first, then prepends the model instruction, then delegates to `embed`. Validating
+before preparation is deliberate. The cap describes what the caller may submit, so charging the
+caller for the instruction bytes the service itself adds would reject text that is within the
+documented limit. `embed_query` and `embed_passage` are thin wrappers that call `embed_with_role`
+with the `Query` or `Passage` role, so all three role paths share one ordering decision instead of
+repeating it.
+
+That default cannot preserve the caller-text cap for an external implementation that enforces the
+exact cap inside its own `embed`: the prepared string reaches that `embed` already lengthened.
+Keeping `embed` the sole abstract method is a backward-compatibility choice on a published crate;
+an implementor that caps text should size that guard for the prepared length or override
+`embed_with_role` to reach its backend directly. Both in-crate implementors override it. The
+default also cannot create role-separated cache entries by itself: that behavior comes from
+`CachedEmbeddingService` supplying its role tag on the key. `EmbeddingRole::Generic` also has its
+own tag, so all three role paths receive distinct cache keys even when their resulting text is
+identical.
 
 `model_config` defaults to the model's native dimension. A service that has selected an MRL
 dimension overrides it so a caching wrapper hashes the actual output space, not merely the model
