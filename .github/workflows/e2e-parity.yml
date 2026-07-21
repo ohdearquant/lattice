@@ -125,7 +125,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       - name: Install model downloader
         run: pip install "huggingface_hub==1.20.1"
@@ -191,7 +196,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       # Step 1: install reference framework (HF transformers + torch CPU).
       # Pinned to the known-green reference set — the exact versions that
@@ -224,10 +234,15 @@ jobs:
         run: cargo build --release --bin qwen35_generate -p lattice-inference --features f16
 
       # Step 5: run parity check (HF first = warm machine, then lattice)
+      # The offline flags are belt to the script's local_files_only braces: any
+      # transformers path that still tries to resolve against the Hub fails
+      # loudly here instead of quietly fetching a reference nobody verified.
       - name: Run e2e parity check
         run: python3 scripts/e2e_parity_check.py
         env:
           E2E_REPORT_PATH: parity-report.md
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
 
       # Step 6: post results as PR comment
       - name: Post parity report
@@ -302,7 +317,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       - name: Install Python deps
         run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
@@ -332,6 +352,8 @@ jobs:
           LATTICE_METAL_PATH_PROOF: '1'
           E2E_MAX_TOKENS: '4'
           E2E_REPORT_PATH: metal-parity-report.md
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
 
       - name: Ensure Metal report exists
         if: always()
@@ -616,7 +638,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       # Only huggingface_hub is needed — lattice does the inference, so torch /
       # transformers (the reference framework) are not required for this gate.
@@ -714,7 +741,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       - name: Install Python deps
         run: pip install "huggingface_hub==1.20.1"
@@ -869,7 +901,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          key: hf-qwen35-0.8b-v1
+          # Derived from the provisioning action so the cache cannot outlive the
+          # thing it caches: bump the pinned revision or the expected digests and
+          # this key changes with them. A hand-bumped key is a step someone
+          # forgets, and a stale snapshot restored under a still-matching key is
+          # exactly what the exact-set check would then report as tampering.
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
 
       - name: Install Python deps
         run: pip install "huggingface_hub==1.20.1"
