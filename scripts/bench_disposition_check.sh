@@ -26,13 +26,29 @@ fi
 # Ubuntu runner default, silently ignores — turning the match case-sensitive).
 # The section runs until a heading at the same or shallower depth, so a
 # subheading under it counts as its content.
+#
+# A heading hidden inside a fenced code block or an HTML comment does NOT open
+# the section: a comment renders invisibly and a fence renders as literal code,
+# so counting either would let a PR satisfy a reviewer-facing gate with a
+# disposition no reviewer sees. Fence delimiters toggle a hidden state and are
+# themselves never headings; an HTML comment hides every line from its opening
+# <!-- through its closing -->. Content inside a fence that opens AFTER a visible
+# bench-compare heading still counts as section content, because a real bench
+# table is normally fenced; the hidden state suppresses only heading detection,
+# not membership in an already-open section.
 SECTION=$(printf '%s' "$BODY" | awk '
   function level(s) { if (match(s, /^#{1,6}[[:space:]]/)) { return RLENGTH - 1 } return 0 }
   {
-    lv = level($0)
+    line = $0
+    if (line ~ /^[[:space:]]*(```|~~~)/) { in_fence = !in_fence; if (found) print line; next }
+    was_in_comment = in_comment
+    if (in_comment) { if (line ~ /-->/) in_comment = 0 }
+    else if (line ~ /<!--/ && line !~ /-->/) { in_comment = 1 }
+    hidden = (in_fence || was_in_comment)
+    lv = hidden ? 0 : level(line)
     if (found && lv > 0 && lv <= start_lv) { exit }
-    if (!found && lv > 0 && tolower($0) ~ /bench-?compare/) { found = 1; start_lv = lv }
-    if (found) { print }
+    if (!found && lv > 0 && tolower(line) ~ /bench-?compare/) { found = 1; start_lv = lv }
+    if (found) { print line }
   }
 ')
 

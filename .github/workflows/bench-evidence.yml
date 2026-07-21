@@ -49,7 +49,10 @@ jobs:
     steps:
       - name: Check out the base ref (trusted) for the checker script
         if: github.event_name == 'pull_request_target'
-        uses: actions/checkout@v4
+        # Pinned to a full commit SHA: this is a pull_request_target job, so a
+        # moved or compromised tag would run in the trusted context before the
+        # checker does. SHA is actions/checkout v4 (the v4 tag as of 2026-07-20).
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
@@ -78,11 +81,15 @@ jobs:
           fi
 
           # Changed files from the API (base-controlled, computed by GitHub from the
-          # diff), never from a checked-out PR script. ADR-058 covers the whole of
-          # crates/inference and crates/embed, not just their src/ dirs: a Cargo.toml
-          # opt-level or dependency bump, or a benches/ change, moves performance too. A
-          # doc-only change under those crates satisfies the gate with a one-line N/A.
-          CHANGED=$(gh api "repos/${REPO}/pulls/${PR}/files" --paginate -q '.[].filename')
+          # diff), never from a checked-out PR script. Both the new path and, for a
+          # rename, the previous path are emitted (previous_filename // empty): a file
+          # renamed OUT of crates/inference or crates/embed still moved that crate's
+          # code, so the old path must be matched too, or the rename silently escapes
+          # the gate. ADR-058 covers the whole of crates/inference and crates/embed, not
+          # just their src/ dirs: a Cargo.toml opt-level or dependency bump, or a
+          # benches/ change, moves performance too. A doc-only change under those crates
+          # satisfies the gate with a one-line N/A.
+          CHANGED=$(gh api "repos/${REPO}/pulls/${PR}/files" --paginate -q '.[] | .filename, (.previous_filename // empty)')
           echo "Changed files:"
           echo "$CHANGED"
 

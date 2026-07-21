@@ -107,6 +107,54 @@ class BenchDispositionCheck(unittest.TestCase):
         )
         self.assertFalse(has_disposition(body))
 
+    def test_fenced_heading_does_not_satisfy(self):
+        # A bench-compare heading hidden inside a code fence renders as literal
+        # code, not a disposition section. It must not open the section even with
+        # enough content to clear the length floor; the section stays empty and
+        # the gate fails, so a disposition no reviewer sees cannot pass.
+        body = (
+            "## Summary\nx\n"
+            "```\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen\n"
+            "```\n"
+            "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_html_comment_heading_does_not_satisfy(self):
+        # Same bypass via a multi-line HTML comment: invisible when rendered, so
+        # a heading spanning from <!-- to --> must not open the section.
+        body = (
+            "## Summary\nx\n"
+            "<!--\n"
+            "## bench-compare disposition\n"
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen\n"
+            "-->\n"
+            "## Test plan\ny"
+        )
+        self.assertFalse(has_disposition(body))
+
+    def test_visible_heading_with_fenced_table_passes(self):
+        # A real disposition whose numbers sit in a fenced table. The fence opens
+        # AFTER the visible heading, so its content must still count as section
+        # content. The prose outside the fence is deliberately under the length
+        # floor and carries no marker, so this passes ONLY if the fenced rows are
+        # counted. It fails if fenced content stops being counted.
+        body = (
+            "## bench-compare disposition\n"
+            "Numbers:\n"
+            "```\n"
+            "group        before    after\n"
+            "rms_norm     39us      39us\n"
+            "gelu         41us      41us\n"
+            "silu         44us      44us\n"
+            "```\n"
+            "Overlapping intervals throughout.\n"
+            "## Test plan\nz"
+        )
+        self.assertTrue(has_disposition(body))
+
 
 if __name__ == "__main__":
     unittest.main()
