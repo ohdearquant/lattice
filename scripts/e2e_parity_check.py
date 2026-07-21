@@ -217,7 +217,16 @@ METAL_EXPECTED_DIVERGENCE: dict[str, str] = {
     LONG_PREFILL_PROMPT: "#535",
 }
 
-MAX_TOKENS = int(os.environ.get("E2E_MAX_TOKENS", "15"))
+# compare() reads this at call time, so it stays module scope. The parse must not
+# raise here: an exception at import ends the process on a traceback, and a
+# traceback exits 1, which this script reserves for lattice disagreeing with the
+# reference. A typo in the workflow is a setup error. Hold the raw value and let
+# main()'s preflight reject it as one.
+_MAX_TOKENS_RAW = os.environ.get("E2E_MAX_TOKENS", "15")
+try:
+    MAX_TOKENS: int | None = int(_MAX_TOKENS_RAW)
+except ValueError:
+    MAX_TOKENS = None
 
 # LATTICE_BIN default depends on --backend (chat_metal for metal, qwen35_generate
 # for cpu), but argparse only runs inside main(). An explicit LATTICE_BIN env var
@@ -623,14 +632,27 @@ def main() -> int:
             else "target/release/qwen35_generate"
         )
 
+    # Config first, since it needs no filesystem and its diagnosis is exact. A
+    # non-positive budget is rejected rather than run: zero tokens compares two
+    # empty sequences, which reports as a parity failure and sends a workflow
+    # typo to whoever is on the hook for a lattice regression.
+    if MAX_TOKENS is None or MAX_TOKENS < 1:
+        print(
+            f"error: E2E_MAX_TOKENS must be a positive integer, got "
+            f"{_MAX_TOKENS_RAW!r}",
+            file=sys.stderr,
+        )
+        return 2
+
     if not os.path.isfile(LATTICE_BIN):
         print(f"error: lattice binary not found at {LATTICE_BIN}", file=sys.stderr)
         return 2
     if not os.path.isdir(MODEL_DIR):
         print(f"error: model dir not found at {MODEL_DIR}", file=sys.stderr)
         return 2
-    # A reference snapshot carrying pickle weights is a provisioning problem,
-    # so it belongs here with the other setup validation and exits 2. Raising it
+
+    # A reference snapshot carrying pickle weights is a provisioning problem, so
+    # it belongs here with the other setup validation and exits 2. Raising it
     # from the loader instead would surface as exit 1, which this script defines
     # as a parity failure, and would file a poisoned reference against lattice.
     # rglob, not glob: transformers resolves sharded and subfoldered weights, so
@@ -719,8 +741,19 @@ def main() -> int:
     print(report)
 
     if REPORT_PATH:
-        with open(REPORT_PATH, "w") as f:
-            f.write(report)
+        # A run whose report cannot be written is a broken run, not a verdict
+        # about lattice. Letting the OSError propagate would exit 1 and label an
+        # unwritable output path a parity failure, including on a run where every
+        # prompt matched.
+        try:
+            with open(REPORT_PATH, "w") as f:
+                f.write(report)
+        except OSError as e:
+            print(
+                f"error: could not write report to {REPORT_PATH}: {e}",
+                file=sys.stderr,
+            )
+            return 2
 
     fails = sum(1 for r in results if not r["pass"] and not r.get("xfail_issue"))
     known = sum(1 for r in results if not r["pass"] and r.get("xfail_issue"))
@@ -751,4 +784,20 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Exit 1 means one thing here: lattice and the reference were both produced
+    # and disagreed. Anything else that stops this script is a problem with the
+    # harness or its inputs, and an uncaught exception would otherwise inherit
+    # the interpreter's exit code of 1 and be read as a lattice regression. The
+    # traceback still prints, so nothing is hidden by classifying it as setup.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+        print(
+            "error: parity harness aborted; this is a harness or setup failure, "
+            "not a lattice parity result",
+            file=sys.stderr,
+        )
+        sys.exit(2)
