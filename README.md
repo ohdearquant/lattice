@@ -560,7 +560,7 @@ cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode
 ### Context scaling (Qwen3.5-0.8B)
 
 ```bash
-./scripts/bench_context_scaling.sh
+uv run --with mlx-lm python3 scripts/bench_decode_harness.py run --profile context_scaling --allow-missing-engine
 ```
 
 Performance depends on hardware, model size, batch size, and sequence length. Run benchmarks

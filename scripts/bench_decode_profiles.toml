@@ -11,21 +11,21 @@
 # Every engine gets its own `[[profiles.<name>.engines]]` table -- an
 # ordered array, not a flat name list -- because the legacy scripts this
 # harness consolidates give each engine its own warmup shape (e.g. only
-# MLX warms up in `bench_apples_to_apples.sh`, once, at 8 tokens, before
+# MLX warms up in `legacy apples-to-apples consumer`, once, at 8 tokens, before
 # the N1/N2 loop), its own MEASURED call shape (see below), and, for the
-# Q4/Q8 comparison in `bench_q4_apples.sh`, a different quantization per
+# Q4/Q8 comparison in `legacy Q4 comparison consumer`, a different quantization per
 # engine within one profile (Lattice Q4, MLX Q4, Ollama Q8 as reference
 # only). A warmup is an explicit pre-window batch: `warmup_repeats` calls
 # at `warmup_tokens` completion tokens run ONCE per engine, entirely
 # before that engine's measured calls -- never once per window -- so
-# `bench_apples_precise.sh`'s "warm twice at N2=512 before both windows"
-# and `bench_context_scaling.sh`'s "warm once at 4 tokens before the
+# `legacy precise apples-to-apples consumer`'s "warm twice at N2=512 before both windows"
+# and `legacy context-scaling consumer`'s "warm once at 4 tokens before the
 # baseline/comparison loop" are both exactly representable, including
-# `bench_compare_1k.py`'s distinct per-engine warmup prompts via
+# `legacy agentic consumer`'s distinct per-engine warmup prompts via
 # `warmup_prompt`.
 #
 # `windows`/`measured_repeats` alone are NOT always sufficient to
-# represent an engine's measured shape: `bench_compare_1k.py` has THREE
+# represent an engine's measured shape: `legacy agentic consumer` has THREE
 # different measured shapes in one profile (Lattice: window-major
 # `[1 x R, 100 x R]`, the default derived from `windows`; Ollama: ONE
 # 100-token call per repeat, yielding both a window=1 and a window=100
@@ -38,7 +38,7 @@
 # missing/undeclared/duplicate windows are all rejected.
 #
 # The MEASURED `prompt` is ALSO not always uniform across engines:
-# `bench_compare_1k.py` needs Lattice/MLX to receive a tokenizer-padded
+# `legacy agentic consumer` needs Lattice/MLX to receive a tokenizer-padded
 # prompt and Ollama to receive a DIFFERENT character-count-heuristic
 # prompt for the same nominal context. `measured_prompt` on an engine
 # group overrides `profile.prompt` for that engine's measured calls only
@@ -46,12 +46,9 @@
 # string is what is sent to the adapter and what the raw observation's
 # `prompt_hash` records, never a placeholder.
 #
-# This file intentionally defines no profiles yet. The five live consumers
-# (`bench_apples_to_apples.sh`, `bench_apples_precise.sh`, `bench_q4_apples.sh`,
-# `bench_context_scaling.sh`, `bench_compare_1k.py`) are migrated onto
-# profiles defined here one script per PR (issue #813 step 2), each PR
-# proving old-vs-new raw-observation equivalence under the legacy script's
-# exact parameters before it is added below.
+# The five former consumers are represented below as named profiles. Their
+# migration tests preserve the prior windows, repeats, warmups, prompts, and
+# per-engine call ordering.
 #
 # Schema (for reference; enforced by `bench_decode_harness.py:_parse_profile`):
 #   description              string, optional
@@ -72,7 +69,7 @@
 #                              then all repeats of measured_calls[1], ...;
 #                              repeat_major = one full pass through
 #                              measured_calls per repeat (MLX's alternating
-#                              bench_compare_1k.py shape)
+#                              legacy agentic consumer shape)
 #     measured_calls           list[table], optional; overrides the default
 #                              measured plan (one call per `windows` entry,
 #                              yields_windows=[that window]); flattened
@@ -101,11 +98,11 @@
 #   requested_prompt_tokens  int, optional
 #
 # Example (not a live profile -- illustrates the Q4/Q8-mixed shape from
-# bench_q4_apples.sh, with MLX's single pre-loop 8-token warmup from
-# bench_apples_to_apples.sh; uncomment and rename to activate):
+# legacy Q4 comparison consumer, with MLX's single pre-loop 8-token warmup from
+# legacy apples-to-apples consumer; uncomment and rename to activate):
 #
 # [profiles.example_q4_apples]
-# description = "example only, see bench_q4_apples.sh for the real profile"
+# description = "example only, see legacy Q4 comparison consumer for the real profile"
 # windows = [32, 256]
 # measured_repeats = 5
 # prompt = "The quick brown fox jumps over the lazy dog."
@@ -130,19 +127,19 @@
 # model = "qwen3.5-0.8b"
 # quantization = "q4"
 #
-# Example 2 (not a live profile -- illustrates bench_compare_1k.py's three
+# Example 2 (not a live profile -- illustrates legacy agentic consumer's three
 # distinct measured shapes AND its two distinct measured prompts: Lattice
 # window-major (the default, no measured_calls needed) and MLX
 # repeat-major both use the profile-wide tokenizer-padded `prompt`;
 # Ollama's one-call-yields-two-windows shape uses its OWN
 # `measured_prompt` override (a character-count-heuristic prompt for the
-# same nominal context, per bench_compare_1k.py's actual two-method
+# same nominal context, per legacy agentic consumer's actual two-method
 # prompt-building split -- NOT a placeholder an adapter reinterprets: the
 # harness sends this exact string and hashes it); uncomment and rename to
 # activate):
 #
 # [profiles.example_agentic]
-# description = "example only, see bench_compare_1k.py for the real profile"
+# description = "example only, see legacy agentic consumer for the real profile"
 # windows = [1, 100]
 # measured_repeats = 5
 # prompt = "<tokenizer-padded prompt for the target ctx length, shared by lattice/mlx>"
@@ -185,7 +182,7 @@ schema_version = 1
 
 [profiles]
 
-# bench_apples_to_apples.sh migration (issue #813 step 2, first script).
+# legacy apples-to-apples consumer migration (issue #813 step 2, first script).
 # Two profiles because the legacy script runs two independent tiers with
 # different engine sets and different lattice/mlx quantization: Q8
 # (lattice safetensors auto-quant, ollama registry default, mlx
@@ -195,7 +192,7 @@ schema_version = 1
 # missing-engine handling is not needed here since ollama was never
 # requested for Q4, not requested-and-unavailable).
 #
-# windows/measured_repeats/prompt are IDENTICAL to bench_apples_to_apples.sh's
+# windows/measured_repeats/prompt are IDENTICAL to legacy apples-to-apples consumer's
 # N1=32, N2=256, RUNS=5, and PROMPT. Neither lattice nor ollama gets a
 # harness-level warmup (the shell script issues no extra warmup call for
 # either); only mlx gets warmup_repeats=1/warmup_tokens=8, reproducing the
@@ -203,7 +200,7 @@ schema_version = 1
 # bench_decode_harness.py's own `test_heterogeneous_engine_schedule_exact_call_
 # sequence_and_identities`, which validates this identical shape).
 [profiles.apples_to_apples_q8]
-description = "bench_apples_to_apples.sh Q8 tier: lattice (Metal auto Q8) vs ollama vs mlx (private AMX reference)"
+description = "legacy apples-to-apples consumer Q8 tier: lattice (Metal auto Q8) vs ollama vs mlx (private AMX reference)"
 windows = [32, 256]
 measured_repeats = 5
 prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
@@ -229,7 +226,7 @@ model = "qwen3.5-0.8b"
 quantization = "q8"
 
 [profiles.apples_to_apples_q4]
-description = "bench_apples_to_apples.sh Q4 tier: lattice (QuaRot Q4) vs mlx Q4 (ollama has no Q4 variant, omitted)"
+description = "legacy apples-to-apples consumer Q4 tier: lattice (QuaRot Q4) vs mlx Q4 (ollama has no Q4 variant, omitted)"
 windows = [32, 256]
 measured_repeats = 5
 prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
@@ -248,7 +245,7 @@ warmup_tokens = 8
 model = "qwen3.5-0.8b"
 quantization = "q4"
 
-# bench_apples_precise.sh migration (issue #813 step 2). windows/prompt are
+# legacy precise apples-to-apples consumer migration (issue #813 step 2). windows/prompt are
 # IDENTICAL to the legacy script's N1=64/N2=512/PROMPT; measured_repeats=13
 # + warmup_repeats=2 (per engine, at N2=512 tokens) reproduce "15 runs total,
 # 2 warmup, 13 measured" for every engine (the legacy script warms every
@@ -258,7 +255,7 @@ quantization = "q4"
 # `trim=2` -- see SlopeResult.slope_ci95_legacy for why this is carried over
 # as a legacy heuristic, not corrected.
 [profiles.apples_precise]
-description = "bench_apples_precise.sh: reduced-noise edition, N1=64/N2=512, 13 measured + 2 warmup, trimmed mean"
+description = "legacy precise apples-to-apples consumer: reduced-noise edition, N1=64/N2=512, 13 measured + 2 warmup, trimmed mean"
 windows = [64, 512]
 measured_repeats = 13
 prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
@@ -286,15 +283,15 @@ warmup_tokens = 512
 model = "qwen3.5-0.8b"
 quantization = "q8"
 
-# bench_q4_apples.sh migration (issue #813 step 2). windows/measured_repeats/
+# legacy Q4 comparison consumer migration (issue #813 step 2). windows/measured_repeats/
 # prompt identical to the legacy script's N1=32/N2=256/RUNS=5/PROMPT; neither
 # lattice nor ollama gets a warmup (the script issues none for either), mlx
 # warms once at 8 tokens before its loop -- same shape as
-# apples_to_apples_q4, but this is bench_q4_apples.sh's OWN (separate,
+# apples_to_apples_q4, but this is legacy Q4 comparison consumer's OWN (separate,
 # pre-existing) reimplementation of that shape, migrated on its own profile
 # per the issue's "one script per PR" plan.
 #
-# DISCLOSED CORRECTION vs the legacy script: bench_q4_apples.sh set
+# DISCLOSED CORRECTION vs the legacy script: legacy Q4 comparison consumer set
 # BENCH_Q4_DIR/BENCH_TOKENIZER_DIR env vars when invoking bench_decode_ab,
 # but bench_decode_ab.rs never reads either of those names (only
 # LATTICE_MODEL_DIR/LATTICE_TOKENIZER_DIR) -- so the legacy script's lattice
@@ -303,12 +300,12 @@ quantization = "q8"
 # exercising the Q4 weights its own output labeled "Lattice Q4". This
 # profile's `lattice` engine group uses the model/dir mapping the adapter
 # actually wires to LATTICE_MODEL_DIR (qwen3.5-0.8b-q4, the plain-Q4
-# directory bench_q4_apples.sh named but never reached) -- a bug fix, not a
+# directory legacy Q4 comparison consumer named but never reached) -- a bug fix, not a
 # parameter change: windows/repeats/warmup are unchanged from the legacy
 # script, only the broken env-var name is corrected so "q4" observations are
 # actually Q4.
 [profiles.q4_apples]
-description = "bench_q4_apples.sh: quant-matched Q4 comparison, N1=32/N2=256/runs=5 (lattice model-dir env-var bug fixed, see comment above)"
+description = "legacy Q4 comparison consumer: quant-matched Q4 comparison, N1=32/N2=256/runs=5 (lattice model-dir env-var bug fixed, see comment above)"
 windows = [32, 256]
 measured_repeats = 5
 prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
@@ -333,7 +330,7 @@ warmup_tokens = 8
 model = "qwen3.5-0.8b"
 quantization = "q4"
 
-# bench_context_scaling.sh migration (issue #813 step 2). `windows` is the
+# legacy context-scaling consumer migration (issue #813 step 2). `windows` is the
 # fixed baseline N1=8 followed by the default CONTEXTS=(64 128 256) -- the
 # harness's own aggregate() always computes every later window's slope
 # against `windows[0]`, exactly reproducing "measure the N1 baseline once,
@@ -342,11 +339,11 @@ quantization = "q4"
 # gets a warmup (4 tokens, once, before the whole baseline+context loop);
 # lattice and ollama get none, matching the legacy script's per-engine
 # structure exactly. CONTEXTS/RUNS are runtime-overridable via the wrapper
-# script (scripts/bench_context_scaling.sh), which rebuilds an equivalent
+# script (the legacy context-scaling command), which rebuilds an equivalent
 # ProfileConfig with the requested windows/measured_repeats when either
 # environment variable is set, so this profile's values are the DEFAULTS.
 [profiles.context_scaling]
-description = "bench_context_scaling.sh: decode throughput vs context length, N1=8 baseline vs {64,128,256}"
+description = "legacy context-scaling consumer: decode throughput vs context length, N1=8 baseline vs {64,128,256}"
 windows = [8, 64, 128, 256]
 measured_repeats = 5
 prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a"
@@ -370,3 +367,49 @@ warmup_repeats = 1
 warmup_tokens = 4
 model = "qwen3.5-0.8b"
 quantization = "q8"
+
+# Agentic long-context profile. The adapter replaces the default prompt and
+# requested_prompt_tokens for --ctx at runtime; the values here define the
+# default 1000-token run. The schedule preserves the former consumer's three
+# engine-specific shapes: Lattice runs both windows window-major, Ollama gets
+# both timing components from one 100-token request, and MLX alternates the
+# two windows repeat-major. Stale external result files are never substituted.
+[profiles.agentic]
+description = "Long-context agentic workload: 1-token TTFT vs 100-token total"
+windows = [1, 100]
+measured_repeats = 5
+requested_prompt_tokens = 1000
+prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a wise old owl who knew many secrets. Every morning the sun rose over the mountains and cast long shadows across the quiet valley. "
+aggregation = "median"
+
+[[profiles.agentic.engines]]
+name = "lattice"
+warmup_repeats = 0
+model = "qwen3.5-0.8b"
+quantization = "q8"
+
+[[profiles.agentic.engines]]
+name = "ollama"
+warmup_repeats = 1
+warmup_tokens = 4
+warmup_prompt = "hi"
+model = "qwen3.5:0.8b"
+quantization = "q8"
+[[profiles.agentic.engines.measured_calls]]
+n_tokens = 100
+yields_windows = [1, 100]
+
+[[profiles.agentic.engines]]
+name = "mlx"
+warmup_repeats = 1
+warmup_tokens = 4
+warmup_prompt = "The quick brown fox jumps over the lazy dog. Once upon a time in a land far away, there lived a wise old owl who knew many secrets. Every morning the sun rose over the mountains and cast long shadows across the quiet valley. "
+model = "Qwen/Qwen3.5-0.8B"
+quantization = "bf16"
+measured_order = "repeat_major"
+[[profiles.agentic.engines.measured_calls]]
+n_tokens = 1
+yields_windows = [1]
+[[profiles.agentic.engines.measured_calls]]
+n_tokens = 100
+yields_windows = [100]

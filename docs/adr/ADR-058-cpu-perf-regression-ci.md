@@ -21,7 +21,7 @@ The decode hot path on Apple Silicon depends on tight CPU SIMD kernels (NEON ele
 2. Restoring the `-128` validation scan on the public `dot_product_i8` entry point cost a measurable percentage of int8 throughput before being moved behind a `_dispatch` indirection.
 3. Tightening the polynomial `exp` upper clamp from 88.72 → 88.0 — no measurable impact, but easy to imagine a similar change costing 5% of softmax throughput.
 
-The end-to-end decode bench (`scripts/bench_apples_to_apples.sh`) catches macro regressions but is too noisy to attribute them: on a busy M2 Max with 5–10 concurrent GPU-bench processes, lattice decode throughput swings by 25% (issue #77). We cannot use noisy end-to-end numbers as a merge gate.
+The end-to-end decode bench (`scripts/bench_decode_harness.py run --profile apples_to_apples_q8`) catches macro regressions but is too noisy to attribute them: on a busy M2 Max with 5–10 concurrent GPU-bench processes, lattice decode throughput swings by 25% (issue #77). We cannot use noisy end-to-end numbers as a merge gate.
 
 The GPU path cannot run on GitHub Actions runners (no Metal). But the CPU paths can — and they account for elementwise activations, normalization, the int8 embed path, decode attention reductions, and the entire CPU fallback for systems without GPU acceleration.
 
@@ -199,7 +199,7 @@ A `make bench-ci` target builds and runs the exact same matrix locally on the de
 
 - **2x bench wall time per PR** (build baseline + build current). Mitigation: `Swatinem/rust-cache` for deps; Criterion bench builds themselves are seconds, not minutes.
 - **Noise tolerance is real.** Even with a 10% threshold, ~5% of bench runs may flake-warn. The `bench-allow-regression` label and the warning band (5-10%) give an honest escape valve without weakening the hard gate.
-- **No Apple Silicon coverage in CI.** Metal GPU regressions and M-series-specific NEON behavior remain caught only by local `bench_apples_precise.sh` runs. This ADR explicitly does not solve the Apple Silicon CI problem — see Alternatives Considered §A3.
+- **No Apple Silicon coverage in CI.** Metal GPU regressions and M-series-specific NEON behavior remain caught only by local `scripts/bench_decode_harness.py run --profile apples_precise` runs. This ADR explicitly does not solve the Apple Silicon CI problem — see Alternatives Considered §A3.
 - **Bench shape is now part of the contract.** Renaming a Criterion bench group requires updating `perf-baselines` (it'll appear as a "new bench, no baseline" rather than a regression). Document this in `perf-baselines/README.md`.
 
 ### Risks
