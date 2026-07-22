@@ -61,7 +61,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - id: filter
@@ -111,8 +111,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: rustfmt, clippy
       - name: Pin the real toolchain bin on PATH
@@ -123,7 +123,7 @@ jobs:
         # later step (cache, clean, ci.sh) gets a working cargo. No-op on healthy
         # images and on Linux.
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-on-failure: true
       - name: Clean lattice crates (force rebuild, keep dep cache)
@@ -152,13 +152,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: clippy
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: feature-matrix
           cache-on-failure: true
@@ -188,6 +188,20 @@ jobs:
         run: cargo build -p lattice-inference --features wgpu-gpu
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
+      # `-p lattice-embed` is the only invocation that resolves lattice-embed's
+      # `lattice-inference` dependency features in isolation. Any --workspace
+      # command (including this job's own sibling steps and scripts/ci.sh's
+      # `cargo test --workspace`) also builds lattice-tune, whose Cargo.toml
+      # requests `lattice-inference/f16` unconditionally — feature unification
+      # then grants lattice-embed f16 for free regardless of what
+      # crates/embed/Cargo.toml itself declares. That is how the native/wasm
+      # dependency tables drifted apart silently before (#1094): every green
+      # --workspace run was testing a configuration the standalone crate never
+      # gets. Run this test target alone so it actually resolves the table a
+      # standalone `cargo build -p lattice-embed` (or `cargo install
+      # lattice-embed`, or the wasm/npm build) would get. See #1095.
+      - name: embed — f16 native dependency load guard (standalone, no workspace unification)
+        run: cargo test -p lattice-embed --test f16_feature_load_guard
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'
@@ -428,11 +442,11 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: bench-compile
           cache-on-failure: true
@@ -464,11 +478,11 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.93.1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@683cb613d4ff7d29ceb2fe421b81294b4319512a # 1.93.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: msrv
           cache-on-failure: true
@@ -485,13 +499,13 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: licenses + bans + sources (required)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check licenses bans sources
       - name: advisories (informational)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         continue-on-error: true
         with:
           command: check advisories
@@ -506,11 +520,11 @@ jobs:
     name: rustdoc-lint (informational)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: rustdoc-lint
           cache-on-failure: true
@@ -534,13 +548,13 @@ jobs:
     name: unwrap-in-lib-lint (informational)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: clippy
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: unwrap-in-lib-lint
           cache-on-failure: true
@@ -555,8 +569,8 @@ jobs:
     name: typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: crate-ci/typos@v1.48.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
 
   # Cheap ubuntu workflow/config lint. Catches malformed expressions, unknown
   # contexts/inputs, shellcheck-level issues, and changed-file range regressions
@@ -566,8 +580,8 @@ jobs:
     name: actionlint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: raven-actions/actionlint@v2.2.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
         with:
           version: '1.7.12'
       - name: merge-queue config tests
@@ -595,8 +609,8 @@ jobs:
     name: decode-harness-unit-tests (no engine)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
       - name: python3 tests/test_bench_decode_harness.py
@@ -641,15 +655,15 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: semver-checks
       # metal-gpu does not compile on Linux and must stay off; default-features
       # keeps the check to each crate's own `[features] default = [...]` set
       # rather than the action's heuristic all-features-ish default, which
       # would otherwise try to turn on optional platform-gated features.
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         with:
           package: lattice-fann,lattice-transport,lattice-inference,lattice-embed,lattice-tune
           feature-group: default-features
