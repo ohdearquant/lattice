@@ -45,6 +45,19 @@ fn load_tensor<T: TensorSource + ?Sized>(
     expected: &[usize],
 ) -> Result<Vec<f32>, InferenceError> {
     check_dtype(source, name)?;
+    // Check the header-declared shape before materializing tensor data: a source that
+    // cannot report a shape up front returns None and falls through to the post-load
+    // check below, but any source that can answer rejects a mismatch before the
+    // (potentially huge) allocation and copy happen.
+    if let Some(declared) = source.tensor_shape(name)?
+        && declared != expected
+    {
+        return Err(InferenceError::ShapeMismatch {
+            name: name.to_string(),
+            expected: expected.to_vec(),
+            actual: declared,
+        });
+    }
     let (data, shape) = source.get_f32_tensor_owned(name)?;
     if shape != expected {
         return Err(InferenceError::ShapeMismatch {
@@ -401,6 +414,75 @@ mod tests {
             tensors: full_tensor_set(&cfg),
         };
         load_weights(&mut source, &cfg).expect("an all-BF16 tensor set must load");
+    }
+
+    /// A [`TensorSource`] that counts calls to `get_f32_tensor_owned`, so a test can
+    /// assert a shape mismatch is caught from the header-declared shape without ever
+    /// copying the tensor's data.
+    struct CountingSource {
+        tensors: HashMap<String, (Vec<f32>, Vec<usize>, String)>,
+        materialize_calls: std::cell::Cell<usize>,
+    }
+
+    impl TensorSource for CountingSource {
+        fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+            Ok(self.tensors.contains_key(name))
+        }
+        fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, s, _)| s.clone()))
+        }
+        fn tensor_dtype(&mut self, name: &str) -> Result<Option<String>, InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, _, d)| d.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.materialize_calls.set(self.materialize_calls.get() + 1);
+            self.tensors
+                .get(name)
+                .map(|(d, s, _)| (d.clone(), s.clone()))
+                .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
+    /// An undersized (but declared-shape-visible) required tensor must be rejected from
+    /// its header-declared shape, before `get_f32_tensor_owned` ever copies the data.
+    /// Before the fix, `load_tensor` materialized the tensor first and only then checked
+    /// `shape != expected`; this test would still pass under that ordering, so the
+    /// `materialize_calls == 0` assertion is what actually pins the preflight-before-load
+    /// contract (mutation-sensitive: reverting the `tensor_shape` check back out makes
+    /// this assertion fail even though the overall call still returns `Err`).
+    #[test]
+    fn undersized_tensor_rejected_before_materialization() {
+        let cfg = tiny_config();
+        let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>, String)> =
+            full_tensor_set(&cfg).into_iter().collect();
+        let mutated_name = format!("{LM_PREFIX}embed_tokens.weight");
+        // Declared shape is undersized relative to [vocab_size, hidden] but still
+        // internally consistent (data.len() matches the declared shape), so a
+        // post-materialization-only check would also catch it -- the point of this
+        // test is that it's caught *before* the copy.
+        let entry = tensors.get_mut(&mutated_name).unwrap();
+        entry.1 = vec![cfg.vocab_size - 1, cfg.hidden_size];
+        entry.0 = vec![0.0f32; (cfg.vocab_size - 1) * cfg.hidden_size];
+        let mut source = CountingSource {
+            tensors,
+            materialize_calls: std::cell::Cell::new(0),
+        };
+
+        let Err(err) = load_weights(&mut source, &cfg) else {
+            panic!("an undersized required tensor must fail closed, not silently load");
+        };
+        assert!(
+            err.to_string().contains(&mutated_name),
+            "error must name the tensor: {err}"
+        );
+        assert_eq!(
+            source.materialize_calls.get(),
+            0,
+            "a declared-shape mismatch must be rejected before any tensor data is copied"
+        );
     }
 
     #[test]

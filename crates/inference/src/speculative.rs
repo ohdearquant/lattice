@@ -264,6 +264,20 @@ impl MtpWeights {
 
         let load_checked =
             |source: &mut S, name: &str, expected: &[usize]| -> Result<Vec<f32>, InferenceError> {
+                // Check the header-declared shape before materializing tensor data: a
+                // source that cannot report a shape up front returns None and falls
+                // through to the post-load check below, but any source that can
+                // answer rejects a mismatch before the (potentially huge) allocation
+                // and copy happen.
+                if let Some(declared) = source.tensor_shape(name)?
+                    && declared != expected
+                {
+                    return Err(InferenceError::ShapeMismatch {
+                        name: name.to_string(),
+                        expected: expected.to_vec(),
+                        actual: declared,
+                    });
+                }
                 let (data, shape) = source.get_f32_tensor_owned(name)?;
                 if shape != expected {
                     return Err(InferenceError::ShapeMismatch {
@@ -278,8 +292,16 @@ impl MtpWeights {
         // Validate fc_weight shape: must be [hidden, 2*hidden]
         let fc_weight = {
             let name = "mtp.fc.weight";
-            let (data, shape) = source.get_f32_tensor_owned(name)?;
             let expected_fc = [hidden, 2 * hidden];
+            if let Some(declared) = source.tensor_shape(name)?
+                && declared != expected_fc
+            {
+                return Err(InferenceError::UnsupportedModel(format!(
+                    "unexpected mtp.fc.weight shape {declared:?}; expected fusion projection [{hidden}, {}]",
+                    2 * hidden
+                )));
+            }
+            let (data, shape) = source.get_f32_tensor_owned(name)?;
             if shape != expected_fc {
                 return Err(InferenceError::UnsupportedModel(format!(
                     "unexpected mtp.fc.weight shape {shape:?}; expected fusion projection [{hidden}, {}]",
@@ -370,6 +392,15 @@ impl MtpWeights {
             // shared_expert_gate can be [1, hidden] (flatten to [hidden])
             let shared_expert_gate = {
                 let name = format!("mtp.layers.{i}.mlp.shared_expert_gate.weight");
+                if let Some(declared) = source.tensor_shape(&name)?
+                    && declared.iter().product::<usize>() != hidden
+                {
+                    return Err(InferenceError::ShapeMismatch {
+                        name,
+                        expected: vec![hidden],
+                        actual: declared,
+                    });
+                }
                 let (data, shape) = source.get_f32_tensor_owned(&name)?;
                 let total = shape.iter().product::<usize>();
                 if total != hidden {
@@ -4457,6 +4488,171 @@ mod tests {
             pre_fc_norm_embedding_weight: ones(h),
             pre_fc_norm_hidden_weight: ones(h),
         }
+    }
+
+    /// A [`crate::weights::TensorSource`] that records every name passed to
+    /// `get_f32_tensor_owned`, so a test can assert a specific tensor's shape mismatch
+    /// is caught from the header-declared shape without that tensor's data ever being
+    /// copied (other, correctly-shaped tensors ahead of it in iteration order are still
+    /// fetched normally).
+    struct CountingTensorSource {
+        tensors: std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>,
+        materialized: std::cell::RefCell<std::collections::HashSet<String>>,
+    }
+
+    impl crate::weights::TensorSource for CountingTensorSource {
+        fn has_tensor(&mut self, name: &str) -> Result<bool, crate::error::InferenceError> {
+            Ok(self.tensors.contains_key(name))
+        }
+        fn tensor_shape(
+            &mut self,
+            name: &str,
+        ) -> Result<Option<Vec<usize>>, crate::error::InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, s)| s.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), crate::error::InferenceError> {
+            self.materialized.borrow_mut().insert(name.to_string());
+            self.tensors
+                .get(name)
+                .map(|(d, s)| (d.clone(), s.clone()))
+                .ok_or_else(|| crate::error::InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
+    /// Full, cfg-consistent tensor set for `tiny_mtp_config()`'s single-layer geometry,
+    /// keyed exactly as `MtpWeights::load_from_source` expects.
+    fn tiny_mtp_tensor_map(
+        cfg: &MtpConfig,
+    ) -> std::collections::HashMap<String, (Vec<f32>, Vec<usize>)> {
+        let h = cfg.hidden_size;
+        let q_proj_rows = 2 * cfg.num_attention_heads * cfg.head_dim;
+        let kv_proj_rows = cfg.num_key_value_heads * cfg.head_dim;
+        let o_proj_cols = cfg.num_attention_heads * cfg.head_dim;
+        let moe_inter = cfg.moe_intermediate_size;
+        let shared_inter = cfg.shared_expert_intermediate_size;
+        let num_experts = cfg.num_experts;
+        let z = |n: usize| vec![0.0f32; n];
+
+        let mut m = std::collections::HashMap::new();
+        m.insert("mtp.fc.weight".to_string(), (z(h * 2 * h), vec![h, 2 * h]));
+        m.insert("mtp.norm.weight".to_string(), (z(h), vec![h]));
+        m.insert(
+            "mtp.pre_fc_norm_embedding.weight".to_string(),
+            (z(h), vec![h]),
+        );
+        m.insert("mtp.pre_fc_norm_hidden.weight".to_string(), (z(h), vec![h]));
+        for i in 0..cfg.num_hidden_layers {
+            let p = format!("mtp.layers.{i}");
+            m.insert(format!("{p}.input_layernorm.weight"), (z(h), vec![h]));
+            m.insert(
+                format!("{p}.post_attention_layernorm.weight"),
+                (z(h), vec![h]),
+            );
+            m.insert(
+                format!("{p}.self_attn.q_proj.weight"),
+                (z(q_proj_rows * h), vec![q_proj_rows, h]),
+            );
+            m.insert(
+                format!("{p}.self_attn.k_proj.weight"),
+                (z(kv_proj_rows * h), vec![kv_proj_rows, h]),
+            );
+            m.insert(
+                format!("{p}.self_attn.v_proj.weight"),
+                (z(kv_proj_rows * h), vec![kv_proj_rows, h]),
+            );
+            m.insert(
+                format!("{p}.self_attn.o_proj.weight"),
+                (z(h * o_proj_cols), vec![h, o_proj_cols]),
+            );
+            m.insert(
+                format!("{p}.self_attn.q_norm.weight"),
+                (z(cfg.head_dim), vec![cfg.head_dim]),
+            );
+            m.insert(
+                format!("{p}.self_attn.k_norm.weight"),
+                (z(cfg.head_dim), vec![cfg.head_dim]),
+            );
+            m.insert(
+                format!("{p}.mlp.gate.weight"),
+                (z(num_experts * h), vec![num_experts, h]),
+            );
+            m.insert(
+                format!("{p}.mlp.experts.gate_up_proj"),
+                (
+                    z(num_experts * 2 * moe_inter * h),
+                    vec![num_experts, 2 * moe_inter, h],
+                ),
+            );
+            m.insert(
+                format!("{p}.mlp.experts.down_proj"),
+                (
+                    z(num_experts * h * moe_inter),
+                    vec![num_experts, h, moe_inter],
+                ),
+            );
+            m.insert(
+                format!("{p}.mlp.shared_expert.gate_proj.weight"),
+                (z(shared_inter * h), vec![shared_inter, h]),
+            );
+            m.insert(
+                format!("{p}.mlp.shared_expert.up_proj.weight"),
+                (z(shared_inter * h), vec![shared_inter, h]),
+            );
+            m.insert(
+                format!("{p}.mlp.shared_expert.down_proj.weight"),
+                (z(h * shared_inter), vec![h, shared_inter]),
+            );
+            m.insert(
+                format!("{p}.mlp.shared_expert_gate.weight"),
+                (z(h), vec![1, h]),
+            );
+        }
+        m
+    }
+
+    /// An undersized (but declared-shape-visible) `q_proj` tensor must be rejected from
+    /// its header-declared shape before `get_f32_tensor_owned` ever copies its data.
+    /// Before the fix, `load_from_source`'s `load_checked` closure materialized the
+    /// tensor first and only then compared shapes; that ordering still returns `Err`
+    /// here (so `expect_err` alone would not catch a regression) -- the "mutated name
+    /// was never materialized" assertion is what pins the preflight-before-load
+    /// contract specifically.
+    #[test]
+    fn mtp_load_from_source_rejects_undersized_tensor_before_materialization() {
+        let cfg = tiny_mtp_config();
+        let mut tensors = tiny_mtp_tensor_map(&cfg);
+        let mutated_name = "mtp.layers.0.self_attn.q_proj.weight".to_string();
+        let h = cfg.hidden_size;
+        let q_proj_rows = 2 * cfg.num_attention_heads * cfg.head_dim;
+        // Declared shape is undersized relative to [q_proj_rows, hidden], with data
+        // matching the (wrong) declared shape so a naive `data.len()`-only check would
+        // not catch it either -- only the axis-shape comparison does.
+        tensors.insert(
+            mutated_name.clone(),
+            (
+                vec![0.0f32; (q_proj_rows - 1) * h],
+                vec![q_proj_rows - 1, h],
+            ),
+        );
+        let mut source = CountingTensorSource {
+            tensors,
+            materialized: std::cell::RefCell::new(std::collections::HashSet::new()),
+        };
+
+        let Err(err) = MtpWeights::load_from_source(&mut source, &cfg) else {
+            panic!("an undersized required tensor must fail closed, not silently load");
+        };
+        assert!(
+            err.to_string().contains(&mutated_name),
+            "error must name the tensor: {err}"
+        );
+        assert!(
+            !source.materialized.borrow().contains(&mutated_name),
+            "the mismatched tensor's data must never be copied"
+        );
     }
 
     #[test]
