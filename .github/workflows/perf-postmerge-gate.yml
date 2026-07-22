@@ -116,16 +116,16 @@ jobs:
             arch: aarch64-linux
     steps:
       - name: Checkout with history
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           # bench-compare.sh creates a detached worktree at the base ref, so the
           # base commit must actually be present. A shallow clone silently has
           # no parent and the resolve step below would fail closed.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-on-failure: true
           shared-key: perf-postmerge-${{ matrix.arch }}

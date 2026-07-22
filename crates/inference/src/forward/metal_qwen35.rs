@@ -27741,11 +27741,20 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// across BOTH test threads in this process and any other process on the
         /// machine.
         ///
-        /// In-process half: concurrent GPU execution amplifies the pre-existing
-        /// ADR-065 attention race, which perturbs the *serial* GDN reference that
-        /// the cross-algorithm parity tests compare against — producing
-        /// false-positive failures under `cargo test`'s default multi-threading.
-        /// The chunked scan itself is deterministic (see
+        /// In-process half: the Metal batched/decode attention kernels carry a
+        /// runtime-only nondeterminism that perturbs logit values by small
+        /// magnitudes on roughly 1-in-N runs. Static analysis of
+        /// `gdn_recurrence_fused` and `decode_attention` found both barrier-correct
+        /// (no uninitialized threadgroup reads, no intra-dispatch cross-threadgroup
+        /// device race, no untracked buffers), so the hazard has not been
+        /// root-caused — it is only observable via GPU frame capture (Xcode Metal
+        /// debugger), which no run here has done yet. Concurrent GPU execution
+        /// amplifies it, and it perturbs the *serial* GDN reference that the
+        /// cross-algorithm parity tests compare against — producing false-positive
+        /// failures under `cargo test`'s default multi-threading. Argmax stays
+        /// stable across the perturbation; only logit values drift (see the
+        /// chunked-prefill parity test below for the magnitude evidence). The
+        /// chunked scan itself is deterministic (see
         /// `gdn_chunked_b_vs_b_self_consistency`); serializing device access keeps
         /// the serial reference clean run-to-run.
         ///
@@ -30185,8 +30194,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // debugger). The argmax is STABLE across hundreds of runs, so generated tokens
             // are unaffected; only logit *values* drift. The hard guarantee this test
             // enforces is therefore argmax equality; the logit-value bound is a loose
-            // regression guard, not a strict-parity assertion. See RACE_FIX_NOTES.md /
-            // ADR-065 for the full diagnosis and the GPU-capture path to a true fix.
+            // regression guard, not a strict-parity assertion. Root cause is unconfirmed:
+            // a GPU frame capture of a divergent run is the diagnostic that could show the
+            // actual dispatch-level ordering hazard, and nothing in this tree has done that
+            // capture yet (see `gpu_test_lock`'s doc comment for what static analysis has
+            // and hasn't ruled out).
             assert!(
                 max_abs_diff < 0.5,
                 "chunked prefill logits diverged from step loop beyond the known-issue \
@@ -30876,7 +30888,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // The chunked GDN scan is itself deterministic — gdn_chunked_b_vs_b_self_consistency and
             // the race-localization probe both show chunked-vs-chunked state diff = 0.0 across many
             // runs.  The only remaining nondeterminism is the pre-existing batched/decode attention
-            // race (ADR-065), which perturbs the residual stream on ~1-in-N runs.  GPU access is
+            // race (root cause unconfirmed; see `gpu_test_lock`'s doc comment for what static
+            // analysis has and hasn't ruled out), which perturbs the residual stream on
+            // ~1-in-N runs.  GPU access is
             // serialized via gpu_test_lock() so that race is not amplified by device contention, but
             // it can still occasionally perturb the *serial* forward_step reference by ~1e-3.
             //
@@ -30937,7 +30951,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         ///
         /// Both paths are selected via `state.use_gdn_chunked` (no process-env mutation), so there
         /// are no setenv races. GPU access is additionally serialized via `gpu_test_lock()` so the
-        /// pre-existing ADR-065 attention race is not amplified by concurrent device contention,
+        /// pre-existing batched/decode attention race (root cause unconfirmed; see
+        /// `gpu_test_lock`'s doc comment) is not amplified by concurrent device contention,
         /// and the deterministic chunked logits are computed once per length while only the serial
         /// reference is retried — a flaky chunked attempt cannot be masked by best-of-N.
         ///
@@ -30983,7 +30998,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             // The chunked scan is deterministic (gdn_chunked_b_vs_b_self_consistency), but
             // chunked-vs-serial all-position value drift grows with prompt length even after
-            // best-of-N discards the ADR-065 serial-race outliers: best-of-5 max_abs_diff
+            // best-of-N discards the batched/decode attention race's serial-reference outliers
+            // (root cause unconfirmed; see `gpu_test_lock`'s doc comment): best-of-5 max_abs_diff
             // reaches ~4.8e-2 at n=1009 and crosses the old 1e-2 bound at n=511/512/513
             // (#534). The value bound below is a drift sentinel, not the correctness gate —
             // the argmax-flip assertion after the sweep is the hard safety check. Tighten
@@ -31019,7 +31035,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     "chunked all_logits len mismatch at n={n}"
                 );
 
-                // Best-of-N: the serial reference is perturbed by the ADR-065 race on a minority
+                // Best-of-N: the serial reference is perturbed by the batched/decode attention
+                // race (root cause unconfirmed; see `gpu_test_lock`'s doc comment) on a minority
                 // of runs.  Keep the attempt with the smallest max_abs (and its flip count); a
                 // single clean comparison proves the chunked algorithm correct, so stop early once
                 // one attempt is within bound and flip-free.  Mirrors
