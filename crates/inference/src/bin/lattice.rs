@@ -716,9 +716,9 @@ mod doctor {
         let Some(sample) = sample else {
             return Ok("Q4 (no .q4 files found to sample)".to_string());
         };
-        let file = std::fs::File::open(sample.path())
+        let mut file = std::fs::File::open(sample.path())
             .map_err(|e| format!("failed to open {}: {e}", sample.path().display()))?;
-        lattice_inference::weights::q4_weights::read_q4_header(&file)
+        lattice_inference::weights::q4_weights::read_q4_header(&mut file)
             .map(|_| "Q4_0 (lattice native, v2 asymmetric)".to_string())
             .map_err(|e| {
                 format!(

@@ -83,6 +83,14 @@ const _: () = assert!(std::mem::size_of::<Q4Block>() == 20);
 /// it can never drift from the struct layout asserted above.
 pub const Q4_BLOCK_BYTES: usize = std::mem::size_of::<Q4Block>();
 
+/// Number of original weights packed into one [`Q4Block`] (32 nibbles).
+///
+/// Both the quantizer's block-count math and the ingress validator's
+/// expected-block-count check must agree on this value — a single constant
+/// keeps a future block-width change from updating one side and not the
+/// other.
+pub(crate) const Q4_BLOCK_WEIGHTS: usize = 32;
+
 /// A Q4_0 quantized tensor.
 ///
 /// Stores blocks, shape metadata, and the count of valid original weights (the last
@@ -129,6 +137,24 @@ pub(crate) fn q4_f16_to_f32(bits: u16) -> f32 {
 #[inline]
 fn bf16_to_f32(v: u16) -> f32 {
     crate::weights::half_bits::bf16_bits_to_f32(v)
+}
+
+fn q4_metadata_bits(scale: f32, bias: f32) -> Result<(u16, u16), InferenceError> {
+    let scale_bits = q4_f32_to_f16(scale);
+    let bias_bits = q4_f32_to_f16(bias);
+    let serialized_scale = q4_f16_to_f32(scale_bits);
+    let serialized_bias = q4_f16_to_f32(bias_bits);
+    if !serialized_scale.is_finite() || serialized_scale <= 0.0 {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q4 scale {scale} is not representable as a finite, strictly positive f16 value"
+        )));
+    }
+    if !serialized_bias.is_finite() {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q4 bias {bias} is not representable as a finite f16 value"
+        )));
+    }
+    Ok((scale_bits, bias_bits))
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +210,7 @@ fn quantize_block_with_mode_len(
         };
         let inv_scale = 1.0 / scale;
         let bias = -8.0 * scale;
+        let (scale_bits, bias_bits) = q4_metadata_bits(scale, bias)?;
         let mut packed = [0u8; 16];
         for b in 0..16 {
             let q0 = ((vals[2 * b] * inv_scale).round() + 8.0).clamp(0.0, 15.0) as u8;
@@ -191,8 +218,8 @@ fn quantize_block_with_mode_len(
             packed[b] = (q1 << 4) | (q0 & 0x0f);
         }
         Ok(Q4Block {
-            scale: q4_f32_to_f16(scale),
-            bias: q4_f32_to_f16(bias),
+            scale: scale_bits,
+            bias: bias_bits,
             packed,
         })
     } else {
@@ -201,6 +228,7 @@ fn quantize_block_with_mode_len(
         let max_val = real.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let range = max_val - min_val;
         let scale = if range == 0.0 { 1.0f32 } else { range / 15.0 };
+        let (scale_bits, bias_bits) = q4_metadata_bits(scale, min_val)?;
         let inv_scale = 1.0 / scale;
         let mut packed = [0u8; 16];
         for b in 0..16 {
@@ -209,8 +237,8 @@ fn quantize_block_with_mode_len(
             packed[b] = (q1 << 4) | (q0 & 0x0f);
         }
         Ok(Q4Block {
-            scale: q4_f32_to_f16(scale),
-            bias: q4_f32_to_f16(min_val),
+            scale: scale_bits,
+            bias: bias_bits,
             packed,
         })
     }
@@ -229,9 +257,10 @@ fn quantize_block_with_mode_len(
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any value in `src` is non-finite.
+/// Returns [`InferenceError::InvalidInput`] if any value in `src` is non-finite
+/// or the derived scale/bias cannot be represented as finite f16 metadata.
 pub fn quantize_row_q4_0(src: &[f32]) -> Result<Vec<u8>, InferenceError> {
-    let n_blocks = src.len().div_ceil(32);
+    let n_blocks = src.len().div_ceil(Q4_BLOCK_WEIGHTS);
     let mut out = Vec::with_capacity(n_blocks * 20);
     for chunk in src.chunks(32) {
         let mut vals = [0.0f32; 32];
@@ -280,18 +309,26 @@ pub fn dequantize_row_q4_0(data: &[u8], n_weights: usize) -> Vec<f32> {
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any value in `src` is non-finite.
+/// Returns [`InferenceError::InvalidInput`] if the shape does not match `src`,
+/// any source value is non-finite, or Q4 metadata is not representable in f16.
 pub fn quantize_tensor_q4_0(
     src: &[f32],
     rows: usize,
     cols: usize,
 ) -> Result<Vec<u8>, InferenceError> {
-    assert_eq!(
-        src.len(),
-        rows * cols,
-        "src length does not match rows * cols"
-    );
-    let blocks_per_row = cols.div_ceil(32);
+    let expected_len = rows.checked_mul(cols).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "Q4 tensor shape [{rows}, {cols}] overflows usize element count"
+        ))
+    })?;
+    if src.len() != expected_len {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q4 tensor source length {} does not match shape [{rows}, {cols}] \
+             (expected {expected_len})",
+            src.len()
+        )));
+    }
+    let blocks_per_row = cols.div_ceil(Q4_BLOCK_WEIGHTS);
     let mut out = Vec::with_capacity(rows * blocks_per_row * 20);
     for row_idx in 0..rows {
         let row = &src[row_idx * cols..(row_idx + 1) * cols];
@@ -304,7 +341,7 @@ pub fn quantize_tensor_q4_0(
 // BF16-input quantization API (for streaming model shards)
 // ---------------------------------------------------------------------------
 
-/// Assert that `shape.iter().product()` equals `data_len`.
+/// Validate that `shape.iter().product()` equals `data_len`.
 ///
 /// SafeTensors' own `TensorView::new` rejects shape/data-size mismatches
 /// (returns `InvalidTensorView`). The Q4 entry points keep the same
@@ -313,34 +350,35 @@ pub fn quantize_tensor_q4_0(
 /// `save_q4_file` will then write the inconsistent metadata into a `.q4`
 /// header that downstream loaders (`write_merged_qkvz`, the Metal
 /// runtime path) trust without re-verification. Uses `checked_mul` so
-/// `usize` overflow on a malformed shape surfaces as a panic at
-/// construction, not as a wraparound that aliases a valid length.
-#[track_caller]
-fn assert_shape_matches_data_len(shape: &[usize], data_len: usize) {
+/// `usize` overflow on a malformed shape surfaces as a typed error rather
+/// than wrapping to a plausible element count.
+fn validate_shape_matches_data_len(shape: &[usize], data_len: usize) -> Result<(), InferenceError> {
     let numel = shape
         .iter()
         .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
-        .unwrap_or_else(|| {
-            panic!("shape product overflowed usize: shape={shape:?}");
-        });
-    assert_eq!(
-        numel, data_len,
-        "shape product {numel} (shape={shape:?}) must equal data length {data_len}"
-    );
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "Q4 tensor shape product overflows usize: shape={shape:?}"
+            ))
+        })?;
+    if numel != data_len {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q4 tensor shape product {numel} (shape={shape:?}) must equal data length {data_len}"
+        )));
+    }
+    Ok(())
 }
 
 /// Quantize a BF16 tensor (raw `u16` slice) into a [`Q4Tensor`].
 ///
-/// Panics if `shape.iter().product()` does not equal `data.len()`.
-///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any BF16 value decodes to a
-/// non-finite f32 (NaN or ±inf).
+/// Returns [`InferenceError::InvalidInput`] if the shape does not match the
+/// data or any BF16 value decodes to a non-finite f32 (NaN or ±inf).
 pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Result<Q4Tensor, InferenceError> {
-    assert_shape_matches_data_len(shape, data.len());
+    validate_shape_matches_data_len(shape, data.len())?;
     let original_len = data.len();
-    let n_blocks = original_len.div_ceil(32);
+    let n_blocks = original_len.div_ceil(Q4_BLOCK_WEIGHTS);
     let mut blocks = Vec::with_capacity(n_blocks);
 
     for chunk in data.chunks(32) {
@@ -375,15 +413,14 @@ pub fn quantize_bf16_to_q4(data: &[u16], shape: &[usize]) -> Result<Q4Tensor, In
 /// side of a Q4 bin boundary or shift `abs_max` for the block. The f32 path
 /// avoids that truncation.
 ///
-/// Panics if `shape.iter().product()` does not equal `data.len()`.
-///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any value in `data` is non-finite.
+/// Returns [`InferenceError::InvalidInput`] if the shape does not match the
+/// data or any value in `data` is non-finite.
 pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Result<Q4Tensor, InferenceError> {
-    assert_shape_matches_data_len(shape, data.len());
+    validate_shape_matches_data_len(shape, data.len())?;
     let original_len = data.len();
-    let n_blocks = original_len.div_ceil(32);
+    let n_blocks = original_len.div_ceil(Q4_BLOCK_WEIGHTS);
     let mut blocks = Vec::with_capacity(n_blocks);
 
     for chunk in data.chunks(32) {
@@ -420,8 +457,6 @@ pub fn quantize_f32_to_q4(data: &[f32], shape: &[usize]) -> Result<Q4Tensor, Inf
 /// at exact-midpoint values and rotated activations rarely sit on bin
 /// boundaries.
 ///
-/// Panics if `shape.iter().product()` does not equal `data.len()`.
-///
 /// # Errors
 ///
 /// Returns [`InferenceError::InvalidInput`] if any f64 value is non-finite (NaN
@@ -440,15 +475,16 @@ pub fn quantize_f64_to_q4(data: &[f64], shape: &[usize]) -> Result<Q4Tensor, Inf
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any value in `data` is non-finite.
+/// Returns [`InferenceError::InvalidInput`] if the shape does not match the
+/// data or any value in `data` is non-finite.
 pub fn quantize_f64_to_q4_mode(
     data: &[f64],
     shape: &[usize],
     symmetric: bool,
 ) -> Result<Q4Tensor, InferenceError> {
-    assert_shape_matches_data_len(shape, data.len());
+    validate_shape_matches_data_len(shape, data.len())?;
     let original_len = data.len();
-    let n_blocks = original_len.div_ceil(32);
+    let n_blocks = original_len.div_ceil(Q4_BLOCK_WEIGHTS);
     let mut blocks = Vec::with_capacity(n_blocks);
 
     for chunk in data.chunks(32) {
@@ -498,7 +534,7 @@ pub fn stream_quantize_shard(
         return Err("bf16_bytes length must be even (2 bytes per BF16 value)".into());
     }
     let n = bf16_bytes.len() / 2;
-    let n_blocks = n.div_ceil(32);
+    let n_blocks = n.div_ceil(Q4_BLOCK_WEIGHTS);
     let mut blocks = Vec::with_capacity(n_blocks);
 
     for i in (0..bf16_bytes.len()).step_by(64) {
@@ -568,6 +604,10 @@ pub struct Q4FileHeader {
     pub payload_offset: u64,
 }
 
+fn usize_from_u64(value: u64, what: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    usize::try_from(value).map_err(|_| format!("{what}: value {value} exceeds usize").into())
+}
+
 /// Validate a header-declared element count before allocating a buffer for it.
 ///
 /// Custom `.q4`/`.f16` files carry untrusted `ndim`/`original_len`/`numel` fields
@@ -603,42 +643,53 @@ fn checked_alloc_bytes(
 /// # Errors
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
-pub fn read_q4_header(file: &std::fs::File) -> Result<Q4FileHeader, Box<dyn std::error::Error>> {
-    use std::io::Read;
+pub fn read_q4_header(
+    file: &mut std::fs::File,
+) -> Result<Q4FileHeader, Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
     let file_len = file.metadata()?.len();
-    let mut f = std::io::BufReader::new(file);
 
-    let mut magic = [0u8; 4];
-    f.read_exact(&mut magic)?;
-    if &magic != b"KHQ4" {
-        return Err("invalid magic: not a .q4 file".into());
-    }
+    let (shape, original_len, payload_offset) = {
+        let mut f = std::io::BufReader::new(&mut *file);
 
-    let mut b4 = [0u8; 4];
-    f.read_exact(&mut b4)?;
-    let ver = u32::from_le_bytes(b4);
-    if ver == 1 {
-        return Err("legacy .q4 file (v1 symmetric format) — re-quantize with current quantize_q4 to produce v2 asymmetric blocks".into());
-    }
-    if ver != 2 {
-        return Err(format!("unsupported .q4 file version: {ver}").into());
-    }
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic)?;
+        if &magic != b"KHQ4" {
+            return Err("invalid magic: not a .q4 file".into());
+        }
 
-    f.read_exact(&mut b4)?;
-    let ndim = u32::from_le_bytes(b4) as usize;
-    checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
-    let mut shape = Vec::with_capacity(ndim);
-    let mut b8 = [0u8; 8];
-    for _ in 0..ndim {
+        let mut b4 = [0u8; 4];
+        f.read_exact(&mut b4)?;
+        let ver = u32::from_le_bytes(b4);
+        if ver == 1 {
+            return Err("legacy .q4 file (v1 symmetric format) — re-quantize with current quantize_q4 to produce v2 asymmetric blocks".into());
+        }
+        if ver != 2 {
+            return Err(format!("unsupported .q4 file version: {ver}").into());
+        }
+
+        f.read_exact(&mut b4)?;
+        let ndim = u32::from_le_bytes(b4) as usize;
+        let shape_bytes = checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
+        let mut shape = Vec::with_capacity(ndim);
+        let mut b8 = [0u8; 8];
+        for index in 0..ndim {
+            f.read_exact(&mut b8)?;
+            shape.push(usize_from_u64(
+                u64::from_le_bytes(b8),
+                &format!("shape dimension {index}"),
+            )?);
+        }
+
         f.read_exact(&mut b8)?;
-        shape.push(u64::from_le_bytes(b8) as usize);
-    }
+        let original_len = usize_from_u64(u64::from_le_bytes(b8), "original_len")?;
+        let payload_offset = 20u64
+            .checked_add(shape_bytes as u64)
+            .ok_or("Q4 payload offset overflows u64")?;
+        (shape, original_len, payload_offset)
+    };
 
-    f.read_exact(&mut b8)?;
-    let original_len = u64::from_le_bytes(b8) as usize;
-
-    // payload_offset = 4 + 4 + 4 + ndim*8 + 8
-    let payload_offset = (20 + ndim * 8) as u64;
+    file.seek(SeekFrom::Start(payload_offset))?;
 
     Ok(Q4FileHeader {
         shape,
@@ -647,44 +698,19 @@ pub fn read_q4_header(file: &std::fs::File) -> Result<Q4FileHeader, Box<dyn std:
     })
 }
 
-/// Validate that `file_len` bytes are enough to cover the full Q4 block
-/// payload declared by `header`, without reading the payload itself.
+/// Validate that `file_len` exactly covers the Q4 payload declared by
+/// `header`, with no truncation or trailing data, and route the declared
+/// tensor geometry through the shared ingress seam.
 ///
-/// [`load_q4_file`] fails closed on a truncated payload because its
-/// `read_exact` for the block bytes returns an `Err` short of `n_blocks *
-/// 20` bytes. The Metal no-copy mmap path (`forward::metal_qwen35::
-/// mmap_q4_weight`) has no `read_exact` to fail — it hands the whole mmap
-/// to the GPU — so this check is the sole gate standing between a
-/// truncated on-disk `.q4` file and a Metal dispatch reading past the end
-/// of the mapped payload.
-///
-/// Only compiled for tests or the `metal-gpu` feature: its sole caller is
-/// the Metal no-copy `.q4` loader in `forward::metal_qwen35`.
-#[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn validate_q4_header_payload_bounds(
     header: &Q4FileHeader,
     file_len: u64,
     path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let shape_product = header
-        .shape
-        .iter()
-        .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
-        .ok_or("shape dims overflow usize")?;
-    if shape_product != header.original_len {
-        return Err(format!(
-            "{}: shape product {shape_product} (shape={:?}) != original_len {}",
-            path.display(),
-            header.shape,
-            header.original_len
-        )
-        .into());
-    }
-
     let payload_bytes = header
         .original_len
-        .div_ceil(32)
-        .checked_mul(20)
+        .div_ceil(Q4_BLOCK_WEIGHTS)
+        .checked_mul(Q4_BLOCK_BYTES)
         .ok_or("Q4 block payload byte count overflows usize")? as u64;
     let required_len = header
         .payload_offset
@@ -697,7 +723,102 @@ pub(crate) fn validate_q4_header_payload_bounds(
         )
         .into());
     }
+    if file_len > required_len {
+        return Err(format!(
+            "{}: file has trailing bytes after Q4 block payload ({file_len} bytes > expected \
+             {required_len})",
+            path.display()
+        )
+        .into());
+    }
+
+    let source = path.display().to_string();
+    crate::weights::ingress::validate_ingested_tensor(
+        crate::weights::ingress::IngestedTensor::native_q4(
+            &source,
+            "native Q4 tensor",
+            &header.shape,
+            header.original_len,
+            header.original_len.div_ceil(Q4_BLOCK_WEIGHTS),
+        ),
+    )?;
     Ok(())
+}
+
+/// Validate a `.q4` file's header, declared geometry, and exact on-disk
+/// extent against `expected_shape` — without reading a single block byte.
+///
+/// This is the preflight every Q4 load path (CPU materializing load, Metal
+/// no-copy mmap, MoE expert-cache mmap) shares: header parse plus
+/// [`validate_q4_header_payload_bounds`] are both `O(1)` (fixed-size header
+/// reads and a `file.metadata()` length check), so calling this before an
+/// mmap never forces the payload's pages to be faulted in. Per-block
+/// scale/bias finiteness is deliberately **not** checked here — each loader
+/// folds that check into the single pass it already makes over the block
+/// bytes it materializes (see [`validate_q4_block_metadata`] and its call
+/// sites in `load_q4_file_impl` and the Metal/MoE mmap dequant loops), so no
+/// caller ever pays for a separate full-payload scan on top of its own read.
+///
+/// # Errors
+///
+/// Returns an error on I/O failure, unrecognized magic bytes, unsupported
+/// version, a truncated/oversized payload, or a shape mismatch against
+/// `expected_shape`.
+pub(crate) fn validate_q4_file(
+    file: &mut std::fs::File,
+    path: &std::path::Path,
+    expected_shape: Option<&[usize]>,
+) -> Result<Q4FileHeader, Box<dyn std::error::Error>> {
+    use std::io::{Seek, SeekFrom};
+
+    let header = read_q4_header(file)?;
+    let file_len = file.metadata()?.len();
+    validate_q4_header_payload_bounds(&header, file_len, path)?;
+
+    if let Some(expected_shape) = expected_shape {
+        let source = path.display().to_string();
+        let tensor_name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("native Q4 tensor");
+        let block_count = header.original_len.div_ceil(Q4_BLOCK_WEIGHTS);
+        crate::weights::ingress::validate_ingested_tensor(
+            crate::weights::ingress::IngestedTensor::native_q4(
+                &source,
+                tensor_name,
+                &header.shape,
+                header.original_len,
+                block_count,
+            )
+            .with_expected_shape(expected_shape),
+        )?;
+    }
+    file.seek(SeekFrom::Start(header.payload_offset))?;
+    Ok(header)
+}
+
+/// Validate one already-read Q4 block's scale/bias metadata (finite,
+/// strictly positive scale; finite bias) at the exact point a loader decodes
+/// that block — never as a separate pre-scan pass.
+///
+/// `source`/`tensor_name`/`index` are provenance only, threaded through to
+/// the error message so a rejected block names its file and position.
+pub(crate) fn validate_q4_block_metadata(
+    source: &str,
+    tensor_name: &str,
+    index: usize,
+    scale_bits: u16,
+    bias_bits: u16,
+) -> Result<(), InferenceError> {
+    crate::weights::ingress::validate_ingested_tensor(
+        crate::weights::ingress::IngestedTensor::native_q4_block(
+            source,
+            tensor_name,
+            index,
+            scale_bits,
+            bias_bits,
+        ),
+    )
 }
 
 /// Load a [`Q4Tensor`] from a `.q4` file written by [`save_q4_file`].
@@ -706,74 +827,60 @@ pub(crate) fn validate_q4_header_payload_bounds(
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
 pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
+    load_q4_file_impl(path, None)
+}
+
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn load_q4_file_checked(
+    path: &std::path::Path,
+    expected_shape: &[usize],
+) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
+    load_q4_file_impl(path, Some(expected_shape))
+}
+
+fn load_q4_file_impl(
+    path: &std::path::Path,
+    expected_shape: Option<&[usize]>,
+) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let file_len = f.metadata()?.len();
 
-    let mut magic = [0u8; 4];
-    f.read_exact(&mut magic)?;
-    if &magic != b"KHQ4" {
-        return Err("invalid magic: not a .q4 file".into());
-    }
+    let header = validate_q4_file(&mut f, path, expected_shape)?;
+    let n_blocks = header.original_len.div_ceil(Q4_BLOCK_WEIGHTS);
 
-    let mut b4 = [0u8; 4];
-    f.read_exact(&mut b4)?;
-    let ver = u32::from_le_bytes(b4);
-    if ver == 1 {
-        return Err("legacy .q4 file (v1 symmetric format) — re-quantize with current quantize_q4 to produce v2 asymmetric blocks".into());
-    }
-    if ver != 2 {
-        return Err(format!("unsupported .q4 file version: {ver}").into());
-    }
-
-    f.read_exact(&mut b4)?;
-    let ndim = u32::from_le_bytes(b4) as usize;
-    checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
-    let mut shape = Vec::with_capacity(ndim);
-    let mut b8 = [0u8; 8];
-    for _ in 0..ndim {
-        f.read_exact(&mut b8)?;
-        shape.push(u64::from_le_bytes(b8) as usize);
-    }
-
-    f.read_exact(&mut b8)?;
-    let original_len = u64::from_le_bytes(b8) as usize;
-
-    // Fail closed on a header whose shape disagrees with its element count.
-    // The quantize paths enforce `shape.product() == data.len()` via
-    // `assert_shape_matches_data_len`; the loader must reject the same
-    // inconsistency rather than return a tensor whose `shape` overstates the
-    // block payload (downstream matmuls would read stale, out-of-range data).
-    let shape_product = shape
-        .iter()
-        .try_fold(1_usize, |acc, &d| acc.checked_mul(d))
-        .ok_or("shape dims overflow usize")?;
-    if shape_product != original_len {
-        return Err(format!(
-            "shape product {shape_product} (shape={shape:?}) != original_len {original_len}"
-        )
-        .into());
-    }
-
-    let n_blocks = original_len.div_ceil(32);
-
-    let raw_len = checked_alloc_bytes(n_blocks, 20, file_len, "block payload")?;
+    let raw_len = checked_alloc_bytes(n_blocks, Q4_BLOCK_BYTES, file_len, "block payload")?;
     let mut raw = vec![0u8; raw_len];
     f.read_exact(&mut raw)?;
 
-    let blocks: Vec<Q4Block> = raw
-        .chunks_exact(20)
-        .map(|c| Q4Block {
-            scale: u16::from_ne_bytes([c[0], c[1]]),
-            bias: u16::from_ne_bytes([c[2], c[3]]),
-            packed: c[4..20].try_into().expect("slice is exactly 16 bytes"),
-        })
-        .collect();
+    // Single pass over the payload: decode each Q4Block AND validate its
+    // scale/bias metadata here, rather than in a separate pre-scan over the
+    // same bytes (`validate_q4_file` no longer does that scan — see its doc
+    // comment). This is the only full-payload read `load_q4_file`/
+    // `load_q4_file_checked` perform.
+    let source = path.display().to_string();
+    let tensor_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("native Q4 tensor");
+    let mut blocks: Vec<Q4Block> = Vec::with_capacity(n_blocks);
+    for (index, c) in raw.chunks_exact(Q4_BLOCK_BYTES).enumerate() {
+        let scale = u16::from_ne_bytes([c[0], c[1]]);
+        let bias = u16::from_ne_bytes([c[2], c[3]]);
+        validate_q4_block_metadata(&source, tensor_name, index, scale, bias)?;
+        let mut packed = [0u8; 16];
+        packed.copy_from_slice(&c[4..20]);
+        blocks.push(Q4Block {
+            scale,
+            bias,
+            packed,
+        });
+    }
 
     Ok(Q4Tensor {
         blocks,
-        shape,
-        original_len,
+        shape: header.shape,
+        original_len: header.original_len,
     })
 }
 
@@ -795,6 +902,21 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
 /// unsupported version.
 pub fn load_f16_tensor_file(
     path: &std::path::Path,
+) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+    load_f16_tensor_file_impl(path, None)
+}
+
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn load_f16_tensor_file_checked(
+    path: &std::path::Path,
+    expected_shape: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+    load_f16_tensor_file_impl(path, Some(expected_shape))
+}
+
+fn load_f16_tensor_file_impl(
+    path: &std::path::Path,
+    expected_shape: Option<&[usize]>,
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
@@ -819,28 +941,42 @@ pub fn load_f16_tensor_file(
 
     f.read_exact(&mut b4)?;
     let ndim = u32::from_le_bytes(b4) as usize;
-    checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
+    let shape_bytes = checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
     let mut shape = Vec::with_capacity(ndim);
     let mut b8 = [0u8; 8];
-    for _ in 0..ndim {
+    for index in 0..ndim {
         f.read_exact(&mut b8)?;
-        shape.push(u64::from_le_bytes(b8) as usize);
+        shape.push(usize_from_u64(
+            u64::from_le_bytes(b8),
+            &format!("shape dimension {index}"),
+        )?);
     }
 
     f.read_exact(&mut b8)?;
-    let numel = u64::from_le_bytes(b8) as usize;
-
-    let shape_product = shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or("shape dims overflow usize")?;
-    if shape_product != numel {
-        return Err(
-            format!("shape product {shape_product} (shape={shape:?}) != numel {numel}").into(),
-        );
-    }
+    let numel = usize_from_u64(u64::from_le_bytes(b8), "numel")?;
 
     let raw_len = checked_alloc_bytes(numel, 2, file_len, "f16 data")?;
+    let payload_offset = 20u64
+        .checked_add(shape_bytes as u64)
+        .ok_or("KHF1 payload offset overflows u64")?;
+    let required_len = payload_offset
+        .checked_add(raw_len as u64)
+        .ok_or("KHF1 payload end offset overflows u64")?;
+    if file_len < required_len {
+        return Err(format!(
+            "{}: file truncated below KHF1 payload ({file_len} bytes < required {required_len})",
+            path.display()
+        )
+        .into());
+    }
+    if file_len > required_len {
+        return Err(format!(
+            "{}: file has trailing bytes after KHF1 payload ({file_len} bytes > expected \
+             {required_len})",
+            path.display()
+        )
+        .into());
+    }
     let mut raw = vec![0u8; raw_len];
     f.read_exact(&mut raw)?;
 
@@ -851,6 +987,25 @@ pub fn load_f16_tensor_file(
             q4_f16_to_f32(bits)
         })
         .collect();
+
+    let source = path.display().to_string();
+    let tensor_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("native KHF1 tensor");
+    let tensor = crate::weights::ingress::IngestedTensor::decoded_f32(
+        &source,
+        tensor_name,
+        &shape,
+        "KHF1/F16",
+        &values,
+    );
+    let tensor = if let Some(expected_shape) = expected_shape {
+        tensor.with_expected_shape(expected_shape)
+    } else {
+        tensor
+    };
+    crate::weights::ingress::validate_ingested_tensor(tensor)?;
 
     Ok((values, shape))
 }
@@ -900,8 +1055,8 @@ pub(crate) fn read_q4_payload_bounded(
 ) -> Result<(Q4FileHeader, Vec<u8>), Box<dyn std::error::Error>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    let file = std::fs::File::open(path)?;
-    let header = read_q4_header(&file)?;
+    let mut file = std::fs::File::open(path)?;
+    let header = read_q4_header(&mut file)?;
     let file_len = file.metadata()?.len();
     if file_len < header.payload_offset {
         return Err(format!(
@@ -920,10 +1075,11 @@ pub(crate) fn read_q4_payload_bounded(
         .into());
     }
 
-    let mut f = file;
-    f.seek(SeekFrom::Start(header.payload_offset))?;
+    file.seek(SeekFrom::Start(0))?;
+    let header = validate_q4_file(&mut file, path, None)?;
+
     let mut buf = Vec::new();
-    f.take(max_len.saturating_add(1)).read_to_end(&mut buf)?;
+    file.take(max_len.saturating_add(1)).read_to_end(&mut buf)?;
     if buf.len() as u64 > max_len {
         return Err(format!(
             "{}: payload too large: read exceeds cap of {max_len} bytes",
@@ -1062,14 +1218,42 @@ pub(crate) fn write_merged_qkvz(
     let (z_hdr, z_payload) = read_q4_payload_bounded(z_path, MAX_Q4_MERGE_PAYLOAD_LEN)
         .map_err(|e| format!("read {}: {e}", z_path.display()))?;
 
-    // Merged shape: rows = qkv_rows + z_rows, cols = hidden (shared)
-    let merged_rows = qkv_hdr.shape[0] + z_hdr.shape[0];
-    let cols = if qkv_hdr.shape.len() >= 2 {
-        qkv_hdr.shape[1]
-    } else {
-        1
-    };
-    let original_len = qkv_hdr.original_len + z_hdr.original_len;
+    // Merged shape: rows = qkv_rows + z_rows, cols = hidden (shared). Both
+    // source headers are untrusted on-disk data — a crafted or corrupt
+    // rank-0 (`ndim = 0`) file would otherwise index `shape[0]` out of
+    // bounds and panic here (denial of service), so both inputs must be
+    // exactly 2-D before either dimension is read.
+    if qkv_hdr.shape.len() != 2 {
+        return Err(format!(
+            "{}: qkv header shape {:?} is not 2-D (expected [rows, hidden])",
+            qkv_path.display(),
+            qkv_hdr.shape
+        ));
+    }
+    if z_hdr.shape.len() != 2 {
+        return Err(format!(
+            "{}: z header shape {:?} is not 2-D (expected [rows, hidden])",
+            z_path.display(),
+            z_hdr.shape
+        ));
+    }
+    if qkv_hdr.shape[1] != z_hdr.shape[1] {
+        return Err(format!(
+            "{}/{}: qkv hidden dimension {} does not match z hidden dimension {}",
+            qkv_path.display(),
+            z_path.display(),
+            qkv_hdr.shape[1],
+            z_hdr.shape[1]
+        ));
+    }
+    let merged_rows = qkv_hdr.shape[0]
+        .checked_add(z_hdr.shape[0])
+        .ok_or("merged row count overflows usize")?;
+    let cols = qkv_hdr.shape[1];
+    let original_len = qkv_hdr
+        .original_len
+        .checked_add(z_hdr.original_len)
+        .ok_or("merged original_len overflows usize")?;
 
     // Write to a temp file then rename atomically so partial writes are never trusted.
     let tmp = out_path.with_extension("q4.tmp");
@@ -1113,6 +1297,38 @@ pub(crate) fn write_merged_qkvz(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn q4_file_bytes(shape: &[usize], original_len: usize, scale: u16, bias: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHQ4");
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+        for &dim in shape {
+            buf.extend_from_slice(&(dim as u64).to_le_bytes());
+        }
+        buf.extend_from_slice(&(original_len as u64).to_le_bytes());
+        for _ in 0..original_len.div_ceil(32) {
+            buf.extend_from_slice(&scale.to_ne_bytes());
+            buf.extend_from_slice(&bias.to_ne_bytes());
+            buf.extend_from_slice(&[0u8; 16]);
+        }
+        buf
+    }
+
+    fn f16_file_bytes(shape: &[usize], values: &[u16]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&(shape.len() as u32).to_le_bytes());
+        for &dim in shape {
+            buf.extend_from_slice(&(dim as u64).to_le_bytes());
+        }
+        buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for &value in values {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        buf
+    }
 
     // -----------------------------------------------------------------------
     // Test 1: Q4Block is exactly 20 bytes (scale + bias + 16 nibble bytes).
@@ -1965,40 +2181,43 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "shape product")]
     fn quantize_f32_to_q4_rejects_shape_data_mismatch() {
         let data = synthetic_f32_uniform(64, 41);
-        // shape claims 96 elements; data has 64 → must panic.
-        let _ = quantize_f32_to_q4(&data, &[3, 32]);
+        let err = quantize_f32_to_q4(&data, &[3, 32])
+            .expect_err("shape claiming 96 elements for 64 values must fail");
+        assert!(err.to_string().contains("shape product"));
     }
 
     #[test]
-    #[should_panic(expected = "shape product")]
     fn quantize_f64_to_q4_rejects_shape_data_mismatch() {
         let data: Vec<f64> = synthetic_f32_uniform(64, 43)
             .into_iter()
             .map(f64::from)
             .collect();
-        let _ = quantize_f64_to_q4(&data, &[3, 32]);
+        let err = quantize_f64_to_q4(&data, &[3, 32])
+            .expect_err("shape claiming 96 elements for 64 values must fail");
+        assert!(err.to_string().contains("shape product"));
     }
 
     #[test]
-    #[should_panic(expected = "shape product")]
     fn quantize_bf16_to_q4_rejects_shape_data_mismatch() {
         // Lock the same contract on the pre-existing BF16 entry point — the
         // SafeTensors source format rejects shape/data mismatches and the Q4
         // bridge must not silently weaken that invariant.
         let data: Vec<u16> = (0..64).map(|i| i as u16).collect();
-        let _ = quantize_bf16_to_q4(&data, &[3, 32]);
+        let err = quantize_bf16_to_q4(&data, &[3, 32])
+            .expect_err("shape claiming 96 elements for 64 values must fail");
+        assert!(err.to_string().contains("shape product"));
     }
 
     #[test]
-    #[should_panic(expected = "overflowed usize")]
     fn quantize_f32_to_q4_rejects_shape_product_overflow() {
         let data = vec![0.0_f32; 32];
         // usize::MAX * 2 overflows; checked_mul must catch it before the
         // length comparison aliases to a valid length by wraparound.
-        let _ = quantize_f32_to_q4(&data, &[usize::MAX, 2]);
+        let err = quantize_f32_to_q4(&data, &[usize::MAX, 2])
+            .expect_err("overflowed shape product must fail");
+        assert!(err.to_string().contains("overflows usize"));
     }
 
     #[test]
@@ -2122,13 +2341,44 @@ mod tests {
         buf.extend_from_slice(&u32::MAX.to_le_bytes());
         let path = std::path::PathBuf::from("/tmp/test_q4_header_huge_ndim.q4");
         std::fs::write(&path, &buf).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        let r = read_q4_header(&file);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let r = read_q4_header(&mut file);
         std::fs::remove_file(&path).ok();
         assert!(
             r.is_err(),
             "u32::MAX ndim in read_q4_header must be rejected"
         );
+    }
+
+    #[test]
+    fn read_q4_header_positions_cursor_at_first_block() {
+        use std::io::Read;
+
+        let first_block = Q4Block {
+            scale: q4_f32_to_f16(0.5),
+            bias: q4_f32_to_f16(-1.0),
+            packed: [0xA5; 16],
+        };
+        let tensor = Q4Tensor {
+            blocks: vec![first_block],
+            shape: vec![32],
+            original_len: 32,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cursor.q4");
+        save_q4_file(&path, &tensor).unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let header = read_q4_header(&mut file).unwrap();
+        assert_eq!(header.payload_offset, 28);
+        let mut actual = [0u8; Q4_BLOCK_BYTES];
+        file.read_exact(&mut actual).unwrap();
+
+        let mut expected = [0u8; Q4_BLOCK_BYTES];
+        expected[0..2].copy_from_slice(&first_block.scale.to_ne_bytes());
+        expected[2..4].copy_from_slice(&first_block.bias.to_ne_bytes());
+        expected[4..].copy_from_slice(&first_block.packed);
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -2164,7 +2414,9 @@ mod tests {
         buf.extend_from_slice(&4u64.to_le_bytes()); // shape[0]
         buf.extend_from_slice(&16u64.to_le_bytes()); // shape[1] → product 64
         buf.extend_from_slice(&32u64.to_le_bytes()); // original_len (≠ 64)
-        buf.extend_from_slice(&[0u8; 20]); // one valid-size block payload
+        buf.extend_from_slice(&q4_f32_to_f16(1.0).to_ne_bytes());
+        buf.extend_from_slice(&q4_f32_to_f16(0.0).to_ne_bytes());
+        buf.extend_from_slice(&[0u8; 16]); // one valid block payload
         let path = std::path::PathBuf::from("/tmp/test_q4_shape_mismatch.q4");
         std::fs::write(&path, &buf).unwrap();
         let r = load_q4_file(&path);
@@ -2173,6 +2425,109 @@ mod tests {
             r.is_err(),
             "shape product 64 != original_len 32 must be rejected"
         );
+    }
+
+    #[test]
+    fn q4_ingress_rejects_invalid_scale_and_bias_metadata() {
+        let cases = [
+            (q4_f32_to_f16(f32::NAN), q4_f32_to_f16(0.0), "NaN scale"),
+            (
+                q4_f32_to_f16(f32::INFINITY),
+                q4_f32_to_f16(0.0),
+                "infinite scale",
+            ),
+            (q4_f32_to_f16(0.0), q4_f32_to_f16(0.0), "zero scale"),
+            (q4_f32_to_f16(-1.0), q4_f32_to_f16(0.0), "negative scale"),
+            (q4_f32_to_f16(1.0), q4_f32_to_f16(f32::NAN), "NaN bias"),
+        ];
+
+        for (scale, bias, label) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("invalid_metadata.q4");
+            std::fs::write(&path, q4_file_bytes(&[32], 32, scale, bias)).unwrap();
+
+            let err = load_q4_file(&path).expect_err(label);
+            assert!(
+                err.to_string().contains("block 0"),
+                "{label} error must identify its block: {err}"
+            );
+        }
+    }
+
+    /// Structural proof that `validate_q4_file` no longer performs a
+    /// separate full-payload block scan: a file with a structurally valid
+    /// header/geometry/extent but deliberately non-finite (NaN) block
+    /// scale/bias must be *accepted* by `validate_q4_file` alone, because
+    /// that function only checks header/geometry/extent now. The exact same
+    /// bytes are still rejected by `load_q4_file`, which folds the
+    /// per-block finite check into the single read-and-decode pass it
+    /// already performs over the payload — proving the check moved rather
+    /// than disappeared.
+    ///
+    /// Mutation sensitivity: reverting the perf fix (re-adding the per-block
+    /// scan loop to `validate_q4_file`) makes `validate_q4_file` itself
+    /// reject this file, so `validate_q4_file_does_not_scan_block_payload`
+    /// goes red on the first assertion. Verified via reverse-apply + touch +
+    /// `cargo test` (see PR report).
+    #[test]
+    fn validate_q4_file_does_not_scan_block_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("garbage_blocks.q4");
+        std::fs::write(
+            &path,
+            q4_file_bytes(&[32], 32, q4_f32_to_f16(f32::NAN), q4_f32_to_f16(f32::NAN)),
+        )
+        .unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let result = validate_q4_file(&mut file, &path, Some(&[32]));
+        assert!(
+            result.is_ok(),
+            "validate_q4_file must not scan block payload bytes, but got: {:?}",
+            result.err()
+        );
+
+        let load_result = load_q4_file(&path);
+        assert!(
+            load_result.is_err(),
+            "load_q4_file must still reject non-finite block metadata, folded into its own \
+             single payload read"
+        );
+    }
+
+    #[test]
+    fn q4_ingress_rejects_trailing_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trailing.q4");
+        let mut bytes = q4_file_bytes(&[32], 32, q4_f32_to_f16(1.0), q4_f32_to_f16(0.0));
+        bytes.push(0xAA);
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = load_q4_file(&path).expect_err("trailing byte must be rejected");
+        assert!(
+            err.to_string().contains("trailing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn checked_native_loaders_reject_same_numel_transposed_geometry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q4_path = tmp.path().join("transposed.q4");
+        std::fs::write(
+            &q4_path,
+            q4_file_bytes(&[2, 32], 64, q4_f32_to_f16(1.0), q4_f32_to_f16(0.0)),
+        )
+        .unwrap();
+        let f16_path = tmp.path().join("transposed.f16");
+        std::fs::write(&f16_path, f16_file_bytes(&[2, 32], &[0u16; 64])).unwrap();
+
+        let q4_err = load_q4_file_checked(&q4_path, &[32, 2])
+            .expect_err("same-numel transposed Q4 shape must be rejected");
+        assert!(q4_err.to_string().contains("expected [32, 2]"));
+        let f16_err = load_f16_tensor_file_checked(&f16_path, &[32, 2])
+            .expect_err("same-numel transposed F16 shape must be rejected");
+        assert!(f16_err.to_string().contains("expected [32, 2]"));
     }
 
     // -----------------------------------------------------------------------
@@ -2225,14 +2580,25 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_q4_header_payload_bounds_rejects_trailing_byte() {
+        let header = Q4FileHeader {
+            shape: vec![32],
+            original_len: 32,
+            payload_offset: 28,
+        };
+        let r = validate_q4_header_payload_bounds(&header, 49, std::path::Path::new("t.q4"));
+        let err = r.expect_err("one trailing byte must be rejected");
+        assert!(err.to_string().contains("trailing"));
+    }
+
+    #[test]
     fn test_validate_q4_header_payload_bounds_rejects_shape_mismatch() {
         let header = Q4FileHeader {
             shape: vec![4, 16], // product 64
             original_len: 32,   // disagrees with shape product
             payload_offset: 36,
         };
-        let r =
-            validate_q4_header_payload_bounds(&header, 1_000, &std::path::PathBuf::from("t.q4"));
+        let r = validate_q4_header_payload_bounds(&header, 56, std::path::Path::new("t.q4"));
         assert!(
             r.is_err(),
             "shape product != original_len must be rejected before a payload-length check"
@@ -2295,6 +2661,52 @@ mod tests {
             err.to_string().contains("shape product"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn f16_ingress_rejects_non_finite_values_and_trailing_bytes() {
+        for (bits, label) in [
+            (q4_f32_to_f16(f32::NAN), "NaN"),
+            (q4_f32_to_f16(f32::INFINITY), "infinity"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("non_finite.f16");
+            std::fs::write(&path, f16_file_bytes(&[1], &[bits])).unwrap();
+            let err = load_f16_tensor_file(&path).expect_err(label);
+            assert!(err.to_string().contains("element index 0"));
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trailing.f16");
+        let mut bytes = f16_file_bytes(&[1], &[q4_f32_to_f16(1.0)]);
+        bytes.push(0xAA);
+        std::fs::write(&path, bytes).unwrap();
+        let err = load_f16_tensor_file(&path).expect_err("trailing byte must be rejected");
+        assert!(
+            err.to_string().contains("trailing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn quantizers_return_errors_for_shape_mismatches() {
+        assert!(quantize_tensor_q4_0(&[0.0], 1, 2).is_err());
+        assert!(quantize_bf16_to_q4(&[0], &[2]).is_err());
+        assert!(quantize_f32_to_q4(&[0.0], &[2]).is_err());
+        assert!(quantize_f64_to_q4_mode(&[0.0], &[2], true).is_err());
+    }
+
+    #[test]
+    fn quantizer_rejects_f16_metadata_overflow() {
+        let err = quantize_row_q4_0(&[f32::MAX; 32])
+            .expect_err("finite source whose serialized bias overflows f16 must be rejected");
+        assert!(err.to_string().contains("f16"));
+
+        let mut symmetric = [0.0f64; 32];
+        symmetric[0] = 500_000.0;
+        let err = quantize_f64_to_q4_mode(&symmetric, &[32], true)
+            .expect_err("finite source whose serialized symmetric metadata overflows f16");
+        assert!(err.to_string().contains("f16"));
     }
 
     #[test]
@@ -2550,6 +2962,60 @@ mod tests {
         assert!(
             err.contains("payload too large"),
             "expected a payload-cap error, got: {err}"
+        );
+        assert!(
+            !merged_p.exists(),
+            "no merged artifact may be produced from a rejected source"
+        );
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_write_merged_qkvz_rejects_rank0_qkv_header_instead_of_panicking() {
+        // A structurally valid-per-`validate_q4_file` but rank-0 (`ndim = 0`)
+        // qkv source: shape = [], original_len = 1 (matches the empty
+        // shape's element-count product of 1), one valid block. Before the
+        // 2-D guard, `write_merged_qkvz` unconditionally indexed
+        // `qkv_hdr.shape[0]`, which panics (denial of service) on this input
+        // instead of returning `Err`.
+        let (qkv_p, z_p, merged_p) = merge_test_paths("rank0_qkv");
+        std::fs::write(
+            &qkv_p,
+            q4_file_bytes(&[], 1, q4_f32_to_f16(1.0), q4_f32_to_f16(0.0)),
+        )
+        .unwrap();
+        write_test_q4_source(&z_p, 4, 8, 5.0);
+
+        let err = write_merged_qkvz(&qkv_p, &z_p, &merged_p)
+            .expect_err("rank-0 qkv header must be rejected, not panic");
+        assert!(
+            err.contains("not 2-D"),
+            "expected a 2-D shape error, got: {err}"
+        );
+        assert!(
+            !merged_p.exists(),
+            "no merged artifact may be produced from a rejected source"
+        );
+
+        std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn test_write_merged_qkvz_rejects_rank0_z_header_instead_of_panicking() {
+        let (qkv_p, z_p, merged_p) = merge_test_paths("rank0_z");
+        write_test_q4_source(&qkv_p, 4, 8, 1.0);
+        std::fs::write(
+            &z_p,
+            q4_file_bytes(&[], 1, q4_f32_to_f16(1.0), q4_f32_to_f16(0.0)),
+        )
+        .unwrap();
+
+        let err = write_merged_qkvz(&qkv_p, &z_p, &merged_p)
+            .expect_err("rank-0 z header must be rejected, not panic");
+        assert!(
+            err.contains("not 2-D"),
+            "expected a 2-D shape error, got: {err}"
         );
         assert!(
             !merged_p.exists(),
