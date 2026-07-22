@@ -54,6 +54,12 @@ on:
       - 'scripts/bench-compare.sh'
       - 'scripts/perf-bench-gate.py'
       # Helpers bench-compare.sh invokes: a change in them changes the run.
+      # bench-compare-impl.sh is the measurement body itself — the entry point
+      # only takes the locks, so a change confined to the body would otherwise
+      # not trigger this lane at all.
+      - 'scripts/lib/bench-compare-impl.sh'
+      - 'scripts/lib/bench-locks.py'
+      - 'scripts/lib/quiet-probe.py'
       - 'scripts/lib/bench-informational-groups.sh'
       - 'scripts/lib/bench-quick-informational-targets.txt'
       - 'scripts/lib/resolve-informational-groups.sh'
