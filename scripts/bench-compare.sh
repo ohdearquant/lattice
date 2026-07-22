@@ -70,18 +70,81 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 
-# Parse --full flag
-if [ "${1:-}" = "--full" ]; then
-  QUICK_FLAGS=""  # 100 samples, ~15 min total
-  shift
-fi
+# Parse flags. Both are optional and may appear in either order, but they must
+# precede the positional BASE/HEAD pair: the first non-flag argument ends flag
+# parsing. A flag written AFTER a ref is rejected rather than silently taken as
+# a ref — `bench-compare.sh HEAD~1 --full` used to resolve "--full" as HEAD_REF
+# and bench against nonsense. Use `--` to pass a ref that legitimately begins
+# with a dash.
+#
+# --fail-on-regression exists because this script is a REPORTER by default: the
+# gate invocation at the bottom ends in `|| true`, so a confirmed regression is
+# rendered in the report while the script still exits 0. That is correct for a
+# human reading an A/B, and completely wrong for an automated lane, where a
+# green exit beside a printed FAIL means the job passes on a real regression.
+# Opt in to propagate the gate's exit code instead. Default behavior is
+# unchanged so existing callers keep their current semantics.
+FAIL_ON_REGRESSION=0
+AFTER_DDASH=0
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --full)
+      QUICK_FLAGS=""  # 100 samples, ~15 min total
+      shift
+      ;;
+    --fail-on-regression)
+      FAIL_ON_REGRESSION=1
+      shift
+      ;;
+    --)
+      AFTER_DDASH=1
+      shift
+      break
+      ;;
+    -*)
+      echo "bench-compare.sh: unknown flag '$1'" >&2
+      echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 BASE_REF="${1:-origin/main}"
 HEAD_REF="${2:-HEAD}"
 
+# Reject dash-led leftovers. Without this a misplaced flag becomes a ref and the
+# script benches against garbage, which is worse than refusing: it produces a
+# confident-looking A/B nobody asked for.
+#
+# `--` opts out, and that opt-out has to be honored HERE, not just in the parser
+# above: the parser only shifts `--` away, so without this guard the very
+# arguments `--` was meant to protect land back in "$@" and are rejected by the
+# loop below. Advertising an escape hatch that the next ten lines then close is
+# worse than having none, because the diagnostic names it as the remedy.
+if [ "$AFTER_DDASH" = "0" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      -*)
+        echo "bench-compare.sh: '$arg' looks like a flag but follows a positional" \
+             "argument; flags must precede BASE/HEAD (use -- for a literal ref)" >&2
+        echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
+        exit 2
+        ;;
+    esac
+  done
+fi
+if [ "$#" -gt 2 ]; then
+  echo "bench-compare.sh: too many positional arguments ($#); expected at most" \
+       "BASE_REF and HEAD_REF" >&2
+  exit 2
+fi
+
 # Resolve to short SHAs for display
-BASE_SHA=$(git -C "$REPO" rev-parse --short "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
-HEAD_SHA=$(git -C "$REPO" rev-parse --short "$HEAD_REF" 2>/dev/null || echo "$HEAD_REF")
+BASE_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
+HEAD_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$HEAD_REF" 2>/dev/null || echo "$HEAD_REF")
 
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
 
@@ -100,7 +163,7 @@ WT="$REPO/.cache/bench-compare-base"
 if [ -d "$WT" ]; then
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
 fi
-git -C "$REPO" worktree add --detach "$WT" "$BASE_REF" 2>&1 | tail -1
+git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_REF" 2>&1 | tail -1
 
 cleanup() {
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
@@ -117,19 +180,83 @@ BENCHES_EMBED="simd"
 BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
 
+# --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
+# `cargo bench ... | grep -E "time:" || true` discards cargo's status TWICE: a
+# pipeline reports its LAST command (grep), and `|| true` then resets
+# PIPESTATUS to 0. So a bench that failed to build or died mid-run looked
+# exactly like a bench that produced no matching lines, and the A/B continued
+# with half its measurements missing. Verified: after `p | grep x || true`,
+# ${PIPESTATUS[0]} reads 0 even when p exited 7.
+#
+# Cargo's exit status is necessary and not sufficient. A bench invocation whose
+# Criterion filter matches no benchmark exits 0 having measured nothing, and a
+# target that emits no Criterion output contributes no comparison for the gate
+# to reconcile — absence leaves no artifact to be found missing. So each
+# invocation also reports how many measurement lines it actually printed:
+# that is the only per-target evidence available at the point where the run's
+# INTENT is known. Downstream, `perf-bench-gate.py` sees a directory tree and
+# cannot know a second target was ever supposed to be in it.
+BENCH_RC=0
+BENCH_LINES=0
+run_bench() {
+  local filter="$1"; shift
+  BENCH_RC=0
+  BENCH_LINES=0
+  local matched
+  matched="$(mktemp)"
+  { "$@" 2>&1 | grep -E "$filter" | tee "$matched"; BENCH_RC=${PIPESTATUS[0]}; } || true
+  BENCH_LINES="$(wc -l < "$matched" | tr -d ' ')"
+  rm -f "$matched"
+}
+
+# A partial A/B is not weaker evidence that nothing regressed, it is no
+# evidence: the target that failed is precisely the one nobody measured. Exit 2
+# (measurement broken) rather than 1 (confirmed regression) because the two ask
+# the reader for opposite responses. The reporter keeps its tolerant behavior.
+require_measured() {
+  local what="$1" rc="$2" lines="${3:-}"
+  if [ "$FAIL_ON_REGRESSION" != "1" ]; then
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "bench-compare: $what failed (exit $rc) — refusing to certify a partial A/B." >&2
+    exit 2
+  fi
+  # An invocation that exits 0 having printed no measurement line ran no
+  # benchmark (a filter that matches nothing is the ordinary way to get here).
+  # Its target then produces no Criterion comparison at all, and a gate that
+  # reconciles comparisons found against comparisons judged cannot see it:
+  # there is nothing on disk to be missing. Caught here, where the target is
+  # still named, or not at all.
+  if [ -n "$lines" ] && [ "$lines" -eq 0 ]; then
+    echo "bench-compare: $what exited 0 but produced no measurements — refusing to certify a partial A/B." >&2
+    exit 2
+  fi
+}
+
 # --- Build + bench base ---
 echo ""
 echo "--- Building + benching BASE ($BASE_SHA) ---"
+BASE_PHASE_RC=0
 (
   cd "$WT"
-  # Only bench what exists — some benches may not exist on older refs
+  # Only bench what exists — some benches may not exist on older refs. That
+  # tolerance is right for a human comparing against an old ref and wrong for
+  # the enforcing lane, where "absent" and "failed to compile" arrive on the
+  # same channel and one of them silently deletes half the comparison.
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
+    run_bench "time:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS
+    require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
+    require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
-  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:" || true
-)
+  run_bench "time:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS
+  require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
+) || BASE_PHASE_RC=$?
+# `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
+# and re-raised here or the refusal above is itself swallowed.
+if [ "$BASE_PHASE_RC" -ne 0 ]; then exit "$BASE_PHASE_RC"; fi
 
 # --- Copy base criterion data to HEAD's target ---
 echo ""
@@ -143,7 +270,7 @@ else
   if [ -d "$HEAD_WT" ]; then
     git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
   fi
-  git -C "$REPO" worktree add --detach "$HEAD_WT" "$HEAD_REF" 2>&1 | tail -1
+  git -C "$REPO" worktree add --detach --end-of-options "$HEAD_WT" "$HEAD_REF" 2>&1 | tail -1
   HEAD_DIR="$HEAD_WT"
   # Update cleanup to also remove head worktree
   trap 'git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true; cleanup' EXIT
@@ -158,15 +285,20 @@ if [ -d "$WT/target/criterion" ]; then
   rsync -a "$WT/target/criterion/" "$HEAD_DIR/target/criterion/" 2>/dev/null || true
 fi
 
+HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
+    run_bench "time:|change:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS
+    require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
+    require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS 2>&1 | grep -E "time:|change:" || true
-)
+  run_bench "time:|change:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS
+  require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
+) || HEAD_PHASE_RC=$?
+if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
 
 # --- Quick-mode informational demotion (lattice#714 / lattice#1060) ---
 # Target-level policy: the demoted-target set lives in ONE validated
@@ -242,9 +374,35 @@ GATE_ARGS=(--baseline-name compare-base)
 if [ -s "$INFO_GROUPS_FILE" ]; then
   GATE_ARGS+=(--informational-groups-file "$INFO_GROUPS_FILE")
 fi
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  # Ask the gate to distinguish "nothing regressed" from "nothing was
+  # measured". It is the only party that can: it parses the comparisons and
+  # knows how many were judgeable. Testing for the criterion DIRECTORY here
+  # cannot work — this script creates that directory itself before benching.
+  GATE_ARGS+=(--require-measurements)
+fi
+
+GATE_RC=0
 if [ -d "$HEAD_DIR/target/criterion" ]; then
-  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || true
+  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || GATE_RC=$?
+else
+  # Cannot happen via the normal path (the directory is created above), but a
+  # missing root must not read as a pass under --fail-on-regression.
+  GATE_RC=2
 fi
 
 echo ""
 echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
+
+if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
+  # Exit 1 is a confirmed regression; exit 2 is the gate refusing to certify a
+  # run it could not judge (no comparison data, or nothing gating). Both must
+  # fail the caller: a green exit standing in for evidence that was never
+  # produced is the exact defect this flag exists to remove.
+  if [ "$GATE_RC" = "2" ]; then
+    echo "bench-compare: gate could not judge this run — no usable measurements." >&2
+  else
+    echo "bench-compare: gate reported a confirmed regression (exit $GATE_RC)." >&2
+  fi
+  exit "$GATE_RC"
+fi
