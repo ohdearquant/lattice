@@ -89,13 +89,26 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 
-# --- Proof that the locks are held, not a claim that they are ---
+# --- Refuse to measure unless a live supervisor is above us ---
 # scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
-# which records its own PID here after taking both locks. Requiring that PID to
-# be one of THIS process's ancestors is what makes the check sound: process
-# ancestry comes from the OS, so a stale file, a copied file, or a hand-written
-# one cannot satisfy it, and running this body outside the supervisor is
-# refused rather than silently measured without isolation.
+# which records its own PID here after taking both locks. This requires that PID
+# to be one of THIS process's ancestors before measuring.
+#
+# WHAT THAT ACTUALLY PROVES, stated exactly, because the tempting overclaim is
+# one word wider than the truth. The file supplies the PID and the OS supplies
+# the chain, so the check establishes a RELATION: the named process is really an
+# ancestor of this one. It refuses a status file left over from a finished run,
+# a file copied from a different run or machine, and accidental direct
+# invocation of this body, which are the ways this actually gets run without
+# isolation. It does NOT stop a caller who deliberately records an ancestor's
+# PID, their own shell's included: the recorded PID is still caller-supplied,
+# and ancestry confirms the relation, not that the named process holds anything.
+#
+# Closing that needs the lock DESCRIPTOR rather than a PID — an fstat identity
+# check on an inherited fd, followed by a non-blocking flock on it, which leaves
+# the lock held on that description whichever branch is taken. That arrives with
+# the nested-acquirer work, where a child that must hold a lock exists to
+# receive the descriptor. Until then this is the strong refusal, not a proof.
 LOCK_STATUS_FILE="$REPO/.cache/bench-locks-status.txt"
 LOCK_SUMMARY=""
 verify_locks() {

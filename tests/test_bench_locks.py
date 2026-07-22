@@ -4,25 +4,33 @@
 Two properties are pinned here, and both are about refusing rather than about
 measuring.
 
-The lock status file is PROOF, not a claim. scripts/bench-compare.sh runs the
-measurement body under scripts/lib/bench-locks.py, which records its own PID
-after taking both machine-wide locks. The body requires that PID to be one of
-its own ancestors. Process ancestry comes from the OS, so a stale file, a copied
-file, or a hand-written one cannot satisfy it -- which is what keeps the body
-from being run directly and silently measuring without isolation. A check that
-merely asserted the file exists would be a claim supplied by the thing being
-checked.
+The body refuses to measure unless a live supervisor is above it.
+scripts/bench-compare.sh runs the measurement body under
+scripts/lib/bench-locks.py, which records its own PID after taking both
+machine-wide locks; the body requires that PID to be one of its own ancestors.
+
+Stated exactly, because the tempting claim is one word wider than the truth: the
+file supplies the PID and the OS supplies the chain, so the check establishes a
+RELATION. It refuses a status file left over from a finished run, one copied
+from a different run, and accidental direct invocation -- the ways this actually
+gets run without isolation. It does not stop a caller who deliberately records
+an ancestor's PID. Closing that needs the lock descriptor rather than a PID, and
+arrives with the nested-acquirer work.
+
+A check that merely asserted the file exists would refuse none of the above.
 
 The ambient-load gate REFUSES. A lock excludes peers on this machine; it says
 nothing about how busy the machine is. A warning printed on a bench report is
 read by nobody at the moment it matters, which is weeks later when someone
 quotes the number.
 """
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -94,9 +102,9 @@ class _Sandbox:
         return self.root / ".cache" / "bench-locks-status.txt"
 
 
-class LockProof(unittest.TestCase):
+class LockPrecondition(unittest.TestCase):
     def test_body_invoked_directly_refuses(self):
-        """No status file at all means no proof of isolation.
+        """No status file at all means no evidence of isolation.
 
         Mutation-sensitive: delete the verify_locks call from the body and this
         run proceeds to bench without either machine-wide lock held.
@@ -121,8 +129,43 @@ class LockProof(unittest.TestCase):
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
             self.assertIn("not an ancestor", r.stderr)
 
+    def test_deliberately_recorded_ancestor_pid_is_accepted(self):
+        """The boundary of the guard, pinned as a fact rather than left in prose.
+
+        A caller who records a PID that really is one of its ancestors -- its own
+        shell, here -- passes the check with no lock held. That is the limit of
+        what a PID can establish: the file supplies the number, the OS confirms
+        only the relation.
+
+        This is a characterization test, not a wish. It exists so the comment
+        describing that limit cannot drift away from the code: strengthen the
+        guard to close this and the test fails, which is the signal to update
+        every place the limit is described.
+        """
+        with _Sandbox() as sb:
+            sb.status.parent.mkdir(parents=True, exist_ok=True)
+            script = (
+                f'echo "supervisor_pid=$$" > {sb.status}\n'
+                f'echo "lock=fabricated, nothing is held" >> {sb.status}\n'
+                # The recording shell must stay alive as the parent. Two ways to
+                # lose it, both of which make the body inherit that PID as its
+                # OWN and get refused (the walk starts at PPID, so self never
+                # matches): an explicit `exec`, and bash's implicit exec of the
+                # LAST simple command in a -c script. The trailing statement
+                # below defeats the second. An interactive operator typing the
+                # command hits neither, which is the case being characterized.
+                f'bash {sb.impl} HEAD~1 HEAD\n'
+                'rc=$?\n'
+                'exit "$rc"\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                env={**sb.env, "BENCH_IDLE_FLOOR": "0"}, timeout=300)
+            self.assertNotIn("not an ancestor", r.stderr)
+            self.assertIn("Run conditions", r.stdout, f"stderr:\n{r.stderr}")
+
     def test_supervised_run_reaches_the_measurement(self):
-        """Through the entry point the proof holds and the body runs.
+        """Through the entry point the check passes and the body runs.
 
         Without this the two refusals above would also pass if the body refused
         unconditionally, which would be a broken script and a green suite.
@@ -131,6 +174,51 @@ class LockProof(unittest.TestCase):
             r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
             self.assertIn("Run conditions", r.stdout, f"stdout:\n{r.stdout}")
             self.assertIn("bench-window", r.stdout)
+
+
+class ContentionDiagnostics(unittest.TestCase):
+    def test_holder_report_never_includes_command_line_arguments(self):
+        """Waiting on a lock must not print other processes' arguments.
+
+        The contention message goes to stderr, which on this repository's
+        workflows lands in publicly readable job logs. Arguments carry tokens,
+        keys and connection strings, so a diagnostic that prints the full
+        command line discloses them.
+
+        Mutation-sensitive: change the executable-name lookup back to
+        `ps -o command=` and the marker below appears in the output.
+        """
+        if shutil.which("lsof") is None:
+            self.skipTest("lsof unavailable; the diagnostic returns nothing")
+
+        spec = importlib.util.spec_from_file_location(
+            "bench_locks", str(LIB / "bench-locks.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        marker = "PRETEND-CREDENTIAL-do-not-log"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "held.lock")
+            open(path, "w").close()
+            holder = subprocess.Popen(
+                ["python3", "-c",
+                 "import sys,time; f=open(sys.argv[1]); time.sleep(20)",
+                 path, marker])
+            try:
+                for _ in range(40):
+                    found = mod._openers(path)
+                    if any(pid == holder.pid for pid, _ in found):
+                        break
+                    time.sleep(0.25)
+                else:
+                    self.skipTest("holder never appeared in lsof output")
+                rendered = mod._describe_contention(path)
+                self.assertIn(str(holder.pid), rendered)
+                self.assertNotIn(marker, rendered)
+                self.assertNotIn(path, rendered)
+            finally:
+                holder.kill()
+                holder.wait()
 
 
 class AmbientLoadGate(unittest.TestCase):

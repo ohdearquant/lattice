@@ -102,7 +102,16 @@ def ancestors() -> list[int]:
 
 
 def _openers(path: str) -> list[tuple[int, str]]:
-    """(pid, command) for processes with `path` open. Diagnostic only."""
+    """(pid, executable name) for processes with `path` open. Diagnostic only.
+
+    THE EXECUTABLE NAME, NEVER THE COMMAND LINE. `ps -o command=` would be more
+    informative and is the wrong trade: arguments carry tokens, keys and
+    connection strings, and this message is written to stderr by a script that
+    runs in this repository's workflows, whose job logs are publicly readable.
+    A diagnostic that can disclose a credential is not worth the extra context;
+    a PID plus a name is enough for an operator to run `ps` themselves on the
+    machine where doing so is safe.
+    """
     if shutil.which("lsof") is None:
         return []
     try:
@@ -118,15 +127,15 @@ def _openers(path: str) -> list[tuple[int, str]]:
         except ValueError:
             continue
         try:
-            cmd = subprocess.run(
-                ["ps", "-o", "command=", "-p", str(pid)],
+            name = subprocess.run(
+                ["ps", "-o", "comm=", "-p", str(pid)],
                 capture_output=True,
                 text=True,
                 timeout=5,
             ).stdout.strip()
         except (subprocess.SubprocessError, OSError):
-            cmd = "?"
-        found.append((pid, cmd[:120] or "?"))
+            name = "?"
+        found.append((pid, os.path.basename(name)[:64] or "?"))
     return found
 
 
