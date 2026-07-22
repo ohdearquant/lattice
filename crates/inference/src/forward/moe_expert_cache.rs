@@ -278,11 +278,22 @@ impl ExpertByteTable {
     /// PLAN.md §3 proves holds for every Q4 MoE checkpoint this loader
     /// writes; it is re-verified here, not just assumed, via the
     /// block-alignment check below.
+    ///
+    /// Same open+trust-boundary gate + post-map fstat recheck as
+    /// `MetalQwen35State::mmap_q4_weight` (#1037): this table's `mmap` is
+    /// kept alive for the cache's entire lifetime and re-read lazily on
+    /// every cache miss via [`Self::expert_bytes`], long after this `open`
+    /// call returns — a strictly *wider* truncate-after-validate window
+    /// than a loader that dequantizes immediately, so it needs the same two
+    /// guards: [`open_trusted_mmap_file`] (regular-file/O_NONBLOCK +
+    /// mode/uid/ACL, before the file is even parsed) and
+    /// [`verify_mmap_target_unchanged`]'s real post-map fstat recheck on the
+    /// still-open fd, rather than only the pre-map `stat` length.
     fn open(path: &Path, expected_shape: &[usize]) -> Result<Self, String> {
+        use crate::weights::mmap_trust::{open_trusted_mmap_file, verify_mmap_target_unchanged};
         use crate::weights::q4_weights::{read_q4_header, validate_q4_header_payload_bounds};
 
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        let (file, metadata) = open_trusted_mmap_file(path)?;
         let header = read_q4_header(&file)
             .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
         if header.shape != expected_shape {
@@ -294,10 +305,7 @@ impl ExpertByteTable {
                 header.shape
             ));
         }
-        let file_len = file
-            .metadata()
-            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-            .len();
+        let file_len = metadata.len();
         validate_q4_header_payload_bounds(&header, file_len, path)
             .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
 
@@ -347,6 +355,16 @@ impl ExpertByteTable {
         // `load_q4_mmap_dequant_f16`).
         let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
             .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        // Post-map integrity recheck (#1037) -- mirrors
+        // `mmap_q4_weight`'s: a writer that truncates the file between the
+        // pre-map stat and this `mmap()` call would otherwise let a
+        // now-too-short mapping back this table, and every subsequent
+        // `expert_bytes` read (for the rest of this cache's lifetime) would
+        // read past the end of a too-short mapping instead of failing to
+        // load in the first place. See `verify_mmap_target_unchanged`'s doc
+        // comment for why this fstats the fd again rather than trusting
+        // `mmap.len()`.
+        verify_mmap_target_unchanged(&file, &metadata, path)?;
 
         Ok(Self {
             mmap,

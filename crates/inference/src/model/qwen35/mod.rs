@@ -79,7 +79,10 @@ pub(crate) use generation::check_context_budget;
 // gated identically) consumer needs the re-export; `generation.rs` itself
 // uses `DecodePolicy` directly within its own module.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use generation::{DecodePolicy, StepOutcome, StopCheckOutcome};
+pub(crate) use generation::{
+    DecodePolicy, REASONING_CLOSE_MARKER, StepOutcome, StopCheckOutcome,
+    resolve_reasoning_close_token,
+};
 // Sibling guard for `enable_mtp` on the cross-turn prefix-cache path, which
 // has no MTP draft/verify wiring (PR #787). Only
 // that Metal-only path needs it, same gate as `DecodePolicy`/`StepOutcome`.
