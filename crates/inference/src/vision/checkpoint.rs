@@ -22,6 +22,13 @@ use crate::quant::q4_manifest;
 use crate::weights::f32_weights::{ShardedSafetensors, TensorSource};
 use crate::weights::q4_weights::{dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file};
 
+/// Tensor name to its dequantized data paired with the shape it was declared with.
+///
+/// The shape travels alongside the data because a checkpoint's declared shape is what
+/// preflight validates against, and it must stay available after materialization for
+/// the sources that cannot report a shape without reading the tensor.
+type NamedTensors = HashMap<String, (Vec<f32>, Vec<usize>)>;
+
 /// One ViT transformer block's real tensors (`model.visual.blocks.{i}.*`).
 #[derive(Debug, Clone)]
 pub struct VisualBlockWeights {
@@ -167,6 +174,52 @@ fn tensor_names(vision_cfg: &VisionModelConfig) -> Vec<String> {
     names
 }
 
+/// The shape `assemble` will require for a given `model.visual.*` tensor name, mirroring
+/// its per-tensor `take(name, expected_shape)` calls. `None` means the name is not one of
+/// the expected tensors (unreachable given `tensor_names()`, but the caller falls back to
+/// the post-materialization check in that case rather than assuming a shape).
+fn expected_visual_tensor_shape(name: &str, vision_cfg: &VisionModelConfig) -> Option<Vec<usize>> {
+    let hidden = vision_cfg.hidden_size;
+    let qkv_out = 3 * hidden;
+    let mlp_intermediate = 4 * hidden;
+    let merge_in = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size * hidden;
+    let out_hidden = vision_cfg.out_hidden_size;
+
+    if let Some(rest) = name.strip_prefix("model.visual.blocks.") {
+        let suffix = rest.split_once('.').map(|(_, s)| s).unwrap_or(rest);
+        return match suffix {
+            "attn.qkv.weight" => Some(vec![qkv_out, hidden]),
+            "attn.qkv.bias" => Some(vec![qkv_out]),
+            "attn.proj.weight" => Some(vec![hidden, hidden]),
+            "attn.proj.bias" => Some(vec![hidden]),
+            "mlp.linear_fc1.weight" => Some(vec![mlp_intermediate, hidden]),
+            "mlp.linear_fc1.bias" => Some(vec![mlp_intermediate]),
+            "mlp.linear_fc2.weight" => Some(vec![hidden, mlp_intermediate]),
+            "mlp.linear_fc2.bias" => Some(vec![hidden]),
+            "norm1.weight" | "norm2.weight" | "norm1.bias" | "norm2.bias" => Some(vec![hidden]),
+            _ => None,
+        };
+    }
+
+    match name {
+        "model.visual.patch_embed.proj.weight" => Some(vec![
+            hidden,
+            vision_cfg.in_channels,
+            vision_cfg.temporal_patch_size,
+            vision_cfg.patch_size,
+            vision_cfg.patch_size,
+        ]),
+        "model.visual.patch_embed.proj.bias" => Some(vec![hidden]),
+        "model.visual.pos_embed.weight" => Some(vec![vision_cfg.num_position_embeddings, hidden]),
+        "model.visual.merger.linear_fc1.weight" => Some(vec![merge_in, merge_in]),
+        "model.visual.merger.linear_fc1.bias" => Some(vec![merge_in]),
+        "model.visual.merger.linear_fc2.weight" => Some(vec![out_hidden, merge_in]),
+        "model.visual.merger.linear_fc2.bias" => Some(vec![out_hidden]),
+        "model.visual.merger.norm.weight" | "model.visual.merger.norm.bias" => Some(vec![hidden]),
+        _ => None,
+    }
+}
+
 fn load_from_fp16_dir(
     model_dir: &Path,
     vision_cfg: &VisionModelConfig,
@@ -196,12 +249,37 @@ fn load_from_fp16_dir(
         )));
     }
 
-    let mut tensors = HashMap::with_capacity(expected_names.len());
-    for name in expected_names {
-        let (data, shape) = reader.get_f32_tensor_owned(&name)?;
+    let tensors = fetch_expected_tensors(&mut reader, expected_names, vision_cfg)?;
+    assemble(tensors, vision_cfg)
+}
+
+/// Fetch every name in `names` from `source`, checking each one's header-declared shape
+/// against `expected_visual_tensor_shape` before materializing it -- mirroring the
+/// Qwen3.5 text-decoder loader's `load_owned_tensor_checked`. A shape mismatch is
+/// rejected here instead of after a full owned read and allocation. Generic over
+/// `TensorSource` (rather than inlined into `load_from_fp16_dir`) so tests can exercise
+/// the preflight-before-materialize ordering with a mock source.
+fn fetch_expected_tensors<T: TensorSource + ?Sized>(
+    source: &mut T,
+    names: Vec<String>,
+    vision_cfg: &VisionModelConfig,
+) -> Result<NamedTensors, InferenceError> {
+    let mut tensors = HashMap::with_capacity(names.len());
+    for name in names {
+        if let Some(expected) = expected_visual_tensor_shape(&name, vision_cfg)
+            && let Some(declared) = source.tensor_shape(&name)?
+            && declared != expected
+        {
+            return Err(InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual: declared,
+            });
+        }
+        let (data, shape) = source.get_f32_tensor_owned(&name)?;
         tensors.insert(name, (data, shape));
     }
-    assemble(tensors, vision_cfg)
+    Ok(tensors)
 }
 
 fn load_from_q4_dir(
@@ -576,6 +654,83 @@ mod tests {
             v.push((format!("model.visual.blocks.0.{suffix}"), shape));
         }
         v
+    }
+
+    /// A [`TensorSource`] that records every name passed to `get_f32_tensor_owned`, so a
+    /// test can assert a specific tensor's shape mismatch is caught from the
+    /// header-declared shape without that tensor's data ever being copied (other,
+    /// correctly-shaped tensors ahead of it in iteration order are still fetched
+    /// normally).
+    struct CountingSource {
+        tensors: HashMap<String, (Vec<f32>, Vec<usize>)>,
+        materialized: std::cell::RefCell<std::collections::HashSet<String>>,
+    }
+
+    impl TensorSource for CountingSource {
+        fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+            Ok(self.tensors.contains_key(name))
+        }
+        fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, s)| s.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.materialized.borrow_mut().insert(name.to_string());
+            self.tensors
+                .get(name)
+                .map(|(d, s)| (d.clone(), s.clone()))
+                .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
+    /// An undersized (but declared-shape-visible) block tensor must be rejected from
+    /// its header-declared shape, before `get_f32_tensor_owned` ever copies its data.
+    /// `assemble`'s own post-materialization check would also catch this shape
+    /// mismatch, so `expect_err` alone would not be mutation-sensitive to the
+    /// preflight; the "mutated name was never materialized" assertion is what pins the
+    /// preflight-before-materialize ordering specifically.
+    #[test]
+    fn fetch_expected_tensors_rejects_undersized_tensor_before_materialization() {
+        let cfg = tiny_vision_cfg();
+        let names = tensor_names(&cfg);
+        let mutated_name = "model.visual.blocks.0.mlp.linear_fc1.weight".to_string();
+        let hidden = cfg.hidden_size;
+
+        let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = tiny_expected_shapes()
+            .into_iter()
+            .map(|(name, shape)| {
+                let numel: usize = shape.iter().product();
+                (name, (vec![0.5f32; numel], shape))
+            })
+            .collect();
+        // Declared shape undersized relative to [4*hidden, hidden], data consistent
+        // with the (wrong) declared shape.
+        tensors.insert(
+            mutated_name.clone(),
+            (
+                vec![0.5f32; (4 * hidden - 1) * hidden],
+                vec![4 * hidden - 1, hidden],
+            ),
+        );
+        let mut source = CountingSource {
+            tensors,
+            materialized: std::cell::RefCell::new(std::collections::HashSet::new()),
+        };
+
+        let err = fetch_expected_tensors(&mut source, names, &cfg)
+            .expect_err("undersized fc1 weight must be rejected");
+        match err {
+            InferenceError::ShapeMismatch { name, .. } => {
+                assert_eq!(name, mutated_name, "error must name the mutated tensor");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+        assert!(
+            !source.materialized.borrow().contains(&mutated_name),
+            "the mismatched tensor's data must never be copied"
+        );
     }
 
     /// Corrupt the FC2 weight entry in `shapes` to a same-numel transposition

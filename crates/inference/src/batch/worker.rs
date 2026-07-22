@@ -342,7 +342,10 @@ impl BatchWorker {
         if request.prompt_ids.is_empty() {
             return None;
         }
-        let total_len = request.prompt_ids.len() + request.max_new_tokens;
+        let total_len = request
+            .prompt_ids
+            .len()
+            .checked_add(request.max_new_tokens)?;
         if total_len > self.config.max_seq_len {
             return None;
         }
@@ -743,6 +746,24 @@ mod tests {
             sampling: SamplingConfig::greedy(),
             lora_adapter: None,
             max_new_tokens: 10, // 60 + 10 = 70 > 64
+        };
+        assert!(worker.submit(req).is_none());
+    }
+
+    /// `prompt_ids.len() + max_new_tokens` must not overflow `usize`: before the fix,
+    /// `max_new_tokens = usize::MAX` wrapped the unchecked `+` to a small value in
+    /// release builds (bypassing the `total_len > max_seq_len` guard and admitting an
+    /// absurd budget) or panicked in debug. `checked_add` must reject this cleanly on
+    /// both profiles. Mutation-sensitive: reverting `checked_add` back to `+` makes
+    /// this test panic on overflow in a debug build (the profile tests run under).
+    #[test]
+    fn submit_max_new_tokens_near_usize_max_returns_none() {
+        let mut worker = test_worker();
+        let req = InferenceRequest {
+            prompt_ids: vec![1, 2, 3],
+            sampling: SamplingConfig::greedy(),
+            lora_adapter: None,
+            max_new_tokens: usize::MAX,
         };
         assert!(worker.submit(req).is_none());
     }
