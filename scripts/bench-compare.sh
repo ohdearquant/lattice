@@ -16,6 +16,17 @@
 #   lattice-embed: simd
 # Uses a git worktree for the base ref so your working tree stays untouched.
 #
+# VOCABULARY, because these four are separate and get conflated. A group is
+# MEASURED if the bench ran and produced numbers; REPORTED if those numbers
+# appear in the report; CLASSIFIED GATING (vs informational) if a regression
+# in it contributes to the report's FAIL verdict; and ENFORCED only if that
+# FAIL verdict reaches the caller as a non-zero exit status. Classification
+# is not enforcement: by default this script computes a verdict and then
+# discards its exit status, so --quick and --full are both REPORT-ONLY.
+# Enforcement is opt-in per invocation via --fail-on-regression, which
+# propagates the gate's status instead; `make bench-gate` also enforces.
+# Use these words literally below.
+#
 # lattice#714 / lattice#1060: the lattice-embed `simd` bench TARGET is
 # informational in --quick mode (the default). Same-toolchain, same-commit
 # A/A reproductions in exclusive bench windows repeatedly produced
@@ -26,14 +37,45 @@
 # scripts/lib/bench-quick-informational-targets.txt (validated by
 # scripts/perf-bench-gate.py --selftest); their groups are still fully
 # measured and rendered — the informational section plus the
-# all-measurements table record every number — but excluded from the
-# FAIL/WARN gate and exit code. Every non-demoted target (all of
-# lattice-inference) gates normally in --quick.
+# all-measurements table record every number — but classified informational,
+# so they cannot produce a FAIL verdict. Every non-demoted target this script
+# benches (the lattice-inference one) is classified gating in --quick.
 #
-# --full remains the gate for EVERY group of every target: quick mode is a
-# PR-side direction/magnitude screen, and full-resolution simd gating rides
-# the scheduled nightly perf lane (a --full run on current main), so the
-# demotion is a resolution split, not a coverage hole.
+# --full applies no informational demotion: every group it benches is
+# classified gating, simd included, because full resolution is tight enough
+# to distinguish a real simd regression from machine noise. Three caveats
+# keep that from meaning "a regression cannot get past this".
+#
+# Enforcement: neither mode enforces BY DEFAULT. This script ends its gate
+# invocation with `|| true`, so a FAIL verdict is printed and then discarded,
+# and the script exits 0 either way — which is why the demotion below is a
+# resolution split rather than a coverage hole in the default path. Two
+# callers do enforce: --fail-on-regression propagates the gate's status (exit
+# 1 confirmed regression, exit 2 the measurement itself is broken), and
+# `make bench-gate` runs the same two default targets unfiltered against the
+# perf-baselines branch and returns perf-bench-gate.py's status directly.
+#
+# Scope: this script benches two targets, not the workspace's full bench set
+# — lattice-inference:$BENCHES_INFERENCE (default elementwise_cpu_bench) and
+# lattice-embed:simd. The optional BENCH_GROUPS_* filters above narrow it
+# further, so a filtered --full run classifies only the selected groups of
+# those two.
+#
+# Automation: bench-update.yml runs those targets at full resolution on main
+# — on every push touching the perf paths (which include embed's simd source
+# and bench) and weekly by cron — and saves the baselines. It does not invoke
+# perf-bench-gate.py and takes no regression-specific fail or alert action;
+# its ordinary job steps can of course still fail on their own errors. It is
+# not silent about regressions either: its README generator compares each
+# snapshot against its predecessor and publishes a "Worst step-regression"
+# headline. So bench-update.yml itself is regression REPORTING.
+#
+# Enforcement at full resolution is a separate workflow, perf-postmerge-gate
+# .yml: it runs this script with --full --fail-on-regression on perf-path
+# merges to main, benching the merged commit against its own parent, and
+# fails the job when the gate confirms a regression. Read the two together —
+# bench-update.yml maintains the baselines and the trend, the post-merge gate
+# is what makes a confirmed regression stop something.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

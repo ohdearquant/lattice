@@ -22,8 +22,22 @@
 # INFO_TARGETS_MANIFEST overrides the manifest path for those controlled
 # probes; production never sets it.
 #
-# FULL mode (`bench-compare.sh --full`, nightly perf lane) ignores this
-# mechanism entirely and gates every group of every target.
+# FULL mode (`bench-compare.sh --full`, or `make bench-gate`) ignores this
+# mechanism entirely: every group those paths bench is classified gating,
+# with no demotion. Classification is not enforcement — `bench-compare.sh`
+# discards its gate's exit status unless the caller passes
+# --fail-on-regression, so a FAIL verdict becomes a non-zero exit only under
+# that flag or via `make bench-gate`. Both bench the same two targets rather
+# than the workspace's full bench set, and --full additionally honors
+# bench-compare.sh's BENCH_GROUPS_* filters.
+#
+# Two automated full-resolution jobs run on main, and they do different
+# things. bench-update.yml saves baselines and publishes historical trend
+# comparisons, including a "Worst step-regression" headline; it does not
+# invoke perf-bench-gate.py and takes no regression-specific fail action, so
+# it reports rather than enforces. perf-postmerge-gate.yml is the enforcing
+# one: it runs `bench-compare.sh --full --fail-on-regression` against the
+# merged commit's own parent and fails on a confirmed regression.
 set -euo pipefail
 
 MANIFEST="${INFO_TARGETS_MANIFEST:-$(dirname "$0")/bench-quick-informational-targets.txt}"
