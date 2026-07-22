@@ -2594,14 +2594,20 @@ fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
 }
 
 /// Reject a `oneOf` whose branches provably overlap on a literal value (issue
-/// #1077). Only branches that each reduce to a closed `const`/`enum` value set
-/// are checked; if any branch is open-ended (`closed_form_values` returns
-/// `None`) exclusivity is statically undecidable here and the whole schema is
-/// left unchecked — a partial check over just the literal-resolvable subset
-/// could clear branches whose actual overlap lies in the unchecked pair, which
-/// would be worse than not checking at all. This is a DOCUMENTED, bounded
-/// fix, not full runtime `oneOf` enforcement: a `oneOf` mixing e.g. an
-/// `object` branch with a `const` branch compiles exactly as `anyOf` does
+/// #1077). Only branches that reduce to a closed `const`/`enum` value set are
+/// decidable here. An open-ended branch (`closed_form_values` returns `None`)
+/// contributes nothing and is skipped, while the branches around it are still
+/// checked against each other. Skipping rather than abandoning the whole check
+/// at the first such branch is what keeps the outcome independent of where an
+/// open-ended branch sits: `oneOf`'s branches are an unordered set, so the same
+/// schema written in a different order has to compile the same way.
+///
+/// Rejecting on a shared literal is sound whatever the other branches admit —
+/// that value matches more than one branch, which is precisely what `oneOf`
+/// forbids. The converse does not hold: compiling is not a claim that
+/// exclusivity is enforced. Overlap between two open-ended branches stays
+/// undetected, which is the limitation #1077 leaves standing: a `oneOf` mixing
+/// an `object` branch with a `const` branch compiles exactly as `anyOf` does
 /// today, per the module doc's known-limitations section.
 ///
 /// Bounded against the same DoS class as `flatten_any_of_branches`
@@ -2616,7 +2622,7 @@ fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaError> {
     let mut seen: HashSet<String> = HashSet::new();
     for (i, b) in branches.iter().enumerate() {
         let Some(values) = closed_form_values(b) else {
-            return Ok(());
+            continue;
         };
         if seen.len().saturating_add(values.len()) > MAX_STRING_LITERALS {
             return Ok(());
@@ -3945,6 +3951,31 @@ mod tests {
         assert!(accepts(&g, b"\"a\""));
         assert!(accepts(&g, b"\"b\""));
         assert!(rejects(&g, b"\"c\""));
+    }
+
+    /// `oneOf`'s branches are an unordered set, so an undecidable branch must
+    /// not hide an overlap that sits on the other side of it. The first two
+    /// orderings below are the discriminating ones: a check that abandoned the
+    /// whole schema at the first open-ended branch would compile them, and the
+    /// same three branches would then reject or compile depending only on the
+    /// order they were written in.
+    #[test]
+    fn oneof_literal_overlap_found_across_an_open_ended_branch() {
+        for branches in [
+            serde_json::json!([{"const": "a"}, {"type": "object"}, {"const": "a"}]),
+            serde_json::json!([{"type": "object"}, {"const": "a"}, {"const": "a"}]),
+            serde_json::json!([{"const": "a"}, {"const": "a"}, {"type": "object"}]),
+        ] {
+            let schema = serde_json::json!({ "oneOf": branches });
+            let err = compile_json_schema(&schema).expect_err(
+                "two branches overlapping on a literal must be rejected wherever the open-ended branch sits",
+            );
+            assert!(
+                err.0.contains("oneOf"),
+                "error should name the oneOf violation, got: {}",
+                err.0
+            );
+        }
     }
 
     /// A nested union with an EXTRA sibling key (`"description"`) is NOT a
