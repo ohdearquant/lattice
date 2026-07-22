@@ -52,25 +52,25 @@ jobs:
       # Weights are immutable, so the cache keys never need to change unless a
       # model revision is bumped (then bump the matching key suffix).
       - name: Cache bge-small-en-v1.5 weights
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.lattice/models/bge-small-en-v1.5
           key: bge-small-en-v1.5-v1
 
       - name: Cache multilingual-e5-small weights
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.lattice/models/multilingual-e5-small
           key: multilingual-e5-small-v1
 
       - name: Cache all-minilm-l6-v2 weights
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.lattice/models/all-minilm-l6-v2
           key: all-minilm-l6-v2-v1
 
       - name: Cache paraphrase-multilingual-minilm-l12-v2 weights
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.lattice/models/paraphrase-multilingual-minilm-l12-v2
           key: paraphrase-multilingual-minilm-l12-v2-v1
