@@ -513,12 +513,22 @@ impl<'a> CompileCtx<'a> {
         // reject at MAX_SCHEMA_DEPTH before the native stack overflows. Folding
         // the anyOf locals in here regressed that headroom (a 2000-link chain
         // overflowed instead of returning the depth error).
-        if let Some(any_of) = schema
-            .get("anyOf")
-            .or_else(|| schema.get("oneOf"))
-            .and_then(Value::as_array)
-        {
+        if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
             return self.compile_any_of(any_of, _path);
+        }
+        if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+            // `oneOf` requires mutual exclusivity (exactly one branch matches);
+            // `compile_any_of` only enforces "at least one" (issue #1077). Full
+            // exclusivity would need the no-rewind PDA to track which branch(es)
+            // a completed value matches, which this single-stack byte matcher
+            // cannot do (same class of limitation as the shared-prefix
+            // over-rejection documented in pda.rs). Rather than ship a partial
+            // runtime tracker that would sometimes over-reject valid input,
+            // catch the one case that IS cheaply and soundly decidable at
+            // compile time: branches that reduce to a closed literal value set
+            // (`const`/`enum`). See `check_one_of_exclusivity`.
+            check_one_of_exclusivity(one_of)?;
+            return self.compile_any_of(one_of, _path);
         }
 
         // Dispatch on `type`
@@ -2566,6 +2576,64 @@ fn flatten_any_of_branches<'v>(
     Ok(())
 }
 
+/// The exact JSON values a branch is restricted to, if (and only if) that set
+/// is closed-form and enumerable from the schema alone — a `const` (one
+/// value) or an `enum` (a fixed list). Any other shape (a bare `type`, an
+/// object/array schema, an unresolved `$ref`, ...) can admit an open-ended set
+/// of values, so this returns `None` rather than guess: overlap between two
+/// `None` branches is exactly the case #1077 leaves undetected and documented,
+/// and it must stay silent rather than produce a false positive.
+fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
+    if let Some(v) = schema.get("const") {
+        return Some(vec![v.clone()]);
+    }
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return Some(values.clone());
+    }
+    None
+}
+
+/// Reject a `oneOf` whose branches provably overlap on a literal value (issue
+/// #1077). Only branches that each reduce to a closed `const`/`enum` value set
+/// are checked; if any branch is open-ended (`closed_form_values` returns
+/// `None`) exclusivity is statically undecidable here and the whole schema is
+/// left unchecked — a partial check over just the literal-resolvable subset
+/// could clear branches whose actual overlap lies in the unchecked pair, which
+/// would be worse than not checking at all. This is a DOCUMENTED, bounded
+/// fix, not full runtime `oneOf` enforcement: a `oneOf` mixing e.g. an
+/// `object` branch with a `const` branch compiles exactly as `anyOf` does
+/// today, per the module doc's known-limitations section.
+///
+/// Bounded against the same DoS class as `flatten_any_of_branches`
+/// (issue #474): branch count is capped at `MAX_ANYOF_BRANCHES` and the
+/// cumulative literal count at `MAX_STRING_LITERALS`, both by skipping the
+/// check (not erroring) once exceeded — the pre-existing `compile_any_of`
+/// guards still reject an oversized schema on the normal path.
+fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaError> {
+    if branches.len() > MAX_ANYOF_BRANCHES {
+        return Ok(());
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for (i, b) in branches.iter().enumerate() {
+        let Some(values) = closed_form_values(b) else {
+            return Ok(());
+        };
+        if seen.len().saturating_add(values.len()) > MAX_STRING_LITERALS {
+            return Ok(());
+        }
+        for v in values {
+            let key = serde_json::to_string(&v)
+                .map_err(|e| SchemaError(format!("cannot JSON-encode oneOf literal: {e}")))?;
+            if !seen.insert(key) {
+                return Err(SchemaError(format!(
+                    "oneOf branch {i} overlaps an earlier branch on literal value {v}: oneOf requires mutually exclusive branches"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fold `values` into the running `literals`/`byte_total` accumulators shared
 /// by every string-class-merging path in `compile_any_of` — a direct
 /// `StrClass::Literals` branch, a resolved `$ref` target (issue #473 shape
@@ -3846,6 +3914,37 @@ mod tests {
             rejects(&g, b"\"zzz\""),
             "issue #473: overlapping nested oneOf must not over-accept the shared value \"zzz\""
         );
+    }
+
+    #[test]
+    fn oneof_overlapping_literal_branches_rejected() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": "a"},
+                {"enum": ["a", "b"]}
+            ]
+        });
+        let err = compile_json_schema(&schema)
+            .expect_err("oneOf branches overlapping on a literal value must be rejected");
+        assert!(
+            err.0.contains("oneOf"),
+            "error should name the oneOf violation, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn oneof_disjoint_literal_branches_still_compiles() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": "a"},
+                {"const": "b"}
+            ]
+        });
+        let g = compile_json_schema(&schema).unwrap();
+        assert!(accepts(&g, b"\"a\""));
+        assert!(accepts(&g, b"\"b\""));
+        assert!(rejects(&g, b"\"c\""));
     }
 
     /// A nested union with an EXTRA sibling key (`"description"`) is NOT a
