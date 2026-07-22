@@ -21,8 +21,9 @@
 # appear in the report; CLASSIFIED GATING (vs informational) if a regression
 # in it contributes to the report's FAIL verdict; and ENFORCED only if that
 # FAIL verdict reaches the caller as a non-zero exit status. Classification
-# is not enforcement: by default this script computes a verdict and then
-# discards its exit status, so --quick and --full are both REPORT-ONLY.
+# is not enforcement: by default this script computes a verdict, captures the
+# gate's exit status, and does not act on it, so --quick and --full are both
+# REPORT-ONLY.
 # Enforcement is opt-in per invocation via --fail-on-regression, which
 # propagates the gate's status instead; `make bench-gate` also enforces.
 # Use these words literally below.
@@ -46,10 +47,11 @@
 # to distinguish a real simd regression from machine noise. Three caveats
 # keep that from meaning "a regression cannot get past this".
 #
-# Enforcement: neither mode enforces BY DEFAULT. This script ends its gate
-# invocation with `|| true`, so a FAIL verdict is printed and then discarded,
-# and the script exits 0 either way — which is why the demotion below is a
-# resolution split rather than a coverage hole in the default path. Two
+# Enforcement: neither mode enforces BY DEFAULT. The gate's exit status is
+# captured into GATE_RC at the bottom and re-raised only under
+# --fail-on-regression, so by default a FAIL verdict is printed and the script
+# still exits 0 — which is why the demotion below is a resolution split rather
+# than a coverage hole in the default path. Two
 # callers do enforce: --fail-on-regression propagates the gate's status (exit
 # 1 confirmed regression, exit 2 the measurement itself is broken), and
 # `make bench-gate` runs the same two default targets unfiltered against the
@@ -89,8 +91,9 @@ QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 # with a dash.
 #
 # --fail-on-regression exists because this script is a REPORTER by default: the
-# gate invocation at the bottom ends in `|| true`, so a confirmed regression is
-# rendered in the report while the script still exits 0. That is correct for a
+# gate invocation at the bottom captures its status into GATE_RC and re-raises
+# it only under this flag, so a confirmed regression is rendered in the report
+# while the script still exits 0. That is correct for a
 # human reading an A/B, and completely wrong for an automated lane, where a
 # green exit beside a printed FAIL means the job passes on a real regression.
 # Opt in to propagate the gate's exit code instead. Default behavior is
