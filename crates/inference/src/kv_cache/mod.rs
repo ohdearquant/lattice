@@ -17,7 +17,7 @@ pub use cross_turn::{
     plan_prefix_reuse,
 };
 pub use flat::{FlatKVCache, FlatKVCacheConfig};
-pub use paged::{EvictionPolicy, PagePool, PageTable, PagedKVCache, PagedKVCacheConfig};
+pub use paged::{CacheType, EvictionPolicy, PagePool, PageTable, PagedKVCache, PagedKVCacheConfig};
 pub use prefix::{
     AdapterId, PrefixEntry, PrefixKey, PrefixPageCache, PrefixPageCacheConfig, SharedPageRef,
 };
