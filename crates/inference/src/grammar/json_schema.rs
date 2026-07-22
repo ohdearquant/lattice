@@ -31,7 +31,7 @@
 
 use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
 /// materialize.
@@ -96,6 +96,28 @@ const MAX_PREFIX_ITEMS: usize = 4096;
 
 // DoS bound: cap the number of anyOf/oneOf branches a single schema node may declare (issue #474).
 const MAX_ANYOF_BRANCHES: usize = 4096;
+
+/// Keys alongside `$ref` that `compile_ref_with_siblings` (issue #1078) never
+/// treats as an assertion needing conjunction or rejection: `$ref` itself;
+/// `$defs`/`definitions`, the document's own definitions container (a schema
+/// with a root-level `$ref` commonly carries `$defs` in the very same object,
+/// see `deep_ref_chain_rejected` in `engine.rs`); and the rest, pure
+/// annotations with no grammar meaning.
+const REF_IGNORED_SIBLING_KEYS: &[&str] = &[
+    "$ref",
+    "$defs",
+    "definitions",
+    "$id",
+    "$schema",
+    "$comment",
+    "title",
+    "description",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
 
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
@@ -461,9 +483,9 @@ impl<'a> CompileCtx<'a> {
         schema: &'a Value,
         _path: &[&str],
     ) -> Result<Vec<Alt>, SchemaError> {
-        // Handle `$ref`
+        // Handle `$ref` (and any `required`/`properties` siblings — issue #1078).
         if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
-            return self.compile_ref(ref_str);
+            return self.compile_ref_with_siblings(ref_str, schema);
         }
 
         // Handle `enum`
@@ -538,6 +560,156 @@ impl<'a> CompileCtx<'a> {
                 Ok(self.any_value_alts())
             }
         }
+    }
+
+    /// Compile a `$ref`, applying `required`/`properties` siblings on the same
+    /// schema object as a conjunction with the resolved target instead of
+    /// dropping them (issue #1078). This compiler targets JSON Schema draft
+    /// 2020-12 (see the module doc and `spec.rs`), under which `$ref` is an
+    /// ordinary applicator: sibling keywords apply IN ADDITION to the
+    /// reference, not instead of it (draft-07's replace-the-object semantics do
+    /// not apply here).
+    ///
+    /// Scope: only `required`/`properties` siblings on a `$ref` to an
+    /// object-typed target are merged — the common "extend a base object"
+    /// pattern, and exactly what issue #1078's regression test exercises.
+    /// Anything else (a non-object target, or any other sibling keyword such
+    /// as `enum`/`const`/`type`/`pattern`) falls through to the plain `$ref`
+    /// compile unchanged: those already have a separate, narrower, DELIBERATE
+    /// partial-narrowing treatment when reached through an `anyOf`/`oneOf`
+    /// branch (see `ref_string_contribution`, issue #473), which this fix must
+    /// not disturb, and a general `allOf`-style intersection of arbitrary
+    /// schemas is out of scope here.
+    ///
+    /// Kept deliberately tiny (only the sibling-key scan, no merge locals) and
+    /// out of the merge body (`merge_ref_with_siblings`, `#[inline(never)]`):
+    /// `compile_schema` re-enters this dispatch once per `$ref` chain link, so
+    /// this function's own stack frame size is multiplied by the chain depth
+    /// before `MAX_SCHEMA_DEPTH` rejects it (issue #343). The plain,
+    /// no-siblings `$ref` — the overwhelmingly common case, including every
+    /// link of a long reference chain — must stay as cheap as it was before
+    /// this fix. A regression test (`deep_ref_chain_rejected` in
+    /// `engine.rs`) exercises a 2000-link chain specifically to catch this: an
+    /// earlier version of this fix folded the merge locals into this
+    /// function directly and overflowed the test-thread stack at native
+    /// recursion depth ~512, well before `MAX_SCHEMA_DEPTH` had a chance to
+    /// return its clean rejection.
+    fn compile_ref_with_siblings(
+        &mut self,
+        ref_str: &str,
+        schema: &'a Value,
+    ) -> Result<Vec<Alt>, SchemaError> {
+        let mergeable = schema.as_object().is_some_and(|m| {
+            let mut saw_sibling = false;
+            for k in m.keys() {
+                let k = k.as_str();
+                // `$ref` itself, the document-structure keywords a schema
+                // commonly carries alongside a root-level `$ref` (`$defs`,
+                // `definitions`), and pure annotations carry no grammar
+                // meaning and must not block the merge or be treated as an
+                // unsupported assertion.
+                if REF_IGNORED_SIBLING_KEYS.contains(&k) {
+                    continue;
+                }
+                if k != "required" && k != "properties" {
+                    return false;
+                }
+                saw_sibling = true;
+            }
+            saw_sibling
+        });
+        if !mergeable {
+            return self.compile_ref(ref_str);
+        }
+        self.merge_ref_with_siblings(ref_str, schema)
+    }
+
+    /// The actual `required`/`properties` conjunction merge for
+    /// [`Self::compile_ref_with_siblings`], split out (and `#[inline(never)]`)
+    /// so its locals do not enlarge that function's per-recursion stack frame
+    /// — see the doc comment there.
+    #[inline(never)]
+    fn merge_ref_with_siblings(
+        &mut self,
+        ref_str: &str,
+        schema: &'a Value,
+    ) -> Result<Vec<Alt>, SchemaError> {
+        let name = extract_ref_name(ref_str)?;
+        let target: &'a Value = self
+            .defs
+            .get(name)
+            .copied()
+            .ok_or_else(|| SchemaError(format!("$ref not found: {ref_str}")))?;
+
+        if target.get("type").and_then(Value::as_str) != Some("object") {
+            // Cannot merge object-only siblings onto a non-object target;
+            // leave the pre-existing drop behavior rather than guess at a
+            // conjunction this compiler has no representation for.
+            return self.compile_ref(ref_str);
+        }
+
+        // Merge `properties`: sibling entries take precedence over the
+        // target's on key collision (the sibling is the "closer" declaration,
+        // matching JSON Merge Patch convention).
+        let mut merged_props: Vec<(&'a String, &'a Value)> = Vec::new();
+        let mut seen_keys: HashSet<&str> = HashSet::new();
+        if let Some(m) = schema.get("properties").and_then(Value::as_object) {
+            for (k, v) in m {
+                seen_keys.insert(k.as_str());
+                merged_props.push((k, v));
+            }
+        }
+        if let Some(m) = target.get("properties").and_then(Value::as_object) {
+            for (k, v) in m {
+                if seen_keys.insert(k.as_str()) {
+                    merged_props.push((k, v));
+                }
+            }
+        }
+        if merged_props.len() > MAX_OBJECT_PROPERTIES {
+            return Err(SchemaError(format!(
+                "object property count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                merged_props.len()
+            )));
+        }
+        let properties = if merged_props.is_empty() {
+            None
+        } else {
+            Some(merged_props)
+        };
+
+        // Merge `required`: union, deduplicated, sibling first.
+        let mut required: Vec<&str> = Vec::new();
+        let mut seen_req: HashSet<&str> = HashSet::new();
+        for arr in [
+            schema.get("required").and_then(Value::as_array),
+            target.get("required").and_then(Value::as_array),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if arr.len() > MAX_OBJECT_PROPERTIES {
+                return Err(SchemaError(format!(
+                    "object required count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                    arr.len()
+                )));
+            }
+            for v in arr {
+                if let Some(s) = v.as_str()
+                    && seen_req.insert(s)
+                {
+                    required.push(s);
+                    if required.len() > MAX_OBJECT_PROPERTIES {
+                        return Err(SchemaError(format!(
+                            "object required count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                            required.len()
+                        )));
+                    }
+                }
+            }
+        }
+
+        self.compile_object_fields(properties, required)
     }
 
     /// Compile `#/$defs/Name` or `#/definitions/Name` reference.
@@ -667,6 +839,20 @@ impl<'a> CompileCtx<'a> {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
+        self.compile_object_fields(properties, required)
+    }
+
+    /// Compile an object schema from already-extracted `properties`/`required`,
+    /// shared by [`Self::compile_object`] and the `$ref`+sibling merge in
+    /// [`Self::compile_ref_with_siblings`] (issue #1078), which must combine a
+    /// `$ref` target's fields with a sibling's before compiling — the two
+    /// sources live in different `&'a Value` documents, so the merge happens on
+    /// these already-borrowed collections rather than on a synthesized `Value`.
+    fn compile_object_fields(
+        &mut self,
+        properties: Option<Vec<(&'a String, &'a Value)>>,
+        required: Vec<&'a str>,
+    ) -> Result<Vec<Alt>, SchemaError> {
         let ws_id = self.builder.rule_id("ws").unwrap();
         match properties {
             None => {
@@ -3983,6 +4169,59 @@ mod tests {
         let g = compile(&schema).unwrap();
         assert!(accepts(&g, b"{\"status\":\"ok\"}"));
         assert!(accepts(&g, b"{\"status\":\"err\"}"));
+    }
+
+    /// Issue #1078: a `required` sibling alongside `$ref` must be enforced as
+    /// a conjunction with the target, not silently dropped. `Base` declares
+    /// `y` as an OPTIONAL property; the sibling makes it required, so an
+    /// object omitting `y` must now be rejected even though `Base` alone would
+    /// have allowed it.
+    ///
+    /// Mutation guard: reverting `compile_schema_inner`'s `$ref` dispatch to
+    /// the plain early-return `self.compile_ref(ref_str)` (dropping the
+    /// sibling) makes `rejects(&g, b"{}")` false — `{}` would satisfy `Base`
+    /// alone — so this assertion fails.
+    #[test]
+    fn ref_required_sibling_is_enforced() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": { "y": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["y"]
+        });
+        let g = compile(&schema).unwrap();
+        assert!(
+            accepts(&g, b"{\"y\":1}"),
+            "y present must still be accepted"
+        );
+        assert!(
+            rejects(&g, b"{}"),
+            "required sibling on $ref must be enforced, not dropped"
+        );
+    }
+
+    /// Sibling keywords this compiler cannot merge (anything beyond
+    /// `required`/`properties`) must not be silently widened into an
+    /// incorrect conjunction — they fall through to the pre-existing plain
+    /// `$ref` compile (which drops them, same as before this fix; see
+    /// `anyof_ref_to_integer_with_numeric_enum_sibling_stays_reachable` for
+    /// the deliberately-scoped `enum` case reached via `anyOf`). This test
+    /// only pins that a non-object `$ref` target with `properties`/`required`
+    /// siblings does not panic or wrongly merge — it still compiles via the
+    /// unmerged target.
+    #[test]
+    fn ref_sibling_on_non_object_target_falls_through() {
+        let schema = serde_json::json!({
+            "$defs": { "N": { "type": "integer" } },
+            "$ref": "#/$defs/N",
+            "required": ["y"]
+        });
+        let g = compile(&schema).unwrap();
+        assert!(accepts(&g, b"7"), "non-object $ref target still compiles");
     }
 
     // -----------------------------------------------------------------------
