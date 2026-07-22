@@ -3,16 +3,19 @@
 //!
 //! `crates/embed/Cargo.toml` declares `lattice-inference` once now (the
 //! native/wasm split that used to carry two independently-editable feature
-//! lists was collapsed by #1094), but a standalone `cargo build -p
-//! lattice-embed` is still the only invocation that resolves `lattice-embed`'s
-//! `lattice-inference` feature set in isolation. Any `--workspace` build also
-//! compiles `lattice-tune`, whose own `Cargo.toml` requests
-//! `lattice-inference/f16` unconditionally — Cargo's workspace feature
-//! unification then grants `lattice-embed` an `f16`-enabled build for free,
-//! even if `crates/embed/Cargo.toml` itself no longer asks for it. That is
-//! exactly how the dependency table drifted silently before (#1094): every
-//! green `--workspace` run was testing a configuration the standalone crate
-//! never actually gets.
+//! lists was collapsed by #1094), and a standalone `cargo build -p
+//! lattice-embed` resolves that one feature set in isolation — the same
+//! resolve `cargo install lattice-embed` and the wasm/npm build get.
+//!
+//! Running the guard on that isolated resolve, rather than inside a
+//! `--workspace` run, is deliberate. `lattice-tune`'s `lattice-inference`
+//! dependency is optional but carries `features = ["f16"]`, so any invocation
+//! that activates tune's `inference-hook` or `train-backward` alongside
+//! `lattice-embed` lets Cargo's feature unification grant `lattice-embed` an
+//! `f16`-enabled build for free, whatever `crates/embed/Cargo.toml` itself
+//! asks for. Neither tune feature is in its defaults today, so a plain
+//! `cargo test --workspace` does not currently mask anything; nothing enforces
+//! that, and the isolated resolve does not depend on it staying true.
 //!
 //! This test never resolves through `--workspace`. It builds a half-precision
 //! (BF16) tensor in memory and round-trips it through

@@ -55,7 +55,7 @@ jobs:
         if: github.event_name == 'pull_request_target'
         # Pinned to a full commit SHA: this is a pull_request_target job, so a
         # moved or compromised tag would run in the trusted context before the
-        # checker does. SHA is actions/checkoutd5960a326750d5838078e36cf38b85af677262 # v4 v4 (the v4 tag as of 2026-07-20).
+        # checker does. SHA is actions/checkout v4 (the v4 tag as of 2026-07-20).
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.pull_request.base.sha }}

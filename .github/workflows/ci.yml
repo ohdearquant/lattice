@@ -188,18 +188,21 @@ jobs:
         run: cargo build -p lattice-inference --features wgpu-gpu
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
-      # `-p lattice-embed` is the only invocation that resolves lattice-embed's
-      # `lattice-inference` dependency features in isolation. Any --workspace
-      # command (including this job's own sibling steps and scripts/ci.sh's
-      # `cargo test --workspace`) also builds lattice-tune, whose Cargo.toml
-      # requests `lattice-inference/f16` unconditionally — feature unification
-      # then grants lattice-embed f16 for free regardless of what
-      # crates/embed/Cargo.toml itself declares. That is how the native/wasm
-      # dependency tables drifted apart silently before (#1094): every green
-      # --workspace run was testing a configuration the standalone crate never
-      # gets. Run this test target alone so it actually resolves the table a
-      # standalone `cargo build -p lattice-embed` (or `cargo install
-      # lattice-embed`, or the wasm/npm build) would get. See #1095.
+      # Run this target alone. `-p lattice-embed` resolves lattice-embed's own
+      # `lattice-inference` feature table in isolation, which is the configuration
+      # a standalone `cargo build -p lattice-embed`, `cargo install lattice-embed`,
+      # or the wasm/npm build actually gets — and the one that drifted in #1094.
+      #
+      # Two things keep this out of the workspace-wide runs. The failure is
+      # runtime-only: `SafetensorsFile` returns `InvalidSafetensors` for a
+      # half-precision tensor rather than failing to build, so the `--no-run`
+      # steps above cannot observe it. And lattice-tune's optional
+      # `lattice-inference` dependency carries `features = ["f16"]`, so any
+      # invocation that activates tune's `inference-hook` or `train-backward`
+      # alongside lattice-embed unifies that `f16` into embed for free and the
+      # regression reads green. Neither tune feature is in its defaults today, so
+      # `cargo test --workspace` does not do this — but nothing enforces that,
+      # which is why the guard runs on the isolated resolve instead. See #1095.
       - name: embed — f16 native dependency load guard (standalone, no workspace unification)
         run: cargo test -p lattice-embed --test f16_feature_load_guard
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
