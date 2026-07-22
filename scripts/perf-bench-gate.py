@@ -19,7 +19,10 @@ Exit codes:
       Criterion's two-sided 95% CI as a one-sided cutoff — see the
       WARN_PCT/FAIL_PCT note below for the actual one-sided confidence
       level this implies, which is tighter than "95%")
-  2 — parse error / bad input
+  2 — parse error / bad input, or (with --require-measurements) the gate
+      refusing to certify a run it could not judge: no comparison data, or
+      no gating comparison among the parsed results. An automated lane must
+      not read "nothing was measured" as "nothing regressed".
 
 --informational-groups-file (lattice#714): quick-mode Criterion runs on
 sub-microsecond micro-benches (lattice-embed's `simd` bench target) are
@@ -614,6 +617,77 @@ def run_selftest() -> int:
                     "informational status — resolver over-suppressed"
                 )
 
+    # --require-measurements: the lane must not read "nothing measured" as
+    # "nothing regressed" (#1105). bench-compare.sh creates the criterion
+    # directory itself before benching, and the cargo pipelines swallow bench
+    # failures, so an EMPTY-but-present root is the realistic failure shape.
+    with tempfile.TemporaryDirectory() as td:
+        gate = Path(__file__).resolve()
+        empty_root = Path(td) / "empty" / "criterion"
+        empty_root.mkdir(parents=True)
+
+        def _run(root: Path, *extra: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [sys.executable, str(gate), str(root), "selftest-arch", *extra],
+                capture_output=True, text=True, timeout=60,
+            )
+
+        # Without the flag, an absent baseline stays a pass (first-run semantics).
+        if _run(empty_root).returncode != 0:
+            failures.append("require-measurements: empty root without the flag "
+                            "must still exit 0 (first-run semantics changed)")
+        # With it, the same empty root must refuse to certify.
+        if _run(empty_root, "--require-measurements").returncode != 2:
+            failures.append("require-measurements: empty criterion root exited "
+                            "0 with the flag set — the lane can go green having "
+                            "measured nothing (the #1105 fail-open)")
+
+        # A real gating comparison must still pass, or the flag is just a brake.
+        ok_root = Path(td) / "ok" / "criterion"
+        _fabricate_bench(ok_root / "grp_ok" / "bench_ok", "compare-base")
+        if _run(ok_root, "--require-measurements").returncode != 0:
+            failures.append("require-measurements: a parsed gating comparison "
+                            "was rejected — the flag over-fails")
+
+        # All-informational is measured-but-unjudgeable: nothing could FAIL.
+        info_file = Path(td) / "informational.txt"
+        info_file.write_text("grp_info\n")
+        info_root = Path(td) / "info" / "criterion"
+        _fabricate_bench(info_root / "grp_info" / "bench_info", "compare-base")
+        if _run(info_root, "--require-measurements",
+                "--informational-groups-file", str(info_file)).returncode != 2:
+            failures.append("require-measurements: an all-informational run was "
+                            "certified — no gating comparison was judged")
+
+        # PARTIAL is the shape the first fix missed: asking whether ANY judgeable
+        # comparison exists passes a run where one target compared cleanly and the
+        # other produced an unresolvable baseline. The unmeasured target is exactly
+        # the one a green exit would be vouching for.
+        mixed_root = Path(td) / "mixed" / "criterion"
+        _fabricate_bench(mixed_root / "grp_ok" / "bench_ok", "compare-base")
+        mixed_orphan = mixed_root / "grp_bad" / "bench_orphan"
+        (mixed_orphan / "new").mkdir(parents=True)
+        (mixed_orphan / "new" / "estimates.json").write_text(
+            json.dumps({"mean": {"point_estimate": 100.0}}))
+        (mixed_orphan / "change").mkdir(parents=True)
+        (mixed_orphan / "change" / "estimates.json").write_text(json.dumps({
+            "mean": {"point_estimate": 0.10,
+                     "confidence_interval": {"lower_bound": 0.05, "upper_bound": 0.15}}
+        }))
+        mixed = _run(mixed_root, "--require-measurements")
+        if mixed.returncode != 2:
+            failures.append("require-measurements: a run with one judgeable and one "
+                            "unresolvable comparison exited "
+                            f"{mixed.returncode} — a partial A/B was certified")
+        if "bench_orphan" not in mixed.stderr:
+            failures.append("require-measurements: the partial-run refusal did not "
+                            "name the unjudged bench")
+        # Without the flag the same mixed root stays a pass: the reporter is
+        # allowed to render what it has.
+        if _run(mixed_root).returncode != 0:
+            failures.append("require-measurements: the mixed root without the flag "
+                            "must still exit 0 (reporter behavior changed)")
+
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)
     if failures:
@@ -621,7 +695,7 @@ def run_selftest() -> int:
         return 1
     print("SELFTEST: PASS — base/, compare-base/, orphan-warn, named-wins-over-stale-base, "
           "multi-sibling-refusal, manifest-handoff (demoted target informational, "
-          "non-demoted target gated), and composed-path collision-guard all correct")
+          "non-demoted target gated), and composed-path collision-guard, and require-measurements (empty root, gating pass, all-informational refusal, partial-run refusal) all correct")
     return 0
 
 
@@ -639,6 +713,11 @@ def main() -> int:
                     help="Path to a file listing Criterion top-level group names (one per "
                          "line) to measure+report but exclude from gating/exit-code — quick-"
                          "mode noise-floor groups (lattice#714). Omit for full-mode runs.")
+    ap.add_argument("--require-measurements", action="store_true",
+                    help="Fail (exit 2) instead of passing when the run produced no gating "
+                         "comparison to judge. Without this, an absent baseline exits 0, which "
+                         "is right for a first run but wrong for an automated lane: it cannot "
+                         "tell 'nothing regressed' from 'nothing was measured'.")
     ap.add_argument("--selftest", action="store_true",
                     help="Run the fixture self-test (no criterion_root/arch needed) and exit")
     args = ap.parse_args()
@@ -657,6 +736,11 @@ def main() -> int:
     if not change_files:
         print(f"warn: no change/estimates.json under {args.criterion_root}; baseline missing?",
               file=sys.stderr)
+        if args.require_measurements:
+            print(f"error: --require-measurements set but no change/estimates.json under "
+                  f"{args.criterion_root}: the run produced no comparison, so it is not "
+                  f"evidence that nothing regressed.", file=sys.stderr)
+            return 2
         # Treat missing baseline as pass — first run on a bench has no comparison.
         if args.out:
             args.out.write_text(f"### `{args.arch}` — no baseline to compare\n\n"
@@ -665,10 +749,17 @@ def main() -> int:
         return 0
 
     results = []
+    unjudged = []
     for cf in change_files:
         r = parse_bench(cf, args.criterion_root, args.baseline_name)
         if r is not None:
             results.append(r)
+        else:
+            # parse_bench warns and returns None for both malformed data and an
+            # unresolvable baseline. Keep the file, not just the warning: the
+            # count of comparisons the run INTENDED is the only thing that makes
+            # a missing one visible downstream.
+            unjudged.append(cf)
 
     if not results:
         print("error: change files found but all failed to parse", file=sys.stderr)
@@ -680,10 +771,33 @@ def main() -> int:
     if args.out:
         args.out.write_text(report)
 
-    fails = sum(
-        1 for r in results
-        if r.verdict() == "FAIL" and not r.is_informational(informational_groups)
-    )
+    gating = [r for r in results if not r.is_informational(informational_groups)]
+
+    # Completeness, not existence. The first version of this guard asked whether
+    # ANY judgeable comparison existed, which passes a run where one target built
+    # a clean comparison and the other produced an unresolvable or malformed one:
+    # the failed target is exactly the one nobody measured, so a green exit is a
+    # claim about code that was never benched. Reconcile what the run intended
+    # (change files on disk) against what was actually judged.
+    if args.require_measurements and unjudged:
+        listed = ", ".join(str(cf.parent.parent.relative_to(args.criterion_root))
+                           for cf in unjudged[:5])
+        more = f" (+{len(unjudged) - 5} more)" if len(unjudged) > 5 else ""
+        print(f"error: --require-measurements set but {len(unjudged)} of "
+              f"{len(change_files)} comparison(s) could not be judged "
+              f"(unresolvable baseline or malformed data): {listed}{more}. A partial "
+              f"A/B is not evidence that nothing regressed.", file=sys.stderr)
+        return 2
+
+    # Parsed results are not automatically judgeable results. If every parsed
+    # result is informational, nothing in this run could have produced a FAIL,
+    # so a zero exit says only that no gating comparison existed.
+    if args.require_measurements and not gating:
+        print(f"error: --require-measurements set but all {len(results)} parsed result(s) are "
+              f"informational: no gating comparison was judged.", file=sys.stderr)
+        return 2
+
+    fails = sum(1 for r in gating if r.verdict() == "FAIL")
     return 1 if fails > 0 else 0
 
 
