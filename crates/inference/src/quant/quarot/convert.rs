@@ -1405,10 +1405,19 @@ mod tests {
 
     #[test]
     fn convert_quarot_qwen35_rejects_hostile_hidden_size() {
-        // 1 << 60 IS a power of two, so it passes the power-of-two check above and
-        // would otherwise reach `RandomizedHadamard::new`'s `Vec::with_capacity(n)`,
-        // which aborts (capacity overflow) or OOM-kills the process rather than
-        // returning an `Err`. This must be rejected before that allocation.
+        // 1 << 60 IS a power of two, so it passes the power-of-two check above.
+        //
+        // The guard exists because `RandomizedHadamard::new` sizes an allocation
+        // directly from `hidden_size`, and that allocation aborts on capacity overflow
+        // rather than returning an `Err` — an abort is not catchable, so the value has
+        // to be rejected before it gets there.
+        //
+        // What this test demonstrates is narrower than that motivation, and the
+        // distinction is worth stating: no tensor files are written here, so with the
+        // guard removed the conversion fails at safetensors loading rather than at the
+        // allocation. The assertion therefore pins the guard's *ordering* — the
+        // hidden_size rejection precedes tensor load — and not the abort-avoidance
+        // itself, which would need a fixture carrying a full valid checkpoint.
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
         let output = tmp.path().join("output");
