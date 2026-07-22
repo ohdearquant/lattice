@@ -16,15 +16,20 @@
 # resolution (--full also honors bench-compare.sh's BENCH_GROUPS_* filters,
 # and neither path covers the workspace's full bench set). Being classified
 # gating is not the same as being enforced: bench-compare.sh discards its
-# gate's exit status, so `make bench-gate` is the only path whose FAIL
-# verdict becomes a non-zero exit. Both are manual/local today.
-# bench-update.yml runs the same targets at full resolution on main, on
-# perf-path pushes and weekly, and saves the baselines. It publishes
-# historical trend comparisons including a "Worst step-regression" headline,
-# but does not invoke perf-bench-gate.py or fail on a regression. So a demoted
-# target has automated full-resolution REPORTING; what it lacks until #1105
-# lands is enforcement. Targets not listed here are classified gating in
-# quick mode.
+# gate's exit status unless the caller passes --fail-on-regression, so a FAIL
+# verdict becomes a non-zero exit only under that flag or via
+# `make bench-gate`.
+#
+# Two automated jobs bench these targets at full resolution on main.
+# bench-update.yml runs on perf-path pushes and weekly and saves the
+# baselines; it publishes historical trend comparisons including a "Worst
+# step-regression" headline, but does not invoke perf-bench-gate.py or fail
+# on a regression, so it REPORTS. perf-postmerge-gate.yml runs
+# `bench-compare.sh --full --fail-on-regression` on perf-path merges,
+# against the merged commit's own parent, and fails on a confirmed
+# regression, so it ENFORCES. A demoted target is therefore reported AND
+# enforced at full resolution; the demotion only removes it from the quick
+# mode gate. Targets not listed here are classified gating in quick mode.
 #
 # Demoting a target requires same-toolchain, same-commit A/A evidence in an
 # exclusive bench window, reviewed in a PR that edits this file.
