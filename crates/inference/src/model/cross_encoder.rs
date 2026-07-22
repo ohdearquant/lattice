@@ -73,11 +73,31 @@ impl CrossEncoderModel {
     }
 
     /// Score a single (query, document) pair with a LoRA hook applied during the forward pass.
-    pub fn score_with_hook(&self, query: &str, document: &str, lora: &dyn LoraHook) -> f32 {
+    ///
+    /// Validates the hook's declared projection geometry against this
+    /// model's BERT dimensions before the forward pass runs, so a malformed
+    /// or attacker-controlled adapter (e.g. one declaring `d_out` larger
+    /// than `hidden_size`) is rejected with a recoverable error instead of
+    /// `apply_lora` slicing out of bounds — see
+    /// [`LoraHook::validate_against_bert`].
+    pub fn score_with_hook(
+        &self,
+        query: &str,
+        document: &str,
+        lora: &dyn LoraHook,
+    ) -> Result<f32, InferenceError> {
+        let config = self.bert.config();
+        lora.validate_against_bert(
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.intermediate_size,
+        )
+        .map_err(InferenceError::InvalidInput)?;
+
         let input = self.bert.tokenizer().tokenize_pair(query, document);
         let seq_len = input.real_length;
         if seq_len == 0 {
-            return 0.5;
+            return Ok(0.5);
         }
         let hidden_size = self.bert.config().hidden_size;
         let mut buffers = AttentionBuffers::new(
@@ -91,7 +111,7 @@ impl CrossEncoderModel {
             .forward_tokenized_with_hook(&input, &mut buffers, lora);
         let pooled = cls_pool(&hidden, seq_len, hidden_size);
         let logit = self.classifier.logit(&pooled);
-        sigmoid(logit)
+        Ok(sigmoid(logit))
     }
 
     /// Score a query against a batch of documents with a LoRA hook applied during each forward pass.
@@ -100,7 +120,7 @@ impl CrossEncoderModel {
         query: &str,
         documents: &[&str],
         lora: &dyn LoraHook,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferenceError> {
         documents
             .iter()
             .map(|doc| self.score_with_hook(query, doc, lora))

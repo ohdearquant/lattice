@@ -12,7 +12,7 @@ use crate::error::InferenceError;
 use crate::forward::cpu::{
     add_bias, add_bias_gelu, layer_norm, matmul_bt, residual_add_layer_norm,
 };
-use crate::lora_hook::{LoraHook, NoopLoraHook};
+use crate::lora_hook::{LoraHook, NoopLoraHook, apply_lora_rows};
 use crate::pool::{BertPooling, cls_pool, l2_normalize, mean_pool};
 use crate::tokenizer::common::{Tokenizer, load_tokenizer};
 use crate::weights::{BertWeights, SafetensorsFile, TransformerLayerWeights};
@@ -640,6 +640,7 @@ impl BertModel {
                     &hidden,
                     ffn_intermediate,
                     layer.ffn_intermediate_bias.data,
+                    hidden_size,
                     intermediate_size,
                 );
             }
@@ -656,7 +657,15 @@ impl BertModel {
                     hidden_size,
                 );
                 add_bias(temp, layer.ffn_output_bias.data, hidden_size);
-                lora.apply(layer_idx, "ffn_output", ffn_intermediate, temp);
+                apply_lora_rows(
+                    lora,
+                    layer_idx,
+                    "ffn_output",
+                    ffn_intermediate,
+                    temp,
+                    intermediate_size,
+                    hidden_size,
+                );
                 let temp = &buffers.temp[..used_hidden];
                 residual_add_layer_norm(
                     &mut hidden,
@@ -815,6 +824,7 @@ impl BertModel {
                 &hidden,
                 &mut ffn_intermediate,
                 layer.ffn_intermediate_bias.data,
+                hidden_size,
                 intermediate_size,
             );
 
@@ -827,7 +837,15 @@ impl BertModel {
                 hidden_size,
             );
             add_bias(&mut temp, layer.ffn_output_bias.data, hidden_size);
-            lora.apply(layer_idx, "ffn_output", &ffn_intermediate, &mut temp);
+            apply_lora_rows(
+                lora,
+                layer_idx,
+                "ffn_output",
+                &ffn_intermediate,
+                &mut temp,
+                intermediate_size,
+                hidden_size,
+            );
             residual_add_layer_norm(
                 &mut hidden,
                 &temp,
@@ -1037,6 +1055,7 @@ impl BertModel {
                 &hidden,
                 &mut ffn_intermediate,
                 layer.ffn_intermediate_bias.data,
+                hidden_size,
                 intermediate_size,
             );
 
@@ -1049,7 +1068,15 @@ impl BertModel {
                 hidden_size,
             );
             add_bias(&mut temp, layer.ffn_output_bias.data, hidden_size);
-            lora.apply(layer_idx, "ffn_output", &ffn_intermediate, &mut temp);
+            apply_lora_rows(
+                lora,
+                layer_idx,
+                "ffn_output",
+                &ffn_intermediate,
+                &mut temp,
+                intermediate_size,
+                hidden_size,
+            );
             residual_add_layer_norm(
                 &mut hidden,
                 &temp,
@@ -1081,9 +1108,18 @@ fn apply_ffn_intermediate_lora_and_activation(
     hidden: &[f32],
     ffn_intermediate: &mut [f32],
     bias: &[f32],
+    hidden_size: usize,
     intermediate_size: usize,
 ) {
-    lora.apply(layer_idx, "ffn_intermediate", hidden, ffn_intermediate);
+    apply_lora_rows(
+        lora,
+        layer_idx,
+        "ffn_intermediate",
+        hidden,
+        ffn_intermediate,
+        hidden_size,
+        intermediate_size,
+    );
     add_bias_gelu(ffn_intermediate, bias, intermediate_size);
 }
 
@@ -1573,7 +1609,7 @@ mod tests {
         let hook = CapturingDeltaHook {
             target_module: "ffn_intermediate",
             delta,
-            captured_x: Mutex::new(None),
+            captured_x: Mutex::new(Vec::new()),
         };
         let mut produced = raw.clone();
         apply_ffn_intermediate_lora_and_activation(
@@ -1582,6 +1618,7 @@ mod tests {
             &hidden,
             &mut produced,
             &bias,
+            hidden_size,
             intermediate_size,
         );
 
@@ -1631,7 +1668,7 @@ mod tests {
     struct CapturingDeltaHook {
         target_module: &'static str,
         delta: f32,
-        captured_x: Mutex<Option<Vec<f32>>>,
+        captured_x: Mutex<Vec<f32>>,
     }
 
     impl LoraHook for CapturingDeltaHook {
@@ -1639,7 +1676,7 @@ mod tests {
             if module != self.target_module {
                 return;
             }
-            *self.captured_x.lock().unwrap() = Some(x.to_vec());
+            self.captured_x.lock().unwrap().extend_from_slice(x);
             for o in output.iter_mut() {
                 *o += self.delta;
             }
@@ -1690,7 +1727,7 @@ mod tests {
         let hook = CapturingDeltaHook {
             target_module: "ffn_intermediate",
             delta,
-            captured_x: Mutex::new(None),
+            captured_x: Mutex::new(Vec::new()),
         };
         let (input2, mut buffers2) = tokenize_and_buffers(&model, text);
         let with_delta = model.forward_tokenized_with_hook(&input2, &mut buffers2, &hook);
@@ -1719,12 +1756,7 @@ mod tests {
         let used_intermediate = seq_len * intermediate_size;
         let layer = &model.weights.layers[0];
 
-        let captured_x = hook
-            .captured_x
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("hook must have been invoked for ffn_intermediate");
+        let captured_x = hook.captured_x.lock().unwrap().clone();
         assert_eq!(captured_x.len(), used_hidden);
 
         let mut raw = vec![0.0f32; used_intermediate];
