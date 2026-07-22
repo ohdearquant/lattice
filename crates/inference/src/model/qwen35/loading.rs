@@ -924,6 +924,38 @@ mod tests {
         load_weights(&mut src, &cfg).expect("correctly shaped layernorms must load");
     }
 
+    /// Regression for #1035: a finite, undersized dense-FFN tensor must cause
+    /// `load_weights` — the routine `Qwen35Model::from_safetensors` uses to assemble a
+    /// model — to return `Err`, not reach the forward pass and panic in the release-active
+    /// GEMM bounds guard.
+    #[test]
+    fn load_weights_rejects_undersized_dense_ffn_tensor() {
+        let cfg = tiny_linear_layer_cfg();
+        let hidden = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
+        let mut src = tiny_linear_layer_tensors(&cfg, hidden, hidden);
+        // down_proj declared as [hidden, inter - 1] instead of [hidden, inter] --
+        // finite, just smaller than the config requires.
+        src.tensors.insert(
+            "model.language_model.layers.0.mlp.down_proj.weight".to_string(),
+            (vec![0.0f32; hidden * (inter - 1)], vec![hidden, inter - 1]),
+        );
+
+        match load_weights(&mut src, &cfg) {
+            Err(InferenceError::ShapeMismatch { name, .. }) => {
+                assert!(
+                    name.contains("down_proj"),
+                    "error must name down_proj, got: {name}"
+                );
+            }
+            Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
+            Ok(_) => panic!(
+                "expected Err for undersized down_proj, got Ok (an undersized tensor would \
+                 reach the forward pass and panic in the GEMM bounds guard)"
+            ),
+        }
+    }
+
     /// A config with `num_attention_heads = 2^63` and `head_dim = 2` overflows
     /// `full_q_dim()`/`full_kv_dim()` in release builds. `load_full_attention_weights`
     /// must reject this via the checked accessors before deriving a wrapped, undersized
