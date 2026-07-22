@@ -15,6 +15,7 @@ stub `cargo` on PATH that exits 0 and prints no measurement lines — exactly th
 shape that used to pass.
 """
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -48,13 +49,43 @@ def _run(extra_args):
             subprocess.run(["git", "-C", str(root), "commit", "-qm", f"c{i}"],
                            check=True, env=env_git)
 
+        # Redirect the machine-wide lock and pending-marker paths inside the
+        # COPIED supervisor. These tests measure nothing, so serializing them
+        # against real benches on this machine buys no isolation and costs a
+        # wait that can exceed the timeout below. Rewriting path constants in
+        # the copy is deliberately weaker than reimplementing the locking:
+        # every line of acquisition, refusal and reporting logic is still the
+        # shipping one. There is no equivalent knob in the shipping script,
+        # which is the point -- a real run cannot redirect its own locks.
+        locks = root / "scripts" / "lib" / "bench-locks.py"
+        src = locks.read_text()
+        for const in ("BENCH_WINDOW", "GPU_LOCK", "PENDING_DIR"):
+            before = src
+            src = re.sub(
+                rf'^{const} = "[^"]*"$',
+                f'{const} = "{tmp}/{const.lower()}"',
+                src,
+                flags=re.M,
+            )
+            assert src != before, f"{const} constant not found to redirect"
+        locks.write_text(src)
+
         bindir = Path(tmp) / "bin"
         bindir.mkdir()
         cargo = bindir / "cargo"
         cargo.write_text(STUB_CARGO)
         cargo.chmod(0o755)
 
-        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+        # The ambient-load gate judges whether the MACHINE was quiet enough for
+        # a number to be trusted. This run produces no number, so the only
+        # thing the gate could do here is fail the test on unrelated load.
+        # Zero is honest for a run whose output is never quoted as a
+        # measurement; it is not a default anything else should use.
+        env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "BENCH_IDLE_FLOOR": "0",
+        }
         return subprocess.run(
             ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, "HEAD~1", "HEAD"],
             capture_output=True, text=True, env=env, timeout=300)
