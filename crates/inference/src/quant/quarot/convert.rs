@@ -47,6 +47,11 @@ use crate::quant::quarot::plan::RotationPlan;
 use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
 use crate::weights::q4_weights::{q4_f32_to_f16, quantize_f64_to_q4, save_q4_file};
 
+/// Upper bound on `hidden_size` accepted by [`convert_quarot_qwen35`], well above any
+/// real Qwen3.5 checkpoint, guarding `RandomizedHadamard::new`'s config-sized allocation
+/// against a hostile or corrupted `config.json`.
+const MAX_QUAROT_HIDDEN_SIZE: usize = 1 << 20;
+
 /// CLI / library options for [`convert_quarot_qwen35`].
 #[derive(Debug, Clone)]
 pub struct ConversionOptions {
@@ -465,6 +470,21 @@ pub fn convert_quarot_qwen35(
             "convert_quarot_qwen35: hidden_size={} is not a power of 2; \
              QuaRot v0 only supports power-of-2 hidden dims \
              (see ADR-044 §Model coverage)",
+            cfg.hidden_size
+        )));
+    }
+    // `hidden_size` drives `RandomizedHadamard::new`'s sign-buffer allocation directly
+    // (`Vec::with_capacity(hidden_size)` and per-block sign generation). A hostile or
+    // corrupted `config.json` can pass the power-of-two check above with an absurd
+    // value (e.g. `1 << 60`) and drive that allocation to a capacity-overflow abort or
+    // OOM kill before any tensor bytes are read. No real Qwen3.5 model exceeds a few
+    // tens of thousands of hidden dims; cap generously above that and reject anything
+    // larger with a typed error before the allocation is ever attempted.
+    if cfg.hidden_size > MAX_QUAROT_HIDDEN_SIZE {
+        return Err(InferenceError::Inference(format!(
+            "convert_quarot_qwen35: hidden_size={} exceeds the maximum supported value \
+             ({MAX_QUAROT_HIDDEN_SIZE}); this is almost certainly a corrupted or hostile \
+             config.json, not a real model",
             cfg.hidden_size
         )));
     }
@@ -1378,6 +1398,31 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("hidden_size=10") && msg.contains("power of 2"),
+            "unexpected error: {msg}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn convert_quarot_qwen35_rejects_hostile_hidden_size() {
+        // 1 << 60 IS a power of two, so it passes the power-of-two check above and
+        // would otherwise reach `RandomizedHadamard::new`'s `Vec::with_capacity(n)`,
+        // which aborts (capacity overflow) or OOM-kills the process rather than
+        // returning an `Err`. This must be rejected before that allocation.
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let mut cfg = tiny_cfg(true);
+        cfg.hidden_size = 1 << 60;
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
+        // No safetensors needed; reject happens before tensor load.
+
+        let err =
+            convert_quarot_qwen35(&input, &output, &ConversionOptions::default()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds the maximum supported value"),
             "unexpected error: {msg}"
         );
         assert!(!output.exists());
