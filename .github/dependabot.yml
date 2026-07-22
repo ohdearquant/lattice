@@ -4,3 +4,23 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      # Patch and minor action bumps are the routine, low-risk ones and travel
+      # together in a single pull request so a weekly run does not fan out into
+      # one review per action.
+      actions-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      # Major bumps are separated deliberately. Action majors change runtime
+      # behavior often enough that they need to be looked at on their own, and
+      # grouping them with patches would let a breaking change ride in beside
+      # updates that are safe to take on sight.
+      actions-major:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
