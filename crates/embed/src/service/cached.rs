@@ -3,7 +3,7 @@
 //! It preserves caller order across partial cache hits and uses role-aware keys for asymmetric
 //! retrieval. See `docs/service.md` for the lookup and fill algorithm.
 
-use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES};
+use super::{EmbeddingRole, EmbeddingService};
 use crate::error::Result;
 use crate::model::EmbeddingModel;
 use async_trait::async_trait;
@@ -58,28 +58,21 @@ impl<S: EmbeddingService> CachedEmbeddingService<S> {
 impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<S> {
     async fn embed(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
         // Generic has its own role tag — see docs/service.md.
-        self.embed_with_role(texts, model, EmbeddingRole::Generic)
+        self.cache_and_embed(texts, model, EmbeddingRole::Generic)
             .await
     }
 
-    /// Override: apply query prompt then cache with `Query` role key.
-    async fn embed_query(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
-        let prefix = model.query_instruction();
-        let prompted = super::apply_prefix(texts, prefix);
-        self.embed_with_role(&prompted, model, EmbeddingRole::Query)
-            .await
-    }
-
-    /// Override: apply passage prompt then cache with `Passage` role key.
-    async fn embed_passage(
+    /// Override: cache under the role key rather than prefixing here.
+    ///
+    /// `embed_query` and `embed_passage` reach this through their trait defaults,
+    /// so all three role paths share one cache-aware implementation.
+    async fn embed_with_role(
         &self,
         texts: &[String],
         model: EmbeddingModel,
+        role: EmbeddingRole,
     ) -> Result<Vec<Vec<f32>>> {
-        let prefix = model.document_instruction();
-        let prompted = super::apply_prefix(texts, prefix);
-        self.embed_with_role(&prompted, model, EmbeddingRole::Passage)
-            .await
+        self.cache_and_embed(texts, model, role).await
     }
 
     fn supports_model(&self, model: EmbeddingModel) -> bool {
@@ -92,11 +85,16 @@ impl<S: EmbeddingService + 'static> EmbeddingService for CachedEmbeddingService<
 }
 
 impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
-    /// Core cache-and-embed implementation shared by `embed`, `embed_query`, and
-    /// `embed_passage`.  `texts` must already have the prompt prefix applied; `role`
-    /// is used only as part of the cache key so that different roles produce separate
-    /// cache entries for the same raw text.
-    async fn embed_with_role(
+    /// Core cache-and-embed implementation shared by every entry point.
+    ///
+    /// `texts` is caller text. The retrieval instruction is applied by the wrapped
+    /// service rather than here, so the published cap is checked against what the
+    /// caller actually passed. `role` selects that instruction downstream and
+    /// namespaces the cache key, so the same raw text under two roles never shares
+    /// an entry; keying on caller text is equivalent to keying on prepared text
+    /// because the instruction is a function of the role and model config already
+    /// in the key.
+    async fn cache_and_embed(
         &self,
         texts: &[String],
         model: EmbeddingModel,
@@ -105,28 +103,11 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
         use crate::error::EmbedError;
 
         // Validate wrapper-owned request bounds before cache interaction.
-        if texts.is_empty() {
-            return Err(EmbedError::InvalidInput("no texts provided".into()));
-        }
-        if texts.len() > DEFAULT_MAX_BATCH_SIZE {
-            return Err(EmbedError::InvalidInput(format!(
-                "batch size {} exceeds maximum {}",
-                texts.len(),
-                DEFAULT_MAX_BATCH_SIZE
-            )));
-        }
-        for text in texts {
-            if text.len() > MAX_TEXT_BYTES {
-                return Err(EmbedError::TextTooLong {
-                    length: text.len(),
-                    max: MAX_TEXT_BYTES,
-                });
-            }
-        }
+        super::validate_texts(texts)?;
 
         // Fast path: bypass cache entirely when disabled (no key computation, no locking)
         if !self.cache.is_enabled() {
-            return self.inner.embed(texts, model).await;
+            return self.inner.embed_with_role(texts, model, role).await;
         }
 
         // Compute cache keys — include the active dimension (for MRL models) and role.
@@ -164,9 +145,12 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
             to_embed.len()
         );
 
-        // Embed missing texts (after prompt is already applied in texts)
+        // Embed missing texts; the wrapped service applies the role instruction.
         let texts_to_embed: Vec<String> = to_embed.iter().map(|(_, t)| (*t).clone()).collect();
-        let new_embeddings = self.inner.embed(&texts_to_embed, model).await?;
+        let new_embeddings = self
+            .inner
+            .embed_with_role(&texts_to_embed, model, role)
+            .await?;
 
         // FP-035: validate count before zipping — a count mismatch would silently
         // drop slots via zip() and return fewer embeddings than requested.
@@ -191,9 +175,3 @@ impl<S: EmbeddingService + 'static> CachedEmbeddingService<S> {
         Ok(results.into_iter().flatten().collect())
     }
 }
-
-// Suppress dead code warnings for constants that are used by other modules
-const _: () = {
-    let _ = DEFAULT_MAX_BATCH_SIZE;
-    let _ = MAX_TEXT_BYTES;
-};

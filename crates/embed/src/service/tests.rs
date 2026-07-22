@@ -273,6 +273,234 @@ mod native_tests {
         let msg = err.to_string();
         assert!(msg.contains("32846"), "got: {msg}");
     }
+
+    /// #1104: the published cap covers caller text, so text sitting exactly at
+    /// the cap must clear validation on a role path even though the model's
+    /// query instruction makes the prepared string longer than the cap.
+    ///
+    /// Model weights are not present in every environment, so this asserts the
+    /// request got PAST length validation rather than asserting success. That is
+    /// the precise thing that regressed: validating prepared text returned
+    /// `TextTooLong` here and never reached model loading.
+    #[tokio::test]
+    async fn test_role_path_validates_caller_text_not_prepared_text() {
+        let model = EmbeddingModel::BgeSmallEnV15;
+        assert!(
+            model.max_instruction_bytes() > 0,
+            "test needs a model that prepends a query instruction"
+        );
+
+        let text = "a".repeat(MAX_TEXT_BYTES);
+        assert_eq!(text.len(), MAX_TEXT_BYTES);
+
+        let service = NativeEmbeddingService::default();
+        if let Err(e) = service.embed_query(&[text], model).await {
+            assert!(
+                !matches!(e, crate::error::EmbedError::TextTooLong { .. }),
+                "caller text at exactly the cap must not be rejected for length: {e}"
+            );
+        }
+    }
+
+    /// #1104 companion: the cap is still enforced, and the error still reports
+    /// the published cap rather than the wider backstop used on prepared text.
+    #[tokio::test]
+    async fn test_role_path_still_rejects_caller_text_over_the_cap() {
+        let text = "a".repeat(MAX_TEXT_BYTES + 1);
+        let service = NativeEmbeddingService::default();
+        let err = service
+            .embed_query(&[text], EmbeddingModel::BgeSmallEnV15)
+            .await
+            .expect_err("caller text over the cap must be rejected");
+        assert!(
+            matches!(err, crate::error::EmbedError::TextTooLong { max, .. } if max == MAX_TEXT_BYTES),
+            "must report the published cap, got: {err}"
+        );
+    }
+
+    /// Sibling invocation path: the cached wrapper has its own entry point and
+    /// must apply the same caller-text semantics.
+    #[tokio::test]
+    async fn test_cached_role_path_validates_caller_text() {
+        use crate::service::CachedEmbeddingService;
+        use std::sync::Arc;
+
+        let text = "a".repeat(MAX_TEXT_BYTES);
+        let service =
+            CachedEmbeddingService::with_default_cache(Arc::new(NativeEmbeddingService::default()));
+
+        if let Err(e) = service
+            .embed_query(&[text], EmbeddingModel::BgeSmallEnV15)
+            .await
+        {
+            assert!(
+                !matches!(e, crate::error::EmbedError::TextTooLong { .. }),
+                "caller text at exactly the cap must not be rejected for length: {e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_max_instruction_bytes_matches_the_longest_instruction() {
+    for model in [
+        EmbeddingModel::BgeSmallEnV15,
+        EmbeddingModel::MultilingualE5Small,
+        EmbeddingModel::Qwen3Embedding0_6B,
+        EmbeddingModel::AllMiniLmL6V2,
+    ] {
+        let q = model.query_instruction().map_or(0, str::len);
+        let d = model.document_instruction().map_or(0, str::len);
+        assert_eq!(
+            model.max_instruction_bytes(),
+            q.max(d),
+            "{model:?} reports the wrong instruction bound"
+        );
+    }
+
+    // Symmetric models take no instruction, so prepared text is caller text and
+    // the backstop collapses onto the published cap exactly.
+    assert_eq!(EmbeddingModel::AllMiniLmL6V2.max_instruction_bytes(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// External-implementor contract for the embed_with_role default (PR #1110)
+// ---------------------------------------------------------------------------
+//
+// The default `embed_with_role` validates caller text, then prepends the role
+// instruction and delegates to `embed`. For an out-of-tree service that enforces
+// the exact `MAX_TEXT_BYTES` cap inside `embed` and does not override the default,
+// that means cap-sized caller text for an instruction-bearing model reaches the
+// backend already lengthened and is rejected. This is a deliberate, documented
+// limitation of keeping `embed` the sole abstract method (backward compatible on
+// a published crate); the escape hatch is overriding `embed_with_role`. Both in-
+// crate implementors take the escape hatch. These tests pin both sides of that
+// contract executably so the choice cannot regress into prose only. They use no
+// model weights, so they run in every feature configuration.
+mod external_impl_contract {
+    use crate::error::{EmbedError, Result};
+    use crate::model::EmbeddingModel;
+    use crate::service::{
+        EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES, apply_prefix, validate_texts,
+    };
+    use async_trait::async_trait;
+
+    /// Shared backend: exact published cap, no weights, one-dim stub vectors.
+    fn exact_cap_embed(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        for t in texts {
+            if t.len() > MAX_TEXT_BYTES {
+                return Err(EmbedError::TextTooLong {
+                    length: t.len(),
+                    max: MAX_TEXT_BYTES,
+                });
+            }
+        }
+        Ok(texts.iter().map(|_| vec![0.0]).collect())
+    }
+
+    /// External service that inherits the `embed_with_role` default unchanged.
+    struct ExactCapNoOverride;
+
+    #[async_trait]
+    impl EmbeddingService for ExactCapNoOverride {
+        async fn embed(&self, texts: &[String], _model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+            exact_cap_embed(texts)
+        }
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "exact-cap-no-override"
+        }
+    }
+
+    /// External service that overrides the role method: validate caller text,
+    /// then reach its own backend with a bound sized for the prepared string.
+    struct ExactCapWithOverride;
+
+    #[async_trait]
+    impl EmbeddingService for ExactCapWithOverride {
+        async fn embed(&self, texts: &[String], _model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
+            exact_cap_embed(texts)
+        }
+        async fn embed_with_role(
+            &self,
+            texts: &[String],
+            model: EmbeddingModel,
+            role: EmbeddingRole,
+        ) -> Result<Vec<Vec<f32>>> {
+            validate_texts(texts)?;
+            let prepared = apply_prefix(texts, role.instruction(model));
+            let backstop = MAX_TEXT_BYTES + model.max_instruction_bytes();
+            for t in &prepared {
+                if t.len() > backstop {
+                    return Err(EmbedError::TextTooLong {
+                        length: t.len(),
+                        max: MAX_TEXT_BYTES,
+                    });
+                }
+            }
+            Ok(prepared.iter().map(|_| vec![0.0]).collect())
+        }
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "exact-cap-with-override"
+        }
+    }
+
+    /// The documented limitation, made executable: the default forwards prepared
+    /// text through the exact-cap `embed`, so cap-sized caller text is rejected.
+    /// Reverting the default to skip preparation would flip this, so it guards the
+    /// dispatch shape rather than restating it.
+    #[tokio::test]
+    async fn default_role_forwards_prepared_text_to_embed() {
+        let text = "a".repeat(MAX_TEXT_BYTES);
+        assert_eq!(text.len(), MAX_TEXT_BYTES);
+        let err = ExactCapNoOverride
+            .embed_query(&[text], EmbeddingModel::BgeSmallEnV15)
+            .await
+            .expect_err("default forwards the lengthened string through exact-cap embed");
+        assert!(
+            matches!(err, EmbedError::TextTooLong { .. }),
+            "expected the inherited exact-cap embed to reject prepared text, got: {err}"
+        );
+    }
+
+    /// The escape hatch, made executable: overriding `embed_with_role` lets an
+    /// external service enforce the cap on caller text and admit cap-sized input.
+    #[tokio::test]
+    async fn overriding_the_role_method_preserves_the_caller_cap() {
+        let text = "a".repeat(MAX_TEXT_BYTES);
+        let out = ExactCapWithOverride
+            .embed_query(&[text], EmbeddingModel::BgeSmallEnV15)
+            .await
+            .expect("overriding embed_with_role admits cap-sized caller text");
+        assert_eq!(out.len(), 1, "one embedding per input");
+    }
+
+    /// Over-cap caller text is rejected on both external shapes, and the error
+    /// reports the published cap rather than any wider internal bound.
+    #[tokio::test]
+    async fn over_cap_caller_text_reports_published_cap_on_both_shapes() {
+        let text = "a".repeat(MAX_TEXT_BYTES + 1);
+        let one = std::slice::from_ref(&text);
+        for res in [
+            ExactCapNoOverride
+                .embed_query(one, EmbeddingModel::BgeSmallEnV15)
+                .await,
+            ExactCapWithOverride
+                .embed_query(one, EmbeddingModel::BgeSmallEnV15)
+                .await,
+        ] {
+            let err = res.expect_err("over-cap caller text must be rejected");
+            assert!(
+                matches!(err, EmbedError::TextTooLong { max, .. } if max == MAX_TEXT_BYTES),
+                "must report the published cap, got: {err}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
