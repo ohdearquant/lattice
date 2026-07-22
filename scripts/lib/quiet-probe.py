@@ -35,23 +35,62 @@ import time
 DEFAULT_FLOOR = 70.0
 
 
-def _idle_linux() -> float:
-    """Idle share over a short interval, from two /proc/stat reads."""
+# The parsing is separated from the sampling on purpose. A parser that can only
+# be reached by reading the live machine can only be tested against whatever the
+# machine happens to be doing, which is a test that passes on a correct parser
+# and on several wrong ones -- including a regex that captures the busy field
+# instead of the idle one, whose error is invisible on an idle box.
 
-    def snapshot() -> tuple[int, int]:
-        with open("/proc/stat") as fh:
-            fields = [int(x) for x in fh.readline().split()[1:]]
-        # user nice system idle iowait irq softirq steal ...
-        idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
-        return sum(fields), idle
 
-    total0, idle0 = snapshot()
-    time.sleep(1.0)
-    total1, idle1 = snapshot()
+def parse_proc_stat(line: str) -> tuple[int, int]:
+    """(total, idle) jiffies from a /proc/stat aggregate `cpu` line.
+
+    iowait counts as idle: the CPU is available for the bench during it. That
+    is a deliberate choice, pinned by test rather than left to be rediscovered.
+    """
+    fields = [int(x) for x in line.split()[1:]]
+    # user nice system idle iowait irq softirq steal ...
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+    return sum(fields), idle
+
+
+def linux_idle_pct(line0: str, line1: str) -> float:
+    """Idle share between two /proc/stat samples."""
+    total0, idle0 = parse_proc_stat(line0)
+    total1, idle1 = parse_proc_stat(line1)
     dt = total1 - total0
     if dt <= 0:
         raise RuntimeError("/proc/stat did not advance")
     return 100.0 * (idle1 - idle0) / dt
+
+
+def parse_top_idle(out: str) -> float:
+    """Idle percentage from top's LAST 'CPU usage' line.
+
+    The last one, because `top -l 2` reports its first sample as an average
+    since boot, which on a machine that has been idle for hours reads as quiet
+    no matter what is running right now.
+
+    The percentage immediately preceding the word `idle`, because the same line
+    carries user and sys percentages first; anchoring on position rather than on
+    the word reports the busiest field as if it were the idlest.
+    """
+    hits = re.findall(r"CPU usage:.*?([\d.]+)%\s+idle", out)
+    if not hits:
+        raise RuntimeError("could not parse 'CPU usage' from top")
+    return float(hits[-1])
+
+
+def _idle_linux() -> float:
+    """Idle share over a short interval, from two /proc/stat reads."""
+
+    def first_line() -> str:
+        with open("/proc/stat") as fh:
+            return fh.readline()
+
+    line0 = first_line()
+    time.sleep(1.0)
+    return linux_idle_pct(line0, first_line())
 
 
 def _idle_macos() -> float:
@@ -62,10 +101,7 @@ def _idle_macos() -> float:
         text=True,
         timeout=30,
     ).stdout
-    hits = re.findall(r"CPU usage:.*?([\d.]+)%\s+idle", out)
-    if not hits:
-        raise RuntimeError("could not parse 'CPU usage' from top")
-    return float(hits[-1])
+    return parse_top_idle(out)
 
 
 def idle_percent() -> float:

@@ -96,7 +96,11 @@ def ancestors() -> list[int]:
                 timeout=5,
             ).stdout.strip()
             pid = int(out) if out else 0
-        except (subprocess.SubprocessError, ValueError):
+        except (subprocess.SubprocessError, OSError, ValueError):
+            # OSError covers ps being absent or process inspection being denied.
+            # SubprocessError is not a subclass of it, so both are needed: this
+            # runs while a lock is contended, and a traceback here would replace
+            # the contention diagnostic with a crash.
             break
     return chain
 

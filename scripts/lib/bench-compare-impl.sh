@@ -4,8 +4,9 @@
 # INVOKE scripts/bench-compare.sh, NOT THIS FILE. This is the measurement body;
 # the entry point runs it under scripts/lib/bench-locks.py, which holds the
 # machine-wide bench-window and Metal GPU locks for the whole run. Running this
-# file directly is refused below, because the lock status it reports would
-# otherwise be a claim rather than a fact.
+# file by accident is refused below. Running it deliberately, by a caller
+# willing to prepare the status file, is not prevented — see the comment above
+# verify_locks for exactly what that check establishes.
 #
 # Usage:
 #   scripts/bench-compare.sh                        # origin/main vs HEAD (quick)
@@ -89,7 +90,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 
-# --- Refuse to measure unless a live supervisor is above us ---
+# --- Refuse to measure unless the recorded supervisor is one of our ancestors ---
 # scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
 # which records its own PID here after taking both locks. This requires that PID
 # to be one of THIS process's ancestors before measuring.
@@ -127,17 +128,36 @@ verify_locks() {
   esac
   local pid="$PPID"
   local hops=0
+  local parent
+  local walked=1
   while [ "$pid" -gt 1 ] && [ "$hops" -lt 64 ]; do
     if [ "$pid" = "$sup" ]; then
       LOCK_SUMMARY="$(sed -n 's/^lock=/  /p' "$LOCK_STATUS_FILE")"
       return 0
     fi
-    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
-    case "$pid" in ''|*[!0-9]*) break ;; esac
+    # A failing ps must reach the refusal below rather than abort the script.
+    # Under `set -o pipefail` the failure propagates out of the assignment and
+    # `set -e` exits with ps's own status, skipping the diagnostic entirely: the
+    # caller sees a bare 1 or 126 and no message. That is still fail-closed, but
+    # silently, and it fires on the ordinary case of an ancestor exiting during
+    # the walk, not only where process inspection is denied.
+    if ! parent="$(ps -o ppid= -p "$pid" 2>/dev/null)"; then
+      walked=0
+      break
+    fi
+    pid="$(printf '%s' "$parent" | tr -d ' ')"
+    case "$pid" in ''|*[!0-9]*) walked=0; break ;; esac
     hops=$((hops + 1))
   done
-  echo "bench-compare: lock supervisor $sup is not an ancestor of this run" \
-       "(stale or hand-written $LOCK_STATUS_FILE) — refusing to measure." >&2
+  if [ "$walked" -eq 0 ]; then
+    echo "bench-compare: could not walk this process's ancestry to the end" \
+         "(ps failed or returned nothing) — refusing to measure." >&2
+    echo "  Supervisor $sup was not seen before the walk stopped, so whether it" \
+         "is an ancestor is unknown, and unknown is refused." >&2
+  else
+    echo "bench-compare: lock supervisor $sup is not an ancestor of this run" \
+         "(stale or copied $LOCK_STATUS_FILE) — refusing to measure." >&2
+  fi
   echo "  Run scripts/bench-compare.sh, not this file directly." >&2
   exit 2
 }
