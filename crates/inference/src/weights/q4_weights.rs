@@ -859,7 +859,16 @@ impl std::fmt::Display for F16LoadError {
     }
 }
 
-impl std::error::Error for F16LoadError {}
+impl std::error::Error for F16LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // Keep the wrapped cause reachable. `Display` alone flattens the chain, so a
+            // caller that walks `source()` would otherwise see this wrapper as the root.
+            Self::Other(e) => Some(e.as_ref()),
+            Self::ShapeMismatch { .. } => None,
+        }
+    }
+}
 
 /// Load a KHF1 `.f16` tensor, requiring its header to declare `expected` before the
 /// payload is read.
