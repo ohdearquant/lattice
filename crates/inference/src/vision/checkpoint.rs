@@ -21,7 +21,8 @@ use crate::model::qwen35_config::VisionModelConfig;
 use crate::quant::q4_manifest;
 use crate::weights::f32_weights::{ShardedSafetensors, TensorSource};
 use crate::weights::q4_weights::{
-    dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file, read_f16_tensor_shape,
+    F16LoadError, dequantize_q4_to_f32, load_f16_tensor_file, load_f16_tensor_file_expecting,
+    load_q4_file,
 };
 
 /// Tensor name to its dequantized data paired with the shape it was declared with.
@@ -376,28 +377,31 @@ fn load_from_q4_dir(
             }
             let shape = q4.shape.clone();
             (dequantize_q4_to_f32(&q4), shape)
-        } else {
+        } else if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg) {
             // Same reasoning as the `.q4` header check above, for the arm that reads an
             // `.f16` companion: when the manifest omits `shape`, the preflight before
             // `contained_shard_path` had nothing to compare, and this arm would otherwise
             // materialize the whole tensor before `assemble` noticed the disagreement.
-            // Read the KHF1 header's shape only, and reject here.
-            if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg) {
-                let declared = read_f16_tensor_shape(&file_path).map_err(|e| {
-                    InferenceError::InvalidSafetensors(format!(
-                        "failed to read f16 header for tensor {} from {}: {e}",
-                        entry.name,
-                        file_path.display()
-                    ))
-                })?;
-                if declared != expected {
-                    return Err(InferenceError::ShapeMismatch {
-                        name: entry.name.clone(),
-                        expected,
-                        actual: declared,
-                    });
-                }
-            }
+            //
+            // The check and the payload read happen inside ONE open handle rather than
+            // here around two calls. Checking a shape through one open and materializing
+            // through a second leaves nothing binding the validated header to the bytes
+            // actually read, since the pathname can be replaced in between, and the
+            // checkpoint directory is untrusted input (see the containment check above).
+            let loaded = load_f16_tensor_file_expecting(&file_path, &expected);
+            loaded.map_err(|e| match e {
+                F16LoadError::ShapeMismatch { declared } => InferenceError::ShapeMismatch {
+                    name: entry.name.clone(),
+                    expected,
+                    actual: declared,
+                },
+                F16LoadError::Other(e) => InferenceError::InvalidSafetensors(format!(
+                    "failed to load f16 tensor {} from {}: {e}",
+                    entry.name,
+                    file_path.display()
+                )),
+            })?
+        } else {
             load_f16_tensor_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
                     "failed to load f16 tensor {} from {}: {e}",
@@ -1088,6 +1092,47 @@ mod tests {
                 assert_eq!(actual, vec![64]);
             }
             other => panic!("expected ShapeMismatch before materialization, got: {other}"),
+        }
+    }
+
+    /// Proves the shape comparison happens BEFORE the payload is read, rather than merely
+    /// before `assemble`.
+    ///
+    /// The fixture's header declares 64 elements but the file carries no payload bytes at
+    /// all. If the loader read the payload first it would fail on the truncated read and
+    /// surface `InvalidSafetensors`; only a loader that compares the header against the
+    /// expected shape first can return `ShapeMismatch` for this input. The two outcomes
+    /// are therefore distinguishable, which is the whole point of the fixture.
+    ///
+    /// What this does not prove is the same-handle property. That the header and payload
+    /// come from one open cannot be shown without a filesystem seam to swap the file
+    /// mid-load; it is structural, held by `load_f16_tensor_file_expecting` performing a
+    /// single open, and this test would still pass if that were split back into two.
+    #[test]
+    fn f16_shape_is_compared_before_the_payload_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&64u64.to_le_bytes());
+        buf.extend_from_slice(&64u64.to_le_bytes());
+        // Deliberately no payload: 64 declared elements, zero bytes of data.
+        std::fs::write(tmp.path().join("t0.f16"), &buf).expect("test setup: write f16 header");
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"model.visual.patch_embed.proj.bias","file":"t0.f16","quantized":false}]"#,
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &tiny_vision_cfg())
+            .expect_err("a header disagreeing with vision_cfg must be rejected");
+        match err {
+            InferenceError::ShapeMismatch { actual, .. } => assert_eq!(actual, vec![64]),
+            other => panic!(
+                "expected ShapeMismatch from the header check, which proves the payload \
+                 read was never attempted; got: {other}"
+            ),
         }
     }
 

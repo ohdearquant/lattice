@@ -777,28 +777,13 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
     })
 }
 
-/// Load a tensor from a KHF1 `.f16` file, returning f32 values and shape.
+/// Read a `.f16` (KHF1) file's header from an already-open handle, leaving the reader
+/// positioned at the payload.
 ///
-/// File format:
-/// ```text
-/// magic       b"KHF1"   4 bytes
-/// version     1u32 LE   4 bytes
-/// ndim        u32 LE    4 bytes
-/// shape[i]    u64 LE × ndim
-/// numel       u64 LE    8 bytes
-/// data        [u16; numel]   numel × 2 bytes (IEEE-754 f16 bit patterns)
-/// ```
-///
-/// # Errors
-///
-/// Returns an error on I/O failure, malformed dimensions, unrecognized magic bytes, or
-/// unsupported version.
-/// Read a `.f16` (KHF1) file's header, leaving the reader positioned at the payload.
-///
-/// Split out of [`load_f16_tensor_file`] so a caller can learn a tensor's declared
-/// shape without materializing it. Validating a shape against a config is only
-/// meaningful *before* the payload is read: a check performed afterwards has already
-/// paid the allocation it exists to refuse.
+/// Takes the `File` rather than a path on purpose. A shape check is only meaningful for
+/// the bytes it actually guards, so the header and the payload must come from the same
+/// open handle; re-opening the pathname to read one and then the other lets the file be
+/// replaced in between, and the validated header need not describe what gets materialized.
 fn read_f16_header(
     f: &mut std::fs::File,
     path: &std::path::Path,
@@ -849,29 +834,97 @@ fn read_f16_header(
     Ok((shape, numel))
 }
 
-/// Read only the declared shape of a `.f16` (KHF1) tensor, without reading its payload.
+/// Why loading a `.f16` failed, when the caller needs to distinguish a shape
+/// disagreement from every other failure in order to report it well.
+#[derive(Debug)]
+pub enum F16LoadError {
+    /// The header's declared shape disagreed with the shape the caller required.
+    /// The payload was not read.
+    ShapeMismatch {
+        /// The shape the file's own header declares.
+        declared: Vec<usize>,
+    },
+    /// Any other failure: I/O, bad magic, unsupported version, inconsistent header.
+    Other(Box<dyn std::error::Error>),
+}
+
+impl std::fmt::Display for F16LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShapeMismatch { declared } => {
+                write!(f, "f16 header declares shape {declared:?}")
+            }
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for F16LoadError {}
+
+/// Load a KHF1 `.f16` tensor, requiring its header to declare `expected` before the
+/// payload is read.
+///
+/// This exists instead of a public "read the shape" helper because reading the shape and
+/// then loading the file are two opens of the same pathname, and nothing binds the shape
+/// that was checked to the bytes that get materialized. Here the header is parsed and
+/// compared on the same handle the payload is then read from, so passing the check is a
+/// property of the actual tensor rather than of whatever happened to be at that path a
+/// moment earlier.
 ///
 /// # Errors
 ///
-/// Returns an error on I/O failure, unrecognized magic bytes, unsupported version, or a
-/// header whose shape product disagrees with its element count.
-pub fn read_f16_tensor_shape(
+/// [`F16LoadError::ShapeMismatch`] if the header disagrees with `expected`, in which case
+/// no payload is read; otherwise [`F16LoadError::Other`] on I/O failure, unrecognized
+/// magic bytes, unsupported version, or malformed dimensions.
+pub fn load_f16_tensor_file_expecting(
     path: &std::path::Path,
-) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-    let mut f = std::fs::File::open(path)?;
-    let file_len = f.metadata()?.len();
-    let (shape, _numel) = read_f16_header(&mut f, path, file_len)?;
-    Ok(shape)
+    expected: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>), F16LoadError> {
+    let mut f = std::fs::File::open(path).map_err(|e| F16LoadError::Other(Box::new(e)))?;
+    let file_len = f
+        .metadata()
+        .map_err(|e| F16LoadError::Other(Box::new(e)))?
+        .len();
+    let (shape, numel) = read_f16_header(&mut f, path, file_len).map_err(F16LoadError::Other)?;
+    if shape != expected {
+        return Err(F16LoadError::ShapeMismatch { declared: shape });
+    }
+    read_f16_payload(&mut f, shape, numel, file_len).map_err(F16LoadError::Other)
 }
 
+/// Load a tensor from a KHF1 `.f16` file, returning f32 values and shape.
+///
+/// File format:
+/// ```text
+/// magic       b"KHF1"   4 bytes
+/// version     1u32 LE   4 bytes
+/// ndim        u32 LE    4 bytes
+/// shape[i]    u64 LE × ndim
+/// numel       u64 LE    8 bytes
+/// data        [u16; numel]   numel × 2 bytes (IEEE-754 f16 bit patterns)
+/// ```
+///
+/// # Errors
+///
+/// Returns an error on I/O failure, malformed dimensions, unrecognized magic bytes, or
+/// unsupported version.
 pub fn load_f16_tensor_file(
     path: &std::path::Path,
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
-    use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let file_len = f.metadata()?.len();
     let (shape, numel) = read_f16_header(&mut f, path, file_len)?;
+    read_f16_payload(&mut f, shape, numel, file_len)
+}
 
+/// Read a `.f16` payload from a handle already positioned past its header.
+fn read_f16_payload(
+    f: &mut std::fs::File,
+    shape: Vec<usize>,
+    numel: usize,
+    file_len: u64,
+) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+    use std::io::Read;
     let raw_len = checked_alloc_bytes(numel, 2, file_len, "f16 data")?;
     let mut raw = vec![0u8; raw_len];
     f.read_exact(&mut raw)?;
