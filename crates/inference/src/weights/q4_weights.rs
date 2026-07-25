@@ -793,12 +793,18 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
 ///
 /// Returns an error on I/O failure, malformed dimensions, unrecognized magic bytes, or
 /// unsupported version.
-pub fn load_f16_tensor_file(
+/// Read a `.f16` (KHF1) file's header, leaving the reader positioned at the payload.
+///
+/// Split out of [`load_f16_tensor_file`] so a caller can learn a tensor's declared
+/// shape without materializing it. Validating a shape against a config is only
+/// meaningful *before* the payload is read: a check performed afterwards has already
+/// paid the allocation it exists to refuse.
+fn read_f16_header(
+    f: &mut std::fs::File,
     path: &std::path::Path,
-) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+    file_len: u64,
+) -> Result<(Vec<usize>, usize), Box<dyn std::error::Error>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
-    let file_len = f.metadata()?.len();
 
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
@@ -839,6 +845,32 @@ pub fn load_f16_tensor_file(
             format!("shape product {shape_product} (shape={shape:?}) != numel {numel}").into(),
         );
     }
+
+    Ok((shape, numel))
+}
+
+/// Read only the declared shape of a `.f16` (KHF1) tensor, without reading its payload.
+///
+/// # Errors
+///
+/// Returns an error on I/O failure, unrecognized magic bytes, unsupported version, or a
+/// header whose shape product disagrees with its element count.
+pub fn read_f16_tensor_shape(
+    path: &std::path::Path,
+) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+    let mut f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
+    let (shape, _numel) = read_f16_header(&mut f, path, file_len)?;
+    Ok(shape)
+}
+
+pub fn load_f16_tensor_file(
+    path: &std::path::Path,
+) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let file_len = f.metadata()?.len();
+    let (shape, numel) = read_f16_header(&mut f, path, file_len)?;
 
     let raw_len = checked_alloc_bytes(numel, 2, file_len, "f16 data")?;
     let mut raw = vec![0u8; raw_len];

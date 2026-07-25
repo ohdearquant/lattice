@@ -20,7 +20,9 @@ use crate::error::InferenceError;
 use crate::model::qwen35_config::VisionModelConfig;
 use crate::quant::q4_manifest;
 use crate::weights::f32_weights::{ShardedSafetensors, TensorSource};
-use crate::weights::q4_weights::{dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file};
+use crate::weights::q4_weights::{
+    dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file, read_f16_tensor_shape,
+};
 
 /// Tensor name to its dequantized data paired with the shape it was declared with.
 ///
@@ -375,6 +377,27 @@ fn load_from_q4_dir(
             let shape = q4.shape.clone();
             (dequantize_q4_to_f32(&q4), shape)
         } else {
+            // Same reasoning as the `.q4` header check above, for the arm that reads an
+            // `.f16` companion: when the manifest omits `shape`, the preflight before
+            // `contained_shard_path` had nothing to compare, and this arm would otherwise
+            // materialize the whole tensor before `assemble` noticed the disagreement.
+            // Read the KHF1 header's shape only, and reject here.
+            if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg) {
+                let declared = read_f16_tensor_shape(&file_path).map_err(|e| {
+                    InferenceError::InvalidSafetensors(format!(
+                        "failed to read f16 header for tensor {} from {}: {e}",
+                        entry.name,
+                        file_path.display()
+                    ))
+                })?;
+                if declared != expected {
+                    return Err(InferenceError::ShapeMismatch {
+                        name: entry.name.clone(),
+                        expected,
+                        actual: declared,
+                    });
+                }
+            }
             load_f16_tensor_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
                     "failed to load f16 tensor {} from {}: {e}",
@@ -1029,6 +1052,43 @@ mod tests {
         .expect("test setup: write manifest");
 
         assert_fc2_shape_mismatch(load_qwen35_vision_weights(tmp.path(), &cfg));
+    }
+
+    /// The `.f16` companion arm needs its own header check, and this is the case that
+    /// proves it: a non-quantized entry whose manifest omits `shape` skips the preflight
+    /// before `contained_shard_path` (there is no declared shape to compare) and does not
+    /// reach the `.q4` header check (that arm is not taken). Without a header check here
+    /// the tensor is fully read and converted before `assemble` notices.
+    ///
+    /// The single manifest entry is the bias rather than `patch_embed.proj.weight`, so
+    /// without the guard the loader gets far enough for `assemble` to report the absent
+    /// weight as `MissingTensor`. That makes the assertion below discriminating: it can
+    /// only pass if the header was checked before materialization, not merely because
+    /// loading failed somewhere.
+    #[test]
+    fn f16_header_shape_disagreeing_with_config_is_rejected_before_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_khf1_f16_file(&tmp.path().join("t0.f16"), &[64], &vec![0.5f32; 64]);
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"model.visual.patch_embed.proj.bias","file":"t0.f16","quantized":false}]"#,
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &tiny_vision_cfg())
+            .expect_err("an f16 header shape contradicting vision_cfg must be rejected");
+        match err {
+            InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(name, "model.visual.patch_embed.proj.bias");
+                assert_eq!(expected, vec![4]);
+                assert_eq!(actual, vec![64]);
+            }
+            other => panic!("expected ShapeMismatch before materialization, got: {other}"),
+        }
     }
 
     #[test]
