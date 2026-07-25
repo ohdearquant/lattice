@@ -319,6 +319,22 @@ fn load_from_q4_dir(
                 entry.name,
             )));
         }
+        // Config-shape preflight, mirroring what `fetch_expected_tensors` does for the
+        // fp16 path. The manifest's declared shape is compared against what `vision_cfg`
+        // implies BEFORE the tensor's file is opened, so a checkpoint that disagrees with
+        // the config is rejected without reading or allocating it. This sits ahead of the
+        // branch below because BOTH arms materialize: the q4 arm through
+        // `dequantize_q4_to_f32` and the f16 arm inside `load_f16_tensor_file`.
+        if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg)
+            && let Some(declared) = &entry.shape
+            && declared != &expected
+        {
+            return Err(InferenceError::ShapeMismatch {
+                name: entry.name.clone(),
+                expected,
+                actual: declared.clone(),
+            });
+        }
         // Manifest-declared file names are untrusted checkpoint content;
         // containment-check before reading (#1069).
         let file_path = crate::weights::contained_shard_path(model_dir, &entry.file)?;
@@ -340,6 +356,20 @@ fn load_from_q4_dir(
                     name: entry.name.clone(),
                     expected: q4.shape.clone(),
                     actual: manifest_shape.clone(),
+                });
+            }
+            // `entry.shape` is optional, so when the manifest omits it the `.q4` header
+            // is the only declared shape that exists and the preflight above had nothing
+            // to check. Compare the header against the config here, while the tensor is
+            // still its compressed self and before `dequantize_q4_to_f32` allocates the
+            // full f32 buffer.
+            if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg)
+                && q4.shape != expected
+            {
+                return Err(InferenceError::ShapeMismatch {
+                    name: entry.name.clone(),
+                    expected,
+                    actual: q4.shape.clone(),
                 });
             }
             let shape = q4.shape.clone();
@@ -878,6 +908,86 @@ mod tests {
                 .contains("must stay within the model directory"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The manifest's declared shape must be checked against `vision_cfg` BEFORE the
+    /// tensor's file is opened, matching what `fetch_expected_tensors` does on the fp16
+    /// path.
+    ///
+    /// Pointing the entry at a file that does not exist is what makes this
+    /// mutation-sensitive. With the preflight the loader never gets that far and returns
+    /// ShapeMismatch; without it the loader tries to read `missing.q4` and reports a read
+    /// failure instead. Asserting merely that *some* error came back would pass either
+    /// way and guard nothing.
+    #[test]
+    fn q4_manifest_shape_disagreeing_with_config_is_rejected_before_the_file_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"model.visual.patch_embed.proj.bias","file":"missing.q4","quantized":true,"shape":[9999]}]"#,
+        )
+        .expect("test setup: write manifest");
+        assert!(
+            !tmp.path().join("missing.q4").exists(),
+            "test setup: the tensor file must NOT exist, that absence is the assertion"
+        );
+
+        let err = load_qwen35_vision_weights(tmp.path(), &tiny_vision_cfg())
+            .expect_err("a manifest shape contradicting vision_cfg must be rejected");
+        match err {
+            InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(name, "model.visual.patch_embed.proj.bias");
+                assert_eq!(expected, vec![4]);
+                assert_eq!(actual, vec![9999]);
+            }
+            other => panic!("expected ShapeMismatch before any file read, got: {other}"),
+        }
+    }
+
+    /// When the manifest omits `shape`, the `.q4` header carries the only declared shape
+    /// there is and the manifest-level preflight has nothing to compare. The header must
+    /// then be checked against `vision_cfg` before `dequantize_q4_to_f32` allocates the
+    /// full f32 buffer.
+    ///
+    /// Mutation-sensitivity needs care here, and it is exactly the trap the fp16-path
+    /// test author already called out: `assemble` rejects a contradictory shape too, so
+    /// `expect_err` alone still passes with the fix reverted. The discriminator is WHICH
+    /// error comes back. This manifest carries exactly one tensor and it is deliberately
+    /// not the one `assemble` takes first, so with the header check removed the loader
+    /// dequantizes happily and then dies on MissingTensor for `patch_embed.proj.weight`,
+    /// a different error about a different tensor.
+    #[test]
+    fn q4_header_shape_disagreeing_with_config_is_rejected_before_dequantization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = vec![0.25_f64; 64];
+        let q4 = crate::weights::q4_weights::quantize_f64_to_q4(&data, &[64])
+            .expect("quantize succeeds");
+        crate::weights::q4_weights::save_q4_file(&tmp.path().join("t0.q4"), &q4)
+            .expect("test setup: write q4 file");
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"model.visual.patch_embed.proj.bias","file":"t0.q4","quantized":true}]"#,
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &tiny_vision_cfg())
+            .expect_err("a q4 header shape contradicting vision_cfg must be rejected");
+        match err {
+            InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(name, "model.visual.patch_embed.proj.bias");
+                assert_eq!(expected, vec![4]);
+                assert_eq!(actual, vec![64]);
+            }
+            other => panic!("expected ShapeMismatch before dequantization, got: {other}"),
+        }
     }
 
     fn write_khf1_f16_file(path: &Path, shape: &[usize], values: &[f32]) {
