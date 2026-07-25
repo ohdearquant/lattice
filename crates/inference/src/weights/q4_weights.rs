@@ -854,7 +854,11 @@ impl std::fmt::Display for F16LoadError {
             Self::ShapeMismatch { declared } => {
                 write!(f, "f16 header declares shape {declared:?}")
             }
-            Self::Other(e) => write!(f, "{e}"),
+            // Deliberately does NOT interpolate the wrapped error. `source()` below returns
+            // that same error, and a consumer that walks the chain (or prints with `{:#}`)
+            // would otherwise see the cause twice. `Display` states only what this wrapper
+            // itself contributes; the cause is reached through `source()`.
+            Self::Other(_) => write!(f, "f16 tensor could not be read"),
         }
     }
 }
@@ -2825,5 +2829,32 @@ mod tests {
         );
 
         std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    /// `Display` must not repeat what `source()` already exposes.
+    ///
+    /// These two assertions fail in opposite directions, which is the point: reverting
+    /// `Display` to interpolate the wrapped error trips the first, and dropping the
+    /// `source()` implementation trips the second. A chain-printing consumer needs both
+    /// halves to hold, and neither is observable from the other.
+    #[test]
+    fn f16_load_error_display_does_not_duplicate_its_source() {
+        use std::error::Error;
+
+        const CAUSE: &str = "sentinel-cause-text";
+        let err = F16LoadError::Other(Box::new(std::io::Error::other(CAUSE)));
+
+        let shown = format!("{err}");
+        assert!(
+            !shown.contains(CAUSE),
+            "Display must describe only this wrapper's own contribution, but it \
+             interpolated the wrapped cause: {shown:?}"
+        );
+
+        let source = err.source().expect("Other must keep its cause reachable");
+        assert!(
+            format!("{source}").contains(CAUSE),
+            "source() must yield the wrapped cause itself"
+        );
     }
 }
