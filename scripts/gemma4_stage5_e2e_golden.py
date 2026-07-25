@@ -72,7 +72,7 @@ def main() -> None:
         cfg_dict = json.load(f)
     cfg = Gemma4Config(**cfg_dict)
 
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR)
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=False, local_files_only=True)
     bos_id = cfg.text_config.bos_token_id
     prompt_ids = tok(PROMPT, add_special_tokens=False)["input_ids"]
     input_ids_list = [bos_id] + prompt_ids
@@ -80,7 +80,12 @@ def main() -> None:
 
     print("loading model (CPU f32, text-only)...", file=sys.stderr)
     model = Gemma4ForConditionalGeneration.from_pretrained(
-        MODEL_DIR, config=cfg, dtype=torch.float32, low_cpu_mem_usage=True
+        MODEL_DIR,
+        config=cfg,
+        dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        trust_remote_code=False,
+        local_files_only=True,
     )
     model.eval()
 

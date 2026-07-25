@@ -15,7 +15,16 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$REPO/scripts/lib/ensure-noindex-marker.sh"
-CALLER="$REPO/scripts/bench-compare.sh"
+# The measurement body, not the entry point: scripts/bench-compare.sh only
+# takes the machine-wide locks and execs this. Naming a file by path is how a
+# check like this goes stale, so the existence assertion below is what turns a
+# future move into a loud failure instead of a silently-skipped call-site test.
+CALLER="$REPO/scripts/lib/bench-compare-impl.sh"
+if [ ! -f "$CALLER" ]; then
+  echo "FATAL: expected caller $CALLER does not exist — the call-site assertions" >&2
+  echo "  below would vacuously pass against a moved or renamed file." >&2
+  exit 1
+fi
 SB="$(mktemp -d)"
 trap 'chmod -R u+w "$SB" 2>/dev/null; rm -rf "$SB"' EXIT
 
@@ -103,11 +112,11 @@ else
 fi
 
 # 8. CALL-SITE ASSERTION. Testing the helper in isolation would still pass if
-#    bench-compare.sh stopped calling it, so assert the wiring too.
+#    the measurement body stopped calling it, so assert the wiring too.
 if grep -q 'scripts/lib/ensure-noindex-marker.sh' "$CALLER"; then
-  echo "  PASS: bench-compare.sh invokes the guard"; pass=$((pass+1))
+  echo "  PASS: the measurement body invokes the guard"; pass=$((pass+1))
 else
-  echo "  FAIL: bench-compare.sh no longer invokes the guard"; fail=$((fail+1))
+  echo "  FAIL: the measurement body no longer invokes the guard"; fail=$((fail+1))
 fi
 
 # 9. The guard must run BEFORE the worktrees it protects are created.

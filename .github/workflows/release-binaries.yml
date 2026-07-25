@@ -49,18 +49,18 @@ jobs:
             target: aarch64-unknown-linux-gnu
             features: f16
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
 
       - name: Pin the real toolchain bin on PATH
         # See ci.yml: some macos-latest images ship a rustup-init shim as
         # ~/.cargo/bin/cargo rather than the rustup proxy.
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-binaries-${{ matrix.target }}
 
