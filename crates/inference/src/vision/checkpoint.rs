@@ -20,7 +20,17 @@ use crate::error::InferenceError;
 use crate::model::qwen35_config::VisionModelConfig;
 use crate::quant::q4_manifest;
 use crate::weights::f32_weights::{ShardedSafetensors, TensorSource};
-use crate::weights::q4_weights::{dequantize_q4_to_f32, load_f16_tensor_file, load_q4_file};
+use crate::weights::q4_weights::{
+    F16LoadError, dequantize_q4_to_f32, load_f16_tensor_file, load_f16_tensor_file_expecting,
+    load_q4_file,
+};
+
+/// Tensor name to its dequantized data paired with the shape it was declared with.
+///
+/// The shape travels alongside the data because a checkpoint's declared shape is what
+/// preflight validates against, and it must stay available after materialization for
+/// the sources that cannot report a shape without reading the tensor.
+type NamedTensors = HashMap<String, (Vec<f32>, Vec<usize>)>;
 
 /// One ViT transformer block's real tensors (`model.visual.blocks.{i}.*`).
 #[derive(Debug, Clone)]
@@ -167,6 +177,52 @@ fn tensor_names(vision_cfg: &VisionModelConfig) -> Vec<String> {
     names
 }
 
+/// The shape `assemble` will require for a given `model.visual.*` tensor name, mirroring
+/// its per-tensor `take(name, expected_shape)` calls. `None` means the name is not one of
+/// the expected tensors (unreachable given `tensor_names()`, but the caller falls back to
+/// the post-materialization check in that case rather than assuming a shape).
+fn expected_visual_tensor_shape(name: &str, vision_cfg: &VisionModelConfig) -> Option<Vec<usize>> {
+    let hidden = vision_cfg.hidden_size;
+    let qkv_out = 3 * hidden;
+    let mlp_intermediate = 4 * hidden;
+    let merge_in = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size * hidden;
+    let out_hidden = vision_cfg.out_hidden_size;
+
+    if let Some(rest) = name.strip_prefix("model.visual.blocks.") {
+        let suffix = rest.split_once('.').map(|(_, s)| s).unwrap_or(rest);
+        return match suffix {
+            "attn.qkv.weight" => Some(vec![qkv_out, hidden]),
+            "attn.qkv.bias" => Some(vec![qkv_out]),
+            "attn.proj.weight" => Some(vec![hidden, hidden]),
+            "attn.proj.bias" => Some(vec![hidden]),
+            "mlp.linear_fc1.weight" => Some(vec![mlp_intermediate, hidden]),
+            "mlp.linear_fc1.bias" => Some(vec![mlp_intermediate]),
+            "mlp.linear_fc2.weight" => Some(vec![hidden, mlp_intermediate]),
+            "mlp.linear_fc2.bias" => Some(vec![hidden]),
+            "norm1.weight" | "norm2.weight" | "norm1.bias" | "norm2.bias" => Some(vec![hidden]),
+            _ => None,
+        };
+    }
+
+    match name {
+        "model.visual.patch_embed.proj.weight" => Some(vec![
+            hidden,
+            vision_cfg.in_channels,
+            vision_cfg.temporal_patch_size,
+            vision_cfg.patch_size,
+            vision_cfg.patch_size,
+        ]),
+        "model.visual.patch_embed.proj.bias" => Some(vec![hidden]),
+        "model.visual.pos_embed.weight" => Some(vec![vision_cfg.num_position_embeddings, hidden]),
+        "model.visual.merger.linear_fc1.weight" => Some(vec![merge_in, merge_in]),
+        "model.visual.merger.linear_fc1.bias" => Some(vec![merge_in]),
+        "model.visual.merger.linear_fc2.weight" => Some(vec![out_hidden, merge_in]),
+        "model.visual.merger.linear_fc2.bias" => Some(vec![out_hidden]),
+        "model.visual.merger.norm.weight" | "model.visual.merger.norm.bias" => Some(vec![hidden]),
+        _ => None,
+    }
+}
+
 fn load_from_fp16_dir(
     model_dir: &Path,
     vision_cfg: &VisionModelConfig,
@@ -196,12 +252,37 @@ fn load_from_fp16_dir(
         )));
     }
 
-    let mut tensors = HashMap::with_capacity(expected_names.len());
-    for name in expected_names {
-        let (data, shape) = reader.get_f32_tensor_owned(&name)?;
+    let tensors = fetch_expected_tensors(&mut reader, expected_names, vision_cfg)?;
+    assemble(tensors, vision_cfg)
+}
+
+/// Fetch every name in `names` from `source`, checking each one's header-declared shape
+/// against `expected_visual_tensor_shape` before materializing it -- mirroring the
+/// Qwen3.5 text-decoder loader's `load_owned_tensor_checked`. A shape mismatch is
+/// rejected here instead of after a full owned read and allocation. Generic over
+/// `TensorSource` (rather than inlined into `load_from_fp16_dir`) so tests can exercise
+/// the preflight-before-materialize ordering with a mock source.
+fn fetch_expected_tensors<T: TensorSource + ?Sized>(
+    source: &mut T,
+    names: Vec<String>,
+    vision_cfg: &VisionModelConfig,
+) -> Result<NamedTensors, InferenceError> {
+    let mut tensors = HashMap::with_capacity(names.len());
+    for name in names {
+        if let Some(expected) = expected_visual_tensor_shape(&name, vision_cfg)
+            && let Some(declared) = source.tensor_shape(&name)?
+            && declared != expected
+        {
+            return Err(InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual: declared,
+            });
+        }
+        let (data, shape) = source.get_f32_tensor_owned(&name)?;
         tensors.insert(name, (data, shape));
     }
-    assemble(tensors, vision_cfg)
+    Ok(tensors)
 }
 
 fn load_from_q4_dir(
@@ -241,7 +322,25 @@ fn load_from_q4_dir(
                 entry.name,
             )));
         }
-        let file_path = model_dir.join(&entry.file);
+        // Config-shape preflight, mirroring what `fetch_expected_tensors` does for the
+        // fp16 path. The manifest's declared shape is compared against what `vision_cfg`
+        // implies BEFORE the tensor's file is opened, so a checkpoint that disagrees with
+        // the config is rejected without reading or allocating it. This sits ahead of the
+        // branch below because BOTH arms materialize: the q4 arm through
+        // `dequantize_q4_to_f32` and the f16 arm inside `load_f16_tensor_file`.
+        if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg)
+            && let Some(declared) = &entry.shape
+            && declared != &expected
+        {
+            return Err(InferenceError::ShapeMismatch {
+                name: entry.name.clone(),
+                expected,
+                actual: declared.clone(),
+            });
+        }
+        // Manifest-declared file names are untrusted checkpoint content;
+        // containment-check before reading (#1069).
+        let file_path = crate::weights::contained_shard_path(model_dir, &entry.file)?;
         let (data, shape) = if entry.quantized.unwrap_or(false) {
             let q4 = load_q4_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
@@ -262,8 +361,46 @@ fn load_from_q4_dir(
                     actual: manifest_shape.clone(),
                 });
             }
+            // `entry.shape` is optional, so when the manifest omits it the `.q4` header
+            // is the only declared shape that exists and the preflight above had nothing
+            // to check. Compare the header against the config here, while the tensor is
+            // still its compressed self and before `dequantize_q4_to_f32` allocates the
+            // full f32 buffer.
+            if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg)
+                && q4.shape != expected
+            {
+                return Err(InferenceError::ShapeMismatch {
+                    name: entry.name.clone(),
+                    expected,
+                    actual: q4.shape.clone(),
+                });
+            }
             let shape = q4.shape.clone();
             (dequantize_q4_to_f32(&q4), shape)
+        } else if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg) {
+            // Same reasoning as the `.q4` header check above, for the arm that reads an
+            // `.f16` companion: when the manifest omits `shape`, the preflight before
+            // `contained_shard_path` had nothing to compare, and this arm would otherwise
+            // materialize the whole tensor before `assemble` noticed the disagreement.
+            //
+            // The check and the payload read happen inside ONE open handle rather than
+            // here around two calls. Checking a shape through one open and materializing
+            // through a second leaves nothing binding the validated header to the bytes
+            // actually read, since the pathname can be replaced in between, and the
+            // checkpoint directory is untrusted input (see the containment check above).
+            let loaded = load_f16_tensor_file_expecting(&file_path, &expected);
+            loaded.map_err(|e| match e {
+                F16LoadError::ShapeMismatch { declared } => InferenceError::ShapeMismatch {
+                    name: entry.name.clone(),
+                    expected,
+                    actual: declared,
+                },
+                F16LoadError::Other(e) => InferenceError::InvalidSafetensors(format!(
+                    "failed to load f16 tensor {} from {}: {e}",
+                    entry.name,
+                    file_path.display()
+                )),
+            })?
         } else {
             load_f16_tensor_file(&file_path).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
@@ -481,8 +618,7 @@ mod tests {
     fn q4_full_inventory_with_depth_zero_is_rejected() {
         // A checkpoint that genuinely carries the full 153-tensor real inventory, paired
         // with a (malformed) vision_config claiming depth: 0, must error rather than
-        // silently returning a nine-tensor `Qwen35VisionWeights` (the S1/S2 review's
-        // exact failure scenario).
+        // silently returning a nine-tensor `Qwen35VisionWeights`.
         let tmp = tempfile::tempdir().unwrap();
         let full_cfg = real_vision_cfg();
         let entries: Vec<String> = tensor_names(&full_cfg)
@@ -575,6 +711,83 @@ mod tests {
             v.push((format!("model.visual.blocks.0.{suffix}"), shape));
         }
         v
+    }
+
+    /// A [`TensorSource`] that records every name passed to `get_f32_tensor_owned`, so a
+    /// test can assert a specific tensor's shape mismatch is caught from the
+    /// header-declared shape without that tensor's data ever being copied (other,
+    /// correctly-shaped tensors ahead of it in iteration order are still fetched
+    /// normally).
+    struct CountingSource {
+        tensors: HashMap<String, (Vec<f32>, Vec<usize>)>,
+        materialized: std::cell::RefCell<std::collections::HashSet<String>>,
+    }
+
+    impl TensorSource for CountingSource {
+        fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+            Ok(self.tensors.contains_key(name))
+        }
+        fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, s)| s.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.materialized.borrow_mut().insert(name.to_string());
+            self.tensors
+                .get(name)
+                .map(|(d, s)| (d.clone(), s.clone()))
+                .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
+    /// An undersized (but declared-shape-visible) block tensor must be rejected from
+    /// its header-declared shape, before `get_f32_tensor_owned` ever copies its data.
+    /// `assemble`'s own post-materialization check would also catch this shape
+    /// mismatch, so `expect_err` alone would not be mutation-sensitive to the
+    /// preflight; the "mutated name was never materialized" assertion is what pins the
+    /// preflight-before-materialize ordering specifically.
+    #[test]
+    fn fetch_expected_tensors_rejects_undersized_tensor_before_materialization() {
+        let cfg = tiny_vision_cfg();
+        let names = tensor_names(&cfg);
+        let mutated_name = "model.visual.blocks.0.mlp.linear_fc1.weight".to_string();
+        let hidden = cfg.hidden_size;
+
+        let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = tiny_expected_shapes()
+            .into_iter()
+            .map(|(name, shape)| {
+                let numel: usize = shape.iter().product();
+                (name, (vec![0.5f32; numel], shape))
+            })
+            .collect();
+        // Declared shape undersized relative to [4*hidden, hidden], data consistent
+        // with the (wrong) declared shape.
+        tensors.insert(
+            mutated_name.clone(),
+            (
+                vec![0.5f32; (4 * hidden - 1) * hidden],
+                vec![4 * hidden - 1, hidden],
+            ),
+        );
+        let mut source = CountingSource {
+            tensors,
+            materialized: std::cell::RefCell::new(std::collections::HashSet::new()),
+        };
+
+        let err = fetch_expected_tensors(&mut source, names, &cfg)
+            .expect_err("undersized fc1 weight must be rejected");
+        match err {
+            InferenceError::ShapeMismatch { name, .. } => {
+                assert_eq!(name, mutated_name, "error must name the mutated tensor");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+        assert!(
+            !source.materialized.borrow().contains(&mutated_name),
+            "the mismatched tensor's data must never be copied"
+        );
     }
 
     /// Corrupt the FC2 weight entry in `shapes` to a same-numel transposition
@@ -694,6 +907,116 @@ mod tests {
         assert_fc2_shape_mismatch(load_qwen35_vision_weights(tmp.path(), &cfg));
     }
 
+    /// #1069: quantize_index.json file entries are untrusted checkpoint
+    /// content; an entry escaping the model directory must be rejected
+    /// before its file is read.
+    #[test]
+    fn q4_manifest_entry_escaping_model_dir_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        std::fs::create_dir_all(&model_dir).expect("test setup");
+        // A structurally valid q4 file OUTSIDE the model dir — containment,
+        // not file validity, must be what rejects the entry.
+        let data = vec![0.25_f64; 4];
+        let q4 = crate::weights::q4_weights::quantize_f64_to_q4(&data, &[2, 2])
+            .expect("quantize succeeds");
+        crate::weights::q4_weights::save_q4_file(&tmp.path().join("evil.q4"), &q4)
+            .expect("test setup: write q4 file");
+        std::fs::write(
+            model_dir.join("quantize_index.json"),
+            r#"[{"name":"model.visual.evil","file":"../evil.q4","quantized":true}]"#,
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(&model_dir, &tiny_vision_cfg())
+            .expect_err("escaping manifest entry must be rejected");
+        assert!(
+            err.to_string()
+                .contains("must stay within the model directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The manifest's declared shape must be checked against `vision_cfg` BEFORE the
+    /// tensor's file is opened, matching what `fetch_expected_tensors` does on the fp16
+    /// path.
+    ///
+    /// Pointing the entry at a file that does not exist is what makes this
+    /// mutation-sensitive. With the preflight the loader never gets that far and returns
+    /// ShapeMismatch; without it the loader tries to read `missing.q4` and reports a read
+    /// failure instead. Asserting merely that *some* error came back would pass either
+    /// way and guard nothing.
+    #[test]
+    fn q4_manifest_shape_disagreeing_with_config_is_rejected_before_the_file_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"model.visual.patch_embed.proj.bias","file":"missing.q4","quantized":true,"shape":[9999]}]"#,
+        )
+        .expect("test setup: write manifest");
+        assert!(
+            !tmp.path().join("missing.q4").exists(),
+            "test setup: the tensor file must NOT exist, that absence is the assertion"
+        );
+
+        let err = load_qwen35_vision_weights(tmp.path(), &tiny_vision_cfg())
+            .expect_err("a manifest shape contradicting vision_cfg must be rejected");
+        match err {
+            InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(name, "model.visual.patch_embed.proj.bias");
+                assert_eq!(expected, vec![4]);
+                assert_eq!(actual, vec![9999]);
+            }
+            other => panic!("expected ShapeMismatch before any file read, got: {other}"),
+        }
+    }
+
+    /// When the manifest omits `shape`, the `.q4` header carries the only declared shape
+    /// there is and the manifest-level preflight has nothing to compare. The header must
+    /// then be checked against `vision_cfg` before `dequantize_q4_to_f32` allocates the
+    /// full f32 buffer.
+    ///
+    /// Mutation-sensitivity needs care here, and it is exactly the trap the fp16-path
+    /// test author already called out: `assemble` rejects a contradictory shape too, so
+    /// `expect_err` alone still passes with the fix reverted. The discriminator is WHICH
+    /// error comes back. This manifest carries exactly one tensor and it is deliberately
+    /// not the one `assemble` takes first, so with the header check removed the loader
+    /// dequantizes happily and then dies on MissingTensor for `patch_embed.proj.weight`,
+    /// a different error about a different tensor.
+    #[test]
+    fn q4_header_shape_disagreeing_with_config_is_rejected_before_dequantization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = vec![0.25_f64; 64];
+        let q4 = crate::weights::q4_weights::quantize_f64_to_q4(&data, &[64])
+            .expect("quantize succeeds");
+        crate::weights::q4_weights::save_q4_file(&tmp.path().join("t0.q4"), &q4)
+            .expect("test setup: write q4 file");
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"model.visual.patch_embed.proj.bias","file":"t0.q4","quantized":true}]"#,
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &tiny_vision_cfg())
+            .expect_err("a q4 header shape contradicting vision_cfg must be rejected");
+        match err {
+            InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(name, "model.visual.patch_embed.proj.bias");
+                assert_eq!(expected, vec![4]);
+                assert_eq!(actual, vec![64]);
+            }
+            other => panic!("expected ShapeMismatch before dequantization, got: {other}"),
+        }
+    }
+
     fn write_khf1_f16_file(path: &Path, shape: &[usize], values: &[f32]) {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"KHF1");
@@ -733,6 +1056,84 @@ mod tests {
         .expect("test setup: write manifest");
 
         assert_fc2_shape_mismatch(load_qwen35_vision_weights(tmp.path(), &cfg));
+    }
+
+    /// The `.f16` companion arm needs its own header check, and this is the case that
+    /// proves it: a non-quantized entry whose manifest omits `shape` skips the preflight
+    /// before `contained_shard_path` (there is no declared shape to compare) and does not
+    /// reach the `.q4` header check (that arm is not taken). Without a header check here
+    /// the tensor is fully read and converted before `assemble` notices.
+    ///
+    /// The single manifest entry is the bias rather than `patch_embed.proj.weight`, so
+    /// without the guard the loader gets far enough for `assemble` to report the absent
+    /// weight as `MissingTensor`. That makes the assertion below discriminating: it can
+    /// only pass if the header was checked before materialization, not merely because
+    /// loading failed somewhere.
+    #[test]
+    fn f16_header_shape_disagreeing_with_config_is_rejected_before_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_khf1_f16_file(&tmp.path().join("t0.f16"), &[64], &vec![0.5f32; 64]);
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"model.visual.patch_embed.proj.bias","file":"t0.f16","quantized":false}]"#,
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &tiny_vision_cfg())
+            .expect_err("an f16 header shape contradicting vision_cfg must be rejected");
+        match err {
+            InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(name, "model.visual.patch_embed.proj.bias");
+                assert_eq!(expected, vec![4]);
+                assert_eq!(actual, vec![64]);
+            }
+            other => panic!("expected ShapeMismatch before materialization, got: {other}"),
+        }
+    }
+
+    /// Proves the shape comparison happens BEFORE the payload is read, rather than merely
+    /// before `assemble`.
+    ///
+    /// The fixture's header declares 64 elements but the file carries no payload bytes at
+    /// all. If the loader read the payload first it would fail on the truncated read and
+    /// surface `InvalidSafetensors`; only a loader that compares the header against the
+    /// expected shape first can return `ShapeMismatch` for this input. The two outcomes
+    /// are therefore distinguishable, which is the whole point of the fixture.
+    ///
+    /// What this does not prove is the same-handle property. That the header and payload
+    /// come from one open cannot be shown without a filesystem seam to swap the file
+    /// mid-load; it is structural, held by `load_f16_tensor_file_expecting` performing a
+    /// single open, and this test would still pass if that were split back into two.
+    #[test]
+    fn f16_shape_is_compared_before_the_payload_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"KHF1");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&64u64.to_le_bytes());
+        buf.extend_from_slice(&64u64.to_le_bytes());
+        // Deliberately no payload: 64 declared elements, zero bytes of data.
+        std::fs::write(tmp.path().join("t0.f16"), &buf).expect("test setup: write f16 header");
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"[{"name":"model.visual.patch_embed.proj.bias","file":"t0.f16","quantized":false}]"#,
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &tiny_vision_cfg())
+            .expect_err("a header disagreeing with vision_cfg must be rejected");
+        match err {
+            InferenceError::ShapeMismatch { actual, .. } => assert_eq!(actual, vec![64]),
+            other => panic!(
+                "expected ShapeMismatch from the header check, which proves the payload \
+                 read was never attempted; got: {other}"
+            ),
+        }
     }
 
     #[test]

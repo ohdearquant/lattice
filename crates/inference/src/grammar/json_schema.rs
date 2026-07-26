@@ -31,7 +31,7 @@
 
 use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Maximum array cardinality (`minItems` / `maxItems`) the compiler will
 /// materialize.
@@ -96,6 +96,28 @@ const MAX_PREFIX_ITEMS: usize = 4096;
 
 // DoS bound: cap the number of anyOf/oneOf branches a single schema node may declare (issue #474).
 const MAX_ANYOF_BRANCHES: usize = 4096;
+
+/// Keys alongside `$ref` that `compile_ref_with_siblings` (issue #1078) never
+/// treats as an assertion needing conjunction or rejection: `$ref` itself;
+/// `$defs`/`definitions`, the document's own definitions container (a schema
+/// with a root-level `$ref` commonly carries `$defs` in the very same object,
+/// see `deep_ref_chain_rejected` in `engine.rs`); and the rest, pure
+/// annotations with no grammar meaning.
+const REF_IGNORED_SIBLING_KEYS: &[&str] = &[
+    "$ref",
+    "$defs",
+    "definitions",
+    "$id",
+    "$schema",
+    "$comment",
+    "title",
+    "description",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
 
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
@@ -461,9 +483,9 @@ impl<'a> CompileCtx<'a> {
         schema: &'a Value,
         _path: &[&str],
     ) -> Result<Vec<Alt>, SchemaError> {
-        // Handle `$ref`
+        // Handle `$ref` (and any `required`/`properties` siblings — issue #1078).
         if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
-            return self.compile_ref(ref_str);
+            return self.compile_ref_with_siblings(ref_str, schema);
         }
 
         // Handle `enum`
@@ -491,12 +513,22 @@ impl<'a> CompileCtx<'a> {
         // reject at MAX_SCHEMA_DEPTH before the native stack overflows. Folding
         // the anyOf locals in here regressed that headroom (a 2000-link chain
         // overflowed instead of returning the depth error).
-        if let Some(any_of) = schema
-            .get("anyOf")
-            .or_else(|| schema.get("oneOf"))
-            .and_then(Value::as_array)
-        {
+        if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
             return self.compile_any_of(any_of, _path);
+        }
+        if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+            // `oneOf` requires mutual exclusivity (exactly one branch matches);
+            // `compile_any_of` only enforces "at least one" (issue #1077). Full
+            // exclusivity would need the no-rewind PDA to track which branch(es)
+            // a completed value matches, which this single-stack byte matcher
+            // cannot do (same class of limitation as the shared-prefix
+            // over-rejection documented in pda.rs). Rather than ship a partial
+            // runtime tracker that would sometimes over-reject valid input,
+            // catch the one case that IS cheaply and soundly decidable at
+            // compile time: branches that reduce to a closed literal value set
+            // (`const`/`enum`). See `check_one_of_exclusivity`.
+            check_one_of_exclusivity(one_of)?;
+            return self.compile_any_of(one_of, _path);
         }
 
         // Dispatch on `type`
@@ -537,6 +569,324 @@ impl<'a> CompileCtx<'a> {
                 // No type: treat as any JSON value.
                 Ok(self.any_value_alts())
             }
+        }
+    }
+
+    /// Compile a `$ref`, applying `required`/`properties` siblings on the same
+    /// schema object as a conjunction with the resolved target instead of
+    /// dropping them (issue #1078). This compiler targets JSON Schema draft
+    /// 2020-12 (see the module doc and `spec.rs`), under which `$ref` is an
+    /// ordinary applicator: sibling keywords apply IN ADDITION to the
+    /// reference, not instead of it (draft-07's replace-the-object semantics do
+    /// not apply here).
+    ///
+    /// Scope: only `required`/`properties` siblings on a `$ref` to an
+    /// object-typed target are merged — the common "extend a base object"
+    /// pattern, and exactly what issue #1078's regression test exercises.
+    /// Anything else (a non-object target, or any other sibling keyword such
+    /// as `enum`/`const`/`type`/`pattern`) falls through to the plain `$ref`
+    /// compile unchanged: those already have a separate, narrower, DELIBERATE
+    /// partial-narrowing treatment when reached through an `anyOf`/`oneOf`
+    /// branch (see `ref_string_contribution`, issue #473), which this fix must
+    /// not disturb, and a general `allOf`-style intersection of arbitrary
+    /// schemas is out of scope here.
+    ///
+    /// Kept deliberately tiny (only the sibling-key scan, no merge locals) and
+    /// out of the merge body (`merge_ref_with_siblings`, `#[inline(never)]`):
+    /// `compile_schema` re-enters this dispatch once per `$ref` chain link, so
+    /// this function's own stack frame size is multiplied by the chain depth
+    /// before `MAX_SCHEMA_DEPTH` rejects it (issue #343). The plain,
+    /// no-siblings `$ref` — the overwhelmingly common case, including every
+    /// link of a long reference chain — must stay as cheap as it was before
+    /// this fix. A regression test (`deep_ref_chain_rejected` in
+    /// `engine.rs`) exercises a 2000-link chain specifically to catch this: an
+    /// earlier version of this fix folded the merge locals into this
+    /// function directly and overflowed the test-thread stack at native
+    /// recursion depth ~512, well before `MAX_SCHEMA_DEPTH` had a chance to
+    /// return its clean rejection.
+    fn compile_ref_with_siblings(
+        &mut self,
+        ref_str: &str,
+        schema: &'a Value,
+    ) -> Result<Vec<Alt>, SchemaError> {
+        let mergeable = schema.as_object().is_some_and(|m| {
+            let mut saw_sibling = false;
+            for k in m.keys() {
+                let k = k.as_str();
+                // `$ref` itself, the document-structure keywords a schema
+                // commonly carries alongside a root-level `$ref` (`$defs`,
+                // `definitions`), and pure annotations carry no grammar
+                // meaning and must not block the merge or be treated as an
+                // unsupported assertion.
+                if REF_IGNORED_SIBLING_KEYS.contains(&k) {
+                    continue;
+                }
+                if k != "required" && k != "properties" {
+                    return false;
+                }
+                saw_sibling = true;
+            }
+            saw_sibling
+        });
+        if !mergeable {
+            return self.compile_ref(ref_str);
+        }
+        self.merge_ref_with_siblings(ref_str, schema)
+    }
+
+    /// The actual `required`/`properties` conjunction merge for
+    /// [`Self::compile_ref_with_siblings`], split out (and `#[inline(never)]`)
+    /// so its locals do not enlarge that function's per-recursion stack frame
+    /// — see the doc comment there.
+    #[inline(never)]
+    fn merge_ref_with_siblings(
+        &mut self,
+        ref_str: &str,
+        schema: &'a Value,
+    ) -> Result<Vec<Alt>, SchemaError> {
+        let target: &'a Value = self.resolve_ref_chain_target(ref_str)?;
+
+        let target_type = target.get("type").and_then(Value::as_str);
+
+        if let Some(t) = target_type
+            && t != "object"
+        {
+            // `required` and `properties` constrain object instances only, so
+            // against a target pinned to some other type they are vacuous:
+            // dropping them cannot widen the language. Compile the target
+            // alone.
+            //
+            // This is deliberately keyed on an EXPLICIT non-object `type`, not
+            // on the absence of `"object"`. A target with no `type` (or a
+            // `type` array) still matches object instances, so its siblings are
+            // NOT vacuous — that case falls through to the representability
+            // check below and is rejected rather than silently dropped.
+            return self.compile_ref(ref_str);
+        }
+
+        // The merge reconstructs the target from `properties`/`required` alone
+        // (the `compile_object_fields` call that ends this function), so it is
+        // only faithful when those are the only assertions the target carries.
+        // A target that also constrains itself comes back WIDER than it went
+        // in, because `compile_schema_inner` dispatches `enum`/`const` ahead of
+        // object compilation and returns immediately: the plain `$ref` path
+        // compiles
+        // `{"type":"object","enum":[{"x":1}],"properties":{"x":{"type":"integer"}}}`
+        // to exactly `{"x":1}`, while a merge that sees only the property and
+        // the required key admits `{"x":2}`. Dropping a sibling over-accepts by
+        // one keyword; discarding a target assertion over-accepts by the whole
+        // referenced schema, so this falls back to the plain path rather than
+        // merging.
+        //
+        // Positive allowlist, not a denylist of known assertions: a keyword the
+        // compiler gains later then lands in the safe path by default instead of
+        // being silently discarded by a merge that has never heard of it.
+        // `$ref` is deliberately NOT allowed here even though it is an ignorable
+        // *sibling* — on the target it means an indirection
+        // `resolve_ref_chain_target` declined to follow, and compiling the
+        // target's properties while ignoring it would widen in the same way.
+        let target_is_representable = target.as_object().is_some_and(|m| {
+            m.keys().all(|k| {
+                let k = k.as_str();
+                (k != "$ref" && REF_IGNORED_SIBLING_KEYS.contains(&k))
+                    || k == "type"
+                    || k == "properties"
+                    || k == "required"
+            })
+        });
+        if !target_is_representable || target_type != Some("object") {
+            // Falling back to the plain `$ref` path here is NOT safe, and the
+            // tempting argument for it is subtly wrong in a way worth naming.
+            //
+            // That argument runs: for a target carrying `enum`/`const` — which
+            // `compile_schema_inner` dispatches ahead of object compilation —
+            // the plain path compiles the target's own narrow language, so
+            // dropping the sibling cannot widen past the referenced schema.
+            // Every step is true and the conclusion still does not follow. The
+            // schema's language is the CONJUNCTION of target and siblings,
+            // which is narrower than the target alone; "no wider than the
+            // target" is therefore not the bound that matters. With
+            // `$defs.Base = {"type":"object","enum":[{},{"x":1}]}` and a
+            // `required: ["x"]` sibling, the schema admits only `{"x":1}`,
+            // while the target alone also admits `{}`.
+            //
+            // For a keyword this compiler does not support at all
+            // (`additionalProperties`, `minProperties`, `patternProperties`,
+            // ...) the plain path is worse still: it IGNORES the keyword, so
+            // the fallback keeps nothing from the target AND drops the
+            // sibling. An untyped target is the same shape once more — it
+            // compiles to "any JSON value", which admits every object the
+            // siblings exist to exclude.
+            //
+            // So every non-representable target is rejected, with no carve
+            // out. A constrained-decoding grammar that accepts strings the
+            // schema forbids fails at the caller's parser, after the tokens
+            // are spent; a schema this compiler declines to compile fails
+            // here, loudly, at compile time. Filtering a finite `enum` by the
+            // siblings would be a real conjunction and is the natural way to
+            // lift this, but it needs instance validation this compiler does
+            // not have, so it is deliberately left undone rather than
+            // approximated.
+            return Err(SchemaError(format!(
+                "`$ref` to {ref_str} carries `required`/`properties` siblings that must \
+                 be applied as a conjunction, but the target is not expressible as one: \
+                 it is {}. Inline the intersection at the reference site.",
+                match target_type {
+                    Some("object") =>
+                        "an object carrying assertions beyond \
+                                       `properties`/`required` that this compiler cannot \
+                                       reproduce",
+                    Some(_) => unreachable!("explicit non-object types returned above"),
+                    None =>
+                        "untyped, so it also matches instances the siblings cannot \
+                             constrain",
+                }
+            )));
+        }
+
+        // Merge `properties`. A key declared on both sides must satisfy BOTH
+        // schemas — draft 2020-12 applies `$ref` siblings as an intersection,
+        // not as a JSON Merge Patch where the closer declaration wins. Only
+        // intersections this compiler can represent by reusing one of the two
+        // operand schemas are merged; anything else is an explicit error
+        // rather than a silent widening to whichever side was picked.
+        let target_props = target.get("properties").and_then(Value::as_object);
+        let mut merged_props: Vec<(&'a String, &'a Value)> = Vec::new();
+        let mut seen_keys: HashSet<&str> = HashSet::new();
+        if let Some(m) = schema.get("properties").and_then(Value::as_object) {
+            for (k, v) in m {
+                let effective = match target_props.and_then(|t| t.get(k.as_str())) {
+                    Some(t) => intersect_property_schemas(k, v, t)?,
+                    None => v,
+                };
+                seen_keys.insert(k.as_str());
+                merged_props.push((k, effective));
+            }
+        }
+        if let Some(m) = target_props {
+            for (k, v) in m {
+                if seen_keys.insert(k.as_str()) {
+                    merged_props.push((k, v));
+                }
+            }
+        }
+        if merged_props.len() > MAX_OBJECT_PROPERTIES {
+            return Err(SchemaError(format!(
+                "object property count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                merged_props.len()
+            )));
+        }
+        let properties = if merged_props.is_empty() {
+            None
+        } else {
+            Some(merged_props)
+        };
+
+        // Merge `required`: union, deduplicated, sibling first.
+        let mut required: Vec<&str> = Vec::new();
+        let mut seen_req: HashSet<&str> = HashSet::new();
+        for arr in [
+            schema.get("required").and_then(Value::as_array),
+            target.get("required").and_then(Value::as_array),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if arr.len() > MAX_OBJECT_PROPERTIES {
+                return Err(SchemaError(format!(
+                    "object required count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                    arr.len()
+                )));
+            }
+            for v in arr {
+                if let Some(s) = v.as_str()
+                    && seen_req.insert(s)
+                {
+                    required.push(s);
+                    if required.len() > MAX_OBJECT_PROPERTIES {
+                        return Err(SchemaError(format!(
+                            "object required count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                            required.len()
+                        )));
+                    }
+                }
+            }
+        }
+
+        // `compile_object_fields` only consults `required` while iterating the
+        // properties it was given, so a required name that neither side
+        // DECLARES produces no pair rule and imposes no requirement — the
+        // grammar comes back accepting an object without it. That limitation
+        // is older than this function and is reachable without any `$ref` at
+        // all (`{"type":"object","required":["y"]}` compiles to the
+        // empty-object grammar on the merge base too, measured, not inferred),
+        // so fixing it belongs with `compile_object_fields` and its direct
+        // caller rather than here.
+        //
+        // What does belong here is not routing a caller into it. Merging is
+        // this function's choice, and it is only worth making when the result
+        // is faithful; when a merged `required` name has no declaration to
+        // attach to, the merge cannot express the conjunction it exists to
+        // express. Reject, consistent with every other unrepresentable case
+        // above, rather than returning a grammar that silently drops the key.
+        if let Some(name) = required.iter().copied().find(|name| {
+            !properties
+                .as_ref()
+                .is_some_and(|p| p.iter().any(|(k, _)| k.as_str() == *name))
+        }) {
+            return Err(SchemaError(format!(
+                "`$ref` to {ref_str} carries a `required` entry `{name}` that neither the \
+                 reference site nor the target declares in `properties`; this compiler \
+                 represents a required key through its property declaration, so the \
+                 conjunction cannot be expressed. Declare `{name}` in `properties`."
+            )));
+        }
+
+        self.compile_object_fields(properties, required)
+    }
+
+    /// Resolve `ref_str` through any chain of pure `$ref` indirections to the
+    /// definition that actually carries the schema, for the sibling merge in
+    /// [`Self::merge_ref_with_siblings`].
+    ///
+    /// Stopping at the first link instead would look at `{"$ref": ...}`, find
+    /// no `"type": "object"`, and fall through to the plain `compile_ref` —
+    /// which resolves the same chain but drops the caller's `required` /
+    /// `properties` siblings on the way, so the compiled grammar would accept
+    /// documents the sibling forbids.
+    ///
+    /// A chain link that carries any keyword of its own beyond `$ref` and the
+    /// annotation/document-structure keys is an explicit unsupported-schema
+    /// error: merging the caller's siblings onto the resolved target would
+    /// discard that link's own assertions, which is the same silent widening
+    /// this resolution exists to prevent. The visited set bounds the walk, so a
+    /// cyclic chain reports the cycle instead of looping.
+    fn resolve_ref_chain_target(&self, ref_str: &str) -> Result<&'a Value, SchemaError> {
+        let mut current = ref_str;
+        let mut visited: HashSet<&str> = HashSet::new();
+        loop {
+            let name = extract_ref_name(current)?;
+            let target: &'a Value = self
+                .defs
+                .get(name)
+                .copied()
+                .ok_or_else(|| SchemaError(format!("$ref not found: {current}")))?;
+            let Some(next) = target.get("$ref").and_then(Value::as_str) else {
+                return Ok(target);
+            };
+            if !visited.insert(name) {
+                return Err(SchemaError(format!("$ref chain cycles through {current}")));
+            }
+            if let Some(m) = target.as_object() {
+                for k in m.keys() {
+                    if !REF_IGNORED_SIBLING_KEYS.contains(&k.as_str()) {
+                        return Err(SchemaError(format!(
+                            "unsupported schema: $ref chain link {current} carries keyword `{k}` alongside `$ref`, which cannot be merged with the referring schema's siblings"
+                        )));
+                    }
+                }
+            }
+            current = next;
         }
     }
 
@@ -667,6 +1017,20 @@ impl<'a> CompileCtx<'a> {
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
             .unwrap_or_default();
 
+        self.compile_object_fields(properties, required)
+    }
+
+    /// Compile an object schema from already-extracted `properties`/`required`,
+    /// shared by [`Self::compile_object`] and the `$ref`+sibling merge in
+    /// [`Self::compile_ref_with_siblings`] (issue #1078), which must combine a
+    /// `$ref` target's fields with a sibling's before compiling — the two
+    /// sources live in different `&'a Value` documents, so the merge happens on
+    /// these already-borrowed collections rather than on a synthesized `Value`.
+    fn compile_object_fields(
+        &mut self,
+        properties: Option<Vec<(&'a String, &'a Value)>>,
+        required: Vec<&'a str>,
+    ) -> Result<Vec<Alt>, SchemaError> {
         let ws_id = self.builder.rule_id("ws").unwrap();
         match properties {
             None => {
@@ -2380,6 +2744,172 @@ fn flatten_any_of_branches<'v>(
     Ok(())
 }
 
+/// The exact JSON values a branch is restricted to, if (and only if) that set
+/// is closed-form and enumerable from the schema alone — a `const` (one
+/// value) or an `enum` (a fixed list). Any other shape (a bare `type`, an
+/// object/array schema, an unresolved `$ref`, ...) can admit an open-ended set
+/// of values, so this returns `None` rather than guess: overlap between two
+/// `None` branches is exactly the case #1077 leaves undetected and documented,
+/// and it must stay silent rather than produce a false positive.
+/// The set is the CONJUNCTION of every assertion in the branch, not the
+/// `const`/`enum` alone: a branch also asserting `"type"` matches only the
+/// literals of that type, and a branch whose assertions contradict each other
+/// (`{"const": "a", "type": "integer"}`) matches nothing at all and returns the
+/// empty set. Reporting the bare literal there would let the overlap check
+/// reject a `oneOf` whose branches are in fact mutually exclusive. A branch
+/// carrying an assertion this function cannot intersect returns `None` and is
+/// skipped for the same reason: an unanalysed assertion may exclude the
+/// literal, so claiming the branch matches it would manufacture an overlap.
+fn closed_form_values(schema: &Value) -> Option<Vec<Value>> {
+    let mut values: Vec<Value> = if let Some(v) = schema.get("const") {
+        vec![v.clone()]
+    } else if let Some(a) = schema.get("enum").and_then(Value::as_array) {
+        a.clone()
+    } else {
+        return None;
+    };
+
+    for k in schema.as_object()?.keys() {
+        let k = k.as_str();
+        if k == "const" || k == "enum" || k == "type" || REF_IGNORED_SIBLING_KEYS.contains(&k) {
+            continue;
+        }
+        return None;
+    }
+
+    // `const` alongside `enum`: the value must satisfy both.
+    if schema.get("const").is_some()
+        && let Some(enum_values) = schema.get("enum").and_then(Value::as_array)
+    {
+        values.retain(|v| enum_values.contains(v));
+    }
+
+    match schema.get("type") {
+        None => {}
+        Some(Value::String(t)) => values.retain(|v| value_matches_type(v, t)),
+        Some(Value::Array(ts)) => values.retain(|v| {
+            ts.iter()
+                .any(|t| t.as_str().is_some_and(|t| value_matches_type(v, t)))
+        }),
+        Some(_) => return None,
+    }
+
+    Some(values)
+}
+
+/// Whether `v` is an instance of the JSON Schema primitive type named `t`.
+/// An unrecognized type name matches nothing: the compiler rejects it as an
+/// unsupported type on the normal path, and reporting no match here only ever
+/// removes a literal from the overlap check.
+fn value_matches_type(v: &Value, t: &str) -> bool {
+    match t {
+        "string" => v.is_string(),
+        "integer" => v.as_i64().is_some() || v.as_u64().is_some(),
+        "number" => v.is_number(),
+        "boolean" => v.is_boolean(),
+        "null" => v.is_null(),
+        "object" => v.is_object(),
+        "array" => v.is_array(),
+        _ => false,
+    }
+}
+
+/// Reject a `oneOf` whose branches provably overlap on a literal value (issue
+/// #1077). Only branches that reduce to a closed `const`/`enum` value set are
+/// decidable here. An open-ended branch (`closed_form_values` returns `None`)
+/// contributes nothing and is skipped, while the branches around it are still
+/// checked against each other. Skipping rather than abandoning the whole check
+/// at the first such branch is what keeps the outcome independent of where an
+/// open-ended branch sits: `oneOf`'s branches are an unordered set, so the same
+/// schema written in a different order has to compile the same way.
+///
+/// Rejecting on a shared literal is sound whatever the other branches admit —
+/// that value matches more than one branch, which is precisely what `oneOf`
+/// forbids. The converse does not hold: compiling is not a claim that
+/// exclusivity is enforced. Overlap between two open-ended branches stays
+/// undetected, which is the limitation #1077 leaves standing: a `oneOf` mixing
+/// an `object` branch with a `const` branch compiles exactly as `anyOf` does
+/// today, per the module doc's known-limitations section.
+///
+/// Bounded against the same DoS class as `flatten_any_of_branches`
+/// (issue #474): branch count is capped at `MAX_ANYOF_BRANCHES` and the
+/// cumulative literal count at `MAX_STRING_LITERALS`, both by skipping the
+/// check (not erroring) once exceeded — the pre-existing `compile_any_of`
+/// guards still reject an oversized schema on the normal path.
+fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaError> {
+    if branches.len() > MAX_ANYOF_BRANCHES {
+        return Ok(());
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    for (i, b) in branches.iter().enumerate() {
+        let Some(values) = closed_form_values(b) else {
+            continue;
+        };
+        if seen.len().saturating_add(values.len()) > MAX_STRING_LITERALS {
+            return Ok(());
+        }
+        // A branch's own values join `seen` only once the whole branch has
+        // been measured against it. A value repeated inside ONE branch
+        // (`{"enum":["a","a"]}`, which draft 2020-12 permits — `enum` members
+        // SHOULD be unique, not MUST) does not give an instance a second
+        // matching branch, so folding the branch in value-by-value would make
+        // it collide with itself and report an earlier branch that need not
+        // exist.
+        let mut branch_keys: Vec<String> = Vec::with_capacity(values.len());
+        for v in &values {
+            let key = overlap_key(v)?;
+            if seen.contains(&key) {
+                return Err(SchemaError(format!(
+                    "oneOf branch {i} overlaps an earlier branch on literal value {v}: oneOf requires mutually exclusive branches"
+                )));
+            }
+            branch_keys.push(key);
+        }
+        seen.extend(branch_keys);
+    }
+    Ok(())
+}
+
+/// The key on which two `oneOf` branches' literals are held to collide.
+///
+/// JSON Schema compares instances by value, and numbers are arbitrary-precision
+/// decimals compared by mathematical value, so `1` and `1.0` are the SAME
+/// instance. `serde_json`'s rendering preserves the spelling a number was
+/// written with (`"1"` against `"1.0"`), which would let those two branches
+/// pass as distinct. A number whose mathematical value is an integer inside
+/// `i64` range is therefore keyed by that integer.
+///
+/// Deliberately NOT canonicalized through `f64`: past 2^53 distinct integers
+/// share a single `f64`, and a collision here reports an overlap between
+/// branches that are in fact exclusive — rejecting a correct schema. That is
+/// the worse direction of error, so the conversion is applied only where it is
+/// exact and every other value falls back to its rendering, which at worst
+/// leaves an overlap undetected.
+fn overlap_key(v: &Value) -> Result<String, SchemaError> {
+    if let Value::Number(n) = v {
+        if let Some(i) = n.as_i64() {
+            return Ok(format!("n:{i}"));
+        }
+        if let Some(u) = n.as_u64() {
+            return Ok(format!("n:{u}"));
+        }
+        // `f as i64` saturates rather than wrapping, so the range test is what
+        // keeps two far-apart magnitudes off the same key. Both bounds are
+        // exactly representable, and every `f64` in the half-open range whose
+        // fractional part is zero converts to `i64` without loss.
+        if let Some(f) = n.as_f64()
+            && f.fract() == 0.0
+            && f >= -(2f64.powi(63))
+            && f < 2f64.powi(63)
+        {
+            return Ok(format!("n:{}", f as i64));
+        }
+    }
+    serde_json::to_string(v)
+        .map(|s| format!("j:{s}"))
+        .map_err(|e| SchemaError(format!("cannot JSON-encode oneOf literal: {e}")))
+}
+
 /// Fold `values` into the running `literals`/`byte_total` accumulators shared
 /// by every string-class-merging path in `compile_any_of` — a direct
 /// `StrClass::Literals` branch, a resolved `$ref` target (issue #473 shape
@@ -2542,6 +3072,39 @@ fn extract_ref_name(ref_str: &str) -> Result<&str, SchemaError> {
             "unsupported $ref format: {ref_str} (only #/$defs/Name supported)"
         ))),
     }
+}
+
+/// The schema a property named by BOTH a `$ref` target and that `$ref`'s
+/// `properties` sibling must satisfy: the intersection of the two, since
+/// draft 2020-12 applies the sibling in addition to the reference rather than
+/// in place of it.
+///
+/// This compiler has no `allOf` representation and `compile_object_fields`
+/// borrows property schemas out of the source document, so an intersection can
+/// only be honored when it IS one of the two operands: identical declarations,
+/// or one side being the empty schema `{}`, which admits every value and so
+/// contributes nothing. Every other collision is an explicit unsupported-schema
+/// error — picking a side would compile a language that accepts values the
+/// other side forbids, which for `{"type":"integer"}` against
+/// `{"type":"string"}` means accepting a value the schema admits for no type at
+/// all.
+fn intersect_property_schemas<'a>(
+    key: &str,
+    sibling: &'a Value,
+    target: &'a Value,
+) -> Result<&'a Value, SchemaError> {
+    if sibling == target {
+        return Ok(sibling);
+    }
+    if sibling.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(target);
+    }
+    if target.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(sibling);
+    }
+    Err(SchemaError(format!(
+        "unsupported schema: property `{key}` is declared by both a $ref target and its `properties` sibling, and the intersection of the two declarations is not representable in this grammar"
+    )))
 }
 
 /// Compile a JSON Schema document into a `CompiledGrammar`.
@@ -3662,6 +4225,203 @@ mod tests {
         );
     }
 
+    #[test]
+    fn oneof_overlapping_literal_branches_rejected() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": "a"},
+                {"enum": ["a", "b"]}
+            ]
+        });
+        let err = compile_json_schema(&schema)
+            .expect_err("oneOf branches overlapping on a literal value must be rejected");
+        assert!(
+            err.0.contains("oneOf"),
+            "error should name the oneOf violation, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn oneof_disjoint_literal_branches_still_compiles() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": "a"},
+                {"const": "b"}
+            ]
+        });
+        let g = compile_json_schema(&schema).unwrap();
+        assert!(accepts(&g, b"\"a\""));
+        assert!(accepts(&g, b"\"b\""));
+        assert!(rejects(&g, b"\"c\""));
+    }
+
+    /// `oneOf`'s branches are an unordered set, so an undecidable branch must
+    /// not hide an overlap that sits on the other side of it. The first two
+    /// orderings below are the discriminating ones: a check that abandoned the
+    /// whole schema at the first open-ended branch would compile them, and the
+    /// same three branches would then reject or compile depending only on the
+    /// order they were written in.
+    #[test]
+    fn oneof_literal_overlap_found_across_an_open_ended_branch() {
+        for branches in [
+            serde_json::json!([{"const": "a"}, {"type": "object"}, {"const": "a"}]),
+            serde_json::json!([{"type": "object"}, {"const": "a"}, {"const": "a"}]),
+            serde_json::json!([{"const": "a"}, {"const": "a"}, {"type": "object"}]),
+        ] {
+            let schema = serde_json::json!({ "oneOf": branches });
+            let err = compile_json_schema(&schema).expect_err(
+                "two branches overlapping on a literal must be rejected wherever the open-ended branch sits",
+            );
+            assert!(
+                err.0.contains("oneOf"),
+                "error should name the oneOf violation, got: {}",
+                err.0
+            );
+        }
+    }
+
+    /// A branch's literal is only the value it matches once the branch's other
+    /// assertions are taken into account. `{"const":"a","type":"integer"}`
+    /// asserts a value that is both the string `"a"` and an integer, which no
+    /// JSON value is, so the branch matches nothing and `"a"` matches exactly
+    /// one branch — a valid `oneOf`. Crediting the branch with its bare literal
+    /// manufactures an overlap and rejects a schema that is fine.
+    #[test]
+    fn oneof_contradictory_branch_does_not_manufacture_overlap() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": "a", "type": "integer"},
+                {"const": "a"}
+            ]
+        });
+        let g = compile_json_schema(&schema)
+            .expect("a branch matching no value cannot overlap another branch");
+        assert!(accepts(&g, b"\"a\""), "the reachable branch still matches");
+    }
+
+    /// The other half of the same rule: an assertion this compiler cannot
+    /// intersect (`minLength` here) may exclude the literal — `"a"` is one
+    /// character, so the branch matches nothing — and the branch must be
+    /// skipped rather than credited with a literal it may not match.
+    #[test]
+    fn oneof_branch_with_unanalysable_assertion_is_skipped() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": "a", "minLength": 5},
+                {"const": "a"}
+            ]
+        });
+        let g = compile_json_schema(&schema)
+            .expect("a branch carrying an un-intersectable assertion cannot prove an overlap");
+        assert!(accepts(&g, b"\"a\""), "the analysable branch still matches");
+    }
+
+    /// The same accounting must not go the other way: a `type` that is
+    /// CONSISTENT with the literal leaves the branch matching it, so a genuine
+    /// overlap is still found.
+    #[test]
+    fn oneof_overlap_still_found_when_type_is_consistent() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": "a", "type": "string"},
+                {"enum": ["a", "b"]}
+            ]
+        });
+        let err = compile_json_schema(&schema)
+            .expect_err("consistent type must leave the literal in the branch's value set");
+        assert!(
+            err.0.contains("oneOf"),
+            "error should name the oneOf violation, got: {}",
+            err.0
+        );
+    }
+
+    /// A repeated member inside ONE `enum` is not two branches. Draft 2020-12
+    /// says `enum` values SHOULD be unique, not MUST, and a duplicate member
+    /// does not give the instance a second branch to match, so this schema is
+    /// genuinely exclusive and must compile. Comparing a branch's raw value
+    /// list against the shared cross-branch set makes the branch collide with
+    /// ITSELF, which is both a false rejection and an error message naming an
+    /// "earlier branch" that does not exist for branch 0.
+    #[test]
+    fn oneof_duplicate_enum_member_within_one_branch_is_not_an_overlap() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"enum": ["a", "a"]},
+                {"const": "b"}
+            ]
+        });
+        let g = compile_json_schema(&schema)
+            .expect("a duplicate inside one enum does not give a value a second matching branch");
+        assert!(accepts(&g, b"\"a\""), "the duplicated member still matches");
+        assert!(accepts(&g, b"\"b\""), "the other branch still matches");
+    }
+
+    /// JSON Schema compares numbers by mathematical value, so `1` and `1.0`
+    /// are the SAME instance and these two branches both match it. Keying the
+    /// overlap set by lexical JSON rendering separates them (`"1"` vs `"1.0"`)
+    /// and lets an ambiguous `oneOf` compile.
+    #[test]
+    fn oneof_integer_and_float_spelling_of_one_value_overlap() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": 1},
+                {"const": 1.0}
+            ]
+        });
+        let err = compile_json_schema(&schema)
+            .expect_err("1 and 1.0 are the same number, so both branches match it");
+        assert!(
+            err.0.contains("oneOf"),
+            "error should name the oneOf violation, got: {}",
+            err.0
+        );
+    }
+
+    /// The other direction of the same keying rule, and the reason it must not
+    /// route through `f64`: these two integers are distinct but land on the
+    /// same `f64` past 2^53, so a lossy canonicalization would report a false
+    /// overlap and reject a schema whose branches really are exclusive.
+    /// Compiling at all is the assertion here.
+    #[test]
+    fn oneof_large_integers_indistinguishable_as_f64_stay_distinct() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": 9007199254740993i64},
+                {"const": 9007199254740992i64}
+            ]
+        });
+        let g = compile_json_schema(&schema)
+            .expect("integers differing past f64 precision are distinct values");
+        assert!(accepts(&g, b"9007199254740993"));
+    }
+
+    /// Exponent notation is a SPELLING, not a distinct value: `1e20` and
+    /// `100000000000000000000` are the same number, and JSON Schema compares
+    /// instances by mathematical value. Both exceed `u64::MAX`, so neither
+    /// takes `overlap_key`'s exact-integer path and both fall to the JSON
+    /// rendering — which, without `serde_json`'s `arbitrary_precision`
+    /// feature, has already parsed each to the same `f64` and therefore
+    /// renders them identically. The overlap is caught by that collapse rather
+    /// than in spite of it, so this pins the outcome against a future
+    /// `arbitrary_precision` bump, which would preserve the two spellings and
+    /// silently split the key.
+    #[test]
+    fn oneof_exponent_and_longhand_spelling_of_one_value_overlap() {
+        let schema: Value =
+            serde_json::from_str(r#"{"oneOf":[{"const":1e20},{"const":100000000000000000000}]}"#)
+                .expect("both literals are valid JSON numbers");
+        let err = compile_json_schema(&schema).expect_err(
+            "1e20 and 100000000000000000000 are the same number, so both branches match it",
+        );
+        assert!(
+            err.0.contains("oneOf"),
+            "error should name the oneOf violation, got: {}",
+            err.0
+        );
+    }
+
     /// A nested union with an EXTRA sibling key (`"description"`) is NOT a
     /// PURE nested union, so `flatten_any_of_branches` deliberately leaves it
     /// unflattened (`as_pure_nested_union` only recognizes an object whose
@@ -3983,6 +4743,369 @@ mod tests {
         let g = compile(&schema).unwrap();
         assert!(accepts(&g, b"{\"status\":\"ok\"}"));
         assert!(accepts(&g, b"{\"status\":\"err\"}"));
+    }
+
+    /// Issue #1078: a `required` sibling alongside `$ref` must be enforced as
+    /// a conjunction with the target, not silently dropped. `Base` declares
+    /// `y` as an OPTIONAL property; the sibling makes it required, so an
+    /// object omitting `y` must now be rejected even though `Base` alone would
+    /// have allowed it.
+    ///
+    /// Mutation guard: reverting `compile_schema_inner`'s `$ref` dispatch to
+    /// the plain early-return `self.compile_ref(ref_str)` (dropping the
+    /// sibling) makes `rejects(&g, b"{}")` false — `{}` would satisfy `Base`
+    /// alone — so this assertion fails.
+    #[test]
+    fn ref_required_sibling_is_enforced() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": { "y": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["y"]
+        });
+        let g = compile(&schema).unwrap();
+        assert!(
+            accepts(&g, b"{\"y\":1}"),
+            "y present must still be accepted"
+        );
+        assert!(
+            rejects(&g, b"{}"),
+            "required sibling on $ref must be enforced, not dropped"
+        );
+    }
+
+    /// A `$ref` whose target is itself a `$ref` reaches the object only
+    /// through the chain. Deciding the merge on the first link alone finds no
+    /// `"type": "object"` there and falls through to the plain `$ref` compile,
+    /// which resolves the rest of the chain but has already discarded the
+    /// `required` sibling — so `{}` would compile as acceptable.
+    #[test]
+    fn ref_chain_required_sibling_is_enforced() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "A": { "$ref": "#/$defs/B" },
+                "B": {
+                    "type": "object",
+                    "properties": { "y": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/A",
+            "required": ["y"]
+        });
+        let g = compile(&schema).unwrap();
+        assert!(
+            accepts(&g, b"{\"y\":1}"),
+            "y present must still be accepted through the chain"
+        );
+        assert!(
+            rejects(&g, b"{}"),
+            "required sibling must survive $ref chain resolution, not be dropped"
+        );
+    }
+
+    /// A chain link carrying assertions of its own cannot be merged with the
+    /// referring schema's siblings, and must say so instead of falling through
+    /// to the permissive plain-`$ref` path that drops those siblings.
+    #[test]
+    fn ref_chain_link_with_own_assertion_is_explicit_error() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "A": { "$ref": "#/$defs/B", "minProperties": 1 },
+                "B": {
+                    "type": "object",
+                    "properties": { "y": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/A",
+            "required": ["y"]
+        });
+        let Err(err) = compile(&schema) else {
+            panic!("unmergeable chain link must be an explicit error, not a compiled grammar")
+        };
+        assert!(
+            err.0.contains("minProperties"),
+            "error should name the unmergeable keyword, got: {}",
+            err.0
+        );
+    }
+
+    /// A cyclic chain of pure `$ref` links reports the cycle rather than
+    /// looping while resolving the merge target.
+    #[test]
+    fn ref_chain_cycle_is_reported() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "A": { "$ref": "#/$defs/B" },
+                "B": { "$ref": "#/$defs/A" }
+            },
+            "$ref": "#/$defs/A",
+            "required": ["y"]
+        });
+        let Err(err) = compile(&schema) else {
+            panic!("cyclic $ref chain must be reported, not compiled")
+        };
+        assert!(
+            err.0.contains("cycles"),
+            "error should name the cycle, got: {}",
+            err.0
+        );
+    }
+
+    /// Draft 2020-12 applies a `$ref` sibling as an intersection, so a
+    /// property declared on both sides must satisfy both schemas. An integer
+    /// and a string declaration share no value, so no document satisfies the
+    /// schema — compiling it to the sibling's `string` (merge-patch
+    /// precedence) accepts `{"x":"s"}`, which the schema admits for no value
+    /// of `x` at all.
+    #[test]
+    fn ref_sibling_property_collision_is_not_resolved_by_precedence() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": { "x": { "type": "integer" } },
+                    "required": ["x"]
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "properties": { "x": { "type": "string" } }
+        });
+        match compile(&schema) {
+            Err(e) => assert!(
+                e.0.contains("`x`"),
+                "error should name the colliding property, got: {}",
+                e.0
+            ),
+            Ok(g) => assert!(
+                rejects(&g, b"{\"x\":\"s\"}"),
+                "colliding property must not compile to the sibling's declaration alone"
+            ),
+        }
+    }
+
+    /// The representable half of the same rule: an empty sibling declaration
+    /// admits every value, so the intersection is the target's declaration and
+    /// the schema still compiles — enforcing the sibling's `required` AND the
+    /// target's `integer` type. Merge-patch precedence would install the empty
+    /// schema and accept `{"x":"s"}`.
+    #[test]
+    fn ref_sibling_property_collision_conjunction_enforces_both() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": { "x": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "properties": { "x": {} },
+            "required": ["x"]
+        });
+        let g = compile(&schema).unwrap();
+        assert!(accepts(&g, b"{\"x\":1}"), "integer x must be accepted");
+        assert!(
+            rejects(&g, b"{\"x\":\"s\"}"),
+            "target's integer constraint must survive the collision"
+        );
+        assert!(rejects(&g, b"{}"), "sibling's required must be enforced");
+    }
+
+    /// Sibling keywords this compiler cannot merge (anything beyond
+    /// `required`/`properties`) must not be silently widened into an
+    /// incorrect conjunction — they fall through to the pre-existing plain
+    /// `$ref` compile (which drops them, same as before this fix; see
+    /// `anyof_ref_to_integer_with_numeric_enum_sibling_stays_reachable` for
+    /// the deliberately-scoped `enum` case reached via `anyOf`). This test
+    /// only pins that a non-object `$ref` target with `properties`/`required`
+    /// siblings does not panic or wrongly merge — it still compiles via the
+    /// unmerged target.
+    #[test]
+    fn ref_sibling_on_non_object_target_falls_through() {
+        let schema = serde_json::json!({
+            "$defs": { "N": { "type": "integer" } },
+            "$ref": "#/$defs/N",
+            "required": ["y"]
+        });
+        let g = compile(&schema).unwrap();
+        assert!(accepts(&g, b"7"), "non-object $ref target still compiles");
+    }
+
+    /// The merge rebuilds the target from `properties`/`required` alone, so a
+    /// target carrying any further assertion must NOT take the merge path: the
+    /// rebuild cannot express that assertion and would drop it. An `enum`
+    /// target is the sharpest case, because the obvious alternative to
+    /// rejecting — fall back to the plain `$ref` path, which dispatches `enum`
+    /// ahead of object compilation and so keeps the target's own assertion —
+    /// is wrong for a reason that does not show up unless the sibling is
+    /// chosen carefully.
+    ///
+    /// The sibling here is deliberately NOT redundant: `enum` admits both `{}`
+    /// and `{"x":1}`, and `required: ["x"]` excludes the first, so the
+    /// schema's language is `{"x":1}` alone. Compiling the target by itself
+    /// would accept `{}` — wider than the conjunction even though it is no
+    /// wider than the target. A test whose enum members all satisfy the
+    /// sibling cannot tell the two apart and would pass either way.
+    #[test]
+    fn ref_sibling_merge_rejects_a_target_with_an_enum_assertion() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "enum": [{}, { "x": 1 }],
+                    "properties": { "x": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["x"]
+        });
+        let err = compile(&schema).expect_err(
+            "the conjunction of an enum target and a required sibling is not representable",
+        );
+        assert!(
+            err.0.contains("conjunction"),
+            "error should name the unrepresentable conjunction, got: {}",
+            err.0
+        );
+    }
+
+    /// The same rejection for `const`, which `compile_schema_inner` dispatches
+    /// at the same precedence as `enum`. `const: {}` against `required: ["x"]`
+    /// is the degenerate case: the conjunction matches NO value at all, so any
+    /// grammar that compiles and accepts something is wrong by construction.
+    #[test]
+    fn ref_sibling_merge_rejects_a_target_with_a_const_assertion() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "const": {},
+                    "properties": { "x": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["x"]
+        });
+        let err = compile(&schema)
+            .expect_err("a const target contradicting its sibling cannot compile to a language");
+        assert!(
+            err.0.contains("conjunction"),
+            "error should name the unrepresentable conjunction, got: {}",
+            err.0
+        );
+    }
+
+    /// A merged `required` name with no `properties` declaration on either
+    /// side cannot be represented: `compile_object_fields` reaches `required`
+    /// only while iterating the properties it was handed, so an undeclared
+    /// required key produces no pair rule and imposes no requirement.
+    ///
+    /// That limitation is older than the merge and is reachable with no `$ref`
+    /// involved — `{"type":"object","required":["y"]}` compiles to the
+    /// empty-object grammar on the merge base as well, which is why fixing it
+    /// belongs with `compile_object_fields` and its direct caller rather than
+    /// here. What is fixed here is routing a caller INTO it: merging is this
+    /// function's own choice and is only worth making when the result is
+    /// faithful.
+    ///
+    /// The existing `ref_required_sibling_is_enforced` cannot cover this,
+    /// because its fixture declares the required key in `Base.properties` and
+    /// so exercises the only path where `required.contains(key)` can have an
+    /// effect.
+    #[test]
+    fn ref_sibling_merge_rejects_a_required_name_no_side_declares() {
+        let schema = serde_json::json!({
+            "$defs": { "Base": { "type": "object" } },
+            "$ref": "#/$defs/Base",
+            "required": ["y"]
+        });
+        let err = compile(&schema).expect_err(
+            "a required key with no property declaration cannot be represented, and \
+             compiling would accept an object without it",
+        );
+        assert!(
+            err.0.contains("`y`"),
+            "error should name the undeclared required key, got: {}",
+            err.0
+        );
+    }
+
+    /// The declared case must keep working, and this is the control that says
+    /// the rejection above is scoped to the undeclared name rather than to
+    /// `required` siblings generally.
+    #[test]
+    fn ref_sibling_merge_accepts_a_required_name_the_target_declares() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": { "type": "object", "properties": { "y": { "type": "integer" } } }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["y"]
+        });
+        let g = compile(&schema).expect("a declared required key merges normally");
+        assert!(accepts(&g, b"{\"y\":1}"), "the required key is accepted");
+        assert!(
+            rejects(&g, b"{}"),
+            "the merged `required` must actually be enforced"
+        );
+    }
+
+    /// The counterpart to the two tests above, and the reason they are not the
+    /// whole rule. Falling back to the plain `$ref` path is only safe when that
+    /// path preserves the assertion that blocked the merge — `enum`/`const`,
+    /// which `compile_schema_inner` dispatches ahead of object compilation.
+    ///
+    /// `additionalProperties` is not supported by this compiler at all, so the
+    /// plain path ignores it. Falling back would therefore keep NOTHING from
+    /// the target and drop the caller's `required: ["y"]` as well, returning
+    /// `Ok` on a grammar that accepts `{}` — wider than either operand. The
+    /// conjunction is not representable, so compilation must fail instead.
+    #[test]
+    fn ref_sibling_merge_rejects_a_target_whose_assertion_the_plain_path_would_ignore() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "x": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["y"]
+        });
+        let err = compile(&schema).expect_err(
+            "an unrepresentable conjunction must fail closed, not compile to the wider target",
+        );
+        assert!(
+            err.0.contains("conjunction"),
+            "error should name the unrepresentable conjunction, got: {}",
+            err.0
+        );
+    }
+
+    /// An UNTYPED target is the same hazard reached a different way, and the
+    /// non-object guard must not absorb it: `type` is absent, so the target is
+    /// not `"object"`, but an untyped schema still matches object instances —
+    /// the siblings are live, not vacuous. The plain path compiles an untyped
+    /// schema to "any JSON value", which admits every object `required: ["y"]`
+    /// exists to exclude.
+    #[test]
+    fn ref_sibling_merge_rejects_an_untyped_target() {
+        let schema = serde_json::json!({
+            "$defs": { "Any": {} },
+            "$ref": "#/$defs/Any",
+            "required": ["y"]
+        });
+        let err =
+            compile(&schema).expect_err("an untyped target cannot carry the sibling conjunction");
+        assert!(
+            err.0.contains("untyped"),
+            "error should name the untyped target, got: {}",
+            err.0
+        );
     }
 
     // -----------------------------------------------------------------------

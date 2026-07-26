@@ -552,7 +552,7 @@ thread_local! {
     /// no owning struct to hold per-generation buffers: the Metal CPU fallback
     /// (`forward/metal_qwen35.rs`'s private `sample_token`) and the Qwen CPU
     /// decode loops (`model/qwen35/sampling.rs::sample_token`, shared by the
-    /// f16/q8/NEON/batch-prefill forward paths). Kept thread-local instead of
+    /// f16/q8/NEON forward paths). Kept thread-local instead of
     /// per-call so vocab-sized buffers are allocated once per thread and
     /// reused across every decode step, not just within one generation.
     static FULL_LOGIT_SCRATCH: std::cell::RefCell<FullLogitScratch> =

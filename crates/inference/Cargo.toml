@@ -21,7 +21,7 @@ default = ["std", "download", "serve"]
 # keep including `lattice_serve` without needing an extra flag. Library
 # consumers building with `default-features = false` no longer pull an HTTP
 # server into their dependency tree (the lib itself never uses it).
-serve = ["dep:axum", "dep:tokio", "dep:futures"]
+serve = ["dep:axum", "dep:tokio", "dep:futures", "dep:mime", "dep:http-body-util"]
 std = []
 f16 = []
 metal-gpu = ["dep:metal", "dep:objc"]
@@ -38,6 +38,11 @@ mixture = ["dep:lattice-fann"]
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.
 gdn-state-counters = []
+# os_signpost instrumentation of the Metal decode path (W1.0), for capturing
+# a Metal System Trace of command-buffer/dispatch/wait structure in
+# Instruments. Opt-in only: every call site is a zero-sized no-op guard when
+# this is off, so the default decode path stays byte-identical.
+signpost = []
 # Exposes test-only fixture constructors (currently: a tiny all-zero-weight
 # Qwen35Model, ADR-080 C2) as `pub` library API, gated so they never
 # ship in a normal build. Needed because bin targets (lattice.rs,
@@ -58,9 +63,16 @@ thiserror.workspace = true
 tracing.workspace = true
 clap = { workspace = true }
 axum = { workspace = true, optional = true }
+mime = { workspace = true, optional = true }
+# Distinguishes a request-body length-limit rejection (`LengthLimitError`)
+# from any other body-buffering failure in the `serve` HTTP handlers.
+# Already an axum 0.8 transitive dependency at the same version; this makes
+# it a direct dependency so production handler code can downcast against it.
+http-body-util = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
-ureq = { version = "2", features = ["tls"], optional = true }
+# `ureq` (the `download` feature's HTTP client) is declared in the non-wasm
+# `[target]` table below, not here -- see the rationale there.
 sha2.workspace = true
 rusqlite = { workspace = true, optional = true }
 metal = { version = "0.33", optional = true }
@@ -203,19 +215,23 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_gdn_state"
 required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 
+# `download` (ureq -> rustls -> ring) is gated to non-wasm targets. ring does not
+# build for wasm32-unknown-unknown, and its build script does not cross-compile to
+# aarch64-unknown-linux-gnu under a zig toolchain. Declaring `ureq` here rather than
+# as an unconditional optional dependency makes the `download` feature a no-op on
+# wasm: a consumer that forwards `lattice-inference/download` on a wasm build then
+# resolves download-free instead of failing to compile ureq. The `download`-gated
+# code in download.rs is correspondingly `not(target_arch = "wasm32")`-gated, so on
+# wasm the "downloads unavailable" path is what compiles. See issue #1095.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "2", features = ["tls"], optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
-# Partial-body polling (`BodyExt::frame`) for the `lattice.rs` HTTP-level
-# client-disconnect test (ADR-080 C2): axum's own
-# `to_bytes` reads to EOF or errors past a byte cap, neither of which lets a
-# test read N real SSE frames then drop the body mid-stream to simulate a
-# disconnect. Already an axum 0.8 transitive dependency at the same version;
-# this just makes it a direct dev-dependency so test code can `use` it.
-http-body-util = { workspace = true }
 # Drives real HTTP requests (built from `CHAT_COMPLETIONS_PARITY_CASES`
 # fixture bodies) through each binary's `Router` via `ServiceExt::oneshot`
 # for the cross-binary parity table (ADR-080 C2).
@@ -269,6 +285,10 @@ bench = false
 
 [[bench]]
 name = "topk_readback"
+harness = false
+
+[[bench]]
+name = "quarot_hadamard_bench"
 harness = false
 
 [[bench]]

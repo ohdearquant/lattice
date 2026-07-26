@@ -8,7 +8,7 @@ use lattice_inference::model::qwen35::Qwen35Model;
 use lattice_inference::tokenizer::Tokenizer;
 use lattice_tune::lora::AdamState;
 
-mod train_common;
+use lattice_tune::train_support as train_common;
 use train_common::{ArgView, Sample, load_jsonl, verify_tbv};
 
 fn usage() {
@@ -430,7 +430,7 @@ mod cli_contract_tests {
 
     fn args(extra: &[&str]) -> Vec<String> {
         let mut v = vec!["train_grad".to_string()];
-        v.extend(extra.iter().map(|s| s.to_string()));
+        v.extend(extra.iter().map(ToString::to_string));
         v
     }
 

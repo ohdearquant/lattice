@@ -6,6 +6,14 @@ generation output (token IDs) and reports speed.
 
 Exit codes: 0 = pass, 1 = parity failure, 2 = setup error.
 
+A lattice binary that exits non-zero, emits unparseable output, or never
+finishes is a lattice failure and exits 1 on both backends. It is not a setup
+error: reporting it as one tells whoever reads the run that their environment
+is broken when what actually broke is the thing under test. 2 is reserved for
+everything that stops this script from producing a comparison at all, which
+includes anything wrong with the reference side, since a bad reference is
+never evidence about lattice.
+
 Args:
   --backend {cpu,metal}  which lattice binary/path to exercise (default: cpu).
                           "cpu" runs qwen35_generate and parses its legacy text
@@ -21,8 +29,9 @@ Env vars:
   LATTICE_BIN             path to the lattice binary under test (default:
                            target/release/qwen35_generate for --backend cpu,
                            target/release/chat_metal for --backend metal)
-  LATTICE_MODEL_DIR       path to model weights (default: ~/.lattice/models/qwen3.5-0.8b)
-  HF_MODEL_ID             HuggingFace model ID (default: Qwen/Qwen3.5-0.8B)
+  LATTICE_MODEL_DIR       path to model weights (default: ~/.lattice/models/qwen3.5-0.8b);
+                          also the source of the HF reference load (local files only,
+                          no Hub fetch)
   E2E_MAX_TOKENS          tokens to generate per prompt (default: 15)
   E2E_REPORT_PATH         write markdown report here (optional)
   LATTICE_METAL_PATH_PROOF  set to "1" so chat_metal emits the
@@ -37,6 +46,8 @@ import re
 import subprocess
 import sys
 import time
+import traceback
+from pathlib import Path
 
 
 # Each entry is (prompt, match_window).
@@ -214,9 +225,16 @@ METAL_EXPECTED_DIVERGENCE: dict[str, str] = {
     LONG_PREFILL_PROMPT: "#535",
 }
 
-MAX_TOKENS = int(os.environ.get("E2E_MAX_TOKENS", "15"))
-
-HF_MODEL_ID = os.environ.get("HF_MODEL_ID", "Qwen/Qwen3.5-0.8B")
+# compare() reads this at call time, so it stays module scope. The parse must not
+# raise here: an exception at import ends the process on a traceback, and a
+# traceback exits 1, which this script reserves for lattice disagreeing with the
+# reference. A typo in the workflow is a setup error. Hold the raw value and let
+# main()'s preflight reject it as one.
+_MAX_TOKENS_RAW = os.environ.get("E2E_MAX_TOKENS", "15")
+try:
+    MAX_TOKENS: int | None = int(_MAX_TOKENS_RAW)
+except ValueError:
+    MAX_TOKENS = None
 
 # LATTICE_BIN default depends on --backend (chat_metal for metal, qwen35_generate
 # for cpu), but argparse only runs inside main(). An explicit LATTICE_BIN env var
@@ -240,12 +258,27 @@ def run_hf_reference(prompt: str, max_tokens: int) -> dict:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     if not hasattr(run_hf_reference, "_model"):
+        if not os.path.isdir(MODEL_DIR):
+            raise RuntimeError(
+                f"reference model snapshot not found at {MODEL_DIR}; "
+                "provision it before running this script (no network fallback)"
+            )
+        # `use_safetensors=True` below is the enforcement at the load call:
+        # trust_remote_code=False blocks remote *code*, but a `.bin` weight file
+        # is a pickle and stays an arbitrary-execution vector at load time
+        # regardless of that flag. Refusing a snapshot that carries one at all
+        # happens in the preflight, where it can exit as a setup error instead
+        # of being mistaken for a parity failure.
         t0 = time.time()
         run_hf_reference._tokenizer = AutoTokenizer.from_pretrained(
-            HF_MODEL_ID, trust_remote_code=True
+            MODEL_DIR, trust_remote_code=False, local_files_only=True
         )
         run_hf_reference._model = AutoModelForCausalLM.from_pretrained(
-            HF_MODEL_ID, dtype=torch.float32, trust_remote_code=True
+            MODEL_DIR,
+            dtype=torch.float32,
+            trust_remote_code=False,
+            local_files_only=True,
+            use_safetensors=True,
         )
         run_hf_reference._model.eval()
         print(f"[hf] model loaded in {time.time() - t0:.1f}s", file=sys.stderr)
@@ -305,9 +338,19 @@ def run_lattice(prompt: str, max_tokens: int) -> dict:
     ]
 
     t0 = time.time()
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=300
-    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        # Mirrors run_lattice_metal: a lattice binary that never finishes is a
+        # lattice failure, in the same category as one that exits non-zero, and
+        # both reach main() as a None result. Letting the exception escape here
+        # would classify it as a setup error, which tells whoever reads the run
+        # that their environment is broken when what actually broke is the thing
+        # under test.
+        print("[lattice] FAILED (timeout)", file=sys.stderr)
+        return None
     elapsed = time.time() - t0
 
     if result.returncode != 0:
@@ -325,9 +368,21 @@ def run_lattice(prompt: str, max_tokens: int) -> dict:
         print(stdout, file=sys.stderr)
         return None
 
-    gen_ids = [int(x.strip()) for x in token_match.group(1).split(",") if x.strip()]
-    gen_count = int(gen_match.group(1)) if gen_match else len(gen_ids)
-    tok_per_sec = float(speed_match.group(1)) if speed_match else (gen_count / elapsed if elapsed > 0 else 0)
+    # Parser boundary. A binary that exits 0 and then prints a field this cannot
+    # read has failed to produce a usable result, which is the same category as
+    # exiting non-zero, so it leaves as None and the run reports a lattice
+    # failure. Narrowed to the conversions malformed output actually raises: a
+    # launch-side OSError must still reach the entry point as the setup failure
+    # it is. The regexes are not sufficient protection here, since `[\d.]+`
+    # matches `1.2.3` and the token list is unconstrained.
+    try:
+        gen_ids = [int(x.strip()) for x in token_match.group(1).split(",") if x.strip()]
+        gen_count = int(gen_match.group(1)) if gen_match else len(gen_ids)
+        tok_per_sec = float(speed_match.group(1)) if speed_match else (gen_count / elapsed if elapsed > 0 else 0)
+    except (ValueError, TypeError) as e:
+        print(f"[lattice] unreadable output field: {e}", file=sys.stderr)
+        print(stdout, file=sys.stderr)
+        return None
 
     text_match = re.search(r"--- Generated Text ---\n(.*?)--- Stats ---", stdout, re.DOTALL)
     text = text_match.group(1).strip() if text_match else ""
@@ -453,20 +508,58 @@ def run_lattice_metal(prompt: str, max_tokens: int) -> dict:
             print(f"[lattice-metal] malformed @@lattice event: {e}", file=sys.stderr)
             print(line, file=sys.stderr)
             return None
+
+        # Check the event's shape once, here, rather than defending each field
+        # where it is read. json.loads returns whatever JSON value the binary
+        # emitted, so `@@lattice []` is well-formed JSON and `ev.get` raises on
+        # it; typing every field afterwards means one more escape route per
+        # field added later. Everything below this point may assume a dict with
+        # correctly typed values, and a binary that emits anything else has
+        # failed to produce a usable result, which leaves as None like every
+        # other lattice failure.
+        if not isinstance(ev, dict):
+            print(
+                f"[lattice-metal] @@lattice event is not a JSON object: {ev!r}",
+                file=sys.stderr,
+            )
+            return None
         if ev.get("ev") != "gen_token":
             continue
+
+        # bool is a subclass of int in Python, so `isinstance(True, int)` is
+        # true; the token_id check below rejects a boolean explicitly rather
+        # than silently accepting `true` as token 1.
+        bad_field = None
+        if "token_id" in ev and (
+            isinstance(ev["token_id"], bool) or not isinstance(ev["token_id"], int)
+        ):
+            bad_field = "token_id must be an integer"
+        elif "token" in ev and not isinstance(ev["token"], str):
+            bad_field = "token must be a string"
+        elif "tok_s" in ev and (
+            isinstance(ev["tok_s"], bool)
+            or not isinstance(ev["tok_s"], (int, float))
+        ):
+            bad_field = "tok_s must be a number"
+        if bad_field is not None:
+            print(
+                f"[lattice-metal] gen_token event is ill-typed ({bad_field}): {ev}",
+                file=sys.stderr,
+            )
+            print(line, file=sys.stderr)
+            return None
+
         if ev.get("done"):
             saw_done = True
             tok_per_sec = float(ev.get("tok_s", 0.0))
             continue
-        token_id = ev.get("token_id")
-        if not isinstance(token_id, int):
+        if "token_id" not in ev:
             print(
-                f"[lattice-metal] gen_token event missing integer token_id: {ev}",
+                f"[lattice-metal] gen_token event missing token_id: {ev}",
                 file=sys.stderr,
             )
             return None
-        gen_ids.append(token_id)
+        gen_ids.append(ev["token_id"])
         text_parts.append(ev.get("token", ""))
 
     if not saw_done:
@@ -607,11 +700,44 @@ def main() -> int:
             else "target/release/qwen35_generate"
         )
 
+    # Config first, since it needs no filesystem and its diagnosis is exact. A
+    # non-positive budget is rejected rather than run: zero tokens compares two
+    # empty sequences, which reports as a parity failure and sends a workflow
+    # typo to whoever is on the hook for a lattice regression.
+    if MAX_TOKENS is None or MAX_TOKENS < 1:
+        print(
+            f"error: E2E_MAX_TOKENS must be a positive integer, got "
+            f"{_MAX_TOKENS_RAW!r}",
+            file=sys.stderr,
+        )
+        return 2
+
     if not os.path.isfile(LATTICE_BIN):
         print(f"error: lattice binary not found at {LATTICE_BIN}", file=sys.stderr)
         return 2
     if not os.path.isdir(MODEL_DIR):
         print(f"error: model dir not found at {MODEL_DIR}", file=sys.stderr)
+        return 2
+
+    # A reference snapshot carrying pickle weights is a provisioning problem, so
+    # it belongs here with the other setup validation and exits 2. Raising it
+    # from the loader instead would surface as exit 1, which this script defines
+    # as a parity failure, and would file a poisoned reference against lattice.
+    # rglob, not glob: transformers resolves sharded and subfoldered weights, so
+    # a nested `.bin` is loadable and a non-recursive check would miss it. CI's
+    # provisioned snapshot is flat and the exact-set verifier would reject a
+    # subdirectory before this runs, but this script also runs by hand against
+    # directories nothing verified, and that is where the nested case lives.
+    pickle_weights = sorted(Path(MODEL_DIR).rglob("*.bin"))
+    if pickle_weights:
+        print(
+            f"error: model dir {MODEL_DIR} contains pickle weight file(s) "
+            f"{[str(p.relative_to(MODEL_DIR)) for p in pickle_weights]}; "
+            "only safetensors weights are "
+            "trusted here (a .bin is a pickle and an arbitrary-execution vector "
+            "at load time even with trust_remote_code=False)",
+            file=sys.stderr,
+        )
         return 2
 
     try:
@@ -627,7 +753,24 @@ def main() -> int:
         print(f"Prompt: {prompt[:60]}  (match_window={match_window})", file=sys.stderr)
 
         print("[hf] running reference...", file=sys.stderr)
-        hf_out = run_hf_reference(prompt, MAX_TOKENS)
+        # Anything that goes wrong producing the reference is a problem with the
+        # reference, not evidence about lattice. Letting it propagate would end
+        # the process on a traceback, and a traceback exits 1, which this script
+        # defines as a parity failure. That mislabels every reference-side fault
+        # (a snapshot that will not load, a transformers version that refuses
+        # it, a directory that disappeared after the preflight) as a lattice
+        # regression, which is the one conclusion this gate must never reach by
+        # accident.
+        try:
+            hf_out = run_hf_reference(prompt, MAX_TOKENS)
+        except Exception as e:  # noqa: BLE001 - deliberately broad, see above
+            print(
+                f"error: reference generation failed for prompt {prompt[:40]!r}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            traceback.print_exc(file=sys.stderr)
+            return 2
 
         print(f"[lattice-{backend}] running under test...", file=sys.stderr)
         lat_out = (
@@ -666,8 +809,19 @@ def main() -> int:
     print(report)
 
     if REPORT_PATH:
-        with open(REPORT_PATH, "w") as f:
-            f.write(report)
+        # A run whose report cannot be written is a broken run, not a verdict
+        # about lattice. Letting the OSError propagate would exit 1 and label an
+        # unwritable output path a parity failure, including on a run where every
+        # prompt matched.
+        try:
+            with open(REPORT_PATH, "w") as f:
+                f.write(report)
+        except OSError as e:
+            print(
+                f"error: could not write report to {REPORT_PATH}: {e}",
+                file=sys.stderr,
+            )
+            return 2
 
     fails = sum(1 for r in results if not r["pass"] and not r.get("xfail_issue"))
     known = sum(1 for r in results if not r["pass"] and r.get("xfail_issue"))
@@ -698,4 +852,20 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Exit 1 means one thing here: lattice and the reference were both produced
+    # and disagreed. Anything else that stops this script is a problem with the
+    # harness or its inputs, and an uncaught exception would otherwise inherit
+    # the interpreter's exit code of 1 and be read as a lattice regression. The
+    # traceback still prints, so nothing is hidden by classifying it as setup.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+        print(
+            "error: parity harness aborted; this is a harness or setup failure, "
+            "not a lattice parity result",
+            file=sys.stderr,
+        )
+        sys.exit(2)

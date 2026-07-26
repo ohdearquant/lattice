@@ -354,8 +354,7 @@ fn write_head_to_interleaved(
 /// the full-layer V-transpose buffer (`v_all_t`) added by #674/#673: it is
 /// *not* the field set from before those changes. `estimate_matches_actual_attention_buffer_lengths`
 /// below cross-checks this estimate against `AttentionBuffers::new`'s real
-/// field lengths so this can't silently rot again the way it did across #678
-/// review finding 3.
+/// field lengths so this can't silently rot again the way it did in #678.
 pub fn estimate_materialized_attention_buffer_bytes(
     max_seq_len: usize,
     hidden_size: usize,
@@ -847,7 +846,7 @@ mod tests {
     use crate::weights::{Tensor1D, Tensor2D, TransformerLayerWeights};
 
     /// Keeps `estimate_materialized_attention_buffer_bytes` honest against the
-    /// real `AttentionBuffers` field set (#678 review finding 3): the helper's
+    /// real `AttentionBuffers` field set (#678): the helper's
     /// formula is hand-maintained and previously drifted (it kept counting a
     /// removed `context`/per-head `v_head_t` allocation and omitted the newer
     /// `qkv` and full-layer `v_all_t` scratch). Covers the concrete BGE-small

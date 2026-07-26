@@ -5,7 +5,7 @@ decode-bench harness).
 No engine binary or network access is required: real adapters are
 exercised only through their pure parsing helpers
 (`parse_lattice_result_line`, `ollama_response_to_result`); the profile ->
-call-schedule equivalence is checked with the harness's own deterministic
+call-schedule contract is checked against the harness's own deterministic
 fake adapters, matching
 tests/test_bench_decode_adapters_apples_to_apples.py's convention.
 
@@ -66,7 +66,7 @@ class _FakeAdapter:
         )
 
 
-class ProfileParameterEquivalenceTest(unittest.TestCase):
+class ProfileParameterTranscriptionTest(unittest.TestCase):
     """bench_apples_precise.sh: N1=64, N2=512, TOTAL_RUNS=15, WARMUP=2 (so
     13 measured), trimmed mean dropping top/bottom 2, every engine warms
     identically (unlike apples_to_apples's mlx-only warmup)."""
@@ -113,7 +113,7 @@ class ProfileParameterEquivalenceTest(unittest.TestCase):
             self.assertEqual(group.quantization, "q8", group.name)
 
 
-class CallScheduleEquivalenceTest(unittest.TestCase):
+class CallScheduleContractTest(unittest.TestCase):
     """Proves the produced call schedule matches bench_apples_precise.sh's
     loop structure: every engine gets 2 warmup calls at N2=512, then N1 x13,
     then N2 x13."""

@@ -10,6 +10,7 @@ pytest-only features are used).
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import math
@@ -892,12 +893,55 @@ class RunProfileTest(unittest.TestCase):
         self.assertTrue(all(o.engine == "fake" for o in result.observations))
 
     def test_missing_engine_never_fabricates_observations(self):
+        """Every engine absent yields no result at all -- not an empty one.
+
+        The harness never substitutes stale or synthesized rows, and it also
+        never hands back a result whose only honest content is "nothing was
+        measured": a caller that renders and exits on the return value cannot
+        tell that apart from a full comparison.
+        """
         profile = _profile(engines=[_engine("ghost")])
+        with self.assertRaises(harness.NoMeasurementError) as ctx:
+            harness.run_profile(
+                profile, {}, allow_missing_engine=True, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+            )
+        self.assertIn("no measured observation", str(ctx.exception))
+        self.assertIn("ghost", str(ctx.exception))
+
+    def test_no_measurement_error_is_a_missing_engine_error(self):
+        """Callers already treating a missing engine as a failed run inherit
+        the no-measurement case without a check of their own."""
+        self.assertTrue(issubclass(harness.NoMeasurementError, harness.MissingEngineError))
+
+    def test_one_live_engine_with_missing_peer_still_returns_a_result(self):
+        profile = _profile(engines=[_engine("fake"), _engine("ghost")])
         result = harness.run_profile(
-            profile, {}, allow_missing_engine=True, clock=_FakeClock(), git_sha_value="x", hardware_id_value="h"
+            profile,
+            {"fake": _FakeAdapter()},
+            allow_missing_engine=True,
+            clock=_FakeClock(),
+            git_sha_value="x",
+            hardware_id_value="h",
         )
-        self.assertEqual(result.observations, ())
         self.assertEqual(result.missing_engines, ("ghost",))
+        self.assertTrue(any(not o.warmup for o in result.observations))
+
+    def test_warmup_only_run_is_not_a_measurement(self):
+        # measured_repeats=0 is rejected by the profile loader, so the
+        # warmup-only shape is built directly: warmup calls are not a
+        # measurement, and a live adapter having been invoked is not either.
+        profile = dataclasses.replace(
+            _profile(engines=[_engine("fake", warmup_repeats=2, warmup_tokens=8)]), measured_repeats=0
+        )
+        with self.assertRaises(harness.NoMeasurementError):
+            harness.run_profile(
+                profile,
+                {"fake": _FakeAdapter()},
+                allow_missing_engine=True,
+                clock=_FakeClock(),
+                git_sha_value="x",
+                hardware_id_value="h",
+            )
 
     def test_adapter_default_identity_matches_requested(self):
         profile = _profile(
@@ -1694,8 +1738,11 @@ class RenderReportTest(unittest.TestCase):
         self.assertIn("fake", report)
 
     def test_report_handles_no_measured_data(self):
-        profile = _profile(engines=[_engine("ghost")])
-        result = harness.run_profile(profile, {}, allow_missing_engine=True, clock=_FakeClock())
+        # `run_profile` no longer returns an observation-free result, so the
+        # renderer's empty case is exercised on a directly constructed one.
+        result = harness.HarnessRunResult(
+            profile=_profile(engines=[_engine("ghost")]), observations=(), missing_engines=("ghost",)
+        )
         report = harness.render_report(result, harness.aggregate(result))
         self.assertIn("no measured data", report)
 
@@ -1747,29 +1794,56 @@ quantization = "q8"
             rc = harness.main(["run", "--profile", "smoke", "--profiles-file", str(path)])
             self.assertEqual(rc, 1)
 
-    def test_run_subcommand_missing_engine_allowed_exits_zero(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "profiles.toml"
-            path.write_text(
-                """
+    @staticmethod
+    def _write_smoke_profile(directory: str, engine_names: list[str]) -> Path:
+        path = Path(directory) / "profiles.toml"
+        engines = "".join(
+            f"""
+[[profiles.smoke.engines]]
+name = "{name}"
+warmup_repeats = 0
+model = "m"
+quantization = "q8"
+"""
+            for name in engine_names
+        )
+        path.write_text(
+            f"""
 schema_version = 1
 
 [profiles.smoke]
 windows = [32, 256]
 measured_repeats = 1
 prompt = "hello"
+{engines}""",
+            encoding="utf-8",
+        )
+        return path
 
-[[profiles.smoke.engines]]
-name = "nonexistent-engine"
-warmup_repeats = 0
-model = "m"
-quantization = "q8"
-""",
-                encoding="utf-8",
-            )
-            rc = harness.main(
-                ["run", "--profile", "smoke", "--profiles-file", str(path), "--allow-missing-engine"]
-            )
+    def test_run_subcommand_all_engines_missing_exits_nonzero(self):
+        """`--allow-missing-engine` tolerates a missing engine, not a missing
+        measurement: a run in which every engine was absent has nothing to
+        report and must not exit zero."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_smoke_profile(tmp, ["nonexistent-engine"])
+            rc = harness.main(["run", "--profile", "smoke", "--profiles-file", str(path), "--allow-missing-engine"])
+            self.assertEqual(rc, 1)
+
+    def test_run_subcommand_one_live_engine_with_missing_peer_exits_zero(self):
+        """The partial-availability case the flag exists for: one engine
+        measured, its peers unavailable, exit zero."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_smoke_profile(tmp, ["fake", "nonexistent-engine"])
+            saved = dict(harness.ADAPTER_REGISTRY)
+            harness.ADAPTER_REGISTRY.clear()
+            harness.ADAPTER_REGISTRY["fake"] = _FakeAdapter()
+            try:
+                rc = harness.main(
+                    ["run", "--profile", "smoke", "--profiles-file", str(path), "--allow-missing-engine"]
+                )
+            finally:
+                harness.ADAPTER_REGISTRY.clear()
+                harness.ADAPTER_REGISTRY.update(saved)
             self.assertEqual(rc, 0)
 
 
