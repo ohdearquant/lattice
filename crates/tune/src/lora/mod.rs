@@ -356,8 +356,8 @@ impl LoraAdapter {
     /// Validate adapter dimensions against a BERT cross-encoder model's
     /// geometry.
     ///
-    /// Returns the first invalid layer, module, projection-shape, or
-    /// oversized-rank mismatch. Call it before hooked BERT scoring (see
+    /// Returns the first invalid layer, module, or projection-shape
+    /// mismatch. Call it before hooked BERT scoring (see
     /// [`lattice_inference::model::cross_encoder::CrossEncoderModel::score_with_hook`],
     /// which validates through the [`LoraHook`](lattice_inference::lora_hook::LoraHook)
     /// trait object below) — this is the BERT counterpart to
@@ -365,12 +365,12 @@ impl LoraAdapter {
     ///
     /// Per-layer `a`/`b` buffer lengths are not re-checked here for the same
     /// reason as `validate_against`: [`Self::new`] already rejects any layer
-    /// whose buffers don't match its own `rank`/`d_in`/`d_out`. Rank IS
-    /// checked here (against `min(d_in, d_out)`, the largest non-redundant
-    /// value for a two-factor product): unlike the buffer-length invariant,
-    /// this bound doesn't hold for every `LoraAdapter` in general (a blended
-    /// adapter's concatenated rank can legitimately exceed it), so it's
-    /// enforced at this BERT-scoring gate instead of at construction.
+    /// whose buffers don't match its own `rank`/`d_in`/`d_out`.
+    ///
+    /// `rank` is deliberately not bounded here. A factorization with
+    /// `rank > min(d_in, d_out)` is redundant but valid, and rejecting it
+    /// would make a legitimately constructed adapter unscoreable — see the
+    /// note in the body.
     pub fn validate_against_bert(
         &self,
         num_hidden_layers: usize,
@@ -404,25 +404,21 @@ impl LoraAdapter {
                 )));
             }
 
-            // `B @ A` has rank at most `min(d_in, d_out)` no matter how the
-            // factors are padded, so a rank above that bound adds only
-            // wasted `apply_lora` compute (extra multiply-adds per hooked
-            // row) with zero extra expressiveness — the adapter is exactly
-            // representable at `rank = min(d_in, d_out)`. Bounded here
-            // rather than in `Self::new`: a blended adapter's concatenated
-            // rank can legitimately exceed this per-layer bound (the
-            // combined factorization is over-complete but its matrix rank
-            // stays bounded), so the constraint only holds for a single
-            // untrusted adapter about to be hooked into BERT scoring, not
-            // for `LoraAdapter` construction in general.
-            let rank_bound = expected_d_in.min(expected_d_out);
-            if layer.rank > rank_bound {
-                return Err(crate::error::TuneError::Validation(format!(
-                    "LoRA layer {layer_idx} module '{module}': rank {} exceeds min(d_in={expected_d_in}, \
-                     d_out={expected_d_out})={rank_bound}",
-                    layer.rank
-                )));
-            }
+            // `layer.rank` is intentionally unbounded relative to
+            // `min(d_in, d_out)`. The matrix rank of `B @ A` cannot exceed
+            // that bound however wide the inner dimension is, so a
+            // factorization above it is redundant: the same update is
+            // exactly representable at `rank = min(d_in, d_out)`, and the
+            // extra columns cost additional multiply-adds per hooked row in
+            // `apply_lora`. That is an efficiency property of the caller's
+            // factorization, not a validity condition — `apply_lora` derives
+            // every buffer offset from `rank` itself, and the per-layer
+            // buffer-length invariant enforced by `Self::new`
+            // (`rank * d_in == a.len()`, `d_out * rank == b.len()`) is what
+            // keeps those offsets in bounds. `blend_lora_adapters` produces
+            // over-complete adapters by construction (the blended rank is
+            // the sum of the source ranks), so rejecting them here would
+            // make an adapter this crate can build unscoreable.
         }
         Ok(())
     }
@@ -1213,16 +1209,16 @@ mod tests {
         }
 
         /// A rank above `min(d_in, d_out)` is representationally redundant
-        /// (`B @ A` cannot exceed that rank no matter how the factors are
-        /// padded): the adapter still constructs (buffers are
-        /// self-consistent with its own declared rank/d_in/d_out), but
-        /// `validate_against_bert` — the gate every BERT adapter passes
-        /// through before it can be hooked into scoring — must refuse it.
-        /// `HIDDEN_SIZE` is 384, so the bound here is 384; this uses a rank
-        /// one above it, so the only thing that can reject it is the bound
-        /// itself.
+        /// (`B @ A` cannot exceed that rank no matter how wide the inner
+        /// dimension is) but perfectly valid: the factorization computes a
+        /// correct update, `apply_lora` derives every buffer offset from
+        /// `rank` itself, and `blend_lora_adapters` produces exactly this
+        /// shape by summing source ranks. `validate_against_bert` must
+        /// accept it. `HIDDEN_SIZE` is 384, so this uses a rank one above
+        /// that; the buffers stay consistent with the declared rank, so the
+        /// redundancy is the only thing left for a validator to object to.
         #[test]
-        fn test_validate_against_bert_rejects_rank_above_min_d_in_d_out() {
+        fn test_validate_against_bert_accepts_over_complete_rank() {
             let rank = HIDDEN_SIZE + 1;
             let mut layers = HashMap::new();
             layers.insert(
@@ -1242,12 +1238,79 @@ mod tests {
             };
             let adapter =
                 LoraAdapter::new(config, layers).expect("buffers match the declared rank");
+            assert!(
+                adapter
+                    .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+                    .is_ok(),
+                "an over-complete but correctly shaped factorization must be accepted"
+            );
+        }
+
+        /// The buffer-geometry invariant is what actually keeps `apply_lora`
+        /// in bounds, and it is independent of the redundancy question:
+        /// removing the rank ceiling must not let a layer through whose
+        /// buffers disagree with its own declared `rank`/`d_in`/`d_out`.
+        /// Asserted at construction, which is where that check lives.
+        #[test]
+        fn test_over_complete_rank_still_requires_matching_buffer_lengths() {
+            let rank = HIDDEN_SIZE + 1;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, "query".to_string()),
+                LoraLayer {
+                    // One row short of `rank * d_in`: an over-complete rank
+                    // does not excuse an under-sized A factor.
+                    a: vec![0.0; (rank - 1) * HIDDEN_SIZE],
+                    b: vec![0.0; HIDDEN_SIZE * rank],
+                    d_in: HIDDEN_SIZE,
+                    d_out: HIDDEN_SIZE,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["query".to_string()],
+            };
+            let err = LoraAdapter::new(config, layers)
+                .expect_err("an A buffer shorter than rank * d_in must be rejected");
+            assert!(
+                err.to_string().contains("A buffer length"),
+                "expected the A-buffer-length rejection, got: {err}"
+            );
+        }
+
+        /// A geometry mismatch against the model's BERT dimensions must
+        /// still be rejected at an over-complete rank — the two conditions
+        /// are independent and the removed ceiling was never what caught
+        /// this.
+        #[test]
+        fn test_over_complete_rank_does_not_excuse_bert_dim_mismatch() {
+            let rank = HIDDEN_SIZE + 1;
+            let mut layers = HashMap::new();
+            layers.insert(
+                (0, "query".to_string()),
+                LoraLayer {
+                    a: vec![0.0; rank * HIDDEN_SIZE],
+                    b: vec![0.0; (HIDDEN_SIZE + 1) * rank],
+                    d_in: HIDDEN_SIZE,
+                    d_out: HIDDEN_SIZE + 1,
+                    rank,
+                },
+            );
+            let config = LoraConfig {
+                rank,
+                alpha: rank as f32,
+                target_modules: vec!["query".to_string()],
+            };
+            let adapter =
+                LoraAdapter::new(config, layers).expect("buffers match the declared rank");
             let err = adapter
                 .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
-                .expect_err("rank above min(d_in, d_out) must be rejected");
+                .expect_err("d_out != hidden_size must be rejected whatever the rank");
             assert!(
-                err.to_string().contains("exceeds min(d_in"),
-                "expected the rank-bound rejection, got: {err}"
+                err.to_string().contains("dims mismatch"),
+                "expected the BERT dim-mismatch rejection, got: {err}"
             );
         }
 
