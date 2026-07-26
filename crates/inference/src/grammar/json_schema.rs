@@ -653,6 +653,40 @@ impl<'a> CompileCtx<'a> {
             return self.compile_ref(ref_str);
         }
 
+        // The merge reconstructs the target from `properties`/`required` alone
+        // (the `compile_object_fields` call that ends this function), so it is
+        // only faithful when those are the only assertions the target carries.
+        // A target that also constrains itself comes back WIDER than it went
+        // in, because `compile_schema_inner` dispatches `enum`/`const` ahead of
+        // object compilation and returns immediately: the plain `$ref` path
+        // compiles
+        // `{"type":"object","enum":[{"x":1}],"properties":{"x":{"type":"integer"}}}`
+        // to exactly `{"x":1}`, while a merge that sees only the property and
+        // the required key admits `{"x":2}`. Dropping a sibling over-accepts by
+        // one keyword; discarding a target assertion over-accepts by the whole
+        // referenced schema, so this falls back to the plain path rather than
+        // merging.
+        //
+        // Positive allowlist, not a denylist of known assertions: a keyword the
+        // compiler gains later then lands in the safe path by default instead of
+        // being silently discarded by a merge that has never heard of it.
+        // `$ref` is deliberately NOT allowed here even though it is an ignorable
+        // *sibling* — on the target it means an indirection
+        // `resolve_ref_chain_target` declined to follow, and compiling the
+        // target's properties while ignoring it would widen in the same way.
+        let target_is_representable = target.as_object().is_some_and(|m| {
+            m.keys().all(|k| {
+                let k = k.as_str();
+                (k != "$ref" && REF_IGNORED_SIBLING_KEYS.contains(&k))
+                    || k == "type"
+                    || k == "properties"
+                    || k == "required"
+            })
+        });
+        if !target_is_representable {
+            return self.compile_ref(ref_str);
+        }
+
         // Merge `properties`. A key declared on both sides must satisfy BOTH
         // schemas — draft 2020-12 applies `$ref` siblings as an intersection,
         // not as a JSON Merge Patch where the closer declaration wins. Only
@@ -4787,6 +4821,64 @@ mod tests {
         });
         let g = compile(&schema).unwrap();
         assert!(accepts(&g, b"7"), "non-object $ref target still compiles");
+    }
+
+    /// The merge rebuilds the target from `properties`/`required` alone, so a
+    /// target carrying any further assertion must NOT take the merge path: the
+    /// rebuild cannot express that assertion and would drop it.
+    ///
+    /// Here the target is object-typed (so the non-object guard above does not
+    /// catch it) and additionally pinned by `enum` to the single value
+    /// `{"x":1}`. `compile_schema_inner` dispatches `enum` ahead of object
+    /// compilation, so the plain `$ref` path compiles exactly that one value.
+    /// A merge seeing only `properties.x: integer` and `required: ["x"]` would
+    /// admit `{"x":2}` — an over-accept of the whole referenced schema rather
+    /// than of one dropped sibling.
+    #[test]
+    fn ref_sibling_merge_declines_a_target_with_an_enum_assertion() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "enum": [{ "x": 1 }],
+                    "properties": { "x": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["x"]
+        });
+        let g = compile(&schema).unwrap();
+        assert!(
+            accepts(&g, b"{\"x\":1}"),
+            "the enum's own value must compile"
+        );
+        assert!(
+            rejects(&g, b"{\"x\":2}"),
+            "target's enum assertion must survive: merging it away admits every integer x"
+        );
+    }
+
+    /// The same guard for `const`, which `compile_schema_inner` dispatches on
+    /// the same precedence as `enum`.
+    #[test]
+    fn ref_sibling_merge_declines_a_target_with_a_const_assertion() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "const": { "x": 1 },
+                    "properties": { "x": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["x"]
+        });
+        let g = compile(&schema).unwrap();
+        assert!(accepts(&g, b"{\"x\":1}"), "the const value must compile");
+        assert!(
+            rejects(&g, b"{\"x\":2}"),
+            "target's const assertion must survive the sibling merge"
+        );
     }
 
     // -----------------------------------------------------------------------
