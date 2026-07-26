@@ -440,16 +440,32 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     contexts = SWEEP_CONTEXTS if args.sweep else (args.ctx,)
     all_rows: list[dict] = []
+    # A context that loses every engine now aborts the loop, because
+    # `run_profile` refuses to return a result it did not measure. The contexts
+    # that already ran did produce measurements, and discarding them would make
+    # an incomplete sweep indistinguishable from one that never started. So the
+    # rows are persisted either way and the exit status carries the failure.
+    #
+    # Engine availability really can differ between contexts: the per-context
+    # `padded_prompt(ctx)` call above drops both mlx and lattice when it fails,
+    # so a long context can end up with fewer engines than a short one.
+    failure: str | None = None
     try:
         for ctx in contexts:
             all_rows.extend(run_context(ctx, args.runs, args.allow_missing_engine, args.out))
     except (ValueError, harness.MissingEngineError, AdapterOutputError) as exc:
-        print(f"FAIL: {exc}", file=sys.stderr)
-        return 1
+        failure = str(exc)
     if args.sweep:
-        path = OUT_DIR / "agentic_sweep.json"
+        # A partial sweep is written under a different name rather than a
+        # differently-shaped payload: readers keep the schema they expect, and
+        # nothing that looks for the canonical artifact can silently pick up a
+        # sweep that stopped early.
+        path = OUT_DIR / ("agentic_sweep.json" if failure is None else "agentic_sweep.partial.json")
         path.write_text(json.dumps(all_rows, indent=2) + "\n")
         print(f"Sweep JSON: {path}")
+    if failure is not None:
+        print(f"FAIL: {failure}", file=sys.stderr)
+        return 1
     notices = [row for row in all_rows if row.get("source") != "live"]
     if notices:
         print("\n*** FRAMEWORK STATUS NOTICES ***")

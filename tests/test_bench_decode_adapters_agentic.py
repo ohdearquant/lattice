@@ -206,5 +206,56 @@ class ExitStatusMeansMeasuredTest(unittest.TestCase):
         self.assertEqual(status, 0)
 
 
+class PartialSweepIsPersistedTest(unittest.TestCase):
+    """A sweep that dies partway still wrote measurements; they must survive.
+
+    Engine availability differs between contexts -- the per-context
+    `padded_prompt(ctx)` call drops both mlx and lattice when it fails -- so a
+    long context can measure nothing where a short one measured fine. The run
+    must fail, because it did not complete, and it must still persist what it
+    measured, under a name that cannot be mistaken for a complete sweep.
+    """
+
+    def _sweep(self, tmp, side_effect):
+        with mock.patch.object(agentic, "OUT_DIR", tmp), \
+             mock.patch.object(agentic, "run_context", side_effect=side_effect):
+            return agentic.main(["--runs", "1", "--sweep", "--allow-missing-engine"])
+
+    def test_rows_measured_before_the_failure_are_written(self):
+        import json
+        import tempfile
+
+        live = [{"engine": "lattice", "source": "live", "tok_s": 157.0}]
+        # First context measures, the next one loses every engine.
+        effects = [live, harness.MissingEngineError("no measured observation")]
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            status = self._sweep(tmp, effects)
+            self.assertEqual(status, 1, "an incomplete sweep must not exit 0")
+            # Checked before the presence assertion below so that each way of
+            # breaking this reports its own cause: writing the partial rows to
+            # the canonical name fails here, and discarding them fails there.
+            # Ordered the other way, the first assertion shadows the second and
+            # both mutations produce the same misleading message.
+            self.assertFalse(
+                (tmp / "agentic_sweep.json").exists(),
+                "a partial sweep must not occupy the canonical artifact name",
+            )
+            partial = tmp / "agentic_sweep.partial.json"
+            self.assertTrue(partial.is_file(), "measured rows were discarded on failure")
+            self.assertEqual(json.loads(partial.read_text()), live)
+
+    def test_a_complete_sweep_uses_the_canonical_name(self):
+        import tempfile
+
+        live = [{"engine": "lattice", "source": "live", "tok_s": 157.0}]
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            status = self._sweep(tmp, lambda *a, **k: list(live))
+            self.assertEqual(status, 0)
+            self.assertTrue((tmp / "agentic_sweep.json").is_file())
+            self.assertFalse((tmp / "agentic_sweep.partial.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
