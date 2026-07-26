@@ -279,12 +279,19 @@ impl ExpertByteTable {
     /// writes; it is re-verified here, not just assumed, via the
     /// block-alignment check below.
     fn open(path: &Path, expected_shape: &[usize]) -> Result<Self, String> {
-        use crate::weights::q4_weights::validate_q4_file;
+        use crate::weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
 
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        let header = validate_q4_file(&mut file, path, Some(expected_shape))
-            .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
+        // Scale/bias is validated per expert in `dequant_expert_f16`, which
+        // already walks that expert's blocks; an expert routing never selects
+        // is never read at all, so an eager whole-file scan here would defeat
+        // the point of the cache.
+        let (header, mmap, _) = open_and_mmap_q4_file(
+            path,
+            Some(expected_shape),
+            Q4BlockCheck::InCallerTraversal {
+                traversal: "ExpertByteTable::dequant_expert_f16 per-expert loop",
+            },
+        )?;
 
         let num_experts = expected_shape[0];
         if num_experts == 0 {
@@ -326,12 +333,6 @@ impl ExpertByteTable {
         }
         let per_expert_blocks = per_expert_elems / crate::weights::q4_weights::Q4_BLOCK_WEIGHTS;
         let per_expert_bytes = per_expert_blocks * 20;
-
-        // SAFETY: read-only mmap of a file this process does not mutate
-        // while running (same invariant as `mmap_q4_weight` /
-        // `load_q4_mmap_dequant_f16`).
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
 
         Ok(Self {
             mmap,

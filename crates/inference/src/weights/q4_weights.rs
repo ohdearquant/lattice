@@ -753,11 +753,18 @@ pub(crate) fn validate_q4_header_payload_bounds(
 /// [`validate_q4_header_payload_bounds`] are both `O(1)` (fixed-size header
 /// reads and a `file.metadata()` length check), so calling this before an
 /// mmap never forces the payload's pages to be faulted in. Per-block
-/// scale/bias finiteness is deliberately **not** checked here — each loader
-/// folds that check into the single pass it already makes over the block
-/// bytes it materializes (see [`validate_q4_block_metadata`] and its call
-/// sites in `load_q4_file_impl` and the Metal/MoE mmap dequant loops), so no
-/// caller ever pays for a separate full-payload scan on top of its own read.
+/// scale/bias finiteness is deliberately **not** checked here, because a
+/// scan folded into a traversal the caller already performs is free while a
+/// scan performed here is an extra pass over the same bytes.
+///
+/// This function therefore does **not** on its own make a file safe to hand
+/// to a consumer that never reads the blocks. It is a preflight, not a
+/// complete ingress check, and callers must additionally discharge the
+/// per-block obligation described on [`validate_q4_block_metadata`] — either
+/// by calling it from their own decode loop, or by calling
+/// [`validate_q4_block_metadata_scan`] over the payload. Callers that obtain
+/// the payload by memory-mapping go through [`open_and_mmap_q4_file`], whose
+/// required `check` argument makes that choice unskippable.
 ///
 /// # Errors
 ///
@@ -819,6 +826,133 @@ pub(crate) fn validate_q4_block_metadata(
             bias_bits,
         ),
     )
+}
+
+/// Validate every Q4 block's scale/bias metadata in `payload`, one pass, for
+/// consumers that never decode the blocks themselves.
+///
+/// `payload` is the block region only (the bytes at and after
+/// [`Q4FileHeader::payload_offset`]); trailing bytes shorter than one block
+/// are ignored here because [`validate_q4_header_payload_bounds`] has already
+/// rejected any file whose extent is not an exact block multiple.
+///
+/// # Errors
+///
+/// Returns an error naming the first block whose scale is non-finite or
+/// non-positive, or whose bias is non-finite.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn validate_q4_block_metadata_scan(
+    source: &str,
+    tensor_name: &str,
+    payload: &[u8],
+) -> Result<(), InferenceError> {
+    for (index, chunk) in payload.chunks_exact(Q4_BLOCK_BYTES).enumerate() {
+        let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+        let bias_bits = u16::from_ne_bytes([chunk[2], chunk[3]]);
+        validate_q4_block_metadata(source, tensor_name, index, scale_bits, bias_bits)?;
+    }
+    Ok(())
+}
+
+/// How a caller of [`open_and_mmap_q4_file`] discharges the per-block
+/// scale/bias obligation that [`validate_q4_file`] deliberately leaves open.
+///
+/// This is a required argument rather than a defaulted option so that adding
+/// a new memory-mapping Q4 consumer forces an explicit answer to "who checks
+/// the block metadata for these bytes?". A consumer that never traverses the
+/// payload has no correct answer other than [`Q4BlockCheck::Now`].
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) enum Q4BlockCheck<'a> {
+    /// Scan every block's scale/bias before the mapping is returned. Required
+    /// for consumers that hand the mapped bytes to something other than a CPU
+    /// decode loop — a no-copy GPU buffer, a DMA target, a raw slice — since
+    /// nothing downstream of them will ever look at the metadata on the CPU.
+    ///
+    /// Costs one sequential pass over the payload, which for a no-copy
+    /// mapping means faulting in pages the mapping was designed not to touch.
+    Now { tensor_name: &'a str },
+    /// The caller decodes every block it consumes and calls
+    /// [`validate_q4_block_metadata`] inside that loop, so a separate pass
+    /// would read the same bytes twice. `traversal` names the loop that
+    /// discharges the obligation, so the claim can be checked against code
+    /// rather than taken on trust.
+    InCallerTraversal { traversal: &'static str },
+}
+
+/// Evidence that every block's scale/bias in a mapping was validated before
+/// that mapping was handed to its consumer.
+///
+/// Only [`Q4BlockCheck::Now`] produces one. Constructors that publish mapped
+/// bytes to something which will never decode them on the CPU take this by
+/// value, so reaching such a constructor from a deferred check requires
+/// visibly unwrapping a `None` rather than simply not writing a line.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) struct Q4BlocksChecked(());
+
+/// Open `path`, run the [`validate_q4_file`] preflight against
+/// `expected_shape`, discharge the per-block obligation per `check`, and
+/// return the header, a read-only mapping of the whole file, and — when
+/// `check` was [`Q4BlockCheck::Now`] — a [`Q4BlocksChecked`] witness.
+///
+/// Every memory-mapped Q4 consumer in this crate goes through here. That is
+/// the point: the per-block scale/bias check is not something a mapping
+/// consumer can reach the payload without having answered for, because the
+/// only way to get the mapping is to pass a [`Q4BlockCheck`].
+///
+/// # Safety invariant
+///
+/// The returned mapping is read-only, and the model files must not be
+/// modified while the process is running.
+///
+/// # Errors
+///
+/// Returns an error on I/O failure, a failed [`validate_q4_file`] preflight,
+/// an mmap failure, a header whose `payload_offset` lies beyond the mapped
+/// length, or — under [`Q4BlockCheck::Now`] — a block with a non-finite or
+/// non-positive scale or a non-finite bias.
+#[cfg(any(test, feature = "metal-gpu"))]
+pub(crate) fn open_and_mmap_q4_file(
+    path: &std::path::Path,
+    expected_shape: Option<&[usize]>,
+    check: Q4BlockCheck<'_>,
+) -> Result<(Q4FileHeader, memmap2::Mmap, Option<Q4BlocksChecked>), String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let header = validate_q4_file(&mut file, path, expected_shape)
+        .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
+
+    // SAFETY: read-only mapping of a file this process does not mutate while
+    // running; the caller upholds the "model files are immutable for the
+    // process lifetime" invariant documented above.
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
+        .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+
+    let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
+        format!(
+            "{}: payload_offset {} beyond mapped length {}",
+            path.display(),
+            header.payload_offset,
+            mmap.len()
+        )
+    })?;
+
+    let checked = match check {
+        Q4BlockCheck::Now { tensor_name } => {
+            let source = path.display().to_string();
+            validate_q4_block_metadata_scan(&source, tensor_name, payload)
+                .map_err(|e| e.to_string())?;
+            Some(Q4BlocksChecked(()))
+        }
+        Q4BlockCheck::InCallerTraversal { traversal } => {
+            debug_assert!(
+                !traversal.is_empty(),
+                "a deferred block check must name the traversal that discharges it"
+            );
+            None
+        }
+    };
+
+    Ok((header, mmap, checked))
 }
 
 /// Load a [`Q4Tensor`] from a `.q4` file written by [`save_q4_file`].
@@ -2454,21 +2588,24 @@ mod tests {
         }
     }
 
-    /// Structural proof that `validate_q4_file` no longer performs a
-    /// separate full-payload block scan: a file with a structurally valid
+    /// Structural proof that `validate_q4_file` does not perform a separate
+    /// full-payload block scan: a file with a structurally valid
     /// header/geometry/extent but deliberately non-finite (NaN) block
     /// scale/bias must be *accepted* by `validate_q4_file` alone, because
-    /// that function only checks header/geometry/extent now. The exact same
+    /// that function only checks header/geometry/extent. The exact same
     /// bytes are still rejected by `load_q4_file`, which folds the
     /// per-block finite check into the single read-and-decode pass it
     /// already performs over the payload — proving the check moved rather
     /// than disappeared.
     ///
-    /// Mutation sensitivity: reverting the perf fix (re-adding the per-block
-    /// scan loop to `validate_q4_file`) makes `validate_q4_file` itself
-    /// reject this file, so `validate_q4_file_does_not_scan_block_payload`
-    /// goes red on the first assertion. Verified via reverse-apply + touch +
-    /// `cargo test` (see PR report).
+    /// This is a statement about the preflight in isolation, not about what
+    /// any load path admits: a consumer that never traverses the payload
+    /// discharges the same obligation eagerly via `open_and_mmap_q4_file`'s
+    /// `Q4BlockCheck::Now`, covered by the `mmap_entry_point_*` tests below.
+    ///
+    /// Mutation sensitivity: re-adding a per-block scan loop to
+    /// `validate_q4_file` makes `validate_q4_file` itself reject this file,
+    /// so this test goes red on the first assertion.
     #[test]
     fn validate_q4_file_does_not_scan_block_payload() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2492,6 +2629,136 @@ mod tests {
             load_result.is_err(),
             "load_q4_file must still reject non-finite block metadata, folded into its own \
              single payload read"
+        );
+    }
+
+    /// Write a single-block `.q4` file with the given scale/bias bit patterns
+    /// and return its path, keeping `tmp` alive in the caller.
+    fn write_single_block_q4(tmp: &tempfile::TempDir, scale: u16, bias: u16) -> std::path::PathBuf {
+        let path = tmp.path().join("block_metadata.q4");
+        std::fs::write(&path, q4_file_bytes(&[32], 32, scale, bias)).unwrap();
+        path
+    }
+
+    /// The no-copy mapping path never decodes a block on the CPU, so a NaN
+    /// scale reaches the GPU kernel unless the mapping entry point checks it.
+    /// Exercised without a Metal device: the guard lives in
+    /// `open_and_mmap_q4_file`, not in the Metal buffer construction that
+    /// follows it, so a machine with no GPU still runs the assertion instead
+    /// of skipping past it.
+    #[test]
+    fn mmap_entry_point_rejects_nan_scale_when_caller_does_not_traverse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_single_block_q4(&tmp, q4_f32_to_f16(f32::NAN), q4_f32_to_f16(0.0));
+
+        let Err(err) = open_and_mmap_q4_file(
+            &path,
+            Some(&[32]),
+            Q4BlockCheck::Now {
+                tensor_name: "nan scale weight",
+            },
+        ) else {
+            panic!("NaN block scale must not reach a no-copy GPU buffer");
+        };
+        assert!(
+            err.contains("block 0"),
+            "rejection must name the offending block: {err}"
+        );
+    }
+
+    #[test]
+    fn mmap_entry_point_rejects_infinite_scale_when_caller_does_not_traverse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_single_block_q4(&tmp, q4_f32_to_f16(f32::INFINITY), q4_f32_to_f16(0.0));
+
+        let Err(err) = open_and_mmap_q4_file(
+            &path,
+            Some(&[32]),
+            Q4BlockCheck::Now {
+                tensor_name: "infinite scale weight",
+            },
+        ) else {
+            panic!("infinite block scale must not reach a no-copy GPU buffer");
+        };
+        assert!(
+            err.contains("block 0"),
+            "rejection must name the offending block: {err}"
+        );
+    }
+
+    #[test]
+    fn mmap_entry_point_rejects_nan_bias_when_caller_does_not_traverse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_single_block_q4(&tmp, q4_f32_to_f16(1.0), q4_f32_to_f16(f32::NAN));
+
+        let Err(err) = open_and_mmap_q4_file(
+            &path,
+            Some(&[32]),
+            Q4BlockCheck::Now {
+                tensor_name: "nan bias weight",
+            },
+        ) else {
+            panic!("NaN block bias must not reach a no-copy GPU buffer");
+        };
+        assert!(
+            err.contains("block 0"),
+            "rejection must name the offending block: {err}"
+        );
+    }
+
+    /// The rejections above must come from the requested check, not from the
+    /// header preflight both variants share: the identical bytes are accepted
+    /// under `InCallerTraversal`, where the caller's own decode loop is what
+    /// discharges the obligation.
+    #[test]
+    fn mmap_entry_point_defers_block_check_to_a_traversing_caller() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_single_block_q4(&tmp, q4_f32_to_f16(f32::NAN), q4_f32_to_f16(f32::NAN));
+
+        let result = open_and_mmap_q4_file(
+            &path,
+            Some(&[32]),
+            Q4BlockCheck::InCallerTraversal {
+                traversal: "test stand-in for a caller decode loop",
+            },
+        );
+        let (_header, _mmap, checked) = result.unwrap_or_else(|e| {
+            panic!(
+                "a traversing caller validates during its own pass, so the mapping must be \
+                 handed out here: {e}"
+            )
+        });
+        assert!(
+            checked.is_none(),
+            "a deferred check must not hand out the witness that lets bytes be published \
+             to a consumer which never decodes them"
+        );
+    }
+
+    /// A well-formed file still maps cleanly under the eager check, and the
+    /// header it returns still describes the same payload.
+    #[test]
+    fn mmap_entry_point_accepts_well_formed_q4_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_single_block_q4(&tmp, q4_f32_to_f16(0.25), q4_f32_to_f16(-1.0));
+
+        let (header, mmap, checked) = open_and_mmap_q4_file(
+            &path,
+            Some(&[32]),
+            Q4BlockCheck::Now {
+                tensor_name: "well formed weight",
+            },
+        )
+        .expect("a well-formed Q4 file must still load through the eager-check path");
+        assert!(
+            checked.is_some(),
+            "an eagerly checked mapping must yield the witness a no-copy consumer needs"
+        );
+        assert_eq!(header.shape, vec![32]);
+        assert_eq!(header.original_len, 32);
+        assert_eq!(
+            mmap.len() as u64,
+            header.payload_offset + Q4_BLOCK_BYTES as u64
         );
     }
 

@@ -1145,7 +1145,18 @@ mod inner {
         }
 
         /// Wrap a no-copy Metal buffer backed by `mmap` with a non-zero payload offset.
-        fn from_mmap(buffer: Buffer, payload_offset: u64, mmap: memmap2::Mmap) -> Self {
+        ///
+        /// The GPU is the only thing that will ever read these bytes, so the
+        /// caller must present the [`Q4BlocksChecked`] witness that
+        /// `open_and_mmap_q4_file` issues for an eagerly checked mapping.
+        /// A caller that deferred the block check has no witness to pass and
+        /// cannot reach this constructor without visibly unwrapping a `None`.
+        fn from_mmap(
+            buffer: Buffer,
+            payload_offset: u64,
+            mmap: memmap2::Mmap,
+            _blocks_checked: crate::weights::q4_weights::Q4BlocksChecked,
+        ) -> Self {
             Q4WeightBuf {
                 buffer,
                 payload_offset,
@@ -1158,16 +1169,19 @@ mod inner {
     /// `StorageModeShared` buffer.  Stores the mmap owner inside the returned
     /// [`Q4WeightBuf`] so the pages remain valid for the lifetime of the buffer.
     ///
-    /// `validate_q4_file` here only checks header/geometry/exact file extent
-    /// (`O(1)`, no block bytes read) — this is the one Q4 load path with no
-    /// CPU-side pass over block bytes to fold a per-block scale/bias check
-    /// into (packed nibbles stay resident in the no-copy GPU buffer and are
-    /// dequantized by the Metal kernel at dispatch time, not read back to the
-    /// CPU). Adding a dedicated scan here would reintroduce exactly the
-    /// eager full-payload traversal this function is designed to avoid.
-    /// Every other Q4 path (CPU `load_q4_file`, Metal mmap-dequant-to-f16/f32,
-    /// per-expert MoE dequant) still validates scale/bias, folded into the
-    /// single pass each of those already makes over the payload.
+    /// This is the one Q4 load path whose bytes are never decoded on the CPU:
+    /// the packed nibbles stay resident in the no-copy GPU buffer and the
+    /// per-block scale/bias is dequantized by the Metal kernel at dispatch
+    /// time. There is therefore no traversal here to fold a scale/bias check
+    /// into, and a file with a correct header but a NaN or infinite scale
+    /// would otherwise load cleanly and propagate the NaN into the logits at
+    /// the first GEMV. The load requests [`Q4BlockCheck::Now`] so the check
+    /// happens before the buffer exists.
+    ///
+    /// That costs one sequential pass over the payload, faulting in pages
+    /// this no-copy mapping was otherwise designed not to touch — a real cost
+    /// paid once per weight at load, deliberately, because the alternative is
+    /// admitting non-finite weights to the GPU.
     ///
     /// # Safety invariant
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
@@ -1179,14 +1193,23 @@ mod inner {
         label: &str,
         expected_shape: &[usize],
     ) -> Result<Q4WeightBuf, String> {
-        use crate::weights::q4_weights::validate_q4_file;
+        use crate::weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
 
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        let header = validate_q4_file(&mut file, path, Some(expected_shape))
-            .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        let tensor_name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("native Q4 tensor");
+        let (header, mmap, blocks_checked) = open_and_mmap_q4_file(
+            path,
+            Some(expected_shape),
+            Q4BlockCheck::Now { tensor_name },
+        )?;
+        let blocks_checked = blocks_checked.ok_or_else(|| {
+            format!(
+                "{}: block metadata was not checked before no-copy GPU publication",
+                path.display()
+            )
+        })?;
 
         // The mmap pointer is page-aligned (guaranteed by the OS).  We create the Metal
         // buffer over the *whole* file so the pointer alignment requirement of
@@ -1200,7 +1223,12 @@ mod inner {
         );
         buf.set_label(label);
 
-        Ok(Q4WeightBuf::from_mmap(buf, header.payload_offset, mmap))
+        Ok(Q4WeightBuf::from_mmap(
+            buf,
+            header.payload_offset,
+            mmap,
+            blocks_checked,
+        ))
     }
 
     /// A Q3-quantized weight buffer (ADR-072 P1, #420 Stage 2), paired with the
@@ -14271,22 +14299,19 @@ mod inner {
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
             use crate::weights::q4_weights::{
-                q4_f16_to_f32, q4_f32_to_f16, validate_q4_block_metadata, validate_q4_file,
+                Q4BlockCheck, open_and_mmap_q4_file, q4_f16_to_f32, q4_f32_to_f16,
+                validate_q4_block_metadata,
             };
-            let mut file = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            // Header/geometry/extent only — no block scan (see
-            // `validate_q4_file`'s doc comment). Per-block scale/bias
-            // metadata is validated below, folded into the dequant loop this
-            // function already runs over the mmap'd payload, instead of a
-            // separate pre-scan that would force every page in before this
-            // mmap is even created.
-            let header = validate_q4_file(&mut file, path, Some(expected_shape))
-                .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-            // SAFETY: read-only mmap of a file this process does not mutate
-            // while running (same invariant as `mmap_q4_weight`).
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            // Per-block scale/bias is validated inside the dequant loop below,
+            // which already reads every block, instead of by a separate pass
+            // over the same bytes.
+            let (header, mmap, _) = open_and_mmap_q4_file(
+                path,
+                Some(expected_shape),
+                Q4BlockCheck::InCallerTraversal {
+                    traversal: "load_q4_mmap_dequant_f16 dequant loop",
+                },
+            )?;
             let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
                 format!(
                     "{}: payload_offset {} beyond mapped length {}",
@@ -14342,18 +14367,16 @@ mod inner {
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
             use crate::weights::q4_weights::{
-                dequantize_row_q4_0, validate_q4_block_metadata, validate_q4_file,
+                Q4BlockCheck, dequantize_row_q4_0, open_and_mmap_q4_file,
+                validate_q4_block_metadata,
             };
-            let mut file = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            // Header/geometry/extent only — no block scan (see
-            // `validate_q4_file`'s doc comment).
-            let header = validate_q4_file(&mut file, path, Some(expected_shape))
-                .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-            // SAFETY: read-only mmap of a file this process does not mutate
-            // while running (same invariant as `mmap_q4_weight`).
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            let (header, mmap, _) = open_and_mmap_q4_file(
+                path,
+                Some(expected_shape),
+                Q4BlockCheck::InCallerTraversal {
+                    traversal: "load_q4_mmap_dequant_f32 scale/bias loop",
+                },
+            )?;
             let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
                 format!(
                     "{}: payload_offset {} beyond mapped length {}",
