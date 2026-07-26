@@ -25,16 +25,28 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `System` imposes the same contract on `alloc` that this
+        // impl's caller has already satisfied, and `layout` reaches it
+        // unchanged. Counting is side-effect free with respect to that
+        // contract, so this delegation is sound exactly when the call into
+        // this allocator was.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: every pointer this allocator hands out comes from `System`,
+        // so a `ptr`/`layout` pair the caller validly passes here is one
+        // `System` allocated under that same layout. Both are forwarded
+        // unchanged.
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: same forwarding invariant as `dealloc` for `ptr`/`layout`,
+        // and `new_size` is passed through untouched for `System` to validate
+        // against its own contract.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
