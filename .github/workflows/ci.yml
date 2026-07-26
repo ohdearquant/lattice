@@ -482,6 +482,10 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.93.1"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Held one release behind every other rust-toolchain pin in this repository
+      # on purpose: this ref selects the MSRV compiler, so it tracks rust-version
+      # rather than the newest action revision. Automated updates for this action
+      # are turned off in .github/dependabot.yml for that reason.
       - uses: dtolnay/rust-toolchain@683cb613d4ff7d29ceb2fe421b81294b4319512a # 1.93.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
