@@ -74,12 +74,16 @@ impl CrossEncoderModel {
 
     /// Score a single (query, document) pair with a LoRA hook applied during the forward pass.
     ///
-    /// Validates the hook's declared projection geometry against this
-    /// model's BERT dimensions before the forward pass runs, so a malformed
-    /// or attacker-controlled adapter (e.g. one declaring `d_out` larger
-    /// than `hidden_size`) is rejected with a recoverable error instead of
-    /// `apply_lora` slicing out of bounds — see
-    /// [`LoraHook::validate_against_bert`].
+    /// Geometry validation is *delegated* to the hook: this method calls
+    /// [`LoraHook::validate_against_bert`] with the model's BERT dimensions
+    /// before the forward pass runs, and maps any `Err` to
+    /// [`InferenceError::InvalidInput`]. The trait's default implementation
+    /// of that method returns `Ok(())` — it trusts the caller — so an
+    /// adapter is checked here only to the extent that its own
+    /// implementation checks itself. Adapters obtained through this
+    /// workspace's own types (e.g. `lattice_tune::lora::LoraAdapter`)
+    /// override it and are validated, so a mismatched one is rejected with a
+    /// recoverable error rather than reaching the forward pass.
     pub fn score_with_hook(
         &self,
         query: &str,

@@ -86,6 +86,15 @@ Keeping the infallible signature as the primary API was considered and rejected.
 
 **Implementation note**: when D1 lands, the `LoraHook` trait doc comment (`crates/inference/src/lora_hook.rs:19-21`) and `LoraAdapter` module doc (`crates/tune/src/lora/mod.rs:12-15`) must be updated to include the BERT module names alongside the existing Qwen/GDN names.
 
+#### D1a: `validate_against_bert` ships with a fail-open default
+
+`validate_against_bert` is a new method on `LoraHook`, a trait that is public and unsealed and shipped before this change, so it needs a default body. Two arms were available:
+
+- **Fail-open (`Ok(())`)** — every existing downstream implementor keeps compiling, but validation becomes opt-in: a hook that does not override the method is trusted, so the "validates the geometry" statement above holds for adapters that check themselves, not for every hook the API accepts.
+- **Fail-closed (`Err(..)`)** — the guarantee holds for every hook unconditionally, but every existing downstream implementor breaks at once, and breaks at runtime rather than at compile time.
+
+**We take the fail-open arm.** The trait is already public and unsealed, so the fail-closed default would reject working third-party hooks that predate the method existing, which is a cost the geometry check does not earn: the residual exposure is bounded by `apply_lora`, which fails closed on its own shape check (`output.len() >= d_out`) and no-ops rather than slicing out of bounds. Measured at the public boundary, a non-overriding hook declaring `d_out > hidden_size` scores normally and its update is dropped — no panic, no partial write. Revisiting the default belongs with a sealing decision for the trait, not with this change.
+
 ### D2: Public SafeTensors save
 
 Implement a public save function in `crates/tune/src/lora/safetensors.rs`, using the existing test fixture (`write_test_peft_safetensors`, line 529) as a reference for the safetensors serialization API. The test helper writes hardcoded synthetic data for two layers; the public function must iterate an arbitrary `&LoraAdapter`'s layers, infer block names from module names, and write proper metadata:

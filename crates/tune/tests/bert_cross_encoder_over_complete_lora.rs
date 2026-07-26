@@ -11,14 +11,19 @@
 //! a correct adapter into a hard error at the public scoring API. This test
 //! drives a real `LoraAdapter` through that API against a tiny synthetic
 //! BERT cross-encoder checkpoint (no network access, no downloaded model).
+//!
+//! It also pins the behaviour of the other arm of that delegation: a hook
+//! that does *not* override `validate_against_bert` and declares a geometry
+//! the model disagrees with.
 
 #![cfg(feature = "inference-hook")]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use lattice_inference::lora_hook::LoraHook;
 use lattice_inference::model::CrossEncoderModel;
-use lattice_tune::lora::{LoraAdapter, LoraConfig, LoraLayer};
+use lattice_tune::lora::{LoraAdapter, LoraConfig, LoraLayer, apply_lora};
 
 const HIDDEN_SIZE: usize = 4;
 const INTERMEDIATE_SIZE: usize = 4;
@@ -275,5 +280,83 @@ fn cross_encoder_batch_scores_over_complete_lora_adapter() {
     assert!(
         scores.iter().all(|s| (0.0..=1.0).contains(s)),
         "scores {scores:?} out of sigmoid range"
+    );
+}
+
+/// A hook that applies a real `LoraLayer` through `apply_lora` but leaves
+/// `LoraHook::validate_against_bert` at its trait default, so the geometry
+/// check `score_with_hook` delegates to accepts it unconditionally. This is
+/// the shape any out-of-workspace implementor gets for free.
+struct UnvalidatedHook {
+    layer: LoraLayer,
+    module: &'static str,
+    scale: f32,
+}
+
+impl LoraHook for UnvalidatedHook {
+    fn apply(&self, _layer_idx: usize, module: &str, x: &[f32], output: &mut [f32]) {
+        if module != self.module {
+            return;
+        }
+        apply_lora(&self.layer, self.scale, x, output);
+    }
+}
+
+/// Targets `"ffn_output"`, whose per-row output buffer is `hidden_size`
+/// wide. Buffers are internally consistent with the declared `d_out`, so the
+/// only disagreement is between the adapter and the model.
+fn unvalidated_ffn_output_hook(d_out: usize) -> UnvalidatedHook {
+    let rank = 2;
+    UnvalidatedHook {
+        layer: LoraLayer {
+            a: fill(rank * INTERMEDIATE_SIZE, 19),
+            b: fill(d_out * rank, 20),
+            d_in: INTERMEDIATE_SIZE,
+            d_out,
+            rank,
+        },
+        module: "ffn_output",
+        // A LayerNorm follows the hooked projection, so a unit-scaled delta
+        // built from `fill` values moves the final score by ~1e-7 — inside
+        // f32 noise. Scale it up so "applied" and "not applied" are
+        // unambiguously distinguishable.
+        scale: 64.0,
+    }
+}
+
+/// A hook reaching the forward pass without applying anything — the
+/// reference score for "was the adapter applied at all?", taken through the
+/// same hooked forward path so no unhooked/hooked path difference can be
+/// mistaken for an applied update.
+struct NeutralHook;
+
+impl LoraHook for NeutralHook {
+    fn apply(&self, _layer_idx: usize, _module: &str, _x: &[f32], _output: &mut [f32]) {}
+}
+
+/// A non-overriding hook declaring `d_out > hidden_size` scores without
+/// panicking, and its update is not applied: `apply_lora` fails closed on
+/// the `output.len() >= d_out` clause, so the projection row is left exactly
+/// as the base weights produced it.
+#[test]
+fn cross_encoder_drops_the_update_of_an_unvalidated_oversized_hook() {
+    let dir = build_synthetic_cross_encoder_dir();
+    let model = CrossEncoderModel::from_directory(dir.path()).unwrap();
+
+    let reference = model
+        .score_with_hook("what is rust", "rust is a language", &NeutralHook)
+        .expect("a hook that applies nothing must score");
+    let oversized = model
+        .score_with_hook(
+            "what is rust",
+            "rust is a language",
+            &unvalidated_ffn_output_hook(HIDDEN_SIZE + 1),
+        )
+        .expect("an unvalidated oversized hook must not error at this boundary");
+
+    assert_eq!(
+        oversized, reference,
+        "an oversized d_out must leave the projection untouched, not apply a \
+         partial update"
     );
 }
