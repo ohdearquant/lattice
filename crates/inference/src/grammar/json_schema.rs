@@ -695,29 +695,38 @@ impl<'a> CompileCtx<'a> {
             })
         });
         if !target_is_representable || target_type != Some("object") {
-            // The plain `$ref` path preserves the target's own assertion only
-            // for the keywords `compile_schema_inner` dispatches AHEAD of
-            // object compilation: `enum` and `const`, which return a language
-            // narrow enough that also dropping the sibling cannot widen past
-            // the referenced schema. Falling back is right there.
+            // Falling back to the plain `$ref` path here is NOT safe, and the
+            // tempting argument for it is subtly wrong in a way worth naming.
             //
-            // For anything else it is not. An unrepresentable keyword this
-            // compiler does not support (`additionalProperties`,
-            // `minProperties`, `patternProperties`, ...) is IGNORED by the
-            // plain path, so falling back would preserve nothing from the
-            // target and drop the caller's `required`/`properties` as well —
-            // returning `Ok` on a grammar wider than either operand. An
-            // untyped target is the same shape: it compiles to "any JSON
-            // value", which admits every object the siblings were meant to
-            // exclude.
+            // That argument runs: for a target carrying `enum`/`const` — which
+            // `compile_schema_inner` dispatches ahead of object compilation —
+            // the plain path compiles the target's own narrow language, so
+            // dropping the sibling cannot widen past the referenced schema.
+            // Every step is true and the conclusion still does not follow. The
+            // schema's language is the CONJUNCTION of target and siblings,
+            // which is narrower than the target alone; "no wider than the
+            // target" is therefore not the bound that matters. With
+            // `$defs.Base = {"type":"object","enum":[{},{"x":1}]}` and a
+            // `required: ["x"]` sibling, the schema admits only `{"x":1}`,
+            // while the target alone also admits `{}`.
             //
-            // Reject instead. A constrained-decoding grammar that accepts
-            // strings the schema forbids fails at the caller's parser, after
-            // the tokens are spent; a schema this compiler declines to compile
-            // fails here, loudly, at compile time.
-            if target.get("enum").is_some() || target.get("const").is_some() {
-                return self.compile_ref(ref_str);
-            }
+            // For a keyword this compiler does not support at all
+            // (`additionalProperties`, `minProperties`, `patternProperties`,
+            // ...) the plain path is worse still: it IGNORES the keyword, so
+            // the fallback keeps nothing from the target AND drops the
+            // sibling. An untyped target is the same shape once more — it
+            // compiles to "any JSON value", which admits every object the
+            // siblings exist to exclude.
+            //
+            // So every non-representable target is rejected, with no carve
+            // out. A constrained-decoding grammar that accepts strings the
+            // schema forbids fails at the caller's parser, after the tokens
+            // are spent; a schema this compiler declines to compile fails
+            // here, loudly, at compile time. Filtering a finite `enum` by the
+            // siblings would be a real conjunction and is the natural way to
+            // lift this, but it needs instance validation this compiler does
+            // not have, so it is deliberately left undone rather than
+            // approximated.
             return Err(SchemaError(format!(
                 "`$ref` to {ref_str} carries `required`/`properties` siblings that must \
                  be applied as a conjunction, but the target is not expressible as one: \
@@ -4898,59 +4907,65 @@ mod tests {
 
     /// The merge rebuilds the target from `properties`/`required` alone, so a
     /// target carrying any further assertion must NOT take the merge path: the
-    /// rebuild cannot express that assertion and would drop it.
+    /// rebuild cannot express that assertion and would drop it. An `enum`
+    /// target is the sharpest case, because the obvious alternative to
+    /// rejecting — fall back to the plain `$ref` path, which dispatches `enum`
+    /// ahead of object compilation and so keeps the target's own assertion —
+    /// is wrong for a reason that does not show up unless the sibling is
+    /// chosen carefully.
     ///
-    /// Here the target is object-typed (so the non-object guard above does not
-    /// catch it) and additionally pinned by `enum` to the single value
-    /// `{"x":1}`. `compile_schema_inner` dispatches `enum` ahead of object
-    /// compilation, so the plain `$ref` path compiles exactly that one value.
-    /// A merge seeing only `properties.x: integer` and `required: ["x"]` would
-    /// admit `{"x":2}` — an over-accept of the whole referenced schema rather
-    /// than of one dropped sibling.
+    /// The sibling here is deliberately NOT redundant: `enum` admits both `{}`
+    /// and `{"x":1}`, and `required: ["x"]` excludes the first, so the
+    /// schema's language is `{"x":1}` alone. Compiling the target by itself
+    /// would accept `{}` — wider than the conjunction even though it is no
+    /// wider than the target. A test whose enum members all satisfy the
+    /// sibling cannot tell the two apart and would pass either way.
     #[test]
-    fn ref_sibling_merge_declines_a_target_with_an_enum_assertion() {
+    fn ref_sibling_merge_rejects_a_target_with_an_enum_assertion() {
         let schema = serde_json::json!({
             "$defs": {
                 "Base": {
                     "type": "object",
-                    "enum": [{ "x": 1 }],
+                    "enum": [{}, { "x": 1 }],
                     "properties": { "x": { "type": "integer" } }
                 }
             },
             "$ref": "#/$defs/Base",
             "required": ["x"]
         });
-        let g = compile(&schema).unwrap();
-        assert!(
-            accepts(&g, b"{\"x\":1}"),
-            "the enum's own value must compile"
+        let err = compile(&schema).expect_err(
+            "the conjunction of an enum target and a required sibling is not representable",
         );
         assert!(
-            rejects(&g, b"{\"x\":2}"),
-            "target's enum assertion must survive: merging it away admits every integer x"
+            err.0.contains("conjunction"),
+            "error should name the unrepresentable conjunction, got: {}",
+            err.0
         );
     }
 
-    /// The same guard for `const`, which `compile_schema_inner` dispatches on
-    /// the same precedence as `enum`.
+    /// The same rejection for `const`, which `compile_schema_inner` dispatches
+    /// at the same precedence as `enum`. `const: {}` against `required: ["x"]`
+    /// is the degenerate case: the conjunction matches NO value at all, so any
+    /// grammar that compiles and accepts something is wrong by construction.
     #[test]
-    fn ref_sibling_merge_declines_a_target_with_a_const_assertion() {
+    fn ref_sibling_merge_rejects_a_target_with_a_const_assertion() {
         let schema = serde_json::json!({
             "$defs": {
                 "Base": {
                     "type": "object",
-                    "const": { "x": 1 },
+                    "const": {},
                     "properties": { "x": { "type": "integer" } }
                 }
             },
             "$ref": "#/$defs/Base",
             "required": ["x"]
         });
-        let g = compile(&schema).unwrap();
-        assert!(accepts(&g, b"{\"x\":1}"), "the const value must compile");
+        let err = compile(&schema)
+            .expect_err("a const target contradicting its sibling cannot compile to a language");
         assert!(
-            rejects(&g, b"{\"x\":2}"),
-            "target's const assertion must survive the sibling merge"
+            err.0.contains("conjunction"),
+            "error should name the unrepresentable conjunction, got: {}",
+            err.0
         );
     }
 
