@@ -2728,17 +2728,66 @@ fn check_one_of_exclusivity(branches: &[Value]) -> Result<(), SchemaError> {
         if seen.len().saturating_add(values.len()) > MAX_STRING_LITERALS {
             return Ok(());
         }
-        for v in values {
-            let key = serde_json::to_string(&v)
-                .map_err(|e| SchemaError(format!("cannot JSON-encode oneOf literal: {e}")))?;
-            if !seen.insert(key) {
+        // A branch's own values join `seen` only once the whole branch has
+        // been measured against it. A value repeated inside ONE branch
+        // (`{"enum":["a","a"]}`, which draft 2020-12 permits — `enum` members
+        // SHOULD be unique, not MUST) does not give an instance a second
+        // matching branch, so folding the branch in value-by-value would make
+        // it collide with itself and report an earlier branch that need not
+        // exist.
+        let mut branch_keys: Vec<String> = Vec::with_capacity(values.len());
+        for v in &values {
+            let key = overlap_key(v)?;
+            if seen.contains(&key) {
                 return Err(SchemaError(format!(
                     "oneOf branch {i} overlaps an earlier branch on literal value {v}: oneOf requires mutually exclusive branches"
                 )));
             }
+            branch_keys.push(key);
         }
+        seen.extend(branch_keys);
     }
     Ok(())
+}
+
+/// The key on which two `oneOf` branches' literals are held to collide.
+///
+/// JSON Schema compares instances by value, and numbers are arbitrary-precision
+/// decimals compared by mathematical value, so `1` and `1.0` are the SAME
+/// instance. `serde_json`'s rendering preserves the spelling a number was
+/// written with (`"1"` against `"1.0"`), which would let those two branches
+/// pass as distinct. A number whose mathematical value is an integer inside
+/// `i64` range is therefore keyed by that integer.
+///
+/// Deliberately NOT canonicalized through `f64`: past 2^53 distinct integers
+/// share a single `f64`, and a collision here reports an overlap between
+/// branches that are in fact exclusive — rejecting a correct schema. That is
+/// the worse direction of error, so the conversion is applied only where it is
+/// exact and every other value falls back to its rendering, which at worst
+/// leaves an overlap undetected.
+fn overlap_key(v: &Value) -> Result<String, SchemaError> {
+    if let Value::Number(n) = v {
+        if let Some(i) = n.as_i64() {
+            return Ok(format!("n:{i}"));
+        }
+        if let Some(u) = n.as_u64() {
+            return Ok(format!("n:{u}"));
+        }
+        // `f as i64` saturates rather than wrapping, so the range test is what
+        // keeps two far-apart magnitudes off the same key. Both bounds are
+        // exactly representable, and every `f64` in the half-open range whose
+        // fractional part is zero converts to `i64` without loss.
+        if let Some(f) = n.as_f64()
+            && f.fract() == 0.0
+            && f >= -(2f64.powi(63))
+            && f < 2f64.powi(63)
+        {
+            return Ok(format!("n:{}", f as i64));
+        }
+    }
+    serde_json::to_string(v)
+        .map(|s| format!("j:{s}"))
+        .map_err(|e| SchemaError(format!("cannot JSON-encode oneOf literal: {e}")))
 }
 
 /// Fold `values` into the running `literals`/`byte_total` accumulators shared
@@ -4166,6 +4215,66 @@ mod tests {
             "error should name the oneOf violation, got: {}",
             err.0
         );
+    }
+
+    /// A repeated member inside ONE `enum` is not two branches. Draft 2020-12
+    /// says `enum` values SHOULD be unique, not MUST, and a duplicate member
+    /// does not give the instance a second branch to match, so this schema is
+    /// genuinely exclusive and must compile. Comparing a branch's raw value
+    /// list against the shared cross-branch set makes the branch collide with
+    /// ITSELF, which is both a false rejection and an error message naming an
+    /// "earlier branch" that does not exist for branch 0.
+    #[test]
+    fn oneof_duplicate_enum_member_within_one_branch_is_not_an_overlap() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"enum": ["a", "a"]},
+                {"const": "b"}
+            ]
+        });
+        let g = compile_json_schema(&schema)
+            .expect("a duplicate inside one enum does not give a value a second matching branch");
+        assert!(accepts(&g, b"\"a\""), "the duplicated member still matches");
+        assert!(accepts(&g, b"\"b\""), "the other branch still matches");
+    }
+
+    /// JSON Schema compares numbers by mathematical value, so `1` and `1.0`
+    /// are the SAME instance and these two branches both match it. Keying the
+    /// overlap set by lexical JSON rendering separates them (`"1"` vs `"1.0"`)
+    /// and lets an ambiguous `oneOf` compile.
+    #[test]
+    fn oneof_integer_and_float_spelling_of_one_value_overlap() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": 1},
+                {"const": 1.0}
+            ]
+        });
+        let err = compile_json_schema(&schema)
+            .expect_err("1 and 1.0 are the same number, so both branches match it");
+        assert!(
+            err.0.contains("oneOf"),
+            "error should name the oneOf violation, got: {}",
+            err.0
+        );
+    }
+
+    /// The other direction of the same keying rule, and the reason it must not
+    /// route through `f64`: these two integers are distinct but land on the
+    /// same `f64` past 2^53, so a lossy canonicalization would report a false
+    /// overlap and reject a schema whose branches really are exclusive.
+    /// Compiling at all is the assertion here.
+    #[test]
+    fn oneof_large_integers_indistinguishable_as_f64_stay_distinct() {
+        let schema = serde_json::json!({
+            "oneOf": [
+                {"const": 9007199254740993i64},
+                {"const": 9007199254740992i64}
+            ]
+        });
+        let g = compile_json_schema(&schema)
+            .expect("integers differing past f64 precision are distinct values");
+        assert!(accepts(&g, b"9007199254740993"));
     }
 
     /// A nested union with an EXTRA sibling key (`"description"`) is NOT a
