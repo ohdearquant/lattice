@@ -465,6 +465,71 @@ class BenchDispositionCheck(unittest.TestCase):
         )
         self.assertTrue(has_disposition(body))
 
+    def test_long_body_with_valid_disposition_passes(self):
+        # A compliant description must not be rejected for being LONG. The gate
+        # used to pipe the body into readers that exit early (`grep -q`, and the
+        # section `awk`); once the reader exited, the writing `printf` took EPIPE
+        # and `set -o pipefail` promoted that to the gate's result. Short bodies
+        # never tripped it because the whole write fits in the pipe buffer and
+        # completes before the reader leaves, so the outcome depended on size and
+        # on scheduling: the same description passed locally and failed in CI.
+        #
+        # The padding here is well past a 64KiB pipe buffer so the pre-fix failure
+        # is deterministic rather than marginal. The disposition is a blessed
+        # one-liner, so nothing but length distinguishes this from
+        # test_real_heading_with_content_passes.
+        body = (
+            "## bench-compare disposition\n"
+            "bench-compare showed no change (p > 0.05 on all groups).\n\n"
+            + "".join(
+                f"padding line {i} standing in for the prose a long PR body carries\n"
+                for i in range(2000)
+            )
+        )
+        self.assertGreater(len(body), 64 * 1024)
+        self.assertTrue(has_disposition(body))
+
+    def test_long_body_without_disposition_still_fails(self):
+        # The companion to the case above: the length fix must not turn into a
+        # blanket pass for big bodies. Same size, no disposition heading.
+        body = "".join(
+            f"unrelated prose line {i} that says nothing about the gate\n"
+            for i in range(2000)
+        )
+        self.assertGreater(len(body), 64 * 1024)
+        self.assertFalse(has_disposition(body))
+
+    def test_long_body_is_fast_under_system_bash(self):
+        # Guards the OTHER way to get the pipe out of the reads: doing the
+        # whitespace work in the shell (`"${BODY//[[:space:]]/}"`) instead of
+        # handing it to grep/tr. That removes a subprocess but is quadratic-ish
+        # on bash 3.2, which is what macOS ships as /bin/bash and what the
+        # script's own local usage line invokes. Measured on this repo's
+        # host: a valid 16KB body took 3.2s that way versus 0.06s through
+        # grep, and a 64KB body did not finish inside 30s.
+        #
+        # Read the discriminating power honestly: on macOS /bin/bash is 3.2 and
+        # this case catches that shape outright. On a Linux runner /bin/bash is
+        # 5.x, where the shell form is fast and this case cannot fail. It is a
+        # real guard locally and a no-op in CI, which is the reverse of the
+        # usual arrangement and worth knowing before trusting a green run.
+        system_bash = Path("/bin/bash")
+        if not system_bash.exists():
+            self.skipTest("no /bin/bash on this platform")
+        body = (
+            "## bench-compare disposition\n"
+            "bench-compare showed no change (p > 0.05 on all groups).\n\n"
+            + "x" * (64 * 1024)
+        )
+        result = subprocess.run(
+            [str(system_bash), str(SCRIPT)],
+            input=body,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
