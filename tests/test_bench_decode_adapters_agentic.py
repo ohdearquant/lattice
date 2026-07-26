@@ -99,6 +99,35 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(parsed.actual_prompt_tokens, 1007)
         self.assertEqual(parsed.native_ns, 250_500_000)
 
+    def test_prompt_marker_must_be_a_whole_line(self):
+        """An embedded marker must not be mined for benchmark evidence.
+
+        The emitter writes `[bench] prompt_tokens=N` alone on a line. An
+        unanchored search accepts it inside a longer diagnostic and reports
+        whatever digits follow `=` as the measured prompt length, so this
+        fails if the match is loosened back to `search` over the whole blob.
+        """
+        with self.assertRaises(agentic.AdapterOutputError):
+            agentic.parse_lattice_output(
+                "RESULT n_req=100 completion=100 total_ms=250.5\n",
+                "note: retrying after [bench] prompt_tokens=9999 was rejected\n",
+                n_tokens=100,
+            )
+
+    def test_prompt_marker_must_appear_exactly_once(self):
+        """Two markers mean two candidate answers, so neither may be picked.
+
+        Fails if the parser reverts to taking the first match, which is what
+        an unanchored search does and what makes a stale line from an earlier
+        attempt indistinguishable from this run's diagnostic.
+        """
+        with self.assertRaises(agentic.AdapterOutputError):
+            agentic.parse_lattice_output(
+                "RESULT n_req=100 completion=100 total_ms=250.5\n",
+                "[bench] prompt_tokens=1007\n[bench] prompt_tokens=2014\n",
+                n_tokens=100,
+            )
+
     def test_ollama_components_are_ttft_and_total(self):
         result = agentic.ollama_response_to_result(
             {
@@ -145,6 +174,36 @@ class CanonicalCliTest(unittest.TestCase):
         self.assertIn("tokenizer load failed", missing["mlx"])
         self.assertIn("tokenizer-padded prompt", missing["lattice"])
         self.assertTrue(prompt.startswith(agentic.BASE))
+
+
+class ExitStatusMeansMeasuredTest(unittest.TestCase):
+    """A zero exit must mean a measurement happened, not that reporting finished.
+
+    `--allow-missing-engine` exists so a sweep can proceed when one framework is
+    not installed. It must not also let a run where EVERY engine was absent
+    report success: the status notices print either way, and a caller reading
+    only the exit code cannot distinguish a full comparison from a table of
+    unavailable rows.
+    """
+
+    def test_all_engines_unavailable_is_a_failure(self):
+        unavailable = [
+            {"engine": "mlx", "source": "unavailable", "unavailable_reason": "not installed"},
+            {"engine": "lattice", "source": "unavailable", "unavailable_reason": "not built"},
+        ]
+        with mock.patch.object(agentic, "run_context", return_value=unavailable):
+            status = agentic.main(["--ctx", "1024", "--runs", "1", "--allow-missing-engine"])
+        self.assertEqual(status, 1, "a run that measured nothing must not exit 0")
+
+    def test_one_live_row_among_unavailable_ones_still_succeeds(self):
+        """The tolerance the flag was added for must survive the stricter check."""
+        mixed = [
+            {"engine": "mlx", "source": "unavailable", "unavailable_reason": "not installed"},
+            {"engine": "lattice", "source": "live", "tok_s": 157.0},
+        ]
+        with mock.patch.object(agentic, "run_context", return_value=mixed):
+            status = agentic.main(["--ctx", "1024", "--runs", "1", "--allow-missing-engine"])
+        self.assertEqual(status, 0)
 
 
 if __name__ == "__main__":

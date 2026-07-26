@@ -41,7 +41,12 @@ BASE = (
 )
 
 _RESULT_RE = re.compile(r"^RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)$")
-_PROMPT_RE = re.compile(r"\[bench\] prompt_tokens=(\d+)")
+# Anchored and matched per line, like _RESULT_RE above. The emitter writes this
+# marker alone on a line (`eprintln!("[bench] prompt_tokens={}", ...)`), so a
+# whole-line match loses nothing, while an unanchored search over the whole
+# stderr blob would accept the marker embedded in a longer diagnostic and turn
+# whatever followed `=` into benchmark evidence.
+_PROMPT_RE = re.compile(r"^\[bench\] prompt_tokens=(\d+)$")
 
 
 class AdapterOutputError(RuntimeError):
@@ -103,9 +108,14 @@ def parse_lattice_output(stdout: str, stderr: str, *, n_tokens: int) -> harness.
     elapsed_ms = float(total_ms)
     if not math.isfinite(elapsed_ms) or elapsed_ms < 0:
         raise AdapterOutputError(f"lattice: invalid total_ms={total_ms}")
-    prompt_match = _PROMPT_RE.search(stderr)
-    if prompt_match is None:
-        raise AdapterOutputError("lattice: missing prompt_tokens diagnostic")
+    prompt_matches = [
+        match for line in stderr.splitlines() if (match := _PROMPT_RE.fullmatch(line))
+    ]
+    if len(prompt_matches) != 1:
+        raise AdapterOutputError(
+            f"lattice: expected one prompt_tokens diagnostic, found {len(prompt_matches)}"
+        )
+    prompt_match = prompt_matches[0]
     return harness.AdapterRunResult(
         actual_completion_tokens=int(completion),
         actual_prompt_tokens=int(prompt_match.group(1)),
@@ -445,6 +455,22 @@ def main(argv: list[str] | None = None) -> int:
         print("\n*** FRAMEWORK STATUS NOTICES ***")
         for row in notices:
             print(f"  {row['engine']}: UNAVAILABLE — {row.get('unavailable_reason', 'unknown reason')}")
+
+    # A zero exit has to mean something was MEASURED, not merely that the
+    # reporting path ran to the end. `--allow-missing-engine` lets a run proceed
+    # when an engine is absent, which is right for a sweep where one framework is
+    # not installed; it must not also let a run where EVERY engine was absent
+    # report success. The notices above are printed either way, and a caller
+    # reading only the status code cannot tell a full comparison from a table of
+    # unavailable rows.
+    live_rows = [row for row in all_rows if row.get("source") == "live"]
+    if not live_rows:
+        print(
+            "FAIL: no engine produced a measured row; every engine was unavailable. "
+            "--allow-missing-engine tolerates a missing engine, not a missing measurement.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
