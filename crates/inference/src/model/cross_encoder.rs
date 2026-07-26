@@ -114,8 +114,11 @@ impl CrossEncoderModel {
 
     /// Score a query against a batch of documents with a LoRA hook applied during each forward pass.
     ///
-    /// The hook is validated once at the batch boundary, before any document
-    /// is scored. Delegating validation to the per-document method alone would
+    /// The hook is validated at the batch boundary, before any document is
+    /// scored, and again by each per-document call this delegates to; the
+    /// `validate_hook` helper documents why both calls are kept. The boundary call
+    /// is what makes validation a property of the request: delegating it to
+    /// the per-document method alone would
     /// tie it to the number of documents: an empty slice never enters the
     /// closure, so the request would answer `Ok(vec![])` without the hook ever
     /// having been asked about its geometry. A caller admitting an adapter on

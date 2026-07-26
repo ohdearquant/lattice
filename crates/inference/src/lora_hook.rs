@@ -61,6 +61,11 @@ pub trait LoraHook: Send + Sync {
     ///
     /// Implement it for any hook whose geometry is known. Leaving it at the
     /// default opts that hook out of the rejection, not into it.
+    ///
+    /// This may be called more than once for a single request: a batch of N
+    /// documents calls it N+1 times, once at the batch boundary and once per
+    /// document. Implement it as a repeatable read of declared dimensions, not
+    /// as a one-shot operation with side effects.
     fn validate_against_bert(
         &self,
         _num_hidden_layers: usize,
