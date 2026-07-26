@@ -335,9 +335,16 @@ impl LoraHook for NeutralHook {
 }
 
 /// A non-overriding hook declaring `d_out > hidden_size` scores without
-/// panicking, and its update is not applied: `apply_lora` fails closed on
-/// the `output.len() >= d_out` clause, so the projection row is left exactly
-/// as the base weights produced it.
+/// panicking, and its update is not applied: `apply_lora`'s shape check is an
+/// exact-width match (`output.len() == d_out`), which this hook fails, so it
+/// returns early and the projection row is left exactly as the base weights
+/// produced it.
+///
+/// The predicate is exact deliberately. The inequality it replaced —
+/// `output.len() >= d_out` — passed for an under-declared `d_out`, and the
+/// accumulate loop then wrote an update across a prefix of the row while the
+/// rest kept base weights: no panic, no error, a plausible wrong score. Do not
+/// restore the inequality to make this test read more naturally.
 #[test]
 fn cross_encoder_drops_the_update_of_an_unvalidated_oversized_hook() {
     let dir = build_synthetic_cross_encoder_dir();
