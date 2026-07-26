@@ -45,13 +45,22 @@ pub trait LoraHook: Send + Sync {
     /// against a BERT cross-encoder model's dimensions before it is used
     /// for hooked scoring.
     ///
+    /// This is the hook's OWN check, and the default below returns `Ok(())`:
+    /// a hook that does not override it is trusted, and nothing else on the
+    /// scoring path re-checks its geometry.
+    ///
     /// [`crate::model::cross_encoder::CrossEncoderModel::score_with_hook`]
-    /// calls this before the forward pass (and before any row is sliced),
-    /// so a mismatched adapter is rejected with a recoverable error instead
-    /// of `apply_lora` slicing `output[..lora.d_out]` out of bounds past a
-    /// `debug_assert` that release builds compile out. Default: no-op
-    /// (trusts the caller) — real adapters with known geometry (e.g.
-    /// `lattice_tune::lora::LoraAdapter`) override it.
+    /// and `score_batch_with_hook` call this before the forward pass (and
+    /// before any row is sliced) and map an `Err` to
+    /// [`crate::error::InferenceError::InvalidInput`]. So it is an
+    /// OVERRIDING implementation — `lattice_tune::lora::LoraAdapter` is the
+    /// one in this workspace — that makes a mismatched adapter fail with a
+    /// recoverable error instead of `apply_lora` slicing
+    /// `output[..lora.d_out]` out of bounds past a `debug_assert` that
+    /// release builds compile out.
+    ///
+    /// Implement it for any hook whose geometry is known. Leaving it at the
+    /// default opts that hook out of the rejection, not into it.
     fn validate_against_bert(
         &self,
         _num_hidden_layers: usize,
