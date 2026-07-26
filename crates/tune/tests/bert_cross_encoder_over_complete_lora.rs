@@ -360,3 +360,46 @@ fn cross_encoder_drops_the_update_of_an_unvalidated_oversized_hook() {
          partial update"
     );
 }
+
+/// The other direction, and it does NOT behave like the one above.
+///
+/// `apply_lora`'s shape check is `output.len() >= d_out`, an inequality, and
+/// the accumulate loop writes `output[..d_out]`. An UNDER-declared `d_out`
+/// therefore passes the check and writes a partial row: the first `d_out`
+/// elements receive an update computed for a geometry the model does not have,
+/// and the remainder are left as the base weights produced them. No panic, no
+/// error, and a finite score comes back.
+///
+/// This is a characterization test, not an endorsement. It exists because
+/// ADR-057 D1a bounds the residual exposure of the fail-open
+/// `validate_against_bert` default by pointing at this guard, and that bound
+/// holds against out-of-bounds slicing but not against a partial write. Pinning
+/// the behaviour keeps the ADR's claim checkable: if the fail-closed arm lands
+/// at 0.8.0, this test is the one that must change.
+#[test]
+fn cross_encoder_partially_applies_an_unvalidated_undersized_hook() {
+    let dir = build_synthetic_cross_encoder_dir();
+    let model = CrossEncoderModel::from_directory(dir.path()).unwrap();
+
+    let reference = model
+        .score_with_hook("what is rust", "rust is a language", &NeutralHook)
+        .expect("a hook that applies nothing must score");
+    let undersized = model
+        .score_with_hook(
+            "what is rust",
+            "rust is a language",
+            &unvalidated_ffn_output_hook(HIDDEN_SIZE - 1),
+        )
+        .expect("an unvalidated undersized hook does not error at this boundary");
+
+    assert!(
+        undersized.is_finite() && (0.0..=1.0).contains(&undersized),
+        "score {undersized} out of sigmoid range"
+    );
+    assert_ne!(
+        undersized, reference,
+        "an undersized d_out passes the `output.len() >= d_out` check and writes \
+         output[..d_out]; the score must differ from the untouched reference, \
+         which is precisely the exposure the fail-open default leaves open"
+    );
+}
