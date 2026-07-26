@@ -61,7 +61,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - id: filter
@@ -111,8 +111,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: rustfmt, clippy
       - name: Pin the real toolchain bin on PATH
@@ -123,7 +123,7 @@ jobs:
         # later step (cache, clean, ci.sh) gets a working cargo. No-op on healthy
         # images and on Linux.
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           cache-on-failure: true
       - name: Clean lattice crates (force rebuild, keep dep cache)
@@ -152,13 +152,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: clippy
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: feature-matrix
           cache-on-failure: true
@@ -173,6 +173,12 @@ jobs:
       # buffer bounds). Build AND run them here so the feature cannot rot silently.
       - name: tune — mixture (online router-refit, build + run tests)
         run: cargo test -p lattice-tune --features mixture --lib
+      # simulated-teacher gates the deterministic fixed-label test/example path
+      # (label_single_simulated, label_batch_simulated). Off by default, so the
+      # required `ci` job never compiles or runs it. Build AND run here so the
+      # opt-in API cannot rot silently.
+      - name: tune — simulated-teacher (build + run tests)
+        run: cargo test -p lattice-tune --features simulated-teacher --lib
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
       # wgpu-gpu is excluded from default builds and was silently broken under
@@ -182,6 +188,23 @@ jobs:
         run: cargo build -p lattice-inference --features wgpu-gpu
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
+      # Run this target alone. `-p lattice-embed` resolves lattice-embed's own
+      # `lattice-inference` feature table in isolation, which is the configuration
+      # a standalone `cargo build -p lattice-embed`, `cargo install lattice-embed`,
+      # or the wasm/npm build actually gets — and the one that drifted in #1094.
+      #
+      # Two things keep this out of the workspace-wide runs. The failure is
+      # runtime-only: `SafetensorsFile` returns `InvalidSafetensors` for a
+      # half-precision tensor rather than failing to build, so the `--no-run`
+      # steps above cannot observe it. And lattice-tune's optional
+      # `lattice-inference` dependency carries `features = ["f16"]`, so any
+      # invocation that activates tune's `inference-hook` or `train-backward`
+      # alongside lattice-embed unifies that `f16` into embed for free and the
+      # regression reads green. Neither tune feature is in its defaults today, so
+      # `cargo test --workspace` does not do this — but nothing enforces that,
+      # which is why the guard runs on the isolated resolve instead. See #1095.
+      - name: embed — f16 native dependency load guard (standalone, no workspace unification)
+        run: cargo test -p lattice-embed --test f16_feature_load_guard
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'
@@ -370,9 +393,14 @@ jobs:
       # #611 (medium): the three tests above only reach
       # the post-prefill masking site (their fixture blocks every vocab entry
       # from step 0), so removing a DECODE-LOOP `has_finite_logit` guard left
-      # them green. These three companion tests use a grammar that allows
-      # exactly one token then blocks every continuation, so they exercise
-      # the second, decode-loop guard site in each of the three functions.
+      # them green. These three companion tests use a grammar that dead-ends
+      # mid-document (a required continuation byte absent from the vocab), so
+      # they exercise the second, decode-loop guard site in each of the three
+      # functions. (#1064 renamed these from
+      # `fails_closed_on_grammar_blocking_second_token`: that name's fixture
+      # actually tested a grammar completing on its second token, which is a
+      # successful stop, not a fail-closed case — see
+      # `*_completed_grammar_is_success` below.)
       - name: inference — Metal grammar fail-closed decode-loop gate (macOS only)
         if: runner.os == 'macOS'
         env:
@@ -380,7 +408,7 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP:-/tmp}/metal-grammar-failclosed-decode-test.log"
-          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_grammar_blocking_second_token -- --nocapture 2>&1 | tee "$log"
+          cargo test -p lattice-inference --features f16,metal-gpu --lib fails_closed_on_grammar_dead_end -- --nocapture 2>&1 | tee "$log"
           grep -Eq '^test result: ok\. 3 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # Issue #252 (#238 follow-up): the f16 KV-cache Metal path (opt-in via
       # LATTICE_KV_F16) had no automated test. GitHub's hosted macos-latest
@@ -417,11 +445,11 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: bench-compile
           cache-on-failure: true
@@ -453,11 +481,19 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.93.1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Held one release behind every other rust-toolchain pin in this repository
+      # on purpose: this ref installs the MSRV compiler, which RUSTUP_TOOLCHAIN
+      # above then selects. The ref tracks rust-version rather than the newest
+      # action revision, so automated updates for this action are turned off in
+      # .github/dependabot.yml. Installing is not selecting: dropping
+      # RUSTUP_TOOLCHAIN while keeping this ref would let rust-toolchain.toml
+      # outrank the action's `rustup default`, which is the regression the
+      # comment above describes.
+      - uses: dtolnay/rust-toolchain@683cb613d4ff7d29ceb2fe421b81294b4319512a # 1.93.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: msrv
           cache-on-failure: true
@@ -474,13 +510,13 @@ jobs:
     name: cargo-deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: licenses + bans + sources (required)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check licenses bans sources
       - name: advisories (informational)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         continue-on-error: true
         with:
           command: check advisories
@@ -495,11 +531,11 @@ jobs:
     name: rustdoc-lint (informational)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: rustdoc-lint
           cache-on-failure: true
@@ -523,13 +559,13 @@ jobs:
     name: unwrap-in-lib-lint (informational)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: clippy
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: unwrap-in-lib-lint
           cache-on-failure: true
@@ -544,8 +580,8 @@ jobs:
     name: typos
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: crate-ci/typos@v1.48.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
 
   # Cheap ubuntu workflow/config lint. Catches malformed expressions, unknown
   # contexts/inputs, shellcheck-level issues, and changed-file range regressions
@@ -555,8 +591,8 @@ jobs:
     name: actionlint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: raven-actions/actionlint@v2.2.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
         with:
           version: '1.7.12'
       - name: merge-queue config tests
@@ -565,7 +601,7 @@ jobs:
   # Deterministic fake-adapter unit tests + raw-observation schema validation
   # for the decode-benchmark harness core (issue #813 step 1) and every
   # migrated profile's adapter module (issue #813 step 2: apples_to_apples,
-  # apples_precise, q4_apples, context_scaling). Stdlib-only (mlx_lm/ollama
+  # apples_precise, q4_apples, context_scaling, agentic). Stdlib-only (mlx_lm/ollama
   # are never imported by these test files -- adapters are exercised only
   # through pure parsing helpers and the harness's own deterministic fake
   # adapters), no engine binary or model weights required — cheap
@@ -574,12 +610,18 @@ jobs:
   # any CI job before this issue's step-2 migrations landed; this closes
   # that gap for all of them at once rather than repeating the same
   # omission per migrated script.)
-  bench-decode-harness-tests:
-    name: bench-decode-harness-tests
+  # The job/check name says "unit-tests (no engine)" on purpose: a green
+  # check here proves harness plumbing and parameter transcription ONLY.
+  # No benchmark runs, no engine binary executes, no throughput number is
+  # produced or validated by this job — reading it as bench evidence is
+  # exactly the misread its old name ("bench-decode-harness-tests")
+  # invited on the #813 migration PRs.
+  decode-harness-unit-tests:
+    name: decode-harness-unit-tests (no engine)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.11'
       - name: python3 tests/test_bench_decode_harness.py
@@ -592,6 +634,38 @@ jobs:
         run: python3 tests/test_bench_decode_adapters_q4_apples.py -v
       - name: python3 tests/test_bench_decode_adapters_context_scaling.py
         run: python3 tests/test_bench_decode_adapters_context_scaling.py -v
+      - name: python3 tests/test_bench_decode_adapters_agentic.py
+        run: python3 tests/test_bench_decode_adapters_agentic.py -v
+      # bench-compare's Spotlight-exclusion guard. Same "harness plumbing only"
+      # scope as the steps above: it asserts the guard's exit codes and the
+      # bench-compare.sh call site, and runs no benchmark.
+      - name: bash scripts/ensure-noindex-marker-selftest.sh
+        run: bash scripts/ensure-noindex-marker-selftest.sh
+      - name: python3 tests/test_bench_disposition.py
+        run: python3 tests/test_bench_disposition.py -v
+      # perf-bench-gate's own fixture self-test. Same "harness plumbing only"
+      # scope: it fabricates Criterion trees and asserts the gate's exit codes
+      # (including the refusals that keep an automated lane from reading
+      # "nothing measured" as "nothing regressed"), and runs no benchmark.
+      - name: python3 scripts/perf-bench-gate.py --selftest
+        run: python3 scripts/perf-bench-gate.py --selftest
+      # bench-compare.sh's measurement-integrity guard. Drives the shipping
+      # script in a disposable repo against a stub cargo, so it exercises the
+      # real parser-to-guard path; no benchmark runs and no real cargo is
+      # invoked, which keeps it in the same harness-plumbing scope as above.
+      - name: python3 tests/test_bench_compare_measurement.py
+        run: python3 tests/test_bench_compare_measurement.py -v
+
+      # bench-compare.sh's isolation guards: the lock proof (the measurement
+      # body refuses unless the supervisor that recorded the lock status is one
+      # of its own ancestors) and the ambient-load gate (below the idle floor a
+      # run is refused, not warned about). Same disposable-repo, stub-cargo
+      # shape as above — no benchmark runs and no real cargo is invoked. Wired
+      # here rather than left to a local run, because a guard whose only
+      # coverage is somebody remembering to run its test is the same shape as
+      # the lock the guard replaced.
+      - name: python3 tests/test_bench_locks.py
+        run: python3 tests/test_bench_locks.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is
@@ -605,15 +679,15 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: semver-checks
       # metal-gpu does not compile on Linux and must stay off; default-features
       # keeps the check to each crate's own `[features] default = [...]` set
       # rather than the action's heuristic all-features-ish default, which
       # would otherwise try to turn on optional platform-gated features.
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
+      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         with:
           package: lattice-fann,lattice-transport,lattice-inference,lattice-embed,lattice-tune
           feature-group: default-features

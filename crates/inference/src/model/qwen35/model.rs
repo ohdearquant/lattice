@@ -20,6 +20,21 @@ pub struct Qwen35Model {
 
 impl Qwen35Model {
     /// **Unstable**: load Qwen3.5-2B or Qwen3.6 from a local safetensors directory.
+    ///
+    /// Required names are preflighted, then each tensor's own declared
+    /// payload is decoded and finite-value-checked at the shared ingress
+    /// seam (`weights::ingress::validate_ingested_tensor`) while owned
+    /// weights are assembled; a failure there drops the local assembly state
+    /// and returns an error without exposing a partially built model.
+    ///
+    /// Every required tensor — embeddings, the LM head, the final norm,
+    /// per-layer input/post-attention norms, dense FFN weights, full
+    /// attention Q/K/V/O and their norms, the GDN projection and decay
+    /// tensors, and the MoE router/expert/shared-expert tensors — is also
+    /// checked against a config-derived expected shape at assembly
+    /// (`load_owned_tensor_checked`), so a finite but undersized or
+    /// otherwise config-incompatible tensor is rejected here rather than
+    /// reaching a forward pass built for a different shape.
     pub fn from_safetensors(path: &Path) -> Result<Self, InferenceError> {
         let model_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");
@@ -240,6 +255,20 @@ impl Qwen35Model {
             &dense.up_proj,
             &dense.down_proj,
         ))
+    }
+
+    /// **Unstable (train-backward)**: Number of layers actually present in the
+    /// loaded weight storage.
+    ///
+    /// [`Self::config_mut`] allows a caller to change `config.num_hidden_layers`
+    /// after load, independently of the weights this model was loaded with.
+    /// Callers deriving a layer range from `config().num_hidden_layers` must
+    /// check it against this value first — indexing past it inside
+    /// [`Self::gqa_layer_weights`]/[`Self::gdn_layer_weights`] panics rather
+    /// than returning `None`.
+    #[cfg(feature = "train-backward")]
+    pub fn loaded_layer_count(&self) -> usize {
+        self.weights.layers.len()
     }
 
     /// **Unstable (train-backward)**: Return lm_head, final_norm, and embed slices.

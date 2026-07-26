@@ -1,13 +1,19 @@
-//! Binary-private support shared by the gradient-training executables.
+//! Support shared by the gradient-training executables and the layer-23
+//! golden bridge test.
 //!
 //! It owns JSONL sample loading, raw argument lookup, path defaults, and the
 //! fail-closed trust-but-verify comparison. Each binary owns its typed options
 //! and usage contract. See `docs/design.md` for the CLI data and TBV flow.
+//!
+//! Library module, not a binary-embedded one: `full_driver` is compiled once
+//! here and linked by every consumer, instead of being recompiled per binary.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use lattice_inference::tokenizer::Tokenizer;
+
+pub mod full_driver;
 
 /// One training sample with prompt/completion split.
 pub struct Sample {
@@ -167,7 +173,7 @@ mod tests {
     fn arg_view_first_match_wins() {
         let args: Vec<String> = ["bin", "--x", "1", "--x", "2"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         let av = ArgView::new(&args);
         assert_eq!(av.arg("--x"), Some("1".to_string()));
@@ -175,7 +181,7 @@ mod tests {
 
     #[test]
     fn arg_view_missing_flag_is_none() {
-        let args: Vec<String> = ["bin"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["bin"].iter().map(ToString::to_string).collect();
         let av = ArgView::new(&args);
         assert_eq!(av.arg("--x"), None);
     }
@@ -184,14 +190,14 @@ mod tests {
     fn arg_view_dangling_flag_is_none() {
         // Flag present but no following token — same as today's inline
         // parse_arg: `.get(i + 1)` returns None.
-        let args: Vec<String> = ["bin", "--x"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["bin", "--x"].iter().map(ToString::to_string).collect();
         let av = ArgView::new(&args);
         assert_eq!(av.arg("--x"), None);
     }
 
     #[test]
     fn arg_view_presence_flag() {
-        let args: Vec<String> = ["bin", "--save"].iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = ["bin", "--save"].iter().map(ToString::to_string).collect();
         let av = ArgView::new(&args);
         assert!(av.flag("--save"));
         assert!(!av.flag("--gradcheck"));
@@ -201,7 +207,7 @@ mod tests {
     fn arg_view_unknown_flags_ignored() {
         let args: Vec<String> = ["bin", "--totally-unknown", "x"]
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect();
         let av = ArgView::new(&args);
         assert_eq!(av.arg("--model-dir"), None);

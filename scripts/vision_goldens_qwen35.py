@@ -326,8 +326,12 @@ def run(model_dir: Path, out_dir: Path) -> None:
         merged_dir = Path(tmp) / "model_merged"
         build_merged_dir(model_dir, merged_dir)
 
-        processor = AutoProcessor.from_pretrained(str(merged_dir))
-        model = AutoModelForImageTextToText.from_pretrained(str(merged_dir), dtype=torch.float32)
+        processor = AutoProcessor.from_pretrained(
+            str(merged_dir), trust_remote_code=False, local_files_only=True
+        )
+        model = AutoModelForImageTextToText.from_pretrained(
+            str(merged_dir), dtype=torch.float32, trust_remote_code=False, local_files_only=True
+        )
         model.eval()
 
         img = Image.open(image_path).convert("RGB")

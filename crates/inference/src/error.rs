@@ -36,7 +36,7 @@ pub enum InferenceError {
     /// caller-input problems) so downstream consumers -- e.g. the serve
     /// binaries' `blocked_constraint` HTTP machine code -- can classify this
     /// specific condition by type instead of pattern-matching the message
-    /// text (round-1 structured-output-v0 review, medium finding 2).
+    /// text.
     GrammarConstraintBlocked(String),
 }
 
