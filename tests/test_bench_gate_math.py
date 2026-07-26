@@ -330,6 +330,39 @@ class CvBandsTest(unittest.TestCase):
         with self.assertRaises(gm.PolicyConfigError):
             gm.parse_cv_bands([{"max_cv": 1.0, "required_n_class_a": 7, "required_n_class_b": 9}])
 
+    def test_module_does_not_itself_refuse_an_absent_cv(self):
+        """Pin where the missing-CV guard actually lives, because the module
+        header used to claim it lived here.
+
+        `required_n` is typed to take a float. An absent CV therefore reaches
+        it either as a bare `TypeError` or, if a caller substitutes 0.0, as a
+        silent lookup that returns the CHEAPEST band -- the most permissive
+        answer available, from the function a reader would expect to refuse.
+        The refusal is the caller's:
+        `bench_decode_harness.validate_run_record` raises
+        `RunRecordValidationError` for a non-`unsupported` cell with no
+        `measured_cv` (covered by
+        `test_bench_run_record.test_missing_measured_cv_fails_closed`).
+
+        This test asserts the absence of a guard, which is unusual, and it is
+        deliberate: a safety property documented at a module but enforced by
+        its callers reads as fail-closed in isolation, so a new call site
+        inherits the belief without inheriting the guard. Pinning the real
+        locus keeps the header from drifting back.
+        """
+        bands = self._bands()
+        self.assertEqual(gm.required_n(0.0, bands, "A"), (7, 1.0))
+        with self.assertRaises(TypeError):
+            gm.required_n(None, bands, "A")  # type: ignore[arg-type]
+
+    def test_band_boundaries_not_the_calibration_points(self):
+        """The notes quote calibration points (~1%, ~3%, >=8%); the lookup
+        tests `max_cv`. A reader who confuses the two mis-predicts every CV
+        between a calibration point and its boundary, so pin the gap."""
+        bands = self._bands()
+        self.assertEqual(gm.required_n(0.02, bands, "A"), (25, 1.0))
+        self.assertEqual(gm.required_n(0.06, bands, "A"), (25, 2.0))
+
 
 # --------------------------------------------------------------------------
 # perf-policy.toml load (real, shipped file)

@@ -215,9 +215,15 @@ def render_report(results: list[BenchResult], arch: str,
 
     lines = [f"### `{arch}` — perf regression report\n"]
     if fails:
-        lines.append(f"**❌ {len(fails)} FAIL** (regression >{FAIL_PCT}% confirmed by 95% CI)")
+        lines.append(
+            f"**❌ {len(fails)} FAIL** (regression >{FAIL_PCT}% — lower bound of Criterion's "
+            "two-sided 95% CI, i.e. about a 97.5% one-sided level, not a calibrated one-sided 95% test)"
+        )
     if warns:
-        lines.append(f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% confirmed)")
+        lines.append(
+            f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% by the same "
+            "two-sided-95%-CI lower bound)"
+        )
     if wins:
         lines.append(f"**🚀 {len(wins)} confirmed improvement**")
     if not (fails or warns or wins):
