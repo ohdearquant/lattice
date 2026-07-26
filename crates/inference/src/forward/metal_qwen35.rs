@@ -6747,11 +6747,23 @@ mod inner {
         }
 
         /// Method form of [`Self::validate_dispatch_capacity`], resolving the KV/RoPE bound
-        /// from live session state. Shared by every caller that dispatches Metal across a
-        /// caller-supplied `start_pos..start_pos + token_count` range. Pass
-        /// `check_gdn_pool = true` for callers that checkpoint one GDN pool slot per token
-        /// (`verify_tokens_batched`); other callers pass `false` since they never advance the
-        /// GDN checkpoint past the base slot.
+        /// from live session state.
+        ///
+        /// Scope, stated precisely because the obvious paraphrase of it is wrong: this is
+        /// shared by every caller that dispatches a caller-supplied *range*,
+        /// `start_pos..start_pos + token_count`. It is not on the single-position decode
+        /// path. `forward_step_decode` and `forward_step_greedy_argmax` take one position
+        /// and are bounded by their caller instead: each decode loop tests the pending
+        /// position against `kv_cache.max_cache_len` and breaks with `StopReason::KvFull`
+        /// before dispatching, with the headroom each loop needs — plain decode requires one
+        /// free slot, the MTP loop two, and the self-speculative loop `SELF_SPEC_MAX_DRAFT + 1`.
+        /// Read as "every Metal dispatch goes through here" this comment is false, and a
+        /// reader who checks it against the decode path will correctly conclude the guard is
+        /// bypassed.
+        ///
+        /// Pass `check_gdn_pool = true` for callers that checkpoint one GDN pool slot per
+        /// token (`verify_tokens_batched`); other callers pass `false` since they never
+        /// advance the GDN checkpoint past the base slot.
         fn check_forward_range_capacity(
             &self,
             start_pos: usize,
