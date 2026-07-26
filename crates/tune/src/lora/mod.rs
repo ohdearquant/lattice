@@ -677,7 +677,7 @@ mod tests {
         assert!(unknown.is_empty());
     }
 
-    /// Regression for #972: a layer with *correct* `d_in`/`d_out` (what
+    /// Regression for lattice#972: a layer with *correct* `d_in`/`d_out` (what
     /// `validate_against` checked before this fix) but a short `a` buffer
     /// must still be rejected at construction, not admitted to later panic
     /// (slice-out-of-bounds) inside `apply_lora`.
@@ -928,7 +928,7 @@ mod tests {
             );
         }
 
-        /// Regression for #972: a layer whose
+        /// Regression for lattice#972: a layer whose
         /// projection dims exactly match a real Qwen3.5 model's `q_proj`
         /// (the only thing `validate_against` checked before this fix) but
         /// whose `a` buffer is short must be rejected before it can ever
