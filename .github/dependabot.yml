@@ -9,18 +9,16 @@ updates:
       # Patch and minor action bumps are the routine, low-risk ones and travel
       # together in a single pull request so a weekly run does not fan out into
       # one review per action.
+      #
+      # Major bumps are deliberately left OUT of this group and out of any other
+      # group. An update matching no group rule gets its own pull request, which
+      # is the point: action majors change runtime behavior often enough to be
+      # worth reading one at a time, and a second group for them would defeat
+      # that, since a group produces a single combined pull request no matter
+      # how many majors it matches.
       actions-minor:
         patterns:
           - "*"
         update-types:
           - "minor"
           - "patch"
-      # Major bumps are separated deliberately. Action majors change runtime
-      # behavior often enough that they need to be looked at on their own, and
-      # grouping them with patches would let a breaking change ride in beside
-      # updates that are safe to take on sight.
-      actions-major:
-        patterns:
-          - "*"
-        update-types:
-          - "major"
