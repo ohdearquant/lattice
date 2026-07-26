@@ -465,6 +465,40 @@ class BenchDispositionCheck(unittest.TestCase):
         )
         self.assertTrue(has_disposition(body))
 
+    def test_long_body_with_valid_disposition_passes(self):
+        # A compliant description must not be rejected for being LONG. The gate
+        # used to pipe the body into readers that exit early (`grep -q`, and the
+        # section `awk`); once the reader exited, the writing `printf` took EPIPE
+        # and `set -o pipefail` promoted that to the gate's result. Short bodies
+        # never tripped it because the whole write fits in the pipe buffer and
+        # completes before the reader leaves, so the outcome depended on size and
+        # on scheduling: the same description passed locally and failed in CI.
+        #
+        # The padding here is well past a 64KiB pipe buffer so the pre-fix failure
+        # is deterministic rather than marginal. The disposition is a blessed
+        # one-liner, so nothing but length distinguishes this from
+        # test_real_heading_with_content_passes.
+        body = (
+            "## bench-compare disposition\n"
+            "bench-compare showed no change (p > 0.05 on all groups).\n\n"
+            + "".join(
+                f"padding line {i} standing in for the prose a long PR body carries\n"
+                for i in range(2000)
+            )
+        )
+        self.assertGreater(len(body), 64 * 1024)
+        self.assertTrue(has_disposition(body))
+
+    def test_long_body_without_disposition_still_fails(self):
+        # The companion to the case above: the length fix must not turn into a
+        # blanket pass for big bodies. Same size, no disposition heading.
+        body = "".join(
+            f"unrelated prose line {i} that says nothing about the gate\n"
+            for i in range(2000)
+        )
+        self.assertGreater(len(body), 64 * 1024)
+        self.assertFalse(has_disposition(body))
+
 
 if __name__ == "__main__":
     unittest.main()
