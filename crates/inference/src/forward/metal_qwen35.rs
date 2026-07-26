@@ -6755,8 +6755,14 @@ mod inner {
         /// path. `forward_step_decode` and `forward_step_greedy_argmax` take one position
         /// and are bounded by their caller instead: each decode loop tests the pending
         /// position against `kv_cache.max_cache_len` and breaks with `StopReason::KvFull`
-        /// before dispatching, with the headroom each loop needs — plain decode requires one
-        /// free slot, the MTP loop two, and the self-speculative loop `SELF_SPEC_MAX_DRAFT + 1`.
+        /// before dispatching, with the headroom that loop needs. There are three distinct
+        /// headroom requirements, not three loops — the loops are more numerous than the
+        /// shapes, and reading the list below as a list of loops is the mistake this
+        /// paragraph exists to prevent. The MTP loop reserves two slots
+        /// (`max_cache_len.saturating_sub(2)`); the self-speculative loop reserves
+        /// `SELF_SPEC_MAX_DRAFT + 1`; every other decode loop, including the multimodal and
+        /// vision ones, needs a single free slot and tests `seq_len >= max_cache_len`
+        /// directly.
         /// Read as "every Metal dispatch goes through here" this comment is false, and a
         /// reader who checks it against the decode path will correctly conclude the guard is
         /// bypassed.
