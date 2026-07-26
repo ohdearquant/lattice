@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Engine adapters for the `apples_to_apples_q8`/`apples_to_apples_q4`
-profiles (issue #813 step 2: migrate `bench_apples_to_apples.sh`).
+profiles (issue #813 step 2: migrate `legacy apples-to-apples consumer`).
 
-This is the "thin wrapper that execs the harness" the issue calls for: it
-registers three `EngineAdapter`s (lattice, ollama, mlx) that invoke exactly
-what `bench_apples_to_apples.sh`'s `bench_lattice`/`bench_ollama`/`bench_mlx`
+This module registers three `EngineAdapter`s (lattice, ollama, mlx) that invoke exactly
+what `legacy apples-to-apples consumer`'s `bench_lattice`/`bench_ollama`/`bench_mlx`
 shell functions invoked, then delegates argument parsing and execution to
 `bench_decode_harness.main()`. All repeat-count, warmup, and verdict
 decisions stay in the harness/profile (`bench_decode_profiles.toml`); this
@@ -58,11 +57,8 @@ harness's "native tok/s" diagnostic column, same mechanism as lattice's
 entry above.
 
 Run with (from repo root): `uv run --quiet --with mlx-lm python3
-scripts/bench_decode_adapters_apples_to_apples.py run --profile
-apples_to_apples_q8 --allow-missing-engine` (mlx-lm must be available in the
-invoking environment since the mlx engine is present in both profiles; the
-`--with mlx-lm` flag is how `scripts/bench_apples_to_apples.sh` provides it,
-matching the legacy script's own `uv run --with mlx-lm` invocation).
+scripts/bench_decode_harness.py run --profile apples_to_apples_q8
+--allow-missing-engine`.
 """
 
 from __future__ import annotations
@@ -85,7 +81,7 @@ import bench_decode_harness as harness  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# -- lattice: exactly bench_apples_to_apples.sh's Q8_DIR/Q4_DIR/LAT_BIN --
+# -- lattice: exactly legacy apples-to-apples consumer's Q8_DIR/Q4_DIR/LAT_BIN --
 LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
 Q8_MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b"
 Q4_MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b-q4-quarot"
@@ -97,7 +93,7 @@ _LATTICE_MODEL_DIRS: dict[str, Path] = {
     "qwen3.5-0.8b-q4-quarot": Q4_MODEL_DIR,
 }
 
-# -- ollama: exactly bench_apples_to_apples.sh's model_tag / API shape --
+# -- ollama: exactly legacy apples-to-apples consumer's model_tag / API shape --
 OLLAMA_BASE_URL = os.environ.get("LATTICE_BENCH_OLLAMA_URL", "http://localhost:11434")
 
 _RESULT_RE = re.compile(r"^RESULT n_req=(\d+) completion=(\d+) total_ms=([\d.]+)$")
@@ -173,7 +169,7 @@ def extract_single_result(stdout: str, *, n_tokens: int) -> tuple[int, int, floa
 
 class LatticeAdapter:
     """Invokes `target/release/bench_decode_ab`, mirroring
-    `bench_apples_to_apples.sh`'s `bench_lattice()` exactly, one measured
+    `legacy apples-to-apples consumer`'s `bench_lattice()` exactly, one measured
     repeat per call (`BENCH_RUNS=1`) -- see module docstring for the
     disclosed model-load-per-call methodology note.
     """
@@ -374,7 +370,7 @@ def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
 
 class OllamaAdapter:
     """Invokes ollama's `/api/generate`, mirroring
-    `bench_apples_to_apples.sh`'s `bench_ollama()` exactly: one HTTP call per
+    `legacy apples-to-apples consumer`'s `bench_ollama()` exactly: one HTTP call per
     measured repeat (the shell script also issues no warmup for ollama, and
     neither does this profile)."""
 
@@ -406,7 +402,7 @@ class OllamaAdapter:
 def ollama_available(
     base_url: str = OLLAMA_BASE_URL, *, model_tag: str, start_if_down: bool = True
 ) -> bool:
-    """Mirrors `bench_apples_to_apples.sh`'s `bench_ollama()` preflight:
+    """Mirrors `legacy apples-to-apples consumer`'s `bench_ollama()` preflight:
     binary installed, model pulled (best-effort pull if missing), server
     reachable (best-effort `ollama serve &` + 3s settle if not)."""
     if shutil.which("ollama") is None:
@@ -449,7 +445,7 @@ def ollama_available(
 
 
 class MlxAdapter:
-    """Invokes `mlx_lm` in-process, mirroring `bench_apples_to_apples.sh`'s
+    """Invokes `mlx_lm` in-process, mirroring `legacy apples-to-apples consumer`'s
     `bench_mlx()`: load the Q8_DIR safetensors model once, `nn.quantize` it
     to the requested bit width once, run ONE 8-token warmup, then time only
     `generate()` per measured call -- model load/quantize is cached per
@@ -541,7 +537,7 @@ def mlx_available() -> bool:
 def register_available_adapters(argv: list[str] | None = None) -> None:
     """Registers whichever of lattice/ollama/mlx are actually available,
     printing a legacy-style message for each -- mirroring
-    `bench_apples_to_apples.sh`'s per-engine graceful skip (missing binary /
+    `legacy apples-to-apples consumer`'s per-engine graceful skip (missing binary /
     missing model dir / ollama not installed all print-and-continue rather
     than aborting the whole run).
 
