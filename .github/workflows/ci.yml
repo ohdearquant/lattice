@@ -483,9 +483,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Held one release behind every other rust-toolchain pin in this repository
-      # on purpose: this ref selects the MSRV compiler, so it tracks rust-version
-      # rather than the newest action revision. Automated updates for this action
-      # are turned off in .github/dependabot.yml for that reason.
+      # on purpose: this ref installs the MSRV compiler, which RUSTUP_TOOLCHAIN
+      # above then selects. The ref tracks rust-version rather than the newest
+      # action revision, so automated updates for this action are turned off in
+      # .github/dependabot.yml. Installing is not selecting: dropping
+      # RUSTUP_TOOLCHAIN while keeping this ref would let rust-toolchain.toml
+      # outrank the action's `rustup default`, which is the regression the
+      # comment above describes.
       - uses: dtolnay/rust-toolchain@683cb613d4ff7d29ceb2fe421b81294b4319512a # 1.93.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
