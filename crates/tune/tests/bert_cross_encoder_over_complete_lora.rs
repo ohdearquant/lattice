@@ -408,3 +408,68 @@ fn cross_encoder_drops_the_update_of_an_unvalidated_undersized_hook() {
          which is the silent-wrong-score hole the exact-width check closes"
     );
 }
+
+/// An adapter targeting only attention projections reaches the forward path.
+///
+/// The BERT forward path dispatches all six BERT projections to the hook, not
+/// only the two FFN ones: `bert.rs` routes attention through
+/// `attention::standard`, which asks the hook for `query`, `key`, `value` and
+/// `attn_output`. An adapter built solely from attention layers is therefore
+/// applied, not silently inert.
+///
+/// The adapter here is deliberately strong. The neighbouring
+/// `over_complete_query_adapter` uses `fill`, whose values are bounded by
+/// 0.03, so its update reaches the score at roughly 1e-8 — below f32
+/// resolution at a sigmoid output near 0.5. A test built on that adapter
+/// reports "no change" whether the update is applied or dropped, which is the
+/// same as having no test. Magnitude is part of what makes this one able to
+/// fail.
+#[test]
+fn cross_encoder_applies_an_attention_only_adapter() {
+    let dir = build_synthetic_cross_encoder_dir();
+    let model = CrossEncoderModel::from_directory(dir.path()).unwrap();
+
+    let rank = 2usize;
+    let mut layers = HashMap::new();
+    layers.insert(
+        (0, "value".to_string()),
+        LoraLayer {
+            // Deliberately non-uniform. A uniform `a` makes every row of
+            // `A @ x` proportional to `sum(x)`, and the preceding LayerNorm
+            // zero-means each row, so a uniform adapter computes an update of
+            // approximately zero and the test would report "inert" for an
+            // adapter that is in fact applied correctly.
+            a: (0..rank * HIDDEN_SIZE)
+                .map(|i| if i % 2 == 0 { 0.9 } else { -0.4 })
+                .collect(),
+            b: (0..HIDDEN_SIZE * rank)
+                .map(|i| if i % 3 == 0 { 0.8 } else { -0.6 })
+                .collect(),
+            d_in: HIDDEN_SIZE,
+            d_out: HIDDEN_SIZE,
+            rank,
+        },
+    );
+    let adapter = LoraAdapter::new(
+        LoraConfig {
+            rank,
+            alpha: rank as f32,
+            target_modules: vec!["value".to_string()],
+        },
+        layers,
+    )
+    .expect("buffers match the declared rank");
+
+    let reference = model
+        .score_with_hook("what is rust", "rust is a language", &NeutralHook)
+        .expect("a hook that applies nothing must score");
+    let adapted = model
+        .score_with_hook("what is rust", "rust is a language", &adapter)
+        .expect("an attention-only adapter must score");
+
+    assert_ne!(
+        adapted, reference,
+        "an adapter targeting only `value` changed nothing: the attention \
+         projections are not reaching the hook"
+    );
+}
