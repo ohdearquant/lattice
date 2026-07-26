@@ -54,7 +54,13 @@ def tokenize_corpus_bpe(corpus_path: Path, model_dir: Path, n: int) -> list[int]
     We use mlx_lm's tokenizer here — it loads the same tokenizer.json file.
     """
     from transformers import AutoTokenizer  # type: ignore
-    tok = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    # Qwen3.5's tokenizer is a stock Qwen2Tokenizer/tokenizer.json — no custom
+    # tokenization class ships with the snapshot, so no remote code is needed
+    # to load it, and running arbitrary code from a caller-supplied directory
+    # is not a trade this script should make on their behalf.
+    tok = AutoTokenizer.from_pretrained(
+        str(model_dir), trust_remote_code=False, local_files_only=True
+    )
     text = corpus_path.read_text(encoding="utf-8")[:8192]  # first ~8K chars
     ids = tok.encode(text, add_special_tokens=False)
     return ids[:n]

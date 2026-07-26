@@ -31,34 +31,41 @@ policy_version = 1
 # (100%) so no measured CV can fall through uncovered — enforced by
 # `bench_gate_math.parse_cv_bands`.
 #
-# Evidence (cross-checked by an independent Monte-Carlo power simulation,
-# summarized here so the policy is self-explaining without it): at cv~=1%
-# n=7 already has ~99% power
-# against a true 10% regression (class A, decode family, FAIL=7%). At
-# cv~=3%, n=7 only has ~47-63% power; n~=23-25 restores ~80-84%. At
-# cv>=8%, even n=30 caps out near ~31% power — inflating n further stops
-# being cost-effective, so that band widens the FAIL margin instead
-# (`fail_margin_multiplier`) rather than chasing an ever-larger n.
+# Evidence (cross-checked by an independent Monte-Carlo power simulation
+# that is NOT in this repository — nothing in the tree recomputes these
+# percentages, so they are the recorded rationale for the bands rather than
+# a reproducible result): at cv~=1% n=7 already has ~99% power against a
+# true 10% regression (class A, decode family, FAIL=7%). At cv~=3%, n=7
+# only has ~47-63% power; n=25 restores ~80-84%. At cv>=8%, even n=30 caps
+# out near ~31% power — inflating n further stops being cost-effective, so
+# that band widens the FAIL margin instead (`fail_margin_multiplier`)
+# rather than chasing an ever-larger n.
+#
+# Those CV percentages are the CALIBRATION POINTS the power curves were
+# computed at. They are NOT the band boundaries, and the note on each band
+# below names both so the two are never read as the same number: the
+# lookup tests `max_cv`, so a measured 2% is already in the n=25 band and a
+# measured 6% already carries the 2.0 FAIL-margin multiplier.
 [[cv_bands]]
 max_cv = 0.015
 required_n_class_a = 7
 required_n_class_b = 9
 fail_margin_multiplier = 1.0
-note = "measured CV ~1%: n=7/9 as originally registered; ~99% power vs a true 10% regression."
+note = "applies to measured_cv <= 0.015. Calibration point cv~=1%: n=7/9 as originally registered, ~99% power vs a true 10% regression."
 
 [[cv_bands]]
 max_cv = 0.05
 required_n_class_a = 25
 required_n_class_b = 25
 fail_margin_multiplier = 1.0
-note = "measured CV ~3%: n=7 has only ~47-63% power vs a true 10% regression; n=25 restores ~80-84%."
+note = "applies to 0.015 < measured_cv <= 0.05, so a measured 2% lands here, not in the n=7 band. Calibration point cv~=3%: n=7 has only ~47-63% power vs a true 10% regression, n=25 restores ~80-84%."
 
 [[cv_bands]]
 max_cv = 1.0
 required_n_class_a = 25
 required_n_class_b = 25
 fail_margin_multiplier = 2.0
-note = "measured CV >=8%: even n=30 only reaches ~31% power vs a true 10% regression -- widen the FAIL margin for this band instead of chasing n. A cell with no measured_cv record can never be assumed to land in the cheapest band; the validator refuses promotion of any such cell (correction 1's fail-closed requirement)."
+note = "catch-all: applies to any measured_cv > 0.05, so a measured 6% already carries this band's widened FAIL margin. Calibration point cv>=8%: even n=30 only reaches ~31% power vs a true 10% regression -- widen the FAIL margin for this band instead of chasing n. A cell with no measured_cv record can never be assumed to land in the cheapest band; the validator refuses promotion of any such cell (correction 1's fail-closed requirement)."
 
 # ---------------------------------------------------------------------------
 # Gate-math method (Correction 2, mandatory): bootstrap the MEAN of paired

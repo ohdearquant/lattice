@@ -1,0 +1,43 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    ignore:
+      # dtolnay/rust-toolchain is not an action whose version should be kept
+      # current. Its ref selects the Rust toolchain the action installs, so the
+      # pinned revision is a version selector owned by rust-toolchain.toml and
+      # by the workspace rust-version, and it has to move in lockstep with them
+      # rather than on a weekly schedule.
+      #
+      # The concrete hazard is the MSRV job in ci.yml, whose pin is deliberately
+      # held one release behind every other pin in the repository because that
+      # job exists to prove the workspace still compiles at the declared
+      # rust-version. An automated bump moves that pin to the newer toolchain
+      # while the trailing version comment keeps claiming the older one, leaving
+      # the file stating a toolchain it no longer selects.
+      #
+      # That bump does not announce itself. The job pins RUSTUP_TOOLCHAIN and
+      # asserts the compiler version, so it stays green while the pin quietly
+      # stops matching its stated intent — and the comment is the only thing
+      # telling a later reader why that one line differs from the others.
+      - dependency-name: "dtolnay/rust-toolchain"
+    groups:
+      # Patch and minor action bumps are the routine, low-risk ones and travel
+      # together in a single pull request so a weekly run does not fan out into
+      # one review per action.
+      #
+      # Major bumps are deliberately left OUT of this group and out of any other
+      # group. An update matching no group rule gets its own pull request, which
+      # is the point: action majors change runtime behavior often enough to be
+      # worth reading one at a time, and a second group for them would defeat
+      # that, since a group produces a single combined pull request no matter
+      # how many majors it matches.
+      actions-minor:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

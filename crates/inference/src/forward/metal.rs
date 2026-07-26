@@ -1313,8 +1313,7 @@ kernel void rms_norm_pre_854_oracle(
         ///
         /// Mutation-sensitive: reverting the fix in flash_attention.metal back to
         /// `O4[out_base4] = o_frag * inv_l;` makes this test fail (160/160 NaN
-        /// elements instead of 0), confirmed at PR time (round 1) and reconfirmed
-        /// after the fix-round refactor (round 2).
+        /// elements instead of 0).
         #[test]
         fn fused_attention_fails_closed_on_nan_q_lane() {
             let Some(metal_out) = run_fused_attention_with_corrupted_q_lane(

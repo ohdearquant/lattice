@@ -1,0 +1,11 @@
+fixture_model=Qwen/Qwen3.5-0.8B
+fixture_data=tests/fixtures/layer23_golden_v1/train.jsonl
+command=train_grad_layer23 --steps 1 --lr 1e-3 --rank 1 --alpha 2 --seq-len 32 --max-train 1 --log-every 1 --save legacy_adapter.safetensors
+seed=0xFEED_FACE
+a_init_amp=0.02
+tbv_model_nll=1.33847
+tbv_chain_nll=1.33847
+tbv_diff=4.05e-6
+step0_nll=1.3385
+final_nll=1.3245
+adapter_sha256=f5dfc117b1c65e1f8e76092ef1db7f2547225047bc97858085797f5d7c4fefc6

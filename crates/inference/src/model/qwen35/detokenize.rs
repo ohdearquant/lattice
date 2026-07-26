@@ -307,8 +307,7 @@ mod tests {
         assert!(detok.retained_byte_capacity() <= DETOK_RETAINED_BYTE_CAPACITY);
     }
 
-    /// Companion regression for issue #324 (review finding on the retention-bound
-    /// PR): the test above only ever pushes 1-byte ASCII tokens, so `pending`'s
+    /// Companion regression for issue #324: the test above only ever pushes 1-byte ASCII tokens, so `pending`'s
     /// `Vec` never grows past its initial `with_capacity(DETOK_RETAINED_BYTE_CAPACITY)`
     /// allocation — deleting the `compact_pending_capacity()` call (or its call
     /// site) would still pass it, since there is never anything to compact.

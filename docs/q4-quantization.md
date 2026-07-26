@@ -278,14 +278,19 @@ sample to make an accept/reject call.** `--max-tokens 4096` is useful for confir
 pipeline runs end to end (both checkpoints load, both score, the gate logic itself works), not for
 a real quality verdict — treat a FAIL at this scale as "rerun on more data," not "the conversion is
 bad." The project's own published reference numbers, at a still-modest but larger 2048-token
-window count (`docs/bench_results/perplexity.tsv`, cited in the README), show the same pattern:
-`lattice q4 19.266338` vs `lattice q4-quarot 19.950512` — a delta of +0.68, which is _also_ over
-the nominal 0.5 threshold. In other words, a nonzero, threshold-exceeding delta at reduced token
-counts is a known characteristic of this measurement at small scale, not something unique to a
-fresh from-scratch conversion. Reproduce the project's own reference numbers with
-`./scripts/bench_context_scaling.sh`, or omit `--max-tokens` entirely (scores the full corpus,
-310,034 tokens for `wiki.test.raw` — expect this to take considerably longer than the smoke-test
-run above) before treating either a PASS or a FAIL as a real acceptance decision.
+window count (`docs/bench_results/perplexity.tsv`, regenerated 2026-07-07 and cited in the
+README), show a delta of the same sign and similar magnitude: `lattice q4 16.589166` vs
+`lattice q4-quarot 19.007144` — +2.42, far over the nominal 0.5 threshold. That is a documented
+property of the current offline QuaRot pipeline, not something unique to a fresh from-scratch
+conversion: offline QuaRot v0 is net-negative by design at this stage (the Hadamard rotation
+forces symmetric Q4 with a worse fidelity floor; the missing recovery mechanism is online R3/R4,
+tracked in [#703](https://github.com/ohdearquant/lattice/issues/703) — see the provenance
+comments in the TSV itself). A FAIL whose delta lands near the reference's +2.42 therefore says
+your conversion matches known pipeline behavior; a delta far beyond it is the signal worth
+investigating. Reproduce the project's own reference numbers with `./scripts/bench_quality.sh`,
+or omit `--max-tokens` entirely (scores the full corpus, 310,034 tokens for `wiki.test.raw` —
+expect this to take considerably longer than the smoke-test run above) before treating either a
+PASS or a FAIL as a real acceptance decision.
 
 `eval_perplexity` also emits a machine-readable line per report on stdout, independent of the
 human-readable summary on stderr:
