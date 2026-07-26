@@ -361,23 +361,25 @@ fn cross_encoder_drops_the_update_of_an_unvalidated_oversized_hook() {
     );
 }
 
-/// The other direction, and it does NOT behave like the one above.
+/// The other direction of the same mismatch, which used to behave differently
+/// and deliberately no longer does.
 ///
-/// `apply_lora`'s shape check is `output.len() >= d_out`, an inequality, and
+/// `apply_lora`'s shape check was `output.len() >= d_out`, an inequality, while
 /// the accumulate loop writes `output[..d_out]`. An UNDER-declared `d_out`
-/// therefore passes the check and writes a partial row: the first `d_out`
-/// elements receive an update computed for a geometry the model does not have,
-/// and the remainder are left as the base weights produced them. No panic, no
-/// error, and a finite score comes back.
+/// therefore passed the check and wrote a partial row: an update computed for a
+/// geometry the model does not have across the prefix, base weights across the
+/// rest, no panic, no error, and a finite in-range score. That is a silent
+/// wrong answer, which is a worse failure than the dropped update the
+/// over-declared direction produces.
 ///
-/// This is a characterization test, not an endorsement. It exists because
-/// ADR-057 D1a bounds the residual exposure of the fail-open
-/// `validate_against_bert` default by pointing at this guard, and that bound
-/// holds against out-of-bounds slicing but not against a partial write. Pinning
-/// the behaviour keeps the ADR's claim checkable: if the fail-closed arm lands
-/// at 0.8.0, this test is the one that must change.
+/// The check is now exact width, so both directions no-op. Nothing in this
+/// workspace declares a `d_out` other than the projection's own width — both
+/// validators reject any dims disagreement, and the engine hands `apply_lora`
+/// `chunks_exact_mut` rows — so tightening costs no legitimate caller anything.
+///
+/// This test is the guard on that: it fails if the inequality ever comes back.
 #[test]
-fn cross_encoder_partially_applies_an_unvalidated_undersized_hook() {
+fn cross_encoder_drops_the_update_of_an_unvalidated_undersized_hook() {
     let dir = build_synthetic_cross_encoder_dir();
     let model = CrossEncoderModel::from_directory(dir.path()).unwrap();
 
@@ -390,16 +392,12 @@ fn cross_encoder_partially_applies_an_unvalidated_undersized_hook() {
             "rust is a language",
             &unvalidated_ffn_output_hook(HIDDEN_SIZE - 1),
         )
-        .expect("an unvalidated undersized hook does not error at this boundary");
+        .expect("an unvalidated undersized hook must not error at this boundary");
 
-    assert!(
-        undersized.is_finite() && (0.0..=1.0).contains(&undersized),
-        "score {undersized} out of sigmoid range"
-    );
-    assert_ne!(
+    assert_eq!(
         undersized, reference,
-        "an undersized d_out passes the `output.len() >= d_out` check and writes \
-         output[..d_out]; the score must differ from the untouched reference, \
-         which is precisely the exposure the fail-open default leaves open"
+        "an undersized d_out must leave the projection untouched; a score that \
+         differs from the reference means a partial prefix update was applied, \
+         which is the silent-wrong-score hole the exact-width check closes"
     );
 }

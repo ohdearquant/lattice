@@ -31,7 +31,20 @@ const STACK_RANK_CAPACITY: usize = 128;
 ///
 /// Fails closed: if `x`, `output`, or the layer's own `a`/`b` buffers don't
 /// match the layer's declared `rank`/`d_in`/`d_out`, this is a no-op rather
-/// than an out-of-bounds slice.
+/// than an out-of-bounds slice or a partial write.
+///
+/// `output` is checked for EXACT width, not `>= d_out`. The inequality it
+/// replaced rejected an over-declared `d_out` but accepted an under-declared
+/// one, and an under-declared `d_out` is the worse direction: the check passes,
+/// the accumulate loop writes `output[..d_out]`, and the projection row comes
+/// back with an update computed for a geometry the model does not have across
+/// its prefix and base weights across the rest. No panic, no error, a finite
+/// in-range result. Every consumer in this workspace declares the exact
+/// projection width — both `validate_against` and `validate_against_bert`
+/// reject any `d_in`/`d_out` disagreement outright, `LoraAdapter::apply`
+/// documents that slices must match the layer's shape, and the engine hands
+/// this function `chunks_exact_mut` rows at the projection's own width — so
+/// there is no prefix-adaptation use for the inequality to serve.
 pub fn apply_lora(lora: &LoraLayer, scale: f32, x: &[f32], output: &mut [f32]) {
     // Adapter data is untrusted input: a `LoraLayer` reaching this function
     // may not satisfy its own declared geometry (e.g. an empty or
@@ -43,7 +56,7 @@ pub fn apply_lora(lora: &LoraLayer, scale: f32, x: &[f32], output: &mut [f32]) {
     let d_in = lora.d_in;
     let d_out = lora.d_out;
     let shapes_match = x.len() == d_in
-        && output.len() >= d_out
+        && output.len() == d_out
         && rank.checked_mul(d_in) == Some(lora.a.len())
         && d_out.checked_mul(rank) == Some(lora.b.len());
     if !shapes_match {
