@@ -85,9 +85,11 @@ tokenizers = { version = "0.22", optional = true, default-features = false, feat
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 lattice-fann = { version = "0.7.0", path = "../fann", optional = true }
 
-# fd-bind path containment (F_GETPATH) for the manifest-driven checkpoint loaders --
-# closes the canonicalize-then-reopen TOCTOU window; see `weights/f32_weights.rs`'s
-# `open_contained_manifest_file`. macOS-only: F_GETPATH is a Darwin/BSD `fcntl` command.
+# `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s `real_path_of_open_file`, which reports the
+# real path of an already-open shard descriptor for diagnostics and error text. Containment is
+# lexical, in `contained_shard_path`; the check-then-reopen window is closed by
+# `open_manifest_entry_once` returning the opened `File` rather than a path to reopen. Nothing
+# security-relevant keys off the reported path. macOS-only: F_GETPATH is a Darwin/BSD `fcntl`.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
