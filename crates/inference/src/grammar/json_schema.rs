@@ -646,10 +646,21 @@ impl<'a> CompileCtx<'a> {
     ) -> Result<Vec<Alt>, SchemaError> {
         let target: &'a Value = self.resolve_ref_chain_target(ref_str)?;
 
-        if target.get("type").and_then(Value::as_str) != Some("object") {
-            // Cannot merge object-only siblings onto a non-object target;
-            // leave the pre-existing drop behavior rather than guess at a
-            // conjunction this compiler has no representation for.
+        let target_type = target.get("type").and_then(Value::as_str);
+
+        if let Some(t) = target_type
+            && t != "object"
+        {
+            // `required` and `properties` constrain object instances only, so
+            // against a target pinned to some other type they are vacuous:
+            // dropping them cannot widen the language. Compile the target
+            // alone.
+            //
+            // This is deliberately keyed on an EXPLICIT non-object `type`, not
+            // on the absence of `"object"`. A target with no `type` (or a
+            // `type` array) still matches object instances, so its siblings are
+            // NOT vacuous — that case falls through to the representability
+            // check below and is rejected rather than silently dropped.
             return self.compile_ref(ref_str);
         }
 
@@ -683,8 +694,45 @@ impl<'a> CompileCtx<'a> {
                     || k == "required"
             })
         });
-        if !target_is_representable {
-            return self.compile_ref(ref_str);
+        if !target_is_representable || target_type != Some("object") {
+            // The plain `$ref` path preserves the target's own assertion only
+            // for the keywords `compile_schema_inner` dispatches AHEAD of
+            // object compilation: `enum` and `const`, which return a language
+            // narrow enough that also dropping the sibling cannot widen past
+            // the referenced schema. Falling back is right there.
+            //
+            // For anything else it is not. An unrepresentable keyword this
+            // compiler does not support (`additionalProperties`,
+            // `minProperties`, `patternProperties`, ...) is IGNORED by the
+            // plain path, so falling back would preserve nothing from the
+            // target and drop the caller's `required`/`properties` as well —
+            // returning `Ok` on a grammar wider than either operand. An
+            // untyped target is the same shape: it compiles to "any JSON
+            // value", which admits every object the siblings were meant to
+            // exclude.
+            //
+            // Reject instead. A constrained-decoding grammar that accepts
+            // strings the schema forbids fails at the caller's parser, after
+            // the tokens are spent; a schema this compiler declines to compile
+            // fails here, loudly, at compile time.
+            if target.get("enum").is_some() || target.get("const").is_some() {
+                return self.compile_ref(ref_str);
+            }
+            return Err(SchemaError(format!(
+                "`$ref` to {ref_str} carries `required`/`properties` siblings that must \
+                 be applied as a conjunction, but the target is not expressible as one: \
+                 it is {}. Inline the intersection at the reference site.",
+                match target_type {
+                    Some("object") =>
+                        "an object carrying assertions beyond \
+                                       `properties`/`required` that this compiler cannot \
+                                       reproduce",
+                    Some(_) => unreachable!("explicit non-object types returned above"),
+                    None =>
+                        "untyped, so it also matches instances the siblings cannot \
+                             constrain",
+                }
+            )));
         }
 
         // Merge `properties`. A key declared on both sides must satisfy BOTH
@@ -4311,6 +4359,31 @@ mod tests {
         assert!(accepts(&g, b"9007199254740993"));
     }
 
+    /// Exponent notation is a SPELLING, not a distinct value: `1e20` and
+    /// `100000000000000000000` are the same number, and JSON Schema compares
+    /// instances by mathematical value. Both exceed `u64::MAX`, so neither
+    /// takes `overlap_key`'s exact-integer path and both fall to the JSON
+    /// rendering — which, without `serde_json`'s `arbitrary_precision`
+    /// feature, has already parsed each to the same `f64` and therefore
+    /// renders them identically. The overlap is caught by that collapse rather
+    /// than in spite of it, so this pins the outcome against a future
+    /// `arbitrary_precision` bump, which would preserve the two spellings and
+    /// silently split the key.
+    #[test]
+    fn oneof_exponent_and_longhand_spelling_of_one_value_overlap() {
+        let schema: Value =
+            serde_json::from_str(r#"{"oneOf":[{"const":1e20},{"const":100000000000000000000}]}"#)
+                .expect("both literals are valid JSON numbers");
+        let err = compile_json_schema(&schema).expect_err(
+            "1e20 and 100000000000000000000 are the same number, so both branches match it",
+        );
+        assert!(
+            err.0.contains("oneOf"),
+            "error should name the oneOf violation, got: {}",
+            err.0
+        );
+    }
+
     /// A nested union with an EXTRA sibling key (`"description"`) is NOT a
     /// PURE nested union, so `flatten_any_of_branches` deliberately leaves it
     /// unflattened (`as_pure_nested_union` only recognizes an object whose
@@ -4878,6 +4951,61 @@ mod tests {
         assert!(
             rejects(&g, b"{\"x\":2}"),
             "target's const assertion must survive the sibling merge"
+        );
+    }
+
+    /// The counterpart to the two tests above, and the reason they are not the
+    /// whole rule. Falling back to the plain `$ref` path is only safe when that
+    /// path preserves the assertion that blocked the merge — `enum`/`const`,
+    /// which `compile_schema_inner` dispatches ahead of object compilation.
+    ///
+    /// `additionalProperties` is not supported by this compiler at all, so the
+    /// plain path ignores it. Falling back would therefore keep NOTHING from
+    /// the target and drop the caller's `required: ["y"]` as well, returning
+    /// `Ok` on a grammar that accepts `{}` — wider than either operand. The
+    /// conjunction is not representable, so compilation must fail instead.
+    #[test]
+    fn ref_sibling_merge_rejects_a_target_whose_assertion_the_plain_path_would_ignore() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": { "x": { "type": "integer" } }
+                }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["y"]
+        });
+        let err = compile(&schema).expect_err(
+            "an unrepresentable conjunction must fail closed, not compile to the wider target",
+        );
+        assert!(
+            err.0.contains("conjunction"),
+            "error should name the unrepresentable conjunction, got: {}",
+            err.0
+        );
+    }
+
+    /// An UNTYPED target is the same hazard reached a different way, and the
+    /// non-object guard must not absorb it: `type` is absent, so the target is
+    /// not `"object"`, but an untyped schema still matches object instances —
+    /// the siblings are live, not vacuous. The plain path compiles an untyped
+    /// schema to "any JSON value", which admits every object `required: ["y"]`
+    /// exists to exclude.
+    #[test]
+    fn ref_sibling_merge_rejects_an_untyped_target() {
+        let schema = serde_json::json!({
+            "$defs": { "Any": {} },
+            "$ref": "#/$defs/Any",
+            "required": ["y"]
+        });
+        let err =
+            compile(&schema).expect_err("an untyped target cannot carry the sibling conjunction");
+        assert!(
+            err.0.contains("untyped"),
+            "error should name the untyped target, got: {}",
+            err.0
         );
     }
 
