@@ -813,6 +813,35 @@ impl<'a> CompileCtx<'a> {
             }
         }
 
+        // `compile_object_fields` only consults `required` while iterating the
+        // properties it was given, so a required name that neither side
+        // DECLARES produces no pair rule and imposes no requirement — the
+        // grammar comes back accepting an object without it. That limitation
+        // is older than this function and is reachable without any `$ref` at
+        // all (`{"type":"object","required":["y"]}` compiles to the
+        // empty-object grammar on the merge base too, measured, not inferred),
+        // so fixing it belongs with `compile_object_fields` and its direct
+        // caller rather than here.
+        //
+        // What does belong here is not routing a caller into it. Merging is
+        // this function's choice, and it is only worth making when the result
+        // is faithful; when a merged `required` name has no declaration to
+        // attach to, the merge cannot express the conjunction it exists to
+        // express. Reject, consistent with every other unrepresentable case
+        // above, rather than returning a grammar that silently drops the key.
+        if let Some(name) = required.iter().copied().find(|name| {
+            !properties
+                .as_ref()
+                .is_some_and(|p| p.iter().any(|(k, _)| k.as_str() == *name))
+        }) {
+            return Err(SchemaError(format!(
+                "`$ref` to {ref_str} carries a `required` entry `{name}` that neither the \
+                 reference site nor the target declares in `properties`; this compiler \
+                 represents a required key through its property declaration, so the \
+                 conjunction cannot be expressed. Declare `{name}` in `properties`."
+            )));
+        }
+
         self.compile_object_fields(properties, required)
     }
 
@@ -4966,6 +4995,61 @@ mod tests {
             err.0.contains("conjunction"),
             "error should name the unrepresentable conjunction, got: {}",
             err.0
+        );
+    }
+
+    /// A merged `required` name with no `properties` declaration on either
+    /// side cannot be represented: `compile_object_fields` reaches `required`
+    /// only while iterating the properties it was handed, so an undeclared
+    /// required key produces no pair rule and imposes no requirement.
+    ///
+    /// That limitation is older than the merge and is reachable with no `$ref`
+    /// involved — `{"type":"object","required":["y"]}` compiles to the
+    /// empty-object grammar on the merge base as well, which is why fixing it
+    /// belongs with `compile_object_fields` and its direct caller rather than
+    /// here. What is fixed here is routing a caller INTO it: merging is this
+    /// function's own choice and is only worth making when the result is
+    /// faithful.
+    ///
+    /// The existing `ref_required_sibling_is_enforced` cannot cover this,
+    /// because its fixture declares the required key in `Base.properties` and
+    /// so exercises the only path where `required.contains(key)` can have an
+    /// effect.
+    #[test]
+    fn ref_sibling_merge_rejects_a_required_name_no_side_declares() {
+        let schema = serde_json::json!({
+            "$defs": { "Base": { "type": "object" } },
+            "$ref": "#/$defs/Base",
+            "required": ["y"]
+        });
+        let err = compile(&schema).expect_err(
+            "a required key with no property declaration cannot be represented, and \
+             compiling would accept an object without it",
+        );
+        assert!(
+            err.0.contains("`y`"),
+            "error should name the undeclared required key, got: {}",
+            err.0
+        );
+    }
+
+    /// The declared case must keep working, and this is the control that says
+    /// the rejection above is scoped to the undeclared name rather than to
+    /// `required` siblings generally.
+    #[test]
+    fn ref_sibling_merge_accepts_a_required_name_the_target_declares() {
+        let schema = serde_json::json!({
+            "$defs": {
+                "Base": { "type": "object", "properties": { "y": { "type": "integer" } } }
+            },
+            "$ref": "#/$defs/Base",
+            "required": ["y"]
+        });
+        let g = compile(&schema).expect("a declared required key merges normally");
+        assert!(accepts(&g, b"{\"y\":1}"), "the required key is accepted");
+        assert!(
+            rejects(&g, b"{}"),
+            "the merged `required` must actually be enforced"
         );
     }
 
