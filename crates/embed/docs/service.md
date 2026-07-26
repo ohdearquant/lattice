@@ -254,7 +254,7 @@ native embedding call.
 | `InferenceFailed`     | The inference backend failed, including a cache-wrapper result-count violation      | Surface the backend failure; do not accept a partial batch                       |
 | `TaskFailed`          | A background task was cancelled or panicked                                         | Treat the current call as failed and check service state before retrying         |
 | `InvalidInput`        | Empty/oversized batch, wrong model, invalid configuration, or other invalid request | Correct the request without retrying unchanged input                             |
-| `TextTooLong`         | A text exceeded the service's length check                                          | Chunk or shorten the prompted input                                              |
+| `TextTooLong`         | A text exceeded the service's length check                                          | Chunk or shorten the caller-supplied input                                       |
 | `DimensionMismatch`   | An operation received vectors of different expected and actual dimensions           | Keep model/config/index namespaces consistent                                    |
 | `UnsupportedModel`    | The selected service cannot provide that model                                      | Select a capable service or model                                                |
 | `Internal`            | An invariant failed, such as a missing single-item result                           | Treat as a bug report; do not synthesize a vector                                |
@@ -273,8 +273,11 @@ an internal error if an implementation violates that cardinality contract rather
 an empty vector.
 
 `embed_with_role` is the single role entry point: it validates the caller's text against the
-published cap first, then prepends the model instruction, then delegates to `embed`. Validating
-before preparation is deliberate. The cap describes what the caller may submit, so charging the
+published cap first, then prepends the model instruction, then hands the prepared text to the
+backend. The trait default reaches the backend by calling `embed`; both implementations in this
+crate override the method and go straight to their own backend entry point, precisely so the
+prepared text is not re-checked against a cap that describes caller input. Validating before
+preparation is deliberate. The cap describes what the caller may submit, so charging the
 caller for the instruction bytes the service itself adds would reject text that is within the
 documented limit. `embed_query` and `embed_passage` are thin wrappers that call `embed_with_role`
 with the `Query` or `Passage` role, so all three role paths share one ordering decision instead of
