@@ -19,9 +19,7 @@ use std::path::Path;
 use crate::error::InferenceError;
 use crate::model::qwen35_config::VisionModelConfig;
 use crate::quant::q4_manifest;
-use crate::weights::f32_weights::{
-    ShardedSafetensors, TensorSource, canonicalize_model_root, open_contained_manifest_file,
-};
+use crate::weights::f32_weights::{ShardedSafetensors, TensorSource, open_manifest_entry_once};
 use crate::weights::q4_weights::{
     F16LoadError, dequantize_q4_to_f32, load_f16_tensor_from_open_file,
     load_f16_tensor_from_open_file_expecting, load_q4_from_open_file,
@@ -336,10 +334,6 @@ fn load_from_q4_dir(
     let aggregate_budget_bytes: u128 =
         expected_names.len() as u128 * crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES;
     let mut aggregate_bytes: u128 = 0;
-    // FIX 7 perf-minor: canonicalize the model root ONCE, not per entry -- the 153-tensor
-    // vision path previously canonicalized `model_dir` on every single manifest entry via
-    // `contain_manifest_path`.
-    let canon_root = canonicalize_model_root(model_dir)?;
 
     let mut tensors = HashMap::new();
     for entry in manifest
@@ -385,11 +379,10 @@ fn load_from_q4_dir(
                 actual: declared.clone(),
             });
         }
-        // PATH CONTAINMENT + fd-bind -- `entry.file` comes from `quantize_index.json`,
-        // part of the untrusted checkpoint directory. Open the candidate file exactly
-        // once and verify the OPENED fd's identity (not a path re-derived after the
-        // check), then read from that fd.
-        let (file, real_path) = open_contained_manifest_file(model_dir, &canon_root, &entry.file)?;
+        // PATH CONTAINMENT -- `entry.file` comes from `quantize_index.json`, part of the
+        // untrusted checkpoint directory, so it is validated before the join. The file is
+        // opened exactly once and read from that fd rather than reopened by path.
+        let (file, real_path) = open_manifest_entry_once(model_dir, &entry.file)?;
         let (data, shape) = if entry.quantized.unwrap_or(false) {
             let q4 = load_q4_from_open_file(file).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(

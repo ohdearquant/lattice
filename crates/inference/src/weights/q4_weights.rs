@@ -710,9 +710,9 @@ pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::err
     load_q4_from_open_file(f)
 }
 
-/// Parse a [`Q4Tensor`] from an already-open `.q4` file (FIX 7 fd-bind: callers that
-/// resolved this file through [`crate::weights::f32_weights::open_contained_manifest_file`]
-/// must read from that opened fd, not reopen by path -- see that function's docs).
+/// Parse a [`Q4Tensor`] from an already-open `.q4` file. Callers that resolved this file
+/// through [`crate::weights::f32_weights::open_manifest_entry_once`] must read from that
+/// opened fd rather than reopen by path -- see that function's docs.
 pub(crate) fn load_q4_from_open_file(
     mut f: std::fs::File,
 ) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
@@ -907,9 +907,9 @@ pub fn load_f16_tensor_file_expecting(
 /// [`load_f16_tensor_file_expecting`] for a handle the caller already opened.
 ///
 /// Both properties hold at once here: the header is compared against `expected` on the
-/// same handle the payload is read from, and that handle is the one the caller verified
-/// (see [`crate::weights::f32_weights::open_contained_manifest_file`]) rather than a
-/// pathname reopened afterwards. `display_path` is used only for error messages.
+/// same handle the payload is read from, and that handle is the one the caller opened
+/// (see [`crate::weights::f32_weights::open_manifest_entry_once`]) rather than a pathname
+/// reopened afterwards. `display_path` is used only for error messages.
 pub(crate) fn load_f16_tensor_from_open_file_expecting(
     mut f: std::fs::File,
     display_path: &str,
@@ -950,9 +950,9 @@ pub fn load_f16_tensor_file(
     load_f16_tensor_from_open_file(f, &path.display().to_string())
 }
 
-/// Parse an f32 tensor from an already-open `.f16` file (fd-bind: callers that resolved
-/// this file through [`crate::weights::f32_weights::open_contained_manifest_file`] must
-/// read from that opened fd, not reopen by path -- see that function's docs).
+/// Parse an f32 tensor from an already-open `.f16` file. Callers that resolved this file
+/// through [`crate::weights::f32_weights::open_manifest_entry_once`] must read from that
+/// opened fd rather than reopen by path -- see that function's docs.
 /// `display_path` is used only for error messages.
 pub(crate) fn load_f16_tensor_from_open_file(
     mut f: std::fs::File,

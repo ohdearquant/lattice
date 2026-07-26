@@ -276,9 +276,12 @@ impl SafetensorsFile {
         Self::from_open_file(file, path.display().to_string())
     }
 
-    /// Parse a safetensors file from an already-open [`File`] (FIX 7 fd-bind: the caller
-    /// has already verified this fd's identity via
-    /// [`open_contained_manifest_file`]; never reopen by path after that check).
+    /// Parse a safetensors file from an already-open [`File`].
+    ///
+    /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
+    /// validates the manifest string and opens the file exactly once. Mapping the fd the
+    /// caller already holds is what keeps that single open meaningful; reopening by path
+    /// here would reintroduce the window between the open and the read.
     pub(crate) fn from_open_file(file: File, display_path: String) -> Result<Self, InferenceError> {
         // SAFETY: The file descriptor remains alive until the mmap is created,
         // and the returned Mmap owns the mapping independently of the File.
@@ -1126,9 +1129,6 @@ impl TensorSource for SafetensorsFile {
 #[derive(Debug)]
 pub struct ShardedSafetensors {
     root: PathBuf,
-    /// Canonicalized once at `open_index` time and reused by every subsequent
-    /// `open_shard` call, rather than re-canonicalizing `root` per shard access.
-    canon_root: PathBuf,
     index: SafetensorsIndex,
     shards: HashMap<String, SafetensorsFile>,
 }
@@ -1215,83 +1215,41 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
     })
 }
 
-/// Joins `entry_name` (a manifest/index-derived tensor-shard filename, e.g. from
-/// `model.safetensors.index.json`'s `weight_map` or `quantize_index.json`'s per-tensor
-/// `file` field) onto `model_root`, then asserts the result is still inside `model_root`.
+/// Open a manifest-derived shard entry exactly once, returning the open [`File`] and the
+/// real on-disk path it resolved to.
 ///
-/// PATH CONTAINMENT (sibling class): every one of these manifests is part of an untrusted
-/// checkpoint directory, and every site that joins one of their filename fields onto the
-/// model root without this check lets a `../` entry (or an absolute path, which
-/// [`Path::join`] treats as a full replacement of the base) escape the model directory.
-/// Canonicalizing both sides catches a symlink-based escape the same way as a literal
-/// `../` traversal, since [`std::fs::canonicalize`] resolves symlinks. Every manifest ->
-/// path construction in this crate routes through this one function -- see the
-/// PATH CONTAINMENT table in the PR body.
-pub(crate) fn contain_manifest_path(
-    model_root: &Path,
-    entry_name: &str,
-) -> Result<PathBuf, InferenceError> {
-    if Path::new(entry_name).is_absolute() {
-        return Err(InferenceError::Inference(format!(
-            "manifest entry {entry_name:?} must be a path relative to the model directory, \
-             not absolute"
-        )));
-    }
-    let candidate = model_root.join(entry_name);
-    let canon_root = model_root.canonicalize().map_err(InferenceError::Io)?;
-    let canon_candidate = candidate.canonicalize().map_err(InferenceError::Io)?;
-    if !canon_candidate.starts_with(&canon_root) {
-        return Err(InferenceError::Inference(format!(
-            "manifest entry {entry_name:?} escapes model root {} (resolved to {})",
-            model_root.display(),
-            canon_candidate.display()
-        )));
-    }
-    Ok(canon_candidate)
-}
-
-/// Canonicalize `model_root` once. Callers that resolve many manifest entries against the
-/// same root (e.g. the 153-tensor vision checkpoint loop in `vision/checkpoint.rs`) must
-/// canonicalize once and reuse the result via [`open_contained_manifest_file`], rather than
-/// re-canonicalizing per entry (FIX 7 perf-minor fold).
-pub(crate) fn canonicalize_model_root(model_root: &Path) -> Result<PathBuf, InferenceError> {
-    model_root.canonicalize().map_err(InferenceError::Io)
-}
-
-/// Open `entry_name` (joined onto `model_root`) exactly once, verifying the OPENED file
-/// descriptor's real path is contained within `canon_root` (pre-canonicalized by the
-/// caller via [`canonicalize_model_root`]) -- and returns that open [`File`] for the
-/// caller to read from directly.
+/// `entry_name` comes from an untrusted checkpoint manifest (`model.safetensors.index.json`'s
+/// `weight_map`, or `quantize_index.json`'s per-tensor `file` field), so it is validated by
+/// [`contained_shard_path`] before the join: absolute paths and parent-directory components
+/// are rejected, lexically, without consulting any filesystem state.
 ///
-/// FIX 7: [`contain_manifest_path`] alone canonicalizes+validates a path, then leaves the
-/// caller to reopen it separately by that same path -- a concurrent attacker can swap the
-/// file/symlink between the check and the reopen (TOCTOU). This function closes that
-/// window by opening the candidate first and verifying the identity of the fd that was
-/// actually opened, not the path that was checked. Never reopen the path this returns;
-/// read from the returned `File`.
-pub(crate) fn open_contained_manifest_file(
+/// # Why this opens the file instead of returning a path to reopen
+///
+/// Resolving a path and handing it back leaves the caller to `open()` it separately, and a
+/// concurrent writer can swap the file or symlink in between: the path that was checked and
+/// the path that was opened are then not the same file. This function opens the candidate
+/// first and reports the identity of the descriptor actually opened. **Never reopen the path
+/// this returns** — read from the returned `File`. The returned path is for diagnostics and
+/// error text only, and nothing security-relevant keys off it.
+///
+/// # What this deliberately does NOT check
+///
+/// It does not require the opened file's real path to stay beneath the model root, and it
+/// follows symlinks. That matches the threat model documented on [`contained_shard_path`]:
+/// manifest strings are untrusted, the local filesystem is trusted. Asserting containment on
+/// the *resolved* path would reject every HuggingFace hub-cache checkpoint, since those
+/// snapshots are symlink farms (`snapshots/<rev>/x.safetensors -> ../../blobs/<sha>`) and
+/// lattice loads such directories directly. Read that threat-model section before
+/// reintroducing a resolved-path containment check here.
+pub(crate) fn open_manifest_entry_once(
     model_root: &Path,
-    canon_root: &Path,
     entry_name: &str,
 ) -> Result<(File, PathBuf), InferenceError> {
-    if Path::new(entry_name).is_absolute() {
-        return Err(InferenceError::Inference(format!(
-            "manifest entry {entry_name:?} must be a path relative to the model directory, \
-             not absolute"
-        )));
-    }
-    let candidate = model_root.join(entry_name);
+    let candidate = contained_shard_path(model_root, entry_name)?;
     let file = File::open(&candidate).map_err(|e| {
         InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", candidate.display()))
     })?;
     let real_path = real_path_of_open_file(&file, &candidate)?;
-    if !real_path.starts_with(canon_root) {
-        return Err(InferenceError::Inference(format!(
-            "manifest entry {entry_name:?} escapes model root {} (resolved to {})",
-            model_root.display(),
-            real_path.display()
-        )));
-    }
     Ok((file, real_path))
 }
 
@@ -1333,7 +1291,7 @@ pub fn resolve_shard(
         .weight_map
         .get(tensor_name)
         .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-    contain_manifest_path(model_dir, shard_file)
+    contained_shard_path(model_dir, shard_file)
 }
 
 /// Eagerly load all tensors from a sharded checkpoint into an owned map.
@@ -1343,7 +1301,6 @@ pub fn resolve_shard(
 /// for lower peak memory during model loading.
 pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, InferenceError> {
     let index = parse_index(model_dir)?;
-    let canon_root = canonicalize_model_root(model_dir)?;
     let mut by_shard: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
 
@@ -1356,7 +1313,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
-        let (file, real_path) = open_contained_manifest_file(model_dir, &canon_root, &shard_file)?;
+        let (file, real_path) = open_manifest_entry_once(model_dir, &shard_file)?;
         let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
@@ -1381,10 +1338,8 @@ impl ShardedSafetensors {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
         let index = parse_index(&root)?;
-        let canon_root = canonicalize_model_root(&root)?;
         Ok(Self {
             root,
-            canon_root,
             index,
             shards: HashMap::new(),
         })
@@ -1402,7 +1357,7 @@ impl ShardedSafetensors {
             .weight_map
             .get(tensor_name)
             .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-        let shard_path = contain_manifest_path(&self.root, shard_file)?;
+        let shard_path = contained_shard_path(&self.root, shard_file)?;
         Ok((shard_path, tensor_name.to_string()))
     }
 
@@ -1416,8 +1371,7 @@ impl ShardedSafetensors {
 
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
-            let (file, real_path) =
-                open_contained_manifest_file(&self.root, &self.canon_root, shard_file)?;
+            let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
             let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
             self.shards.insert(shard_file.to_string(), shard);
         }
@@ -2694,13 +2648,10 @@ mod tests {
         assert_eq!(index.weight_map.len(), 2);
 
         // Test resolve_shard free function.
+        // The returned path is the validated entry joined onto `model_dir`, not a
+        // canonicalized one -- symlinks are followed at open time, not resolved here.
         let shard_a_path = resolve_shard(&index, &dir, "tensor.a").expect("resolve_shard tensor.a");
-        assert_eq!(
-            shard_a_path,
-            shard_a
-                .canonicalize()
-                .expect("test setup: canonicalize shard_a")
-        );
+        assert_eq!(shard_a_path, shard_a);
         assert!(resolve_shard(&index, &dir, "tensor.missing").is_err());
 
         // Test load_sharded free function.
@@ -3041,60 +2992,6 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    // ── PATH CONTAINMENT ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn contain_manifest_path_rejects_absolute_entry() {
-        let root = temp_dir("lattice_containment_absolute");
-        let err = contain_manifest_path(&root, "/etc/passwd")
-            .expect_err("an absolute manifest entry must be rejected");
-        assert!(
-            matches!(err, InferenceError::Inference(ref msg) if msg.contains("absolute")),
-            "wrong error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn contain_manifest_path_rejects_relative_traversal_escape() {
-        let root = temp_dir("lattice_containment_traversal");
-        // A real file placed one level above `root`, reachable only via `../`.
-        let escape_target = root.parent().expect("temp dir has a parent").join(format!(
-            "lattice_containment_secret_{}.txt",
-            std::process::id()
-        ));
-        fs::write(&escape_target, b"secret").expect("test setup: write escape target");
-
-        let entry = format!(
-            "../{}",
-            escape_target.file_name().unwrap().to_str().unwrap()
-        );
-        let result = contain_manifest_path(&root, &entry);
-
-        fs::remove_file(&escape_target).ok();
-
-        let err = result.expect_err("a `../` traversal escaping model_root must be rejected");
-        assert!(
-            matches!(err, InferenceError::Inference(ref msg) if msg.contains("escapes")),
-            "wrong error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn contain_manifest_path_accepts_contained_entry() {
-        let root = temp_dir("lattice_containment_ok");
-        let shard = root.join("model-00001-of-00001.safetensors");
-        write_single_f32_tensor(&shard, "tensor.a", &[1.0]);
-
-        let resolved = contain_manifest_path(&root, "model-00001-of-00001.safetensors")
-            .expect("a contained entry must resolve");
-        assert_eq!(
-            resolved,
-            shard
-                .canonicalize()
-                .expect("test setup: canonicalize shard")
-        );
-    }
-
     #[test]
     fn parse_index_rejects_oversized_index_file() {
         // FIX 6 regression: an oversized model.safetensors.index.json must be rejected
@@ -3154,42 +3051,18 @@ mod tests {
     }
 
     #[test]
-    fn open_contained_manifest_file_rejects_symlink_escaping_root() {
-        // FIX 7 regression: a manifest entry that resolves (via a symlink) outside the
-        // canonicalized model root must be rejected by the fd-bind check -- the OPENED
-        // fd's real path (F_GETPATH on macOS), not the path that was joined before
-        // opening, is what gets compared against `canon_root`.
-        let root = temp_dir("lattice_fdbind_escape_root");
-        let outside = root.parent().expect("temp dir has a parent").join(format!(
-            "lattice_fdbind_escape_target_{}_{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::write(&outside, b"secret").expect("test setup: write escape target");
-
-        #[cfg(unix)]
-        {
-            let link = root.join("shard.safetensors");
-            std::os::unix::fs::symlink(&outside, &link).expect("test setup: create symlink");
-
-            let canon_root = canonicalize_model_root(&root).expect("canonicalize root");
-            let result = open_contained_manifest_file(&root, &canon_root, "shard.safetensors");
-
-            fs::remove_file(&outside).ok();
-
-            let err = result.expect_err("a symlink escaping model_root must be rejected");
-            assert!(
-                matches!(err, InferenceError::Inference(ref msg) if msg.contains("escapes")),
-                "wrong error: {err:?}"
-            );
-        }
-        #[cfg(not(unix))]
-        {
-            fs::remove_file(&outside).ok();
-        }
+    fn open_manifest_entry_once_rejects_traversal_before_opening() {
+        // The lexical check runs before the join, so a `../` entry is refused whether or
+        // not it names a real file -- the fd is never opened. Symlink escape is NOT
+        // tested here and NOT rejected: see the threat model on `contained_shard_path`
+        // and `sharded_loader_follows_hub_cache_snapshot_layout`.
+        let root = temp_dir("lattice_manifest_entry_traversal");
+        let err = open_manifest_entry_once(&root, "../escape.safetensors")
+            .expect_err("a `../` manifest entry must be rejected");
+        assert!(
+            err.to_string().contains("escapes the model directory"),
+            "expected the lexical traversal guard to fire, got: {err}"
+        );
     }
 
     #[test]
