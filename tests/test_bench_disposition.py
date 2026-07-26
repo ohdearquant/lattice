@@ -499,6 +499,37 @@ class BenchDispositionCheck(unittest.TestCase):
         self.assertGreater(len(body), 64 * 1024)
         self.assertFalse(has_disposition(body))
 
+    def test_long_body_is_fast_under_system_bash(self):
+        # Guards the OTHER way to get the pipe out of the reads: doing the
+        # whitespace work in the shell (`"${BODY//[[:space:]]/}"`) instead of
+        # handing it to grep/tr. That removes a subprocess but is quadratic-ish
+        # on bash 3.2, which is what macOS ships as /bin/bash and what the
+        # script's own local usage line invokes. Measured on this repo's
+        # host: a valid 16KB body took 3.2s that way versus 0.06s through
+        # grep, and a 64KB body did not finish inside 30s.
+        #
+        # Read the discriminating power honestly: on macOS /bin/bash is 3.2 and
+        # this case catches that shape outright. On a Linux runner /bin/bash is
+        # 5.x, where the shell form is fast and this case cannot fail. It is a
+        # real guard locally and a no-op in CI, which is the reverse of the
+        # usual arrangement and worth knowing before trusting a green run.
+        system_bash = Path("/bin/bash")
+        if not system_bash.exists():
+            self.skipTest("no /bin/bash on this platform")
+        body = (
+            "## bench-compare disposition\n"
+            "bench-compare showed no change (p > 0.05 on all groups).\n\n"
+            + "x" * (64 * 1024)
+        )
+        result = subprocess.run(
+            [str(system_bash), str(SCRIPT)],
+            input=body,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

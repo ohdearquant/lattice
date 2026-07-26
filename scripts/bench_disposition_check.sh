@@ -15,9 +15,9 @@ set -euo pipefail
 
 BODY=$(cat)
 
-# Every read of the description below goes through a herestring or pure parameter
-# expansion, never `printf ... | reader`. Under `set -o pipefail` that pipeline
-# shape turns a LARGE description into a false rejection:
+# Every read of the description below goes through a herestring, never
+# `printf ... | reader`. Under `set -o pipefail` that pipeline shape turns a
+# LARGE description into a false rejection:
 #
 #   `grep -q` and this file's `awk` both exit as soon as they have their answer.
 #   Once the reader is gone, the writing `printf` takes SIGPIPE/EPIPE and exits
@@ -35,7 +35,15 @@ BODY=$(cat)
 # A herestring makes the reader's stdin a temp file with no writer to signal, so
 # an early exit is just an early exit. Fail-closed direction is preserved: a read
 # error still surfaces, it just can no longer be manufactured by input size.
-if [[ -z "${BODY//[[:space:]]/}" ]]; then
+#
+# The readers themselves are unchanged from the pipeline version. Doing the same
+# work in the shell instead (`[[ -z "${BODY//[[:space:]]/}" ]]`) removes a
+# subprocess but is quadratic-ish on bash 3.2, which is what macOS ships as
+# /bin/bash and what the local usage line above invokes: a valid 16KB
+# description took 3.2s that way versus 0.11s under bash 5, and a 65KB one did
+# not finish inside half a minute. The defect being fixed here is the pipe, so
+# the pipe is the only thing that changes.
+if ! grep -q '[^[:space:]]' <<< "$BODY"; then
   echo "empty description; a bench-compare disposition is required" >&2
   exit 1
 fi
@@ -193,7 +201,7 @@ SECTION=$(awk '
 
 # This awk exits early at the section's closing heading, so it is the same
 # early-exiting reader as the greps; see the note at the top.
-if [[ -z "${SECTION//[[:space:]]/}" ]]; then
+if ! grep -q '[^[:space:]]' <<< "$SECTION"; then
   echo "no bench-compare disposition heading found in the description" >&2
   echo "put the numbers under a heading, e.g.  ## bench-compare disposition" >&2
   exit 1
@@ -204,7 +212,7 @@ fi
 # marker matching (markers like "no change" contain spaces) and a stripped
 # copy for the length floor.
 BODYTEXT=$(tail -n +2 <<< "$SECTION")
-CONTENT="${BODYTEXT//[[:space:]]/}"
+CONTENT=$(tr -d '[:space:]' <<< "$BODYTEXT")
 
 # The blessed minimal dispositions are legitimately terse and fall well
 # under a raw length floor: the no-change one-liner CLAUDE.md blesses
