@@ -3382,6 +3382,7 @@ mod tests {
             num_position_embeddings: 1,
             in_channels: 1,
             deepstack_visual_indexes: vec![],
+            intermediate_size: None,
         });
         (cfg, weights)
     }
