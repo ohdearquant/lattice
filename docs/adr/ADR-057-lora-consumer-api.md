@@ -74,7 +74,7 @@ pub fn score_batch_with_hook(
 ) -> Result<Vec<f32>, InferenceError>;
 ```
 
-Both methods validate the hook's declared projection geometry against the model's BERT dimensions (via `LoraHook::validate_against_bert`) before the forward pass runs, and return `Err(InferenceError::InvalidInput)` if the geometry doesn't match — this is what lets a malformed or attacker-controlled adapter be rejected with a recoverable error instead of a forward pass indexing out of bounds.
+Both methods *delegate* geometry validation to the hook: each calls `LoraHook::validate_against_bert` with the model's BERT dimensions before the forward pass runs, and maps any `Err` to `Err(InferenceError::InvalidInput)`. The trait's default implementation of that method returns `Ok(())` — it trusts the caller — so a hook is checked here only to the extent that its own implementation checks itself. Adapters obtained through this workspace's own types (e.g. `lattice_tune::lora::LoraAdapter`) override it, which is what lets a malformed or attacker-controlled adapter be rejected with a recoverable error instead of a forward pass indexing out of bounds. `score_batch_with_hook` runs that check once at the boundary rather than per document, so it also rejects on an empty `documents` slice.
 
 `BertModel::forward_tokenized` is `pub(crate)` today. The hook-aware variant stays `pub(crate)` — downstream consumers access hooks through `CrossEncoderModel::score_with_hook` (which is `pub`), not through the internal BERT forward method directly.
 
