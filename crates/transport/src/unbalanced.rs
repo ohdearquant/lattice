@@ -348,6 +348,19 @@ impl UnbalancedSinkhornSolver {
 
             iterations = iteration + 1;
             if iterations.is_multiple_of(check_every) || iterations == self.config.max_iterations {
+                // WHY THIS DIFFERS FROM THE BALANCED SOLVER, deliberately.
+                // `sinkhorn.rs` converges on marginal L1 residuals and its FP-026 note
+                // records that dual-update magnitude is unsound *there*, because a
+                // balanced plan must match its marginals exactly. Under KL relaxation
+                // the marginals are intentionally not matched: the residual is nonzero
+                // at the optimum, so porting that criterion here would not be stricter,
+                // it would be meaningless. Reading these two files side by side without
+                // this note makes the divergence look like a regression of FP-026.
+                //
+                // This is still a proxy. The principled analogue is the KL-penalized
+                // objective or a primal-dual gap, and `marginal_kl_penalties` is already
+                // imported above, so the stronger criterion is in reach and simply not
+                // wired. Treat that as the open item, not the divergence itself.
                 last_error = max_du.max(max_dv);
                 if let Some(observer) = progress.as_deref_mut() {
                     let keep_going = observer.on_progress(ProgressState {
@@ -567,6 +580,19 @@ impl UnbalancedSinkhornSolver {
 
             iterations = iteration + 1;
             if iterations.is_multiple_of(check_every) || iterations == self.config.max_iterations {
+                // WHY THIS DIFFERS FROM THE BALANCED SOLVER, deliberately.
+                // `sinkhorn.rs` converges on marginal L1 residuals and its FP-026 note
+                // records that dual-update magnitude is unsound *there*, because a
+                // balanced plan must match its marginals exactly. Under KL relaxation
+                // the marginals are intentionally not matched: the residual is nonzero
+                // at the optimum, so porting that criterion here would not be stricter,
+                // it would be meaningless. Reading these two files side by side without
+                // this note makes the divergence look like a regression of FP-026.
+                //
+                // This is still a proxy. The principled analogue is the KL-penalized
+                // objective or a primal-dual gap, and `marginal_kl_penalties` is already
+                // imported above, so the stronger criterion is in reach and simply not
+                // wired. Treat that as the open item, not the divergence itself.
                 last_error = max_du.max(max_dv);
                 if let Some(observer) = progress.as_deref_mut() {
                     let keep_going = observer.on_progress(ProgressState {

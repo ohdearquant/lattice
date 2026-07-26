@@ -233,8 +233,8 @@ mod gated {
     }
 
     /// Dispatch-count accounting is only compiled into the library under the
-    /// non-default `test-utils` feature (review follow-up: the counter must
-    /// not run in a normal production `metal-gpu` build). These helpers make
+    /// non-default `test-utils` feature: the counter must
+    /// not run in a normal production `metal-gpu` build. These helpers make
     /// that opt-in a no-op here too, so `cargo test --features f16,metal-gpu`
     /// (without `test-utils`) still compiles and runs the cosine gate below,
     /// just without the dispatch-count proof.

@@ -66,20 +66,28 @@ mod imp {
         Json, Router,
         body::{Body, to_bytes},
         extract::State,
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         response::{
             IntoResponse, Response,
             sse::{Event, KeepAlive, Sse},
         },
         routing::{get, post},
     };
-    use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
+    use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model::qwen35_config::{
         GenerateConfig, GenerateOutput, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
     };
     use lattice_inference::model_format::{self, ModelFormat};
+    use lattice_inference::serve::contract::{
+        ChatRequest as ChatReq, GenerationDefaults, ServeProfile, ValidatedChatRequest,
+        is_message_flood_error, message_flood_text, normalize_request,
+    };
+    #[cfg(test)]
+    use lattice_inference::serve::contract::{
+        ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, normalize_messages,
+    };
     use lattice_inference::serve::metal_worker::{
         ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
         WorkerMetadata,
@@ -91,7 +99,6 @@ mod imp {
     #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
     use lattice_inference::tokenizer::Tokenizer as _;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
-    use serde::Deserialize;
     use serde_json::{Value, json};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Condvar, Mutex};
@@ -203,6 +210,7 @@ mod imp {
     /// #649: image input is accepted in the OpenAI wire shape but this server
     /// has no vision tower, so it must fail closed with a clear message
     /// rather than silently dropping the part or coercing it to text.
+    #[cfg(test)]
     const IMAGE_REQUIRES_VISION_MESSAGE: &str = "image input requires a vision-capable model";
 
     /// A request-validation failure that must surface as HTTP 400 (#641,
@@ -227,8 +235,8 @@ mod imp {
             message: String,
             code: &'static str,
         },
-        /// A server-side malfunction discovered during admission (round-1
-        /// review medium finding 4a: e.g. the grammar cache's own lock/slot
+        /// A server-side malfunction discovered during admission (e.g. the
+        /// grammar cache's own lock/slot
         /// invariants broke) -- never the caller's fault, so it must not be
         /// reported as the 400 every other `RequestError` is.
         ServerError {
@@ -270,132 +278,6 @@ mod imp {
                 Self::ServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             }
         }
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct ChatReq {
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        messages: Vec<InMsg>,
-        #[serde(default)]
-        temperature: Option<f32>,
-        #[serde(default)]
-        top_p: Option<f32>,
-        #[serde(default)]
-        top_k: Option<usize>,
-        #[serde(default)]
-        max_tokens: Option<usize>,
-        #[serde(default)]
-        seed: Option<u64>,
-        #[serde(default)]
-        stream: Option<bool>,
-        // Lattice extensions (ignored by stock OpenAI clients).
-        #[serde(default)]
-        repetition_penalty: Option<f32>,
-        #[serde(default)]
-        reasoning_budget: Option<usize>,
-        // #656: known-but-unsupported OpenAI fields, modeled explicitly (not
-        // left to serde's default silent-drop of unknown fields) so
-        // `reject_unsupported` can name the exact offending field and
-        // return HTTP 400 rather than quietly running a tool-calling/
-        // JSON-mode/multi-completion request as a plain text completion.
-        #[serde(default)]
-        max_completion_tokens: Option<usize>,
-        #[serde(default)]
-        tools: Option<Value>,
-        #[serde(default)]
-        tool_choice: Option<Value>,
-        #[serde(default)]
-        response_format: Option<ResponseFormat>,
-        #[serde(default)]
-        n: Option<usize>,
-        #[serde(default)]
-        logprobs: Option<bool>,
-        #[serde(default)]
-        top_logprobs: Option<usize>,
-        #[serde(default)]
-        stop: Option<Value>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct ResponseFormat {
-        r#type: String,
-        #[serde(default)]
-        json_schema: Option<JsonSchemaFormat>,
-    }
-
-    /// `response_format.json_schema` (structured-output v0 design note).
-    /// Fields are all `Option` at the wire boundary so `admit_structured_request`
-    /// can name exactly which one is missing/wrong rather than serde
-    /// rejecting the whole request with a generic parse error.
-    #[derive(Debug, Deserialize)]
-    struct JsonSchemaFormat {
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        strict: Option<bool>,
-        #[serde(default)]
-        schema: Option<Value>,
-    }
-
-    /// #656: reject known-but-unsupported OpenAI request fields with HTTP
-    /// 400 instead of silently ignoring them -- the same fail-closed
-    /// philosophy `MessageRole::parse`/`content_text` already apply to
-    /// roles and content parts. Mirrors `lattice.rs`'s `reject_unsupported`,
-    /// scoped to this minimal server's narrower surface: unlike
-    /// `lattice.rs`, this server has no `logprobs`/`stop` implementation at
-    /// all, so both are rejected outright rather than conditionally.
-    fn reject_unsupported(req: &ChatReq) -> Result<(), RequestError> {
-        if req.tools.is_some() || req.tool_choice.is_some() {
-            return Err(RequestError::bad_request(
-                "tools and tool_choice are not supported by this server",
-                "unsupported_feature",
-            ));
-        }
-        if req.n.unwrap_or(1) > 1 {
-            return Err(RequestError::bad_request(
-                "n > 1 is not supported",
-                "unsupported_feature",
-            ));
-        }
-        if let Some(fmt) = &req.response_format
-            && fmt.r#type != "text"
-            && fmt.r#type != "json_schema"
-        {
-            return Err(RequestError::bad_request(
-                format!(
-                    "response_format.type '{}' is not supported; use 'text'",
-                    fmt.r#type
-                ),
-                "unsupported_feature",
-            ));
-        }
-        if req.logprobs.unwrap_or(false) || req.top_logprobs.is_some() {
-            return Err(RequestError::bad_request(
-                "logprobs/top_logprobs are not supported by this server",
-                "unsupported_feature",
-            ));
-        }
-        if req.stop.is_some() {
-            return Err(RequestError::bad_request(
-                "stop is not supported by this server",
-                "unsupported_feature",
-            ));
-        }
-        if let (Some(a), Some(b)) = (req.max_tokens, req.max_completion_tokens)
-            && a != b
-        {
-            return Err(RequestError::bad_request(
-                format!("max_tokens ({a}) and max_completion_tokens ({b}) differ; supply only one"),
-                // Matches lattice.rs's `validate_max_tokens`, which uses the
-                // generic "invalid_request" code for this exact conflict
-                // (not a more specific "invalid_max_tokens" -- that code is
-                // reserved for the zero/cap cases).
-                "invalid_request",
-            ));
-        }
-        Ok(())
     }
 
     // ─── structured-output v0 (design note: strict JSON Schema, non-streaming only) ──
@@ -545,7 +427,7 @@ mod imp {
     /// shared between admission-time compilation and this check cannot
     /// silently agree on a wrong answer.
     ///
-    /// Round-1 review major finding: `serde_json::Value` (without the
+    /// A correctness note on `serde_json::Value`: (without the
     /// `arbitrary_precision` feature, which the workspace does not enable)
     /// parses any JSON number into `u64`/`i64`/`f64` before this function
     /// would ever see it, so a grammar-conforming integer literal outside
@@ -894,8 +776,7 @@ mod imp {
     /// grammar cache.
     const GRAMMAR_CACHE_CAPACITY: usize = 32;
 
-    /// [`GrammarCache::get_or_compile`]'s error shape (round-1 review
-    /// medium finding 4a). Distinguishes a legitimate schema-compile
+    /// [`GrammarCache::get_or_compile`]'s error shape distinguishes a legitimate schema-compile
     /// failure -- the caller's fault, an ordinary 400
     /// `unsupported_strict_schema`, exactly the behavior before this change
     /// -- from the cache's own internal machinery breaking (a poisoned
@@ -971,8 +852,8 @@ mod imp {
         /// if absent. Concurrent callers with the same `key` share one
         /// compile: all but the first block on that first call's result.
         ///
-        /// Never panics on a poisoned lock or a broken internal invariant
-        /// (round-1 review medium finding 4a): every lock is recovered via
+        /// Never panics on a poisoned lock or a broken internal invariant:
+        /// every lock is recovered via
         /// `unwrap_or_else(PoisonError::into_inner)` instead of `expect`,
         /// and `compile` runs under `catch_unwind` so a panicking compile
         /// still frees its slot and wakes every waiter with
@@ -1080,6 +961,7 @@ mod imp {
     /// design note's fail-closed admission contract.
     fn admit_structured_request(
         req: &ChatReq,
+        stream: bool,
         vocab_bytes: &Arc<Vec<Vec<u8>>>,
         grammar_cache: &Arc<GrammarCache>,
     ) -> Result<Option<StructuredRequest>, RequestError> {
@@ -1093,7 +975,7 @@ mod imp {
         // behavior"): an SSE consumer could observe syntactically
         // incomplete JSON at every intermediate token, so v0 rejects the
         // combination outright rather than hiding partial bytes.
-        if req.stream.unwrap_or(false) {
+        if stream {
             return Err(RequestError::bad_request(
                 "response_format.json_schema requires a non-streaming request \
                  (stream must be false or omitted)",
@@ -1126,12 +1008,23 @@ mod imp {
                 "unsupported_feature",
             ));
         }
-        let Some(schema) = &json_schema.schema else {
+        let Some(schema_raw) = &json_schema.schema else {
             return Err(RequestError::bad_request(
                 "response_format.json_schema.schema is required",
                 "invalid_request",
             ));
         };
+        // Materialized here, not during the outer `ChatReq` deserialization:
+        // `schema` is a `RawValue` span until this exact point, so a request
+        // that fails the cheaper `name`/`strict`/`stream` checks above never
+        // pays this parse.
+        let schema: Value = serde_json::from_str(schema_raw.get()).map_err(|err| {
+            RequestError::bad_request(
+                format!("response_format.json_schema.schema is invalid: {err}"),
+                "invalid_request",
+            )
+        })?;
+        let schema = &schema;
         if let Err(message) = admit_v0_schema(schema) {
             return Err(RequestError::bad_request(
                 message,
@@ -1176,22 +1069,18 @@ mod imp {
         }))
     }
 
-    #[derive(Debug, Deserialize)]
-    struct InMsg {
-        role: String,
-        content: MessageContent,
-    }
-
     /// Fail-closed chat role (#641): only these three roles are accepted.
     /// Anything else — `tool`, `developer`, a typo, an empty string — is
     /// rejected with HTTP 400 rather than silently coerced to `user`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg(test)]
     enum MessageRole {
         System,
         User,
         Assistant,
     }
 
+    #[cfg(test)]
     impl MessageRole {
         /// ADR-080 C2: differentiates the same
         /// two cases `lattice.rs`'s `ValidatedRole::parse` does -- `tool`/
@@ -1212,83 +1101,6 @@ mod imp {
                     format!("unsupported role '{other}'; must be 'system', 'user', or 'assistant'"),
                     "invalid_role",
                 )),
-            }
-        }
-    }
-
-    /// OpenAI message content: either a plain string or an array of typed
-    /// parts (`[{"type":"text","text":"..."}]`). Both forms deserialize
-    /// successfully here; rejection of unsupported part types happens in
-    /// `content_text` so the exact offending part is available for the error
-    /// message.
-    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-    #[serde(untagged)]
-    enum MessageContent {
-        Text(String),
-        Parts(Vec<Part>),
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Part {
-        Text {
-            text: String,
-        },
-        ImageUrl {
-            image_url: ImageUrl,
-        },
-        /// Any part `type` other than `text`/`image_url` (#641/#649): kept
-        /// instead of dropped so it can be rejected with its real type name.
-        Unsupported {
-            kind: String,
-        },
-    }
-
-    #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-    struct ImageUrl {
-        url: String,
-        #[serde(default)]
-        detail: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    struct RawPart {
-        #[serde(rename = "type")]
-        kind: Option<String>,
-        #[serde(default)]
-        text: Option<String>,
-        #[serde(default)]
-        image_url: Option<ImageUrl>,
-    }
-
-    impl<'de> Deserialize<'de> for Part {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            let raw = RawPart::deserialize(deserializer)?;
-            match raw.kind.as_deref() {
-                Some("text") => {
-                    let text = raw.text.ok_or_else(|| {
-                        serde::de::Error::custom(
-                            "text content part must include string field 'text'",
-                        )
-                    })?;
-                    Ok(Self::Text { text })
-                }
-                Some("image_url") => {
-                    let image_url = raw.image_url.ok_or_else(|| {
-                        serde::de::Error::custom(
-                            "image_url content part must include object field 'image_url'",
-                        )
-                    })?;
-                    Ok(Self::ImageUrl { image_url })
-                }
-                Some(kind) => Ok(Self::Unsupported {
-                    kind: kind.to_string(),
-                }),
-                None => Ok(Self::Unsupported {
-                    kind: "<missing>".to_string(),
-                }),
             }
         }
     }
@@ -1674,7 +1486,7 @@ mod imp {
         }
     }
 
-    /// Raw-JSON duplicate-member scan (round-1 review blocker, finding 1):
+    /// Raw-JSON duplicate-member scan:
     /// rejects a request body containing an object with a repeated member
     /// name, at any nesting depth, ANYWHERE in the body -- not scoped to
     /// just `response_format.json_schema.schema`. Deliberate choice: a
@@ -1804,61 +1616,25 @@ mod imp {
     /// counts/sizes against the raw bytes first, then deserializes the typed
     /// request. Never allocates the request's strings/arrays before the
     /// clamp has run.
+    ///
+    /// The message-count bound is enforced inline during the typed `ChatReq`
+    /// parse below (`serve::contract::deserialize_bounded_messages`): a body
+    /// with more than `MAX_MESSAGE_COUNT` tiny messages is rejected without
+    /// materializing a `Vec<Message>` entry for each one, in that same parse
+    /// -- there is no separate raw-bytes pass over `messages` ahead of it.
     fn parse_chat_req(body: &[u8]) -> Result<ChatReq, RequestError> {
         reject_duplicate_json_members(body)?;
         validate_content_part_limits(body)?;
-        serde_json::from_slice::<ChatReq>(body).map_err(|_| {
+        serde_json::from_slice::<ChatReq>(body).map_err(|err| {
+            if is_message_flood_error(&err) {
+                return RequestError::bad_request(message_flood_text(), "invalid_request_body");
+            }
             RequestError::bad_request(
                 "invalid JSON request body",
                 // Matches lattice.rs's JSON-extraction-failure code
                 // (ADR-080 C2).
                 "invalid_request_body",
             )
-        })
-    }
-
-    /// Flatten message content to plain text (#641, #649). Fails closed:
-    /// an `image_url` part returns the vision-model message, any other
-    /// unsupported part type names itself in the error rather than being
-    /// silently dropped.
-    fn content_text(content: &MessageContent) -> Result<String, RequestError> {
-        match content {
-            MessageContent::Text(text) => Ok(text.clone()),
-            MessageContent::Parts(parts) => {
-                let mut out = String::new();
-                for part in parts {
-                    match part {
-                        Part::Text { text } => out.push_str(text),
-                        Part::ImageUrl { .. } => {
-                            // Matches lattice.rs's `message_text` image
-                            // rejection code (ADR-080 C2).
-                            return Err(RequestError::bad_request(
-                                IMAGE_REQUIRES_VISION_MESSAGE,
-                                "unsupported_feature",
-                            ));
-                        }
-                        Part::Unsupported { kind } => {
-                            return Err(RequestError::bad_request(
-                                format!(
-                                    "unsupported content part type '{kind}'; only 'text' parts are accepted"
-                                ),
-                                "unsupported_feature",
-                            ));
-                        }
-                    }
-                }
-                Ok(out)
-            }
-        }
-    }
-
-    fn to_chat_message(m: &InMsg) -> Result<ChatMessage, RequestError> {
-        let role = MessageRole::parse(&m.role)?;
-        let content = content_text(&m.content)?;
-        Ok(match role {
-            MessageRole::System => ChatMessage::system(content),
-            MessageRole::User => ChatMessage::user(content),
-            MessageRole::Assistant => ChatMessage::assistant(content),
         })
     }
 
@@ -1872,63 +1648,22 @@ mod imp {
             .unwrap_or(FALLBACK_MODEL_MAX_CONTEXT)
     }
 
-    fn build_cfg(
-        req: &ChatReq,
-        d: &Defaults,
-        model_max_context: usize,
-    ) -> Result<GenerateConfig, lattice_inference::serve::ApiError> {
-        // #745 (ADR-080 C2): reject a caller-supplied `max_tokens: 0` (or
-        // `max_completion_tokens: 0`) up front, on the alias-resolved but
-        // still-unclamped value -- previously this clamped straight through
-        // via `.min(..)` below into a zero-budget completion instead of a
-        // clear rejection. Checked before the clamp so the rejection reflects
-        // the caller's actual request, not a clamp artifact.
-        let max_new_tokens_requested = req
-            .max_tokens
-            // #656: `max_completion_tokens` is the current OpenAI field name;
-            // `reject_unsupported` already rejected the two being present
-            // and disagreeing, so whichever is set here is the caller's
-            // single, unambiguous intent.
-            .or(req.max_completion_tokens)
-            .unwrap_or(d.max_tokens);
-        lattice_inference::serve::reject_zero_max_tokens(max_new_tokens_requested)?;
-        // Clamp like `max_tokens`: a budget past the KV window is meaningless and
-        // would let a future `with_capacity(decode_cap(..))` abort on overflow.
-        // Reserve one slot of headroom so the worst-case decode cap below
-        // (`reasoning_budget + max_new_tokens + 1`) never exceeds the KV
-        // window even when `reasoning_budget` is absent/zero.
-        let max_new_tokens = max_new_tokens_requested.min(model_max_context.saturating_sub(1));
-        // The worst-case decode cap is `reasoning_budget + max_new_tokens + 1`
-        // (#551): keep it at or below the KV window the worker actually
-        // allocated, not just below `model_max_context` in isolation.
-        let reasoning_room = model_max_context
-            .saturating_sub(max_new_tokens)
-            .saturating_sub(1);
-        let reasoning_budget = req
-            .reasoning_budget
-            .filter(|&n| n > 0)
-            .or(d.reasoning_budget)
-            .map(|n| n.min(reasoning_room))
-            .filter(|&n| n > 0);
-        Ok(GenerateConfig {
-            max_new_tokens,
-            temperature: req.temperature.unwrap_or(d.temperature),
-            top_k: req.top_k.unwrap_or(d.top_k),
-            top_p: req.top_p.unwrap_or(d.top_p),
-            repetition_penalty: req.repetition_penalty.unwrap_or(d.repetition_penalty),
+    fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
+        GenerateConfig {
+            max_new_tokens: req.max_tokens,
+            temperature: req.temperature,
+            top_k: req.top_k,
+            top_p: req.top_p,
+            repetition_penalty: req.repetition_penalty,
             seed: req.seed,
             stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
             enable_thinking: true,
             enable_mtp: None,
             grammar: None,
-            stop_strings: vec![],
-            reasoning_budget,
-            // ChatReq models `logprobs`/`top_logprobs` (#656) only so
-            // `reject_unsupported` can fail closed with HTTP 400 -- this
-            // minimal server has no logprobs implementation at all, so a
-            // `logprobs: true` request never reaches here (see below).
-            logprobs: None,
-        })
+            stop_strings: req.stop_strings.clone(),
+            reasoning_budget: req.reasoning_budget,
+            logprobs: req.logprobs,
+        }
     }
 
     // ─── GPU worker thread ───────────────────────────────────────────────────
@@ -2105,29 +1840,80 @@ mod imp {
         End(usize, usize, Option<(u16, &'static str)>),  // same; emits telemetry then stream ends
     }
 
-    async fn chat_completions(State(s): State<AppState>, body: Body) -> Response {
+    /// Content-Type guard: unlike `lattice.rs`'s
+    /// `chat_completions`, this handler never went through axum's `Json`
+    /// extractor at all -- it has always taken the raw `Body` directly, so
+    /// it never got `Json`'s free Content-Type enforcement either, before
+    /// or after this PR's message-count preflight. Guarded here with the
+    /// same `require_json_content_type` check, ahead of `to_bytes`.
+    async fn chat_completions(
+        State(s): State<AppState>,
+        headers: HeaderMap,
+        body: Body,
+    ) -> Response {
         let timer = Instant::now();
-        let Ok(body) = to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await else {
+        if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
             emit_serve_event(
                 &s.metrics,
                 "POST",
                 "/v1/chat/completions",
-                413,
+                415,
                 None,
                 None,
                 timer.elapsed().as_secs_f64() * 1000.0,
                 false,
-                Some("request_body_too_large"),
+                Some(err.code()),
             );
-            // ADR-080 C2: previously mapped to
-            // HTTP 400 + generic "invalid_request", diverging from
-            // lattice.rs's 413 + "request_body_too_large" for the identical
-            // oversized-body condition. Aligned to match.
-            return err_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
-                "request_body_too_large",
-            );
+            return err.into_response();
+        }
+        let body = match to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await {
+            Ok(body) => body,
+            Err(err) => {
+                // Only a length-limit rejection is an oversized-body
+                // condition; any other body-buffering failure (e.g. a
+                // client disconnecting mid-stream) is not, and must not be
+                // reported as 413.
+                let is_length_limit = std::error::Error::source(&err)
+                    .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+                if is_length_limit {
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        "/v1/chat/completions",
+                        413,
+                        None,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        false,
+                        Some("request_body_too_large"),
+                    );
+                    // ADR-080 C2: previously mapped to
+                    // HTTP 400 + generic "invalid_request", diverging from
+                    // lattice.rs's 413 + "request_body_too_large" for the identical
+                    // oversized-body condition. Aligned to match.
+                    return err_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!("request body exceeds {REQUEST_BODY_LIMIT_BYTES} bytes"),
+                        "request_body_too_large",
+                    );
+                }
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    "/v1/chat/completions",
+                    400,
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some("invalid_request"),
+                );
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid request body",
+                    "invalid_request",
+                );
+            }
         };
         let req = match parse_chat_req(&body) {
             Ok(req) => req,
@@ -2146,66 +1932,21 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
-        if let Err(err) = reject_unsupported(&req) {
-            emit_serve_event(
-                &s.metrics,
-                "POST",
-                "/v1/chat/completions",
-                400,
-                None,
-                None,
-                timer.elapsed().as_secs_f64() * 1000.0,
-                false,
-                Some(err.code()),
-            );
-            return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
-        }
-        if let Some(requested_model) = req.model.as_deref()
-            && requested_model != s.model_id.as_ref()
-        {
-            emit_serve_event(
-                &s.metrics,
-                "POST",
-                "/v1/chat/completions",
-                400,
-                None,
-                None,
-                timer.elapsed().as_secs_f64() * 1000.0,
-                false,
-                Some("model_not_found"),
-            );
-            return err_response(
-                StatusCode::BAD_REQUEST,
-                &format!(
-                    "model '{requested_model}' is not loaded; this server serves '{}'",
-                    s.model_id
-                ),
-                "model_not_found",
-            );
-        }
-        if req.messages.is_empty() {
-            emit_serve_event(
-                &s.metrics,
-                "POST",
-                "/v1/chat/completions",
-                400,
-                None,
-                None,
-                timer.elapsed().as_secs_f64() * 1000.0,
-                false,
-                Some("invalid_messages"),
-            );
-            // Matches lattice.rs's `validate_chat_request` code for the
-            // identical empty-messages condition (ADR-080 C2).
-            return err_response(
-                StatusCode::BAD_REQUEST,
-                "`messages` must not be empty",
-                "invalid_messages",
-            );
-        }
-
-        let messages: Vec<ChatMessage> = match req.messages.iter().map(to_chat_message).collect() {
-            Ok(messages) => messages,
+        let defaults = GenerationDefaults {
+            max_tokens: s.defaults.max_tokens,
+            temperature: s.defaults.temperature,
+            top_k: s.defaults.top_k,
+            top_p: s.defaults.top_p,
+            repetition_penalty: s.defaults.repetition_penalty,
+            reasoning_budget: s.defaults.reasoning_budget,
+        };
+        let (validated, ()) = match normalize_request(
+            &req,
+            defaults,
+            ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context),
+            |_, _| Ok(()),
+        ) {
+            Ok(validated) => validated,
             Err(err) => {
                 emit_serve_event(
                     &s.metrics,
@@ -2218,7 +1959,7 @@ mod imp {
                     false,
                     Some(err.code()),
                 );
-                return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
+                return err.into_response();
             }
         };
         // Structured-output v0 (design note): admit + compile
@@ -2226,7 +1967,12 @@ mod imp {
         // `Ok(None)` for an ordinary text request; a schema/streaming
         // problem here always surfaces as a 4xx, never a best-effort
         // fallback to unconstrained generation.
-        let structured = match admit_structured_request(&req, &s.vocab_bytes, &s.grammar_cache) {
+        let structured = match admit_structured_request(
+            &req,
+            validated.stream,
+            &s.vocab_bytes,
+            &s.grammar_cache,
+        ) {
             Ok(structured) => structured,
             Err(err) => {
                 emit_serve_event(
@@ -2243,33 +1989,10 @@ mod imp {
                 return err_response(err.status(), err.message(), err.code());
             }
         };
-        let mut cfg = match build_cfg(&req, &s.defaults, s.model_max_context) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                emit_serve_event(
-                    &s.metrics,
-                    "POST",
-                    "/v1/chat/completions",
-                    400,
-                    None,
-                    None,
-                    timer.elapsed().as_secs_f64() * 1000.0,
-                    false,
-                    Some(err.code()),
-                );
-                // ADR-080 C2: `build_cfg` already
-                // returns the shared `lattice_inference::serve::ApiError`
-                // with the correct status+code (e.g. `invalid_max_tokens`
-                // for #745's max_tokens=0 rejection) -- routing it through
-                // `err_response`'s (StatusCode, &str) signature discarded
-                // that code and re-wrapped it as generic "invalid_request".
-                // Propagate the original error directly instead.
-                return err.into_response();
-            }
-        };
+        let mut cfg = build_cfg(&validated);
         // Wire the compiled grammar into the worker config (design note
         // §"End-to-end execution", step 4) and force `enable_thinking` off
-        // for strict requests regardless of server defaults (sign-off Q5):
+        // for strict requests regardless of server defaults:
         // the grammar masks from the first decode token, so thinking
         // tokens are unsampleable under it and a think-then-constrain flow
         // is out of scope for v0.
@@ -2277,9 +2000,10 @@ mod imp {
             cfg.grammar = Some(Arc::clone(&structured.engine));
             cfg.enable_thinking = false;
         }
+        let streaming = validated.stream;
+        let messages = validated.messages;
         let cfg = cfg;
         let model_id = s.model_id.to_string();
-        let streaming = req.stream.unwrap_or(false);
         let id = format!("chatcmpl-{}", unix_nanos());
         let created = unix_secs();
 
@@ -2686,12 +2410,11 @@ mod imp {
                         .into_response();
                     }
                     WorkerEvent::ConstraintBlocked(message) => {
-                        // Structured-output v0 (design note, sign-off Q4): a
+                        // Structured-output v0 (design note): a
                         // strict request's generation failure is reported
                         // with the `blocked_constraint` machine code instead
-                        // of the generic `internal_error`. Round-1 review
-                        // medium finding 2: this used to be decided by
-                        // sniffing `message` for the engine's known
+                        // of the generic `internal_error`. This used to be
+                        // decided by sniffing `message` for the engine's known
                         // grammar-exhausted-mask wording
                         // (`metal_qwen35.rs`'s `has_finite_logit` fail-closed
                         // check); `WorkerEvent::ConstraintBlocked` is now a
@@ -3242,6 +2965,42 @@ mod imp {
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::sync::Arc;
 
+        /// `Content-Type: application/json` `HeaderMap`, for tests that call
+        /// `chat_completions` directly as a Rust function (bypassing the
+        /// router) and need to satisfy its `require_json_content_type`
+        /// guard to exercise the behavior downstream of it.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        fn test_json_headers() -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            headers
+        }
+
+        fn normalize_for_cfg(
+            req: &ChatReq,
+            defaults: &Defaults,
+            model_max_context: usize,
+        ) -> ValidatedChatRequest {
+            normalize_request(
+                req,
+                GenerationDefaults {
+                    max_tokens: defaults.max_tokens,
+                    temperature: defaults.temperature,
+                    top_k: defaults.top_k,
+                    top_p: defaults.top_p,
+                    repetition_penalty: defaults.repetition_penalty,
+                    reasoning_budget: defaults.reasoning_budget,
+                },
+                ServeProfile::lattice_serve("", model_max_context),
+                |_, _| Ok(()),
+            )
+            .unwrap()
+            .0
+        }
+
         // NOTE (issue #832): the FIFO/cancellation/window-check worker-loop
         // test suite that used to live here (`fake_generate`,
         // `fake_generate_with_prefill_gap`, `make_job`,
@@ -3310,48 +3069,65 @@ mod imp {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
             };
-            let chat_message = to_chat_message(&msg).expect("plain string content must parse");
+            let chat_message = normalize_messages(std::slice::from_ref(&msg))
+                .expect("plain string content must parse");
             assert_eq!(
-                chat_message.role,
+                chat_message[0].role,
                 lattice_inference::forward::metal_qwen35::ChatRole::User
             );
-            assert_eq!(chat_message.content, "hi");
+            assert_eq!(chat_message[0].content, "hi");
         }
 
         #[test]
         fn message_content_parts_concatenate_in_order() {
-            let content = MessageContent::Parts(vec![
-                Part::Text {
-                    text: "a".to_string(),
-                },
-                Part::Text {
-                    text: "b".to_string(),
-                },
-            ]);
-            assert_eq!(content_text(&content).unwrap(), "ab");
+            let msg = InMsg {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![
+                    Part::Text {
+                        text: "a".to_string(),
+                    },
+                    Part::Text {
+                        text: "b".to_string(),
+                    },
+                ]),
+            };
+            let chat_message = normalize_messages(std::slice::from_ref(&msg)).unwrap();
+            assert_eq!(chat_message[0].content, "ab");
         }
 
         #[test]
         fn message_content_image_url_rejected() {
-            let content = MessageContent::Parts(vec![Part::ImageUrl {
-                image_url: ImageUrl {
-                    url: "https://example.com/cat.png".to_string(),
-                    detail: None,
-                },
-            }]);
-            let err = content_text(&content).unwrap_err();
+            let msg = InMsg {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![Part::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/cat.png".to_string(),
+                        detail: None,
+                    },
+                }]),
+            };
+            let err = normalize_messages(std::slice::from_ref(&msg)).unwrap_err();
             assert_eq!(err.message(), IMAGE_REQUIRES_VISION_MESSAGE);
         }
 
         #[test]
         fn message_content_unknown_part_rejected() {
-            let content = MessageContent::Parts(vec![Part::Unsupported {
-                kind: "file".to_string(),
-            }]);
-            let err = content_text(&content).unwrap_err();
+            // The shared normalizer's wording ("content part type 'file' is
+            // not supported; ...") differs from this binary's now-removed
+            // local test-only copy ("unsupported content part type 'file';
+            // ..."); production always went through the shared normalizer
+            // (`normalize_request`), so this pins the wording clients
+            // actually receive.
+            let msg = InMsg {
+                role: "user".to_string(),
+                content: MessageContent::Parts(vec![Part::Unsupported {
+                    kind: "file".to_string(),
+                }]),
+            };
+            let err = normalize_messages(std::slice::from_ref(&msg)).unwrap_err();
             assert_eq!(
                 err.message(),
-                "unsupported content part type 'file'; only 'text' parts are accepted"
+                "content part type 'file' is not supported; only 'text' parts are accepted"
             );
         }
 
@@ -3433,7 +3209,10 @@ mod imp {
             };
             let req = ChatReq {
                 model: None,
-                messages: vec![],
+                messages: vec![InMsg {
+                    role: "user".to_string(),
+                    content: MessageContent::Text("hi".to_string()),
+                }],
                 temperature: None,
                 top_p: None,
                 top_k: None,
@@ -3441,7 +3220,9 @@ mod imp {
                 seed: None,
                 stream: None,
                 repetition_penalty: None,
-                reasoning_budget: Some(50),
+                reasoning_budget: Some(
+                    serde_json::value::RawValue::from_string("50".to_string()).unwrap(),
+                ),
                 max_completion_tokens: None,
                 tools: None,
                 tool_choice: None,
@@ -3451,7 +3232,8 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 8).unwrap();
+            let normalized = normalize_for_cfg(&req, &defaults, 8);
+            let cfg = build_cfg(&normalized);
             assert!(cfg.max_new_tokens <= 8);
             let reasoning_budget = cfg.reasoning_budget.unwrap_or(0);
             assert!(reasoning_budget + cfg.max_new_tokens < 8);
@@ -3621,7 +3403,8 @@ mod imp {
             // below for that split, ADR-080 C2).
             let body =
                 Body::from(r#"{"messages":[{"role":"moderator","content":"hi"}]}"#.to_string());
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -3637,7 +3420,8 @@ mod imp {
                 let body = Body::from(format!(
                     r#"{{"messages":[{{"role":"{role}","content":"hi"}}]}}"#
                 ));
-                let response = chat_completions(State(test_app_state()), body).await;
+                let response =
+                    chat_completions(State(test_app_state()), test_json_headers(), body).await;
                 assert_eq!(response.status(), StatusCode::BAD_REQUEST);
                 let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                     .await
@@ -3660,7 +3444,8 @@ mod imp {
                 ]}]}"#
                     .to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(message, IMAGE_REQUIRES_VISION_MESSAGE);
@@ -3673,7 +3458,8 @@ mod imp {
             let body = Body::from(format!(
                 r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"{big_text}"}}]}}]}}"#,
             ));
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(message, "messages[0].content[0] exceeds 65536 bytes");
@@ -3696,7 +3482,8 @@ mod imp {
                     "tools":[{"type":"function","function":{"name":"f"}}]}"#
                     .to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -3711,7 +3498,8 @@ mod imp {
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":"auto"}"#.to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -3728,7 +3516,8 @@ mod imp {
                     "response_format":{"type":"json_object"}}"#
                     .to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -3789,7 +3578,7 @@ mod imp {
             )
         }
 
-        /// Round-1 review blocker, finding 1: a duplicate root `"type"`
+        /// Regression: a duplicate root `"type"`
         /// member inside the submitted schema must be rejected with 400
         /// before any worker job is submitted. `test_app_state()`'s worker
         /// receiver is dropped immediately, so a request that reached
@@ -3806,13 +3595,14 @@ mod imp {
                         "schema":{"type":"boolean","type":"string"}}}}"#
                     .to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(code, "invalid_request_body");
         }
 
-        /// Round-1 review blocker, finding 1: a duplicate nested
+        /// Regression: a duplicate nested
         /// `"properties"` member inside an object schema must be rejected
         /// with 400 before any worker job is submitted.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -3828,13 +3618,14 @@ mod imp {
                             "required":["a"],"additionalProperties":false}}}}"#
                     .to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(code, "invalid_request_body");
         }
 
-        /// Round-1 review blocker, finding 1: a duplicate key inside a
+        /// Regression: a duplicate key inside a
         /// nested `properties.<name>` schema object must be rejected with
         /// 400 before any worker job is submitted.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -3849,7 +3640,8 @@ mod imp {
                             "required":["a"],"additionalProperties":false}}}}"#
                     .to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(code, "invalid_request_body");
@@ -3859,7 +3651,8 @@ mod imp {
         #[tokio::test]
         async fn chat_completions_structured_missing_strict_400() {
             let body = Body::from(structured_body(V0_OBJECT_SCHEMA, None, None));
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert!(message.contains("strict must be true"), "{message}");
@@ -3869,7 +3662,8 @@ mod imp {
         #[tokio::test]
         async fn chat_completions_structured_strict_false_400() {
             let body = Body::from(structured_body(V0_OBJECT_SCHEMA, Some("false"), None));
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert!(message.contains("strict must be true"), "{message}");
@@ -3885,7 +3679,8 @@ mod imp {
         #[tokio::test]
         async fn chat_completions_structured_streaming_400() {
             let body = Body::from(structured_body(V0_OBJECT_SCHEMA, Some("true"), Some(true)));
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert!(message.contains("non-streaming"), "{message}");
@@ -3901,7 +3696,8 @@ mod imp {
         async fn chat_completions_structured_pattern_keyword_400() {
             let schema = r#"{"type":"object","properties":{"name":{"type":"string","pattern":"^a"}},"required":["name"],"additionalProperties":false}"#;
             let body = Body::from(structured_body(schema, Some("true"), None));
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(code, "unsupported_strict_schema");
@@ -3912,7 +3708,8 @@ mod imp {
         async fn chat_completions_structured_enum_keyword_400() {
             let schema = r#"{"type":"string","enum":["a","b"]}"#;
             let body = Body::from(structured_body(schema, Some("true"), None));
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(code, "unsupported_strict_schema");
@@ -3920,7 +3717,7 @@ mod imp {
 
         /// Route test (design note §"Serve and backend integration", item
         /// 1): an admitted strict request's worker job carries
-        /// `grammar.is_some()`, `enable_thinking == false` (sign-off Q5),
+        /// `grammar.is_some()`, `enable_thinking == false`,
         /// and the successful response carries `constraint_applied` --
         /// asserted from a real, compiled `GrammarEngine`, not a stub, so a
         /// route that merely returns schema-shaped JSON without actually
@@ -3980,7 +3777,7 @@ mod imp {
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -3995,10 +3792,10 @@ mod imp {
             assert_eq!(value["choices"][0]["message"]["content"], r#"{"ok":true}"#);
         }
 
-        /// Sign-off Q4: a `WorkerEvent::ConstraintBlocked` event must surface
+        /// A `WorkerEvent::ConstraintBlocked` event must surface
         /// as HTTP 500 with the `blocked_constraint` machine code for a
-        /// structured request, never a 200 with partial/absent JSON. Round-1
-        /// review medium finding 2: replies via the raw `WorkerJob::reply`
+        /// structured request, never a 200 with partial/absent JSON. Replies
+        /// via the raw `WorkerJob::reply`
         /// seam (not `spawn_fake`'s `Result<_, String>` closure, which can
         /// only ever produce a generic `WorkerEvent::Failed`) so this test
         /// exercises the real production classification -- a distinct
@@ -4034,13 +3831,13 @@ mod imp {
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(code, "blocked_constraint");
         }
 
-        /// Round-1 review medium finding 2: a `WorkerEvent::Failed` (the
+        /// A `WorkerEvent::Failed` (the
         /// generic variant) whose message text happens to contain the
         /// engine's grammar-exhausted-mask wording must NOT be classified as
         /// `blocked_constraint` -- only the distinct `ConstraintBlocked`
@@ -4080,13 +3877,13 @@ mod imp {
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(code, "internal_error");
         }
 
-        /// Sign-off Q4: `stopped == false` (length/KV-window exhaustion)
+        /// `stopped == false` (length/KV-window exhaustion)
         /// on a structured request must surface as HTTP 500
         /// `length_limit`, never HTTP 200 with truncated JSON.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -4129,7 +3926,7 @@ mod imp {
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(code, "length_limit");
@@ -4183,7 +3980,7 @@ mod imp {
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(code, "validation_failed");
@@ -4330,9 +4127,9 @@ mod imp {
             }
         }
 
-        /// Round-2 review medium finding 1: the `catch_unwind` single-flight
-        /// recovery path (`get_or_compile`'s `Action::Compile` arm) had no
-        /// test exercising an actual owner-closure panic. `compile` is an
+        /// Exercises the `catch_unwind` single-flight
+        /// recovery path (`get_or_compile`'s `Action::Compile` arm) against
+        /// an actual owner-closure panic. `compile` is an
         /// injectable `FnOnce` argument to `get_or_compile` already -- no
         /// extra test-only seam is needed, since single-flight semantics
         /// mean only the one thread that wins `Action::Compile` ever
@@ -4626,8 +4423,7 @@ mod imp {
             assert!(err.contains("wat"), "{err}");
         }
 
-        /// Mutation-sensitivity check (round-1 review medium finding 3):
-        /// unlike a plain `.is_err()` check, this asserts the REJECTION
+        /// Mutation-sensitivity check: unlike a plain `.is_err()` check, this asserts the REJECTION
         /// SOURCE is specifically `V0_REJECTED_KEYWORDS` (the denylist
         /// layer walked before the per-type match in `admit_v0_schema_at`),
         /// not the primitive per-type allowlist layer (`ALLOWED` inside the
@@ -4635,10 +4431,8 @@ mod imp {
         /// key on its own. If `enum` is removed from
         /// `V0_REJECTED_KEYWORDS`, this schema still gets rejected -- by the
         /// allowlist layer instead -- but with a DIFFERENT message, so this
-        /// test (unlike a bare `.is_err()` check) fails as intended. See
-        /// the stage-1 report's mutation transcript for the revert/restore
-        /// procedure this test guards, and this session's report for the
-        /// re-run transcript.
+        /// test (unlike a bare `.is_err()` check) fails if the denylist
+        /// layer's rejection of `enum` regresses.
         #[test]
         fn admit_v0_schema_mutation_sensitive_to_enum_admission() {
             let schema = serde_json::json!({"type": "string", "enum": ["a", "b"]});
@@ -4650,8 +4444,7 @@ mod imp {
             );
         }
 
-        /// Independent companion to the denylist test above (round-1 review
-        /// medium finding 3): a keyword that `V0_REJECTED_KEYWORDS` never
+        /// Independent companion to the denylist test above: a keyword that `V0_REJECTED_KEYWORDS` never
         /// mentions at all (so the denylist layer can never be the one that
         /// rejects it) must still be rejected by the primitive per-type
         /// `ALLOWED`-keyword layer. Mutation-sensitive to a DIFFERENT
@@ -4708,7 +4501,7 @@ mod imp {
             assert!(!v0_validate_json(r#"{"name": "ok"} garbage"#, &schema));
         }
 
-        /// Round-1 review major finding: a grammar-conforming integer
+        /// A grammar-conforming integer
         /// outside `u64`/`i64` range must validate, not produce a false
         /// `validation_failed`.
         #[test]
@@ -4745,7 +4538,7 @@ mod imp {
             assert!(!v0_validate_json("18446744073709551616", &schema));
         }
 
-        /// End-to-end shape from the review's suggested test: a large
+        /// End-to-end shape: a large
         /// integer nested inside an admitted object schema.
         #[test]
         fn v0_validate_json_accepts_large_integer_nested_in_object() {
@@ -4758,7 +4551,7 @@ mod imp {
             assert!(v0_validate_json(r#"{"n": 18446744073709551616}"#, &schema));
         }
 
-        /// Round-2 review major finding 1: a valid UTF-16 surrogate pair
+        /// A valid UTF-16 surrogate pair
         /// (the G-clef character, U+1D11E) spelled as its two `\uXXXX`
         /// escape halves must validate under a string schema -- it is a
         /// grammar-conforming strict completion, and rejecting it turned
@@ -4797,7 +4590,7 @@ mod imp {
             assert!(v0_validate_json(r#""\uDD1E""#, &schema));
         }
 
-        /// Round-2 review major finding 1, second half: RFC 8259 §7
+        /// RFC 8259 §7
         /// requires U+0000-U+001F to be escaped, and the compiled grammar
         /// rejects them raw too (json_schema.rs
         /// `string_rejects_raw_control_byte`). A literal BEL (0x07) byte
@@ -4814,7 +4607,8 @@ mod imp {
         async fn chat_completions_n_greater_than_one_400() {
             let body =
                 Body::from(r#"{"messages":[{"role":"user","content":"hi"}],"n":2}"#.to_string());
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(message, "n > 1 is not supported");
@@ -4826,7 +4620,8 @@ mod imp {
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"logprobs":true}"#.to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -4841,7 +4636,8 @@ mod imp {
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stop":"\n"}"#.to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(message, "stop is not supported by this server");
@@ -4855,7 +4651,8 @@ mod imp {
                     "max_tokens":10,"max_completion_tokens":20}"#
                     .to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(
@@ -4874,7 +4671,8 @@ mod imp {
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#.to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             let (status, message) = error_message_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(message, "max_tokens must be at least 1");
@@ -4931,7 +4729,7 @@ mod imp {
                 }
             });
             let body = Body::from(r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string());
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -4985,11 +4783,13 @@ mod imp {
             });
             let ok_body =
                 Body::from(r#"{"messages":[{"role":"user","content":"hi"}]}"#.to_string());
-            let ok_response = chat_completions(State(state.clone()), ok_body).await;
+            let ok_response =
+                chat_completions(State(state.clone()), test_json_headers(), ok_body).await;
             assert_eq!(ok_response.status(), StatusCode::OK);
 
             let bad_body = Body::from(r#"{"messages":[]}"#.to_string());
-            let bad_response = chat_completions(State(state.clone()), bad_body).await;
+            let bad_response =
+                chat_completions(State(state.clone()), test_json_headers(), bad_body).await;
             assert_eq!(bad_response.status(), StatusCode::BAD_REQUEST);
 
             let _ = health(State(state.clone())).await;
@@ -5051,7 +4851,7 @@ mod imp {
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
             );
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -5093,7 +4893,7 @@ mod imp {
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
             );
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             assert_eq!(response.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -5118,7 +4918,7 @@ mod imp {
             );
         }
 
-        /// Reviewer finding (b): a mid-stream `WorkerEvent::Failed` (or
+        /// A mid-stream `WorkerEvent::Failed` (or
         /// `Rejected`/worker-gone) emits a client-facing SSE error event
         /// (asserted above) but, before this fix, the terminal `Phase::End`
         /// still recorded the request in `/metrics` as a plain 200 with no
@@ -5141,7 +4941,7 @@ mod imp {
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
             );
-            let response = chat_completions(State(state.clone()), body).await;
+            let response = chat_completions(State(state.clone()), test_json_headers(), body).await;
             assert_eq!(response.status(), StatusCode::OK);
             // Drain the full SSE body so the stream runs to `Phase::End`,
             // which is where the metric gets recorded.
@@ -5210,8 +5010,8 @@ mod imp {
         /// discovering `WorkerEvent::Rejected` only inside `Phase::Body`)
         /// makes this fail -- the response status would be 200 with an SSE body
         /// carrying a `finish_reason: "length"` terminal chunk instead of a
-        /// 400 error envelope. Verified by reverting the preflight and
-        /// re-running: see the PR body's mutation log.
+        /// 400 error envelope, so this test fails if the preflight
+        /// regresses.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse() {
@@ -5231,7 +5031,7 @@ mod imp {
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stream":true}"#.to_string(),
             );
-            let response = chat_completions(State(state), body).await;
+            let response = chat_completions(State(state), test_json_headers(), body).await;
             assert_eq!(
                 response.status(),
                 StatusCode::BAD_REQUEST,
@@ -5542,7 +5342,10 @@ mod imp {
             };
             let req = ChatReq {
                 model: None,
-                messages: vec![],
+                messages: vec![InMsg {
+                    role: "user".to_string(),
+                    content: MessageContent::Text("hi".to_string()),
+                }],
                 temperature: None,
                 top_p: None,
                 top_k: None,
@@ -5560,7 +5363,8 @@ mod imp {
                 top_logprobs: None,
                 stop: None,
             };
-            let cfg = build_cfg(&req, &defaults, 4096).unwrap();
+            let normalized = normalize_for_cfg(&req, &defaults, 4096);
+            let cfg = build_cfg(&normalized);
             assert_eq!(cfg.max_new_tokens, 42);
         }
 
@@ -5582,7 +5386,8 @@ mod imp {
                 r#"{"model":"wrong-model","messages":[{"role":"user","content":"hi"}]}"#
                     .to_string(),
             );
-            let response = chat_completions(State(test_app_state()), body).await;
+            let response =
+                chat_completions(State(test_app_state()), test_json_headers(), body).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
             let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -5883,7 +5688,7 @@ mod imp {
                     r#"{"messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#
                         .to_string(),
                 );
-                let response = chat_completions(State(state), body).await;
+                let response = chat_completions(State(state), test_json_headers(), body).await;
                 assert_eq!(response.status(), StatusCode::OK);
 
                 observed

@@ -86,6 +86,7 @@ fn bench_train_micro_lora_one_step_737() {
         rank: 8,
         alpha: 16.0,
         first_layer: 19, // spans layers 19..=23: GQA(19), GDN(20,21,22), GQA(23)
+        last_layer: Some(23),
         steps: 1,
         learning_rate: 1e-3,
         max_seq_len: 64,

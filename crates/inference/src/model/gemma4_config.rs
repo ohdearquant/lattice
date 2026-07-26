@@ -187,7 +187,7 @@ struct HfGemma4TextConfig {
 
 /// Raw `text_config.rope_parameters`: two nested per-attention-type RoPE
 /// records, as the target `config.json` actually nests them (ADR-082
-/// Amendment 1 / review finding 1) -- not the flat `rope_theta` /
+/// Amendment 1) -- not the flat `rope_theta` /
 /// `rope_local_base_freq` shape this loader previously (incorrectly)
 /// expected at the top level of `text_config`.
 #[derive(Debug, serde::Deserialize)]
@@ -428,7 +428,7 @@ impl Gemma4Config {
                 self.num_kv_shared_layers, self.num_hidden_layers
             )));
         }
-        // Amendment 1 / review finding 1: use_double_wide_mlp must not be a
+        // ADR-082 Amendment 1: use_double_wide_mlp must not be a
         // tautological function of is_kv_shared_layer. The raw checkpoint
         // flag is required to agree with the derived KV-shared set: the
         // reference runtime sets it identically (Amendment 1, "G2/G7

@@ -1,0 +1,47 @@
+# bench-quick-informational-targets.txt — the single validated manifest for
+# quick-mode informational demotion (lattice#714; target-level policy per
+# lattice#1060, 2026-07-19).
+#
+# Format: one `<crate>:<bench-target>` key per line; `#` starts a comment.
+# scripts/lib/bench-informational-groups.sh (the production shell path) and
+# scripts/perf-bench-gate.py --selftest (the validator) both read THIS file.
+# There is no other copy of the demoted-target set anywhere.
+#
+# Semantics: in QUICK mode, every Criterion group of a listed target is
+# reported informationally — fully measured, rendered in the report's
+# informational section and the all-measurements table, excluded only from
+# the gating verdict and exit code. FULL mode (`scripts/bench-compare.sh
+# --full`, or `make bench-gate` against the perf-baselines branch) ignores
+# this manifest: every group those paths bench is classified gating at full
+# resolution (--full also honors bench-compare.sh's BENCH_GROUPS_* filters,
+# and neither path covers the workspace's full bench set). Being classified
+# gating is not the same as being enforced: bench-compare.sh discards its
+# gate's exit status unless the caller passes --fail-on-regression, so a FAIL
+# verdict becomes a non-zero exit only under that flag or via
+# `make bench-gate`.
+#
+# Two automated jobs bench these targets at full resolution on main.
+# bench-update.yml runs on perf-path pushes and weekly and saves the
+# baselines; it publishes historical trend comparisons including a "Worst
+# step-regression" headline, but does not invoke perf-bench-gate.py or fail
+# on a regression, so it REPORTS. perf-postmerge-gate.yml runs
+# `bench-compare.sh --full --fail-on-regression` on perf-path merges,
+# against the merged commit's own parent, and fails on a confirmed
+# regression, so it ENFORCES. A demoted target is therefore reported AND
+# enforced at full resolution; the demotion only removes it from the quick
+# mode gate. Targets not listed here are classified gating in quick mode.
+#
+# Demoting a target requires same-toolchain, same-commit A/A evidence in an
+# exclusive bench window, reviewed in a PR that edits this file.
+#
+# lattice-embed:simd — demoted 2026-07-19. Evidence: repeated same-commit
+# A/A quick-mode runs in exclusive machine-wide bench windows (2026-07-13
+# idle-machine calibration; 2026-07-19 twice on origin/main e1000d3108)
+# produced confirmed-CI FAIL rows (+8% to +17%, 95% CIs) on identical
+# binaries, with DISJOINT failing groups across runs — machine-level noise
+# above quick-mode resolution, not signal. 9 of the target's ~23 groups had
+# individually accumulated that evidence before the target-level decision;
+# per-group allowlisting was converging on the whole target one PR at a
+# time while implying the unlisted groups were reliable at quick
+# resolution, which the disjoint-failure signature disproves.
+lattice-embed:simd

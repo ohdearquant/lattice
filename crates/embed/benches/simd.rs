@@ -750,15 +750,17 @@ fn bench_int8_prepared_dot_product(c: &mut Criterion) {
 }
 
 // ============================================================================
-// ROUND 3: NORMALIZED COSINE FAST PATH BENCHMARKS (H1 baseline)
+// NORMALIZED-COSINE FAST-PATH HEADROOM
 // ============================================================================
 
-/// Baseline for normalized-cosine fast path (Round 3, Hypothesis 1).
-///
-/// Compares full cosine (two norm ops + division) vs dot product on pre-normalized
-/// unit vectors at [384, 768, 1024] dims. Shows the theoretical speedup available.
-/// After i2 adds `approximate_cosine_distance_prepared_with_meta`, it should
-/// approach dot-product speed on the same unit corpus.
+/// Cosine similarity between two already-unit-normalized vectors reduces to a
+/// bare dot product — no norm computation or division needed. `cosine_full`
+/// still pays for the general two-norm-and-divide path; `dot_product` is the
+/// floor a unit-aware fast path could reach on the same corpus. The gap
+/// between the two groups at [384, 768, 1024] dims is the headroom a
+/// unit-normalization hint has to recover, which is what
+/// `approximate_cosine_distance_prepared_with_meta`'s `NormalizationHint::Unit`
+/// path (benchmarked below in `bench_prepared_query_normalized_cosine`) exists to close.
 fn bench_normalized_cosine_fast_path(c: &mut Criterion) {
     const BENCH_DIMS: [usize; 3] = [384, 768, 1024];
     let mut group = c.benchmark_group("simd_normalized_cosine_fast_path");
@@ -782,14 +784,14 @@ fn bench_normalized_cosine_fast_path(c: &mut Criterion) {
 }
 
 // ============================================================================
-// ROUND 3: SQUARED EUCLIDEAN FAST PATH BENCHMARKS (H3 baseline)
+// SQUARED-EUCLIDEAN FAST-PATH HEADROOM
 // ============================================================================
 
-/// Baseline for squared-L2 fast path (Round 3, Hypothesis 3).
-///
-/// Measures `euclidean_distance` (with final sqrt) at [384, 768, 1024] dims.
-/// After i2 adds `simd::squared_euclidean_distance`, this becomes a before/after
-/// comparison: squared variant skips the sqrt and is used for HNSW internal ordering.
+/// `euclidean_distance` computes squared distance then takes a final `sqrt`;
+/// `squared_euclidean_distance` skips it. HNSW's internal candidate ordering
+/// only needs relative distance, so it uses the squared variant — the
+/// `squared_euclidean` group here is that same computation, and the gap to
+/// `euclidean_full` is the cost of the `sqrt` per comparison.
 fn bench_squared_euclidean_fast_path(c: &mut Criterion) {
     const BENCH_DIMS: [usize; 3] = [384, 768, 1024];
     let mut group = c.benchmark_group("simd_squared_euclidean_fast_path");
@@ -825,12 +827,15 @@ fn bench_squared_euclidean_fast_path(c: &mut Criterion) {
 // ROUND 3: PREPARED QUERY NORMALIZED COSINE BENCHMARKS (H1 batch baseline)
 // ============================================================================
 
-/// Baseline for prepared normalized-cosine batch path (Round 3, Hypothesis 1).
+/// Prepared normalized-cosine batch path: parity check against the fused meta path.
 ///
 /// Measures `approximate_cosine_distance_prepared` on `QuantizedData::Full` unit
-/// vectors at [384, 768, 1024] dims (1000 stored vectors). After i2 adds
-/// `approximate_cosine_distance_prepared_with_meta` with `VectorNorm::Unit`, the
-/// new path should improve by at least 15% for 768/1024 by routing to dot product.
+/// vectors at [384, 768, 1024] dims (1000 stored vectors), against
+/// `approximate_cosine_distance_prepared_with_meta` on the same corpus. A unit-norm
+/// hint path that routes to bare dot product does not beat full cosine: verifying the
+/// stored norm costs an extra O(d) pass, while `cosine_similarity` fuses dot and norms
+/// in one pass. `_with_meta` delegates to the fused path, so these two groups are
+/// expected to measure AT PARITY; a gap between them is a regression.
 fn bench_prepared_query_normalized_cosine(c: &mut Criterion) {
     const BENCH_DIMS: [usize; 3] = [384, 768, 1024];
     const STORED_COUNT: usize = 1000;

@@ -556,7 +556,7 @@ pub fn gated_delta_net_step_fused(
 
     // 8. Gated RMSNorm + output projection
     // norm_weight is [value_dim] per-head, applied to each head independently.
-    // Fail fast if weight dimension doesn't match (reviewer fix: no silent fallback).
+    // Fail fast if weight dimension doesn't match: no silent fallback.
     let gamma = &weights.norm_weight[..value_dim];
     debug_assert_eq!(gamma.len(), value_dim);
 
