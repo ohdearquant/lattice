@@ -168,6 +168,19 @@ class MissingEngineError(RuntimeError):
     """A profile requested an engine with no adapter registered for it."""
 
 
+class NoMeasurementError(MissingEngineError):
+    """`allow_missing_engine` was set and the run produced no measured
+    observation at all, so there is nothing to report.
+
+    A subclass of `MissingEngineError` so that every caller already treating
+    a missing engine as a failed run inherits this without its own check --
+    the distinction the message must carry is "an engine was missing"
+    (survivable, other engines measured) versus "no measurement was
+    produced" (the run reports nothing regardless of how far the reporting
+    path got).
+    """
+
+
 class AdapterContractError(RuntimeError):
     """An adapter's returned result did not satisfy the harness's measured-call
     contract for a multi-window `MeasuredCall` (missing or incomplete
@@ -1156,6 +1169,20 @@ def run_profile(
                         call_prompt_hash=group_measured_prompt_hash,
                         run_index=run_index,
                     )
+
+    # A result that a caller can render and exit zero on has to mean something
+    # was MEASURED. `allow_missing_engine` lets a run proceed when an engine is
+    # absent, which is right for a sweep where one framework is not installed;
+    # it must not also let a run where EVERY engine was absent return a result
+    # indistinguishable from a full comparison. Enforced here, where the
+    # measurement is produced, so every wrapper inherits it: a per-wrapper copy
+    # of the check leaves each new wrapper free to omit it.
+    if allow_missing_engine and not any(not obs.warmup for obs in observations):
+        detail = f"engine(s) {list(missing)} were unavailable" if missing else "no engine ran a measured call"
+        raise NoMeasurementError(
+            f"profile {profile.name!r} produced no measured observation: {detail}. "
+            "--allow-missing-engine tolerates a missing engine, not a missing measurement."
+        )
 
     return HarnessRunResult(
         profile=profile,

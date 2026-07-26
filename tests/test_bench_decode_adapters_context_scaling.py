@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO_ROOT / "scripts"
@@ -384,6 +386,42 @@ class LatticeResultParsingTest(unittest.TestCase):
     def test_extract_single_result_rejects_wrong_window(self):
         with self.assertRaises(adapters.LatticeResultError):
             adapters.extract_single_result("RESULT n_req=8 completion=8 total_ms=1.0", n_tokens=64)
+
+
+class WrapperExitStatusTest(unittest.TestCase):
+    """A zero exit from the wrapper has to mean something was measured.
+
+    `--allow-missing-engine` exists for the partial-availability case (one
+    framework not installed on this box); it must not also let a run where
+    every engine was absent write a report, name a chart path and exit zero.
+    """
+
+    def _run_main(self, registry: dict, tmp: Path) -> int:
+        saved = dict(harness.ADAPTER_REGISTRY)
+        harness.ADAPTER_REGISTRY.clear()
+        harness.ADAPTER_REGISTRY.update(registry)
+        try:
+            with (
+                mock.patch.object(adapters, "build_lattice_binary_if_missing"),
+                mock.patch.object(adapters, "register_available_adapters"),
+                mock.patch.object(adapters, "OUT_DIR", tmp),
+                mock.patch.object(adapters, "DATA_TSV", tmp / "data.tsv"),
+                mock.patch.object(adapters, "CHART_PNG", tmp / "chart.png"),
+                mock.patch.object(adapters, "subprocess") as fake_subprocess,
+            ):
+                fake_subprocess.run.return_value = None
+                return adapters.main(["--allow-missing-engine"])
+        finally:
+            harness.ADAPTER_REGISTRY.clear()
+            harness.ADAPTER_REGISTRY.update(saved)
+
+    def test_all_engines_missing_exits_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._run_main({}, Path(tmp)), 1)
+
+    def test_one_live_engine_with_missing_peers_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._run_main({"lattice": _FakeAdapter()}, Path(tmp)), 0)
 
 
 if __name__ == "__main__":
