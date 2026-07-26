@@ -90,13 +90,7 @@ impl CrossEncoderModel {
         document: &str,
         lora: &dyn LoraHook,
     ) -> Result<f32, InferenceError> {
-        let config = self.bert.config();
-        lora.validate_against_bert(
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
-        )
-        .map_err(InferenceError::InvalidInput)?;
+        self.validate_hook(lora)?;
 
         let input = self.bert.tokenizer().tokenize_pair(query, document);
         let seq_len = input.real_length;
@@ -119,16 +113,46 @@ impl CrossEncoderModel {
     }
 
     /// Score a query against a batch of documents with a LoRA hook applied during each forward pass.
+    ///
+    /// The hook is validated once at the batch boundary, before any document
+    /// is scored. Delegating validation to the per-document method alone would
+    /// tie it to the number of documents: an empty slice never enters the
+    /// closure, so the request would answer `Ok(vec![])` without the hook ever
+    /// having been asked about its geometry. A caller admitting an adapter on
+    /// that answer would accept a malformed one and only discover it on a
+    /// later nonempty request.
     pub fn score_batch_with_hook(
         &self,
         query: &str,
         documents: &[&str],
         lora: &dyn LoraHook,
     ) -> Result<Vec<f32>, InferenceError> {
+        self.validate_hook(lora)?;
+
         documents
             .iter()
             .map(|doc| self.score_with_hook(query, doc, lora))
             .collect()
+    }
+
+    /// Ask a hook to check its own declared geometry against this model's BERT
+    /// dimensions, mapping a rejection to [`InferenceError::InvalidInput`].
+    ///
+    /// Both hooked entry points route through here so that the check is a
+    /// property of the request rather than of the work the request happens to
+    /// perform. `score_with_hook` keeps its own call rather than relying on the
+    /// batch boundary, because it is a public entry point in its own right and
+    /// the geometry check is what makes it safe to reach the row loop; the
+    /// resulting re-validation per batch document reads only declared
+    /// dimensions and costs nothing measurable against a BERT forward pass.
+    fn validate_hook(&self, lora: &dyn LoraHook) -> Result<(), InferenceError> {
+        let config = self.bert.config();
+        lora.validate_against_bert(
+            config.num_hidden_layers,
+            config.hidden_size,
+            config.intermediate_size,
+        )
+        .map_err(InferenceError::InvalidInput)
     }
 
     /// Access the underlying `BertModel` (for config and tokenizer inspection).

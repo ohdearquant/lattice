@@ -294,6 +294,55 @@ fn bert_cross_encoder_rejects_malformed_lora_d_in_without_panicking() {
     );
 }
 
+/// An empty batch is still a hooked-scoring request, so it must still answer
+/// for the hook's geometry. Before the batch boundary validated on its own,
+/// `score_batch_with_hook` obtained validation only as a side effect of mapping
+/// `score_with_hook` over the documents — with none to map over, the closure
+/// never ran and a malformed adapter came back as `Ok(vec![])`. That is a
+/// success answer produced by a guard that never executed, and a caller probing
+/// admission with an empty batch would accept an adapter the nonempty path
+/// rejects.
+#[test]
+fn bert_cross_encoder_rejects_malformed_lora_on_an_empty_batch() {
+    let dir = build_synthetic_cross_encoder_dir();
+    let model = CrossEncoderModel::from_directory(dir.path()).unwrap();
+
+    let bad_d_out = FakeBertLoraHook {
+        d_out: HIDDEN_SIZE + 1,
+        d_in: HIDDEN_SIZE,
+        module: "query",
+    };
+
+    let result = model.score_batch_with_hook("what is rust", &[], &bad_d_out);
+    let err = result.expect_err("an empty batch must still reject a malformed adapter");
+    assert!(
+        matches!(err, InferenceError::InvalidInput(_)),
+        "expected a recoverable InvalidInput error, got {err:?}"
+    );
+}
+
+/// The empty-batch guard must reject on geometry, not on emptiness: a
+/// well-formed adapter still scores an empty batch as an empty result.
+#[test]
+fn bert_cross_encoder_accepts_well_formed_lora_on_an_empty_batch() {
+    let dir = build_synthetic_cross_encoder_dir();
+    let model = CrossEncoderModel::from_directory(dir.path()).unwrap();
+
+    let good = FakeBertLoraHook {
+        d_out: HIDDEN_SIZE,
+        d_in: HIDDEN_SIZE,
+        module: "query",
+    };
+
+    let scores = model
+        .score_batch_with_hook("what is rust", &[], &good)
+        .expect("a well-formed adapter must not be rejected on an empty batch");
+    assert!(
+        scores.is_empty(),
+        "an empty batch must produce an empty result, got {scores:?}"
+    );
+}
+
 #[test]
 fn bert_cross_encoder_scores_ok_with_well_formed_lora_geometry() {
     let dir = build_synthetic_cross_encoder_dir();
