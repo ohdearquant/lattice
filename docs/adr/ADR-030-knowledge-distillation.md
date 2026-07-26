@@ -82,7 +82,7 @@ The method pairs them by index (returns `TuneError::DimensionMismatch` on length
 
 ### Negative
 
-- The actual HTTP client (`reqwest`) is not wired — `label_single` is a placeholder that returns simulated labels. The interface contract is fully defined but the implementation awaits the async HTTP layer.
+- The actual HTTP client (`reqwest`) is not wired — `label_single` fails closed with a `TeacherApi` error rather than returning fabricated labels. The interface contract is fully defined but the implementation awaits the async HTTP layer. A deterministic simulated-label path exists only behind the non-default `simulated-teacher` feature, is marked with `LabelSource::Simulated`, and is rejected by `to_training_examples` rather than attributed to the configured teacher.
 - Confidence score is a single `f32` — no per-class breakdown, no calibration information
 - `label_batch` is sequential (no parallelism). Large batches against rate-limited teacher APIs will be slow.
 
@@ -95,10 +95,13 @@ The method pairs them by index (returns `TuneError::DimensionMismatch` on length
 
 The data contract (`LabelingResult`, `TrainingExample`, `DistillationStats`) and the
 `DistillationPipeline` struct are fully defined and tested. Actual HTTP teacher calls remain
-placeholder: `crates/tune/src/distill/pipeline/distill.rs:65` comments "This is a placeholder
-— actual implementation would call the teacher API." No `reqwest` HTTP requests are made; the
-`label_single` and `label_batch` methods do not hit any external endpoint. The pipeline struct
-and config presets are ready for wiring once a real HTTP client is added.
+unimplemented: no `reqwest` HTTP requests are made, and `label_single` / `label_batch` fail
+closed with a `TeacherApi` error instead of hitting any external endpoint or fabricating output.
+A deterministic simulated-label path (`label_single_simulated` / `label_batch_simulated`) is
+available only behind the non-default `simulated-teacher` feature; `LabelingResult::source`
+marks its output as `LabelSource::Simulated`, and `to_training_examples` rejects simulated
+results rather than attributing them to the configured teacher. The pipeline struct and config
+presets are ready for wiring once a real HTTP client is added.
 
 ## References
 

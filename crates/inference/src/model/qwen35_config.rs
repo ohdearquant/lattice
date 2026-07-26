@@ -25,12 +25,16 @@ pub const QWEN3_NEWLINE_TOKEN_ID: u32 = 198;
 ///
 /// `num_hidden_layers` comes from an untrusted checkpoint directory and, before this
 /// bound existed, only had a nonzero check. `compute_layer_types`, `normalize_layer_mask`,
-/// and the loader's `Vec::with_capacity` all allocate proportionally to it — an extreme
-/// value (e.g. `usize::MAX`) reaches those allocations before any structural validation,
-/// causing unbounded allocation / OOM / abort at model load. Real Qwen3.5 checkpoints are
-/// well under 100 layers; 512 rejects any config a real checkpoint would never carry while
-/// leaving generous headroom for future architectures.
-pub(crate) const MAX_HIDDEN_LAYERS: usize = 512;
+/// the bounded `layer_types`/`layer_mask` sequence deserializers, and the loader's
+/// `Vec::with_capacity` all allocate proportionally to it — an extreme value (e.g.
+/// `usize::MAX`) reaches those allocations before any structural validation, causing
+/// unbounded allocation / OOM / abort at model load. Real Qwen3.5/3.6 checkpoints are
+/// well under 100 layers; 4096 — this crate's existing ceiling for other untrusted
+/// count fields, e.g. `grammar::json_schema::MAX_ARRAY_CARDINALITY` — rejects a
+/// pathological value like `2^63` while leaving generous headroom for future
+/// architectures. The bound's purpose is to make the allocation finite and small
+/// relative to available memory, which 4096 layers satisfies with room to spare.
+pub const MAX_HIDDEN_LAYERS: usize = 4096;
 
 /// Upper bound on `vocab_size` accepted from `config.json`.
 ///
@@ -2176,6 +2180,94 @@ impl Qwen35Config {
         self.linear_num_value_heads() * self.linear_value_head_dim
     }
 
+    /// Checked variant of [`full_q_dim`](Self::full_q_dim). Config dimensions are parsed
+    /// from an untrusted checkpoint's `config.json`; `num_attention_heads * head_dim` must
+    /// reject overflow with a typed error instead of wrapping before Q8 geometry checks
+    /// consume the result.
+    pub fn checked_full_q_dim(&self) -> Result<usize, InferenceError> {
+        self.num_attention_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "invalid Qwen config: num_attention_heads ({}) * head_dim ({}) overflows usize",
+                    self.num_attention_heads, self.head_dim
+                ))
+            })
+    }
+
+    /// Checked variant of [`full_kv_dim`](Self::full_kv_dim). See [`checked_full_q_dim`](Self::checked_full_q_dim).
+    pub fn checked_full_kv_dim(&self) -> Result<usize, InferenceError> {
+        self.num_key_value_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "invalid Qwen config: num_key_value_heads ({}) * head_dim ({}) overflows usize",
+                    self.num_key_value_heads, self.head_dim
+                ))
+            })
+    }
+
+    /// Checked variant of [`linear_qkv_dim`](Self::linear_qkv_dim). See
+    /// [`checked_full_q_dim`](Self::checked_full_q_dim).
+    pub fn checked_linear_qkv_dim(&self) -> Result<usize, InferenceError> {
+        let overflow = || {
+            InferenceError::InvalidInput(format!(
+                "invalid Qwen config: linear_num_key_heads ({}) * linear_key_head_dim ({}) + \
+                 linear_num_value_heads ({}) * linear_value_head_dim ({}) overflows usize",
+                self.linear_num_key_heads,
+                self.linear_key_head_dim,
+                self.linear_num_value_heads(),
+                self.linear_value_head_dim,
+            ))
+        };
+        let q = self
+            .linear_num_key_heads
+            .checked_mul(self.linear_key_head_dim)
+            .ok_or_else(overflow)?;
+        let k = self
+            .linear_num_key_heads
+            .checked_mul(self.linear_key_head_dim)
+            .ok_or_else(overflow)?;
+        let v = self
+            .linear_num_value_heads()
+            .checked_mul(self.linear_value_head_dim)
+            .ok_or_else(overflow)?;
+        q.checked_add(k)
+            .and_then(|qk| qk.checked_add(v))
+            .ok_or_else(overflow)
+    }
+
+    /// Checked variant of [`linear_output_dim`](Self::linear_output_dim). See
+    /// [`checked_full_q_dim`](Self::checked_full_q_dim).
+    pub fn checked_linear_output_dim(&self) -> Result<usize, InferenceError> {
+        self.linear_num_value_heads()
+            .checked_mul(self.linear_value_head_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "invalid Qwen config: linear_num_value_heads ({}) * linear_value_head_dim ({}) \
+                     overflows usize",
+                    self.linear_num_value_heads(),
+                    self.linear_value_head_dim
+                ))
+            })
+    }
+
+    /// Checked GatedDeltaNet conv1d weight element count: `linear_qkv_dim() * linear_conv_kernel_dim`.
+    /// GDN-specific; net-new (no upstream free-function counterpart). See
+    /// [`checked_full_q_dim`](Self::checked_full_q_dim).
+    pub fn checked_linear_conv_len(&self) -> Result<usize, InferenceError> {
+        let qkv_dim = self.checked_linear_qkv_dim()?;
+        qkv_dim
+            .checked_mul(self.linear_conv_kernel_dim)
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "invalid Qwen config: linear_qkv_dim ({qkv_dim}) * linear_conv_kernel_dim ({}) \
+                 overflows usize",
+                    self.linear_conv_kernel_dim
+                ))
+            })
+    }
+
     /// **Unstable**: returns true when layer `i` uses full GQA attention.
     pub fn is_full_attention(&self, layer_idx: usize) -> bool {
         self.layer_types
@@ -2244,6 +2336,16 @@ impl Qwen35Config {
         cfg.apply_layer_mask(mask);
         cfg
     }
+}
+
+/// Checked doubling of a config-derived dimension (e.g. full-attention `q_rows = 2 * q_dim`).
+/// `what` names the quantity in the error message on overflow.
+pub(crate) fn checked_double(value: usize, what: &str) -> Result<usize, InferenceError> {
+    value.checked_mul(2).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "invalid Qwen config: 2 * {what} ({value}) overflows usize"
+        ))
+    })
 }
 
 /// **Unstable**: sampling configuration for text generation; temperature/top-k/top-p may expand.
@@ -2862,6 +2964,22 @@ mod tests {
             .to_string();
         assert!(
             err.contains("num_hidden_layers") && err.contains("MAX_HIDDEN_LAYERS"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// `num_hidden_layers` is attacker-controlled `config.json` input consumed to size a
+    /// `Vec` (via `compute_layer_types`/`normalize_layer_mask`) before any tensor-level
+    /// validation runs. Rejects a layer count above `MAX_HIDDEN_LAYERS` as a typed error
+    /// at parse time, before any allocation is sized from it.
+    #[test]
+    fn test_num_hidden_layers_above_ceiling_errors_before_allocation() {
+        let json = r#"{"text_config": {"num_hidden_layers": 10000000}}"#;
+        let err = Qwen35Config::from_config_json_str(json)
+            .expect_err("num_hidden_layers above MAX_HIDDEN_LAYERS must yield an InferenceError")
+            .to_string();
+        assert!(
+            err.contains("num_hidden_layers"),
             "wrong guard fired: {err}"
         );
     }
@@ -5540,7 +5658,7 @@ mod tests {
     fn parser_rejects_hostile_gdn_cross_layer_state_aggregate() {
         // Hostile geometry: every per-layer/per-buffer guard (MAX_GDN_STATE_SIZE,
         // MAX_GDN_CONV_BUFFER_SIZE, MAX_GDN_CHUNK_SCRATCH_BYTES, MAX_GDN_SESSION_BYTES)
-        // passes individually, but 512 linear-attention layers (MAX_HIDDEN_LAYERS) each
+        // passes individually, but 512 linear-attention layers each
         // allocating this per-layer state blow past MAX_GDN_CROSS_LAYER_STATE_BYTES --
         // `generation.rs` allocates one `GatedDeltaNetState` per linear layer up front,
         // before the first token.

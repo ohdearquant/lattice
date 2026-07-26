@@ -4,7 +4,7 @@ mod distill;
 mod types;
 
 pub use distill::DistillationPipeline;
-pub use types::{DistillationStats, LabelingResult, RawExample};
+pub use types::{DistillationStats, LabelSource, LabelingResult, RawExample, TeacherAuth};
 
 use crate::error::{Result, TuneError};
 

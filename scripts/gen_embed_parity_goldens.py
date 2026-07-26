@@ -58,6 +58,9 @@ def l2_normalize(vec: np.ndarray) -> np.ndarray:
     return vec / norm
 
 
+BGE_SMALL_EN_V15_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+
+
 def generate_bge_small_goldens() -> list[dict]:
     """
     BAAI/bge-small-en-v1.5: CLS-token pooling + L2 normalize, no prompt prefix.
@@ -66,10 +69,11 @@ def generate_bge_small_goldens() -> list[dict]:
     "Use the CLS token embedding and normalize to unit length."
     """
     model_id = "BAAI/bge-small-en-v1.5"
-    print(f"Loading {model_id} from HF hub...")
+    revision = BGE_SMALL_EN_V15_REVISION
+    print(f"Loading {model_id}@{revision} from HF hub...")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModel.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+    model = AutoModel.from_pretrained(model_id, revision=revision)
     model.eval()
 
     print(f"  model type: {type(model).__name__}, hidden_size: {model.config.hidden_size}")
@@ -85,6 +89,7 @@ def generate_bge_small_goldens() -> list[dict]:
 
         goldens.append({
             "model_id": model_id,
+            "source_revision": revision,
             "pooling": "cls",
             "prompt_prefix": "",
             "input": text,
@@ -113,7 +118,8 @@ def generate_e5_small_goldens() -> list[dict]:
         sys.exit(1)
 
     model_id = "intfloat/multilingual-e5-small"
-    print(f"Loading {model_id} from {model_path}...")
+    revision = source_revision_of(model_path)
+    print(f"Loading {model_id} from {model_path} (source_revision={revision})...")
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_path))
     model = AutoModel.from_pretrained(str(model_path))
@@ -138,6 +144,7 @@ def generate_e5_small_goldens() -> list[dict]:
 
         goldens.append({
             "model_id": model_id,
+            "source_revision": revision,
             "pooling": "mean",
             "prompt_prefix": prompt_prefix,
             "input": text,
@@ -163,6 +170,20 @@ def find_hf_cache_snapshot(model_id: str) -> Path | None:
     return None
 
 
+def source_revision_of(model_path: Path) -> str:
+    """Best-effort provenance for a golden's `source_revision` field.
+
+    HF cache snapshot dirs are named after the exact commit they were
+    resolved from (`snapshots/<sha>/`), so that directory name doubles as a
+    revision pin. `.lattice/models/<slug>/` snapshots carry no such marker —
+    lattice's own downloader resolves against a mutable ref by design (see
+    issue #1100) — so record that plainly rather than inventing a revision.
+    """
+    if model_path.parent.name == "snapshots" and len(model_path.name) == 40:
+        return model_path.name
+    return f"unpinned:{model_path}"
+
+
 def generate_all_minilm_l6_v2_goldens() -> list[dict]:
     """
     sentence-transformers/all-MiniLM-L6-v2: mean pooling + L2 normalize, no prompt prefix.
@@ -181,7 +202,8 @@ def generate_all_minilm_l6_v2_goldens() -> list[dict]:
             print(f"ERROR: all-MiniLM-L6-v2 not found in HF cache or .lattice/models/")
             sys.exit(1)
 
-    print(f"Loading {model_id} from {model_path}...")
+    revision = source_revision_of(model_path)
+    print(f"Loading {model_id} from {model_path} (source_revision={revision})...")
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_path))
     model = AutoModel.from_pretrained(str(model_path))
@@ -205,6 +227,7 @@ def generate_all_minilm_l6_v2_goldens() -> list[dict]:
 
         goldens.append({
             "model_id": model_id,
+            "source_revision": revision,
             "pooling": "mean",
             "prompt_prefix": prompt_prefix,
             "input": text,
@@ -235,7 +258,8 @@ def generate_paraphrase_multilingual_minilm_l12_v2_goldens() -> list[dict]:
             print(f"ERROR: paraphrase-multilingual-MiniLM-L12-v2 not found in HF cache or .lattice/models/")
             sys.exit(1)
 
-    print(f"Loading {model_id} from {model_path}...")
+    revision = source_revision_of(model_path)
+    print(f"Loading {model_id} from {model_path} (source_revision={revision})...")
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_path))
     model = AutoModel.from_pretrained(str(model_path))
@@ -259,6 +283,7 @@ def generate_paraphrase_multilingual_minilm_l12_v2_goldens() -> list[dict]:
 
         goldens.append({
             "model_id": model_id,
+            "source_revision": revision,
             "pooling": "mean",
             "prompt_prefix": prompt_prefix,
             "input": text,
@@ -288,7 +313,8 @@ def generate_qwen_goldens() -> list[dict]:
         sys.exit(1)
 
     model_id = "Qwen/Qwen3-Embedding-0.6B"
-    print(f"Loading {model_id} from {model_path}...")
+    revision = source_revision_of(model_path)
+    print(f"Loading {model_id} from {model_path} (source_revision={revision})...")
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_path))
     model = AutoModel.from_pretrained(str(model_path))
@@ -312,6 +338,7 @@ def generate_qwen_goldens() -> list[dict]:
 
         goldens.append({
             "model_id": model_id,
+            "source_revision": revision,
             "pooling": "last_token",
             "prompt_prefix": prompt_prefix,
             "input": text,

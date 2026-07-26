@@ -219,7 +219,7 @@ impl SentencePieceTokenizer {
         // signal when the flag is true or absent (HF byte-fallback models set
         // it true; some recovery paths omit it). Only an explicit `false`
         // suppresses inference — so a model that genuinely declares no byte
-        // fallback keeps a literal `<0xNN>` text token as Normal (#255 review).
+        // fallback keeps a literal `<0xNN>` text token as Normal (#255).
         let byte_fallback_enabled = json_path(&root, &["model", "byte_fallback"])
             .and_then(JsonValue::as_bool)
             != Some(false);
@@ -1131,7 +1131,7 @@ mod tests {
     fn test_json_loader_respects_explicit_byte_fallback_false() {
         // When the model explicitly declares no byte fallback, a literal
         // `<0xNN>`-shaped piece must stay Normal (trie-resolvable), not be
-        // misrouted to byte_fallback_ids by shape inference (#255 review edge).
+        // misrouted to byte_fallback_ids by shape inference (#255 edge case).
         let json = r#"{"model":{"type":"Unigram","unk_id":0,"byte_fallback":false,"vocab":[["<unk>",0.0],["<0x41>",-5.0]]}}"#;
         let tok = SentencePieceTokenizer::from_tokenizer_json_str(json).unwrap();
         assert_eq!(tok.inner.byte_fallback_ids[0x41], None);

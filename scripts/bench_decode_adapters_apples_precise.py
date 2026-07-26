@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Engine adapters for the `apples_precise` profile (issue #813 step 2:
-migrate `bench_apples_precise.sh`).
+migrate `legacy precise apples-to-apples consumer`).
 
 Registers three `EngineAdapter`s (lattice, ollama, mlx) that invoke exactly
-what `bench_apples_precise.sh`'s inline lattice-loop/ollama-curl/mlx-`uv run`
+what `legacy precise apples-to-apples consumer`'s inline lattice-loop/ollama-curl/mlx-`uv run`
 sections invoked, then delegates argument parsing and execution to
 `bench_decode_harness.main()`. All repeat-count, warmup, and
 aggregation/CI decisions stay in the harness/profile
@@ -25,7 +25,7 @@ merely a diagnostic column -- later adapters must not treat this field as
 non-comparable across engines.
 
 Run with (from repo root): `uv run --quiet --with mlx-lm python3
-scripts/bench_decode_adapters_apples_precise.py run --profile apples_precise
+scripts/bench_decode_harness.py run --profile apples_precise
 --allow-missing-engine`.
 """
 
@@ -48,7 +48,7 @@ import bench_decode_harness as harness  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# -- lattice: exactly bench_apples_precise.sh's LAT_BIN/MODEL_DIR --
+# -- lattice: exactly legacy precise apples-to-apples consumer's LAT_BIN/MODEL_DIR --
 LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
 MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b"
 
@@ -100,7 +100,7 @@ def extract_single_result(stdout: str, *, n_tokens: int) -> tuple[int, int, floa
 
 class LatticeAdapter:
     """Invokes `target/release/bench_decode_ab` against the Q8 safetensors
-    dir, mirroring `bench_apples_precise.sh`'s lattice section (including its
+    dir, mirroring `legacy precise apples-to-apples consumer`'s lattice section (including its
     own untimed pre-loop warmup, now represented as the profile's
     `warmup_repeats=2`/`warmup_tokens=512` instead of the legacy script's
     inline `for _ in $(seq 1 $WARMUP)` loop)."""
@@ -157,7 +157,7 @@ _REQUIRED_OLLAMA_FIELDS = ("eval_count", "eval_duration", "total_duration")
 
 
 def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
-    """Mirrors `bench_apples_precise.sh`'s ollama Python inline block
+    """Mirrors `legacy precise apples-to-apples consumer`'s ollama Python inline block
     exactly: `tot = d.get('total_duration',0)/1e9` is the legacy script's
     PRIMARY metric (fed straight into `rows[eng][N]`), and
     `ec/ed = eval_count/eval_duration` was its separate native-rate column
@@ -191,7 +191,7 @@ def ollama_response_to_result(data: dict) -> harness.AdapterRunResult:
 
 class OllamaAdapter:
     """Invokes ollama's `/api/generate`, one HTTP call per measured/warmup
-    repeat -- matching `bench_apples_precise.sh`'s per-run curl loop
+    repeat -- matching `legacy precise apples-to-apples consumer`'s per-run curl loop
     (including its own inline 2-run warmup, represented here via the
     profile's `warmup_repeats=2`)."""
 
@@ -253,7 +253,7 @@ def ollama_available(base_url: str = OLLAMA_BASE_URL, *, model_tag: str = OLLAMA
 
 
 class MlxAdapter:
-    """Invokes `mlx_lm` in-process, mirroring `bench_apples_precise.sh`'s
+    """Invokes `mlx_lm` in-process, mirroring `legacy precise apples-to-apples consumer`'s
     MLX heredoc: load the Q8 safetensors model once (falling back to the Hub
     id on failure, exactly as the legacy heredoc's bare `try/except`), quantize
     to 8 bits once, then time only `generate()` per call -- the profile's

@@ -126,11 +126,14 @@ struct TensorMeta {
     start: usize,
     end: usize,
     converted_f32: OnceLock<Box<[f32]>>,
-    /// Set once this tensor's decoded f32 values have passed
-    /// `ingress::validate_ingested_tensor`, so repeated access to the same
-    /// zero-copy F32 tensor does not rescan already-validated pages
-    /// (lattice#800 step 4).
-    validated: OnceLock<()>,
+    /// Populated once, via `get_or_init`, by this tensor's
+    /// `ingress::validate_ingested_tensor` outcome, so repeated access to the
+    /// same zero-copy F32 tensor does not rescan already-validated pages and
+    /// concurrent first access cannot run the scan twice (lattice#800 step
+    /// 4). `validate_ingested_tensor` only ever returns
+    /// `InferenceError::InvalidSafetensors`, so the cached error is carried
+    /// as its message and rewrapped on read.
+    validated: OnceLock<Result<(), String>>,
 }
 
 /// **Unstable**: 2D tensor view over memory-mapped safetensors data; field layout may change.
@@ -504,17 +507,25 @@ impl SafetensorsFile {
             }
         };
 
-        if meta.validated.get().is_none() {
+        // `get_or_init` runs its closure at most once even under concurrent
+        // first access: every caller blocks on the same in-flight init
+        // rather than racing separate `get()`-then-`set()` scans of the same
+        // tensor (the previous pattern let multiple callers observe
+        // `get().is_none()` and each redo the O(n) finite scan before one
+        // `set()` won).
+        let source = &self.source;
+        let shape = meta.shape.as_slice();
+        let dtype_name = meta.dtype.name();
+        match meta.validated.get_or_init(|| {
             crate::weights::ingress::validate_ingested_tensor(
                 crate::weights::ingress::IngestedTensor::decoded_f32(
-                    &self.source,
-                    name,
-                    meta.shape.as_slice(),
-                    meta.dtype.name(),
-                    slice,
+                    source, name, shape, dtype_name, slice,
                 ),
-            )?;
-            let _ = meta.validated.set(());
+            )
+            .map_err(|e| e.to_string())
+        }) {
+            Ok(()) => {}
+            Err(msg) => return Err(InferenceError::InvalidSafetensors(msg.clone())),
         }
 
         Ok((slice, meta.shape.as_slice()))
@@ -1120,6 +1131,66 @@ pub struct ShardedSafetensors {
     canon_root: PathBuf,
     index: SafetensorsIndex,
     shards: HashMap<String, SafetensorsFile>,
+}
+
+/// Resolve an index-declared shard file name beneath `model_dir`, rejecting
+/// entries that escape the model directory.
+///
+/// Shard names come from checkpoint-controlled JSON (`model.safetensors.
+/// index.json` or a quantized-checkpoint manifest), so they are untrusted
+/// input: an absolute entry replaces `model_dir` entirely in `Path::join`,
+/// and `..` components address files outside the checkpoint — turning a
+/// malicious model directory into an open-arbitrary-readable-file
+/// primitive (#1069). The validation is purely lexical — absolute paths
+/// and any parent-directory (or Windows prefix/root) component are
+/// rejected before the join — so an index entry cannot address anything
+/// above the model directory, and no filesystem state is consulted,
+/// leaving no check-to-open window to race.
+///
+/// # Threat model
+///
+/// Manifest STRINGS are untrusted; the local FILESYSTEM is trusted.
+/// Symlinks are deliberately followed at open time, matching peer loaders
+/// (HF transformers, candle, llama.cpp). The HuggingFace hub cache stores
+/// snapshots as symlink farms (`snapshots/<rev>/x.safetensors ->
+/// ../../blobs/<sha>`) and lattice loads those directories directly;
+/// resolving symlinks and requiring the resolved target to stay beneath
+/// the model directory — or refusing to follow symlinks at all — would
+/// reject every hub-cache checkpoint (pinned by
+/// `sharded_loader_follows_hub_cache_snapshot_layout`, which fails under
+/// exactly such a policy). A symlink planted inside the model directory
+/// is therefore honored by design: an actor who can write the model
+/// directory already controls every byte the loader reads, so blocking
+/// links there defends nothing, and archive-extraction tools are the
+/// correct place to refuse hostile symlinks. Do not "re-harden" this
+/// helper to resolve or reject symlinks without revisiting that decision
+/// trail (#1069, #1072).
+pub fn contained_shard_path(model_dir: &Path, shard_file: &str) -> Result<PathBuf, InferenceError> {
+    let rel = Path::new(shard_file);
+    if rel.as_os_str().is_empty() {
+        return Err(InferenceError::InvalidSafetensors(
+            "shard entry is empty; index entries must name a file within the model directory"
+                .to_string(),
+        ));
+    }
+    if rel.is_absolute() {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "shard entry {shard_file:?} is an absolute path; \
+             index entries must stay within the model directory"
+        )));
+    }
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "shard entry {shard_file:?} escapes the model directory; \
+                     index entries must stay within the model directory"
+                )));
+            }
+        }
+    }
+    Ok(model_dir.join(rel))
 }
 
 /// Parse `model.safetensors.index.json` from a model directory.
@@ -2643,6 +2714,162 @@ mod tests {
         assert_eq!(tb.shape, vec![3]);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1069: index-declared shard names are untrusted checkpoint content.
+    /// Plain names and subdirectory names beneath the model directory
+    /// resolve; anything that escapes the directory is rejected.
+    #[test]
+    fn contained_shard_path_accepts_entries_beneath_model_dir() {
+        let dir = temp_dir("lattice_containment_ok_test");
+        fs::write(dir.join("shard.safetensors"), b"x").expect("test setup");
+        fs::create_dir_all(dir.join("sub")).expect("test setup");
+        fs::write(dir.join("sub").join("nested.safetensors"), b"x").expect("test setup");
+
+        let plain = contained_shard_path(&dir, "shard.safetensors").expect("plain name resolves");
+        assert_eq!(
+            plain.file_name().unwrap().to_string_lossy(),
+            "shard.safetensors"
+        );
+        contained_shard_path(&dir, "sub/nested.safetensors")
+            .expect("subdirectory entry beneath the model dir resolves");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1069: an absolute index entry replaces the model directory entirely
+    /// in `Path::join`; it must be rejected even when the target exists.
+    #[test]
+    fn contained_shard_path_rejects_absolute_entry() {
+        let dir = temp_dir("lattice_containment_abs_test");
+        let outside = temp_dir("lattice_containment_abs_outside");
+        let target = outside.join("outside.safetensors");
+        fs::write(&target, b"x").expect("test setup");
+
+        let err = contained_shard_path(&dir, &target.to_string_lossy())
+            .expect_err("absolute entry must be rejected");
+        assert!(
+            matches!(err, InferenceError::InvalidSafetensors(_)),
+            "unexpected error kind: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    /// #1069: `..` components must not address files outside the model
+    /// directory, whether or not the target exists.
+    #[test]
+    fn contained_shard_path_rejects_parent_traversal() {
+        let outer = temp_dir("lattice_containment_dotdot_test");
+        let dir = outer.join("model");
+        fs::create_dir_all(&dir).expect("test setup");
+        fs::write(outer.join("secret.bin"), b"x").expect("test setup");
+
+        let err = contained_shard_path(&dir, "../secret.bin")
+            .expect_err("parent traversal must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            contained_shard_path(&dir, "../nonexistent.bin").is_err(),
+            "traversal to a missing target must also fail"
+        );
+
+        fs::remove_dir_all(&outer).ok();
+    }
+
+    /// The HuggingFace hub cache stores snapshots as symlink farms:
+    /// `snapshots/<rev>/model.safetensors -> ../../blobs/<sha>`. Lattice
+    /// loads those directories directly (the e2e workflows point the
+    /// engine at `snapshot_download()` output), so index-entry validation
+    /// must stay lexical — a policy that resolved symlinks and required
+    /// the target beneath the model directory would reject every
+    /// hub-cache checkpoint. This pins the layout end-to-end through
+    /// `load_sharded`.
+    #[cfg(unix)]
+    #[test]
+    fn sharded_loader_follows_hub_cache_snapshot_layout() {
+        let outer = temp_dir("lattice_containment_hub_layout_test");
+        let blobs = outer.join("blobs");
+        let dir = outer.join("snapshots").join("rev");
+        fs::create_dir_all(&blobs).expect("test setup");
+        fs::create_dir_all(&dir).expect("test setup");
+        write_single_f32_tensor(&blobs.join("blob-sha"), "tensor.a", &[1.0, 2.0]);
+        std::os::unix::fs::symlink(
+            Path::new("../../blobs/blob-sha"),
+            dir.join("model.safetensors"),
+        )
+        .expect("test setup");
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"metadata": {}, "weight_map": {"tensor.a": "model.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
+
+        let tensors =
+            load_sharded(&dir).expect("hub-cache snapshot layout must load through the symlink");
+        assert_eq!(tensors["tensor.a"].data, vec![1.0, 2.0]);
+
+        fs::remove_dir_all(&outer).ok();
+    }
+
+    /// #1069 end-to-end: a sharded index whose weight_map entry escapes the
+    /// model directory fails to load through both sharded loaders.
+    #[test]
+    fn sharded_loaders_reject_escaping_index_entry() {
+        let outer = temp_dir("lattice_containment_loader_test");
+        let dir = outer.join("model");
+        fs::create_dir_all(&dir).expect("test setup");
+        // A structurally valid shard OUTSIDE the model dir — containment,
+        // not file validity, must be what rejects it.
+        let evil = outer.join("evil.safetensors");
+        write_single_f32_tensor(&evil, "tensor.a", &[1.0, 2.0]);
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"metadata": {}, "weight_map": {"tensor.a": "../evil.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
+
+        let err = load_sharded(&dir).expect_err("load_sharded must reject the escaping entry");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+
+        let index_path = dir.join("model.safetensors.index.json");
+        let mut st = ShardedSafetensors::open_index(&index_path).expect("index itself parses");
+        let err = st
+            .get_f32_tensor_owned("tensor.a")
+            .expect_err("lazy loader must reject the escaping entry at access time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+        let err = st
+            .resolve_weight("tensor.a")
+            .expect_err("resolve_weight must reject the escaping entry");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&outer).ok();
     }
 
     #[test]

@@ -12,21 +12,48 @@ dependency the gate can't audit.
 Three of this module's gate-math choices were adversarially checked against
 an independent Monte-Carlo simulation (power curves for the paired gate at
 several CV levels, bootstrap tail behavior at small n, and exact binomial
-bounds for promotion evidence) before the module was written.
-All three corrections are encoded as executable functions,
-not just prose, so the validator in `bench_decode_harness.py` can enforce
-them instead of merely documenting them:
+bounds for promotion evidence) before the module was written. That
+simulation is NOT in this repository, and only one of the three checks left
+an artifact here that re-derives its number: the exact binomial bound is
+recomputed by `clopper_pearson_upper` and asserted in the unit tests. The
+power percentages quoted below and in `perf-policy.toml` are carried over
+from the external simulation. Nothing in this tree computes them, so treat
+them as the recorded rationale for the registered bands, not as a result an
+evaluator can reproduce from this checkout.
+
+The corrections are encoded as executable functions, not just prose, so the
+validator in `bench_decode_harness.py` can enforce them instead of merely
+documenting them:
 
   1. `required_n` — minimum `n` is a function of the MEASURED same-session
      residual CV, not a fixed constant. At cv~=1% n=7 already has ~99%
      power against a true 10% regression (Class-A decode family, FAIL=7%).
-     At cv~=3%, n=7 has only ~47-63% power; n~=23-25 restores ~80-84%. At
+     At cv~=3%, n=7 has only ~47-63% power; n=25 restores ~80-84%. At
      cv>=8%, even n=30 only reaches ~31% power against the same true
      regression — inflating n further is not cost-effective, so that band
      widens the FAIL margin instead (see `perf-policy.toml` `[[cv_bands]]`
-     `fail_margin_multiplier`). Bands are DATA in `perf-policy.toml`; this
-     module only looks them up and refuses to guess a required n for a
-     cell with no measured CV on record.
+     `fail_margin_multiplier`). Those CV figures name the calibration
+     points the power curves were computed at; they are NOT the band
+     boundaries. The boundaries are the registered `max_cv` values, and
+     they are what a lookup actually tests against — read them from
+     `perf-policy.toml` before reasoning about a specific CV, because a
+     measured 2% lands in the n=25 band and a measured 6% already carries
+     the widened FAIL margin.
+
+     Bands are DATA in `perf-policy.toml`; this module only looks them up.
+     It does NOT refuse a cell with no measured CV, and cannot: `required_n`
+     takes a float, so a missing CV arrives here either as a bare `TypeError`
+     or, if a caller substitutes 0.0, as a silent lookup into the CHEAPEST
+     band. The fail-closed behaviour lives in the CALLERS —
+     `bench_decode_harness.validate_run_record` raises
+     `RunRecordValidationError` ("INFRA-FAIL: ... has no measured_cv on
+     record") for any cell whose verdict is not `unsupported`, and
+     `bench_cpu_flagship_supervisor` demotes an un-CV'd cell to shadow
+     rather than defaulting it. A NEW CALL SITE INHERITS THE OBLIGATION,
+     NOT THE GUARD: if you call `required_n` from somewhere else, you must
+     refuse the missing-CV case yourself before calling, because nothing in
+     this module will do it for you and nothing here will fail if you skip
+     it.
 
   2. `order_stratified_bootstrap_means` bootstraps the MEAN of paired
      log-slowdowns, never the median. At n=7 the bootstrap distribution of
