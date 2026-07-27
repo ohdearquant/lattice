@@ -45,7 +45,10 @@ enum IngestPayload<'a> {
         error_kind: IngressErrorKind,
     },
     /// Derived Q8 data and per-row scales.
-    Q8 { data: &'a [i8], scales: &'a [f32] },
+    Q8 {
+        data: &'a [i8],
+        scales: &'a [f32],
+    },
     NativeQ4 {
         original_len: usize,
         block_count: usize,
