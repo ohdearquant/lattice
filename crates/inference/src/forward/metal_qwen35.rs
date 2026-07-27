@@ -15462,7 +15462,14 @@ mod inner {
                         norm_weight: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.norm.weight"),
                             &format!("L{i}.gdn.norm"),
-                            &[output_dim],
+                            // Per-HEAD RMSNorm: one gain per value-head element,
+                            // not one per output element. `linear_output_dim()` is
+                            // `linear_num_value_heads() * linear_value_head_dim`, so
+                            // expecting it here demands the full GDN output width and
+                            // rejects the checkpoint's own [linear_value_head_dim]
+                            // tensor. The safetensors loader has always expected
+                            // `cfg.linear_value_head_dim` for this same tensor.
+                            &[cfg.linear_value_head_dim],
                         )?,
                         out_proj: load_q4_buf(
                             &format!("{prefix}.linear_attn.out_proj.weight"),
