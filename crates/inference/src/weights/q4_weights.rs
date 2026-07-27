@@ -139,12 +139,30 @@ fn bf16_to_f32(v: u16) -> f32 {
     crate::weights::half_bits::bf16_bits_to_f32(v)
 }
 
+/// Whether `scale` survives serialization as a finite, strictly positive f16.
+///
+/// A block's scale is written to disk as an f16 bit pattern, so what a reader
+/// dequantizes with is `q4_f16_to_f32(q4_f32_to_f16(scale))`, not `scale`
+/// itself. A positive f32 below f16's smallest subnormal (~5.96e-8) serializes
+/// to exactly `+0.0`, and a value above f16's maximum (~65504) serializes to
+/// infinity; either produces a block no reader can dequantize.
+///
+/// This is the single definition of "is this scale usable?" in this module.
+/// [`q4_metadata_bits`] enforces it at serialization, and
+/// [`quantize_block_with_mode_len`] tests the same condition when choosing a
+/// block's scale, so a scale the quantizer emits can never be one the
+/// serializer rejects for being unrepresentably small.
+#[inline]
+fn q4_scale_survives_f16(scale: f32) -> bool {
+    let serialized = q4_f16_to_f32(q4_f32_to_f16(scale));
+    serialized.is_finite() && serialized > 0.0
+}
+
 fn q4_metadata_bits(scale: f32, bias: f32) -> Result<(u16, u16), InferenceError> {
     let scale_bits = q4_f32_to_f16(scale);
     let bias_bits = q4_f32_to_f16(bias);
-    let serialized_scale = q4_f16_to_f32(scale_bits);
     let serialized_bias = q4_f16_to_f32(bias_bits);
-    if !serialized_scale.is_finite() || serialized_scale <= 0.0 {
+    if !q4_scale_survives_f16(scale) {
         return Err(InferenceError::InvalidInput(format!(
             "Q4 scale {scale} is not representable as a finite, strictly positive f16 value"
         )));
@@ -160,6 +178,37 @@ fn q4_metadata_bits(scale: f32, bias: f32) -> Result<(u16, u16), InferenceError>
 // ---------------------------------------------------------------------------
 // Core block quantization
 // ---------------------------------------------------------------------------
+
+/// The scale a block is actually quantized and serialized with, given the
+/// `candidate` its range implies (`abs_max / 7` symmetric, `range / 15`
+/// asymmetric).
+///
+/// A block whose candidate scale cannot survive f16 serialization as a strictly
+/// positive value carries no range a reader could reconstruct, so it takes the
+/// degenerate fallback of `1.0`: every weight then quantizes to the same code
+/// and dequantizes to the block's bias. For a block whose true range is on the
+/// order of 1e-37 that leaves a reconstruction error of the same order —
+/// identical to what an exactly-zero-range block has always produced, and far
+/// below anything representable downstream.
+///
+/// Testing the candidate for f16 survivability rather than for exact equality
+/// to zero is what makes this predicate agree with the one
+/// [`q4_metadata_bits`] enforces. A range that is tiny but nonzero derives a
+/// tiny-but-nonzero scale, which underflows to `+0.0` in f16 — degenerate in
+/// exactly the sense the fallback exists for, but invisible to a `== 0.0` test.
+///
+/// The fallback deliberately covers only the underflow direction. A candidate
+/// too *large* for f16 is a real range that cannot be represented, not an
+/// absent one; substituting `1.0` there would silently mis-quantize a block, so
+/// it is passed through for [`q4_metadata_bits`] to reject.
+#[inline]
+fn degenerate_safe_scale(candidate: f32) -> f32 {
+    if candidate < 1.0 && !q4_scale_survives_f16(candidate) {
+        1.0f32
+    } else {
+        candidate
+    }
+}
 
 /// Quantize one block from only the first `valid_len` real values of `vals`;
 /// the remaining `32 - valid_len` slots are caller-supplied zero padding used
@@ -203,11 +252,7 @@ fn quantize_block_with_mode_len(
     }
     if symmetric {
         let abs_max = vals.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        let scale = if abs_max == 0.0 {
-            1.0f32
-        } else {
-            abs_max / 7.0
-        };
+        let scale = degenerate_safe_scale(abs_max / 7.0);
         let inv_scale = 1.0 / scale;
         let bias = -8.0 * scale;
         let (scale_bits, bias_bits) = q4_metadata_bits(scale, bias)?;
@@ -227,7 +272,7 @@ fn quantize_block_with_mode_len(
         let min_val = real.iter().copied().fold(f32::INFINITY, f32::min);
         let max_val = real.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let range = max_val - min_val;
-        let scale = if range == 0.0 { 1.0f32 } else { range / 15.0 };
+        let scale = degenerate_safe_scale(range / 15.0);
         let (scale_bits, bias_bits) = q4_metadata_bits(scale, min_val)?;
         let inv_scale = 1.0 / scale;
         let mut packed = [0u8; 16];
@@ -2166,6 +2211,149 @@ mod tests {
         assert_eq!(
             q.blocks[0], expected,
             "symmetric partial blocks must stay byte-identical to the old padded path"
+        );
+    }
+
+    /// The largest f32 whose `abs_max / 7` symmetric scale still underflows f16
+    /// to `+0.0`, scaled to reproduce the magnitude the QuaRot write pass emits
+    /// on Qwen3.5 (~4.8e-38, against f16's smallest positive subnormal ~5.96e-8).
+    const TINY_SYMMETRIC_ABS_MAX: f32 = 3.363e-37;
+
+    /// Asymmetric counterpart: `range / 15` lands in the same underflowing region.
+    const TINY_ASYMMETRIC_RANGE: f32 = 1.5e-37;
+
+    #[test]
+    fn symmetric_block_with_underflowing_scale_is_quantizable_and_reloadable() {
+        // A Hadamard-rotated block can have a range that is tiny but not
+        // exactly zero. `abs_max / 7` is then a positive f32 far below f16's
+        // smallest subnormal, so it serializes to +0.0 -- a scale no reader can
+        // dequantize with. Such a block must take the degenerate fallback, not
+        // be rejected: this is the shape the repository's own `quantize_quarot`
+        // write pass produces, via `quantize_f64_to_q4` (symmetric).
+        let mut vals = [0.0f32; 32];
+        vals[0] = TINY_SYMMETRIC_ABS_MAX;
+        vals[7] = -TINY_SYMMETRIC_ABS_MAX / 3.0;
+        assert!(
+            q4_f16_to_f32(q4_f32_to_f16(TINY_SYMMETRIC_ABS_MAX / 7.0)) == 0.0,
+            "fixture must actually underflow f16, else this test proves nothing"
+        );
+
+        let block = quantize_block_with_mode_len(&vals, 32, true)
+            .expect("a block with a tiny but nonzero range must quantize");
+
+        let scale = q4_f16_to_f32(block.scale);
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "serialized scale {scale} must be finite and strictly positive"
+        );
+        assert_eq!(scale, 1.0, "degenerate blocks take the 1.0 fallback");
+
+        // Reconstruction error is bounded by the block's true range, exactly as
+        // it already was for an all-zero block.
+        let tensor = Q4Tensor {
+            blocks: vec![block],
+            shape: vec![32],
+            original_len: 32,
+        };
+        let out = dequantize_q4_to_f32(&tensor);
+        for (i, (&got, &want)) in out.iter().zip(vals.iter()).enumerate() {
+            assert!(
+                (got - want).abs() <= 2.0 * TINY_SYMMETRIC_ABS_MAX,
+                "element {i}: reconstruction error {} exceeds the block's own range",
+                (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn asymmetric_block_with_underflowing_scale_is_quantizable_and_reloadable() {
+        let mut vals = [0.0f32; 32];
+        vals[3] = TINY_ASYMMETRIC_RANGE;
+        assert!(
+            q4_f16_to_f32(q4_f32_to_f16(TINY_ASYMMETRIC_RANGE / 15.0)) == 0.0,
+            "fixture must actually underflow f16, else this test proves nothing"
+        );
+
+        let block = quantize_block_with_mode_len(&vals, 32, false)
+            .expect("a block with a tiny but nonzero range must quantize");
+
+        let scale = q4_f16_to_f32(block.scale);
+        assert!(
+            scale.is_finite() && scale > 0.0,
+            "serialized scale {scale} must be finite and strictly positive"
+        );
+        assert_eq!(scale, 1.0, "degenerate blocks take the 1.0 fallback");
+
+        let tensor = Q4Tensor {
+            blocks: vec![block],
+            shape: vec![32],
+            original_len: 32,
+        };
+        let out = dequantize_q4_to_f32(&tensor);
+        for (i, (&got, &want)) in out.iter().zip(vals.iter()).enumerate() {
+            assert!(
+                (got - want).abs() <= 2.0 * TINY_ASYMMETRIC_RANGE,
+                "element {i}: reconstruction error {} exceeds the block's own range",
+                (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn quarot_symmetric_write_pass_survives_a_tiny_range_row() {
+        // End to end over the seam CI exercises: a tensor written by the
+        // symmetric (QuaRot) quantizer, saved, and read back through the same
+        // per-block metadata validation the loader applies. Before the
+        // degenerate predicate covered f16 underflow, the write side emitted a
+        // scale of +0.0 and the read side rejected the file the project's own
+        // quantizer had just produced.
+        let mut src = vec![0.0f64; 64];
+        src[0] = f64::from(TINY_SYMMETRIC_ABS_MAX);
+        src[40] = f64::from(-TINY_SYMMETRIC_ABS_MAX) / 2.0;
+
+        let q = quantize_f64_to_q4(&src, &[64]).expect("symmetric quantize must accept the row");
+        for (i, b) in q.blocks.iter().enumerate() {
+            let scale = q4_f16_to_f32(b.scale);
+            assert!(
+                scale.is_finite() && scale > 0.0,
+                "block {i} serialized scale {scale} is not a usable f16"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tiny_range.q4");
+        save_q4_file(&path, &q).unwrap();
+        let reloaded = load_q4_file(&path).expect("the loader must accept what the writer emits");
+        assert_eq!(reloaded.blocks, q.blocks);
+    }
+
+    #[test]
+    fn scale_too_large_for_f16_is_still_rejected() {
+        // The degenerate fallback covers only the underflow direction. A range
+        // that overflows f16 is a real range that cannot be represented, and
+        // substituting 1.0 there would silently mis-quantize the block, so
+        // `q4_metadata_bits` must still reject it.
+        let mut vals = [0.0f32; 32];
+        vals[0] = 1.0e7;
+        let err = quantize_block_with_mode_len(&vals, 32, true)
+            .expect_err("a scale above f16's maximum must not be silently replaced");
+        assert!(
+            format!("{err}").contains("strictly positive f16"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn bias_above_f16_range_is_still_rejected() {
+        // Independent of the scale predicate: an asymmetric block whose
+        // `min_val` exceeds f16's maximum overflows to infinity as a bias.
+        let mut vals = [1.0e5f32; 32];
+        vals[0] = 1.0e5 + 1.0;
+        let err = quantize_block_with_mode_len(&vals, 32, false)
+            .expect_err("a bias outside f16 range must be rejected");
+        assert!(
+            format!("{err}").contains("finite f16"),
+            "unexpected error: {err}"
         );
     }
 
