@@ -961,23 +961,31 @@ pub(crate) fn open_and_mmap_q4_file(
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
 pub fn load_q4_file(path: &std::path::Path) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
-    load_q4_file_impl(path, None)
+    let f = std::fs::File::open(path)?;
+    load_q4_from_open_file(f, path, None)
 }
 
+/// [`load_q4_file`] with the caller's required shape checked against the file's
+/// own header, through the shared ingress seam, before any block is decoded.
 #[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn load_q4_file_checked(
     path: &std::path::Path,
     expected_shape: &[usize],
 ) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
-    load_q4_file_impl(path, Some(expected_shape))
+    let f = std::fs::File::open(path)?;
+    load_q4_from_open_file(f, path, Some(expected_shape))
 }
 
-fn load_q4_file_impl(
+/// Parse a [`Q4Tensor`] from an already-open `.q4` file. Callers that resolved this file
+/// through [`crate::weights::f32_weights::open_manifest_entry_once`] must read from that
+/// opened fd rather than reopen by path -- see that function's docs. `path` is used only
+/// for error messages and ingress provenance; this function never opens it.
+pub(crate) fn load_q4_from_open_file(
+    mut f: std::fs::File,
     path: &std::path::Path,
     expected_shape: Option<&[usize]>,
 ) -> Result<Q4Tensor, Box<dyn std::error::Error>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
     let file_len = f.metadata()?.len();
 
     let header = validate_q4_file(&mut f, path, expected_shape)?;
@@ -1018,6 +1026,162 @@ fn load_q4_file_impl(
     })
 }
 
+/// Read a `.f16` (KHF1) file's header from an already-open handle, leaving the reader
+/// positioned at the payload.
+///
+/// Takes the `File` rather than a path on purpose. A shape check is only meaningful for
+/// the bytes it actually guards, so the header and the payload must come from the same
+/// open handle; re-opening the pathname to read one and then the other lets the file be
+/// replaced in between, and the validated header need not describe what gets materialized.
+/// `display_path` is used only for error messages.
+///
+/// File format:
+/// ```text
+/// magic       b"KHF1"   4 bytes
+/// version     1u32 LE   4 bytes
+/// ndim        u32 LE    4 bytes
+/// shape[i]    u64 LE × ndim
+/// numel       u64 LE    8 bytes
+/// data        [u16; numel]   numel × 2 bytes (IEEE-754 f16 bit patterns)
+/// ```
+fn read_f16_header(
+    f: &mut std::fs::File,
+    display_path: &str,
+    file_len: u64,
+) -> Result<(Vec<usize>, usize), Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+    if &magic != b"KHF1" {
+        return Err(
+            format!("invalid magic at {display_path}: expected KHF1, got {magic:?}").into(),
+        );
+    }
+
+    let mut b4 = [0u8; 4];
+    f.read_exact(&mut b4)?;
+    if u32::from_le_bytes(b4) != 1 {
+        return Err("unsupported .f16 file version".into());
+    }
+
+    f.read_exact(&mut b4)?;
+    let ndim = u32::from_le_bytes(b4) as usize;
+    checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
+    let mut shape = Vec::with_capacity(ndim);
+    let mut b8 = [0u8; 8];
+    for index in 0..ndim {
+        f.read_exact(&mut b8)?;
+        shape.push(usize_from_u64(
+            u64::from_le_bytes(b8),
+            &format!("shape dimension {index}"),
+        )?);
+    }
+
+    f.read_exact(&mut b8)?;
+    let numel = usize_from_u64(u64::from_le_bytes(b8), "numel")?;
+
+    let shape_product = shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or("shape dims overflow usize")?;
+    if shape_product != numel {
+        return Err(format!(
+            "{display_path}: shape product {shape_product} (shape={shape:?}) != numel {numel}"
+        )
+        .into());
+    }
+
+    Ok((shape, numel))
+}
+
+/// Why loading a `.f16` failed, when the caller needs to distinguish a shape
+/// disagreement from every other failure in order to report it well.
+#[derive(Debug)]
+pub enum F16LoadError {
+    /// The header's declared shape disagreed with the shape the caller required.
+    /// The payload was not read.
+    ShapeMismatch {
+        /// The shape the file's own header declares.
+        declared: Vec<usize>,
+    },
+    /// Any other failure: I/O, bad magic, unsupported version, inconsistent header.
+    Other(Box<dyn std::error::Error>),
+}
+
+impl std::fmt::Display for F16LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShapeMismatch { declared } => {
+                write!(f, "f16 header declares shape {declared:?}")
+            }
+            // Deliberately does NOT interpolate the wrapped error. `source()` below returns
+            // that same error, and a consumer that walks the chain (or prints with `{:#}`)
+            // would otherwise see the cause twice. `Display` states only what this wrapper
+            // itself contributes; the cause is reached through `source()`.
+            Self::Other(_) => write!(f, "f16 tensor could not be read"),
+        }
+    }
+}
+
+impl std::error::Error for F16LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // Keep the wrapped cause reachable. `Display` alone flattens the chain, so a
+            // caller that walks `source()` would otherwise see this wrapper as the root.
+            Self::Other(e) => Some(e.as_ref()),
+            Self::ShapeMismatch { .. } => None,
+        }
+    }
+}
+
+/// Load a KHF1 `.f16` tensor, requiring its header to declare `expected` before the
+/// payload is read.
+///
+/// This exists instead of a public "read the shape" helper because reading the shape and
+/// then loading the file are two opens of the same pathname, and nothing binds the shape
+/// that was checked to the bytes that get materialized. Here the header is parsed and
+/// compared on the same handle the payload is then read from, so passing the check is a
+/// property of the actual tensor rather than of whatever happened to be at that path a
+/// moment earlier.
+///
+/// # Errors
+///
+/// [`F16LoadError::ShapeMismatch`] if the header disagrees with `expected`, in which case
+/// no payload is read; otherwise [`F16LoadError::Other`] on I/O failure, unrecognized
+/// magic bytes, unsupported version, or malformed dimensions.
+pub fn load_f16_tensor_file_expecting(
+    path: &std::path::Path,
+    expected: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>), F16LoadError> {
+    let f = std::fs::File::open(path).map_err(|e| F16LoadError::Other(Box::new(e)))?;
+    load_f16_tensor_from_open_file_expecting(f, &path.display().to_string(), expected)
+}
+
+/// [`load_f16_tensor_file_expecting`] for a handle the caller already opened.
+///
+/// Both properties hold at once here: the header is compared against `expected` on the
+/// same handle the payload is read from, and that handle is the one the caller opened
+/// (see [`crate::weights::f32_weights::open_manifest_entry_once`]) rather than a pathname
+/// reopened afterwards. `display_path` is used only for error messages.
+pub(crate) fn load_f16_tensor_from_open_file_expecting(
+    mut f: std::fs::File,
+    display_path: &str,
+    expected: &[usize],
+) -> Result<(Vec<f32>, Vec<usize>), F16LoadError> {
+    let file_len = f
+        .metadata()
+        .map_err(|e| F16LoadError::Other(Box::new(e)))?
+        .len();
+    let (shape, numel) =
+        read_f16_header(&mut f, display_path, file_len).map_err(F16LoadError::Other)?;
+    if shape != expected {
+        return Err(F16LoadError::ShapeMismatch { declared: shape });
+    }
+    read_f16_payload(&mut f, shape, numel, file_len, display_path, Some(expected))
+        .map_err(F16LoadError::Other)
+}
+
 /// Load a tensor from a KHF1 `.f16` file, returning f32 values and shape.
 ///
 /// File format:
@@ -1037,59 +1201,52 @@ fn load_q4_file_impl(
 pub fn load_f16_tensor_file(
     path: &std::path::Path,
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
-    load_f16_tensor_file_impl(path, None)
+    let f = std::fs::File::open(path)?;
+    load_f16_tensor_from_open_file(f, &path.display().to_string(), None)
 }
 
+/// [`load_f16_tensor_file`] with the caller's required shape checked through the
+/// shared ingress seam.
 #[cfg(any(test, feature = "metal-gpu"))]
 pub(crate) fn load_f16_tensor_file_checked(
     path: &std::path::Path,
     expected_shape: &[usize],
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
-    load_f16_tensor_file_impl(path, Some(expected_shape))
+    let f = std::fs::File::open(path)?;
+    load_f16_tensor_from_open_file(f, &path.display().to_string(), Some(expected_shape))
 }
 
-fn load_f16_tensor_file_impl(
-    path: &std::path::Path,
+/// Parse an f32 tensor from an already-open `.f16` file. Callers that resolved this file
+/// through [`crate::weights::f32_weights::open_manifest_entry_once`] must read from that
+/// opened fd rather than reopen by path -- see that function's docs.
+/// `display_path` is used only for error messages and ingress provenance.
+pub(crate) fn load_f16_tensor_from_open_file(
+    mut f: std::fs::File,
+    display_path: &str,
+    expected_shape: Option<&[usize]>,
+) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
+    let file_len = f.metadata()?.len();
+    let (shape, numel) = read_f16_header(&mut f, display_path, file_len)?;
+    read_f16_payload(&mut f, shape, numel, file_len, display_path, expected_shape)
+}
+
+/// Read a `.f16` payload from a handle already positioned past its header, requiring
+/// the file's length to match the header-declared extent exactly and routing the
+/// decoded values through the shared ingress seam.
+fn read_f16_payload(
+    f: &mut std::fs::File,
+    shape: Vec<usize>,
+    numel: usize,
+    file_len: u64,
+    display_path: &str,
     expected_shape: Option<&[usize]>,
 ) -> Result<(Vec<f32>, Vec<usize>), Box<dyn std::error::Error>> {
     use std::io::Read;
-    let mut f = std::fs::File::open(path)?;
-    let file_len = f.metadata()?.len();
-
-    let mut magic = [0u8; 4];
-    f.read_exact(&mut magic)?;
-    if &magic != b"KHF1" {
-        return Err(format!(
-            "invalid magic at {}: expected KHF1, got {:?}",
-            path.display(),
-            magic
-        )
-        .into());
-    }
-
-    let mut b4 = [0u8; 4];
-    f.read_exact(&mut b4)?;
-    if u32::from_le_bytes(b4) != 1 {
-        return Err("unsupported .f16 file version".into());
-    }
-
-    f.read_exact(&mut b4)?;
-    let ndim = u32::from_le_bytes(b4) as usize;
-    let shape_bytes = checked_alloc_bytes(ndim, 8, file_len, "shape dims")?;
-    let mut shape = Vec::with_capacity(ndim);
-    let mut b8 = [0u8; 8];
-    for index in 0..ndim {
-        f.read_exact(&mut b8)?;
-        shape.push(usize_from_u64(
-            u64::from_le_bytes(b8),
-            &format!("shape dimension {index}"),
-        )?);
-    }
-
-    f.read_exact(&mut b8)?;
-    let numel = usize_from_u64(u64::from_le_bytes(b8), "numel")?;
-
     let raw_len = checked_alloc_bytes(numel, 2, file_len, "f16 data")?;
+    let shape_bytes = shape
+        .len()
+        .checked_mul(8)
+        .ok_or("KHF1 shape byte count overflows usize")?;
     let payload_offset = 20u64
         .checked_add(shape_bytes as u64)
         .ok_or("KHF1 payload offset overflows u64")?;
@@ -1098,16 +1255,15 @@ fn load_f16_tensor_file_impl(
         .ok_or("KHF1 payload end offset overflows u64")?;
     if file_len < required_len {
         return Err(format!(
-            "{}: file truncated below KHF1 payload ({file_len} bytes < required {required_len})",
-            path.display()
+            "{display_path}: file truncated below KHF1 payload ({file_len} bytes < required \
+             {required_len})"
         )
         .into());
     }
     if file_len > required_len {
         return Err(format!(
-            "{}: file has trailing bytes after KHF1 payload ({file_len} bytes > expected \
-             {required_len})",
-            path.display()
+            "{display_path}: file has trailing bytes after KHF1 payload ({file_len} bytes > \
+             expected {required_len})"
         )
         .into());
     }
@@ -1122,13 +1278,12 @@ fn load_f16_tensor_file_impl(
         })
         .collect();
 
-    let source = path.display().to_string();
-    let tensor_name = path
+    let tensor_name = std::path::Path::new(display_path)
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("native KHF1 tensor");
     let tensor = crate::weights::ingress::IngestedTensor::decoded_f32(
-        &source,
+        display_path,
         tensor_name,
         &shape,
         "KHF1/F16",
@@ -3464,5 +3619,32 @@ mod tests {
         );
 
         std::fs::remove_dir_all(merged_p.parent().unwrap()).ok();
+    }
+
+    /// `Display` must not repeat what `source()` already exposes.
+    ///
+    /// These two assertions fail in opposite directions, which is the point: reverting
+    /// `Display` to interpolate the wrapped error trips the first, and dropping the
+    /// `source()` implementation trips the second. A chain-printing consumer needs both
+    /// halves to hold, and neither is observable from the other.
+    #[test]
+    fn f16_load_error_display_does_not_duplicate_its_source() {
+        use std::error::Error;
+
+        const CAUSE: &str = "sentinel-cause-text";
+        let err = F16LoadError::Other(Box::new(std::io::Error::other(CAUSE)));
+
+        let shown = format!("{err}");
+        assert!(
+            !shown.contains(CAUSE),
+            "Display must describe only this wrapper's own contribution, but it \
+             interpolated the wrapped cause: {shown:?}"
+        );
+
+        let source = err.source().expect("Other must keep its cause reachable");
+        assert!(
+            format!("{source}").contains(CAUSE),
+            "source() must yield the wrapped cause itself"
+        );
     }
 }

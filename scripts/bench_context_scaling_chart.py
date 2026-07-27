@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate context-scaling bar chart from bench_context_scaling.sh TSV output."""
+"""Generate a context-scaling bar chart from the profiled harness TSV output."""
 import sys
 from pathlib import Path
 

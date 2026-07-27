@@ -7,7 +7,8 @@ engine	context_tokens	slope_tok_s	t1_ms	t2_ms	runs
 #   exactly from the same t1_ms/t2_ms raw timings (#1066) — mlx used a separate, unaffected
 #   derivation path. Still withdrawn from the README cross-engine table pending the
 #   multi-session baseline program (#1060), since these remain a single-session snapshot.
-#   Kept here as the raw record; regenerate with ./scripts/bench_context_scaling.sh.
+#   Kept here as the raw record; regenerate with:
+#   uv run --with mlx-lm python3 scripts/bench_decode_harness.py run --profile context_scaling
 # Parser note: comment lines stay below the header row and contain no tab characters —
 #   bench_context_scaling_chart.py skips line 1 unconditionally and any line with <3 fields.
 lattice	64	156.5	128.015	485.782	5
