@@ -384,7 +384,7 @@ fn load_from_q4_dir(
         // opened exactly once and read from that fd rather than reopened by path.
         let (file, real_path) = open_manifest_entry_once(model_dir, &entry.file)?;
         let (data, shape) = if entry.quantized.unwrap_or(false) {
-            let q4 = load_q4_from_open_file(file).map_err(|e| {
+            let q4 = load_q4_from_open_file(file, &real_path, None).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
                     "failed to load q4 tensor {} from {}: {e}",
                     entry.name,
@@ -473,13 +473,15 @@ fn load_from_q4_dir(
                 },
             )?
         } else {
-            load_f16_tensor_from_open_file(file, &real_path.display().to_string()).map_err(|e| {
-                InferenceError::InvalidSafetensors(format!(
-                    "failed to load f16 tensor {} from {}: {e}",
-                    entry.name,
-                    real_path.display()
-                ))
-            })?
+            load_f16_tensor_from_open_file(file, &real_path.display().to_string(), None).map_err(
+                |e| {
+                    InferenceError::InvalidSafetensors(format!(
+                        "failed to load f16 tensor {} from {}: {e}",
+                        entry.name,
+                        real_path.display()
+                    ))
+                },
+            )?
         };
         tensors.insert(entry.name.clone(), (data, shape));
     }
