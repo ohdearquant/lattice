@@ -14,6 +14,13 @@ name: e2e-parity
 on:
   pull_request:
     branches: [main]
+    # `ready_for_review` is NOT in the default type set, and it is load-bearing
+    # here: the macOS jobs below skip while a PR is a draft, so the flip out of
+    # draft is the only event that can run them. Without this type the flip
+    # fires nothing, the gate never re-reports, and the PR wedges. The other
+    # three are the defaults, restated because naming `types` at all replaces
+    # them.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
     paths:
@@ -102,10 +109,26 @@ jobs:
             echo "→ no tune training change: layer-23 golden not required"
           fi
 
+  # The macOS jobs from here down carry `github.event.pull_request.draft != true`.
+  # The macOS runner pool is ~5 concurrent account-wide and these are the long
+  # jobs (model fetch, HF reference run, then lattice), so a draft under active
+  # iteration otherwise occupies the same pool that ready-to-merge PRs queue on.
+  #
+  # `!= true` rather than `== false` is deliberate: on merge_group, schedule,
+  # workflow_dispatch and push there is no `pull_request` object at all, so the
+  # expression resolves to null. `null != true` runs the job, which is the arm
+  # that must not be skipped; `null == false` would be false and would silently
+  # disable these gates everywhere except pull requests.
+  #
+  # This is not a loosened gate. parity-gate below requires each arm to be
+  # literally "success", so a skipped job fails it — a draft therefore shows an
+  # honest red gate meaning "parity unverified", never a green one. The gate can
+  # only go green after the ready flip actually runs these jobs, which is what
+  # the `ready_for_review` trigger above exists to guarantee.
   layer23-golden:
     name: layer-23 golden bridge
     needs: changes
-    if: needs.changes.outputs.tune == 'true'
+    if: needs.changes.outputs.tune == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -171,7 +194,7 @@ jobs:
   parity:
     name: e2e parity
     needs: changes
-    if: needs.changes.outputs.engine == 'true'
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     # 25 min, not 15: typical runtime is ~12.5 min but shared-runner speed
     # variance exceeds the old ~17% headroom — two consecutive timeout
@@ -297,7 +320,7 @@ jobs:
   metal-parity:
     name: metal parity ratchet (#535 waived)
     needs: changes
-    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: (needs.changes.outputs.engine == 'true' && github.event_name != 'merge_group' && github.event.pull_request.draft != true) || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
@@ -618,7 +641,7 @@ jobs:
   q4-composed:
     name: q4 composed golden
     needs: changes
-    if: needs.changes.outputs.engine == 'true'
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -721,7 +744,7 @@ jobs:
   vision-s3-gate:
     name: vision S3a+S4 cosine gate
     needs: changes
-    if: needs.changes.outputs.engine == 'true'
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -881,7 +904,7 @@ jobs:
   q4-ppl-quality:
     name: q4 ppl regression gate
     needs: changes
-    if: needs.changes.outputs.engine == 'true'
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -1019,9 +1042,23 @@ jobs:
           METAL_RESULT="${{ needs.metal-parity.result }}"
           LAYER23_RESULT="${{ needs.layer23-golden.result }}"
           EVENT_NAME="${{ github.event_name }}"
+          # Empty on every non-pull_request event, which is what we want: the
+          # draft branch below must never fire on merge_group, push, schedule,
+          # or workflow_dispatch.
+          DRAFT="${{ github.event.pull_request.draft }}"
           echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
+            exit 1
+          fi
+          # Drafts skip the macOS parity jobs to keep the ~5-concurrent runner
+          # pool available to PRs that are ready to merge. Those skips reach the
+          # arm checks below as result=skipped, which is correctly not "success",
+          # so this gate would fail anyway. It short-circuits here only so the
+          # failure explains itself instead of reading as a parity regression.
+          # This stays a FAILURE on purpose: a green gate has to mean parity ran.
+          if [ "$DRAFT" = "true" ] && { [ "$ENGINE" = "true" ] || [ "$TUNE" = "true" ]; }; then
+            echo "::error::Draft PR: macOS parity jobs are deferred while this PR is a draft, so parity is UNVERIFIED and this gate fails by design. Mark the PR ready for review and these jobs run automatically on the ready_for_review event."
             exit 1
           fi
           if [ "$TUNE" = "true" ] && [ "$LAYER23_RESULT" != "success" ]; then

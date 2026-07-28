@@ -112,7 +112,7 @@ For each `(arch, bench, test)` triple, Criterion reports `change.estimates.mean.
 | > +7%                                  | Fail the check, block merge                                                        |
 | Point estimate < −3% AND CI-upper < 0% | Pass with celebratory PR comment ("🚀 confirmed improvement: ...")                 |
 
-PRs may bypass the >7% fail by applying the label `bench-allow-regression`. The PR comment must then quote the rationale (e.g. "intentional: layer_norm two-pass revert for numerical stability, see ADR-058 context"). The label is intentionally awkward to apply — protects against accidental bypass.
+The gate has no per-PR label override. A confirmed regression above 7% remains a hard failure.
 
 **Why 7% on CI-lower-bound**: a naive 7% threshold on the raw point estimate would produce unacceptable flake — shared-runner variance puts the P95 of single-bench point-estimate noise around ±7%, so with ~25 measurements per workflow run the per-PR false-positive rate would approach 70%. Using the _lower bound of Criterion's own 95% CI_ requires the run to be statistically confident the regression is real before it can cross the threshold, which collapses noise-driven flakes back to <2% per PR while preserving 7% sensitivity to genuine kernel slowdowns. If observed false-positive rate is still >5% after the 7-day shadow period (D2/Rollout step 3), tighten the CI-confidence threshold from 95% → 99% rather than weakening the 7% sensitivity.
 
@@ -198,7 +198,7 @@ A `make bench-ci` target builds and runs the exact same matrix locally on the de
 ### Negative
 
 - **2x bench wall time per PR** (build baseline + build current). Mitigation: `Swatinem/rust-cache` for deps; Criterion bench builds themselves are seconds, not minutes.
-- **Noise tolerance is real.** Even with a 10% threshold, ~5% of bench runs may flake-warn. The `bench-allow-regression` label and the warning band (5-10%) give an honest escape valve without weakening the hard gate.
+- **Noise tolerance is real.** Even with a 7% failure threshold, bench runs may warn because of noise. The 3-7% warning band makes that uncertainty visible without weakening the hard gate.
 - **No Apple Silicon coverage in CI.** Metal GPU regressions and M-series-specific NEON behavior remain caught only by local `bench_decode_harness.py` runs on the `apples_precise` profile. This ADR explicitly does not solve the Apple Silicon CI problem — see Alternatives Considered §A3.
 - **Bench shape is now part of the contract.** Renaming a Criterion bench group requires updating `perf-baselines` (it'll appear as a "new bench, no baseline" rather than a regression). Document this in `perf-baselines/README.md`.
 
@@ -261,7 +261,7 @@ A subsequent adversarial statistical review of this design found the confidence-
 path (D3 "Why 7% on CI-lower-bound" and Rollout step 5: on persistent false positives,
 tighten the CI confidence from 95% to 99% "rather than weakening the 7% sensitivity")
 to be backwards. At a fixed threshold, requiring higher confidence widens the margin the
-lower bound must clear before tripping, which *reduces* power against genuine regressions;
+lower bound must clear before tripping, which _reduces_ power against genuine regressions;
 it does not preserve sensitivity. If observed flake is high, the honest levers are more
 samples per run, better runner isolation, or an explicitly raised threshold.
 
