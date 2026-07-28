@@ -18,7 +18,6 @@
   `detect_format`, plus its two error-message helpers) consolidated into
   `crates/inference/src/model_format.rs`, shared by `lattice`, `lattice_serve`,
   and `chat_metal`; see "Amendment: model-format detector consolidation" below.
-
 The cluster defect tickets (#739–#741, resolved by C1; #744–#746, resolved by C2) are
 closed against the merged PRs above. The non-cluster audit items from the same sweep
 (#764–#777, per-family checklists and standalone items) remain open and track their
@@ -26,7 +25,8 @@ own work independently; their state does not gate this ADR's acceptance.
 **Crate**: lattice-inference (`crates/inference/src/attention/`, `src/forward/`, `src/bin/`,
 `src/model/qwen35/`)
 **Research**: Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; adversarially verified at the audited commit; re-verified at `origin/main @ 0699e60cc`)
-**Issues**: #739, #740, #741 (attention-softmax); #744, #745, #746 (http-serve); related
+**Issues**: #739, #740, #741 (attention-softmax); #744, #745, #746 (http-serve); #1115
+(Metal measurement lock); related
 non-cluster audit items tracked in #764-#777 (per-family checklists and standalone items)
 **Depends on**: ADR-058 (CPU performance regression CI — superseded; retained for `make bench-compare` provenance), ADR-064 (CI gate taxonomy), ADR-066 (e2e parity gate, Accepted)
 
@@ -306,6 +306,39 @@ are unaffected. See `detect_format_prefers_safetensors_index_over_q4_files` in
 **Resolves**: #829 — one canonical model-format detector, zero remaining local
 re-implementations in `lattice.rs`, `lattice_serve.rs`, `chat_metal.rs`, or the three
 benchmark binaries.
+
+### Amendment (2026-07-28): Metal measurement-lock consolidation (#1115)
+
+The Metal test lock had three test-local implementations in `metal.rs`,
+`metal_qwen35.rs`, and `vision_s3b_vit_metal_gate_test.rs`, plus a fourth
+process-lifetime variant in `bench_gdn_prefill_ab.rs`. All used the same fleet
+path and 30-minute bound, but no implementation was callable by the raw Metal
+benches and examples because Cargo builds those targets as crates separate from
+the library.
+
+The canonical implementation lives in `src/measurement.rs` and is exported only
+under `cfg(all(target_os = "macos", feature = "metal-gpu"))`. Both the module and
+its sole function are `#[doc(hidden)]`; the function returns an opaque RAII
+guard, so its concrete type and fields do not become externally nameable
+surface. This narrowly public boundary is repository support, not production
+API. A library export is necessary because unit tests, integration tests,
+benches, examples, and binaries cannot share a `pub(crate)` item across their
+Cargo crate boundaries. A new support crate would add a dependency and package
+for one guard, while source-including one file into every target would create
+multiple compiled implementations rather than one callable contract.
+
+Behavior remains the established fail-loud contract: acquire the in-process
+mutex first, then poll an exclusive advisory lock on
+`/tmp/lion-metal-gpu-test.lock` every 500 ms; panic after 30 minutes with an
+`lsof` hint; hold both resources until the opaque guard drops. The eight raw
+Metal measurement harnesses identified in #1115 acquire that guard before device
+creation or command-buffer work. A source-contract integration test enumerates
+that complete raw-device harness set and rejects an unguarded call, a late call,
+inventory drift, a second Rust definition, or a second fleet-path literal.
+
+**Resolves**: #1115 — one shared Metal test/measurement guard, the four prior
+implementations migrated, and every verified raw Metal measurement harness
+serialized before GPU work.
 
 ## What we are NOT doing
 
