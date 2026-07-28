@@ -14,6 +14,7 @@
 //! the returned guard owns both for its full lifetime.
 
 use std::fs::{File, OpenOptions};
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -39,14 +40,26 @@ pub fn gpu_test_lock() -> impl Sized {
     let process = GPU_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let file = acquire_machine_lock(
+        Path::new(GPU_MACHINE_LOCK_PATH),
+        GPU_MACHINE_LOCK_TIMEOUT,
+        GPU_MACHINE_LOCK_POLL_INTERVAL,
+    );
 
+    GpuTestGuard {
+        _process: process,
+        _machine: file,
+    }
+}
+
+fn acquire_machine_lock(lock_path: &Path, timeout: Duration, poll_interval: Duration) -> File {
     let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(GPU_MACHINE_LOCK_PATH)
-        .unwrap_or_else(|e| panic!("gpu_test_lock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}"));
-    let deadline = Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
+        .open(lock_path)
+        .unwrap_or_else(|e| panic!("gpu_test_lock: cannot open {}: {e}", lock_path.display()));
+    let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
             Ok(()) => break,
@@ -54,24 +67,25 @@ pub fn gpu_test_lock() -> impl Sized {
                 if Instant::now() >= deadline {
                     panic!(
                         "gpu_test_lock: another process has held \
-                         {GPU_MACHINE_LOCK_PATH} for over {}s — a Metal \
+                         {} for over {}s — a Metal \
                          test run elsewhere on this machine is wedged or \
-                         genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
-                        GPU_MACHINE_LOCK_TIMEOUT.as_secs()
+                         genuinely that long; inspect `lsof {}`",
+                        lock_path.display(),
+                        timeout.as_secs(),
+                        lock_path.display()
                     );
                 }
-                std::thread::sleep(GPU_MACHINE_LOCK_POLL_INTERVAL);
+                std::thread::sleep(poll_interval);
             }
             Err(std::fs::TryLockError::Error(e)) => {
-                panic!("gpu_test_lock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
+                panic!(
+                    "gpu_test_lock: flock on {} failed: {e}",
+                    lock_path.display()
+                )
             }
         }
     }
-
-    GpuTestGuard {
-        _process: process,
-        _machine: file,
-    }
+    file
 }
 
 #[cfg(test)]
@@ -82,16 +96,27 @@ mod tests {
     fn machine_lock_excludes_another_process() {
         const CHILD_ENV: &str = "LATTICE_GPU_LOCK_TEST_CHILD";
         const READY_ENV: &str = "LATTICE_GPU_LOCK_TEST_READY";
+        const LOCK_ENV: &str = "LATTICE_GPU_LOCK_TEST_PATH";
 
         if std::env::var_os(CHILD_ENV).is_some() {
             let ready = std::env::var_os(READY_ENV).expect("child ready path");
+            let lock_path = std::env::var_os(LOCK_ENV).expect("child lock path");
             std::fs::write(ready, b"ready").expect("publish child ready marker");
-            let _guard = gpu_test_lock();
+            let _guard = acquire_machine_lock(
+                Path::new(&lock_path),
+                Duration::from_secs(5),
+                Duration::from_millis(10),
+            );
             return;
         }
 
-        let guard = gpu_test_lock();
         let temp = tempfile::tempdir().expect("temporary lock-test directory");
+        let lock_path = temp.path().join("machine-lock");
+        let guard = acquire_machine_lock(
+            &lock_path,
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
         let ready = temp.path().join("child-ready");
         let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .args([
@@ -101,15 +126,17 @@ mod tests {
             ])
             .env(CHILD_ENV, "1")
             .env(READY_ENV, &ready)
+            .env(LOCK_ENV, &lock_path)
             .spawn()
             .expect("spawn lock contender");
 
         let ready_deadline = Instant::now() + Duration::from_secs(5);
         while !ready.exists() {
-            assert!(
-                Instant::now() < ready_deadline,
-                "child did not reach the lock acquisition"
-            );
+            if Instant::now() >= ready_deadline {
+                child.kill().expect("kill unready lock contender");
+                child.wait().expect("reap unready lock contender");
+                panic!("child did not reach the lock acquisition");
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -127,6 +154,7 @@ mod tests {
             }
             if Instant::now() >= exit_deadline {
                 child.kill().expect("kill wedged lock contender");
+                child.wait().expect("reap wedged lock contender");
                 panic!("lock contender did not acquire after the parent released");
             }
             std::thread::sleep(Duration::from_millis(10));
