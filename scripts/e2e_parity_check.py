@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""E2E parity gate: HF transformers (reference) vs lattice (under test).
+"""E2E parity gate: frozen/live HF reference vs lattice (under test).
 
-Runs HF transformers first to warm the machine, then lattice. Compares greedy
-generation output (token IDs) and reports speed.
+PR and push runs load a frozen HF reference. Scheduled and manually dispatched
+runs execute HF transformers live. Compares greedy generation output (token IDs)
+and reports speed.
 
 Exit codes: 0 = pass, 1 = parity failure, 2 = setup error.
 
@@ -24,6 +25,7 @@ Args:
                           gate FAILURE (never a skip), so a paravirtual runner
                           that silently no-ops the required kernels goes red
                           instead of green (issue #239).
+  --regenerate            run HF live and rewrite the frozen reference fixture.
 
 Env vars:
   LATTICE_BIN             path to the lattice binary under test (default:
@@ -40,6 +42,7 @@ Env vars:
 """
 
 import argparse
+import importlib.metadata
 import json
 import os
 import re
@@ -250,6 +253,184 @@ MODEL_DIR = os.environ.get(
     os.path.expanduser("~/.lattice/models/qwen3.5-0.8b"),
 )
 REPORT_PATH = os.environ.get("E2E_REPORT_PATH")
+REFERENCE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "crates/inference/tests/fixtures/e2e_parity_reference_v1/reference.json"
+)
+REFERENCE_PACKAGES = ("torch", "transformers", "tokenizers", "huggingface_hub")
+REFERENCE_TOKEN_COUNTS = (4, 15)
+MODEL_REPO = "Qwen/Qwen3.5-0.8B"
+MODEL_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
+
+
+def installed_reference_versions() -> dict[str, str]:
+    """Read the installed reference package versions."""
+    versions = {}
+    for package in REFERENCE_PACKAGES:
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError as e:
+            raise RuntimeError(
+                f"reference package {package!r} is not installed"
+            ) from e
+    return versions
+
+
+def load_frozen_reference(max_tokens: int) -> dict[str, dict]:
+    """Load and validate the frozen HF reference, keyed by prompt content."""
+    try:
+        with REFERENCE_PATH.open() as f:
+            fixture = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise RuntimeError(
+            f"frozen reference {REFERENCE_PATH} is missing, unreadable, or malformed: {e}"
+        ) from e
+
+    if not isinstance(fixture, dict):
+        raise RuntimeError("frozen reference root must be a JSON object")
+    versions = fixture.get("package_versions")
+    model = fixture.get("model")
+    generation = fixture.get("generation")
+    entries = fixture.get("prompts")
+    if (
+        fixture.get("schema_version") != 1
+        or not isinstance(versions, dict)
+        or model != {"repo_id": MODEL_REPO, "revision": MODEL_REVISION}
+        or not isinstance(generation, dict)
+        or generation.get("max_new_tokens") != max(REFERENCE_TOKEN_COUNTS)
+        or generation.get("do_sample") is not False
+        or generation.get("temperature") is not None
+        or generation.get("top_p") is not None
+        or generation.get("top_k") is not None
+        or not isinstance(entries, list)
+    ):
+        raise RuntimeError(
+            "frozen reference schema, model provenance, or generation settings "
+            "are malformed or do not match this gate"
+        )
+
+    installed = installed_reference_versions()
+    if set(versions) != set(REFERENCE_PACKAGES):
+        raise RuntimeError(
+            "frozen reference package_versions must name exactly "
+            f"{', '.join(REFERENCE_PACKAGES)}"
+        )
+    for package in REFERENCE_PACKAGES:
+        recorded = versions.get(package)
+        if recorded != installed[package]:
+            raise RuntimeError(
+                f"frozen reference package version mismatch for {package}: "
+                f"recorded {recorded!r}, installed {installed[package]!r}"
+            )
+
+    by_prompt = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"frozen reference prompt entry {index} is not an object")
+        prompt = entry.get("prompt")
+        match_window = entry.get("match_window")
+        references = entry.get("references")
+        if (
+            not isinstance(prompt, str)
+            or isinstance(match_window, bool)
+            or not isinstance(match_window, int)
+            or not isinstance(references, list)
+        ):
+            raise RuntimeError(f"frozen reference prompt entry {index} is malformed")
+        if prompt in by_prompt:
+            raise RuntimeError(
+                f"frozen reference contains duplicate entry for prompt {prompt[:40]!r}"
+            )
+        matching_references = [
+            reference
+            for reference in references
+            if isinstance(reference, dict)
+            and reference.get("token_count") == max_tokens
+        ]
+        if len(matching_references) != 1:
+            raise RuntimeError(
+                f"frozen reference has {len(matching_references)} entries with token "
+                f"count {max_tokens} for prompt {prompt[:40]!r}; expected exactly one"
+            )
+        reference = matching_references[0]
+        generated_ids = reference.get("generated_ids")
+        if (
+            not isinstance(generated_ids, list)
+            or any(
+                isinstance(token, bool) or not isinstance(token, int)
+                for token in generated_ids
+            )
+            or len(generated_ids) != max_tokens
+        ):
+            raise RuntimeError(
+                f"frozen reference token count for prompt {prompt[:40]!r} is "
+                f"{reference.get('token_count')}, but "
+                f"{len(generated_ids) if isinstance(generated_ids, list) else 'an invalid number of'} "
+                "token ids are recorded"
+            )
+        by_prompt[prompt] = {
+            "generated_ids": generated_ids,
+            "text": f"frozen token ids: {generated_ids}",
+            "tok_per_sec": None,
+        }
+
+    for prompt, match_window in PROMPTS:
+        entry = by_prompt.get(prompt)
+        if entry is None:
+            raise RuntimeError(
+                f"frozen reference has no entry for prompt {prompt[:40]!r}"
+            )
+        fixture_entry = next(item for item in entries if item.get("prompt") == prompt)
+        if fixture_entry["match_window"] != match_window:
+            raise RuntimeError(
+                f"frozen reference match window for prompt {prompt[:40]!r} is "
+                f"{fixture_entry['match_window']}, expected {match_window}"
+            )
+    if len(by_prompt) != len(PROMPTS):
+        raise RuntimeError(
+            "frozen reference contains prompts that are not present in PROMPTS"
+        )
+    return by_prompt
+
+
+def write_frozen_reference(outputs: dict[str, dict], max_tokens: int) -> None:
+    """Write live HF outputs as the frozen reference fixture."""
+    if max_tokens < max(REFERENCE_TOKEN_COUNTS):
+        raise RuntimeError(
+            f"--regenerate requires E2E_MAX_TOKENS >= {max(REFERENCE_TOKEN_COUNTS)}"
+        )
+    fixture = {
+        "schema_version": 1,
+        "package_versions": installed_reference_versions(),
+        "model": {"repo_id": MODEL_REPO, "revision": MODEL_REVISION},
+        "generation": {
+            "max_new_tokens": max_tokens,
+            "do_sample": False,
+            "temperature": None,
+            "top_p": None,
+            "top_k": None,
+        },
+        "prompts": [
+            {
+                "prompt": prompt,
+                "match_window": match_window,
+                "references": [
+                    {
+                        "token_count": token_count,
+                        "generated_ids": outputs[prompt]["generated_ids"][:token_count],
+                    }
+                    for token_count in REFERENCE_TOKEN_COUNTS
+                ],
+            }
+            for prompt, match_window in PROMPTS
+        ],
+    }
+    REFERENCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = REFERENCE_PATH.with_suffix(".json.tmp")
+    with temporary_path.open("w") as f:
+        json.dump(fixture, f, indent=2)
+        f.write("\n")
+    temporary_path.replace(REFERENCE_PATH)
 
 
 def run_hf_reference(prompt: str, max_tokens: int) -> dict:
@@ -662,9 +843,12 @@ def render_report(results: list[dict]) -> str:
                 if r.get("xfail_issue")
                 else "FAIL"
             )
+        hf_speed = (
+            f"{r['hf_tok_s']:.1f}" if r["hf_tok_s"] is not None else "frozen"
+        )
         lines.append(
             f"| `{r['prompt']}` | {r['match_window']} | {r['total_agree']}/{r['total_compared']} "
-            f"| {diff} | {r['hf_tok_s']:.1f} | {r['lat_tok_s']:.1f} | {icon} |"
+            f"| {diff} | {hf_speed} | {r['lat_tok_s']:.1f} | {icon} |"
         )
 
     lines.append("")
@@ -689,8 +873,17 @@ def main() -> int:
             "capability marker (issue #239)."
         ),
     )
+    parser.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="run HF live and rewrite the frozen reference fixture",
+    )
     args = parser.parse_args()
     backend = args.backend
+    live_reference = args.regenerate or os.environ.get("GITHUB_EVENT_NAME") in {
+        "schedule",
+        "workflow_dispatch",
+    }
 
     global LATTICE_BIN
     if not _LATTICE_BIN_EXPLICIT:
@@ -741,18 +934,27 @@ def main() -> int:
         return 2
 
     try:
-        import torch  # noqa: F401
-        from transformers import AutoModelForCausalLM  # noqa: F401
-    except ImportError as e:
-        print(f"error: missing dependency: {e}", file=sys.stderr)
+        if live_reference:
+            import torch  # noqa: F401
+            from transformers import AutoModelForCausalLM  # noqa: F401
+        else:
+            frozen_outputs = load_frozen_reference(MAX_TOKENS)
+    except (ImportError, RuntimeError) as e:
+        print(f"error: reference setup failed: {e}", file=sys.stderr)
         return 2
 
     results = []
+    live_outputs = {}
     for prompt, match_window in PROMPTS:
         print(f"\n{'='*60}", file=sys.stderr)
         print(f"Prompt: {prompt[:60]}  (match_window={match_window})", file=sys.stderr)
 
-        print("[hf] running reference...", file=sys.stderr)
+        print(
+            "[hf] running live reference..."
+            if live_reference
+            else "[hf] loading frozen reference...",
+            file=sys.stderr,
+        )
         # Anything that goes wrong producing the reference is a problem with the
         # reference, not evidence about lattice. Letting it propagate would end
         # the process on a traceback, and a traceback exits 1, which this script
@@ -762,7 +964,11 @@ def main() -> int:
         # regression, which is the one conclusion this gate must never reach by
         # accident.
         try:
-            hf_out = run_hf_reference(prompt, MAX_TOKENS)
+            hf_out = (
+                run_hf_reference(prompt, MAX_TOKENS)
+                if live_reference
+                else frozen_outputs[prompt]
+            )
         except Exception as e:  # noqa: BLE001 - deliberately broad, see above
             print(
                 f"error: reference generation failed for prompt {prompt[:40]!r}: "
@@ -771,6 +977,8 @@ def main() -> int:
             )
             traceback.print_exc(file=sys.stderr)
             return 2
+        if live_reference:
+            live_outputs[prompt] = hf_out
 
         print(f"[lattice-{backend}] running under test...", file=sys.stderr)
         lat_out = (
@@ -799,11 +1007,24 @@ def main() -> int:
             )
         else:
             status = f"KNOWN-DIVERGENT {xfail_issue}" if xfail_issue else "FAIL"
+        hf_speed = (
+            f"{hf_out['tok_per_sec']:.1f}"
+            if hf_out["tok_per_sec"] is not None
+            else "frozen"
+        )
         print(
             f"[{status}] agree={verdict['total_agree']}/{verdict['total_compared']} "
-            f"hf={hf_out['tok_per_sec']:.1f} lat={lat_out['tok_per_sec']:.1f} tok/s",
+            f"hf={hf_speed} lat={lat_out['tok_per_sec']:.1f} tok/s",
             file=sys.stderr,
         )
+
+    if args.regenerate:
+        try:
+            write_frozen_reference(live_outputs, MAX_TOKENS)
+        except (OSError, RuntimeError) as e:
+            print(f"error: could not write frozen reference: {e}", file=sys.stderr)
+            return 2
+        print(f"[hf] wrote frozen reference to {REFERENCE_PATH}", file=sys.stderr)
 
     report = render_report(results)
     print(report)
