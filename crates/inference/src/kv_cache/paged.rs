@@ -855,14 +855,15 @@ impl PagedKVCache {
     /// **Unstable**: restore a cached prefix into owned `PagePool` pages.
     ///
     /// Returns `Ok(Some(prefix_len))` on hit and `Ok(None)` when prefix sharing
-    /// is disabled or the key is absent. The cache must be empty (`seq_len == 0`)
-    /// because restore fast-forwards the sequence before the first append.
+    /// is disabled or the key is absent. The cache must be pristine
+    /// (`seq_len == 0` and `num_pages == 0`) because restore fast-forwards the
+    /// sequence before the first append.
     pub fn restore_prefix(
         &mut self,
         adapter_id: AdapterId,
         token_ids: &[u32],
     ) -> Result<Option<usize>, InferenceError> {
-        if self.seq_len() != 0 {
+        if self.seq_len() != 0 || self.num_pages() != 0 {
             return Err(InferenceError::PrefixCache(
                 "restore_prefix requires an empty PagedKVCache".into(),
             ));
@@ -1367,6 +1368,24 @@ mod tests {
 
         assert_eq!(cache.seq_len(), 1);
         assert_eq!(cache.num_pages(), 1);
+    }
+
+    #[test]
+    fn restore_prefix_rejects_append_before_advance() {
+        let config = make_config(4);
+        let kv_dim = config.kv_dim();
+        let mut cache = PagedKVCache::new(config);
+        cache.append_kv_layer(0, &vec![1.0; kv_dim], &vec![2.0; kv_dim]);
+
+        assert_eq!(cache.seq_len(), 0);
+        assert_eq!(cache.num_pages(), 1);
+        let err = cache
+            .restore_prefix(AdapterId::BASE, &[1, 2, 3])
+            .expect_err("partially initialized cache must be rejected");
+        assert!(
+            matches!(err, InferenceError::PrefixCache(_)),
+            "expected PrefixCache error, got {err:?}"
+        );
     }
 
     #[test]
