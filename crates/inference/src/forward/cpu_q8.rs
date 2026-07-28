@@ -719,6 +719,7 @@ pub fn generate_q8(
     // used to accept an empty prompt and return an empty Ok) — see
     // `check_prompt_not_empty` (model::qwen35::generation).
     crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+    crate::model::qwen35::check_prompt_ids_in_vocab(&prompt_ids, cfg.vocab_size)?;
 
     // max_new_tokens == 0 is a valid request: "score this prompt, return no tokens".
     // Guard here so the decode loop (`for _ in 1..0`) never accidentally samples one
@@ -1603,6 +1604,38 @@ mod tests {
             matches!(result, Err(InferenceError::Inference(ref msg)) if msg.contains("empty prompt")),
             "generate_q8 must reject an empty prompt with Err(Inference(\"empty \
              prompt\")) (#856); got {result:?}"
+        );
+    }
+
+    /// A standalone Q8 driver can receive a tokenizer whose vocabulary is
+    /// larger than the supplied model config. The boundary ID `vocab_size`
+    /// must be rejected before `forward_step_q8` slices the embedding table.
+    ///
+    /// Mutation sensitivity: removing only the Q8 call to
+    /// `check_prompt_ids_in_vocab` lets this request reach the unchecked
+    /// embedding slice and panic instead of returning `InvalidInput`.
+    #[test]
+    fn generate_q8_rejects_out_of_vocab_prompt_id() {
+        use std::collections::HashMap;
+
+        let (cfg, weights, rope, _tokenizer) = zero_layer_q8_fixture();
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        vocab_map.insert("z".to_string(), cfg.vocab_size as u32);
+        let mismatched_tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, vec![])
+            .expect("tokenizer with an OOV vocab entry still constructs");
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+
+        let err = generate_q8(&weights, &cfg, &mismatched_tokenizer, &rope, "z", &gen_cfg)
+            .expect_err("an out-of-vocabulary prompt token id must be rejected, not panic");
+        assert!(
+            matches!(err, crate::error::InferenceError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
         );
     }
 

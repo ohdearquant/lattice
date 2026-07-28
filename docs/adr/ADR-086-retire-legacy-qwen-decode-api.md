@@ -1,4 +1,4 @@
-# ADR-084: Retire the Legacy Generic Qwen Decode API
+# ADR-086: Retire the Legacy Generic Qwen Decode API
 
 **Status**: Accepted
 **Date**: 2026-07-28

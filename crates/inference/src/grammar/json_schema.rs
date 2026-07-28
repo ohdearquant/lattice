@@ -813,35 +813,6 @@ impl<'a> CompileCtx<'a> {
             }
         }
 
-        // `compile_object_fields` only consults `required` while iterating the
-        // properties it was given, so a required name that neither side
-        // DECLARES produces no pair rule and imposes no requirement — the
-        // grammar comes back accepting an object without it. That limitation
-        // is older than this function and is reachable without any `$ref` at
-        // all (`{"type":"object","required":["y"]}` compiles to the
-        // empty-object grammar on the merge base too, measured, not inferred),
-        // so fixing it belongs with `compile_object_fields` and its direct
-        // caller rather than here.
-        //
-        // What does belong here is not routing a caller into it. Merging is
-        // this function's choice, and it is only worth making when the result
-        // is faithful; when a merged `required` name has no declaration to
-        // attach to, the merge cannot express the conjunction it exists to
-        // express. Reject, consistent with every other unrepresentable case
-        // above, rather than returning a grammar that silently drops the key.
-        if let Some(name) = required.iter().copied().find(|name| {
-            !properties
-                .as_ref()
-                .is_some_and(|p| p.iter().any(|(k, _)| k.as_str() == *name))
-        }) {
-            return Err(SchemaError(format!(
-                "`$ref` to {ref_str} carries a `required` entry `{name}` that neither the \
-                 reference site nor the target declares in `properties`; this compiler \
-                 represents a required key through its property declaration, so the \
-                 conjunction cannot be expressed. Declare `{name}` in `properties`."
-            )));
-        }
-
         self.compile_object_fields(properties, required)
     }
 
@@ -1033,11 +1004,29 @@ impl<'a> CompileCtx<'a> {
     ) -> Result<Vec<Alt>, SchemaError> {
         let ws_id = self.builder.rule_id("ws").unwrap();
         match properties {
-            None => {
+            None if required.is_empty() => {
                 // No properties: empty object `{}`, tolerating interior ws (`{ }`).
                 Ok(vec![empty_object_as_alt_with_ws(ws_id)])
             }
-            Some(props) => {
+            properties => {
+                let mut props: Vec<(&'a str, Option<&'a Value>)> = properties
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(key, schema)| (key.as_str(), Some(schema)))
+                    .collect();
+                let mut seen_keys: HashSet<&str> = props.iter().map(|(key, _)| *key).collect();
+                for name in required.iter().copied() {
+                    if seen_keys.insert(name) {
+                        if props.len() >= MAX_OBJECT_PROPERTIES {
+                            return Err(SchemaError(format!(
+                                "object effective property count ({}) exceeds the supported limit ({MAX_OBJECT_PROPERTIES})",
+                                props.len() + 1
+                            )));
+                        }
+                        props.push((name, None));
+                    }
+                }
+
                 // Unique per-object suffix so distinct object schemas sharing a
                 // property key don't alias each other's value/pair rules.
                 let obj_idx = self.object_counter;
@@ -1062,8 +1051,8 @@ impl<'a> CompileCtx<'a> {
                 // mirroring the enum/anyOf cumulative guards (issue #474).
                 // saturating_add keeps the running sum from wrapping past the cap.
                 let mut key_bytes_total: usize = 0;
-                for (key, val_schema) in &props {
-                    let key_str: &str = key.as_str();
+                for (key_str, val_schema) in &props {
+                    let key_str = *key_str;
                     let is_req = required.contains(&key_str);
 
                     guard_literal_bytes(key_str)?;
@@ -1090,7 +1079,10 @@ impl<'a> CompileCtx<'a> {
                         id
                     } else {
                         let id = self.builder.reserve(&val_rule_name);
-                        let val_alts = self.compile_schema(val_schema, &[])?;
+                        let val_alts = match val_schema {
+                            Some(schema) => self.compile_schema(schema, &[])?,
+                            None => self.any_value_alts(),
+                        };
                         self.builder.set_alts(id, val_alts);
                         id
                     };
@@ -4745,6 +4737,24 @@ mod tests {
         assert!(accepts(&g, b"{\"status\":\"err\"}"));
     }
 
+    #[test]
+    fn object_required_name_without_properties_is_enforced() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["y"]
+        });
+        let g = compile(&schema).expect("an undeclared required name has any-value semantics");
+
+        assert!(rejects(&g, b"{}"), "an object missing y must be rejected");
+        for value in ["1", "\"value\"", "true", "null", "{}", "[]"] {
+            let instance = format!("{{\"y\":{value}}}");
+            assert!(
+                accepts(&g, instance.as_bytes()),
+                "required y must accept supported JSON value {value}"
+            );
+        }
+    }
+
     /// Issue #1078: a `required` sibling alongside `$ref` must be enforced as
     /// a conjunction with the target, not silently dropped. `Base` declares
     /// `y` as an OPTIONAL property; the sibling makes it required, so an
@@ -4998,38 +5008,22 @@ mod tests {
         );
     }
 
-    /// A merged `required` name with no `properties` declaration on either
-    /// side cannot be represented: `compile_object_fields` reaches `required`
-    /// only while iterating the properties it was handed, so an undeclared
-    /// required key produces no pair rule and imposes no requirement.
-    ///
-    /// That limitation is older than the merge and is reachable with no `$ref`
-    /// involved — `{"type":"object","required":["y"]}` compiles to the
-    /// empty-object grammar on the merge base as well, which is why fixing it
-    /// belongs with `compile_object_fields` and its direct caller rather than
-    /// here. What is fixed here is routing a caller INTO it: merging is this
-    /// function's own choice and is only worth making when the result is
-    /// faithful.
-    ///
-    /// The existing `ref_required_sibling_is_enforced` cannot cover this,
-    /// because its fixture declares the required key in `Base.properties` and
-    /// so exercises the only path where `required.contains(key)` can have an
-    /// effect.
     #[test]
-    fn ref_sibling_merge_rejects_a_required_name_no_side_declares() {
+    fn ref_required_name_without_properties_is_enforced() {
         let schema = serde_json::json!({
             "$defs": { "Base": { "type": "object" } },
             "$ref": "#/$defs/Base",
             "required": ["y"]
         });
-        let err = compile(&schema).expect_err(
-            "a required key with no property declaration cannot be represented, and \
-             compiling would accept an object without it",
+        let g = compile(&schema)
+            .expect("a required sibling without a property declaration has any-value semantics");
+        assert!(
+            accepts(&g, b"{\"y\":1}"),
+            "an object carrying the required key must be accepted"
         );
         assert!(
-            err.0.contains("`y`"),
-            "error should name the undeclared required key, got: {}",
-            err.0
+            rejects(&g, b"{}"),
+            "a reference result missing y must be rejected"
         );
     }
 

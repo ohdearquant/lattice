@@ -983,6 +983,7 @@ pub fn generate_q8_neon(
     // used to accept an empty prompt and return an empty Ok) — see
     // `check_prompt_not_empty` (model::qwen35::generation).
     crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+    crate::model::qwen35::check_prompt_ids_in_vocab(&prompt_ids, cfg.vocab_size)?;
 
     // max_new_tokens == 0 means "generate nothing": return before sampling so
     // we never emit a token the caller did not ask for. Mirrors the guard in
@@ -3139,6 +3140,87 @@ mod tests {
             matches!(result, Err(InferenceError::Inference(ref msg)) if msg.contains("empty prompt")),
             "generate_q8_neon must reject an empty prompt with Err(Inference(\"empty \
              prompt\")) (#856); got {result:?}"
+        );
+    }
+
+    /// A standalone NEON driver can receive a tokenizer whose vocabulary is
+    /// larger than the supplied model config. The boundary ID `vocab_size`
+    /// must be rejected before `forward_step_q8_neon` slices the embedding
+    /// table.
+    ///
+    /// Mutation sensitivity: removing only the NEON call to
+    /// `check_prompt_ids_in_vocab` lets this request reach the unchecked
+    /// embedding slice and panic instead of returning `InvalidInput`.
+    #[test]
+    fn generate_q8_neon_rejects_out_of_vocab_prompt_id() {
+        use std::collections::HashMap;
+
+        let hidden = 32usize;
+        let vocab = 8usize;
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 32,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 32,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
+        };
+        let model = Q8NeonModel {
+            embed_tokens: vec![0.0f32; vocab * hidden],
+            final_norm: vec![0.0f32; hidden],
+            lm_head_packed: zero_packed(vocab, hidden),
+            lm_head_rows: vocab,
+            lm_head_cols: hidden,
+            layers: vec![],
+        };
+        let rope = RopeTable::new(16, 64, 10_000.0);
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        vocab_map.insert("z".to_string(), cfg.vocab_size as u32);
+        let mismatched_tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, vec![])
+            .expect("tokenizer with an OOV vocab entry still constructs");
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+
+        let err = generate_q8_neon(&model, &cfg, &mismatched_tokenizer, &rope, "z", &gen_cfg)
+            .expect_err("an out-of-vocabulary prompt token id must be rejected, not panic");
+        assert!(
+            matches!(err, crate::error::InferenceError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
         );
     }
 

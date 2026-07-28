@@ -17,7 +17,7 @@
 //!     ↓
 //! loop {
 //!     forward_pass(input) → logits
-//!     engine.mask_logits(&mut state, logits) — apply grammar constraint
+//!     engine.mask_logits(&mut state, logits)? — apply grammar constraint
 //!     token = sampler.sample(logits)
 //!     engine.advance(&mut state, token_id)  — update grammar state
 //! }
@@ -178,6 +178,12 @@ impl fmt::Display for GrammarError {
     }
 }
 impl std::error::Error for GrammarError {}
+
+impl From<GrammarError> for crate::error::InferenceError {
+    fn from(error: GrammarError) -> Self {
+        Self::InvalidInput(error.0)
+    }
+}
 
 impl From<crate::grammar::json_schema::SchemaError> for GrammarError {
     fn from(e: crate::grammar::json_schema::SchemaError) -> Self {
@@ -376,19 +382,23 @@ impl GrammarEngine {
     /// been created by `initial_state()` and advanced via `advance()` after
     /// each sampled token.
     ///
+    /// # Errors
+    ///
+    /// Returns [`GrammarError`] when `logits` is shorter than the engine's
+    /// vocabulary.
+    ///
     /// # Performance
     ///
     /// The hot path is a bitmask scan over `vocab_size / 64` words (~3,880
     /// iterations for Qwen3's 248,320 tokens), taking under 40 µs on modern
     /// Apple Silicon.  Context-dependent tokens add O(k × stack_depth)
     /// overhead (k ≈ 1% of vocab).
-    pub fn mask_logits(&self, state: &mut GrammarState, logits: &mut [f32]) {
-        assert!(
-            logits.len() >= self.vocab_size,
-            "logits length {} < vocab_size {}",
-            logits.len(),
-            self.vocab_size
-        );
+    pub fn mask_logits(
+        &self,
+        state: &mut GrammarState,
+        logits: &mut [f32],
+    ) -> Result<(), GrammarError> {
+        self.validate_logits_len(logits)?;
 
         let profiling = mask_profiling_enabled();
         let find_t0 = profiling.then(std::time::Instant::now);
@@ -472,6 +482,18 @@ impl GrammarEngine {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_logits_len(&self, logits: &[f32]) -> Result<(), GrammarError> {
+        if logits.len() < self.vocab_size {
+            return Err(GrammarError(format!(
+                "logits length {} is shorter than vocabulary size {}",
+                logits.len(),
+                self.vocab_size
+            )));
+        }
+        Ok(())
     }
 
     /// Compute the grammar mask for `state` directly by simulating every token.
@@ -483,7 +505,17 @@ impl GrammarEngine {
     /// `MAX_GRAMMAR_STATES`). It defines the mask contract `mask_by_trie`
     /// must reproduce exactly and stays public as the oracle for the
     /// differential tests below and as a slow-path manual escape hatch.
-    pub fn mask_by_simulation(&self, state: &GrammarState, logits: &mut [f32]) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GrammarError`] when `logits` is shorter than the engine's
+    /// vocabulary.
+    pub fn mask_by_simulation(
+        &self,
+        state: &GrammarState,
+        logits: &mut [f32],
+    ) -> Result<(), GrammarError> {
+        self.validate_logits_len(logits)?;
         for token_id in 0..self.vocab_size {
             if logits[token_id] == f32::NEG_INFINITY {
                 continue;
@@ -498,6 +530,7 @@ impl GrammarEngine {
                 logits[token_id] = f32::NEG_INFINITY;
             }
         }
+        Ok(())
     }
 
     /// Compute the grammar mask for `state` via the byte trie.
@@ -778,7 +811,9 @@ mod tests {
 
         let mut state = engine.initial_state();
         let mut logits = vec![1.0f32, 2.0f32, 3.0f32];
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
 
         // "other" should be blocked.
         assert_eq!(
@@ -858,17 +893,23 @@ mod tests {
     }
 
     #[test]
-    fn mask_logits_logits_shorter_panics() {
+    fn mask_logits_logits_shorter_returns_error() {
         let vocab = vec![b"a".to_vec(), b"b".to_vec()];
         let spec = GrammarSpec::JsonSchema(serde_json::json!({"type": "null"}));
         let engine = GrammarEngine::new(&spec, vocab).unwrap();
         let mut state = engine.initial_state();
-        // Panic if logits slice is shorter than vocab_size.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut logits = vec![0.0f32]; // shorter than vocab_size=2
-            engine.mask_logits(&mut state, &mut logits);
-        }));
-        assert!(result.is_err(), "should panic when logits too short");
+        let mut logits = vec![0.0f32];
+        let error = engine
+            .mask_logits(&mut state, &mut logits)
+            .expect_err("logits shorter than vocab_size must return an error");
+        assert!(error.0.contains("logits length 1"));
+        assert!(error.0.contains("vocabulary size 2"));
+
+        let simulation_error = engine
+            .mask_by_simulation(&state, &mut logits)
+            .expect_err("the public simulation path must reject the same mismatch");
+        assert!(simulation_error.0.contains("logits length 1"));
+        assert!(simulation_error.0.contains("vocabulary size 2"));
     }
 
     #[test]
@@ -931,7 +972,9 @@ mod tests {
         );
 
         let mut logits = vec![1.0f32, 1.0f32];
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
 
         assert!(
             logits[1] > f32::NEG_INFINITY,
@@ -958,7 +1001,9 @@ mod tests {
 
         let mut state = engine.initial_state();
         let mut logits = vec![1.0f32; 130];
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
 
         // At least tokens 0 and 1 should be allowed.
         assert!(
@@ -1170,7 +1215,9 @@ mod tests {
         for (i, state) in corpus.iter().enumerate() {
             let mut oracle_logits = vec![0.0f32; vocab.len()];
             let mut trie_logits = vec![0.0f32; vocab.len()];
-            engine.mask_by_simulation(state, &mut oracle_logits);
+            engine
+                .mask_by_simulation(state, &mut oracle_logits)
+                .expect("matching vocab length");
             engine.mask_by_trie(state, &mut trie_logits);
             if engine.find_state_id(state).is_none() {
                 over_cap_states += 1;
@@ -1211,7 +1258,9 @@ mod tests {
         for state in &corpus {
             let mut oracle_logits = vec![0.0f32; vocab.len()];
             let mut trie_logits = vec![0.0f32; vocab.len()];
-            engine.mask_by_simulation(state, &mut oracle_logits);
+            engine
+                .mask_by_simulation(state, &mut oracle_logits)
+                .expect("matching vocab length");
             engine.mask_by_trie(state, &mut trie_logits);
             for tok in 0..vocab.len() {
                 let oracle_blocked = oracle_logits[tok] == f32::NEG_INFINITY;
@@ -1254,8 +1303,12 @@ mod tests {
         let mut via_mask_logits = vec![0.0f32; vocab.len()];
         let mut oracle_logits = vec![0.0f32; vocab.len()];
         let mut state_for_public_call = deep_state.clone();
-        engine.mask_logits(&mut state_for_public_call, &mut via_mask_logits);
-        engine.mask_by_simulation(deep_state, &mut oracle_logits);
+        engine
+            .mask_logits(&mut state_for_public_call, &mut via_mask_logits)
+            .expect("matching vocab length");
+        engine
+            .mask_by_simulation(deep_state, &mut oracle_logits)
+            .expect("matching vocab length");
 
         assert_eq!(
             via_mask_logits, oracle_logits,
@@ -1327,7 +1380,9 @@ mod tests {
         for (i, state) in corpus.iter().enumerate() {
             let mut oracle_logits = vec![0.0f32; vocab.len()];
             let mut trie_logits = vec![0.0f32; vocab.len()];
-            engine.mask_by_simulation(state, &mut oracle_logits);
+            engine
+                .mask_by_simulation(state, &mut oracle_logits)
+                .expect("matching vocab length");
             engine.mask_by_trie(state, &mut trie_logits);
             if engine.find_state_id(state).is_none() {
                 over_cap_states += 1;
