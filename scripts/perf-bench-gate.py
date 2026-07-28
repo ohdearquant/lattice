@@ -11,7 +11,8 @@ For every Criterion bench under target/criterion/, read change/estimates.json
 
 Usage:
   perf-bench-gate.py <criterion_root> <arch_label> [--out report.md]
-  perf-bench-gate.py <criterion_root> <arch_label> --informational-groups-file <path>
+  perf-bench-gate.py <criterion_root> <arch_label> --target <crate>:<bench-target>
+                     [--informational-target <crate>:<bench-target>]
 
 Exit codes:
   0 — pass (no gated FAILs)
@@ -24,17 +25,16 @@ Exit codes:
       no gating comparison among the parsed results. An automated lane must
       not read "nothing was measured" as "nothing regressed".
 
---informational-groups-file (lattice#714): quick-mode Criterion runs on
+--informational-target (lattice#714): quick-mode Criterion runs on
 sub-microsecond micro-benches (lattice-embed's `simd` bench target) are
 dominated by scheduler/thermal jitter rather than code changes — confirmed
 by two same-toolchain quick-mode A/A runs on identical refs flipping FAIL/
-WARN sign across dozens of entries (lattice#714). Groups listed in this file
-(one Criterion top-level group name per line, e.g. from `cargo bench ... --
---list`) are still measured and reported, but excluded from the FAIL/WARN
-gate and the exit code — they render in a separate "informational" section
-labeled below quick-mode resolution. This file should only be passed for
-quick-mode runs; full-mode (tight-CI) runs gate every group normally so a
-real embed SIMD regression is still caught.
+WARN sign across dozens of entries (lattice#714). bench-compare isolates each
+bench target in its own Criterion output root, passes that root's exact target
+key through --target, and marks the key informational only when the reviewed
+manifest says so. Every result in that root is still measured and reported,
+but excluded from the FAIL/WARN gate and exit code. Full mode omits
+--informational-target, so every result gates normally.
 """
 
 from __future__ import annotations
@@ -81,13 +81,8 @@ class BenchResult:
     def ci_low_pct(self) -> float: return self.ci_low * 100.0
     @property
     def ci_high_pct(self) -> float: return self.ci_high * 100.0
-    @property
-    def group(self) -> str:
-        """Top-level Criterion group name (name is 'group/function/param' or 'group/param')."""
-        return self.name.split("/", 1)[0]
-
-    def is_informational(self, informational_groups: frozenset[str]) -> bool:
-        return self.group in informational_groups
+    def is_informational(self, target: str | None, informational_target: str | None) -> bool:
+        return target is not None and target == informational_target
 
     def verdict(self) -> str:
         if self.ci_low_pct > FAIL_PCT:
@@ -97,26 +92,6 @@ class BenchResult:
         if self.point_pct < CELEBRATE_PCT and self.ci_high_pct < 0:
             return "WIN"
         return "PASS"
-
-
-def load_informational_groups(path: Path | None) -> frozenset[str]:
-    """Load top-level group names to exclude from gating (lattice#714).
-
-    One group name per line; blank lines and '#'-prefixed comments ignored.
-    """
-    if path is None:
-        return frozenset()
-    if not path.exists():
-        print(f"warn: --informational-groups-file {path} does not exist — gating "
-              f"every group normally", file=sys.stderr)
-        return frozenset()
-    groups = set()
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        groups.add(line)
-    return frozenset(groups)
 
 
 def find_change_files(root: Path) -> list[Path]:
@@ -200,10 +175,16 @@ def parse_bench(change_file: Path, root: Path, baseline_name: str) -> BenchResul
                        new_ns=new_ns, old_ns=old_ns)
 
 
-def render_report(results: list[BenchResult], arch: str,
-                   informational_groups: frozenset[str] = frozenset()) -> str:
-    gated = [r for r in results if not r.is_informational(informational_groups)]
-    info = [r for r in results if r.is_informational(informational_groups)]
+def render_report(results: list[BenchResult], arch: str, target: str | None = None,
+                  informational_target: str | None = None) -> str:
+    gated = [
+        r for r in results
+        if not r.is_informational(target, informational_target)
+    ]
+    info = [
+        r for r in results
+        if r.is_informational(target, informational_target)
+    ]
 
     fails = [r for r in gated if r.verdict() == "FAIL"]
     warns = [r for r in gated if r.verdict() == "WARN"]
@@ -271,10 +252,10 @@ def render_report(results: list[BenchResult], arch: str,
         f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
         f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
     )
-    if informational_groups:
+    if informational_target is not None:
         lines.append(
-            f"_{len(informational_groups)} group(s) excluded from gating as quick-mode "
-            f"informational-only (lattice#714): {', '.join(sorted(informational_groups))}._\n"
+            f"_Target `{informational_target}` classified informational-only in quick mode "
+            f"(lattice#714); its {len(info)} measurement(s) are excluded from the verdict._\n"
         )
     else:
         lines.append("")
@@ -313,6 +294,7 @@ def run_selftest() -> int:
     """
     import contextlib
     import io
+    import os
     import subprocess
     import tempfile
 
@@ -388,59 +370,56 @@ def run_selftest() -> int:
         if "bench_multi" not in stderr_text or "refusing to guess" not in stderr_text:
             failures.append("multi-sibling layout: no loud refusal warning emitted")
 
-        # lattice#714: informational-groups exclusion. Two confirmed FAILs, one in a
-        # group named as informational (quick-mode embed-SIMD noise floor), one not —
-        # the exit-code fail count and the gated report section must only count the
-        # real one; the informational one must still be measured and reported.
+        # lattice#714 / lattice#1090: classification follows the target-qualified
+        # Criterion root, never a slash-derived group prefix. Criterion 0.5 permits
+        # `/` in group names and also uses `/` between group/function/parameter, so
+        # splitting the rendered ID cannot recover the group boundary.
         noisy_dir = root / "grp_f" / "noisy_fail"
         _fabricate_bench(noisy_dir, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
         real_dir = root / "grp_g" / "real_fail"
         _fabricate_bench(real_dir, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+        slash_dir = root / "slash" / "is" / "legal" / "noisy_fail"
+        _fabricate_bench(slash_dir, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
 
         for cf in find_change_files(root):
             r = parse_bench(cf, root, baseline_name="compare-base")
             if r is not None:
                 results[r.name] = r
 
-        informational = frozenset({"grp_f"})
-        all_results = list(results.values())
-        gated_fails = [
-            r for r in all_results
-            if r.verdict() == "FAIL" and not r.is_informational(informational)
-        ]
-        if "grp_f/noisy_fail" not in results or "grp_g/real_fail" not in results:
-            failures.append("informational-groups fixture: benches not parsed")
-        elif not results["grp_f/noisy_fail"].is_informational(informational):
-            failures.append("informational-groups: grp_f/noisy_fail not classified informational")
-        elif results["grp_g/real_fail"].is_informational(informational):
-            failures.append("informational-groups: grp_g/real_fail wrongly classified informational")
-        elif any(r.name == "grp_f/noisy_fail" for r in gated_fails):
-            failures.append("informational-groups: noisy FAIL leaked into gated fail count")
-        elif not any(r.name == "grp_g/real_fail" for r in gated_fails):
-            failures.append("informational-groups: real FAIL missing from gated fail count")
+        embed_target = "lattice-embed:simd"
+        inference_target = "lattice-inference:elementwise_cpu_bench"
+        needed = {"grp_f/noisy_fail", "grp_g/real_fail", "slash/is/legal/noisy_fail"}
+        if not needed.issubset(results):
+            failures.append("target-qualified fixture: benches not parsed")
+        else:
+            noisy = results["grp_f/noisy_fail"]
+            real = results["grp_g/real_fail"]
+            slash = results["slash/is/legal/noisy_fail"]
+            if not noisy.is_informational(embed_target, embed_target):
+                failures.append("target-qualified: demoted target did not classify informational")
+            if real.is_informational(inference_target, embed_target):
+                failures.append("target-qualified: gated target crossed into demotion")
+            if not slash.is_informational(embed_target, embed_target):
+                failures.append("target-qualified: slash-containing group was misclassified")
 
-        report = render_report(all_results, "selftest-arch", informational)
-        if "grp_g/real_fail" not in report:
-            failures.append("informational-groups: real FAIL missing from rendered report")
-        if "ℹ️" not in report or "grp_f/noisy_fail" not in report:
-            failures.append("informational-groups: noisy FAIL not shown in informational section")
-        if "bench-allow-regression" in report:
-            failures.append("rendered report advertises an unsupported label override")
+            embed_report = render_report(
+                [noisy, slash], "selftest-embed", embed_target, embed_target)
+            inference_report = render_report(
+                [real], "selftest-inference", inference_target, embed_target)
+            if "ℹ️" not in embed_report or "slash/is/legal/noisy_fail" not in embed_report:
+                failures.append("target-qualified: informational report lost slash-group bench")
+            if "❌" not in inference_report or "grp_g/real_fail" not in inference_report:
+                failures.append("target-qualified: gated FAIL missing from inference report")
+            if "bench-allow-regression" in embed_report + inference_report:
+                failures.append("rendered report advertises an unsupported label override")
 
-        # lattice#714 / lattice#1060: the shell-side manifest handoff,
-        # exercised end-to-end against the real helper and the real
-        # manifest (scripts/lib/bench-quick-informational-targets.txt) —
-        # the same files bench-compare.sh uses in production. Three
-        # probes: (1) --print-targets must equal the reviewed expectation
-        # set below, so a manifest-only or expectation-only edit fails
-        # the selftest; (2) a demoted target key must emit every group of
-        # a controlled listing (target-level semantics — including groups
-        # the old per-group allowlist never contained); (3) a non-demoted
-        # target key against the same listing must emit nothing — the
-        # cross-target guarantee that keeps inference gating intact.
-        # Probe 2's output then drives the Python classifier to prove
-        # embed FAILs land informational while an inference FAIL gates.
-        helper = Path(__file__).resolve().parent / "lib" / "bench-informational-groups.sh"
+        # The shell owns manifest membership. Python receives only the exact
+        # target identity selected by that shell path, so there is no second
+        # parser whose group-name semantics can drift. The controlled manifest
+        # probes cover CRLF, surrounding whitespace, comments, duplicate
+        # entries and C-locale sorting; malformed or whitespace-bearing keys
+        # must refuse rather than demote.
+        helper = Path(__file__).resolve().parent / "lib" / "bench-informational-targets.sh"
         # The reviewed demoted-target set, duplicated here on purpose:
         # the selftest compares this against the manifest itself (via
         # --print-targets), so a target added to only ONE side —
@@ -468,161 +447,71 @@ def run_selftest() -> int:
                     f"expectation-only: {sorted(approved_targets - raw_targets)}. "
                     "Every demotion change must update both sides in one PR."
                 )
-            listing_dir = root / "manifest-listing"
-            listing_dir.mkdir(parents=True, exist_ok=True)
-            listing_file = listing_dir / "list.txt"
-            listing_file.write_text(
-                "simd_dot_product/scalar/384: benchmark\n"
-                "simd_dot_product/simd/384: benchmark\n"
-                "simd_cosine_similarity/scalar/384: benchmark\n"
-                "simd_normalize/scalar/384: benchmark\n"
-                "simd_dot_product_extra/scalar/384: benchmark\n"
-                "int8_raw_dot_product/dot_product_i8_raw/128: benchmark\n"
-            )
-            expected_groups = frozenset({
-                "simd_dot_product", "simd_cosine_similarity", "simd_normalize",
-                "simd_dot_product_extra", "int8_raw_dot_product",
-            })
             demoted_proc = subprocess.run(
-                ["bash", str(helper), "lattice-embed:simd", str(listing_file)],
+                ["bash", str(helper), "--is-informational", embed_target],
                 capture_output=True, text=True, timeout=30,
-            )
-            shell_emitted = frozenset(
-                ln.strip() for ln in demoted_proc.stdout.splitlines() if ln.strip()
             )
             gated_proc = subprocess.run(
-                ["bash", str(helper), "lattice-inference:elementwise_cpu_bench",
-                 str(listing_file)],
+                ["bash", str(helper), "--is-informational", inference_target],
                 capture_output=True, text=True, timeout=30,
             )
-            gated_emitted = [ln for ln in gated_proc.stdout.splitlines() if ln.strip()]
             if demoted_proc.returncode != 0:
                 failures.append(
                     f"manifest-handoff: demoted-target probe exited "
                     f"{demoted_proc.returncode}: {demoted_proc.stderr}"
                 )
-            elif shell_emitted != expected_groups:
+            elif gated_proc.returncode != 1:
                 failures.append(
-                    "manifest-handoff: demoted target emitted "
-                    f"{sorted(shell_emitted)}, expected every listing group "
-                    f"{sorted(expected_groups)}"
+                    "manifest-handoff: non-demoted target did not return the "
+                    f"expected predicate miss (1): {gated_proc.returncode}"
                 )
-            elif gated_proc.returncode != 0:
-                failures.append(
-                    f"manifest-handoff: non-demoted-target probe exited "
-                    f"{gated_proc.returncode}: {gated_proc.stderr}"
-                )
-            elif gated_emitted:
-                failures.append(
-                    "manifest-handoff: non-demoted target emitted "
-                    f"{gated_emitted} — cross-target exemption leak"
-                )
-            else:
-                manifest_dir = root / "manifest"
-                emb_a = manifest_dir / "simd_dot_product" / "384"
-                _fabricate_bench(emb_a, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-                emb_b = manifest_dir / "simd_normalize" / "384"
-                _fabricate_bench(emb_b, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-                inf_c = manifest_dir / "rms_norm" / "4096"
-                _fabricate_bench(inf_c, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
 
-                manifest_results: dict[str, BenchResult] = {}
-                for cf in find_change_files(manifest_dir):
-                    r = parse_bench(cf, manifest_dir, baseline_name="compare-base")
-                    if r is not None:
-                        manifest_results[r.name] = r
-
-                needed = {"simd_dot_product/384", "simd_normalize/384", "rms_norm/4096"}
-                if not needed.issubset(manifest_results):
-                    failures.append("manifest-handoff fixture: not all benches parsed")
-                else:
-                    manifest_gated_fails = {
-                        r.name for r in manifest_results.values()
-                        if r.verdict() == "FAIL" and not r.is_informational(shell_emitted)
-                    }
-                    if "simd_dot_product/384" in manifest_gated_fails:
-                        failures.append(
-                            "manifest-handoff: demoted simd_dot_product "
-                            "leaked into gated fails"
-                        )
-                    if "simd_normalize/384" in manifest_gated_fails:
-                        failures.append(
-                            "manifest-handoff: simd_normalize gated despite "
-                            "target-level demotion (listing-derivation broken)"
-                        )
-                    if "rms_norm/4096" not in manifest_gated_fails:
-                        failures.append(
-                            "manifest-handoff: inference group rms_norm did not gate"
-                        )
-
-        # Composed-path collision guard. The two probes above show the
-        # helper is target-aware in isolation, but bench-compare.sh used to
-        # concatenate every target's helper output into one flat file with
-        # no target attribution — a group name demoted for one target
-        # silently exempted an identically-named group produced by a
-        # different, gated target. This drives the resolver
-        # (scripts/lib/resolve-informational-groups.sh) with a fabricated
-        # listing where the demoted target's groups include `rms_norm`,
-        # which also appears in the gated target's listing, and asserts
-        # the collision gates instead of staying informational.
-        resolver = Path(__file__).resolve().parent / "lib" / "resolve-informational-groups.sh"
-        if not resolver.exists():
-            failures.append(f"collision-guard: resolver missing at {resolver}")
-        else:
-            collision_dir = root / "collision-listing"
-            collision_dir.mkdir(parents=True, exist_ok=True)
-            embed_listing = collision_dir / "embed-list.txt"
-            embed_listing.write_text(
-                "simd_dot_product/scalar/384: benchmark\n"
-                "simd_normalize/scalar/384: benchmark\n"
-                "rms_norm/scalar/384: benchmark\n"  # fabricated bare-name collision
+            policy_dir = root / "manifest-policy"
+            policy_dir.mkdir(parents=True, exist_ok=True)
+            normalized_manifest = policy_dir / "normalized.txt"
+            normalized_manifest.write_bytes(
+                b"  z-target  # comment\r\n"
+                b"\r\n"
+                b"a-target \r\n"
+                b"z-target\r\n"
             )
-            inference_listing = collision_dir / "inference-list.txt"
-            inference_listing.write_text(
-                "rms_norm/4096: benchmark\n"
-                "gelu/4096: benchmark\n"
+            policy_env = {
+                **os.environ,
+                "INFO_TARGETS_MANIFEST": str(normalized_manifest),
+            }
+            normalized = subprocess.run(
+                ["bash", str(helper), "--print-targets"],
+                capture_output=True, text=True, timeout=30, env=policy_env,
             )
-
-            def list_groups(listing_path: Path) -> str:
-                proc = subprocess.run(
-                    ["bash", str(helper), "--list-groups", str(listing_path)],
-                    capture_output=True, text=True, timeout=30,
+            if normalized.returncode != 0 or normalized.stdout != "a-target\nz-target\n":
+                failures.append(
+                    "manifest-normalization: CRLF/whitespace/dedup/C-sort drifted: "
+                    f"rc={normalized.returncode}, stdout={normalized.stdout!r}, "
+                    f"stderr={normalized.stderr!r}"
                 )
-                return proc.stdout
 
-            demoted_groups_file = collision_dir / "demoted.txt"
-            demoted_groups_file.write_text(list_groups(embed_listing))
-            gated_groups_file = collision_dir / "gated.txt"
-            gated_groups_file.write_text(list_groups(inference_listing))
-
-            resolve_proc = subprocess.run(
-                ["bash", str(resolver),
-                 str(demoted_groups_file), "lattice-embed:simd",
-                 str(gated_groups_file), "lattice-inference:elementwise_cpu_bench"],
+            malformed_manifest = policy_dir / "malformed.txt"
+            malformed_manifest.write_text("one-target two-targets\n")
+            malformed_env = {
+                **os.environ,
+                "INFO_TARGETS_MANIFEST": str(malformed_manifest),
+            }
+            malformed = subprocess.run(
+                ["bash", str(helper), "--print-targets"],
+                capture_output=True, text=True, timeout=30, env=malformed_env,
+            )
+            if malformed.returncode != 2:
+                failures.append(
+                    "manifest-normalization: malformed policy did not fail closed "
+                    f"(rc={malformed.returncode})"
+                )
+            bad_key = subprocess.run(
+                ["bash", str(helper), "--is-informational", "bad target"],
                 capture_output=True, text=True, timeout=30,
             )
-            resolved = frozenset(
-                ln.strip() for ln in resolve_proc.stdout.splitlines() if ln.strip()
-            )
-            if resolve_proc.returncode != 0:
+            if bad_key.returncode != 2:
                 failures.append(
-                    f"collision-guard: resolver exited {resolve_proc.returncode}: "
-                    f"{resolve_proc.stderr}"
-                )
-            if "rms_norm" in resolved:
-                failures.append(
-                    "collision-guard: rms_norm (demoted+gated collision) leaked "
-                    "into the informational set instead of gating"
-                )
-            if "rms_norm" not in resolve_proc.stderr or "lattice-embed:simd" not in resolve_proc.stderr:
-                failures.append(
-                    "collision-guard: no stderr warning naming the colliding "
-                    "group and both targets"
-                )
-            if not {"simd_dot_product", "simd_normalize"}.issubset(resolved):
-                failures.append(
-                    "collision-guard: non-colliding demoted groups lost "
-                    "informational status — resolver over-suppressed"
+                    "manifest-normalization: whitespace-bearing target key did not refuse"
                 )
 
     # --require-measurements: the lane must not read "nothing measured" as
@@ -657,15 +546,22 @@ def run_selftest() -> int:
             failures.append("require-measurements: a parsed gating comparison "
                             "was rejected — the flag over-fails")
 
-        # All-informational is measured-but-unjudgeable: nothing could FAIL.
-        info_file = Path(td) / "informational.txt"
-        info_file.write_text("grp_info\n")
+        # A target can be intentionally all-informational only when the exact
+        # target key accompanies both the root and the demotion. This remains a
+        # measured target and is valid in an enforcing multi-target run; another
+        # target supplies the gating comparisons. A mismatched key must refuse.
         info_root = Path(td) / "info" / "criterion"
         _fabricate_bench(info_root / "grp_info" / "bench_info", "compare-base")
         if _run(info_root, "--require-measurements",
-                "--informational-groups-file", str(info_file)).returncode != 2:
-            failures.append("require-measurements: an all-informational run was "
-                            "certified — no gating comparison was judged")
+                "--target", "lattice-embed:simd",
+                "--informational-target", "lattice-embed:simd").returncode != 0:
+            failures.append("require-measurements: an explicitly qualified "
+                            "informational target was rejected")
+        if _run(info_root, "--require-measurements",
+                "--target", "lattice-inference:elementwise_cpu_bench",
+                "--informational-target", "lattice-embed:simd").returncode != 2:
+            failures.append("target-qualified: mismatched informational target "
+                            "did not fail closed")
 
         # PARTIAL is the shape the first fix missed: asking whether ANY judgeable
         # comparison exists passes a run where one target compared cleanly and the
@@ -702,8 +598,10 @@ def run_selftest() -> int:
         print(f"SELFTEST: FAIL ({len(failures)} failure(s))")
         return 1
     print("SELFTEST: PASS — base/, compare-base/, orphan-warn, named-wins-over-stale-base, "
-          "multi-sibling-refusal, manifest-handoff (demoted target informational, "
-          "non-demoted target gated), and composed-path collision-guard, and require-measurements (empty root, gating pass, all-informational refusal, partial-run refusal) all correct")
+          "multi-sibling-refusal, target-qualified manifest handoff (CRLF/whitespace/C-sort, "
+          "slash-bearing group, demoted target informational, non-demoted target gated), "
+          "and require-measurements (empty root, gating pass, explicit informational target, "
+          "mismatch refusal, partial-run refusal) all correct")
     return 0
 
 
@@ -717,12 +615,14 @@ def main() -> int:
     ap.add_argument("--baseline-name", default="compare-base",
                     help="Named-baseline dir to look for when base/ is absent "
                          "(default: compare-base, matching bench-compare.sh)")
-    ap.add_argument("--informational-groups-file", type=Path, default=None,
-                    help="Path to a file listing Criterion top-level group names (one per "
-                         "line) to measure+report but exclude from gating/exit-code — quick-"
-                         "mode noise-floor groups (lattice#714). Omit for full-mode runs.")
+    ap.add_argument("--target",
+                    help="Exact <crate>:<bench-target> identity for this isolated Criterion "
+                         "root. bench-compare passes this for every target.")
+    ap.add_argument("--informational-target",
+                    help="Classify this exact target as informational-only. Must equal --target; "
+                         "omit for gating/full-mode runs.")
     ap.add_argument("--require-measurements", action="store_true",
-                    help="Fail (exit 2) instead of passing when the run produced no gating "
+                    help="Fail (exit 2) instead of passing when the run produced no usable "
                          "comparison to judge. Without this, an absent baseline exits 0, which "
                          "is right for a first run but wrong for an automated lane: it cannot "
                          "tell 'nothing regressed' from 'nothing was measured'.")
@@ -735,6 +635,16 @@ def main() -> int:
 
     if args.criterion_root is None or args.arch is None:
         ap.error("criterion_root and arch are required unless --selftest is passed")
+
+    if args.informational_target is not None:
+        if args.target is None:
+            print("error: --informational-target requires --target", file=sys.stderr)
+            return 2
+        if args.informational_target != args.target:
+            print(f"error: informational target '{args.informational_target}' does not match "
+                  f"this Criterion root's target '{args.target}' — refusing to demote",
+                  file=sys.stderr)
+            return 2
 
     if not args.criterion_root.exists():
         print(f"error: {args.criterion_root} does not exist", file=sys.stderr)
@@ -773,13 +683,16 @@ def main() -> int:
         print("error: change files found but all failed to parse", file=sys.stderr)
         return 2
 
-    informational_groups = load_informational_groups(args.informational_groups_file)
-    report = render_report(results, args.arch, informational_groups)
+    report = render_report(
+        results, args.arch, args.target, args.informational_target)
     print(report)
     if args.out:
         args.out.write_text(report)
 
-    gating = [r for r in results if not r.is_informational(informational_groups)]
+    gating = [
+        r for r in results
+        if not r.is_informational(args.target, args.informational_target)
+    ]
 
     # Completeness, not existence. The first version of this guard asked whether
     # ANY judgeable comparison existed, which passes a run where one target built
@@ -795,14 +708,6 @@ def main() -> int:
               f"{len(change_files)} comparison(s) could not be judged "
               f"(unresolvable baseline or malformed data): {listed}{more}. A partial "
               f"A/B is not evidence that nothing regressed.", file=sys.stderr)
-        return 2
-
-    # Parsed results are not automatically judgeable results. If every parsed
-    # result is informational, nothing in this run could have produced a FAIL,
-    # so a zero exit says only that no gating comparison existed.
-    if args.require_measurements and not gating:
-        print(f"error: --require-measurements set but all {len(results)} parsed result(s) are "
-              f"informational: no gating comparison was judged.", file=sys.stderr)
         return 2
 
     fails = sum(1 for r in gating if r.verdict() == "FAIL")

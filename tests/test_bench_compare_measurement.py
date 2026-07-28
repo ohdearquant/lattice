@@ -24,20 +24,29 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
+GATE = REPO / "scripts" / "perf-bench-gate.py"
 LIB = REPO / "scripts" / "lib"
 
 # Exits 0 for every subcommand and prints nothing a measurement filter matches.
 STUB_CARGO = """#!/usr/bin/env bash
+if [ "${STUB_EMIT_CRITERION_HOME:-0}" = "1" ]; then
+  case " $* " in
+    *" --save-baseline "*|*" --baseline "*)
+      echo "time: criterion-home=${CRITERION_HOME:-<unset>}"
+      ;;
+  esac
+fi
 exit 0
 """
 
 
-def _run(extra_args):
+def _run(extra_args, *, emit_criterion_home=False):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "repo"
         (root / "scripts").mkdir(parents=True)
         shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
+        shutil.copy2(GATE, root / "scripts" / GATE.name)
         shutil.copytree(LIB, root / "scripts" / "lib")
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
@@ -85,6 +94,7 @@ def _run(extra_args):
             **os.environ,
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
+            "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
         return subprocess.run(
             ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, "HEAD~1", "HEAD"],
@@ -119,6 +129,29 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"reporter mode must not exit 2\nstdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}")
         self.assertNotIn("produced no measurements", result.stderr)
+
+    def test_each_bench_target_gets_a_distinct_criterion_root(self):
+        """Target identity must be structural, not reconstructed from group names.
+
+        Mutation-sensitive: point EMBED_CRITERION_ROOT at the inference root (or
+        drop either CRITERION_HOME assignment) and the observed path set has one
+        member or includes `<unset>`, reproducing the shared namespace behind
+        #1090. The stub emits only its inherited CRITERION_HOME; no benchmark
+        implementation is duplicated here.
+        """
+        result = _run([], emit_criterion_home=True)
+        self.assertEqual(
+            result.returncode, 0,
+            f"reporter-mode probe failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        roots = set(re.findall(r"criterion-home=(\S+)", result.stdout))
+        self.assertEqual(
+            len(roots), 2,
+            f"expected one isolated Criterion root per target, saw {roots}\n"
+            f"stdout:\n{result.stdout}")
+        self.assertNotIn("<unset>", roots)
+        self.assertTrue(any(path.endswith("/inference") for path in roots), roots)
+        self.assertTrue(any(path.endswith("/embed") for path in roots), roots)
 
 
 if __name__ == "__main__":
