@@ -14,6 +14,7 @@ PACKAGE_SCRIPT = REPO_ROOT / "apps/macos/scripts/package-app.sh"
 UPLOAD_SCRIPT = REPO_ROOT / "apps/macos/scripts/upload-release-assets.sh"
 RELEASE_WORKFLOW = REPO_ROOT / ".github/workflows/release-binaries.yml"
 APP_BINARIES_WORKFLOW = REPO_ROOT / ".github/workflows/app-binaries.yml"
+MACOS_SOURCES = REPO_ROOT / "apps/macos/Sources"
 
 
 def workspace_version() -> str:
@@ -75,6 +76,32 @@ class PackageScriptContractTest(unittest.TestCase):
     def test_shell_scripts_parse(self):
         for script in (PACKAGE_SCRIPT, UPLOAD_SCRIPT):
             subprocess.run(["bash", "-n", str(script)], cwd=REPO_ROOT, check=True)
+
+    def test_preview_macros_are_release_and_toolchain_gated(self):
+        required_guard = "#if DEBUG && canImport(PreviewsMacros)"
+        preview_count = 0
+        for source in sorted(MACOS_SOURCES.rglob("*.swift")):
+            conditional_stack: list[str] = []
+            for line_number, line in enumerate(
+                source.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                directive = line.strip()
+                if directive.startswith("#if "):
+                    conditional_stack.append(directive)
+                elif directive.startswith(("#elseif ", "#else")):
+                    if conditional_stack:
+                        conditional_stack[-1] = directive
+                elif directive == "#endif":
+                    if conditional_stack:
+                        conditional_stack.pop()
+                elif directive.startswith("#Preview"):
+                    preview_count += 1
+                    self.assertIn(
+                        required_guard,
+                        conditional_stack,
+                        f"{source.relative_to(REPO_ROOT)}:{line_number}",
+                    )
+        self.assertGreater(preview_count, 0)
 
 
 class UploadContractTest(unittest.TestCase):
