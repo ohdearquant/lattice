@@ -269,7 +269,7 @@ def render_report(results: list[BenchResult], arch: str,
     lines.append("\n</details>\n")
     lines.append(
         f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
-        f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails. Override via PR label `bench-allow-regression`._"
+        f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
     )
     if informational_groups:
         lines.append(
@@ -424,6 +424,8 @@ def run_selftest() -> int:
             failures.append("informational-groups: real FAIL missing from rendered report")
         if "ℹ️" not in report or "grp_f/noisy_fail" not in report:
             failures.append("informational-groups: noisy FAIL not shown in informational section")
+        if "bench-allow-regression" in report:
+            failures.append("rendered report advertises an unsupported label override")
 
         # lattice#714 / lattice#1060: the shell-side manifest handoff,
         # exercised end-to-end against the real helper and the real
