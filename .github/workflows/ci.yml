@@ -638,7 +638,7 @@ jobs:
         run: python3 tests/test_bench_decode_adapters_agentic.py -v
       # bench-compare's Spotlight-exclusion guard. Same "harness plumbing only"
       # scope as the steps above: it asserts the guard's exit codes and the
-      # bench-compare.sh call site, and runs no benchmark.
+      # benchmark measurement call sites, and runs no benchmark.
       - name: bash scripts/ensure-noindex-marker-selftest.sh
         run: bash scripts/ensure-noindex-marker-selftest.sh
       - name: python3 tests/test_bench_disposition.py
