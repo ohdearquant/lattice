@@ -33118,27 +33118,36 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _gpu_guard = gpu_test_lock();
 
+            const LEGACY_FIXTURE_CONTEXT: usize = 128;
+            const CHAT_FIXTURE_CONTEXT: usize = 192;
+
             let tokenizer = single_char_vocab_tokenizer();
             let (mut cfg, weights) = tiny_hybrid_fixture();
             // Keep EOS unreachable so every turn generates its full budget,
             // guaranteeing the history keeps growing turn over turn (mirrors the
             // raw-prompt sibling test above).
             cfg.eos_token_id = u32::MAX;
+            cfg.max_position_embeddings = CHAT_FIXTURE_CONTEXT;
 
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
-            // max_cache_len=128 = this fixture's max_position_embeddings ceiling;
-            // four short turns of ChatML-formatted history (role words + content)
-            // stay well under it (~70 tokens at the last turn).
-            let mut cached_state =
-                MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
+            let mut cached_state = MetalQwen35State::new(&weights, &cfg, CHAT_FIXTURE_CONTEXT)
+                .expect("tiny hybrid fixture");
 
             let user_turns = ["a", "bc", "d", "ef"];
             let mut history: Vec<ChatMessage> = vec![ChatMessage::system("")];
             let mut saw_exact_append = false;
+            let mut prompt_lengths = Vec::with_capacity(user_turns.len());
 
             for (turn_idx, user_text) in user_turns.iter().enumerate() {
                 history.push(ChatMessage::user(*user_text));
                 let gen_cfg = cross_turn_test_gen_cfg(42, 2);
+                let rendered_prompt = format_chat_template(&history);
+                let prompt_len = tokenizer.tokenize(&rendered_prompt).real_length;
+                prompt_lengths.push(prompt_len);
+                assert!(
+                    prompt_len + gen_cfg.max_new_tokens <= CHAT_FIXTURE_CONTEXT,
+                    "turn {turn_idx}: fixture context must cover the rendered prompt and decode cap"
+                );
 
                 let cached_out = cached_state
                     .chat_completion_streaming_with_prefix_cache(
@@ -33155,7 +33164,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // history — exactly chat_metal's pre-#462 behavior (reset_state +
                 // full re-prefill of the whole ChatML-formatted history every turn).
                 let mut reference_state =
-                    MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
+                    MetalQwen35State::new(&weights, &cfg, CHAT_FIXTURE_CONTEXT)
+                        .expect("tiny hybrid fixture");
                 let reference_gen_cfg = cross_turn_test_gen_cfg(42, 2);
                 let reference_out = reference_state
                     .chat_completion_streaming(
@@ -33196,6 +33206,18 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 history.push(cached_out.output.message.clone());
             }
 
+            assert_eq!(
+                prompt_lengths,
+                [51, 92, 132, 173],
+                "record the four-turn ChatML footprint so template growth cannot silently \
+                 invalidate this cache-parity fixture"
+            );
+            assert!(
+                prompt_lengths
+                    .iter()
+                    .any(|&len| len + 2 > LEGACY_FIXTURE_CONTEXT),
+                "the fixture must exercise history beyond the obsolete 128-token window"
+            );
             assert!(
                 saw_exact_append,
                 "at least one later turn must actually exercise ExactAppend reuse through the \
