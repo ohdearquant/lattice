@@ -12,6 +12,8 @@ For every Criterion bench under target/criterion/, read change/estimates.json
 Usage:
   perf-bench-gate.py <criterion_root> <arch_label> [--out report.md]
   perf-bench-gate.py <criterion_root> <arch_label> --informational-groups-file <path>
+  perf-bench-gate.py <criterion_root> <arch_label> \
+      --ambient-samples samples.jsonl --status-out status.json
 
 Exit codes:
   0 — pass (no gated FAILs)
@@ -23,6 +25,22 @@ Exit codes:
       refusing to certify a run it could not judge: no comparison data, or
       no gating comparison among the parsed results. An automated lane must
       not read "nothing was measured" as "nothing regressed".
+  3 — not measurable: nightly ambient-load samples were missing, malformed,
+      incomplete, or below `BENCH_IDLE_FLOOR`. No performance report is
+      rendered in this state.
+
+`--status-out` activates the nightly contract. It requires a JSONL ambient
+sample stream containing exactly one sample for each voting phase (`before`,
+`between`, and `after`). Each line has this shape:
+
+  {"schema":"perf-ambient-sample/v1","phase":"before","idle_pct":92.5}
+
+Other phase labels may be present but do not vote. The three required phases
+inherit the same `BENCH_IDLE_FLOOR` environment variable as bench-compare
+(70% by default). The status file is written atomically with one of four named
+verdicts: `pass`, `regression`, `error`, or `not_measurable`. A refused run
+contains ambient evidence but no measurement counts, so a trend consumer
+records a visible gap rather than a performance data point.
 
 --informational-groups-file (lattice#714): quick-mode Criterion runs on
 sub-microsecond micro-benches (lattice-embed's `simd` bench target) are
@@ -41,6 +59,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +84,200 @@ from pathlib import Path
 WARN_PCT = 3.0   # CI-lower above this => warning
 FAIL_PCT = 7.0   # CI-lower above this => FAIL
 CELEBRATE_PCT = -3.0  # point estimate below this AND CI-upper<0 => celebrate
+
+EXIT_PASS = 0
+EXIT_REGRESSION = 1
+EXIT_ERROR = 2
+EXIT_NOT_MEASURABLE = 3
+
+AMBIENT_SAMPLE_SCHEMA = "perf-ambient-sample/v1"
+STATUS_SCHEMA = "perf-bench-gate-status/v1"
+REQUIRED_AMBIENT_PHASES = ("before", "between", "after")
+DEFAULT_IDLE_FLOOR = 70.0
+
+
+@dataclass(frozen=True)
+class AmbientAssessment:
+    samples: dict[str, float]
+    floor_pct: float
+    reason: str | None = None
+
+    @property
+    def measurable(self) -> bool:
+        return self.reason is None
+
+    @property
+    def minimum_pct(self) -> float | None:
+        return min(self.samples.values()) if self.samples else None
+
+
+def idle_floor_from_env() -> float:
+    """Return the shared benchmark idle floor, rejecting unusable values."""
+    raw = os.environ.get("BENCH_IDLE_FLOOR", str(DEFAULT_IDLE_FLOOR))
+    try:
+        floor = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"BENCH_IDLE_FLOOR must be numeric, got {raw!r}") from exc
+    if not math.isfinite(floor) or not 0.0 <= floor <= 100.0:
+        raise ValueError(
+            f"BENCH_IDLE_FLOOR must be finite and between 0 and 100, got {raw!r}"
+        )
+    return floor
+
+
+def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssessment:
+    """Validate the three voting ambient samples for an automated run."""
+    if path is None:
+        return AmbientAssessment(
+            {}, floor_pct, "ambient sample input was not provided"
+        )
+
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        return AmbientAssessment(
+            {}, floor_pct, f"ambient sample input could not be read: {exc}"
+        )
+
+    records = [line for line in lines if line.strip()]
+    if not records:
+        return AmbientAssessment({}, floor_pct, "ambient sample input was empty")
+
+    samples: dict[str, float] = {}
+    for line_number, line in enumerate(records, start=1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            return AmbientAssessment(
+                samples,
+                floor_pct,
+                f"ambient sample line {line_number} is malformed JSON: {exc.msg}",
+            )
+        if not isinstance(record, dict):
+            return AmbientAssessment(
+                samples,
+                floor_pct,
+                f"ambient sample line {line_number} must be a JSON object",
+            )
+        if record.get("schema") != AMBIENT_SAMPLE_SCHEMA:
+            return AmbientAssessment(
+                samples,
+                floor_pct,
+                f"ambient sample line {line_number} has an unsupported schema",
+            )
+
+        phase = record.get("phase")
+        if not isinstance(phase, str) or not phase.strip():
+            return AmbientAssessment(
+                samples,
+                floor_pct,
+                f"ambient sample line {line_number} has no valid phase",
+            )
+
+        idle_pct = record.get("idle_pct")
+        if (
+            isinstance(idle_pct, bool)
+            or not isinstance(idle_pct, (int, float))
+            or not math.isfinite(float(idle_pct))
+            or not 0.0 <= float(idle_pct) <= 100.0
+        ):
+            return AmbientAssessment(
+                samples,
+                floor_pct,
+                f"ambient sample line {line_number} has no valid idle_pct",
+            )
+
+        phase = phase.strip()
+        if phase not in REQUIRED_AMBIENT_PHASES:
+            continue
+        if phase in samples:
+            return AmbientAssessment(
+                samples,
+                floor_pct,
+                f"ambient sample phase {phase!r} was recorded more than once",
+            )
+        samples[phase] = float(idle_pct)
+
+    missing = [phase for phase in REQUIRED_AMBIENT_PHASES if phase not in samples]
+    if missing:
+        return AmbientAssessment(
+            samples,
+            floor_pct,
+            "ambient sample input is incomplete; missing " + ", ".join(missing),
+        )
+
+    busy = [
+        f"{phase}={samples[phase]:.1f}%"
+        for phase in REQUIRED_AMBIENT_PHASES
+        if samples[phase] < floor_pct
+    ]
+    if busy:
+        return AmbientAssessment(
+            samples,
+            floor_pct,
+            f"ambient idle was below the {floor_pct:.1f}% floor at "
+            + ", ".join(busy),
+        )
+
+    return AmbientAssessment(samples, floor_pct)
+
+
+def write_gate_status(
+    path: Path,
+    *,
+    arch: str,
+    verdict: str,
+    exit_code: int,
+    reason: str,
+    ambient: AmbientAssessment | None,
+    measurement_count: int | None = None,
+    gated_count: int | None = None,
+    regression_count: int | None = None,
+) -> None:
+    """Atomically publish the machine-readable gate status."""
+    payload: dict[str, object] = {
+        "schema": STATUS_SCHEMA,
+        "verdict": verdict,
+        "exit_code": exit_code,
+        "arch": arch,
+        "reason": reason,
+    }
+    if ambient is not None:
+        payload["ambient"] = {
+            "schema": AMBIENT_SAMPLE_SCHEMA,
+            "floor_pct": ambient.floor_pct,
+            "minimum_idle_pct": ambient.minimum_pct,
+            "samples": {
+                phase: ambient.samples[phase]
+                for phase in REQUIRED_AMBIENT_PHASES
+                if phase in ambient.samples
+            },
+        }
+    if measurement_count is not None:
+        payload["measurement_count"] = measurement_count
+    if gated_count is not None:
+        payload["gated_count"] = gated_count
+    if regression_count is not None:
+        payload["regression_count"] = regression_count
+
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def remove_stale_report(path: Path | None) -> None:
+    """Prevent a refused automated run from exposing an older verdict."""
+    if path is not None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 @dataclass
@@ -634,10 +848,17 @@ def run_selftest() -> int:
         empty_root = Path(td) / "empty" / "criterion"
         empty_root.mkdir(parents=True)
 
-        def _run(root: Path, *extra: str) -> subprocess.CompletedProcess:
+        def _run(
+            root: Path,
+            *extra: str,
+            env: dict[str, str] | None = None,
+        ) -> subprocess.CompletedProcess:
+            run_env = os.environ.copy() if env is None else env
+            if env is None:
+                run_env.pop("BENCH_IDLE_FLOOR", None)
             return subprocess.run(
                 [sys.executable, str(gate), str(root), "selftest-arch", *extra],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=60, env=run_env,
             )
 
         # Without the flag, an absent baseline stays a pass (first-run semantics).
@@ -696,6 +917,293 @@ def run_selftest() -> int:
             failures.append("require-measurements: the mixed root without the flag "
                             "must still exit 0 (reporter behavior changed)")
 
+        # Automated status contract (#1123). A report is a performance verdict,
+        # while not_measurable is a run-status gap. Keep those artifacts
+        # structurally separate so a busy or incomplete sample stream cannot
+        # leave behind a current-looking pass or regression.
+        pass_root = Path(td) / "status-pass" / "criterion"
+        _fabricate_bench(
+            pass_root / "grp_pass" / "bench_pass",
+            "compare-base",
+            point=0.01,
+            ci_low=-0.01,
+            ci_high=0.02,
+        )
+        regression_root = Path(td) / "status-regression" / "criterion"
+        _fabricate_bench(
+            regression_root / "grp_regression" / "bench_regression",
+            "compare-base",
+            point=0.12,
+            ci_low=0.10,
+            ci_high=0.14,
+        )
+
+        def _sample_stream(
+            values: dict[str, float],
+            extra_records: list[dict[str, object]] | None = None,
+        ) -> str:
+            records: list[dict[str, object]] = [
+                {
+                    "schema": AMBIENT_SAMPLE_SCHEMA,
+                    "phase": phase,
+                    "idle_pct": values[phase],
+                }
+                for phase in REQUIRED_AMBIENT_PHASES
+                if phase in values
+            ]
+            records.extend(extra_records or [])
+            return "".join(json.dumps(record) + "\n" for record in records)
+
+        def _status_case(
+            name: str,
+            criterion_root: Path,
+            *,
+            sample_text: str | None,
+            include_ambient_arg: bool = True,
+            stale_report: bool = False,
+            env: dict[str, str] | None = None,
+        ) -> tuple[subprocess.CompletedProcess, dict[str, object], Path]:
+            case_dir = Path(td) / "status-cases" / name
+            case_dir.mkdir(parents=True, exist_ok=True)
+            samples = case_dir / "ambient.jsonl"
+            status = case_dir / "status.json"
+            report_path = case_dir / "report.md"
+            if sample_text is not None:
+                samples.write_text(sample_text)
+            if stale_report:
+                report_path.write_text("stale performance verdict\n")
+            extra = [
+                "--status-out", str(status),
+                "--out", str(report_path),
+            ]
+            if include_ambient_arg:
+                extra.extend(["--ambient-samples", str(samples)])
+            proc = _run(criterion_root, *extra, env=env)
+            try:
+                payload = json.loads(status.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                failures.append(
+                    f"status-contract {name}: no valid machine status was emitted: {exc}"
+                )
+                payload = {}
+            return proc, payload, report_path
+
+        quiet = _sample_stream({
+            "before": 92.0,
+            "between": 91.0,
+            "after": DEFAULT_IDLE_FLOOR,
+        })
+        passed, passed_status, passed_report = _status_case(
+            "pass", pass_root, sample_text=quiet
+        )
+        if passed.returncode != EXIT_PASS:
+            failures.append(
+                f"status-contract pass: exited {passed.returncode}, expected {EXIT_PASS}"
+            )
+        if passed_status.get("verdict") != "pass":
+            failures.append("status-contract pass: named status was not pass")
+        if (
+            passed_status.get("measurement_count") != 1
+            or passed_status.get("gated_count") != 1
+            or passed_status.get("regression_count") != 0
+        ):
+            failures.append("status-contract pass: measurement counts were incomplete")
+        if not passed_report.exists():
+            failures.append("status-contract pass: performance report was not emitted")
+
+        regressed, regressed_status, regressed_report = _status_case(
+            "regression", regression_root, sample_text=quiet
+        )
+        if regressed.returncode != EXIT_REGRESSION:
+            failures.append(
+                "status-contract regression: expected exit "
+                f"{EXIT_REGRESSION}, got {regressed.returncode}"
+            )
+        if regressed_status.get("verdict") != "regression":
+            failures.append("status-contract regression: named status was not regression")
+        if regressed_status.get("regression_count") != 1:
+            failures.append("status-contract regression: regression count was not one")
+        if not regressed_report.exists():
+            failures.append("status-contract regression: performance report was not emitted")
+
+        for busy_phase in REQUIRED_AMBIENT_PHASES:
+            values = {"before": 92.0, "between": 91.0, "after": 90.0}
+            values[busy_phase] = 12.0
+            refused, refused_status, refused_report = _status_case(
+                f"busy-{busy_phase}",
+                pass_root,
+                sample_text=_sample_stream(values),
+                stale_report=True,
+            )
+            if refused.returncode != EXIT_NOT_MEASURABLE:
+                failures.append(
+                    f"status-contract busy {busy_phase}: expected exit "
+                    f"{EXIT_NOT_MEASURABLE}, got {refused.returncode}"
+                )
+            if refused_status.get("verdict") != "not_measurable":
+                failures.append(
+                    f"status-contract busy {busy_phase}: status was not not_measurable"
+                )
+            if any(
+                key in refused_status
+                for key in ("measurement_count", "gated_count", "regression_count")
+            ):
+                failures.append(
+                    f"status-contract busy {busy_phase}: refused status exposed "
+                    "measurement counts"
+                )
+            if refused_report.exists():
+                failures.append(
+                    f"status-contract busy {busy_phase}: stale report survived refusal"
+                )
+            if "### `" in refused.stdout:
+                failures.append(
+                    f"status-contract busy {busy_phase}: rendered a performance verdict"
+                )
+
+        # Refusal outranks the underlying Criterion verdict: busy regression
+        # data must still be a gap, never a red data point.
+        busy_regression, busy_regression_status, busy_regression_report = _status_case(
+            "busy-regression",
+            regression_root,
+            sample_text=_sample_stream({
+                "before": 92.0,
+                "between": 12.0,
+                "after": 90.0,
+            }),
+            stale_report=True,
+        )
+        if (
+            busy_regression.returncode != EXIT_NOT_MEASURABLE
+            or busy_regression_status.get("verdict") != "not_measurable"
+        ):
+            failures.append(
+                "status-contract busy regression: regression outranked ambient refusal"
+            )
+        if busy_regression_report.exists() or "### `" in busy_regression.stdout:
+            failures.append(
+                "status-contract busy regression: emitted a performance verdict"
+            )
+
+        # Ambient load outside the three measurement-adjacent voting phases
+        # remains non-voting; a noisy build stage must not erase a clean A/B.
+        build_busy = _sample_stream(
+            {"before": 92.0, "between": 91.0, "after": 90.0},
+            [{
+                "schema": AMBIENT_SAMPLE_SCHEMA,
+                "phase": "build",
+                "idle_pct": 0.0,
+            }],
+        )
+        build_run, build_status, build_report = _status_case(
+            "build-only-busy", pass_root, sample_text=build_busy
+        )
+        if (
+            build_run.returncode != EXIT_PASS
+            or build_status.get("verdict") != "pass"
+            or not build_report.exists()
+        ):
+            failures.append(
+                "status-contract build-only load: a non-voting phase refused a clean run"
+            )
+
+        # Missing input, unreadable input, an empty stream, sampler death
+        # (one required phase absent), malformed records, and duplicate voting
+        # samples are all unmeasurable rather than harness errors or passes.
+        refusal_cases: list[tuple[str, str | None, bool]] = [
+            ("no-ambient-argument", None, False),
+            ("missing-ambient-file", None, True),
+            ("empty-ambient", "", True),
+            ("malformed-ambient", "{not json}\n", True),
+            (
+                "duplicate-voting-phase",
+                quiet + json.dumps({
+                    "schema": AMBIENT_SAMPLE_SCHEMA,
+                    "phase": "before",
+                    "idle_pct": 95.0,
+                }) + "\n",
+                True,
+            ),
+        ]
+        for missing_phase in REQUIRED_AMBIENT_PHASES:
+            values = {
+                phase: 90.0
+                for phase in REQUIRED_AMBIENT_PHASES
+                if phase != missing_phase
+            }
+            refusal_cases.append((
+                f"missing-{missing_phase}",
+                _sample_stream(values),
+                True,
+            ))
+
+        for name, sample_text, include_arg in refusal_cases:
+            refused, refused_status, refused_report = _status_case(
+                name,
+                pass_root,
+                sample_text=sample_text,
+                include_ambient_arg=include_arg,
+                stale_report=True,
+            )
+            if (
+                refused.returncode != EXIT_NOT_MEASURABLE
+                or refused_status.get("verdict") != "not_measurable"
+            ):
+                failures.append(
+                    f"status-contract {name}: did not preserve not_measurable"
+                )
+            if refused_report.exists() or "### `" in refused.stdout:
+                failures.append(
+                    f"status-contract {name}: emitted or retained a performance verdict"
+                )
+            if any(
+                key in refused_status
+                for key in ("measurement_count", "gated_count", "regression_count")
+            ):
+                failures.append(
+                    f"status-contract {name}: refused status exposed a data point"
+                )
+
+        absent_root = Path(td) / "status-error" / "missing-criterion"
+        errored, error_status, error_report = _status_case(
+            "error", absent_root, sample_text=quiet, stale_report=True
+        )
+        if errored.returncode != EXIT_ERROR or error_status.get("verdict") != "error":
+            failures.append(
+                "status-contract error: setup failure did not remain a named error sibling"
+            )
+        if error_report.exists():
+            failures.append("status-contract error: stale performance report survived")
+
+        invalid_floor_env = os.environ.copy()
+        invalid_floor_env["BENCH_IDLE_FLOOR"] = "not-a-number"
+        bad_floor, bad_floor_status, bad_floor_report = _status_case(
+            "invalid-floor",
+            pass_root,
+            sample_text=quiet,
+            stale_report=True,
+            env=invalid_floor_env,
+        )
+        if (
+            bad_floor.returncode != EXIT_ERROR
+            or bad_floor_status.get("verdict") != "error"
+        ):
+            failures.append(
+                "status-contract invalid floor: configuration error was not named error"
+            )
+        if bad_floor_report.exists():
+            failures.append("status-contract invalid floor: stale report survived")
+
+        ambient_without_status = Path(td) / "ambient-without-status.jsonl"
+        ambient_without_status.write_text(quiet)
+        if _run(
+            pass_root,
+            "--ambient-samples", str(ambient_without_status),
+        ).returncode != EXIT_ERROR:
+            failures.append(
+                "status-contract: ambient input without machine status did not fail"
+            )
+
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)
     if failures:
@@ -703,7 +1211,10 @@ def run_selftest() -> int:
         return 1
     print("SELFTEST: PASS — base/, compare-base/, orphan-warn, named-wins-over-stale-base, "
           "multi-sibling-refusal, manifest-handoff (demoted target informational, "
-          "non-demoted target gated), and composed-path collision-guard, and require-measurements (empty root, gating pass, all-informational refusal, partial-run refusal) all correct")
+          "non-demoted target gated), composed-path collision-guard, require-measurements "
+          "(empty root, gating pass, all-informational refusal, partial-run refusal), and "
+          "automated status (pass/regression/error/not_measurable, three-phase ambient "
+          "refusal, no refused report/data point, non-voting build load) all correct")
     return 0
 
 
@@ -726,6 +1237,12 @@ def main() -> int:
                          "comparison to judge. Without this, an absent baseline exits 0, which "
                          "is right for a first run but wrong for an automated lane: it cannot "
                          "tell 'nothing regressed' from 'nothing was measured'.")
+    ap.add_argument("--ambient-samples", type=Path,
+                    help="JSONL ambient-load samples for before/between/after. Requires "
+                         "--status-out and refuses an unmeasurable run with exit 3.")
+    ap.add_argument("--status-out", type=Path,
+                    help="Atomically write the automated gate status as JSON. This enables "
+                         "the nightly fail-closed ambient and measurement contract.")
     ap.add_argument("--selftest", action="store_true",
                     help="Run the fixture self-test (no criterion_root/arch needed) and exit")
     args = ap.parse_args()
@@ -736,25 +1253,110 @@ def main() -> int:
     if args.criterion_root is None or args.arch is None:
         ap.error("criterion_root and arch are required unless --selftest is passed")
 
+    status_mode = args.status_out is not None
+    ambient: AmbientAssessment | None = None
+
+    def finish(
+        verdict: str,
+        exit_code: int,
+        reason: str,
+        *,
+        measurement_count: int | None = None,
+        gated_count: int | None = None,
+        regression_count: int | None = None,
+    ) -> int:
+        if args.status_out is None:
+            return exit_code
+        try:
+            write_gate_status(
+                args.status_out,
+                arch=args.arch,
+                verdict=verdict,
+                exit_code=exit_code,
+                reason=reason,
+                ambient=ambient,
+                measurement_count=measurement_count,
+                gated_count=gated_count,
+                regression_count=regression_count,
+            )
+        except OSError as exc:
+            print(f"error: could not write gate status {args.status_out}: {exc}",
+                  file=sys.stderr)
+            return EXIT_ERROR
+        return exit_code
+
+    if args.ambient_samples is not None and not status_mode:
+        print("error: --ambient-samples requires --status-out so refusal remains "
+              "machine-readable", file=sys.stderr)
+        return EXIT_ERROR
+
+    same_output = (
+        status_mode
+        and args.out is not None
+        and os.path.abspath(args.out) == os.path.abspath(args.status_out)
+    )
+    if same_output:
+        print("error: --out and --status-out must name different files", file=sys.stderr)
+        return finish(
+            "error",
+            EXIT_ERROR,
+            "the report and machine-readable status paths are identical",
+        )
+
+    if status_mode:
+        try:
+            remove_stale_report(args.out)
+        except OSError as exc:
+            print(f"error: could not remove stale report {args.out}: {exc}",
+                  file=sys.stderr)
+            return finish(
+                "error",
+                EXIT_ERROR,
+                f"the stale performance report could not be removed: {exc}",
+            )
+
+        try:
+            floor_pct = idle_floor_from_env()
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return finish("error", EXIT_ERROR, str(exc))
+
+        ambient = assess_ambient_samples(args.ambient_samples, floor_pct)
+        if not ambient.measurable:
+            reason = ambient.reason or "ambient load could not be assessed"
+            print(f"NOT MEASURABLE: {reason}; no performance verdict rendered",
+                  file=sys.stderr)
+            return finish("not_measurable", EXIT_NOT_MEASURABLE, reason)
+
+    require_measurements = args.require_measurements or status_mode
+
     if not args.criterion_root.exists():
         print(f"error: {args.criterion_root} does not exist", file=sys.stderr)
-        return 2
+        return finish(
+            "error",
+            EXIT_ERROR,
+            f"criterion root {args.criterion_root} does not exist",
+        )
 
     change_files = find_change_files(args.criterion_root)
     if not change_files:
         print(f"warn: no change/estimates.json under {args.criterion_root}; baseline missing?",
               file=sys.stderr)
-        if args.require_measurements:
+        if require_measurements:
             print(f"error: --require-measurements set but no change/estimates.json under "
                   f"{args.criterion_root}: the run produced no comparison, so it is not "
                   f"evidence that nothing regressed.", file=sys.stderr)
-            return 2
+            return finish(
+                "error",
+                EXIT_ERROR,
+                "the run produced no Criterion comparisons",
+            )
         # Treat missing baseline as pass — first run on a bench has no comparison.
         if args.out:
             args.out.write_text(f"### `{args.arch}` — no baseline to compare\n\n"
                                 f"No `change/estimates.json` found; this is expected on the "
                                 f"first run for a bench. Future runs will gate against this run.\n")
-        return 0
+        return EXIT_PASS
 
     results = []
     unjudged = []
@@ -771,13 +1373,21 @@ def main() -> int:
 
     if not results:
         print("error: change files found but all failed to parse", file=sys.stderr)
-        return 2
+        return finish(
+            "error",
+            EXIT_ERROR,
+            "Criterion change files were present but none could be judged",
+        )
 
-    informational_groups = load_informational_groups(args.informational_groups_file)
-    report = render_report(results, args.arch, informational_groups)
-    print(report)
-    if args.out:
-        args.out.write_text(report)
+    try:
+        informational_groups = load_informational_groups(args.informational_groups_file)
+    except OSError as exc:
+        print(f"error: could not read informational groups: {exc}", file=sys.stderr)
+        return finish(
+            "error",
+            EXIT_ERROR,
+            f"the informational-groups input could not be read: {exc}",
+        )
 
     gating = [r for r in results if not r.is_informational(informational_groups)]
 
@@ -787,7 +1397,7 @@ def main() -> int:
     # the failed target is exactly the one nobody measured, so a green exit is a
     # claim about code that was never benched. Reconcile what the run intended
     # (change files on disk) against what was actually judged.
-    if args.require_measurements and unjudged:
+    if require_measurements and unjudged:
         listed = ", ".join(str(cf.parent.parent.relative_to(args.criterion_root))
                            for cf in unjudged[:5])
         more = f" (+{len(unjudged) - 5} more)" if len(unjudged) > 5 else ""
@@ -795,18 +1405,57 @@ def main() -> int:
               f"{len(change_files)} comparison(s) could not be judged "
               f"(unresolvable baseline or malformed data): {listed}{more}. A partial "
               f"A/B is not evidence that nothing regressed.", file=sys.stderr)
-        return 2
+        return finish(
+            "error",
+            EXIT_ERROR,
+            f"{len(unjudged)} of {len(change_files)} Criterion comparisons "
+            "could not be judged",
+        )
 
     # Parsed results are not automatically judgeable results. If every parsed
     # result is informational, nothing in this run could have produced a FAIL,
     # so a zero exit says only that no gating comparison existed.
-    if args.require_measurements and not gating:
+    if require_measurements and not gating:
         print(f"error: --require-measurements set but all {len(results)} parsed result(s) are "
               f"informational: no gating comparison was judged.", file=sys.stderr)
-        return 2
+        return finish(
+            "error",
+            EXIT_ERROR,
+            "all parsed Criterion results were informational",
+        )
 
     fails = sum(1 for r in gating if r.verdict() == "FAIL")
-    return 1 if fails > 0 else 0
+    report = render_report(results, args.arch, informational_groups)
+    print(report)
+    if args.out:
+        try:
+            args.out.write_text(report)
+        except OSError as exc:
+            print(f"error: could not write performance report {args.out}: {exc}",
+                  file=sys.stderr)
+            return finish(
+                "error",
+                EXIT_ERROR,
+                f"the performance report could not be written: {exc}",
+            )
+
+    if fails > 0:
+        return finish(
+            "regression",
+            EXIT_REGRESSION,
+            f"{fails} gated regression(s) exceeded the fail threshold",
+            measurement_count=len(results),
+            gated_count=len(gating),
+            regression_count=fails,
+        )
+    return finish(
+        "pass",
+        EXIT_PASS,
+        "no gated regression exceeded the fail threshold",
+        measurement_count=len(results),
+        gated_count=len(gating),
+        regression_count=0,
+    )
 
 
 if __name__ == "__main__":
