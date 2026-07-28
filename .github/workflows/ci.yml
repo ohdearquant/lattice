@@ -691,6 +691,14 @@ jobs:
       # bench-compare.sh call site, and runs no benchmark.
       - name: bash scripts/ensure-noindex-marker-selftest.sh
         run: bash scripts/ensure-noindex-marker-selftest.sh
+      # e2e-parity's engine/tune change classifier. Same "harness plumbing only"
+      # scope: it extracts the live regexes out of e2e-parity.yml and asserts
+      # their verdicts on fixture path lists, running no parity job. It belongs
+      # in THIS workflow rather than e2e-parity's own, because the classification
+      # it grades is what decides whether e2e-parity's jobs run at all — a test
+      # gated on the decision it is testing cannot observe the false-negative.
+      - name: bash scripts/ci-engine-filter-selftest.sh
+        run: bash scripts/ci-engine-filter-selftest.sh
       - name: python3 tests/test_bench_disposition.py
         run: python3 tests/test_bench_disposition.py -v
       # perf-bench-gate's own fixture self-test. Same "harness plumbing only"

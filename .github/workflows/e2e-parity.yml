@@ -89,6 +89,42 @@ jobs:
           CHANGED=$(./scripts/ci-changed-files.sh)
           echo "Changed files:"
           echo "$CHANGED"
+          # Markdown is stripped BEFORE classification, and the reason is that
+          # several alternations below are DIRECTORY PREFIXES rather than file
+          # patterns: tests/fixtures/vision/, crates/embed/tests/wasm/,
+          # crates/inference/tests/fixtures/{quarot_q4_composed_v1,ppl_gate_v1}/,
+          # crates/embed/tests/fixtures/{embed_parity_v1,embed_drift_baseline_v1}/,
+          # .github/actions/provision-qwen35-0-8b/ and crates/*/src/. A prefix
+          # matches ANY file placed under it, so a README inside a fixture
+          # directory classifies a documentation change as an engine change.
+          # That is not hypothetical: PR #1159 touched 50 files, ZERO of them
+          # under crates/*/src, and was classified engine=true by exactly one
+          # path — tests/fixtures/vision/README.md. It then sat BLOCKED behind
+          # the full macOS parity battery (parity, wasm, wasm-simd128, q4+vision,
+          # ppl self-test, metal ratchet) that its diff could not reach.
+          # Safe because documentation carries no compiled behaviour: no test
+          # consumes a .md as data (zero include_str! of any .md across crates/,
+          # against a control confirming include_str! is live in 9 files), and
+          # the only .md under any fixture directory is that vision README,
+          # referenced from comments rather than read.
+          # `|| true` because grep -v exits 1 when a docs-ONLY diff leaves no
+          # lines, which under `set -e` would abort the job instead of correctly
+          # classifying it as no-engine-change.
+          # Both the engine and tune classifiers read $CHANGED below, so this one
+          # reassignment covers both; crates/tune/(src|tests)/ is a directory
+          # prefix with the identical exposure.
+          DOCS_ONLY=$(grep '\.md$' <<<"$CHANGED" || true)
+          CHANGED=$(grep -v '\.md$' <<<"$CHANGED" || true)
+          # Disclose the exclusion. Without this the log prints the FULL changed
+          # list and then reports engine=false, and a reader diagnosing a skipped
+          # gate would see a fixture path in the list with no indication it was
+          # never classified.
+          if [ -n "$DOCS_ONLY" ]; then
+            echo "Excluded from classification (documentation, no compiled behaviour):"
+            echo "$DOCS_ONLY"
+          fi
+          echo "Classified against:"
+          echo "${CHANGED:-(nothing — documentation-only diff)}"
           # here-string, not `echo | grep -q`: -q exits at first match, echo gets
           # SIGPIPE, and under pipefail the pipeline reports 141 → the else branch
           # would silently skip the gate on large diffs (fail-open).
