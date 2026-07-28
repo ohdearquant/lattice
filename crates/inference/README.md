@@ -34,7 +34,6 @@ These modules contain submodules (directories with their own `mod.rs`).
 | `batch` | Continuous batching engine (ADR-048): `BatchWorker`, `FifoScheduler`, `Sequence`, `SequenceManager`, chunked prefill interleaved with decode steps. |
 | `download` | Model file cache and conditional download (`ensure_model_files`). Disabled unless the `download` feature is enabled. |
 | `error` | `InferenceError` — the crate's single error type, re-exported at the crate root. Stable; adding variants is backward-compatible. |
-| `generate` | Text generation loop for Qwen3: `generate()` entry point, `GenerateConfig`, `GenerateOutput`, `forward_with_cache` inner loop, `compute_attention` GQA kernel. |
 | `grammar` | Grammar-constrained decoding (ADR-046): `GrammarEngine` compiles a JSON Schema or GBNF spec to a byte-level PDA, then masks logits via `mask_logits` and advances state via `advance` each decode step. |
 | `kv_cache` | Two KV cache implementations: `FlatKVCache` (contiguous pre-allocated, single request) and `PagedKVCache` (256-token pages, LRU eviction, multi-model serving). Includes `PrefixPageCache` for prefix reuse. |
 | `lora_hook` | `LoraHook` trait: defines the `apply(layer_idx, module, x, output)` contract that the forward pass calls after each linear projection. `NoopLoraHook` is the zero-overhead default. |
@@ -101,9 +100,10 @@ own file under `attention/` (e.g. `attention/flash_causal.rs`), registers a vari
 `AttentionTag`, and dispatches from the relevant `forward/` backend. See
 `docs/architecture.md` for the full forward-pass walkthrough before touching this path.
 
-**Sampling or generation.** `sampling.rs` owns the `Sampler` and `SamplingConfig` structs.
-The generate loop in `generate.rs` is where sampling is called; grammar-constrained paths
-also live there.
+**Sampling or generation.** `sampling.rs` owns the shared `Sampler` and `SamplingConfig`
+primitives. Canonical Qwen3.5 generation lives in `model/qwen35/generation.rs`, with
+backend-specific entry points under `forward/`; grammar-constrained decoding uses the
+shared `grammar` module.
 
 **LoRA adapter injection.** The `LoraHook` trait in `lora_hook.rs` is the injection point.
 The training-side implementation lives in `crates/tune`. Backward-pass gradients are behind

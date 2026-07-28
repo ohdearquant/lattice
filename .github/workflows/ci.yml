@@ -378,8 +378,8 @@ jobs:
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a
       # grammar that blocked every token silently emitted token 0 instead of
-      # failing closed, unlike the CPU paths (`crate::generate` /
-      # `model::qwen35::generation`), which have always guarded every
+      # failing closed, unlike the canonical CPU path
+      # (`model::qwen35::generation`), which has always guarded every
       # `mask_logits` call this way. These three hardware-gated integration
       # tests prove each real public Metal generation entry point (`generate`,
       # `generate_streaming`, `generate_streaming_with_prefix_cache`) now

@@ -950,9 +950,9 @@ fn bench_q8_neon_forward_allocations(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 // OPT-LOGIT: final logits projection benchmark (vocab=248320, hidden=2048)
 //
-// The generate.rs scalar loop (lines 400-407) does one dot product per vocab
-// row against the final hidden state. This benchmark compares:
-//   scalar             — exact loop from generate.rs
+// The former generic scalar loop did one dot product per vocabulary row
+// against the final hidden state. This benchmark compares:
+//   scalar             — direct per-output dot-product loop
 //   matmul_bt_existing — existing CPU dispatch (Accelerate on macOS, NEON tiled
 //                        on aarch64 non-macOS). Same as the Qwen3.5 qwen35.rs path.
 //
@@ -1001,7 +1001,7 @@ fn bench_logits_projection(c: &mut Criterion) {
 
     let mut out = vec![0.0f32; LOGITS_VOCAB];
 
-    // scalar: identical to the generate.rs:400-407 loop that we will optimize
+    // scalar: direct per-output dot-product reference
     group.bench_function("scalar", |b| {
         b.iter(|| {
             let h = black_box(&hidden[..]);
@@ -1046,8 +1046,8 @@ fn bench_logits_projection(c: &mut Criterion) {
 // OPT-FWD: forward_with_cache allocation gate (requires --features bench-internals)
 //
 // Measures allocations-per-token and latency for a single-token decode at
-// Qwen3.5-target dimensions. The "allocating_current" variant mirrors
-// generate.rs:forward_with_cache exactly: 11 top-level buffer allocs +
+// Qwen3.5-target dimensions. The "allocating_current" variant models the
+// retired flat-cache decode shape: 11 top-level buffer allocations plus
 // 1 logits alloc + 24 layers × 8 heads × 1 query = 192 score allocs
 // = 204 allocs/token total (before ForwardScratch).
 //
@@ -1115,7 +1115,7 @@ impl SyntheticLayerWeights {
 }
 
 // Allocating attention: one Vec<f32> per head per query position.
-// Matches the generate.rs:441 allocation pattern that ForwardScratch eliminates.
+// Matches the retired generic decode allocation pattern that ForwardScratch eliminates.
 #[cfg(feature = "bench-internals")]
 fn compute_attention_alloc(
     output: &mut [f32],
@@ -1178,7 +1178,7 @@ fn compute_attention_alloc(
 }
 
 // Single-token decode with all per-call allocations intact (pre-optimization baseline).
-// Mirrors generate.rs:forward_with_cache for seq_len=1 using synthetic weights.
+// Models a single-token flat-cache decode using synthetic weights.
 // Returns the logits Vec (alloc #12).
 #[cfg(feature = "bench-internals")]
 #[allow(clippy::too_many_arguments)]

@@ -119,6 +119,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [081](ADR-081-prefill-gemm-optimization-priority.md)   | Prefill GEMM Optimization Priority (Metal)                                                                   | Proposed | none                            |
 | [082](ADR-082-gemma4-e2b-support.md)                   | Gemma 4 E2B Support — Staged Multimodal Ladder (Vision + Audio)                                              | Accepted | ADR-069                         |
 | [083](ADR-083-backward-simd-dispatch.md)               | Backward SIMD Dispatch Contract                                                                              | Accepted | ADR-002, ADR-058                |
+| [084](ADR-084-retire-legacy-qwen-decode-api.md)        | Retire the Legacy Generic Qwen Decode API                                                                    | Accepted | ADR-080                         |
 
 ## informational
 

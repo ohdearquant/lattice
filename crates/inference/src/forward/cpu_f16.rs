@@ -537,8 +537,8 @@ fn moe_ffn_step_f16(moe: &F16MoeLayerWeights, scratch: &mut ForwardScratch, hidd
     } else {
         // Fail closed on a non-finite denom (NaN/±inf router logit from a corrupt
         // f16 router gate weight or an upstream activation overflow), mirroring
-        // the f32 router fix in qwen35/moe.rs::compute_router_probs and
-        // generate.rs compute_attention (#409/#410). `max_logit` can stay finite
+        // the f32 router fix in qwen35/moe.rs::compute_router_probs and the
+        // shared attention row contract (#409/#410). `max_logit` can stay finite
         // when only one lane is NaN (Rust `f32::max` ignores a single NaN), so
         // the NaN propagates into `denom` here and `denom > 0.0` is false.
         // Without this the router would leave un-normalized raw `exp` values and,

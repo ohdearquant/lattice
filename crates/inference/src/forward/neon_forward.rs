@@ -738,8 +738,8 @@ fn full_attention_step_q8_neon(
         // Fail closed: a non-finite score (NaN/+inf from a corrupt Q/K
         // activation) poisons sum_exp; real (unclamped) `.exp()` already
         // reaches the shared row-finalizer's full-row-zero outcome via that
-        // NaN-into-`sum_exp` propagation. Mirrors the Q8 CPU and f32 siblings
-        // (forward::cpu_q8, generate::compute_attention). ADR-080 C1 (#785):
+        // NaN-into-`sum_exp` propagation. Mirrors the Q8 CPU and shared attention
+        // siblings (`forward::cpu_q8`, `attention::decode`). ADR-080 C1 (#785):
         // routed through `finalize_row` for consolidation -- behavior-
         // preserving, no output change.
         crate::attention::softmax_row::finalize_row(
