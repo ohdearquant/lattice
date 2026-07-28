@@ -39,8 +39,11 @@ on:
     types: [checks_requested]
 
 # Cancel a PR's own superseded runs so they stop occupying the shared macOS
-# runner pool (~5 concurrent, account-wide) while a newer push on the same PR
-# waits behind them. Never cancel a push to main, a schedule, or a manual
+# runner pool while a newer push on the same PR waits behind them. Contention is
+# real but BURSTY rather than a fixed cap: measured over a 39.6 h window, macOS
+# jobs had a median queue of 0.0 min but a p90 of 32.5 min and a max of 87.8 min,
+# against an ubuntu control at p90 5.7 min. So most jobs start at once and a tail
+# waits a long time, which is exactly the shape superseded-run cancellation helps. Never cancel a push to main, a schedule, or a manual
 # dispatch: none of those has a "next run" to fall back on if killed mid-flight.
 # The event_name segment keeps a scheduled run and a main-push run from
 # sharing one queue: GitHub cancels a PENDING run whenever another run enters
@@ -110,9 +113,13 @@ jobs:
           fi
 
   # The macOS jobs from here down carry `github.event.pull_request.draft != true`.
-  # The macOS runner pool is ~5 concurrent account-wide and these are the long
-  # jobs (model fetch, HF reference run, then lattice), so a draft under active
-  # iteration otherwise occupies the same pool that ready-to-merge PRs queue on.
+  # These are the long jobs (model fetch, HF reference run, then lattice), so a
+  # draft under active iteration otherwise competes for the same macOS pool that
+  # ready-to-merge PRs queue on. An earlier revision of this comment asserted the
+  # pool was "~5 concurrent, account-wide"; that was inherited from an older
+  # comment and never measured. Measured instead: median macOS queue 0.0 min,
+  # p90 32.5 min, max 87.8 min over 39.6 h. The justification is the p90 tail,
+  # not a fixed slot count.
   #
   # `!= true` rather than `== false` is deliberate: on merge_group, schedule,
   # workflow_dispatch and push there is no `pull_request` object at all, so the
@@ -638,12 +645,37 @@ jobs:
   # NOTE: once this job has gone green on CI once, add "q4-composed" to the
   # repository's required status checks alongside embed-drift. That
   # governance step is intentionally not automated here.
-  q4-composed:
-    name: q4 composed golden
+  # FOLDED JOB. q4-composed, vision-s3-gate and q4-ppl-quality were three
+  # separate macOS jobs whose 9-step preambles were byte-identical: checkout,
+  # python, pip cache, HF weight cache, deps, Qwen3.5-0.8B provision, model dir,
+  # toolchain, rust-cache. Each also kept its OWN rust-cache shared-key, so the
+  # same crate was built and cached three separate times. They are one job now:
+  # one model provision, one dep install, one cache, and the crate compiled
+  # twice instead of six times.
+  #
+  # Twice, not once, and the reason is deliberate: the QuaRot converter is built
+  # f16-only while the other gates need f16,metal-gpu. STEP ORDER IS THEREFORE
+  # LOAD-BEARING -- the f16-only build comes first and the f16,metal-gpu build
+  # adds the feature on top; reversing them makes cargo compile a third time.
+  # The converter's feature set is NOT unified to metal-gpu on purpose. It
+  # produces the ephemeral artifact the frozen golden was generated from, so
+  # changing how it is built could change the artifact and silently move what
+  # the golden proves.
+  #
+  # metal-parity is deliberately NOT folded in: it carries a merge_group
+  # exclusion the other three do not, and folding it would push that condition
+  # onto individual steps to save ~10 min.
+  #
+  # Gate steps carry `if: ${{ !cancelled() }}` so one failing gate still lets the
+  # rest report. As three jobs, failures were naturally isolated; without this
+  # the fold would hide every gate after the first red one and an agent would
+  # fix them one slow round-trip at a time.
+  q4-vision-gates:
+    name: q4 + vision gates
     needs: changes
     if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -685,7 +717,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: q4-composed
+          shared-key: q4-vision-gates
+
 
       - name: Build QuaRot converter
         run: cargo build --release -p lattice-inference --bin quantize_quarot --features f16
@@ -702,6 +735,7 @@ jobs:
             --num-probe-tokens 4
 
       - name: Run QuaRot Q4 composed golden gate
+        if: ${{ !cancelled() }}
         env:
           LATTICE_Q4_COMPOSED_GATE_ENFORCE: '1'
           LATTICE_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
@@ -741,54 +775,9 @@ jobs:
   # NOTE: once this job has gone green on CI once, add "vision-s3-gate" to
   # the repository's required status checks alongside embed-drift and
   # q4-composed. That governance step is intentionally not automated here.
-  vision-s3-gate:
-    name: vision S3a+S4 cosine gate
-    needs: changes
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.11'
-
-      - name: Cache Python packages
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/pip
-          key: e2e-pip-${{ runner.os }}-py311-v1
-
-      - name: Cache HF model weights
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          # Derived from the provisioning action so the cache cannot outlive the
-          # thing it caches: bump the pinned revision or the expected digests and
-          # this key changes with them. A hand-bumped key is a step someone
-          # forgets, and a stale snapshot restored under a still-matching key is
-          # exactly what the exact-set check would then report as tampering.
-          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
-
-      - name: Install Python deps
-        run: pip install "huggingface_hub==1.20.1"
-
-      - name: Provision Qwen3.5-0.8B
-        id: provision
-        uses: ./.github/actions/provision-qwen35-0-8b
-
-      - name: Setup lattice model dir
-        run: |
-          mkdir -p ~/.lattice/models
-          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
-
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: vision-s3-gate
 
       - name: Run S3a + S4 cosine gates (fail-closed)
+        if: ${{ !cancelled() }}
         env:
           LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
           LATTICE_VISION_S3_GATE_ENFORCE: '1'
@@ -840,6 +829,7 @@ jobs:
       # the exact-count grep below is 7, not 5 -- update it in the same PR
       # if the `inject`-matching test surface changes.
       - name: Run MP2 Metal injection gate (fail-closed)
+        if: ${{ !cancelled() }}
         env:
           LATTICE_METAL_TEST_ENFORCE: '1'
         run: |
@@ -861,92 +851,6 @@ jobs:
   # one. It locks the gate's fail-closed contract (RECORD-on-null, ENFORCE
   # pass/fail, hard-fail on every provisioning/parse error, env-record cannot
   # mask an armed golden, non-finite golden rejected) against future regressions.
-  ppl-gate-selftest:
-    name: ppl-gate selftest
-    needs: changes
-    if: needs.changes.outputs.engine == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.11'
-      - name: Run ppl-gate control-flow self-test
-        run: bash scripts/ppl_gate_check_selftest.sh
-
-  # Q4 perplexity regression gate (issue #616). Measures the UNROTATED Metal Q4
-  # tier (the actually-shipping quantization) over a fixed WikiText-2 slice and
-  # compares against a frozen golden PPL.
-  #
-  # Why unrotated Q4 and not the QuaRot delta: the original ADR-044 gate asserted
-  # `quarot - unrotated < 0.5`. On the current forward path offline QuaRot v0 is
-  # net-NEGATIVE (+1.9 PPL worse than unrotated asymmetric Q4) by design — Hadamard
-  # forces symmetric Q4 (worse fidelity floor) and offline v0 has no online R3/R4
-  # rotation to recover it. A "quarot must win" gate would red main on a known,
-  # accepted limitation. So #616 repoints the gate to catch a REGRESSION in the
-  # shipping tier. See ADR-044 "Conclusion superseded (2026-07-06)" + issue #703.
-  #
-  # Why an absolute golden captured on THIS runner (paravirtual Metal): the Q4
-  # forward path is numerically correct on the hosted runner (proven by q4-composed)
-  # but absolute PPL differs from real Apple-GPU, so the golden must be captured
-  # here. The golden was captured via a null-sentinel RECORD bootstrap (run
-  # 28841919096) and is now ARMED (golden.json `ppl` = 16.589111). The gate
-  # enforces fail-closed (|measured - golden| > tolerance). Corpus-slice size and
-  # tolerance rationale are documented in golden.json.
-  #
-  # ARMED + REQUIRED: this job is wired into parity-gate.needs (the required
-  # status check). To keep the required leg from being silently de-armed, the run
-  # step below sets LATTICE_PPL_GATE_REQUIRE_ARMED=1 — if a future change reverts
-  # `ppl` to null, the gate fails CLOSED here instead of re-entering the fail-open
-  # RECORD mode. Deliberate re-capture (per golden.json `_regenerate`) runs the
-  # binary/script WITHOUT that flag.
-  q4-ppl-quality:
-    name: q4 ppl regression gate
-    needs: changes
-    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
-    runs-on: macos-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.11'
-
-      - name: Cache Python packages
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/pip
-          key: q4-composed-pip-${{ runner.os }}-py311-v1
-
-      - name: Cache HF model weights
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
-          # Derived from the provisioning action so the cache cannot outlive the
-          # thing it caches: bump the pinned revision or the expected digests and
-          # this key changes with them. A hand-bumped key is a step someone
-          # forgets, and a stale snapshot restored under a still-matching key is
-          # exactly what the exact-set check would then report as tampering.
-          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
-
-      - name: Install Python deps
-        run: pip install "huggingface_hub==1.20.1"
-
-      - name: Provision Qwen3.5-0.8B
-        id: provision
-        uses: ./.github/actions/provision-qwen35-0-8b
-
-      - name: Setup lattice model dir
-        run: |
-          mkdir -p ~/.lattice/models
-          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
-
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: q4-ppl-quality
 
       - name: Build eval_perplexity + quantize_q4
         run: |
@@ -966,6 +870,7 @@ jobs:
           cp ~/.lattice/models/qwen3.5-0.8b/config.json "$RUNNER_TEMP/qwen3.5-0.8b-q4/config.json"
 
       - name: Run Q4 PPL regression gate
+        if: ${{ !cancelled() }}
         env:
           LATTICE_PPL_Q4_DIR: ${{ runner.temp }}/qwen3.5-0.8b-q4
           LATTICE_PPL_TOKENIZER_DIR: ~/.lattice/models/qwen3.5-0.8b
@@ -1007,6 +912,46 @@ jobs:
   # gate can pass. The check runs unconditionally, ahead of the engine
   # short-circuit — otherwise a tune-only change would hit the "no engine
   # change" early PASS and never evaluate the bridge job at all.
+  ppl-gate-selftest:
+    name: ppl-gate selftest
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+      - name: Run ppl-gate control-flow self-test
+        run: bash scripts/ppl_gate_check_selftest.sh
+
+  # Q4 perplexity regression gate (issue #616). Measures the UNROTATED Metal Q4
+  # tier (the actually-shipping quantization) over a fixed WikiText-2 slice and
+  # compares against a frozen golden PPL.
+  #
+  # Why unrotated Q4 and not the QuaRot delta: the original ADR-044 gate asserted
+  # `quarot - unrotated < 0.5`. On the current forward path offline QuaRot v0 is
+  # net-NEGATIVE (+1.9 PPL worse than unrotated asymmetric Q4) by design — Hadamard
+  # forces symmetric Q4 (worse fidelity floor) and offline v0 has no online R3/R4
+  # rotation to recover it. A "quarot must win" gate would red main on a known,
+  # accepted limitation. So #616 repoints the gate to catch a REGRESSION in the
+  # shipping tier. See ADR-044 "Conclusion superseded (2026-07-06)" + issue #703.
+  #
+  # Why an absolute golden captured on THIS runner (paravirtual Metal): the Q4
+  # forward path is numerically correct on the hosted runner (proven by q4-composed)
+  # but absolute PPL differs from real Apple-GPU, so the golden must be captured
+  # here. The golden was captured via a null-sentinel RECORD bootstrap (run
+  # 28841919096) and is now ARMED (golden.json `ppl` = 16.589111). The gate
+  # enforces fail-closed (|measured - golden| > tolerance). Corpus-slice size and
+  # tolerance rationale are documented in golden.json.
+  #
+  # ARMED + REQUIRED: this job is wired into parity-gate.needs (the required
+  # status check). To keep the required leg from being silently de-armed, the run
+  # step below sets LATTICE_PPL_GATE_REQUIRE_ARMED=1 — if a future change reverts
+  # `ppl` to null, the gate fails CLOSED here instead of re-entering the fail-open
+  # RECORD mode. Deliberate re-capture (per golden.json `_regenerate`) runs the
+  # binary/script WITHOUT that flag.
   parity-gate:
     name: parity-gate
     needs:
@@ -1016,10 +961,8 @@ jobs:
         embed-drift,
         wasm-parity,
         wasm-simd128-parity,
-        q4-composed,
-        vision-s3-gate,
+        q4-vision-gates,
         ppl-gate-selftest,
-        q4-ppl-quality,
         metal-parity,
         layer23-golden,
       ]
@@ -1035,10 +978,14 @@ jobs:
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
           WASM_RESULT="${{ needs.wasm-parity.result }}"
           WASM_SIMD128_RESULT="${{ needs.wasm-simd128-parity.result }}"
-          Q4_RESULT="${{ needs.q4-composed.result }}"
-          VISION_S3_RESULT="${{ needs.vision-s3-gate.result }}"
+          # One variable where there were three: the QuaRot golden, the vision
+          # S3a/S4 cosine gates and the Q4 PPL regression gate now run as steps
+          # of a single job, so they report one result. Granularity is not lost
+          # in practice — each step still names itself in the job log, and the
+          # steps carry an if-not-cancelled guard so a red one does not mask the
+          # others.
+          Q4VISION_RESULT="${{ needs.q4-vision-gates.result }}"
           PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
-          Q4PPL_RESULT="${{ needs.q4-ppl-quality.result }}"
           METAL_RESULT="${{ needs.metal-parity.result }}"
           LAYER23_RESULT="${{ needs.layer23-golden.result }}"
           EVENT_NAME="${{ github.event_name }}"
@@ -1046,7 +993,7 @@ jobs:
           # draft branch below must never fire on merge_group, push, schedule,
           # or workflow_dispatch.
           DRAFT="${{ github.event.pull_request.draft }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-composed=$Q4_RESULT vision-s3-gate=$VISION_S3_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT q4-ppl-quality=$Q4PPL_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-vision-gates=$Q4VISION_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -1085,20 +1032,12 @@ jobs:
             echo "::error::Engine changed and wasm-simd128-parity gate did not succeed (result=$WASM_SIMD128_RESULT)."
             exit 1
           fi
-          if [ "$Q4_RESULT" != "success" ]; then
-            echo "::error::Engine changed and q4-composed golden did not succeed (result=$Q4_RESULT)."
-            exit 1
-          fi
-          if [ "$VISION_S3_RESULT" != "success" ]; then
-            echo "::error::Engine changed and vision S3a cosine gate did not succeed (result=$VISION_S3_RESULT)."
+          if [ "$Q4VISION_RESULT" != "success" ]; then
+            echo "::error::Engine changed and the q4 + vision gates job did not succeed (result=$Q4VISION_RESULT). This one result covers the QuaRot composed golden, the vision S3a/S4 cosine gates and the Q4 PPL regression gate; open the job log to see which step failed."
             exit 1
           fi
           if [ "$PPL_SELFTEST_RESULT" != "success" ]; then
             echo "::error::Engine changed and ppl-gate self-test did not succeed (result=$PPL_SELFTEST_RESULT)."
-            exit 1
-          fi
-          if [ "$Q4PPL_RESULT" != "success" ]; then
-            echo "::error::Engine changed and q4-ppl-quality regression gate did not succeed (result=$Q4PPL_RESULT)."
             exit 1
           fi
           if [ "$METAL_RESULT" != "success" ]; then
@@ -1109,5 +1048,5 @@ jobs:
               exit 1
             fi
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, q4-composed, vision-s3-gate, ppl-gate-selftest, q4-ppl-quality, and metal-parity all PASSED."
+          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, q4-vision-gates, ppl-gate-selftest, and metal-parity all PASSED."
           exit 0
