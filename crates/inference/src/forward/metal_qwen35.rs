@@ -16081,21 +16081,56 @@ mod inner {
         }
 
         fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
-            if snapshot.is_empty() {
+            if let Err(error) = self.validate_gdn_restore_snapshot(snapshot) {
+                tracing::warn!(
+                    error = %error,
+                    "refusing malformed GDN state restore"
+                );
                 return;
             }
+            self.restore_gdn_states_validated(snapshot);
+        }
+    }
+
+    impl MetalQwen35State {
+        fn validate_gdn_restore_snapshot(
+            &self,
+            snapshot: &crate::attention::gdn::GdnSnapshot,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
             let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            debug_assert_eq!(snapshot.len(), num_layers);
-            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate().take(num_layers) {
+            if snapshot.len() != num_layers {
+                return Err(InferenceError::PrefixCache(format!(
+                    "restore_gdn_states: snapshot has {} layers, expected {num_layers}",
+                    snapshot.len()
+                )));
+            }
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
                 let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
                 let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_bytes = conv_snap.len() * 4;
-                let s_bytes = s_snap.len() * 4;
-                debug_assert_eq!(conv_bytes as u64, conv_buf.length());
-                debug_assert_eq!(s_bytes as u64, s_buf.length());
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
+                    return Err(InferenceError::PrefixCache(format!(
+                        "restore_gdn_states: layer {i} shape mismatch: conv {} != \
+                         {conv_floats} or s {} != {s_floats}",
+                        conv_snap.len(),
+                        s_snap.len()
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        fn restore_gdn_states_validated(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
                 // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
-                // the buffer directly; callers invoke this outside any in-flight command
-                // buffer (rejection branch in `mtp_verify_draft`).
+                // the buffer directly; validation above proves each snapshot exactly
+                // matches its destination, and callers invoke this outside any in-flight
+                // command buffer (rejection branch in `mtp_verify_draft`).
                 unsafe {
                     let dst = conv_buf.contents() as *mut f32;
                     std::ptr::copy_nonoverlapping(conv_snap.as_ptr(), dst, conv_snap.len());
@@ -16538,40 +16573,15 @@ mod inner {
             Ok(self.snapshot_gdn_states())
         }
 
-        /// Shape-checked wrapper around [`Self::restore_gdn_states`]. The
-        /// underlying restore only asserts shapes in debug builds
-        /// (`debug_assert_eq!`); this validates explicitly in all builds and
-        /// returns `InferenceError::PrefixCache` instead of restoring
-        /// mismatched buffers or panicking.
+        /// Fallible sibling of [`Self::restore_gdn_states`] for callers that
+        /// can propagate a malformed-snapshot error instead of using the
+        /// infallible trait entry point's logged, no-write rejection.
         fn restore_gdn_states_checked(
             &mut self,
             snapshot: &crate::attention::gdn::GdnSnapshot,
         ) -> Result<(), crate::error::InferenceError> {
-            use crate::error::InferenceError;
-            use crate::speculative::MtpTargetVerifier;
-
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            if snapshot.len() != num_layers {
-                return Err(InferenceError::PrefixCache(format!(
-                    "restore_gdn_states_checked: snapshot has {} layers, expected {num_layers}",
-                    snapshot.len()
-                )));
-            }
-            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_floats = (conv_buf.length() / 4) as usize;
-                let s_floats = (s_buf.length() / 4) as usize;
-                if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
-                    return Err(InferenceError::PrefixCache(format!(
-                        "restore_gdn_states_checked: layer {i} shape mismatch: conv {} != \
-                         {conv_floats} or s {} != {s_floats}",
-                        conv_snap.len(),
-                        s_snap.len()
-                    )));
-                }
-            }
-            self.restore_gdn_states(snapshot);
+            self.validate_gdn_restore_snapshot(snapshot)?;
+            self.restore_gdn_states_validated(snapshot);
             Ok(())
         }
 
@@ -30471,6 +30481,55 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     );
                 }
             }
+        }
+
+        #[test]
+        fn restore_gdn_states_rejects_short_snapshot_without_writes() {
+            use crate::speculative::MtpTargetVerifier;
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let mut state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
+            });
+            let mut malformed = state.snapshot_gdn_states();
+            assert!(
+                malformed.len() > 1,
+                "fixture must expose a partial-restore boundary"
+            );
+            malformed.pop();
+
+            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: StorageModeShared buffer; no command buffer is in flight.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = 10.0 + li as f32 + k as f32 * 1e-4;
+                    }
+                }
+            }
+            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: see above.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = -10.0 - li as f32 - k as f32 * 1e-4;
+                    }
+                }
+            }
+
+            let before = state.snapshot_gdn_states();
+            state.restore_gdn_states(&malformed);
+            let after = state.snapshot_gdn_states();
+            assert!(
+                after == before,
+                "a malformed snapshot must not partially overwrite live GDN buffers"
+            );
         }
 
         // -----------------------------------------------------------------------
