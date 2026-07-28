@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Engine adapters for the `q4_apples` profile (issue #813 step 2: migrate
-`bench_q4_apples.sh`).
+`legacy Q4 comparison consumer`).
 
 Registers lattice/ollama/mlx `EngineAdapter`s mirroring
-`bench_q4_apples.sh`'s three sections, then delegates to
+`legacy Q4 comparison consumer`'s three sections, then delegates to
 `bench_decode_harness.main()`. See `bench_decode_profiles.toml`'s
 `[profiles.q4_apples]` comment for the disclosed correction: the legacy
 script set `BENCH_Q4_DIR`/`BENCH_TOKENIZER_DIR`, names `bench_decode_ab.rs`
@@ -15,7 +15,7 @@ name to the actual plain-Q4 directory via `LATTICE_MODEL_DIR`/
 are otherwise unchanged from the legacy script.
 
 Run with (from repo root): `uv run --quiet --with mlx-lm python3
-scripts/bench_decode_adapters_q4_apples.py run --profile q4_apples
+scripts/bench_decode_harness.py run --profile q4_apples
 --allow-missing-engine`.
 """
 
@@ -39,8 +39,8 @@ import bench_decode_harness as harness  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 LAT_BIN = REPO_ROOT / "target" / "release" / "bench_decode_ab"
-# Plain per-row Q4 (bench_q4_apples.sh's Q4_DIR), tied embeddings; tokenizer
-# comes from the Q8 f16 source dir (bench_q4_apples.sh's TOK_DIR), matching
+# Plain per-row Q4 (legacy Q4 comparison consumer's Q4_DIR), tied embeddings; tokenizer
+# comes from the Q8 f16 source dir (legacy Q4 comparison consumer's TOK_DIR), matching
 # the legacy script's declared-but-unreachable `BENCH_TOKENIZER_DIR` intent.
 Q4_MODEL_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b-q4"
 TOKENIZER_DIR = Path.home() / ".lattice" / "models" / "qwen3.5-0.8b"
@@ -107,7 +107,7 @@ class LatticeAdapter:
         `crates/inference/src/model_format.rs::detect_format` precedence:
         safetensors markers win over `.q4` files, so their presence means the
         binary would silently benchmark the full-precision checkpoint under a
-        Q4 label -- exactly the historical bench_q4_apples.sh failure mode.
+        Q4 label -- exactly the historical legacy Q4 comparison consumer failure mode.
 
         `detect_format` (crates/inference/src/model_format.rs) suppresses
         `read_dir` errors with `.ok()`, resolving an unreadable or
@@ -286,7 +286,7 @@ MLX_SOURCE_MODEL_DIR = TOKENIZER_DIR  # same f16 src dir the legacy script loads
 
 
 class MlxAdapter:
-    """Invokes `mlx_lm`, mirroring `bench_q4_apples.sh`'s MLX heredoc: load
+    """Invokes `mlx_lm`, mirroring `legacy Q4 comparison consumer`'s MLX heredoc: load
     the f16 source dir once, `nn.quantize(bits=4, group_size=64)`, one
     8-token warmup (represented by the profile's `warmup_repeats=1`/
     `warmup_tokens=8`), then time only `generate()` per measured call."""

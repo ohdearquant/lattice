@@ -1145,7 +1145,18 @@ mod inner {
         }
 
         /// Wrap a no-copy Metal buffer backed by `mmap` with a non-zero payload offset.
-        fn from_mmap(buffer: Buffer, payload_offset: u64, mmap: memmap2::Mmap) -> Self {
+        ///
+        /// The GPU is the only thing that will ever read these bytes, so the
+        /// caller must present the [`Q4BlocksChecked`] witness that
+        /// `open_and_mmap_q4_file` issues for an eagerly checked mapping.
+        /// A caller that deferred the block check has no witness to pass and
+        /// cannot reach this constructor without visibly unwrapping a `None`.
+        fn from_mmap(
+            buffer: Buffer,
+            payload_offset: u64,
+            mmap: memmap2::Mmap,
+            _blocks_checked: crate::weights::q4_weights::Q4BlocksChecked,
+        ) -> Self {
             Q4WeightBuf {
                 buffer,
                 payload_offset,
@@ -1158,6 +1169,20 @@ mod inner {
     /// `StorageModeShared` buffer.  Stores the mmap owner inside the returned
     /// [`Q4WeightBuf`] so the pages remain valid for the lifetime of the buffer.
     ///
+    /// This is the one Q4 load path whose bytes are never decoded on the CPU:
+    /// the packed nibbles stay resident in the no-copy GPU buffer and the
+    /// per-block scale/bias is dequantized by the Metal kernel at dispatch
+    /// time. There is therefore no traversal here to fold a scale/bias check
+    /// into, and a file with a correct header but a NaN or infinite scale
+    /// would otherwise load cleanly and propagate the NaN into the logits at
+    /// the first GEMV. The load requests [`Q4BlockCheck::Now`] so the check
+    /// happens before the buffer exists.
+    ///
+    /// That costs one sequential pass over the payload, faulting in pages
+    /// this no-copy mapping was otherwise designed not to touch — a real cost
+    /// paid once per weight at load, deliberately, because the alternative is
+    /// admitting non-finite weights to the GPU.
+    ///
     /// # Safety invariant
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
     /// modified while the process is running.
@@ -1166,27 +1191,25 @@ mod inner {
         device: &Device,
         path: &std::path::Path,
         label: &str,
+        expected_shape: &[usize],
     ) -> Result<Q4WeightBuf, String> {
-        use crate::weights::q4_weights::{read_q4_header, validate_q4_header_payload_bounds};
+        use crate::weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
 
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        let header = read_q4_header(&file)
-            .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-        let file_len = file
-            .metadata()
-            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-            .len();
-        // Fail closed on a truncated/malformed Q4 file *before* the mmap is
-        // handed to the GPU: unlike the CPU sibling (`load_q4_file`), which
-        // fails via `read_exact` short of the block payload, this no-copy
-        // path never reads the payload itself, so a missing bounds check
-        // here would let a truncated on-disk checkpoint reach Metal dispatch
-        // and read past the end of the mapped payload.
-        validate_q4_header_payload_bounds(&header, file_len, path)
-            .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        let tensor_name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("native Q4 tensor");
+        let (header, mmap, blocks_checked) = open_and_mmap_q4_file(
+            path,
+            Some(expected_shape),
+            Q4BlockCheck::Now { tensor_name },
+        )?;
+        let blocks_checked = blocks_checked.ok_or_else(|| {
+            format!(
+                "{}: block metadata was not checked before no-copy GPU publication",
+                path.display()
+            )
+        })?;
 
         // The mmap pointer is page-aligned (guaranteed by the OS).  We create the Metal
         // buffer over the *whole* file so the pointer alignment requirement of
@@ -1200,7 +1223,12 @@ mod inner {
         );
         buf.set_label(label);
 
-        Ok(Q4WeightBuf::from_mmap(buf, header.payload_offset, mmap))
+        Ok(Q4WeightBuf::from_mmap(
+            buf,
+            header.payload_offset,
+            mmap,
+            blocks_checked,
+        ))
     }
 
     /// A Q3-quantized weight buffer (ADR-072 P1, #420 Stage 2), paired with the
@@ -14430,9 +14458,12 @@ mod inner {
         /// Load raw Q4 block bytes from a `.q4` file (strips the file header).
         ///
         /// Returns the `Q4Block` bytes and the `original_len` (for validation).
-        fn load_q4_raw_bytes(path: &std::path::Path) -> Result<(Vec<u8>, usize), String> {
-            use crate::weights::q4_weights::load_q4_file;
-            let tensor = load_q4_file(path)
+        fn load_q4_raw_bytes(
+            path: &std::path::Path,
+            expected_shape: &[usize],
+        ) -> Result<(Vec<u8>, usize), String> {
+            use crate::weights::q4_weights::load_q4_file_checked;
+            let tensor = load_q4_file_checked(path, expected_shape)
                 .map_err(|e| format!("failed to load Q4 file {}: {e}", path.display()))?;
             let n_blocks = tensor.blocks.len();
             // Re-serialise the blocks into raw bytes (20 bytes each, Q4Block is
@@ -14484,32 +14515,19 @@ mod inner {
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
             use crate::weights::q4_weights::{
-                q4_f16_to_f32, q4_f32_to_f16, read_q4_header, validate_q4_header_payload_bounds,
+                Q4BlockCheck, open_and_mmap_q4_file, q4_f16_to_f32, q4_f32_to_f16,
+                validate_q4_block_metadata,
             };
-            let file = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            let header = read_q4_header(&file)
-                .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-            if header.shape != expected_shape {
-                return Err(format!(
-                    "{}: MoE tensor has shape {:?}, expected {expected_shape:?} — refusing to \
-                     load (a mismatched/transposed weight file has the same element count but \
-                     a different layout, which would silently corrupt or overrun the GPU MoE \
-                     dispatch instead of failing to load)",
-                    path.display(),
-                    header.shape
-                ));
-            }
-            let file_len = file
-                .metadata()
-                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-                .len();
-            validate_q4_header_payload_bounds(&header, file_len, path)
-                .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-            // SAFETY: read-only mmap of a file this process does not mutate
-            // while running (same invariant as `mmap_q4_weight`).
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            // Per-block scale/bias is validated inside the dequant loop below,
+            // which already reads every block, instead of by a separate pass
+            // over the same bytes.
+            let (header, mmap, _) = open_and_mmap_q4_file(
+                path,
+                Some(expected_shape),
+                Q4BlockCheck::InCallerTraversal {
+                    traversal: "load_q4_mmap_dequant_f16 dequant loop",
+                },
+            )?;
             let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
                 format!(
                     "{}: payload_offset {} beyond mapped length {}",
@@ -14518,10 +14536,19 @@ mod inner {
                     mmap.len()
                 )
             })?;
+            let source = path.display().to_string();
+            let tensor_name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("native Q4 tensor");
             let mut f16_data: Vec<u16> = Vec::with_capacity(header.original_len);
-            for chunk in payload.chunks_exact(20) {
-                let scale = q4_f16_to_f32(u16::from_ne_bytes([chunk[0], chunk[1]]));
-                let bias = q4_f16_to_f32(u16::from_ne_bytes([chunk[2], chunk[3]]));
+            for (index, chunk) in payload.chunks_exact(20).enumerate() {
+                let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                let bias_bits = u16::from_ne_bytes([chunk[2], chunk[3]]);
+                validate_q4_block_metadata(&source, tensor_name, index, scale_bits, bias_bits)
+                    .map_err(|e| e.to_string())?;
+                let scale = q4_f16_to_f32(scale_bits);
+                let bias = q4_f16_to_f32(bias_bits);
                 for b in 0..16 {
                     let byte_val = chunk[4 + b];
                     f16_data.push(q4_f32_to_f16((byte_val & 0x0f) as f32 * scale + bias));
@@ -14556,32 +14583,16 @@ mod inner {
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
             use crate::weights::q4_weights::{
-                dequantize_row_q4_0, read_q4_header, validate_q4_header_payload_bounds,
+                Q4BlockCheck, dequantize_row_q4_0, open_and_mmap_q4_file,
+                validate_q4_block_metadata,
             };
-            let file = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            let header = read_q4_header(&file)
-                .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-            if header.shape != expected_shape {
-                return Err(format!(
-                    "{}: MoE tensor has shape {:?}, expected {expected_shape:?} - refusing to \
-                     load (a mismatched/transposed weight file has the same element count but \
-                     a different layout, which would silently corrupt or overrun the GPU MoE \
-                     dispatch instead of failing to load)",
-                    path.display(),
-                    header.shape
-                ));
-            }
-            let file_len = file
-                .metadata()
-                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-                .len();
-            validate_q4_header_payload_bounds(&header, file_len, path)
-                .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-            // SAFETY: read-only mmap of a file this process does not mutate
-            // while running (same invariant as `mmap_q4_weight`).
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            let (header, mmap, _) = open_and_mmap_q4_file(
+                path,
+                Some(expected_shape),
+                Q4BlockCheck::InCallerTraversal {
+                    traversal: "load_q4_mmap_dequant_f32 scale/bias loop",
+                },
+            )?;
             let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
                 format!(
                     "{}: payload_offset {} beyond mapped length {}",
@@ -14590,6 +14601,22 @@ mod inner {
                     mmap.len()
                 )
             })?;
+            // Only the two small CPU-read MoE scalar gates route through this
+            // f32 path (router gate, shared-expert gate — see doc comment
+            // above); `dequantize_row_q4_0` is shared with non-ingress call
+            // sites and cannot itself validate, so scale/bias metadata is
+            // checked here against the same already-mapped bytes it dequantizes.
+            let source = path.display().to_string();
+            let tensor_name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("native Q4 tensor");
+            for (index, chunk) in payload.chunks_exact(20).enumerate() {
+                let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                let bias_bits = u16::from_ne_bytes([chunk[2], chunk[3]]);
+                validate_q4_block_metadata(&source, tensor_name, index, scale_bits, bias_bits)
+                    .map_err(|e| e.to_string())?;
+            }
             let values = dequantize_row_q4_0(payload, header.original_len);
             Ok(make_buffer(device, &values, label))
         }
@@ -14945,8 +14972,6 @@ mod inner {
             cfg: &Qwen35Config,
             max_cache_len: usize,
         ) -> Result<Self, String> {
-            use crate::weights::q4_weights::{load_f16_tensor_file, load_q4_file};
-
             let device =
                 Device::system_default().ok_or_else(|| "No Metal device found".to_string())?;
 
@@ -15199,6 +15224,7 @@ mod inner {
             let kv_dim = cfg.full_kv_dim();
             let qkv_dim = cfg.linear_qkv_dim();
             let output_dim = cfg.linear_output_dim();
+            let value_heads = cfg.linear_num_value_heads();
             let inter = cfg.intermediate_size;
 
             // ----------------------------------------------------------------
@@ -15213,20 +15239,24 @@ mod inner {
             // Helper: mmap a Q4 file and create a Metal no-copy buffer.
             // Zero CPU copies — GPU pages fault lazily from mmap'd file.
             // ----------------------------------------------------------------
-            let load_q4_buf = |name: &str, label: &str| -> Result<Q4WeightBuf, String> {
+            let load_q4_buf = |name: &str,
+                               label: &str,
+                               expected_shape: &[usize]|
+             -> Result<Q4WeightBuf, String> {
                 let t = std::time::Instant::now();
                 let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                let result = mmap_q4_weight(&device, &path, label);
+                let result = mmap_q4_weight(&device, &path, label, expected_shape);
                 dur_c_cell.set(dur_c_cell.get() + t.elapsed());
                 result
             };
-            let load_q4_raw_timed = |name: &str| -> Result<(Vec<u8>, usize), String> {
-                let t = std::time::Instant::now();
-                let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                let result = Self::load_q4_raw_bytes(&path);
-                dur_c_cell.set(dur_c_cell.get() + t.elapsed());
-                result
-            };
+            let load_q4_raw_timed =
+                |name: &str, expected_shape: &[usize]| -> Result<(Vec<u8>, usize), String> {
+                    let t = std::time::Instant::now();
+                    let path = Self::q4_tensor_path(q4_dir, name, "q4");
+                    let result = Self::load_q4_raw_bytes(&path, expected_shape);
+                    dur_c_cell.set(dur_c_cell.get() + t.elapsed());
+                    result
+                };
             let make_fused_q4_buf = |gate_raw: &[u8], up_raw: &[u8], label: &str| -> Q4WeightBuf {
                 let combined_size = gate_raw.len() + up_raw.len();
                 let buf =
@@ -15247,11 +15277,15 @@ mod inner {
             // ----------------------------------------------------------------
             // Helper: load an F16 file, convert to f32, create a Metal f32 buffer.
             // ----------------------------------------------------------------
-            let load_f16_buf_f32 = |name: &str, label: &str| -> Result<Buffer, String> {
+            let load_f16_buf_f32 = |name: &str,
+                                    label: &str,
+                                    expected_shape: &[usize]|
+             -> Result<Buffer, String> {
                 let t = std::time::Instant::now();
                 let path = Self::q4_tensor_path(q4_dir, name, "f16");
-                let (values, _shape) = load_f16_tensor_file(&path)
-                    .map_err(|e| format!("failed to load f16 file {}: {e}", path.display()))?;
+                let (values, _shape) =
+                    crate::weights::q4_weights::load_f16_tensor_file_checked(&path, expected_shape)
+                        .map_err(|e| format!("failed to load f16 file {}: {e}", path.display()))?;
                 let buf = make_buffer(&device, &values, label);
                 dur_b_cell.set(dur_b_cell.get() + t.elapsed());
                 Ok(buf)
@@ -15341,10 +15375,12 @@ mod inner {
                     input_layernorm: load_f16_buf_f32(
                         &format!("{prefix}.input_layernorm.weight"),
                         &format!("L{i}.in_norm"),
+                        &[hidden],
                     )?,
                     post_attention_layernorm: load_f16_buf_f32(
                         &format!("{prefix}.post_attention_layernorm.weight"),
                         &format!("L{i}.post_norm"),
+                        &[hidden],
                     )?,
                     ffn: if cfg.is_moe() {
                         // MoE checkpoint: routed + shared expert tensors live under
@@ -15355,13 +15391,14 @@ mod inner {
                         // `mlp.{gate,up,down}_proj.weight` files do not exist for this layer.
                         Self::load_moe_ffn_q4(&device, q4_dir, cfg, &prefix, i)?
                     } else {
-                        let (gate_raw, gate_len) =
-                            load_q4_raw_timed(&format!("{prefix}.mlp.gate_proj.weight"))?;
-                        let (up_raw, up_len) =
-                            load_q4_raw_timed(&format!("{prefix}.mlp.up_proj.weight"))?;
-                        debug_assert_eq!(gate_len, cfg.intermediate_size * cfg.hidden_size);
-                        debug_assert_eq!(up_len, cfg.intermediate_size * cfg.hidden_size);
-                        debug_assert_eq!(up_raw.len(), gate_raw.len());
+                        let (gate_raw, _) = load_q4_raw_timed(
+                            &format!("{prefix}.mlp.gate_proj.weight"),
+                            &[inter, hidden],
+                        )?;
+                        let (up_raw, _) = load_q4_raw_timed(
+                            &format!("{prefix}.mlp.up_proj.weight"),
+                            &[inter, hidden],
+                        )?;
                         MetalFfnWeights::Dense {
                             gate_up_proj: make_fused_q4_buf(
                                 &gate_raw,
@@ -15371,6 +15408,7 @@ mod inner {
                             down_proj: load_q4_buf(
                                 &format!("{prefix}.mlp.down_proj.weight"),
                                 &format!("L{i}.down.q4"),
+                                &[hidden, inter],
                             )?,
                         }
                     },
@@ -15381,39 +15419,50 @@ mod inner {
                         q_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.q_proj.weight"),
                             &format!("L{i}.full.q.q4"),
+                            &[2 * q_dim, hidden],
                         )?,
                         k_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.k_proj.weight"),
                             &format!("L{i}.full.k.q4"),
+                            &[kv_dim, hidden],
                         )?,
                         v_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.v_proj.weight"),
                             &format!("L{i}.full.v.q4"),
+                            &[kv_dim, hidden],
                         )?,
                         o_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.o_proj.weight"),
                             &format!("L{i}.full.o.q4"),
+                            &[hidden, q_dim],
                         )?,
                         // q_norm and k_norm are norm.weight → stored as .f16
                         q_norm: load_f16_buf_f32(
                             &format!("{prefix}.self_attn.q_norm.weight"),
                             &format!("L{i}.full.q_norm"),
+                            &[cfg.head_dim],
                         )?,
                         k_norm: load_f16_buf_f32(
                             &format!("{prefix}.self_attn.k_norm.weight"),
                             &format!("L{i}.full.k_norm"),
+                            &[cfg.head_dim],
                         )?,
                     })
                 } else {
                     // in_proj_b and in_proj_a are quantized on disk (ends_with _proj_b.weight /
                     // _proj_a.weight → Q4), but in new() they become f16 Metal buffers for the
                     // CPU GDN recurrence path.  Load Q4 → dequantize → f16 Metal buffer.
-                    let load_q4_as_f16_buf = |name: &str, label: &str| -> Result<Buffer, String> {
+                    let load_q4_as_f16_buf = |name: &str,
+                                              label: &str,
+                                              expected_shape: &[usize]|
+                     -> Result<Buffer, String> {
                         let t = std::time::Instant::now();
                         let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                        let tensor = load_q4_file(&path).map_err(|e| {
-                            format!("failed to load Q4 file {}: {e}", path.display())
-                        })?;
+                        let tensor =
+                            crate::weights::q4_weights::load_q4_file_checked(&path, expected_shape)
+                                .map_err(|e| {
+                                    format!("failed to load Q4 file {}: {e}", path.display())
+                                })?;
                         let buf = Self::make_buffer_f16_from_q4(&device, &tensor, label);
                         dur_b_cell.set(dur_b_cell.get() + t.elapsed());
                         Ok(buf)
@@ -15423,10 +15472,12 @@ mod inner {
                         in_proj_qkv: load_q4_buf(
                             &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
                             &format!("L{i}.gdn.qkv.q4"),
+                            &[qkv_dim, hidden],
                         )?,
                         in_proj_z: load_q4_buf(
                             &format!("{prefix}.linear_attn.in_proj_z.weight"),
                             &format!("L{i}.gdn.z.q4"),
+                            &[output_dim, hidden],
                         )?,
                         in_proj_qkvz: {
                             let t_qkvz = std::time::Instant::now();
@@ -15435,6 +15486,7 @@ mod inner {
                                     &device,
                                     &merged_path,
                                     &format!("L{i}.gdn.qkvz.q4"),
+                                    &[qkv_dim + output_dim, hidden],
                                 )?,
                                 _ => {
                                     // Fallback: model dir is read-only — CPU concat path
@@ -15449,8 +15501,10 @@ mod inner {
                                         &format!("{pfx}.linear_attn.in_proj_z.weight"),
                                         "q4",
                                     );
-                                    let (mut raw, _) = Self::load_q4_raw_bytes(&qkv_p)?;
-                                    let (z_raw, _) = Self::load_q4_raw_bytes(&z_p)?;
+                                    let (mut raw, _) =
+                                        Self::load_q4_raw_bytes(&qkv_p, &[qkv_dim, hidden])?;
+                                    let (z_raw, _) =
+                                        Self::load_q4_raw_bytes(&z_p, &[output_dim, hidden])?;
                                     raw.extend_from_slice(&z_raw);
                                     Q4WeightBuf::from_buffer(Self::make_buffer_from_q4_raw(
                                         &device,
@@ -15466,31 +15520,45 @@ mod inner {
                         in_proj_b: load_q4_as_f16_buf(
                             &format!("{prefix}.linear_attn.in_proj_b.weight"),
                             &format!("L{i}.gdn.b.f16"),
+                            &[value_heads, hidden],
                         )?,
                         in_proj_a: load_q4_as_f16_buf(
                             &format!("{prefix}.linear_attn.in_proj_a.weight"),
                             &format!("L{i}.gdn.a.f16"),
+                            &[value_heads, hidden],
                         )?,
                         // Small scalars: f32 Metal buffers (CPU-read in GDN recurrence)
                         a_log: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.A_log"),
                             &format!("L{i}.gdn.a_log"),
+                            &[value_heads],
                         )?,
                         dt_bias: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.dt_bias"),
                             &format!("L{i}.gdn.dt_bias"),
+                            &[value_heads],
                         )?,
                         conv1d_weight: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.conv1d.weight"),
                             &format!("L{i}.gdn.conv1d"),
+                            &[qkv_dim, 1, cfg.linear_conv_kernel_dim],
                         )?,
                         norm_weight: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.norm.weight"),
                             &format!("L{i}.gdn.norm"),
+                            // Per-HEAD RMSNorm: one gain per value-head element,
+                            // not one per output element. `linear_output_dim()` is
+                            // `linear_num_value_heads() * linear_value_head_dim`, so
+                            // expecting it here demands the full GDN output width and
+                            // rejects the checkpoint's own [linear_value_head_dim]
+                            // tensor. The safetensors loader has always expected
+                            // `cfg.linear_value_head_dim` for this same tensor.
+                            &[cfg.linear_value_head_dim],
                         )?,
                         out_proj: load_q4_buf(
                             &format!("{prefix}.linear_attn.out_proj.weight"),
                             &format!("L{i}.gdn.out.q4"),
+                            &[hidden, output_dim],
                         )?,
                     })
                 };
@@ -15507,19 +15575,28 @@ mod inner {
             // ----------------------------------------------------------------
             let embed_name = "model.language_model.embed_tokens.weight";
             let embed_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
-            let embed_tensor = load_q4_file(&embed_path)
-                .map_err(|e| format!("failed to load embed_tokens Q4 file: {e}"))?;
+            let embed_tensor = crate::weights::q4_weights::load_q4_file_checked(
+                &embed_path,
+                &[cfg.vocab_size, hidden],
+            )
+            .map_err(|e| format!("failed to load embed_tokens Q4 file: {e}"))?;
             // f16 buffer for CPU embedding lookup
             let embed_tokens =
                 Self::make_buffer_f16_from_q4(&device, &embed_tensor, "embed_tokens.f16");
             // Q4 buffer for GPU logits GEMV — mmap no-copy
             let embed_q4_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
-            let embed_tokens_q8 = mmap_q4_weight(&device, &embed_q4_path, "embed_tokens.q4")?;
+            let embed_tokens_q8 = mmap_q4_weight(
+                &device,
+                &embed_q4_path,
+                "embed_tokens.q4",
+                &[cfg.vocab_size, hidden],
+            )?;
 
             // ----------------------------------------------------------------
             // final_norm: stored as .f16 (it's a norm.weight tensor)
             // ----------------------------------------------------------------
-            let final_norm = load_f16_buf_f32("model.language_model.norm.weight", "final_norm")?;
+            let final_norm =
+                load_f16_buf_f32("model.language_model.norm.weight", "final_norm", &[hidden])?;
 
             // ----------------------------------------------------------------
             // lm_head: only present when tie_word_embeddings = false.
@@ -15535,7 +15612,12 @@ mod inner {
             // ----------------------------------------------------------------
             let embed_tokens_q8 = if !cfg.tie_word_embeddings {
                 let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
-                mmap_q4_weight(&device, &lm_head_path, "lm_head.q4")?
+                mmap_q4_weight(
+                    &device,
+                    &lm_head_path,
+                    "lm_head.q4",
+                    &[cfg.vocab_size, hidden],
+                )?
             } else {
                 embed_tokens_q8
             };
@@ -20578,7 +20660,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("write original_len");
             file.flush().expect("flush q4 header");
 
-            let result = mmap_q4_weight(&device, &path, "truncated-payload-proof");
+            let result = mmap_q4_weight(&device, &path, "truncated-payload-proof", &[64]);
 
             assert!(
                 result.is_err(),
@@ -20608,7 +20690,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             file.write_all(&[0u8; 19]).expect("write short payload");
             file.flush().expect("flush truncated payload");
 
-            let result = mmap_q4_weight(&device, &path, "one-byte-short-proof");
+            let result = mmap_q4_weight(&device, &path, "one-byte-short-proof", &[32]);
 
             assert!(
                 result.is_err(),
@@ -20628,7 +20710,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let tensor = crate::weights::q4_weights::Q4Tensor {
                 blocks: vec![
                     crate::weights::q4_weights::Q4Block {
-                        scale: 0,
+                        scale: 0x3C00,
                         bias: 0,
                         packed: [0u8; 16],
                     };
@@ -20640,7 +20722,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             crate::weights::q4_weights::save_q4_file(&path, &tensor)
                 .expect("save well-formed q4 file");
 
-            let result = mmap_q4_weight(&device, &path, "full-payload-accept");
+            let result = mmap_q4_weight(&device, &path, "full-payload-accept", &[64]);
 
             assert!(
                 result.is_ok(),
@@ -21334,7 +21416,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             write_tiny_q4_fixture(
                 dir,
                 &format!("{prefix}.self_attn.q_proj.weight"),
-                &[q_dim, hidden],
+                &[2 * q_dim, hidden],
             );
             write_tiny_q4_fixture(
                 dir,
@@ -23256,6 +23338,74 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 err.contains("shape"),
                 "error must name the shape mismatch so it's diagnosable, got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_transposed_embedding_header() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            write_tiny_q4_fixture(
+                dir,
+                "model.language_model.embed_tokens.weight",
+                &[cfg.hidden_size, cfg.vocab_size],
+            );
+
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(dir, std::path::Path::new("/dev/null"), &cfg, 16)
+            else {
+                panic!("from_q4_dir must reject a same-numel transposed embedding tensor");
+            };
+            assert!(
+                err.contains("expected") && err.contains("shape"),
+                "error must report configured embedding geometry, got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_rank_mismatched_f16_norm_header() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            write_tiny_f16_fixture(
+                dir,
+                "model.language_model.layers.0.input_layernorm.weight",
+                &[1, cfg.hidden_size],
+            );
+
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(dir, std::path::Path::new("/dev/null"), &cfg, 16)
+            else {
+                panic!("from_q4_dir must reject an F16 norm with mismatched rank");
+            };
+            assert!(
+                err.contains("expected") && err.contains("shape"),
+                "error must report configured F16 geometry, got: {err}"
             );
         }
 

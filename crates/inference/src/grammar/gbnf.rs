@@ -546,6 +546,26 @@ pub fn parse_gbnf(gbnf: &str) -> Result<CompiledGrammar, GbnfError> {
     let builder = parser.parse_grammar()?;
     let mut grammar = builder.build();
 
+    // Completeness check (issue #1079): `parse_base_item` reserves a rule id
+    // for every identifier reference before it is known whether that rule is
+    // ever defined (`::=`); a name that is referenced but never defined is
+    // left with empty `alts`. `pda.rs`'s `advance_byte` treats an empty-alts
+    // rule as an intentional epsilon, but there is no GBNF syntax that
+    // legitimately produces one: every parsed `rule = IDENT "::=" expr`
+    // reaches `set_alts` with at least one alt, even for an explicitly empty
+    // RHS (`parse_expr` always pushes at least `parse_alt()`'s result, which
+    // may itself be the empty sequence `vec![]` — that is one alt containing
+    // zero symbols, not zero alts). So `alts.is_empty()` here can only mean
+    // "reserved by a reference, never defined" — a typo'd or missing rule
+    // name — and must be rejected rather than silently treated as an
+    // intentional epsilon rule that would swallow the reference.
+    if let Some(undefined) = grammar.rules.iter().find(|r| r.alts.is_empty()) {
+        return Err(GbnfError(format!(
+            "undefined rule referenced: '{}'",
+            undefined.name
+        )));
+    }
+
     // Ensure root is at index 0.
     let root_pos = grammar
         .rules
@@ -681,6 +701,36 @@ mod tests {
     #[test]
     fn gbnf_no_root_returns_error() {
         assert!(parse_gbnf("foo ::= \"bar\"\n").is_err());
+    }
+
+    /// issue #1079: a reference to a rule name that is never given a `::=`
+    /// definition must be rejected at compile time, naming the undefined rule
+    /// — not silently compiled to an epsilon match for the reference.
+    ///
+    /// Mutation guard: removing the completeness check in `parse_gbnf` makes
+    /// this `Ok` (the reserved-but-undefined `missing_rule` id has empty
+    /// `alts`, which `pda.rs` treats as epsilon), so `expect_err` panics.
+    #[test]
+    fn gbnf_undefined_rule_reference_is_rejected() {
+        let err = parse_gbnf("root ::= missing_rule\n")
+            .expect_err("a reference to an undefined rule must not compile");
+        assert!(
+            err.0.contains("missing_rule"),
+            "error must name the undefined rule, got: {}",
+            err.0
+        );
+    }
+
+    /// issue #1079 (the other direction): `?` desugars into an anon rule with
+    /// TWO alternatives (`[x]` and the empty sequence `[]`) — its `alts`
+    /// vector has length 2, so it is not `alts.is_empty()` and must NOT be
+    /// flagged by the undefined-rule completeness check. Only a rule that was
+    /// `reserve`d and never `set_alts` (zero alternatives, not one empty
+    /// alternative) is a genuine undefined reference.
+    #[test]
+    fn gbnf_legitimate_epsilon_rule_not_flagged_undefined() {
+        let g = parse_gbnf("root ::= \"x\"?\n").unwrap();
+        assert!(accepts(&g, b"x"));
     }
 
     #[test]

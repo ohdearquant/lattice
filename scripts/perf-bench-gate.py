@@ -215,9 +215,15 @@ def render_report(results: list[BenchResult], arch: str,
 
     lines = [f"### `{arch}` — perf regression report\n"]
     if fails:
-        lines.append(f"**❌ {len(fails)} FAIL** (regression >{FAIL_PCT}% confirmed by 95% CI)")
+        lines.append(
+            f"**❌ {len(fails)} FAIL** (regression >{FAIL_PCT}% — lower bound of Criterion's "
+            "two-sided 95% CI, i.e. about a 97.5% one-sided level, not a calibrated one-sided 95% test)"
+        )
     if warns:
-        lines.append(f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% confirmed)")
+        lines.append(
+            f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% by the same "
+            "two-sided-95%-CI lower bound)"
+        )
     if wins:
         lines.append(f"**🚀 {len(wins)} confirmed improvement**")
     if not (fails or warns or wins):
@@ -263,7 +269,7 @@ def render_report(results: list[BenchResult], arch: str,
     lines.append("\n</details>\n")
     lines.append(
         f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
-        f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails. Override via PR label `bench-allow-regression`._"
+        f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
     )
     if informational_groups:
         lines.append(
@@ -418,6 +424,8 @@ def run_selftest() -> int:
             failures.append("informational-groups: real FAIL missing from rendered report")
         if "ℹ️" not in report or "grp_f/noisy_fail" not in report:
             failures.append("informational-groups: noisy FAIL not shown in informational section")
+        if "bench-allow-regression" in report:
+            failures.append("rendered report advertises an unsupported label override")
 
         # lattice#714 / lattice#1060: the shell-side manifest handoff,
         # exercised end-to-end against the real helper and the real

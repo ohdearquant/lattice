@@ -15,7 +15,35 @@ set -euo pipefail
 
 BODY=$(cat)
 
-if ! printf '%s' "$BODY" | grep -q '[^[:space:]]'; then
+# Every read of the description below goes through a herestring, never
+# `printf ... | reader`. Under `set -o pipefail` that pipeline shape turns a
+# LARGE description into a false rejection:
+#
+#   `grep -q` and this file's `awk` both exit as soon as they have their answer.
+#   Once the reader is gone, the writing `printf` takes SIGPIPE/EPIPE and exits
+#   non-zero, `pipefail` promotes that to the pipeline's status, and the gate
+#   reports whatever its failure branch says. A short description never trips it,
+#   because printf's whole write fits in the pipe buffer and completes before the
+#   reader exits; past roughly the buffer size printf blocks and the race is lost
+#   every time.
+#
+# So the gate's outcome depended on the description's LENGTH, and the failure was
+# silent about that: a compliant PR with a long body was told "empty description",
+# which sends the author to rewrite a body that was already correct. Observed on a
+# PR whose body carried six bench-compare sections in 65KB.
+#
+# A herestring makes the reader's stdin a temp file with no writer to signal, so
+# an early exit is just an early exit. Fail-closed direction is preserved: a read
+# error still surfaces, it just can no longer be manufactured by input size.
+#
+# The readers themselves are unchanged from the pipeline version. Doing the same
+# work in the shell instead (`[[ -z "${BODY//[[:space:]]/}" ]]`) removes a
+# subprocess but is quadratic-ish on bash 3.2, which is what macOS ships as
+# /bin/bash and what the local usage line above invokes: a valid 16KB
+# description took 3.2s that way versus 0.11s under bash 5, and a 65KB one did
+# not finish inside half a minute. The defect being fixed here is the pipe, so
+# the pipe is the only thing that changes.
+if ! grep -q '[^[:space:]]' <<< "$BODY"; then
   echo "empty description; a bench-compare disposition is required" >&2
   exit 1
 fi
@@ -75,7 +103,7 @@ fi
 # that opens AFTER a visible bench-compare heading still counts as section
 # content, because a real bench table is often fenced; masking suppresses heading
 # detection, not membership in an already-open section.
-SECTION=$(printf '%s' "$BODY" | awk '
+SECTION=$(awk '
   function level(s,   m) {
     if (match(s, /^#{1,6}([ \t]|$)/)) {
       m = substr(s, 1, RLENGTH); sub(/[ \t]*$/, "", m); return length(m)
@@ -169,9 +197,11 @@ SECTION=$(printf '%s' "$BODY" | awk '
     if (!found && lv > 0 && tolower(line) ~ /bench-?compare/) { found = 1; start_lv = lv }
     if (found) print line
   }
-')
+' <<< "$BODY")
 
-if ! printf '%s' "$SECTION" | grep -q '[^[:space:]]'; then
+# This awk exits early at the section's closing heading, so it is the same
+# early-exiting reader as the greps; see the note at the top.
+if ! grep -q '[^[:space:]]' <<< "$SECTION"; then
   echo "no bench-compare disposition heading found in the description" >&2
   echo "put the numbers under a heading, e.g.  ## bench-compare disposition" >&2
   exit 1
@@ -181,8 +211,8 @@ fi
 # with nothing beneath it cannot satisfy the gate. Keep a spaced copy for
 # marker matching (markers like "no change" contain spaces) and a stripped
 # copy for the length floor.
-BODYTEXT=$(printf '%s' "$SECTION" | tail -n +2)
-CONTENT=$(printf '%s' "$BODYTEXT" | tr -d '[:space:]')
+BODYTEXT=$(tail -n +2 <<< "$SECTION")
+CONTENT=$(tr -d '[:space:]' <<< "$BODYTEXT")
 
 # The blessed minimal dispositions are legitimately terse and fall well
 # under a raw length floor: the no-change one-liner CLAUDE.md blesses
@@ -200,7 +230,7 @@ CONTENT=$(printf '%s' "$BODYTEXT" | tr -d '[:space:]')
 # pre-PR run on macOS); grep -qi tests presence only, so consuming a boundary
 # char is harmless.
 MARKERS='(^|[^[:alnum:]_])(n/a|not required|not applicable|no( measurable)? change|no perf(ormance)? change|compiled out|identical effective source)($|[^[:alnum:]_])'
-if printf '%s' "$BODYTEXT" | grep -qiE "$MARKERS"; then
+if grep -qiE "$MARKERS" <<< "$BODYTEXT"; then
   echo "bench-compare disposition present (explicit disposition marker; ${#CONTENT} chars)"
   exit 0
 fi

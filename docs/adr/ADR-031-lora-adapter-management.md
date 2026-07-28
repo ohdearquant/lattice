@@ -114,8 +114,9 @@ let adapter = LoraAdapter::from_safetensors(path)?;
 let hook: Box<dyn LoraHook> = Box::new(adapter.clone());
 qwen_model.set_lora(hook);
 
-// BERT/cross-encoder — pass hook per call (ADR-057 D1)
-let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter);
+// BERT/cross-encoder — pass hook per call (ADR-057 D1); geometry is
+// validated against the model before scoring, so this returns Result
+let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter)?;
 ```
 
 The `LoraHook` trait is defined in `lattice_inference::lora_hook` (not re-exported at the crate root). The `inference-hook` feature on `lattice-tune` provides `impl LoraHook for LoraAdapter` behind `#[cfg(feature = "inference-hook")]`.
