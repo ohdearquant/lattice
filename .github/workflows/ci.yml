@@ -5,7 +5,7 @@ name: CI
 # workflow never even runs leaves a PR or queue entry stuck on "Expected,
 # waiting for status to be reported" forever. So this workflow always
 # triggers on both. Docs-only changes are instead handled by gating `ci`,
-# `feature-matrix`, `bench-compile`, and `msrv` on the `changes` job below.
+# `feature-matrix`, and `msrv` on the `changes` job below.
 #
 # `ci` and `feature-matrix` are matrix jobs, so their required-check contexts
 # come from matrix expansion ("CI (macos-latest)", "feature-matrix
@@ -134,6 +134,18 @@ jobs:
           cargo clean -p lattice-tune 2>/dev/null || true
           cargo clean -p lattice-transport 2>/dev/null || true
       - run: ./scripts/ci.sh
+      # Bench compilation, folded in from the former standalone `bench-compile`
+      # job. It only ever ran on macOS (metal-gpu), so it maps onto this matrix
+      # leg exactly. Folding it here costs one fewer macOS runner slot per PR
+      # and reuses this job's already-warm dependency build instead of paying
+      # for a second cold one under its own cache key. The commands are
+      # unchanged, and a failure still propagates to `ci-gate` through this job.
+      - name: inference benches (bench-internals) — macOS only
+        if: matrix.os == 'macos-latest'
+        run: cargo bench -p lattice-inference --features bench-internals,metal-gpu,f16 --no-run
+      - name: embed benches — macOS only
+        if: matrix.os == 'macos-latest'
+        run: cargo bench -p lattice-embed --no-run
 
   # The default `cargo test/clippy --workspace` only ever compiles DEFAULT
   # features. Feature-gated code (safetensors serialization, the inference-hook
@@ -439,24 +451,6 @@ jobs:
   # with `quarot_rotation_seed`) only surfaces when the benches are compiled.
   # Runs on Apple Silicon because the inference benches are NEON (aarch64) code;
   # on x86 they are cfg'd out and the gate would be vacuous.
-  bench-compile:
-    name: bench-compile
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: bench-compile
-          cache-on-failure: true
-      - name: inference benches (bench-internals)
-        run: cargo bench -p lattice-inference --features bench-internals,metal-gpu,f16 --no-run
-      - name: embed benches
-        run: cargo bench -p lattice-embed --no-run
 
   # MSRV gate (#568). Every other job pins 1.94.1, so an API that stabilized in
   # 1.94 compiles green across all of CI while breaking every user on an older
@@ -693,8 +687,8 @@ jobs:
           feature-group: default-features
 
   # REQUIRED status check (see the rollout note at the top of this file).
-  # Always runs, always reports. `ci`, `feature-matrix`, `bench-compile`, and
-  # `msrv` are matrix and/or docs-gated, so none of them is individually a
+  # Always runs, always reports. `ci`, `feature-matrix`, and `msrv` are matrix
+  # and/or docs-gated, so none of them is individually a
   # safe required context: a matrix job skipped at job level never creates
   # its per-combination check runs at all, and a plain gated job that skips
   # reports success even if `changes` itself blew up. This job passes when
@@ -703,7 +697,7 @@ jobs:
   # `app-binaries-gate` in app-binaries.yml.
   ci-gate:
     name: ci-gate
-    needs: [changes, ci, feature-matrix, bench-compile, msrv, semver-checks]
+    needs: [changes, ci, feature-matrix, msrv, semver-checks]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -713,10 +707,9 @@ jobs:
           CODE="${{ needs.changes.outputs.code }}"
           CI_RESULT="${{ needs.ci.result }}"
           FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
-          BENCH_COMPILE_RESULT="${{ needs.bench-compile.result }}"
           MSRV_RESULT="${{ needs.msrv.result }}"
           SEMVER_RESULT="${{ needs.semver-checks.result }}"
-          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT bench-compile=$BENCH_COMPILE_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed, failing closed."
             exit 1
@@ -733,10 +726,6 @@ jobs:
             echo "::error::feature-matrix did not succeed (result=$FEATURE_MATRIX_RESULT)."
             exit 1
           fi
-          if [ "$BENCH_COMPILE_RESULT" != "success" ]; then
-            echo "::error::bench-compile did not succeed (result=$BENCH_COMPILE_RESULT)."
-            exit 1
-          fi
           if [ "$MSRV_RESULT" != "success" ]; then
             echo "::error::msrv did not succeed (result=$MSRV_RESULT)."
             exit 1
@@ -745,5 +734,5 @@ jobs:
             echo "::error::semver-checks did not succeed (result=$SEMVER_RESULT)."
             exit 1
           fi
-          echo "Code changed; ci, feature-matrix, bench-compile, msrv, and semver-checks all PASSED."
+          echo "Code changed; ci, feature-matrix, msrv, and semver-checks all PASSED."
           exit 0
