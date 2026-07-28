@@ -261,7 +261,7 @@ A subsequent adversarial statistical review of this design found the confidence-
 path (D3 "Why 7% on CI-lower-bound" and Rollout step 5: on persistent false positives,
 tighten the CI confidence from 95% to 99% "rather than weakening the 7% sensitivity")
 to be backwards. At a fixed threshold, requiring higher confidence widens the margin the
-lower bound must clear before tripping, which *reduces* power against genuine regressions;
+lower bound must clear before tripping, which _reduces_ power against genuine regressions;
 it does not preserve sensitivity. If observed flake is high, the honest levers are more
 samples per run, better runner isolation, or an explicitly raised threshold.
 

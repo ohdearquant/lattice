@@ -7,8 +7,8 @@
 
 ## Context
 
-ADR-064 classified every *existing* gate and established the promotion policy (D7). ADR-065
-governs *new feature admission*. Neither answers the question this ADR answers: **what output
+ADR-064 classified every _existing_ gate and established the promotion policy (D7). ADR-065
+governs _new feature admission_. Neither answers the question this ADR answers: **what output
 invariants must the engine hold, and which gate layer enforces each one?**
 
 Ground truth as of 2026-07-01:
@@ -16,7 +16,7 @@ Ground truth as of 2026-07-01:
 - Branch protection is ruleset `16354934`: exactly 8 required status contexts (`CI` ×3,
   `feature-matrix` ×2, `bench-compile`, `cargo-deny`, `parity-gate`), **zero required PR
   approvals**, and RepositoryRole bypass actors with `bypass_mode: always`.
-- The only *output*-correctness signal in the required set is `parity-gate`: greedy **token-ID**
+- The only _output_-correctness signal in the required set is `parity-gate`: greedy **token-ID**
   agreement with HF on 4 fixed prompts, match windows of 2–3 tokens, bf16 CPU path only.
 - Everything else that runs is advisory to merge: `rustdoc-lint`, `unwrap-in-lib-lint`,
   cargo-deny advisories, the whole of `app-binaries.yml` (no aggregator, not required),
@@ -27,15 +27,15 @@ Ten shipped-and-fixed bug classes were mapped against this gate set. Every one o
 the gates above. They do not miss randomly — they cluster into five structural blind spots of
 the current architecture:
 
-| Blind spot | Why the gate is blind | Bug classes that exploited it |
-|---|---|---|
-| **B1. Token-ID-only comparison** | `e2e_parity_check.py` diffs `hf_ids` vs `lat_ids`, never decoded text or intermediate stream frames | detokenizer added-tokens swallow (#430); streaming UTF-8 mojibake (#196) |
-| **B2. Single-path coverage** (bf16 CPU generate) | parity builds `qwen35_generate --features f16` only; Metal, Q4/QuaRot artifacts, kv_f16, and inlined bench-forward variants are never driven | RoPE pairing surviving in 3 alt-forward variants (#392/#393); Metal dispatch under-write (#384); open gaps #239/#320/#252 |
-| **B3. Well-formed-input-only** | fixed friendly prompts; no adversarial numeric fields, no malformed schemas, no poisoned weights | serve DoS via unclamped `max_tokens`/`reasoning_budget` (#435); quantizer non-finite scale-fold (#452); mask sentinel `-10000` (#373/#374); softmax fail-open family (#409–#414) |
-| **B4. Short-horizon windows** | 2–3-token match windows end before recurrent-state drift accumulates; no PPL or long-generation gate anywhere | GDN per-value-head decay indexing (#262/#427, coherent-early/garbage-late); any PPL regression preserving the first 3 greedy tokens |
-| **B5. Skip-as-green signals** | capability-gated tests early-return pass on paravirtual-GPU runners; `metal_qwen35.rs:17635`'s own comment says "gate passes vacuously" | CI Metal paravirtual-GPU false-greens; any new Metal test added without `LATTICE_METAL_TEST_ENFORCE` |
+| Blind spot                                       | Why the gate is blind                                                                                                                        | Bug classes that exploited it                                                                                                                                                    |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **B1. Token-ID-only comparison**                 | `e2e_parity_check.py` diffs `hf_ids` vs `lat_ids`, never decoded text or intermediate stream frames                                          | detokenizer added-tokens swallow (#430); streaming UTF-8 mojibake (#196)                                                                                                         |
+| **B2. Single-path coverage** (bf16 CPU generate) | parity builds `qwen35_generate --features f16` only; Metal, Q4/QuaRot artifacts, kv_f16, and inlined bench-forward variants are never driven | RoPE pairing surviving in 3 alt-forward variants (#392/#393); Metal dispatch under-write (#384); open gaps #239/#320/#252                                                        |
+| **B3. Well-formed-input-only**                   | fixed friendly prompts; no adversarial numeric fields, no malformed schemas, no poisoned weights                                             | serve DoS via unclamped `max_tokens`/`reasoning_budget` (#435); quantizer non-finite scale-fold (#452); mask sentinel `-10000` (#373/#374); softmax fail-open family (#409–#414) |
+| **B4. Short-horizon windows**                    | 2–3-token match windows end before recurrent-state drift accumulates; no PPL or long-generation gate anywhere                                | GDN per-value-head decay indexing (#262/#427, coherent-early/garbage-late); any PPL regression preserving the first 3 greedy tokens                                              |
+| **B5. Skip-as-green signals**                    | capability-gated tests early-return pass on paravirtual-GPU runners; `metal_qwen35.rs:17635`'s own comment says "gate passes vacuously"      | CI Metal paravirtual-GPU false-greens; any new Metal test added without `LATTICE_METAL_TEST_ENFORCE`                                                                             |
 
-The pattern across all ten classes: the forward pass and sampler were usually *correct* while a
+The pattern across all ten classes: the forward pass and sampler were usually _correct_ while a
 sibling layer (detokenizer, dispatch geometry, quantizer load, streaming flush, serve boundary)
 was silently wrong, and the one required output gate could not see that layer by construction.
 
@@ -44,15 +44,15 @@ was silently wrong, and the one required output gate could not see that layer by
 ### D1. Four gate layers, each owning specific blind spots
 
 Correctness gating is layered by cost and cadence. A defect class must be assigned to the
-*cheapest layer that can structurally see it* — pushing everything into E2E parity is how the
+_cheapest layer that can structurally see it_ — pushing everything into E2E parity is how the
 current blind spots formed.
 
-| Layer | What it is | Cadence | Owns blind spots |
-|---|---|---|---|
-| **L1 — Invariant contract tests** | Model-free, fail-closed unit tests asserting an invariant holds or an error is returned. No golden data, no weights. | Per-PR, inside the required `CI` contexts | B3 (input edges), B5 (via signal rules in D3) |
-| **L2 — Differential parity** | Same computation, two implementations (HF reference vs lattice; CPU vs Metal; bf16 vs quantized artifact), compared at token AND rendered-text level. | Per-PR on engine paths, via the `parity-gate` aggregator pattern | B1, B2 |
-| **L3 — Quality gates** | PPL and long-generation metrics against pinned goldens at literature-derived tolerances. Needs real hardware and minutes-to-hours. | Nightly/weekly scheduled, self-hosted (per #167); never per-PR | B4 |
-| **L4 — Adversarial/abuse gates** | Malformed and hostile input against public boundaries (`lattice_serve` HTTP fields, grammar schemas, weight files). Cheap cases run as L1 tests; fuzz campaigns run scheduled. | Split: clamp/edge cases per-PR; fuzz scheduled | B3 (hostile half) |
+| Layer                             | What it is                                                                                                                                                                     | Cadence                                                          | Owns blind spots                              |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- | --------------------------------------------- |
+| **L1 — Invariant contract tests** | Model-free, fail-closed unit tests asserting an invariant holds or an error is returned. No golden data, no weights.                                                           | Per-PR, inside the required `CI` contexts                        | B3 (input edges), B5 (via signal rules in D3) |
+| **L2 — Differential parity**      | Same computation, two implementations (HF reference vs lattice; CPU vs Metal; bf16 vs quantized artifact), compared at token AND rendered-text level.                          | Per-PR on engine paths, via the `parity-gate` aggregator pattern | B1, B2                                        |
+| **L3 — Quality gates**            | PPL and long-generation metrics against pinned goldens at literature-derived tolerances. Needs real hardware and minutes-to-hours.                                             | Nightly/weekly scheduled, self-hosted (per #167); never per-PR   | B4                                            |
+| **L4 — Adversarial/abuse gates**  | Malformed and hostile input against public boundaries (`lattice_serve` HTTP fields, grammar schemas, weight files). Cheap cases run as L1 tests; fuzz campaigns run scheduled. | Split: clamp/edge cases per-PR; fuzz scheduled                   | B3 (hostile half)                             |
 
 ### D2. The invariant catalog (L1) — every fixed bug class becomes a standing contract
 
@@ -129,7 +129,7 @@ today), and even a future typed error would currently be swallowed by `QwenModel
 silent CPU fallback (`model/qwen.rs`) rather than surfaced — building that plumbing to reject a
 runtime state that is not itself an input-validation error is the wrong shape for this layer.
 
-**The tradeoff this scoping accepts, stated plainly:** zeroing swallows numerical *defects*, not
+**The tradeoff this scoping accepts, stated plainly:** zeroing swallows numerical _defects_, not
 just legitimate masked rows. A NaN produced by an upstream bug (a corrupted weight, a bad
 kernel dispatch, a poisoned activation) that reaches this softmax becomes a silent zero row
 instead of a visible failure — the forward pass keeps running and returns `Ok` with a locally
@@ -137,7 +137,7 @@ zeroed attention contribution. This ADR does not read as "NaN in internal attent
 is not fine, and this is exactly the defect class ADR-066's own D1 table assigns to the
 differential/validation gate layer (D1's L2, `parity-gate`) and L3 quality gates, not to this L1
 zero-row contract. The zero-row finalize is the **fail-closed arithmetic guarantee** (bounded,
-deterministic, never propagates NaN/inf downstream); catching *why* a row went NaN in the first
+deterministic, never propagates NaN/inf downstream); catching _why_ a row went NaN in the first
 place is a detection problem those higher layers own, and PR #794's own regression tests
 (`fused_attention_fails_closed_on_nan_q_lane`, `fused_attention_fails_closed_on_inf_q_lane`)
 verify the arithmetic guarantee, not defect detection.
@@ -148,13 +148,13 @@ by making explicit what was previously only implicit in ADR-080's separately-lan
 
 ### D3. Signal-design rules (how gates report, not just what they check)
 
-1. **No silent skip.** A capability-gated test must report *skipped* as a distinct, visible
+1. **No silent skip.** A capability-gated test must report _skipped_ as a distinct, visible
    state or hard-fail when its capability probe fails — never early-return `ok`. New Metal
    tests default to the `LATTICE_METAL_TEST_ENFORCE` pattern instead of opting in per-test.
 2. **The aggregator pattern is canonical.** Any path-filtered required check must follow
    `parity-gate`'s always-report aggregator design (e2e-parity.yml:205-238). `app-binaries.yml`
    currently violates this: it runs on nearly every engine PR, can show red, and blocks nothing.
-   It gets an aggregator job; making that aggregator *required* is deferred pending sign-off (D6).
+   It gets an aggregator job; making that aggregator _required_ is deferred pending sign-off (D6).
 3. **Compare rendered text, not only token IDs.** `e2e_parity_check.py`'s `compare()` gains a
    decoded-text equality check alongside `hf_ids`/`lat_ids`. This single change makes the
    existing required gate structurally able to see bug classes #430 and (with a CJK prompt
@@ -181,18 +181,18 @@ by making explicit what was previously only implicit in ADR-080's separately-lan
 
 ### D5. Bug-class → gate mapping (the accountability table)
 
-| Bug class (fixed in) | Invariant (D2) | Layer | Standing test exists today? |
-|---|---|---|---|
-| Softmax fail-open (#409–#414) | 1 | L1 | Yes — hardened across sites, incl. mutation test #406 |
-| Mask sentinel (#373/#374) | 2 | L1 | Yes (flash + standard) |
-| Quantizer non-finite (#452) | 3 | L1 | Yes — 4 load-time siblings |
-| RoPE pairing variants (#392/#393) | 8 | L1/L2 | Partial — fixed, but no standing per-copy differential micro-test |
-| Detok added-tokens (#430) | 4 | L1 + D3.3 | Partial — loader test yes; required gate still token-ID-only |
-| Serve DoS (#435) | 7, 10 | L4/L1 | Partial — clamps shipped; no CI abuse-path test |
-| Metal under-dispatch (#384) | 6 | L1 | Partial — fixed site tested; no canary-test convention for new kernels |
-| Paravirtual false-green | D3.1 | signal | No — one opt-in env var on one test |
-| GDN decay indexing (#262/#427) | 9 | L3 | No — needs long-horizon gate + asymmetric checkpoint (deferred) |
-| Streaming UTF-8 (#196) | 5 | L1 + D3.3 | Partial — unit tests yes; no CJK prompt in the required gate |
+| Bug class (fixed in)              | Invariant (D2) | Layer     | Standing test exists today?                                            |
+| --------------------------------- | -------------- | --------- | ---------------------------------------------------------------------- |
+| Softmax fail-open (#409–#414)     | 1              | L1        | Yes — hardened across sites, incl. mutation test #406                  |
+| Mask sentinel (#373/#374)         | 2              | L1        | Yes (flash + standard)                                                 |
+| Quantizer non-finite (#452)       | 3              | L1        | Yes — 4 load-time siblings                                             |
+| RoPE pairing variants (#392/#393) | 8              | L1/L2     | Partial — fixed, but no standing per-copy differential micro-test      |
+| Detok added-tokens (#430)         | 4              | L1 + D3.3 | Partial — loader test yes; required gate still token-ID-only           |
+| Serve DoS (#435)                  | 7, 10          | L4/L1     | Partial — clamps shipped; no CI abuse-path test                        |
+| Metal under-dispatch (#384)       | 6              | L1        | Partial — fixed site tested; no canary-test convention for new kernels |
+| Paravirtual false-green           | D3.1           | signal    | No — one opt-in env var on one test                                    |
+| GDN decay indexing (#262/#427)    | 9              | L3        | No — needs long-horizon gate + asymmetric checkpoint (deferred)        |
+| Streaming UTF-8 (#196)            | 5              | L1 + D3.3 | Partial — unit tests yes; no CJK prompt in the required gate           |
 
 Open issues #239 (Metal parity leg), #320 (rotated+Q4 composed golden), #252 (kv_f16 parity
 run), #167 (self-hosted perf/quality gates), #153 (per-kernel micro-bench gate) are all
@@ -202,12 +202,12 @@ instances of this ADR's L2/L3 layers and inherit its design rather than each re-
 
 **Deferred** (each changes merge-blocking behavior or spends money; per ADR-064 D7 rule 5):
 
-| # | Proposal | Cost/impact |
-|---|---|---|
-| F-1 | Add `app-binaries` aggregator to required contexts | Engine PRs blocked on app-binary build breaks (currently mergeable-while-red) |
-| F-2 | Extend required `parity-gate` to include the Metal leg (#239) and Q4/QuaRot artifact leg (#320) once stable | Longer PR CI; macOS runner minutes |
-| F-3 | Self-hosted M2 Max runner for L3 nightly (PPL tiers, long-generation, #167 perf gates) | Hardware + maintenance; the only path to non-paravirtual Metal signal |
-| F-4 | Any change to review requirements or bypass actors (`required_approving_review_count: 0`, RepositoryRole bypass) | Governance; out of automated hands entirely |
+| #   | Proposal                                                                                                         | Cost/impact                                                                   |
+| --- | ---------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| F-1 | Add `app-binaries` aggregator to required contexts                                                               | Engine PRs blocked on app-binary build breaks (currently mergeable-while-red) |
+| F-2 | Extend required `parity-gate` to include the Metal leg (#239) and Q4/QuaRot artifact leg (#320) once stable      | Longer PR CI; macOS runner minutes                                            |
+| F-3 | Self-hosted M2 Max runner for L3 nightly (PPL tiers, long-generation, #167 perf gates)                           | Hardware + maintenance; the only path to non-paravirtual Metal signal         |
+| F-4 | Any change to review requirements or bypass actors (`required_approving_review_count: 0`, RepositoryRole bypass) | Governance; out of automated hands entirely                                   |
 
 **Dispositions (2026-07-01, approved as recommended):**
 
