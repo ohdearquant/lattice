@@ -126,13 +126,13 @@ struct TensorMeta {
     start: usize,
     end: usize,
     converted_f32: OnceLock<Box<[f32]>>,
-    /// Populated once, via `get_or_init`, by this tensor's
-    /// `ingress::validate_ingested_tensor` outcome, so repeated access to the
-    /// same zero-copy F32 tensor does not rescan already-validated pages and
-    /// concurrent first access cannot run the scan twice (lattice#800 step
-    /// 4). `validate_ingested_tensor` only ever returns
-    /// `InferenceError::InvalidSafetensors`, so the cached error is carried
-    /// as its message and rewrapped on read.
+    /// Populated once, via `get_or_init`, by this tensor's ingress-validation
+    /// outcome. Zero-copy F32 uses the decoded-slice validator; F16/BF16
+    /// widening publishes its reduction here before the cached slice escapes.
+    /// Concurrent first access therefore cannot validate the same tensor
+    /// twice. Ingress validation only returns
+    /// `InferenceError::InvalidSafetensors` on this path, so the cached error
+    /// is carried as its message and rewrapped on read.
     validated: OnceLock<Result<(), String>>,
 }
 
@@ -451,8 +451,11 @@ impl SafetensorsFile {
             .checked_add(meta.end)
             .ok_or_else(|| InferenceError::InvalidSafetensors("tensor end overflow".into()))?;
         let bytes = &self.data.as_slice()[start..end];
+        let source = self.source.as_str();
+        let shape = meta.shape.as_slice();
+        let dtype_name = meta.dtype.name();
 
-        let slice: &[f32] = match meta.dtype {
+        let (slice, validation_is_fused): (&[f32], bool) = match meta.dtype {
             DType::F32 => {
                 // SAFETY: `open()` validated that bytes.len() is exactly the declared
                 // F32 element count times 4. On little-endian targets, aligned mmap
@@ -460,25 +463,50 @@ impl SafetensorsFile {
                 // cache below.
                 #[cfg(target_endian = "little")]
                 if bytes.as_ptr().align_offset(std::mem::align_of::<f32>()) == 0 {
-                    bytes_to_f32_slice(bytes)
+                    (bytes_to_f32_slice(bytes), false)
                 } else {
-                    meta.converted_f32
-                        .get_or_init(|| copy_bytes_to_f32_owned(bytes).into_boxed_slice())
-                        .as_ref()
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| copy_bytes_to_f32_owned(bytes).into_boxed_slice())
+                            .as_ref(),
+                        false,
+                    )
                 }
                 #[cfg(not(target_endian = "little"))]
                 {
-                    meta.converted_f32
-                        .get_or_init(|| copy_bytes_to_f32_owned(bytes).into_boxed_slice())
-                        .as_ref()
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| copy_bytes_to_f32_owned(bytes).into_boxed_slice())
+                            .as_ref(),
+                        false,
+                    )
                 }
             }
             DType::F16 => {
                 #[cfg(feature = "f16")]
                 {
-                    meta.converted_f32
-                        .get_or_init(|| convert_f16_bytes_to_f32(bytes).into_boxed_slice())
-                        .as_ref()
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| {
+                                let (values, has_non_finite) = convert_f16_bytes_to_f32(bytes);
+                                let _ = meta.validated.get_or_init(|| {
+                                    let tensor = if has_non_finite {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    } else {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    };
+                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                        .map_err(|e| e.to_string())
+                                });
+                                values.into_boxed_slice()
+                            })
+                            .as_ref(),
+                        true,
+                    )
                 }
                 #[cfg(not(feature = "f16"))]
                 {
@@ -490,9 +518,28 @@ impl SafetensorsFile {
             DType::BF16 => {
                 #[cfg(feature = "f16")]
                 {
-                    meta.converted_f32
-                        .get_or_init(|| convert_bf16_bytes_to_f32(bytes).into_boxed_slice())
-                        .as_ref()
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| {
+                                let (values, has_non_finite) = convert_bf16_bytes_to_f32(bytes);
+                                let _ = meta.validated.get_or_init(|| {
+                                    let tensor = if has_non_finite {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    } else {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    };
+                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                        .map_err(|e| e.to_string())
+                                });
+                                values.into_boxed_slice()
+                            })
+                            .as_ref(),
+                        true,
+                    )
                 }
                 #[cfg(not(feature = "f16"))]
                 {
@@ -510,23 +557,26 @@ impl SafetensorsFile {
             }
         };
 
-        // `get_or_init` runs its closure at most once even under concurrent
-        // first access: every caller blocks on the same in-flight init
-        // rather than racing separate `get()`-then-`set()` scans of the same
-        // tensor (the previous pattern let multiple callers observe
-        // `get().is_none()` and each redo the O(n) finite scan before one
-        // `set()` won).
-        let source = &self.source;
-        let shape = meta.shape.as_slice();
-        let dtype_name = meta.dtype.name();
-        match meta.validated.get_or_init(|| {
-            crate::weights::ingress::validate_ingested_tensor(
-                crate::weights::ingress::IngestedTensor::decoded_f32(
-                    source, name, shape, dtype_name, slice,
-                ),
-            )
-            .map_err(|e| e.to_string())
-        }) {
+        let validation = if validation_is_fused {
+            meta.validated.get().ok_or_else(|| {
+                InferenceError::InvalidSafetensors(format!(
+                    "{source}: tensor {name} ({dtype_name}) widening completed without a \
+                     validation result"
+                ))
+            })?
+        } else {
+            // `get_or_init` runs its closure at most once even under concurrent
+            // first access, so zero-copy F32 pages are scanned by one caller.
+            meta.validated.get_or_init(|| {
+                crate::weights::ingress::validate_ingested_tensor(
+                    crate::weights::ingress::IngestedTensor::decoded_f32(
+                        source, name, shape, dtype_name, slice,
+                    ),
+                )
+                .map_err(|e| e.to_string())
+            })
+        };
+        match validation {
             Ok(()) => {}
             Err(msg) => return Err(InferenceError::InvalidSafetensors(msg.clone())),
         }
@@ -942,27 +992,31 @@ fn copy_bytes_to_f32_owned(bytes: &[u8]) -> Vec<f32> {
 }
 
 #[cfg(feature = "f16")]
-fn convert_f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+fn convert_f16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut has_non_finite = false;
     for chunk in bytes.chunks_exact(2) {
-        out.push(crate::weights::half_bits::f16_bits_to_f32(
-            u16::from_le_bytes([chunk[0], chunk[1]]),
-        ));
+        let value =
+            crate::weights::half_bits::f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        has_non_finite |= !value.is_finite();
+        out.push(value);
     }
-    out
+    (out, has_non_finite)
 }
 
 #[cfg(feature = "f16")]
-fn convert_bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+fn convert_bf16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut has_non_finite = false;
     for chunk in bytes.chunks_exact(2) {
-        out.push(crate::weights::half_bits::bf16_bits_to_f32(
-            u16::from_le_bytes([chunk[0], chunk[1]]),
-        ));
+        let value =
+            crate::weights::half_bits::bf16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        has_non_finite |= !value.is_finite();
+        out.push(value);
     }
-    out
+    (out, has_non_finite)
 }
 
 /// Owned backing store for Qwen weights loaded from a sharded checkpoint.
@@ -2489,8 +2543,8 @@ mod tests {
         let nan_bits: u16 = 0x7E00;
         let one_bits: u16 = 0x3C00; // f16 1.0
         let mut raw = Vec::new();
-        raw.extend_from_slice(&nan_bits.to_le_bytes());
         raw.extend_from_slice(&one_bits.to_le_bytes());
+        raw.extend_from_slice(&nan_bits.to_le_bytes());
         write_raw_tensor(&path, "t", "F16", &[2], &raw);
 
         let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
@@ -2499,6 +2553,10 @@ mod tests {
             .expect_err("F16 NaN bit pattern must be rejected");
         assert!(
             err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("element index 1"),
             "unexpected error: {err}"
         );
 
@@ -2537,8 +2595,8 @@ mod tests {
         let nan_bits: u16 = 0x7FC0;
         let one_bits: u16 = 0x3F80; // bf16 1.0
         let mut raw = Vec::new();
-        raw.extend_from_slice(&nan_bits.to_le_bytes());
         raw.extend_from_slice(&one_bits.to_le_bytes());
+        raw.extend_from_slice(&nan_bits.to_le_bytes());
         write_raw_tensor(&path, "t", "BF16", &[2], &raw);
 
         let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
@@ -2547,6 +2605,10 @@ mod tests {
             .expect_err("BF16 NaN bit pattern must be rejected");
         assert!(
             err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("element index 1"),
             "unexpected error: {err}"
         );
 
@@ -2572,6 +2634,86 @@ mod tests {
         assert!(
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f16_widening_preserves_finite_edge_values() {
+        let path = temp_path("lattice_weights_f16_fused_finite");
+        let bits = [0x0000u16, 0x8000, 0x0001, 0x3c00];
+        let raw = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_raw_tensor(&path, "t", "F16", &[bits.len()], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let (values, shape) = sf
+            .get_f32_tensor("t")
+            .expect("finite F16 values must widen");
+        let expected = bits.map(crate::weights::half_bits::f16_bits_to_f32);
+        assert_eq!(shape, &[bits.len()]);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            sf.tensors
+                .get("t")
+                .expect("tensor tracked")
+                .validated
+                .get()
+                .is_some(),
+            "widening must publish its fused validation result"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_bf16_widening_preserves_finite_edge_values() {
+        let path = temp_path("lattice_weights_bf16_fused_finite");
+        let bits = [0x0000u16, 0x8000, 0x0001, 0x3f80];
+        let raw = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_raw_tensor(&path, "t", "BF16", &[bits.len()], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let (values, shape) = sf
+            .get_f32_tensor("t")
+            .expect("finite BF16 values must widen");
+        let expected = bits.map(crate::weights::half_bits::bf16_bits_to_f32);
+        assert_eq!(shape, &[bits.len()]);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            sf.tensors
+                .get("t")
+                .expect("tensor tracked")
+                .validated
+                .get()
+                .is_some(),
+            "widening must publish its fused validation result"
         );
 
         fs::remove_file(&path).ok();

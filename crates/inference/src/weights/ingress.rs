@@ -43,6 +43,9 @@ enum IngestPayload<'a> {
         values: &'a [f32],
         dtype_label: &'static str,
         error_kind: IngressErrorKind,
+        /// Set only after widening's reduction has covered every value, avoiding
+        /// a second pass over a newly materialized tensor.
+        known_finite: bool,
     },
     /// Derived Q8 data and per-row scales.
     Q8 {
@@ -96,6 +99,28 @@ impl<'a> IngestedTensor<'a> {
                 values,
                 dtype_label,
                 error_kind: IngressErrorKind::InvalidSafetensors,
+                known_finite: false,
+            },
+        }
+    }
+
+    pub(super) fn decoded_f32_known_finite(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        dtype_label: &'static str,
+        values: &'a [f32],
+    ) -> Self {
+        Self {
+            source,
+            tensor_name,
+            shape,
+            expected_shape: None,
+            payload: IngestPayload::DecodedF32 {
+                values,
+                dtype_label,
+                error_kind: IngressErrorKind::InvalidSafetensors,
+                known_finite: true,
             },
         }
     }
@@ -116,6 +141,7 @@ impl<'a> IngestedTensor<'a> {
                 values,
                 dtype_label: "F32",
                 error_kind: IngressErrorKind::InvalidInput,
+                known_finite: false,
             },
         }
     }
@@ -223,6 +249,7 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
             values,
             dtype_label,
             error_kind,
+            known_finite,
         } => {
             let numel = checked_shape_numel(&tensor)?;
             if values.len() != numel {
@@ -235,7 +262,9 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                     tensor.shape,
                 )));
             }
-            if let Some((idx, bad)) = values.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+            if !known_finite
+                && let Some((idx, bad)) = values.iter().enumerate().find(|(_, v)| !v.is_finite())
+            {
                 return Err(error_kind.error(format!(
                     "{}: tensor {} ({dtype_label}) has non-finite value {bad} at element index \
                      {idx} of {numel} (shape {:?})",
