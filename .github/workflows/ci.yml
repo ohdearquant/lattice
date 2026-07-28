@@ -649,6 +649,8 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      - name: python3 tests/test_bench_targets.py
+        run: python3 tests/test_bench_targets.py -v
 
       # bench-compare.sh's isolation guards: the lock proof (the measurement
       # body refuses unless the supervisor that recorded the lock status is one
