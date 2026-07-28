@@ -591,6 +591,8 @@ jobs:
           version: '1.7.12'
       - name: merge-queue config tests
         run: python3 tests/test_ci_changed_files.py -v
+      - name: post-merge perf workflow contract tests
+        run: python3 tests/test_perf_postmerge_workflow.py -v
 
   # Deterministic fake-adapter unit tests + raw-observation schema validation
   # for the decode-benchmark harness core (issue #813 step 1) and every
