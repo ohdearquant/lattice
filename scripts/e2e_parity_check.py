@@ -44,6 +44,7 @@ Env vars:
 import argparse
 import importlib.metadata
 import json
+import math
 import os
 import re
 import subprocess
@@ -259,6 +260,12 @@ REFERENCE_PATH = (
 )
 REFERENCE_PACKAGES = ("torch", "transformers", "tokenizers", "huggingface_hub")
 REFERENCE_TOKEN_COUNTS = (4, 15)
+REFERENCE_THREAD_COUNTS = (1, 4)
+# The 2026-07-28 pinned 1-thread/4-thread refresh observed fragile minima of
+# 0.0150260925 and 0.0319595337; the remaining per-prompt minima start at
+# 0.110658646. Refuse margins below 0.1 so the fragile positions cannot be
+# admitted into a refreshed reference.
+REFERENCE_LOGIT_MARGIN_FLOOR = 0.1
 MODEL_REPO = "Qwen/Qwen3.5-0.8B"
 MODEL_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
 
@@ -276,6 +283,82 @@ def installed_reference_versions() -> dict[str, str]:
     return versions
 
 
+def validate_regeneration_outputs(
+    runs: dict[int, dict[str, dict]],
+    prompts: list[str],
+    margin_floor: float,
+) -> dict:
+    """Validate token stability and logit margins across reference workers."""
+    first_thread, second_thread = REFERENCE_THREAD_COUNTS
+    summary = {
+        "global_minimum_margin": math.inf,
+        "global_minimum_prompt": None,
+        "global_minimum_position": None,
+        "global_minimum_thread_count": None,
+    }
+    for prompt in prompts:
+        first = runs[first_thread][prompt]
+        second = runs[second_thread][prompt]
+        first_ids = first["generated_ids"]
+        second_ids = second["generated_ids"]
+        if first_ids != second_ids:
+            common_length = min(len(first_ids), len(second_ids))
+            position = next(
+                (
+                    index
+                    for index, (left, right) in enumerate(
+                        zip(first_ids, second_ids)
+                    )
+                    if left != right
+                ),
+                common_length,
+            )
+            first_token = (
+                first_ids[position] if position < len(first_ids) else "<end>"
+            )
+            second_token = (
+                second_ids[position] if position < len(second_ids) else "<end>"
+            )
+            raise RuntimeError(
+                f"reference disagreement for prompt {prompt!r} at token position "
+                f"{position}: {first_thread} thread(s) produced "
+                f"{first_token}, {second_thread} thread(s) produced "
+                f"{second_token}"
+            )
+        for thread_count, output in (
+            (first_thread, first),
+            (second_thread, second),
+        ):
+            margins = output.get("logit_margins")
+            if not isinstance(margins, list) or len(margins) != len(first_ids):
+                raise RuntimeError(
+                    f"invalid logit margins for prompt {prompt!r} with "
+                    f"{thread_count} thread(s)"
+                )
+            for position, margin in enumerate(margins):
+                if not isinstance(margin, (int, float)) or not math.isfinite(margin):
+                    raise RuntimeError(
+                        f"non-finite logit margin for prompt {prompt!r} at token "
+                        f"position {position} with {thread_count} thread(s)"
+                    )
+                if margin < margin_floor:
+                    raise RuntimeError(
+                        f"logit margin {margin:.9g} below refusal floor "
+                        f"{margin_floor:.9g} for prompt {prompt!r} at token "
+                        f"position {position} with {thread_count} thread(s)"
+                    )
+                if margin < summary["global_minimum_margin"]:
+                    summary.update(
+                        {
+                            "global_minimum_margin": margin,
+                            "global_minimum_prompt": prompt,
+                            "global_minimum_position": position,
+                            "global_minimum_thread_count": thread_count,
+                        }
+                    )
+    return summary
+
+
 def load_frozen_reference(max_tokens: int) -> dict[str, dict]:
     """Load and validate the frozen HF reference, keyed by prompt content."""
     try:
@@ -291,9 +374,11 @@ def load_frozen_reference(max_tokens: int) -> dict[str, dict]:
     versions = fixture.get("package_versions")
     model = fixture.get("model")
     generation = fixture.get("generation")
+    determinism = fixture.get("determinism")
     entries = fixture.get("prompts")
+    schema_version = fixture.get("schema_version")
     if (
-        fixture.get("schema_version") != 1
+        schema_version not in (1, 2)
         or not isinstance(versions, dict)
         or model != {"repo_id": MODEL_REPO, "revision": MODEL_REVISION}
         or not isinstance(generation, dict)
@@ -302,6 +387,16 @@ def load_frozen_reference(max_tokens: int) -> dict[str, dict]:
         or generation.get("temperature") is not None
         or generation.get("top_p") is not None
         or generation.get("top_k") is not None
+        or (
+            schema_version == 2
+            and (
+                not isinstance(determinism, dict)
+                or determinism.get("thread_counts")
+                != list(REFERENCE_THREAD_COUNTS)
+                or determinism.get("logit_margin_floor")
+                != REFERENCE_LOGIT_MARGIN_FLOOR
+            )
+        )
         or not isinstance(entries, list)
     ):
         raise RuntimeError(
@@ -354,6 +449,7 @@ def load_frozen_reference(max_tokens: int) -> dict[str, dict]:
             )
         reference = matching_references[0]
         generated_ids = reference.get("generated_ids")
+        logit_margins = reference.get("logit_margins")
         if (
             not isinstance(generated_ids, list)
             or any(
@@ -361,6 +457,20 @@ def load_frozen_reference(max_tokens: int) -> dict[str, dict]:
                 for token in generated_ids
             )
             or len(generated_ids) != max_tokens
+            or (
+                schema_version == 2
+                and (
+                    not isinstance(logit_margins, list)
+                    or len(logit_margins) != max_tokens
+                    or any(
+                        isinstance(margin, bool)
+                        or not isinstance(margin, (int, float))
+                        or not math.isfinite(margin)
+                        or margin < REFERENCE_LOGIT_MARGIN_FLOOR
+                        for margin in logit_margins
+                    )
+                )
+            )
         ):
             raise RuntimeError(
                 f"frozen reference token count for prompt {prompt[:40]!r} is "
@@ -393,14 +503,86 @@ def load_frozen_reference(max_tokens: int) -> dict[str, dict]:
     return by_prompt
 
 
-def write_frozen_reference(outputs: dict[str, dict], max_tokens: int) -> None:
+def run_regeneration_workers(max_tokens: int) -> tuple[dict[str, dict], dict]:
+    """Generate and compare references in isolated thread-count workers."""
+    runs = {}
+    for thread_count in REFERENCE_THREAD_COUNTS:
+        command = [
+            "nice",
+            "-n",
+            "10",
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--hf-reference-worker",
+            "--hf-threads",
+            str(thread_count),
+        ]
+        environment = os.environ.copy()
+        environment["E2E_MAX_TOKENS"] = str(max_tokens)
+        print(
+            f"[hf] starting isolated {thread_count}-thread reference worker",
+            file=sys.stderr,
+        )
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+        if completed.stderr:
+            print(completed.stderr, file=sys.stderr, end="")
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"{thread_count}-thread reference worker exited "
+                f"{completed.returncode}"
+            )
+        try:
+            runs[thread_count] = json.loads(completed.stdout)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"{thread_count}-thread reference worker returned invalid JSON: {e}"
+            ) from e
+
+    prompts = [prompt for prompt, _ in PROMPTS]
+    for prompt in prompts:
+        for token_count in REFERENCE_TOKEN_COUNTS:
+            minima = {
+                thread_count: min(
+                    runs[thread_count][prompt]["logit_margins"][:token_count]
+                )
+                for thread_count in REFERENCE_THREAD_COUNTS
+            }
+            print(
+                f"[hf] prompt {prompt[:40]!r}, {token_count} tokens; minimum "
+                f"margins 1-thread={minima[1]:.9g}, "
+                f"4-thread={minima[4]:.9g}",
+                file=sys.stderr,
+            )
+    summary = validate_regeneration_outputs(
+        runs, prompts, REFERENCE_LOGIT_MARGIN_FLOOR
+    )
+    print(
+        "[hf] global minimum margin "
+        f"{summary['global_minimum_margin']:.9g} at token position "
+        f"{summary['global_minimum_position']} with "
+        f"{summary['global_minimum_thread_count']} thread(s) for prompt "
+        f"{summary['global_minimum_prompt'][:40]!r}",
+        file=sys.stderr,
+    )
+    return runs[REFERENCE_THREAD_COUNTS[0]], summary
+
+
+def write_frozen_reference(
+    outputs: dict[str, dict], max_tokens: int, determinism: dict
+) -> None:
     """Write live HF outputs as the frozen reference fixture."""
     if max_tokens < max(REFERENCE_TOKEN_COUNTS):
         raise RuntimeError(
             f"--regenerate requires E2E_MAX_TOKENS >= {max(REFERENCE_TOKEN_COUNTS)}"
         )
     fixture = {
-        "schema_version": 1,
+        "schema_version": 2,
         "package_versions": installed_reference_versions(),
         "model": {"repo_id": MODEL_REPO, "revision": MODEL_REVISION},
         "generation": {
@@ -410,6 +592,11 @@ def write_frozen_reference(outputs: dict[str, dict], max_tokens: int) -> None:
             "top_p": None,
             "top_k": None,
         },
+        "determinism": {
+            "thread_counts": list(REFERENCE_THREAD_COUNTS),
+            "logit_margin_floor": REFERENCE_LOGIT_MARGIN_FLOOR,
+            **determinism,
+        },
         "prompts": [
             {
                 "prompt": prompt,
@@ -418,6 +605,7 @@ def write_frozen_reference(outputs: dict[str, dict], max_tokens: int) -> None:
                     {
                         "token_count": token_count,
                         "generated_ids": outputs[prompt]["generated_ids"][:token_count],
+                        "logit_margins": outputs[prompt]["logit_margins"][:token_count],
                     }
                     for token_count in REFERENCE_TOKEN_COUNTS
                 ],
@@ -433,7 +621,9 @@ def write_frozen_reference(outputs: dict[str, dict], max_tokens: int) -> None:
     temporary_path.replace(REFERENCE_PATH)
 
 
-def run_hf_reference(prompt: str, max_tokens: int) -> dict:
+def run_hf_reference(
+    prompt: str, max_tokens: int, *, collect_scores: bool = False
+) -> dict:
     """Run HF transformers greedy generation. Returns tokens + timing."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -472,23 +662,32 @@ def run_hf_reference(prompt: str, max_tokens: int) -> dict:
 
     t0 = time.time()
     with torch.no_grad():
-        outputs = model.generate(
+        generation = model.generate(
             **inputs,
             max_new_tokens=max_tokens,
             do_sample=False,
             temperature=None,
             top_p=None,
             top_k=None,
+            output_scores=collect_scores,
+            return_dict_in_generate=collect_scores,
         )
     elapsed = time.time() - t0
 
-    all_ids = outputs[0].tolist()
+    sequences = generation.sequences if collect_scores else generation
+    all_ids = sequences[0].tolist()
     gen_ids = all_ids[len(prompt_ids):]
+    logit_margins = []
+    if collect_scores:
+        for scores in generation.scores:
+            top_two = torch.topk(scores[0], k=2).values
+            logit_margins.append(float((top_two[0] - top_two[1]).item()))
     text = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
     return {
         "prompt_ids": prompt_ids,
         "generated_ids": gen_ids,
+        "logit_margins": logit_margins,
         "text": text,
         "elapsed_s": elapsed,
         "tok_per_sec": len(gen_ids) / elapsed if elapsed > 0 else 0,
@@ -878,6 +1077,17 @@ def main() -> int:
         action="store_true",
         help="run HF live and rewrite the frozen reference fixture",
     )
+    parser.add_argument(
+        "--hf-reference-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--hf-threads",
+        type=int,
+        choices=REFERENCE_THREAD_COUNTS,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     backend = args.backend
     live_reference = args.regenerate or os.environ.get("GITHUB_EVENT_NAME") in {
@@ -905,9 +1115,6 @@ def main() -> int:
         )
         return 2
 
-    if not os.path.isfile(LATTICE_BIN):
-        print(f"error: lattice binary not found at {LATTICE_BIN}", file=sys.stderr)
-        return 2
     if not os.path.isdir(MODEL_DIR):
         print(f"error: model dir not found at {MODEL_DIR}", file=sys.stderr)
         return 2
@@ -933,8 +1140,41 @@ def main() -> int:
         )
         return 2
 
+    if args.hf_reference_worker:
+        if args.hf_threads is None:
+            print("error: --hf-reference-worker requires --hf-threads", file=sys.stderr)
+            return 2
+        try:
+            import torch
+
+            torch.set_num_threads(args.hf_threads)
+            outputs = {
+                prompt: run_hf_reference(
+                    prompt, MAX_TOKENS, collect_scores=True
+                )
+                for prompt, _ in PROMPTS
+            }
+        except Exception as e:  # noqa: BLE001 - worker reports setup uniformly
+            print(
+                f"error: reference worker failed: {type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            traceback.print_exc(file=sys.stderr)
+            return 2
+        json.dump(outputs, sys.stdout)
+        return 0
+
+    if not os.path.isfile(LATTICE_BIN):
+        print(f"error: lattice binary not found at {LATTICE_BIN}", file=sys.stderr)
+        return 2
+
     try:
-        if live_reference:
+        regeneration_summary = None
+        if args.regenerate:
+            regenerated_outputs, regeneration_summary = run_regeneration_workers(
+                MAX_TOKENS
+            )
+        elif live_reference:
             import torch  # noqa: F401
             from transformers import AutoModelForCausalLM  # noqa: F401
         else:
@@ -965,9 +1205,13 @@ def main() -> int:
         # accident.
         try:
             hf_out = (
-                run_hf_reference(prompt, MAX_TOKENS)
-                if live_reference
-                else frozen_outputs[prompt]
+                regenerated_outputs[prompt]
+                if args.regenerate
+                else (
+                    run_hf_reference(prompt, MAX_TOKENS)
+                    if live_reference
+                    else frozen_outputs[prompt]
+                )
             )
         except Exception as e:  # noqa: BLE001 - deliberately broad, see above
             print(
@@ -1020,7 +1264,9 @@ def main() -> int:
 
     if args.regenerate:
         try:
-            write_frozen_reference(live_outputs, MAX_TOKENS)
+            write_frozen_reference(
+                live_outputs, MAX_TOKENS, regeneration_summary
+            )
         except (OSError, RuntimeError) as e:
             print(f"error: could not write frozen reference: {e}", file=sys.stderr)
             return 2
