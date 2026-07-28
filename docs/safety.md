@@ -15,7 +15,7 @@ Counts are recorded in each crate's top-level `lib.rs` comment and updated on ea
 | Crate               | `unsafe` blocks | Reason                                                                                   |
 | ------------------- | --------------- | ---------------------------------------------------------------------------------------- |
 | `lattice-inference` | 153             | SIMD matmul/attention kernels (AVX2, NEON, Metal FFI), mmap tensor slices, f16 bit-casts |
-| `lattice-embed`     | 21              | SIMD intrinsic calls (AVX-512, AVX2, NEON) in distance and normalize kernels             |
+| `lattice-embed`     | 30              | SIMD intrinsic calls (AVX-512, AVX2, NEON), including quantization kernels               |
 | `lattice-fann`      | 0               | No unsafe — all operations are safe Rust                                                 |
 | `lattice-transport` | 0               | No unsafe — pure safe Rust math                                                          |
 | `lattice-tune`      | 0               | No unsafe                                                                                |
@@ -81,7 +81,7 @@ safety invariant is documented at the call site.
 
 | Flag                           | Effect                                                     |
 | ------------------------------ | ---------------------------------------------------------- |
-| Default (`native`, no GPU)     | 21 unsafe blocks in `embed` (SIMD only)                    |
+| Default (`native`, no GPU)     | 30 unsafe blocks in `embed` (SIMD only)                    |
 | Disable `native` feature       | 0 unsafe blocks in `embed` (no inference, remote API only) |
 | No `metal-gpu`                 | Removes Metal FFI unsafe blocks in `inference`             |
 | No `f16`                       | Removes f16 bit-cast unsafe in `inference`                 |
