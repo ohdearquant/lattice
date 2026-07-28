@@ -1099,18 +1099,18 @@ mod inner {
     /// MSL source for the Q8_0 simdgroup-matrix tiled GEMM kernel.
     ///
     /// Block layout: each Q8_0 block is 34 bytes — 2-byte f16 scale (little-endian)
-    /// followed by 32 int8 values.  The kernel tiles BM=64 rows × BN=32 cols × BK=32
+    /// followed by 32 int8 values.  The kernel tiles BM=64 rows × BN=64 cols × BK=32
     /// depth and uses simdgroup_half8x8/float8x8 MMA accumulation, keeping accumulators
     /// in f32 while staging X and W as f16 in threadgroup memory.
     ///
-    /// Threadgroup memory breakdown (~9.8 KB):
+    /// Threadgroup memory breakdown (~14.9 KB):
     ///   half  Xtg[64][32]  = 4096 bytes
-    ///   char  Qraw[32][32] = 1024 bytes
-    ///   half  Qscale[32]   =   64 bytes
-    ///   half  Wtg[32][40]  = 2560 bytes  (BN_PAD=40 avoids bank conflicts)
-    ///   float Ytg[32][16]  = 2048 bytes
+    ///   char  Qraw[64][32] = 2048 bytes
+    ///   half  Qscale[64]   =  128 bytes
+    ///   half  Wtg[32][72]  = 4608 bytes  (BN_PAD=72 avoids bank conflicts)
+    ///   float Ytg[32][32]  = 4096 bytes
     ///   float Zero[8][8]   =  256 bytes
-    ///   Total              = 10048 bytes < 32 KB → 2× occupancy on M1
+    ///   Total              = 15232 bytes < 32 KB → 2× occupancy on M1
     const MSL_Q8_TILED_SOURCE: &str = include_str!("shaders/gemm_q8_tiled.metal");
 
     // ---------------------------------------------------------------------------
@@ -11893,7 +11893,7 @@ mod inner {
                     MTLSize::new(32, 4, 1),
                 );
             } else if let Some(tiled) = self.engine.pipelines.gemm_q8_tiled.as_ref() {
-                // Tiled simdgroup-matrix GEMM (Apple7+, BM=64 × BN=32).
+                // Tiled simdgroup-matrix GEMM (Apple7+, BM=64 × BN=64).
                 // Buffer bindings: buf(0)=QW, buf(1)=X, buf(2)=Y.
                 enc.set_compute_pipeline_state(tiled);
                 enc.set_buffer(0, Some(&qw.buffer), 0);
@@ -11903,7 +11903,7 @@ mod inner {
                 enc.set_bytes(4, 4, &n as *const u32 as *const _);
                 enc.set_bytes(5, 4, &k as *const u32 as *const _);
                 enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                    MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1),
                     MTLSize::new(32, 4, 1),
                 );
             } else {
@@ -12829,7 +12829,7 @@ mod inner {
                 enc.set_bytes(4, 4, &n as *const u32 as *const _);
                 enc.set_bytes(5, 4, &k as *const u32 as *const _);
                 enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
+                    MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1),
                     MTLSize::new(32, 4, 1),
                 );
             } else {
@@ -24431,7 +24431,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     false,
                 );
 
-                // Tiled dispatch: buf(0)=QW, buf(1)=X; tg = (ceil(N/32), ceil(M/64), 1)
+                // Tiled dispatch: buf(0)=QW, buf(1)=X; tg = (ceil(N/64), ceil(M/64), 1)
                 let y_tiled_buf =
                     device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
                 run_gemm_q8_kernel(
@@ -24443,7 +24443,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     m as u32,
                     n as u32,
                     k as u32,
-                    n.div_ceil(32) as u64,
+                    n.div_ceil(64) as u64,
                     m.div_ceil(64) as u64,
                     true,
                 );
@@ -24520,7 +24520,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     m as u32,
                     n as u32,
                     k as u32,
-                    n.div_ceil(32) as u64,
+                    n.div_ceil(64) as u64,
                     m.div_ceil(64) as u64,
                     true,
                 );
@@ -24653,7 +24653,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 m as u32,
                 n as u32,
                 k as u32,
-                n.div_ceil(32) as u64,
+                n.div_ceil(64) as u64,
                 m.div_ceil(64) as u64,
             );
 
@@ -24715,7 +24715,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 m as u32,
                 n as u32,
                 k as u32,
-                n.div_ceil(32) as u64,
+                n.div_ceil(64) as u64,
                 m.div_ceil(64) as u64,
             );
             let y_nz_ref = cpu_matmul_ref(&x, &nz_deq, m, n, k);
