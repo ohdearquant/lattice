@@ -6,6 +6,7 @@ pub(crate) mod ingress;
 pub mod q3_weights;
 pub mod q4_weights;
 pub mod q8_weights;
+pub(crate) mod safetensors_layout;
 
 // Re-export from f32_weights (the primary/base weight types)
 pub use self::f32_weights::*;

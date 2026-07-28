@@ -50,6 +50,9 @@ use crate::error::InferenceError;
 use crate::model::qwen35::qwen_layer_tensor_prefix;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
+use crate::weights::safetensors_layout::{
+    SafetensorsLayoutEntry, safetensors_dtype, validate_safetensors_layout,
+};
 use crate::weights::{contained_shard_path, parse_index};
 
 /// On-disk storage dtype of a tensor.
@@ -113,56 +116,14 @@ struct Shard {
 /// per-tensor validation alone would miss.
 struct ParsedEntry {
     name: String,
+    dtype: &'static str,
+    shape: Vec<usize>,
     start: usize,
     end: usize,
     /// `Some` for F32/F16/BF16; `None` for any other SafeTensors dtype.
     /// `None` entries are still kept in the contiguity check but never
     /// appear in `Shard::headers`.
     header: Option<TensorHeader>,
-}
-
-/// Bits per element for every standard SafeTensors dtype name. The
-/// bit-size variant (rather than bytes) is required because the format
-/// admits sub-byte dtypes: `F4` stores 4 bits per element, and
-/// `F6_E2M3` / `F6_E3M2` store 6 bits.
-///
-/// Returns `None` for any unrecognized dtype string. The caller MUST
-/// reject unknown dtypes rather than treat them as opaque, since they
-/// indicate either a newer SafeTensors revision the reader has not yet
-/// been updated for or a corrupted header.
-///
-/// Strictness note: the official `safetensors` Rust crate rejects
-/// unknown/invalid dtype metadata outright, and this reader follows
-/// that strict contract. Lattice's runtime weights parser
-/// ([`crate::weights::f32_weights::SafetensorsFile`]'s `parse_tensor_meta`)
-/// was more permissive prior to lattice#800 — it mapped unknown dtypes to
-/// `Ok(None)` and silently skipped the entry. As of lattice#800 it also
-/// rejects a genuinely unrecognized dtype string at parse time and tracks
-/// known-but-unsupported whole-byte dtypes (I64, BOOL, ...) structurally
-/// instead of dropping them, matching this reader's strictness for those
-/// cases. The two parsers still diverge on sub-byte dtypes (`F4`,
-/// `F6_E2M3`, `F6_E3M2`): this reader's bit-size table represents them
-/// exactly, while the runtime parser's whole-byte extent model treats them
-/// as unrecognized. Unifying the two parsers (not just their strictness) is
-/// a separate concern, tracked by the native Q4/KHF1 validation-unification
-/// and QuaRot/offline-quantizer routing issues in the lattice#800 cluster.
-///
-/// Table mirrors `Dtype::bitsize()` in the official `safetensors` Rust
-/// crate. Kept inline rather than depending on `safetensors` to match
-/// the hand-roll pattern of [`crate::weights::f32_weights`] (which also
-/// parses safetensors headers directly). When upstream adds a dtype,
-/// add it here and to the dtype-coverage regression tests.
-fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
-    match dtype_str {
-        "F4" => Some(4),
-        "F6_E2M3" | "F6_E3M2" => Some(6),
-        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" | "F8_E4M3FNUZ"
-        | "F8_E5M2FNUZ" => Some(8),
-        "I16" | "U16" | "F16" | "BF16" => Some(16),
-        "I32" | "U32" | "F32" => Some(32),
-        "I64" | "U64" | "F64" | "C64" => Some(64),
-        _ => None,
-    }
 }
 
 impl Shard {
@@ -222,12 +183,8 @@ impl Shard {
         let data_len = mmap.len() - data_offset;
 
         // Phase 1: parse every entry — including dtypes the converter
-        // doesn't decode — so we can validate offset contiguity across
-        // the whole data section. Per-tensor byte length is validated
-        // against the bit-size table of every standard SafeTensors
-        // dtype (sub-byte dtypes like F4 require the shape product to
-        // be byte-aligned), and any unrecognized dtype string is
-        // rejected outright — the runtime / official parser would.
+        // doesn't decode — so the shared validator can account for the
+        // complete data section.
         let mut parsed: Vec<ParsedEntry> = Vec::with_capacity(obj.len());
         for (name, entry) in obj {
             if name == "__metadata__" {
@@ -285,94 +242,42 @@ impl Shard {
                 ))
             })? as usize;
 
-            if start > end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: invalid data_offsets [{start}, {end})"
-                )));
-            }
-            if end > data_len {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: data_offsets end={end} past data_len={data_len}"
-                )));
-            }
-
-            let numel = shape.iter().try_fold(1usize, |acc, &dim| {
-                acc.checked_mul(dim).ok_or_else(|| {
-                    InferenceError::InvalidSafetensors(format!(
-                        "tensor {name}: shape {shape:?} overflows usize"
-                    ))
-                })
-            })?;
-            let bits = safetensors_bits_per_elem(dtype_str).ok_or_else(|| {
+            let dtype = safetensors_dtype(dtype_str).ok_or_else(|| {
                 InferenceError::InvalidSafetensors(format!(
                     "tensor {name}: unrecognized SafeTensors dtype {dtype_str:?}"
                 ))
             })?;
-            let total_bits = numel.checked_mul(bits).ok_or_else(|| {
-                InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: bit length overflows usize"
-                ))
-            })?;
-            if total_bits % 8 != 0 {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: sub-byte dtype {dtype_str} with shape {shape:?} \
-                     produces {total_bits} bits, which is not byte-aligned"
-                )));
-            }
-            let expected = total_bits / 8;
-            let actual = end - start;
-            if actual != expected {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: byte length mismatch for {dtype_str} {shape:?}: \
-                     expected {expected}, got {actual}"
-                )));
-            }
 
             let header = SourceDType::from_header_str(dtype_str).map(|dtype| TensorHeader {
                 dtype,
-                shape,
+                shape: shape.clone(),
                 start,
                 end,
             });
 
             parsed.push(ParsedEntry {
                 name: name.clone(),
+                dtype: dtype.name,
+                shape,
                 start,
                 end,
                 header,
             });
         }
 
-        // Phase 2: validate that all tensor byte ranges are sorted,
-        // disjoint, contiguous from offset 0, and exhaust the data
-        // section. This mirrors the official `safetensors` crate
-        // validation rules — without it, a corrupted checkpoint could
-        // silently alias two tensor names to the same byte range (e.g.
-        // both `a` and `b` pointing at `[0, 4)`), or hide leading /
-        // trailing padding, and the converter would rotate or quantize
-        // bytes that the runtime would never load.
-        parsed.sort_by_key(|p| (p.start, p.end));
-        let mut prev_end = 0usize;
-        for p in &parsed {
-            if p.start != prev_end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "{}: data_offsets non-contiguous at tensor {}: \
-                     expected start={prev_end}, got [{}, {})",
-                    path.display(),
-                    p.name,
-                    p.start,
-                    p.end,
-                )));
-            }
-            prev_end = p.end;
-        }
-        if prev_end != data_len {
-            return Err(InferenceError::InvalidSafetensors(format!(
-                "{}: data section is {data_len} bytes but tensors cover {prev_end} bytes \
-                 (trailing or missing payload)",
-                path.display(),
-            )));
-        }
+        // Phase 2: apply the same dtype extent, byte-alignment, and complete
+        // data-section contract as the runtime SafeTensors loader.
+        let layout: Vec<_> = parsed
+            .iter()
+            .map(|entry| SafetensorsLayoutEntry {
+                name: &entry.name,
+                dtype: entry.dtype,
+                shape: &entry.shape,
+                start: entry.start,
+                end: entry.end,
+            })
+            .collect();
+        validate_safetensors_layout(&path.display().to_string(), data_len, &layout)?;
 
         // Phase 3: expose only supported-dtype tensors via the read API.
         // Unsupported entries already had their offsets validated above
