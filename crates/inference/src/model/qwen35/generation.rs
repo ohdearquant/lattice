@@ -2364,6 +2364,24 @@ pub(crate) fn check_prompt_not_empty(prompt_len: usize) -> Result<(), InferenceE
     Ok(())
 }
 
+/// Rejects tokenizer output that cannot index the configured embedding table.
+///
+/// Standalone CPU generation drivers accept their tokenizer and model config
+/// independently, so tokenizer validity alone does not prove that every prompt
+/// ID is below `vocab_size`. Perform one cold ingress scan before any decoder
+/// state allocation instead of branching inside the per-token forward path.
+pub(crate) fn check_prompt_ids_in_vocab(
+    prompt_ids: &[u32],
+    vocab_size: usize,
+) -> Result<(), InferenceError> {
+    if let Some(&bad_id) = prompt_ids.iter().find(|&&id| id as usize >= vocab_size) {
+        return Err(InferenceError::InvalidInput(format!(
+            "prompt contains out-of-vocabulary token id {bad_id} (vocab_size={vocab_size})"
+        )));
+    }
+    Ok(())
+}
+
 /// Shared total-context admission bound (#922): rejects a request whose
 /// prompt fits the window alone but whose prompt plus decode budget does
 /// not, closing exactly the gap between "will prefill" and "will actually
