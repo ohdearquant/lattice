@@ -1,5 +1,8 @@
 name: release-binaries
-# Prebuilt `lattice` CLI binaries attached to GitHub releases (#633).
+# Prebuilt `lattice` CLI binaries and the macOS Studio app attached to GitHub
+# releases (#633, #390). The app preserves the package script's current ad-hoc
+# signing posture; Developer ID signing and notarization require separate
+# maintainer provisioning.
 #
 # Triggers only on a *published* GitHub release (never on tag push, so a
 # `git tag && git push` alone does not fire a build — a release must be
@@ -97,3 +100,51 @@ jobs:
             "${{ steps.package.outputs.sha256_file }}" \
             --repo "${{ github.repository }}" \
             --clobber
+
+  macos-app:
+    name: build macOS Studio app
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-macos-app
+
+      - name: Cache Swift release build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: apps/macos/.build
+          key: macos-app-${{ runner.os }}-${{ hashFiles('apps/macos/Package.swift', 'apps/macos/Package.resolved') }}
+          restore-keys: |
+            macos-app-${{ runner.os }}-
+
+      - name: Verify release tag matches workspace version
+        run: |
+          set -euo pipefail
+          APP_VERSION="$(./apps/macos/scripts/package-app.sh --print-version)"
+          if [ "$TAG" != "v$APP_VERSION" ]; then
+            echo "::error::release tag $TAG does not match workspace version v$APP_VERSION"
+            exit 1
+          fi
+
+      - name: Build and package ad-hoc-signed macOS app
+        run: ./apps/macos/scripts/package-app.sh
+
+      - name: Upload macOS app assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./apps/macos/scripts/upload-release-assets.sh \
+            "$TAG" \
+            "${{ github.repository }}"

@@ -3,11 +3,15 @@
 #
 # Usage:
 #   ./scripts/package-app.sh [--out <dir>] [--skip-build] [--skip-cargo]
+#                            [--print-version] [--print-target-release]
 #
 # Options:
 #   --out <dir>       Output directory (default: apps/macos/dist/)
 #   --skip-build      Skip `swift build -c release` (use existing .build/release/Lattice)
-#   --skip-cargo      Skip cargo builds (use existing target/release/ binaries)
+#   --skip-cargo      Skip cargo builds (use existing Cargo target binaries)
+#   --print-version   Print the workspace-derived app version and exit
+#   --print-target-release
+#                     Print the resolved Cargo release directory and exit
 #
 # Idempotent: re-running overwrites dist/ cleanly.
 #
@@ -23,20 +27,64 @@ REPO_ROOT="$(cd "$MACOS_DIR/../.." && pwd)"     # lattice/
 OUT_DIR="$MACOS_DIR/dist"
 SKIP_BUILD=false
 SKIP_CARGO=false
+PRINT_VERSION=false
+PRINT_TARGET_RELEASE=false
 
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --out)   OUT_DIR="$(realpath "$2")"; shift 2 ;;
+        --out)   OUT_DIR="$2"; shift 2 ;;
         --skip-build)  SKIP_BUILD=true; shift ;;
         --skip-cargo)  SKIP_CARGO=true; shift ;;
+        --print-version) PRINT_VERSION=true; shift ;;
+        --print-target-release) PRINT_TARGET_RELEASE=true; shift ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
+if [[ -z "${CARGO_TARGET_DIR:-}" ]]; then
+    CARGO_TARGET_DIR="$REPO_ROOT/target"
+elif [[ "$CARGO_TARGET_DIR" != /* ]]; then
+    CARGO_TARGET_DIR="$PWD/$CARGO_TARGET_DIR"
+fi
+export CARGO_TARGET_DIR
+TARGET_RELEASE="$CARGO_TARGET_DIR/release"
+
+if [ "$PRINT_TARGET_RELEASE" = true ]; then
+    printf '%s\n' "$TARGET_RELEASE"
+    exit 0
+fi
+
+VERSION="$(
+    python3 - "$REPO_ROOT/Cargo.toml" <<'PY'
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as cargo_toml:
+    metadata = tomllib.load(cargo_toml)
+try:
+    version = metadata["workspace"]["package"]["version"]
+except (KeyError, TypeError) as error:
+    raise SystemExit(f"workspace package version is missing or malformed: {error}") from error
+if not isinstance(version, str) or not version:
+    raise SystemExit("workspace package version must be a non-empty string")
+print(version)
+PY
+)"
+if [[ -z "$VERSION" ]]; then
+    echo "ERROR: workspace version resolved to an empty string" >&2
+    exit 1
+fi
+if [ "$PRINT_VERSION" = true ]; then
+    printf '%s\n' "$VERSION"
+    exit 0
+fi
+
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd)"
+
 APP_NAME="Lattice"
 BUNDLE="$OUT_DIR/$APP_NAME.app"
-VERSION="0.3.0"
 BUNDLE_ID="ai.khive.lattice.studio"
 
 echo "==> Package $APP_NAME v$VERSION"
@@ -59,7 +107,7 @@ echo "    Swift binary: $(du -sh "$SWIFT_BIN" | awk '{print $1}')"
 # --- Step 2: Cargo release builds ---
 if [ "$SKIP_CARGO" = false ]; then
     echo ""
-    echo "==> [2/6] cargo build --release (9 engine binaries)"
+    echo "==> [2/6] cargo build --release (10 engine binaries)"
     # lattice-inference binaries (no extra features)
     for BIN in quantize_q4 quantize_quarot lattice qwen35_generate; do
         echo "    cargo build --release -p lattice-inference --bin $BIN"
@@ -97,7 +145,6 @@ if [ "$SKIP_CARGO" = false ]; then
         --manifest-path "$REPO_ROOT/Cargo.toml"
 fi
 
-TARGET_RELEASE="$REPO_ROOT/target/release"
 for BIN in quantize_q4 quantize_quarot lattice qwen35_generate train_grad_full generate_lora eval_perplexity embed chat_metal lattice_serve; do
     if [ ! -x "$TARGET_RELEASE/$BIN" ]; then
         echo "ERROR: $TARGET_RELEASE/$BIN not found"

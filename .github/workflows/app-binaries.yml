@@ -27,7 +27,10 @@ on:
       - 'scripts/build-app-bins.sh'
       - 'scripts/ci-changed-files.sh'
       - 'apps/macos/scripts/package-app.sh'
+      - 'apps/macos/scripts/upload-release-assets.sh'
       - '.github/workflows/app-binaries.yml'
+      - '.github/workflows/release-binaries.yml'
+      - 'tests/test_macos_app_release.py'
   workflow_dispatch:
   merge_group:
     branches: [main]
@@ -64,6 +67,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Verify macOS app release contract
+        run: python3 tests/test_macos_app_release.py -v
       - id: filter
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
