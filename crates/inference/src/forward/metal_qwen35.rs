@@ -8922,7 +8922,7 @@ mod inner {
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
                 // id. An accepting state with no legal continuation is a completed
@@ -9120,7 +9120,7 @@ mod inner {
                         let _signpost_grammar = crate::forward::signpost::interval(
                             crate::forward::signpost::Label::DecodeGrammarMask,
                         );
-                        engine.mask_logits(gs, &mut step_logits);
+                        engine.mask_logits(gs, &mut step_logits)?;
                         // Fail closed if the grammar blocked every continuation,
                         // matching the CPU contract (#611).
                         if !super::has_finite_logit(&step_logits) {
@@ -13961,7 +13961,7 @@ mod inner {
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
                 // id. An accepting state with no legal continuation is a completed
@@ -14170,7 +14170,7 @@ mod inner {
                     let _signpost_grammar = crate::forward::signpost::interval(
                         crate::forward::signpost::Label::DecodeGrammarMask,
                     );
-                    engine.mask_logits(gs, &mut step_logits);
+                    engine.mask_logits(gs, &mut step_logits)?;
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
                     if !super::has_finite_logit(&step_logits) {
@@ -16959,7 +16959,7 @@ mod inner {
             }
 
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
                 // id. An accepting state with no legal continuation is a completed
@@ -17218,7 +17218,7 @@ mod inner {
                     let _signpost_grammar = crate::forward::signpost::interval(
                         crate::forward::signpost::Label::DecodeGrammarMask,
                     );
-                    engine.mask_logits(gs, &mut step_logits);
+                    engine.mask_logits(gs, &mut step_logits)?;
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
                     if !super::has_finite_logit(&step_logits) {
