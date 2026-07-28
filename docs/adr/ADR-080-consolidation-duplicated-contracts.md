@@ -2,7 +2,7 @@
 
 **Status**: Accepted (clusters C1–C4 implemented and merged; see implementation record below)
 **Kind**: Aspirational
-**Date**: 2026-07-09 (status updated 2026-07-11)
+**Date**: 2026-07-09 (status updated 2026-07-11; amended 2026-07-28)
 
 **Implementation record** (verified against merged PRs at `origin/main @ 32697ed0e`):
 
@@ -18,17 +18,17 @@
   `detect_format`, plus its two error-message helpers) consolidated into
   `crates/inference/src/model_format.rs`, shared by `lattice`, `lattice_serve`,
   and `chat_metal`; see "Amendment: model-format detector consolidation" below.
-The cluster defect tickets (#739–#741, resolved by C1; #744–#746, resolved by C2) are
-closed against the merged PRs above. The non-cluster audit items from the same sweep
-(#764–#777, per-family checklists and standalone items) remain open and track their
-own work independently; their state does not gate this ADR's acceptance.
-**Crate**: lattice-inference (`crates/inference/src/attention/`, `src/forward/`, `src/bin/`,
-`src/model/qwen35/`)
-**Research**: Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; adversarially verified at the audited commit; re-verified at `origin/main @ 0699e60cc`)
-**Issues**: #739, #740, #741 (attention-softmax); #744, #745, #746 (http-serve); #1115
-(Metal measurement lock); related
-non-cluster audit items tracked in #764-#777 (per-family checklists and standalone items)
-**Depends on**: ADR-058 (CPU performance regression CI — superseded; retained for `make bench-compare` provenance), ADR-064 (CI gate taxonomy), ADR-066 (e2e parity gate, Accepted)
+  The cluster defect tickets (#739–#741, resolved by C1; #744–#746, resolved by C2) are
+  closed against the merged PRs above. The non-cluster audit items from the same sweep
+  (#764–#777, per-family checklists and standalone items) remain open and track their
+  own work independently; their state does not gate this ADR's acceptance.
+  **Crate**: lattice-inference (`crates/inference/src/attention/`, `src/forward/`, `src/bin/`,
+  `src/model/qwen35/`)
+  **Research**: Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; adversarially verified at the audited commit; re-verified at `origin/main @ 0699e60cc`)
+  **Issues**: #739, #740, #741 (attention-softmax); #744, #745, #746 (http-serve); #1115
+  (Metal measurement lock); related
+  non-cluster audit items tracked in #764-#777 (per-family checklists and standalone items)
+  **Depends on**: ADR-058 (CPU performance regression CI — superseded; retained for `make bench-compare` provenance), ADR-064 (CI gate taxonomy), ADR-066 (e2e parity gate, Accepted)
 
 ## Context
 
